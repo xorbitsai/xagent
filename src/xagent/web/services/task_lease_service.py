@@ -50,20 +50,12 @@ def _rowcount(result: Any) -> int:
 
 @dataclass(frozen=True)
 class TaskLease:
-    """One runner's claim on one task row.
+    """Fixed run fence used by execution writers.
 
-    ``attempt_id`` names the exact acquisition that produced this lease. It
-    is minted fresh by ``acquire_task_lease_no_commit`` on every successful
-    claim and mirrored into ``tasks.lease_attempt_id`` in the same UPDATE, so
-    a holder can later prove the row still belongs to *its* attempt rather
-    than to a successor that reused the same ``(runner_id, run_id)`` tuple.
-
-    A missing attempt cannot authorize execution writes or renewal. Acquired
-    leases carry the token through background handoff; live injection must
-    reuse a registered holder rather than adopt a token from a task row.
-    Acquisition still supports the existing same-runner orchestration until
-    the owner mailbox replaces those callers; each acquisition supersedes
-    all previous handles, including handles in the same process.
+    Shared execution carries the coordinator's acquisition token and never
+    independently renews or releases it. Local execution mints a token on each
+    acquisition. Both paths require the exact task/runner/run/attempt tuple;
+    a missing attempt cannot authorize execution writes or renewal.
     """
 
     task_id: int
@@ -861,10 +853,14 @@ def acquire_task_lease_no_commit(
 ) -> TaskLease | None:
     """Stage one atomic claim; the caller owns commit/rollback.
 
-    Existing entry-point reservations still govern same-runner reacquisition.
-    Every successful acquisition supersedes previous handles; continuation or
-    handoff of an existing owner must use its lease instead of reacquiring.
+    In coordinator context, transition execution state under the existing
+    owner and return its fixed run fence. Otherwise, existing entry-point
+    reservations govern acquisition and each claim supersedes prior handles.
     """
+    from .task_coordinator_runtime import current_task_coordinator
+    from .task_coordinator_service import task_lease_predicate
+
+    coordinator = current_task_coordinator(task_id)
     runner = runner_id or get_runner_id()
     now = utc_now()
     expires_at = task_lease_expires_at(now)
@@ -904,20 +900,29 @@ def acquire_task_lease_no_commit(
             lease_checkpoint_trace_event_id_case()
         )
 
-    stmt = (
-        update(Task)
-        .where(Task.id == task_id)
-        .where(
-            or_(
-                task_status_predicate.ne(TaskStatus.RUNNING),
-                Task.runner_id == runner,
-                Task.runner_id.is_(None),
-                Task.lease_expires_at.is_(None),
-                Task.lease_expires_at < now,
-            )
+    if coordinator is not None:
+        # In shared execution this operation admits a run under the existing
+        # task owner. It must never mint a second acquisition or heartbeat.
+        assert coordinator.lease is not None
+        runner = coordinator.lease.runner_id
+        attempt_id = coordinator.lease.attempt_id
+        for field in (
+            "runner_id",
+            "lease_attempt_id",
+            "lease_expires_at",
+            "last_heartbeat_at",
+        ):
+            values.pop(field)
+        owner_predicate = task_lease_predicate(coordinator.lease)
+    else:
+        owner_predicate = or_(
+            task_status_predicate.ne(TaskStatus.RUNNING),
+            Task.runner_id == runner,
+            Task.runner_id.is_(None),
+            Task.lease_expires_at.is_(None),
+            Task.lease_expires_at < now,
         )
-        .values(**values)
-    )
+    stmt = update(Task).where(Task.id == task_id, owner_predicate).values(**values)
     if new_run:
         stmt = stmt.where(task_status_predicate.ne(TaskStatus.RUNNING))
     if expected_run_id is not None:
@@ -936,7 +941,7 @@ def acquire_task_lease_no_commit(
         task_id=task_id,
         runner_id=runner,
         run_id=str(stored_run_id) if stored_run_id is not None else None,
-        attempt_id=values["lease_attempt_id"],
+        attempt_id=attempt_id,
     )
 
 
@@ -1190,6 +1195,22 @@ def release_task_lease(
     return released
 
 
+def task_settlement_ownership_values(
+    task_id: int, *, last_heartbeat_at: datetime | None = None
+) -> dict[str, Any]:
+    """Only the coordinator releases shared ownership after all handles drain."""
+    from .task_coordinator_runtime import current_task_coordinator
+
+    if current_task_coordinator(task_id) is not None:
+        return {}
+    return {
+        "runner_id": None,
+        "lease_attempt_id": None,
+        "lease_expires_at": None,
+        "last_heartbeat_at": last_heartbeat_at,
+    }
+
+
 def release_task_lease_no_commit(
     db: Session,
     lease: TaskLease | None,
@@ -1222,6 +1243,19 @@ def release_task_lease_no_commit(
         ),
         "lease_attempt_id": None,
     }
+    from .task_coordinator_runtime import current_task_coordinator
+
+    coordinator = current_task_coordinator(lease.task_id)
+    if coordinator is not None:
+        if not coordinator.owns_execution(lease):
+            return False
+        for field in (
+            "runner_id",
+            "lease_attempt_id",
+            "lease_expires_at",
+            "last_heartbeat_at",
+        ):
+            values.pop(field)
     if status in _NON_TERMINAL_RELEASE_STATUSES:
         values["error_message"] = None
     stmt = (
@@ -1262,15 +1296,16 @@ def fail_and_release_task_lease_no_commit(
         .where(Task.run_id == lease.run_id)
         .where(task_status_predicate.eq(TaskStatus.RUNNING))
         .values(
-            status=task_status_predicate.value(TaskStatus.FAILED),
-            runner_id=None,
-            lease_expires_at=None,
-            last_heartbeat_at=utc_now(),
-            control_state=failed_control_state,
-            state_version=func.coalesce(Task.state_version, 0) + 1,
-            error_message=error_message,
-            output=None,
-            lease_attempt_id=None,
+            {
+                "status": task_status_predicate.value(TaskStatus.FAILED),
+                "control_state": failed_control_state,
+                "state_version": func.coalesce(Task.state_version, 0) + 1,
+                "error_message": error_message,
+                "output": None,
+                **task_settlement_ownership_values(
+                    lease.task_id, last_heartbeat_at=utc_now()
+                ),
+            }
         )
     )
     result = db.execute(stmt.execution_options(synchronize_session=False))
@@ -1301,15 +1336,16 @@ def release_current_runner_task_lease(
         .where(Task.run_id == lease.run_id)
         .where(task_lease_attempt_predicate(lease))
         .values(
-            status=task_status_predicate.value(status),
-            runner_id=None,
-            lease_expires_at=None,
-            last_heartbeat_at=utc_now(),
-            control_state=control_state,
-            state_version=lease_state_version_case(
-                status, control_state, current_version
-            ),
-            lease_attempt_id=None,
+            {
+                "status": task_status_predicate.value(status),
+                "control_state": control_state,
+                "state_version": lease_state_version_case(
+                    status, control_state, current_version
+                ),
+                **task_settlement_ownership_values(
+                    task_id, last_heartbeat_at=utc_now()
+                ),
+            }
         )
     )
     if expected_run_id is not None:
@@ -1602,6 +1638,17 @@ def registered_task_lease(snapshot: TaskLease | None) -> TaskLease | None:
     """
     if snapshot is None or snapshot.attempt_id is None:
         return None
+    from .task_coordinator_runtime import current_task_coordinator
+
+    coordinator = current_task_coordinator(snapshot.task_id)
+    if coordinator is not None and coordinator.owns_execution(snapshot):
+        assert coordinator.lease is not None
+        return TaskLease(
+            task_id=coordinator.task_id,
+            runner_id=coordinator.lease.runner_id,
+            attempt_id=coordinator.lease.attempt_id,
+            run_id=snapshot.run_id,
+        )
     manager = _task_lease_heartbeat_manager
     if manager is None or manager._loop is not asyncio.get_running_loop():
         return None
@@ -1623,6 +1670,13 @@ async def run_task_lease_heartbeat(
     stop_event: asyncio.Event,
 ) -> TaskLeaseHeartbeatOutcome:
     """Keep a task lease in the process-local heartbeat batch until stopped."""
+    from .task_coordinator_runtime import current_task_coordinator
+
+    coordinator = current_task_coordinator(lease.task_id)
+    if coordinator is not None:
+        if not coordinator.owns_execution(lease):
+            return TaskLeaseHeartbeatOutcome(lease_lost=True)
+        return await coordinator.observe_ownership(stop_event)
     registration = _get_task_lease_heartbeat_manager().register(lease)
     stop_waiter = asyncio.create_task(stop_event.wait())
     terminal_waiter = asyncio.create_task(registration.terminal_event.wait())

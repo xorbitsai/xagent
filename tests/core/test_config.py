@@ -2905,3 +2905,15 @@ def test_task_runtime_secrets_use_explicit_key(monkeypatch):
     key = Fernet.generate_key().decode()
     monkeypatch.setenv(config.ENCRYPTION_KEY, key)
     assert config.get_task_runtime_secrets_encryption_key() == key
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 30), ("12", 12), ("0", 30), ("-1", 30), ("bad", 30)]
+)
+def test_task_reply_wait_timeout(value, expected, monkeypatch):
+    from xagent.config import get_task_reply_wait_timeout_seconds
+
+    monkeypatch.delenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", value)
+    assert get_task_reply_wait_timeout_seconds() == expected

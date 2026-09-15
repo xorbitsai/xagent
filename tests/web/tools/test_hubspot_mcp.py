@@ -261,7 +261,14 @@ def test_association_listing_stops_on_empty_page_with_cursor(monkeypatch):
 
     result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
 
-    assert result == {"status": "success", "deals": [], "has_more": True}
+    assert result == {
+        "status": "success",
+        "deals": [],
+        "has_more": True,
+        "after": "cursor-1",
+        "truncated": False,
+        "missing_deal_ids": [],
+    }
     assert request_mock.call_count == 1
 
 
@@ -274,7 +281,445 @@ def test_get_contact_deals_empty_returns_no_more(monkeypatch):
 
     result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
 
-    assert result == {"status": "success", "deals": [], "has_more": False}
+    assert result == {
+        "status": "success",
+        "deals": [],
+        "has_more": False,
+        "after": None,
+        "truncated": False,
+        "missing_deal_ids": [],
+    }
+
+
+def test_get_company_deals_single_page_has_no_more(monkeypatch):
+    association_urls = []
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            association_urls.append(url)
+            return MockResponse(json_data={"results": [{"id": "d1"}, {"id": "d2"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {"dealname": "Deal"}}
+                    for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_company_deals("co1"))
+
+    assert result["status"] == "success"
+    assert [deal["id"] for deal in result["deals"]] == ["d1", "d2"]
+    assert result["has_more"] is False
+    assert association_urls == [
+        "https://api.hubapi.com/crm/v3/objects/companies/co1/associations/deals"
+    ]
+
+
+def test_get_company_deals_empty_returns_no_more(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"results": []})),
+    )
+
+    result = json.loads(hubspot.hubspot_get_company_deals("co1"))
+
+    assert result == {
+        "status": "success",
+        "deals": [],
+        "has_more": False,
+        "after": None,
+        "truncated": False,
+        "missing_deal_ids": [],
+    }
+
+
+def test_get_company_deals_returns_and_accepts_pagination_cursor(monkeypatch):
+    deal_ids = ["d0", "d1", "d2", "d3"]
+    association_params = []
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            association_params.append(params)
+            start = int(params.get("after", "0"))
+            end = min(start + params["limit"], len(deal_ids))
+            page = {"results": [{"id": deal_id} for deal_id in deal_ids[start:end]]}
+            if end < len(deal_ids):
+                page["paging"] = {"next": {"after": str(end)}}
+            return MockResponse(json_data=page)
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {}} for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    first = json.loads(hubspot.hubspot_get_company_deals("co1", limit=2))
+    second = json.loads(
+        hubspot.hubspot_get_company_deals("co1", limit=2, after=first["after"])
+    )
+
+    assert [deal["id"] for deal in first["deals"]] == ["d0", "d1"]
+    assert first["after"] == "2"
+    assert first["has_more"] is True
+    assert [deal["id"] for deal in second["deals"]] == ["d2", "d3"]
+    assert second["after"] is None
+    assert second["has_more"] is False
+    assert association_params == [{"limit": 2}, {"limit": 2, "after": "2"}]
+
+
+@pytest.mark.parametrize(
+    "tool, object_id",
+    [
+        (hubspot.hubspot_get_contact_deals, "c1"),
+        (hubspot.hubspot_get_company_deals, "co1"),
+    ],
+)
+def test_get_associated_deals_clamps_limit_to_valid_range(monkeypatch, tool, object_id):
+    request_mock = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", request_mock)
+
+    tool(object_id, limit=0)
+    assert request_mock.call_args.kwargs["params"]["limit"] == 1
+
+    tool(object_id, limit=1000)
+    assert request_mock.call_args.kwargs["params"]["limit"] == 100
+
+
+@pytest.mark.parametrize(
+    "tool, object_id",
+    [
+        (hubspot.hubspot_get_contact_deals, "c1"),
+        (hubspot.hubspot_get_company_deals, "co1"),
+    ],
+)
+def test_get_associated_deals_wraps_request_errors(monkeypatch, tool, object_id):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(tool(object_id))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+
+
+def test_get_company_deals_rejects_whitespace_padded_company_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_company_deals(" co1 "))
+
+    assert result["status"] == "error"
+    assert "company_id" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_get_associated_deals_requests_authoritative_closed_state_flags(monkeypatch):
+    """dealstage/pipeline are opaque IDs and closedate is set on open deals
+    too, so a caller needs hs_is_closed(_won|_lost) to tell open from closed
+    without guessing at stage semantics.
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        requested_properties.append(json["properties"])
+        return MockResponse(json_data={"results": [{"id": "d1", "properties": {}}]})
+
+    requested_properties = []
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    contact_result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
+    company_result = json.loads(hubspot.hubspot_get_company_deals("co1"))
+
+    assert contact_result["status"] == "success"
+    assert company_result["status"] == "success"
+    assert len(requested_properties) == 2
+    for properties in requested_properties:
+        assert "hs_is_closed" in properties
+        assert "hs_is_closed_won" in properties
+        assert "hs_is_closed_lost" in properties
+
+
+def test_get_associated_deals_reports_ids_batch_read_silently_dropped(monkeypatch):
+    """A partial batch-read (e.g. an archived deal) must be surfaced, not
+    returned as if every requested id came back.
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}, {"id": "d2"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        # HubSpot dropped d2 from the batch-read response entirely.
+        return MockResponse(json_data={"results": [{"id": "d1", "properties": {}}]})
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
+
+    assert result["status"] == "success"
+    assert [deal["id"] for deal in result["deals"]] == ["d1"]
+    assert result["missing_deal_ids"] == ["d2"]
+
+
+def test_get_associated_deals_halves_response_past_output_limit(monkeypatch):
+    """A large enough deal list must be halved rather than returned whole
+    and hard-truncated into invalid JSON by the platform's output filter.
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(
+                json_data={"results": [{"id": f"d{i}"} for i in range(8)]}
+            )
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {"dealname": "x" * 100}}
+                    for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 400)
+
+    response = hubspot.hubspot_get_contact_deals("c1", limit=8)
+    result = json.loads(response)
+
+    assert len(response) <= 400
+    assert result["status"] == "success"
+    assert 0 < len(result["deals"]) < 8
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["after"] is None
+    assert result["missing_deal_ids"] == []
+
+
+def test_get_associated_deals_reports_input_after_when_deals_are_trimmed(
+    monkeypatch,
+):
+    """A trimmed page must be retried from its input cursor."""
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            assert params["after"] == "caller-cursor"
+            return MockResponse(
+                json_data={
+                    "results": [{"id": f"d{i}"} for i in range(4)],
+                    "paging": {"next": {"after": "server-next-cursor"}},
+                }
+            )
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {"dealname": "x" * 200}}
+                    for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 500)
+
+    result = json.loads(
+        hubspot.hubspot_get_contact_deals("c1", limit=4, after="caller-cursor")
+    )
+
+    assert result["truncated"] is True
+    assert 0 < len(result["deals"]) < 4
+    assert result["has_more"] is True
+    assert result["after"] == "caller-cursor"
+
+
+def test_get_associated_deals_prioritizes_shrinking_missing_ids_over_real_deals(
+    monkeypatch,
+):
+    """When both deals and missing_deal_ids are populated and halving is
+    needed, missing_deal_ids (a diagnostic list of ids HubSpot didn't
+    return) must shrink before real, successfully-fetched deal data is
+    thrown away.
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            found = [{"id": f"d{i}"} for i in range(5)]
+            missing = [{"id": f"missing-deal-id-{i:03d}"} for i in range(20)]
+            return MockResponse(json_data={"results": found + missing})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        # Only the 5 "found" ids actually come back; the 20 "missing" ones
+        # were requested but silently dropped by the batch-read.
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {}}
+                    for item in json["inputs"]
+                    if not item["id"].startswith("missing-deal-id-")
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 300)
+
+    response = hubspot.hubspot_get_contact_deals("c1", limit=25)
+    result = json.loads(response)
+
+    assert len(response) <= 300
+    assert result["status"] == "success"
+    assert len(result["deals"]) == 5
+    assert 0 < len(result["missing_deal_ids"]) < 20
+    assert result["truncated"] is True
+
+
+def test_get_associated_deals_halves_missing_deal_ids_past_output_limit(monkeypatch):
+    """missing_deal_ids must also be halved when it alone keeps the response
+    over the output limit - halving only `deals` isn't enough once `deals`
+    is already empty.
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(
+                json_data={"results": [{"id": f"deal-id-{i:03d}"} for i in range(8)]}
+            )
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        # HubSpot dropped every requested deal from the batch-read.
+        return MockResponse(json_data={"results": []})
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 140)
+
+    response = hubspot.hubspot_get_contact_deals("c1", limit=8)
+    result = json.loads(response)
+
+    assert len(response) <= 140
+    assert result["status"] == "success"
+    assert result["deals"] == []
+    assert 0 < len(result["missing_deal_ids"]) < 8
+    assert result["truncated"] is True
+    assert result["has_more"] is False
+    assert result["after"] is None
+
+
+def test_get_associated_deals_explains_when_everything_collapses(monkeypatch):
+    """Mirrors _paged_list: when halving empties deals and missing_deal_ids
+    and the response still doesn't fit, say retrying won't help rather than
+    returning an empty result indistinguishable from "nothing exists".
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        return MockResponse(
+            json_data={
+                "results": [{"id": "d1", "properties": {"dealname": "x" * 1000}}]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 450)
+
+    response = hubspot.hubspot_get_contact_deals("c1")
+    result = json.loads(response)
+
+    assert len(response) <= 450
+    assert result["status"] == "success"
+    assert result["deals"] == []
+    assert result["truncated"] is True
+    assert "too large to fit" in result["message"]
+
+
+def test_get_associated_deals_drops_message_when_it_alone_exceeds_the_limit(
+    monkeypatch,
+):
+    """Mirrors _paged_list's equivalent test: when even the "everything
+    collapsed" explanatory message wouldn't fit, drop it rather than
+    exceeding the limit anyway.
+    """
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        return MockResponse(
+            json_data={"results": [{"id": "d1", "properties": {"dealname": "x" * 200}}]}
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 150)
+
+    response = hubspot.hubspot_get_contact_deals("c1")
+    result = json.loads(response)
+
+    assert len(response) <= 150
+    assert result["status"] == "success"
+    assert result["deals"] == []
+    assert result["truncated"] is True
+    assert "message" not in result
+
+
+def test_get_associated_deals_handles_association_result_missing_id(monkeypatch):
+    """A malformed association item must not send a null batch-read id."""
+
+    batch_inputs = []
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}, {}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        batch_inputs.extend(json["inputs"])
+        return MockResponse(json_data={"results": [{"id": "d1", "properties": {}}]})
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
+
+    assert result["status"] == "success"
+    assert [deal["id"] for deal in result["deals"]] == ["d1"]
+    assert result["missing_deal_ids"] == []
+    assert batch_inputs == [{"id": "d1"}]
+
+
+def test_get_associated_deals_deduplicates_and_normalizes_ids(monkeypatch):
+    batch_inputs = []
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(
+                json_data={"results": [{"id": 1}, {"id": "1"}, {"id": "2"}]}
+            )
+        batch_inputs.extend(json["inputs"])
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {}} for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_company_deals("co1"))
+
+    assert result["status"] == "success"
+    assert [deal["id"] for deal in result["deals"]] == ["1", "2"]
+    assert result["missing_deal_ids"] == []
+    assert batch_inputs == [{"id": "1"}, {"id": "2"}]
 
 
 def test_create_deal_without_contact_id_sends_no_associations(monkeypatch):

@@ -55,6 +55,8 @@ def _prepare_reply_context_sync(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
             task_owner_user_id=int(task.user_id),
+            actor_user_id=principal.owner_user_id,
+            command_id=request.command_id,
             run_id=str(task.run_id) if task.run_id is not None else None,
             status=task.status,
             text=request.message.content,
@@ -108,6 +110,16 @@ async def reply_to_task(
 
     try:
         result = await task_resume_service.resume_task_reply(ctx)
+    except task_resume_service.TaskResumeOutcomeUnknownError as exc:
+        raise V1ApiError(
+            V1ErrorCode.REPLY_OUTCOME_UNKNOWN,
+            504,
+            details={
+                "accepted": True,
+                "task_id": task_id,
+                "command_id": exc.command_id,
+            },
+        ) from exc
     except task_resume_service.TaskResumeBusyError as exc:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409) from exc
     except task_resume_service.TaskResumeNotWaitingError as exc:
@@ -133,6 +145,7 @@ async def reply_to_task(
     await record_key_usage(str(principal.key.key_prefix))
 
     return ReplyResponse(
+        command_id=result.command_id,
         task_id=ctx.task_id,
         agent_id=ctx.agent_id,
         workforce_id=(

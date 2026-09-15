@@ -8,12 +8,264 @@ import base64
 import json
 import logging
 import os
-from typing import Any, Dict, Optional, Union
-from urllib.parse import urlencode, urlparse
+from typing import Any, Dict, Mapping, Optional, Union
+from urllib.parse import ParseResult, parse_qs, urlencode, urlparse
 
 import httpx
 
+from ...utils.security import host_matches_suffix, redact_url_credentials_for_logging
+
 logger = logging.getLogger(__name__)
+
+# Fixed or tenant-subdomain API hosts already covered by a dedicated,
+# credentialed MCP connector (see src/xagent/web/tools/mcp/). A caller who
+# reaches this generic, credential-less tool for one of these - typically an
+# agent that couldn't find a write tool on the real connector and fell back
+# to hand-rolling the REST call - has no way to attach that connector's OAuth
+# token here, so the request is guaranteed to 401/403 regardless of whether
+# the connector itself is healthy. That failure was previously indistinguishable
+# from an actually-broken connection (see the HubSpot deal-write incident this
+# hint was added for: reads kept working the whole time via the real
+# connector, but the raw fallback calls' 401s got diagnosed as "HubSpot
+# connection broken"). Entries are the domain as it would be matched by
+# _hostname_matches_connector_domain (exact host or "*.<domain>"), not a
+# literal example hostname - deputy.com/zendesk.com/salesforce.com/
+# myshopify.com/posthog.com/mixpanel.com are multi-tenant services where the
+# real host is a customer-specific subdomain.
+#
+# Google, Microsoft Graph, and Meta Graph are each only PARTIALLY covered:
+# xagent's connectors wrap specific product APIs, not every API a customer
+# could reach on that host. Google's per-product hosts below (Ads, Analytics,
+# Search Console inspection, Gmail, Docs, Sheets, Slides) are each dedicated
+# to one product, so listing them is precise. Search Console's Webmasters API
+# is handled separately by a host-plus-path rule. Calendar and Drive are
+# deliberately NOT listed: both share the general-purpose "www.googleapis.com" host with
+# many unrelated Google APIs xagent has no connector for, and annotating that
+# host would mislabel unrelated APIs too. graph.microsoft.com (Outlook /
+# OneDrive / Teams) and graph.facebook.com (Facebook / Instagram - also the
+# WhatsApp Business Cloud API's host, which xagent does not implement) can't
+# be narrowed the same way since Microsoft/Meta multiplex many products onto
+# one host with no separate hostname per product; the warning message below
+# says so explicitly rather than claiming full coverage for either.
+_KNOWN_CONNECTOR_DOMAINS: tuple[tuple[str, str], ...] = (
+    ("hubapi.com", "HubSpot"),
+    ("slack.com", "Slack"),
+    ("api.stripe.com", "Stripe"),
+    ("api.github.com", "GitHub"),
+    ("graph.microsoft.com", "Microsoft Graph (Outlook/OneDrive/Teams)"),
+    ("graph.facebook.com", "Meta Graph (Facebook/Instagram)"),
+    ("api.linkedin.com", "LinkedIn"),
+    ("api.intercom.io", "Intercom"),
+    ("api.linear.app", "Linear"),
+    ("api.zoom.us", "Zoom"),
+    ("googleads.googleapis.com", "Google Ads"),
+    ("analyticsdata.googleapis.com", "Google Analytics"),
+    ("analyticsadmin.googleapis.com", "Google Analytics"),
+    ("searchconsole.googleapis.com", "Google Search Console"),
+    ("gmail.googleapis.com", "Gmail"),
+    ("docs.googleapis.com", "Google Docs"),
+    ("sheets.googleapis.com", "Google Sheets"),
+    ("slides.googleapis.com", "Google Slides"),
+    ("api.atlassian.com", "Jira"),
+    ("api.chartmogul.com", "ChartMogul"),
+    ("api.employmenthero.com", "Employment Hero"),
+    ("api.myob.com", "MYOB"),
+    ("zendesk.com", "Zendesk"),
+    ("deputy.com", "Deputy"),
+    ("myshopify.com", "Shopify"),
+    ("posthog.com", "PostHog"),
+    ("mixpanel.com", "Mixpanel"),
+    ("salesforce.com", "Salesforce"),
+    ("api.xero.com", "Xero"),
+)
+
+# Connector APIs hosted on a shared domain need a path-qualified rule. A
+# blanket www.googleapis.com match would incorrectly label unrelated Google
+# APIs, while Search Console's sites/sitemaps/analytics operations use this
+# legacy Webmasters endpoint rather than searchconsole.googleapis.com.
+_KNOWN_CONNECTOR_PATHS: tuple[tuple[str, str, str], ...] = (
+    ("www.googleapis.com", "/webmasters/v3", "Google Search Console"),
+)
+
+# Domains that match one of _KNOWN_CONNECTOR_DOMAINS by suffix but are
+# actually a different, self-authenticating product the hint must not
+# touch: hooks.slack.com (Slack incoming webhooks) carries its secret in the
+# URL path itself, not in a header/param/token, and is unrelated to the
+# credentialed Slack Web API at slack.com/api that the hint describes.
+_SELF_AUTHENTICATING_SUBDOMAINS = frozenset({"hooks.slack.com"})
+
+
+def _hostname_matches_connector_domain(hostname: str, domain: str) -> bool:
+    return host_matches_suffix(hostname.lower(), domain.lower())
+
+
+def match_known_connector_domain(hostname: str) -> Optional[str]:
+    """Return the connector name if ``hostname`` belongs to one of
+    ``_KNOWN_CONNECTOR_DOMAINS``, else ``None``."""
+    # A trailing "." is a valid DNS root-label marker (api.hubapi.com. is the
+    # same host as api.hubapi.com) that a caller could legitimately send;
+    # without stripping it, that spelling would silently skip this check.
+    hostname = hostname.lower().removesuffix(".")
+    if any(
+        _hostname_matches_connector_domain(hostname, exempted)
+        for exempted in _SELF_AUTHENTICATING_SUBDOMAINS
+    ):
+        return None
+    for domain, label in _KNOWN_CONNECTOR_DOMAINS:
+        if _hostname_matches_connector_domain(hostname, domain):
+            return label
+    return None
+
+
+def match_known_connector_url(url: str) -> Optional[str]:
+    """Return the connector label for a complete URL, including precise
+    path-qualified rules for APIs that share a general-purpose host."""
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower().removesuffix(".")
+    path = parsed.path.rstrip("/")
+    for domain, path_prefix, label in _KNOWN_CONNECTOR_PATHS:
+        if _hostname_matches_connector_domain(hostname, domain) and (
+            path == path_prefix or path.startswith(f"{path_prefix}/")
+        ):
+            return label
+    return match_known_connector_domain(hostname)
+
+
+# Substrings of a header name that indicate the caller already attached
+# their own credential - not just the standard "Authorization" header, since
+# several of the services in _KNOWN_CONNECTOR_DOMAINS use a service-specific
+# one instead (e.g. Shopify's "X-Shopify-Access-Token"). Deliberately does
+# NOT include the bare "auth" or "signature" substrings: "auth" alone also
+# matches non-credential headers like "X-Author" or the HTTP/2 ":authority"
+# pseudo-header, and "signature" matches non-credential headers like
+# GitHub's outbound "X-Hub-Signature-256" webhook-verification header - both
+# would silently suppress the hint for a call that has no real credential.
+# "authorization" alone already covers the real "Authorization"
+# case (it's a superset match of that word), so nothing is lost by dropping
+# the broader "auth".
+_AUTH_HEADER_NAME_MARKERS = (
+    "authorization",
+    "token",
+    "api-key",
+    "apikey",
+)
+
+# Query parameter names (case-insensitive) commonly used to carry an API key
+# instead of a header - e.g. Google APIs' "key" parameter.
+_AUTH_QUERY_PARAM_NAMES = frozenset(
+    {"key", "api_key", "api-key", "apikey", "token", "access_token"}
+)
+
+
+def _is_blank(value: Any) -> bool:
+    # str(None) is the non-empty text "None", so None must be special-cased
+    # here rather than folded into the str(value).strip() check below - every
+    # caller treats "blank" as "nothing was actually provided", and every one
+    # of these Optional fields defaults to None when the caller omits it.
+    if value is None:
+        return True
+    return not str(value).strip()
+
+
+def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
+    if not headers:
+        return False
+    for key, value in headers.items():
+        if _is_blank(value):
+            continue
+        key_lower = str(key).lower()
+        if any(marker in key_lower for marker in _AUTH_HEADER_NAME_MARKERS):
+            return True
+    return False
+
+
+def _has_auth_query_param(parsed_url: ParseResult) -> bool:
+    # parse_qs defaults to keep_blank_values=False, so a blank value here
+    # (e.g. "?key=") is already dropped for us - nothing extra to check.
+    query_keys = {key.lower() for key in parse_qs(parsed_url.query)}
+    return not _AUTH_QUERY_PARAM_NAMES.isdisjoint(query_keys)
+
+
+def _has_url_embedded_credentials(parsed_url: ParseResult) -> bool:
+    """Whether the URL carries HTTP Basic-Auth userinfo (``user:pass@host``)
+    directly, rather than in a header or query parameter."""
+    return bool(parsed_url.username or parsed_url.password)
+
+
+def _sanitize_final_url(url: httpx.URL) -> str:
+    """Strip query string and userinfo from a response URL, keeping only
+    scheme/host/port/path.
+
+    ``_make_request`` reports the actual post-redirect response URL so the
+    connector-domain hint can match the host that really answered - but the
+    raw URL can itself carry a credential: an api_key_query auth_token gets
+    merged into the query string before the request is made, and a caller
+    can embed Basic-Auth userinfo directly (``user:pass@host``). The only
+    thing any consumer of this value needs is which host answered, so
+    everything else is dropped here rather than trusting every call site
+    that ever reads this field to remember not to log or forward it whole.
+
+    Takes the ``httpx.URL`` object directly (``response.url`` /
+    ``response.request.url``) rather than a string: reconstructing a
+    string-form URL by hand (stdlib ``urlparse``/``urlunparse``) needs its
+    own IPv6-literal bracketing to avoid producing something unparsable
+    (``https://::1:8443/...``); ``httpx.URL.copy_with`` already handles
+    that correctly since it's the same type this module already merges
+    query params through elsewhere (``copy_merge_params``).
+    """
+    return str(url.copy_with(userinfo=b"", query=None))
+
+
+def has_auth_credentials(
+    url: str,
+    headers: Optional[Mapping[str, str]],
+) -> bool:
+    """Whether the actual outgoing request carries a recognizable credential
+    in its headers, merged URL query, or Basic-Auth userinfo.
+
+    A name-shaped match alone isn't enough for the header/param cases - an
+    empty value (e.g. {"Authorization": ""}) or a name that merely
+    resembles a credential without being one (e.g. "X-Idempotency-Token",
+    a request-deduplication id, not a secret) both look credential-shaped
+    by name. That imprecision is why this is used only to decide whether
+    to append an informational hint to an ALREADY-received 401/403 (see
+    append_known_connector_domain_hint / adapters/vibe/api_tool.py), never to
+    block a request outright: worst case here is a missed hint, not a
+    request that should have succeeded being refused.
+    """
+    parsed_url = urlparse(url)
+    return bool(
+        _has_auth_header(headers)
+        or _has_auth_query_param(parsed_url)
+        or _has_url_embedded_credentials(parsed_url)
+    )
+
+
+def append_known_connector_domain_hint(
+    existing_error: Optional[str], connector_label: str
+) -> str:
+    """Combine `existing_error` (e.g. "HTTP 401", or the size-limit error
+    text `_make_request` also uses on a 401/403) with
+    the connector-guidance sentence, adding a period + space between it and
+    `existing_error` when the existing text doesn't already end in sentence
+    punctuation - otherwise the two read as one run-on sentence (e.g.
+    "...download aborted This looks like a HubSpot API endpoint...").
+    """
+    hint = (
+        f"This looks like a {connector_label} API endpoint, and this call "
+        f"carried no credential in a form this tool recognizes "
+        f"(a credential-shaped header or query parameter, or Basic-Auth "
+        f"userinfo in the URL), which would explain a 401/403 here - if the "
+        f"dedicated {connector_label} connector tools cover this request, "
+        "prefer those (they carry the account's own OAuth credential); "
+        "otherwise pass your own credential via one of those mechanisms."
+    )
+    existing_error = (existing_error or "").strip()
+    if not existing_error:
+        return hint
+    if existing_error[-1] not in ".!?":
+        existing_error += "."
+    return f"{existing_error} {hint}"
 
 
 class APIClientCore:
@@ -68,10 +320,15 @@ class APIClientCore:
             allow_redirects: Whether to follow redirects
 
         Returns:
-            Dictionary with success status, status_code, headers, body, and error
+            Dictionary with success status, status_code, headers, body, and
+            error. On a 401/403 response, also carries the internal-only
+            final_url/final_request_has_credential keys the adapter's
+            connector-domain hint uses (see _sanitize_final_url /
+            has_auth_credentials) - both are None on every other status.
         """
         logger.info(
-            f"🌐 API Call: {method} {url}"
+            f"🌐 API Call: {method} "
+            f"{redact_url_credentials_for_logging(url, redact_all_query_values=True)}"
             + (f" (auth: {auth_type})" if auth_type else "")
         )
 
@@ -82,7 +339,10 @@ class APIClientCore:
                 "status_code": 0,
                 "headers": {},
                 "body": None,
-                "error": f"Invalid URL: {url}",
+                "error": (
+                    "Invalid URL: "
+                    f"{redact_url_credentials_for_logging(url, redact_all_query_values=True)}"
+                ),
             }
 
         # Prepare request
@@ -94,21 +354,43 @@ class APIClientCore:
         # Ensure retry_count is non-negative to avoid empty range
         retry_count = max(0, retry_count)
 
-        # Handle API key in query parameters
+        # Handle API key in query parameters. Case-insensitive to match
+        # _prepare_headers' auth_type.lower() convention for bearer/basic/
+        # api_key below. A caller sending auth_type="API_KEY_QUERY" must get
+        # the same query credential attached as its lowercase equivalent.
         request_params: Dict[str, Any] = dict(params) if params else {}
-        if auth_type == "api_key_query" and auth_token:
+        if auth_type and auth_type.lower() == "api_key_query" and auth_token:
             request_params[api_key_param] = auth_token
 
-        final_request_params: Optional[Dict[str, Any]] = request_params
-
-        # Merge params directly into URL to prevent httpx from stripping existing query strings
-        if final_request_params:
-            url = str(httpx.URL(url).copy_merge_params(final_request_params))
-            final_request_params = None
-
-        # If request_params is empty, set to None
-        if not final_request_params:
-            final_request_params = None
+        # Merge params directly into the URL string (rather than passing
+        # them separately to httpx) to prevent httpx from stripping any
+        # query string already present in `url` - so every param ends up
+        # merged into `url` here, and `_make_request` never receives a
+        # non-None `params` of its own.
+        #
+        # httpx.URL(...) can raise for a URL _is_valid_url's cheap
+        # scheme/netloc check lets through but httpx itself rejects (e.g. a
+        # non-numeric port, "http://example.com:abc/path") - only reachable
+        # once request_params is non-empty, since a request with no query
+        # params at all never reaches this line. Caught here so call_api
+        # keeps its documented dict-return contract instead of letting an
+        # exception escape uncaught before the retry loop's own try/except
+        # ever gets a chance to handle it.
+        if request_params:
+            try:
+                url = str(httpx.URL(url).copy_merge_params(request_params))
+            except Exception as e:
+                return {
+                    "success": False,
+                    "status_code": 0,
+                    "headers": {},
+                    "body": None,
+                    "error": (
+                        "Invalid URL: "
+                        f"{redact_url_credentials_for_logging(url, redact_all_query_values=True)} "
+                        f"({e})"
+                    ),
+                }
 
         # Prepare headers
         request_headers = self._prepare_headers(headers, auth_type, auth_token, body)
@@ -127,14 +409,25 @@ class APIClientCore:
                     url=url,
                     method=method,
                     headers=request_headers,
-                    params=final_request_params,
+                    # Always None: every param was already merged into
+                    # `url` above, precisely so it isn't passed here too.
+                    params=None,
                     data=request_body,
                     timeout=timeout,
                     proxy_url=proxy_url,
                     allow_redirects=allow_redirects,
                 )
+                # "Completed" rather than "successful" - _make_request
+                # returning without raising only means a response was
+                # received, not that it was a 2xx (e.g. a 401/403 from a
+                # known connector domain completes normally and is exactly
+                # the case this tool's hint logic needs to see as such,
+                # not as a misleading "successful" log line).
+                status_icon = "✅" if result.get("success") else "⚠️"
                 logger.info(
-                    f"✅ API Call successful: {method} {url} -> {result['status_code']}"
+                    f"{status_icon} API Call completed: {method} "
+                    f"{redact_url_credentials_for_logging(url, redact_all_query_values=True)} -> "
+                    f"{result['status_code']}"
                 )
                 return result
 
@@ -173,7 +466,10 @@ class APIClientCore:
         client_kwargs: Dict[str, Any] = {"timeout": timeout}
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
-            logger.debug(f"   Using proxy: {proxy_url}")
+            logger.debug(
+                "   Using proxy: "
+                f"{redact_url_credentials_for_logging(proxy_url, redact_all_query_values=True)}"
+            )
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             # Use streaming to limit download size
@@ -185,6 +481,63 @@ class APIClientCore:
                 content=data,
                 follow_redirects=allow_redirects,
             ) as response:
+                # Only ever consulted by the adapter's connector-domain
+                # hint, which only fires for a 401/403 - so this is skipped
+                # entirely for every 2xx/other response rather than
+                # sanitizing a URL and scanning headers no one will read.
+                #
+                # Wrapped in its own try/except, separate from the retry
+                # loop's: an exception here must never be mistaken for a
+                # transient network failure - the response itself already
+                # arrived successfully. Letting it propagate would have
+                # the retry loop retry an already-answered (and possibly
+                # non-idempotent) request, and after exhausting retries
+                # return status_code=0 with no error detail instead of the
+                # real 401/403 - resurrecting exactly the "looks like a
+                # broken connection" misdiagnosis this feature exists to
+                # fix. Worst case here is just a missing hint, same as any
+                # other imprecision in this heuristic.
+                final_url: Optional[str] = None
+                final_request_has_credential: Optional[bool] = None
+                if response.status_code in (401, 403):
+                    try:
+                        final_url = _sanitize_final_url(response.url)
+                        # Whether the request httpx actually sent - after
+                        # any redirect - still carried a credential.
+                        # Derived from the real sent request/headers
+                        # rather than the caller's original args, because
+                        # httpx strips the Authorization header (and a
+                        # Location without a query string drops any
+                        # api_key_query credential) on a cross-origin
+                        # redirect: a request that started out
+                        # credentialed can still reach a known connector
+                        # host with no credential attached, and the
+                        # adapter's hint decision needs to reflect that,
+                        # not the original request's credential. Checked
+                        # against the real request's own URL/headers only
+                        # - not `params`/`auth_type`/`auth_token`, which
+                        # describe the caller's original intent rather
+                        # than what actually went over the wire after a
+                        # redirect. Note this can also pick up a
+                        # coincidentally auth-shaped query param the
+                        # redirect target itself appended (outside the
+                        # caller's control) - the same class of
+                        # imprecision `has_auth_credentials` already
+                        # accepts for its caller-supplied case: worst case
+                        # is a missed hint on a genuinely uncredentialed
+                        # request, never a blocked or altered one.
+                        final_request_has_credential = has_auth_credentials(
+                            str(response.request.url),
+                            response.request.headers,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"⚠️ Failed to derive connector-hint metadata "
+                            f"for a {response.status_code} response: {e}"
+                        )
+                        final_url = None
+                        final_request_has_credential = None
+
                 # Check response size by reading only up to max_response_size
                 response_size = 0
                 content_chunks = []
@@ -200,6 +553,11 @@ class APIClientCore:
                             "headers": dict(response.headers),
                             "body": None,
                             "error": f"Response too large (exceeds {self.max_response_size} bytes), download aborted",
+                            # The URL that actually produced this response,
+                            # which can differ from the request's starting
+                            # URL after a redirect - see final_url below.
+                            "final_url": final_url,
+                            "final_request_has_credential": final_request_has_credential,
                         }
                     content_chunks.append(chunk)
 
@@ -218,6 +576,20 @@ class APIClientCore:
                     "error": None
                     if 200 <= response.status_code < 300
                     else f"HTTP {response.status_code}",
+                    # Internal-only field (not part of APICallResult's public
+                    # schema - callers use dict.get so an extra key is
+                    # harmless). httpx.Response.url is the URL of the final
+                    # request in the redirect chain, which can be a
+                    # different host than the one the caller originally
+                    # asked for; api_call's known-connector-domain hint
+                    # needs this to know which host actually answered.
+                    # Sanitized (see _sanitize_final_url) because the raw
+                    # URL can carry a credential: an api_key_query
+                    # auth_token is merged into the query string before the
+                    # request runs, and a caller can embed Basic-Auth
+                    # userinfo directly in the URL.
+                    "final_url": final_url,
+                    "final_request_has_credential": final_request_has_credential,
                 }
 
     def _is_valid_url(self, url: str) -> bool:
@@ -366,7 +738,10 @@ async def call_api(
         retry_count: Number of retries on failure
 
     Returns:
-        Dictionary with success status, status_code, headers, body, and error
+        Dictionary with success status, status_code, headers, body, and
+        error. On a 401/403 response, also carries the internal-only
+        final_url/final_request_has_credential keys the adapter's
+        connector-domain hint uses - both are None on every other status.
 
     Example:
         >>> # GET request

@@ -3,7 +3,7 @@ import logging
 import os
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -59,6 +59,14 @@ DEFAULT_DEAL_PROPERTIES = [
     "amount",
     "closedate",
     "hs_lastmodifieddate",
+    # dealstage/pipeline are opaque IDs on a custom pipeline, and closedate
+    # is set on open deals too (and typically isn't cleared on reopen), so
+    # neither reliably signals whether a deal is closed. hs_is_closed(_won|_lost)
+    # are HubSpot's own computed closed-state flags - see
+    # https://knowledge.hubspot.com/properties/hubspots-default-deal-properties
+    "hs_is_closed",
+    "hs_is_closed_won",
+    "hs_is_closed_lost",
 ]
 DEFAULT_CAMPAIGN_PROPERTIES = [
     "hs_name",
@@ -286,34 +294,45 @@ def _request(
     return response.json()
 
 
-def _list_association_ids(path: str, max_results: int) -> tuple[list[Any], bool]:
+def _list_association_ids(
+    path: str, max_results: int, after: str | None = None
+) -> tuple[list[str], str | None]:
     """Collect associated object ids across pages, up to ``max_results``.
 
-    Follows the ``paging.next.after`` cursor so results beyond the API's
-    default page size are not silently dropped. Returns the collected ids and
-    whether more associations remain on the server.
+    Starts at ``after`` and follows HubSpot's ``paging.next.after`` cursor so
+    results beyond the API's default page size are not silently dropped.
+    Invalid ids are ignored and duplicate ids are collapsed while preserving
+    order. Returns the collected ids and the cursor for the next unread page.
     """
-    ids: list[Any] = []
-    after: str | None = None
+    ids: list[str] = []
+    seen_ids: set[str] = set()
+    cursor = after
     while True:
         params: dict[str, Any] = {
             "limit": min(_ASSOCIATION_PAGE_SIZE, max_results - len(ids))
         }
-        if after:
-            params["after"] = after
+        if cursor:
+            params["after"] = cursor
         page = _request(
             "GET", path, params=params, timeout=ASSOCIATION_LISTING_TIMEOUT_SECONDS
         )
         results = page.get("results", [])
-        ids.extend(item.get("id") for item in results)
-        after = ((page.get("paging") or {}).get("next") or {}).get("after")
+        for item in results:
+            raw_id = item.get("id")
+            if not raw_id:
+                continue
+            association_id = str(raw_id)
+            if association_id not in seen_ids:
+                ids.append(association_id)
+                seen_ids.add(association_id)
+        cursor = ((page.get("paging") or {}).get("next") or {}).get("after")
         if len(ids) >= max_results:
-            return ids[:max_results], bool(after) or len(ids) > max_results
-        if not after:
-            return ids, False
+            return ids[:max_results], cursor
+        if not cursor:
+            return ids, None
         if not results:
             # A page with no results but a next cursor would loop forever.
-            return ids, True
+            return ids, cursor
 
 
 def _parse_properties(properties_json: str) -> dict[str, Any]:
@@ -465,39 +484,169 @@ def hubspot_update_company(company_id: str, properties_json: str) -> str:
         return _error(str(e))
 
 
-@mcp.tool()
-def hubspot_get_contact_deals(contact_id: str, limit: int = 100) -> str:
+def _get_associated_deals(
+    object_type: Literal["contacts", "companies"],
+    object_id: str,
+    limit: int,
+    after: str | None,
+) -> dict[str, Any]:
+    """Fetch deals associated with a HubSpot contact or company record.
+
+    Halves the deal list (mirroring _paged_list - see its docstring for why)
+    if the response would otherwise be hard-truncated into invalid JSON past
+    the platform's output limit.
     """
-    List the deals associated with a HubSpot contact, including deal stage,
-    pipeline, amount, and close date. Returns at most `limit` deals (max 100);
-    `has_more` is true when the contact has additional deals beyond the result.
+    deal_ids, next_after = _list_association_ids(
+        f"/crm/v3/objects/{object_type}/{object_id}/associations/deals",
+        max(1, min(limit, 100)),
+        after,
+    )
+    if not deal_ids:
+        return {
+            "deals": [],
+            "has_more": bool(next_after),
+            "after": next_after,
+            "truncated": False,
+            "missing_deal_ids": [],
+        }
+
+    batch = _request(
+        "POST",
+        "/crm/v3/objects/deals/batch/read",
+        body={
+            "properties": DEFAULT_DEAL_PROPERTIES,
+            "inputs": [{"id": deal_id} for deal_id in deal_ids],
+        },
+    )
+    results = batch.get("results", [])
+    deals = [
+        {"id": item.get("id"), "properties": item.get("properties", {})}
+        for item in results
+    ]
+    # A partial batch-read (e.g. an archived deal dropped between the
+    # association listing above and this call) must be surfaced, not
+    # silently returned as if every requested id came back. Normalize ids to
+    # strings on both sides because HubSpot record ids are string identifiers.
+    returned_ids = {str(item["id"]) for item in results if item.get("id")}
+    missing_deal_ids = sorted(set(deal_ids) - returned_ids)
+
+    def _build(
+        deals_slice: list[Any],
+        missing_slice: list[Any],
+        truncated: bool,
+        deals_truncated: bool,
+    ) -> dict[str, Any]:
+        return {
+            "deals": deals_slice,
+            "has_more": bool(next_after) or deals_truncated,
+            # When deal data was trimmed, retry this same association page
+            # with a smaller limit. Otherwise advance to HubSpot's next page.
+            "after": after if deals_truncated else next_after,
+            "truncated": truncated,
+            "missing_deal_ids": missing_slice,
+        }
+
+    max_output_length = get_tool_max_output_length()
+    payload = _build(deals, missing_deal_ids, False, False)
+    truncated = False
+    deals_truncated = False
+    # Shrink missing_deal_ids before deals: it's a diagnostic list of ids
+    # HubSpot didn't return, strictly less valuable than the deals the
+    # caller actually asked for, so a batch-read shortfall large enough to
+    # need trimming on its own shouldn't cost the caller real deal data
+    # that already fit.
+    while len(_success(**payload)) > max_output_length and (deals or missing_deal_ids):
+        truncated = True
+        if missing_deal_ids:
+            missing_deal_ids = missing_deal_ids[: len(missing_deal_ids) // 2]
+        else:
+            deals = deals[: len(deals) // 2]
+            deals_truncated = True
+        payload = _build(deals, missing_deal_ids, truncated, deals_truncated)
+    if truncated and not deals and not missing_deal_ids:
+        # Collapsing everything away means even the single largest
+        # remaining entry didn't fit alone - "retry with a smaller `limit`"
+        # isn't guaranteed to help here, so say so plainly instead of
+        # returning an empty result indistinguishable from "nothing exists".
+        payload_with_message = {
+            **payload,
+            "message": (
+                "Every deal (and/or every id HubSpot's batch lookup didn't "
+                "return) was individually too large to fit the output size "
+                "limit, so none could be returned from this page. Retrying "
+                "with a smaller `limit` cannot shrink an individually "
+                "oversized record."
+            ),
+        }
+        if len(_success(**payload_with_message)) <= max_output_length:
+            payload = payload_with_message
+    return payload
+
+
+@mcp.tool()
+def hubspot_get_contact_deals(
+    contact_id: str, limit: int = 100, after: str | None = None
+) -> str:
+    """
+    List every deal associated with a HubSpot contact - open and closed alike
+    - including deal stage, pipeline, amount, close date, and the closed-state
+    flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost. Use those flags to
+    tell open from closed: dealstage and pipeline are opaque IDs on a custom
+    pipeline, and closedate is set on open deals too (and typically isn't
+    cleared when a deal is reopened), so neither reliably signals closed on
+    its own. Returns at most `limit` deals (max 100). `has_more` is true when
+    there are more deals than returned, either because of `limit` or because
+    the response was trimmed to fit the output size limit (`truncated` is
+    then also true). Pass the returned `after` cursor to retrieve the next
+    page; if `truncated` is true because deals were trimmed, retry that cursor
+    with a smaller `limit`. `missing_deal_ids` lists any requested deal id HubSpot's
+    own batch lookup silently dropped (empty when none were) - though when
+    `truncated` is also true, this list may itself have been trimmed, so
+    it's not a complete accounting in that case.
+
+    A contact's deals are not necessarily the same as its company's deals: two
+    contacts can share a name (e.g. the same person with a role at two
+    different companies) while belonging to different HubSpot companies. When
+    the question is about a company's deals rather than one specific
+    contact's, use `hubspot_get_company_deals` instead of guessing which
+    contact to look up by name - it associates deals with the company record
+    directly instead of relying on a contact match.
     """
     try:
         contact_id = _url_path_id(contact_id, "contact_id")
-        deal_ids, has_more = _list_association_ids(
-            f"/crm/v3/objects/contacts/{contact_id}/associations/deals",
-            max(1, min(limit, 100)),
-        )
-        if not deal_ids:
-            return _success(deals=[], has_more=has_more)
-
-        deals = _request(
-            "POST",
-            "/crm/v3/objects/deals/batch/read",
-            body={
-                "properties": DEFAULT_DEAL_PROPERTIES,
-                "inputs": [{"id": deal_id} for deal_id in deal_ids],
-            },
-        )
-        return _success(
-            deals=[
-                {"id": item.get("id"), "properties": item.get("properties", {})}
-                for item in deals.get("results", [])
-            ],
-            has_more=has_more,
-        )
+        return _success(**_get_associated_deals("contacts", contact_id, limit, after))
     except Exception as e:
         logger.error(f"Error getting contact deals: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_get_company_deals(
+    company_id: str, limit: int = 100, after: str | None = None
+) -> str:
+    """
+    List every deal associated with a HubSpot company - open and closed alike
+    - including deal stage, pipeline, amount, close date, and the closed-state
+    flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost; use those flags to
+    tell open from closed rather than dealstage/pipeline/closedate (see
+    `hubspot_get_contact_deals` for why those aren't reliable on their own).
+    Look up a company_id with `hubspot_search_companies` first if you don't
+    already have one. Returns at most `limit` deals (max 100);
+    `has_more`/`truncated`/`missing_deal_ids` behave as in
+    `hubspot_get_contact_deals`.
+
+    This reads the company-to-deal association directly. Do not substitute a
+    contact lookup for this (e.g. searching for a person's name and calling
+    `hubspot_get_contact_deals` on the match): a contact match found by name
+    is not proof that contact belongs to the company being asked about, and a
+    deal returned that way must not be reported as the company's unless a
+    call scoped to this company's id actually returned it.
+    """
+    try:
+        company_id = _url_path_id(company_id, "company_id")
+        return _success(**_get_associated_deals("companies", company_id, limit, after))
+    except Exception as e:
+        logger.error(f"Error getting company deals: {e}")
         return _error(str(e))
 
 
@@ -507,7 +656,10 @@ def hubspot_create_deal(properties_json: str, contact_id: str | None = None) -> 
     Create a HubSpot deal. properties_json is a JSON object of HubSpot deal
     properties, e.g. {"dealname": "Acme - Onboarding", "amount": "1000",
     "pipeline": "default", "dealstage": "appointmentscheduled"}.
-    If contact_id is given, the new deal is associated with that contact.
+    If contact_id is given, the new deal is associated with that contact -
+    there is no company_id param, so a deal created here won't be found by
+    `hubspot_get_company_deals` unless HubSpot separately associates it
+    with a company (e.g. via the contact's own company association).
     """
     try:
         body: dict[str, Any] = {"properties": _parse_properties(properties_json)}
@@ -563,12 +715,12 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
     """
     try:
         contact_id = _url_path_id(contact_id, "contact_id")
-        note_ids, has_more = _list_association_ids(
+        note_ids, next_after = _list_association_ids(
             f"/crm/v3/objects/contacts/{contact_id}/associations/notes",
             max(1, min(limit, 100)),
         )
         if not note_ids:
-            return _success(notes=[], has_more=has_more)
+            return _success(notes=[], has_more=bool(next_after))
 
         notes = _request(
             "POST",
@@ -583,7 +735,7 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
                 {"id": item.get("id"), "properties": item.get("properties", {})}
                 for item in notes.get("results", [])
             ],
-            has_more=has_more,
+            has_more=bool(next_after),
         )
     except Exception as e:
         logger.error(f"Error getting contact notes: {e}")

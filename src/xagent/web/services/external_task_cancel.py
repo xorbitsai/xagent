@@ -46,6 +46,7 @@ from .chat_history_service import (
 from .db_runtime import run_db_io_cancellation_safe
 from .task_command_transport import TaskCommandRejected
 from .task_execution_controller import TaskControlState
+from .task_lease_service import task_settlement_ownership_values
 
 logger = logging.getLogger(__name__)
 
@@ -401,10 +402,7 @@ def _finalize_external_cancel_sync(
                 status=TaskStatus.FAILED,
                 control_state=TaskControlState.FAILED.value,
                 state_version=expected_state_version + 1,
-                runner_id=None,
-                lease_attempt_id=None,
-                lease_expires_at=None,
-                last_heartbeat_at=None,
+                **task_settlement_ownership_values(task_id),
                 error_message=EXTERNAL_CANCEL_ERROR_MESSAGE,
             )
         )

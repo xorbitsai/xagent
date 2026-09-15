@@ -395,11 +395,18 @@ class ReplyRequest(BaseModel):
     - No ``connector_runtime_context``: the resume reuses the connector
       context already resolved for the run in progress.
     - No ``metadata``: not passed through by this endpoint.
-    - No idempotency key: a retried reply can be posted twice; callers
-      that need to avoid a duplicate answer should ``GET`` the task and
-      confirm it has left ``waiting_for_user`` before retrying.
+    In shared execution mode, repeat ``command_id`` to retrieve the original
+    command outcome without injecting the answer again. If omitted, the server
+    creates an ID and includes it in the response or uncertain-outcome error.
     """
 
+    command_id: str | None = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description="Stable reply command ID; reuse it when checking an uncertain outcome.",
+    )
     agent_id: Optional[int] = Field(
         None,
         description=(
@@ -431,6 +438,9 @@ class ReplyResponse(BaseModel):
     new one.
     """
 
+    command_id: str | None = Field(
+        None, description="The accepted shared reply command ID."
+    )
     task_id: int = Field(..., description="Existing task primary key.")
     agent_id: int = Field(
         ...,

@@ -1531,15 +1531,21 @@ class CollectionInfo(BaseModel):
             }
         )
 
-        # Serialize complex types to JSON strings for LanceDB
-        data["extra_metadata"] = json.dumps(data["extra_metadata"])
+        # Serialize complex types to JSON strings for LanceDB. extra_metadata is
+        # caller-supplied and untyped (Dict[str, Any]), so default=str is the
+        # fallback for values json.dumps() can't otherwise serialize (e.g. an
+        # Enum, datetime, or UUID a caller stuffed in there).
+        data["extra_metadata"] = json.dumps(data["extra_metadata"], default=str)
         data["document_names"] = json.dumps(data["document_names"])
         # Do not persist owners; they are computed from user_id when listing
         data["owners"] = "[]"
 
-        # Serialize ingestion_config if present
-        if data.get("ingestion_config"):
-            data["ingestion_config"] = json.dumps(data["ingestion_config"])
+        # model_dump_json() serializes ingestion_config's enum fields to their
+        # .value per the type annotation, unlike json.dumps() on the
+        # model_dump()'d dict above (which left them as ParseMethod/
+        # ChunkStrategy instances and crashed on any non-null ingestion_config).
+        if self.ingestion_config is not None:
+            data["ingestion_config"] = self.ingestion_config.model_dump_json()
         else:
             # Use empty string sentinel instead of None to prevent LanceDB non-null schema errors
             data["ingestion_config"] = LANCEDB_NULL_STR_SENTINEL

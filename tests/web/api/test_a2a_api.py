@@ -3481,3 +3481,28 @@ def test_subscribe_projects_claimed_waiting_resume_as_working(monkeypatch) -> No
     assert len(data_lines) == 1
     event = json.loads(data_lines[0].removeprefix("data: "))
     assert event["task"]["status"]["state"] == "TASK_STATE_WORKING"
+
+
+def test_reply_timeout_reports_accepted_outcome_unknown():
+    agent_id, full_key = _create_published_agent_with_key()
+    task_id = _resume_error_task(agent_id, context_id="ctx-timeout")
+    with patch(
+        "xagent.web.services.task_start.resume_a2a_task",
+        AsyncMock(side_effect=task_resume.TaskResumeOutcomeUnknownError),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "timeout",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "answer"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    assert response.status_code == 504, response.text
+    assert "Check task status" in response.json()["error"]["message"]
+    assert response.json()["error"]["details"][0]["reason"] == "REPLY_OUTCOME_UNKNOWN"

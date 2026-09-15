@@ -1,4 +1,4 @@
-"""Encrypted, single-turn connector values, never part of task serialization."""
+"""Encrypted, run-scoped connector values, never part of task serialization."""
 
 from sqlalchemy import (
     Column,

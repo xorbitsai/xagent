@@ -146,6 +146,8 @@ class V1ErrorCode(str, Enum):
     # infrastructure failure. 503, retryable -- distinct from
     # ``interaction_not_resumable`` (which means resuming can never
     # succeed) so clients know whether to retry or give up.
+    REPLY_OUTCOME_UNKNOWN = "reply_outcome_unknown"
+
     TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
 
 
@@ -202,6 +204,10 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     ),
     V1ErrorCode.NO_PENDING_INTERACTION: (
         "This task has no pending question to answer."
+    ),
+    V1ErrorCode.REPLY_OUTCOME_UNKNOWN: (
+        "Reply was accepted but its outcome is not yet known. "
+        "Repeat the same command_id to check its outcome; do not send a new reply."
     ),
     V1ErrorCode.TEMPORARILY_UNAVAILABLE: (
         "The task's saved progress could not be read. Please retry."

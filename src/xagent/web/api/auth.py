@@ -43,6 +43,7 @@ from ...core.runtime_performance import (
     observe_duration,
     observe_value,
 )
+from ...core.utils.security import host_matches_suffix
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -67,7 +68,6 @@ from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import (
-    host_matches_suffix,
     matches_provider_family,
     requires_json_accept_header,
     requires_pkce,

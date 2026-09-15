@@ -2,7 +2,6 @@
 
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -59,10 +58,10 @@ def accept_turn(db, start):
         user_id=user.id,
         title="START protocol",
         source="sdk",
-        status=TaskStatus.RUNNING,
-        run_id=start.run_id,
+        status=TaskStatus.PENDING,
+        run_id=start.expected_run_id,
         state_version=start.state_version,
-        control_state="running",
+        control_state="idle",
         input=start.message,
     )
     db.add(task)
@@ -114,7 +113,7 @@ def test_json_round_trip_preserves_execution_input_and_turn_identity(kind, force
         {"version": True},
         {"version": 1.0},
         {"state_version": "1"},
-        {"state_version": 0},
+        {"state_version": -1},
         {"turn_id": "turn with spaces"},
         {"kind": "resume"},
         {"force_fresh": True},
@@ -223,19 +222,12 @@ def test_duplicate_turn_identity_compares_the_full_start_payload(db_session):
 @pytest.mark.parametrize(
     "changes",
     [
-        {"status": TaskStatus.PENDING},
+        {"status": TaskStatus.RUNNING},
         {"run_id": "another-run"},
         {"state_version": 2},
-        {"control_state": "pause_requested"},
-        {"runner_id": "web-process"},
-        {"lease_attempt_id": "old-attempt"},
-        {"lease_expires_at": datetime.now(timezone.utc)},
-        {"last_heartbeat_at": datetime.now(timezone.utc)},
     ],
 )
-def test_start_requires_exact_accepted_turn_without_execution_lease(
-    db_session, changes
-):
+def test_start_requires_exact_admission_snapshot(db_session, changes):
     start = start_payload()
     user, task = accept_turn(db_session, start)
     for field, value in changes.items():
@@ -305,11 +297,9 @@ def test_append_acceptance_rollback_preserves_previous_turn(db_session):
     )
     db_session.commit()
     task_id = task.id
-    task.status = TaskStatus.RUNNING
-    task.control_state = "running"
-    task.run_id = start.run_id
-    task.state_version = start.state_version
-    task.output = None
+    start = start_payload(
+        kind="append", force_fresh=True, expected_run_id="previous-run", state_version=0
+    )
     db_session.add(
         TaskChatMessage(
             task_id=task_id,
@@ -363,13 +353,13 @@ def test_postgres_acceptance_and_start_share_transaction_lock(commit):
             task_id, actor_id = task.id, user.id
 
         start = start_payload(
-            kind="append", run_id="run-2", state_version=2, turn_id="turn-2"
+            kind="append", run_id="run-2", state_version=1, turn_id="turn-2"
         )
         with sessions() as owner, sessions() as competitor:
             accepted = owner.execute(
                 update(Task)
                 .where(Task.id == task_id, Task.state_version == 1)
-                .values(run_id=start.run_id, state_version=2)
+                .values(updated_at=Task.updated_at)
             )
             assert accepted.rowcount == 1
             owner.add(
@@ -410,8 +400,8 @@ def test_postgres_acceptance_and_start_share_transaction_lock(commit):
                 owner.rollback()
             with sessions() as observer:
                 task = observer.get(Task, task_id)
-                assert task.run_id == ("run-2" if commit else "run-1")
-                assert task.state_version == (2 if commit else 1)
+                assert task.run_id is None
+                assert task.state_version == 1
                 command = observer.execute(
                     select(TaskExecutionCommand)
                 ).scalar_one_or_none()
@@ -431,5 +421,5 @@ def test_postgres_acceptance_and_start_share_transaction_lock(commit):
                 .where(Task.id == task_id, Task.state_version == 1)
                 .values(state_version=3)
             )
-            assert result.rowcount == (0 if commit else 1)
+            assert result.rowcount == 1
             competitor.rollback()

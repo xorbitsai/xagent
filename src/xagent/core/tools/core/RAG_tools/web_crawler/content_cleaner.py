@@ -1,12 +1,17 @@
 """Content cleaning and markdown conversion for web crawler."""
 
 import logging
+import re
 from typing import Optional
 
 import html2text
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 logger = logging.getLogger(__name__)
+
+# Stops before trailing punctuation so removing a URL does not eat the comma
+# or full stop that follows it.
+_BARE_URL = re.compile(r"(?:https?://|www\.)[^\s]*[^\s,.;:!?)\]\}>\"']", re.IGNORECASE)
 
 
 class ContentCleaner:
@@ -186,14 +191,31 @@ class ContentCleaner:
         Returns:
             Markdown string
         """
+        # Without the markdown link punctuation, two inline elements that butt
+        # against each other in the source would fuse into one token.
+        for element in soup.find_all(["a", "img"]):
+            following = element.next_sibling
+            if isinstance(following, Tag) and following.name in ("a", "img"):
+                element.insert_after(NavigableString(" "))
+
         h2t = html2text.HTML2Text()
         h2t.body_width = 0  # No line wrapping
+        # Drop URLs, keep their text: a signed CDN link is hundreds of characters
+        # of noise that nobody searches for, and it crowds the prose out of a chunk.
+        # images_to_alt rather than ignore_images so alt text still reaches the index;
+        # it is nested under `not ignore_images`, so that flag must stay False.
         h2t.ignore_images = False
+        h2t.images_to_alt = True
         h2t.ignore_emphasis = False
-        h2t.ignore_links = False
+        h2t.ignore_links = True
         h2t.ignore_tables = False
 
         markdown = h2t.handle(str(soup))
+        # h2t only drops the href/src attribute. Anchor text and alt text that are
+        # themselves URLs (autolinks, tracking-pixel alts) survive it, so strip those too.
+        markdown = _BARE_URL.sub("", markdown)
+        markdown = re.sub(r"[ \t]{2,}", " ", markdown)
+        markdown = re.sub(r" +([,.;:!?])", r"\1", markdown)
         return markdown.strip()
 
     def is_valid_content(self, content: str, min_length: int = 100) -> bool:

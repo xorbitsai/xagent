@@ -1194,3 +1194,47 @@ def test_selection_snapshot_wraps_malformed_team_hook_answer_without_leaking_mes
         assert isinstance(excinfo.value.__cause__, ValueError)
     finally:
         connector_team_scope.set_connector_team_hooks()
+
+
+@pytest.mark.parametrize("resting", [TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER])
+def test_shared_reply_loads_accepted_run_secret_with_new_turn_id(
+    db_session, monkeypatch, resting
+):
+    from cryptography.fernet import Fernet
+
+    from xagent.web.services.task_runtime_secrets import (
+        bind_runtime_values_to_run,
+        stage_runtime_values,
+    )
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    user = _create_user(db_session, "resuming-owner")
+    server = _create_runtime_mcp(db_session, user, "resume", secret_required=True)
+    task = Task(
+        user_id=user.id,
+        title="resume",
+        source="sdk",
+        run_id="same-run",
+        status=resting,
+        connector_runtime_selected_refs=[
+            {"connector_type": "mcp", "connector_id": server.id}
+        ],
+    )
+    db_session.add(task)
+    db_session.flush()
+    ref = ConnectorRef("mcp", server.id)
+    stage_runtime_values(
+        db_session,
+        task_id=task.id,
+        turn_id="acceptance",
+        values_by_ref={ref: {"secrets": {"authorization": "synthetic-token"}}},
+    )
+    bind_runtime_values_to_run(
+        db_session, task_id=task.id, turn_id="acceptance", run_id="same-run"
+    )
+    db_session.commit()
+    view = load_connector_runtime_view(
+        db=db_session, task_id=task.id, user_id=user.id, turn_id="new-reply-turn"
+    )
+    assert view[ref.storage_key]["secrets"]["authorization"] == "synthetic-token"

@@ -9,6 +9,7 @@ from ..models.task import Task, TaskStatus
 from .a2a_protocol import A2ATaskSnapshot, a2a_error
 from .db_runtime import run_db_io_cancellation_safe
 from .task_execution_controller import StaleTaskRunError, TaskControlState
+from .task_lease_service import task_settlement_ownership_values
 
 _TERMINAL_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED}
 
@@ -184,10 +185,7 @@ def _finalize_a2a_cancel_sync(
                 status=TaskStatus.FAILED,
                 control_state=TaskControlState.FAILED.value,
                 state_version=final_state_version,
-                runner_id=None,
-                lease_attempt_id=None,
-                lease_expires_at=None,
-                last_heartbeat_at=None,
+                **task_settlement_ownership_values(task_id),
                 output=None,
                 error_message="Task canceled by A2A client.",
             )

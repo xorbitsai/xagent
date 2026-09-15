@@ -16,7 +16,7 @@ from .model import Model
 from .oauth_provider import OAuthProvider
 from .oidc_consumed_token import OidcConsumedToken
 from .public_mcp import PublicMCPApp, PublicMCPAppAudit
-from .sandbox import SandboxInfo, SandboxSnapshot
+from .sandbox import DurableSandboxLifecycle, SandboxInfo, SandboxSnapshot
 from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
@@ -102,6 +102,7 @@ __all__ = [
     "UploadedFile",
     "SandboxInfo",
     "SandboxSnapshot",
+    "DurableSandboxLifecycle",
     "UserSkill",
     "UserSkillFile",
     "OAuthProvider",

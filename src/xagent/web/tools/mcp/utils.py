@@ -9,6 +9,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil import parser as _date_parser
+from dateutil import tz as _date_tz
 from dateutil.rrule import rrulestr as _rrulestr
 
 from ....config import get_tool_max_output_length
@@ -822,9 +823,14 @@ def offset_datetime_string(
             "datetime string (no trailing 'Z' or +HH:MM) together with "
             "its timezone name instead of embedding an offset in both."
         )
-    return parsed.replace(
-        tzinfo=resolve_zoneinfo(tz_name, allow_windows_names=allow_windows_names)
-    ).isoformat()
+    zone = resolve_zoneinfo(tz_name, allow_windows_names=allow_windows_names)
+    localized = parsed.replace(tzinfo=zone)
+    if not _date_tz.datetime_exists(localized):
+        raise ValueError(
+            f"{value!r} does not exist in timezone {tz_name!r} because of a "
+            "daylight-saving transition"
+        )
+    return localized.isoformat()
 
 
 def calendar_day_bounds(

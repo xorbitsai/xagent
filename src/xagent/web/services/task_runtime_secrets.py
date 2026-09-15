@@ -1,12 +1,13 @@
-"""Single-turn encrypted storage shared by request and execution processes."""
+"""Run-scoped encrypted storage shared by request and execution processes."""
 
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, exists, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
@@ -20,6 +21,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
 )
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..models.task_command import TaskExecutionCommand
 from ..models.task_runtime_secret import TaskRuntimeSecret
 from ..models.user import User
 
@@ -61,8 +63,8 @@ def stage_runtime_values(
 
     Bind them to the accepted run with ``bind_runtime_values_to_run`` before
     committing this same transaction. Unbound inputs must not be committed.
-    The ingress that first wires these writes must also wire terminal cleanup
-    and the compensation sweep in the same change; there is no independent TTL.
+    Terminal settlement and the recovery sweep remove finished or replaced
+    runs; paused and waiting runs retain their inputs without an independent TTL.
     """
     if not values_by_ref:
         return
@@ -107,8 +109,9 @@ def load_runtime_values(
     db: Session,
     *,
     task: Task,
-    turn_id: str,
+    turn_id: str | None = None,
     required: bool = False,
+    run_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Read scoped inputs; both configuration and stored-value errors are 503.
 
@@ -116,20 +119,33 @@ def load_runtime_values(
     cannot decrypt the row raises runtime_secret_unavailable, as do missing
     required inputs or mismatched ownership/run bindings.
     """
-    row = db.execute(
-        select(TaskRuntimeSecret).where(
-            TaskRuntimeSecret.task_id == task.id,
-            TaskRuntimeSecret.turn_id == turn_id,
-        )
-    ).scalar_one_or_none()
+    expected_run_id = run_id if run_id is not None else task.run_id
+    query = select(TaskRuntimeSecret).where(TaskRuntimeSecret.task_id == task.id)
+    if turn_id is not None:
+        query = query.where(TaskRuntimeSecret.turn_id == turn_id)
+    else:
+        # Reply transcript IDs change; the accepted inputs belong to the run.
+        query = query.where(TaskRuntimeSecret.run_id == task.run_id)
+    row = db.execute(query).scalar_one_or_none()
     if row is None:
+        if turn_id is None and task.run_id is not None:
+            from ..models.task_command import TaskExecutionCommand
+
+            accepted = db.execute(
+                select(TaskExecutionCommand.payload).where(
+                    TaskExecutionCommand.task_id == task.id,
+                    TaskExecutionCommand.target_run_id == task.run_id,
+                    TaskExecutionCommand.kind == "start",
+                )
+            ).scalar_one_or_none()
+            required = required or bool(accepted and accepted.get("runtime_values_ref"))
         if required:
             raise _unavailable()
         return None
     owner = db.execute(
         select(User.actor_subject).where(User.id == task.user_id)
     ).scalar_one_or_none()
-    if owner != row.owner_subject or row.run_id != task.run_id:
+    if owner != row.owner_subject or row.run_id != expected_run_id:
         raise _unavailable()
     try:
         body = json.loads(_runtime_cipher().decrypt(row.ciphertext.encode()))
@@ -138,7 +154,7 @@ def load_runtime_values(
     if (
         not isinstance(body, dict)
         or body.get("task_id") != task.id
-        or body.get("turn_id") != turn_id
+        or body.get("turn_id") != row.turn_id
         or body.get("owner_subject") != owner
         or not isinstance(body.get("values"), dict)
     ):
@@ -167,38 +183,54 @@ def delete_runtime_values(*, task_id: int, turn_id: str) -> None:
         db.commit()
 
 
-def clean_finished_runtime_values() -> None:
-    """Compensate interrupted cleanup without expiring queued or active inputs.
+def clean_finished_runtime_values(
+    *,
+    task_id: int | None = None,
+    run_id: str | None = None,
+    after_id: int | None = None,
+    batch_size: int = 100,
+) -> int | None:
+    """Remove a bounded page of finished or replaced runs; return the next cursor.
 
-    Accepted inputs already have a run binding at commit; another session
-    cannot observe the intermediate unbound rows in the acceptance transaction.
-    PAUSED and WAITING_FOR_USER end this execution's access once its lease is
-    released. Resuming requires freshly supplied values; required loads of
-    removed inputs fail with runtime_secret_unavailable, never an empty secret.
+    Page before filtering lifecycle state so active inputs cannot make a sweep
+    unbounded. Paused and waiting runs retain their values without a TTL.
+    Scope and lifecycle are checked again by DELETE in the same transaction.
     """
-    with get_session_local()() as db:
-        rows = (
-            db.execute(
-                select(TaskRuntimeSecret.id)
-                .join(Task)
-                .where(
-                    (TaskRuntimeSecret.run_id.is_distinct_from(Task.run_id))
-                    | (
-                        Task.runner_id.is_(None)
-                        & Task.status.in_(
-                            [
-                                TaskStatus.COMPLETED,
-                                TaskStatus.FAILED,
-                                TaskStatus.PAUSED,
-                                TaskStatus.WAITING_FOR_USER,
-                            ]
-                        )
-                    )
-                )
-            )
-            .scalars()
-            .all()
+    page = select(TaskRuntimeSecret.id).order_by(TaskRuntimeSecret.id).limit(batch_size)
+    if after_id is not None:
+        page = page.where(TaskRuntimeSecret.id > after_id)
+    if task_id is not None:
+        page = page.where(TaskRuntimeSecret.task_id == task_id)
+    if run_id is not None:
+        page = page.where(TaskRuntimeSecret.run_id == run_id)
+    queued = exists(
+        select(TaskExecutionCommand.id).where(
+            TaskExecutionCommand.task_id == TaskRuntimeSecret.task_id,
+            TaskExecutionCommand.kind == "start",
+            TaskExecutionCommand.target_run_id == TaskRuntimeSecret.run_id,
+            TaskExecutionCommand.status.in_(("pending", "processing")),
         )
+    )
+    finished = ~queued & exists(
+        select(Task.id).where(
+            Task.id == TaskRuntimeSecret.task_id,
+            TaskRuntimeSecret.run_id.is_distinct_from(Task.run_id)
+            | (
+                Task.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED))
+                & (
+                    Task.runner_id.is_(None)
+                    | (Task.lease_expires_at < datetime.now(timezone.utc))
+                )
+            ),
+        )
+    )
+    with get_session_local()() as db:
+        rows = db.execute(page).scalars().all()
         if rows:
-            db.execute(delete(TaskRuntimeSecret).where(TaskRuntimeSecret.id.in_(rows)))
+            db.execute(
+                delete(TaskRuntimeSecret)
+                .where(TaskRuntimeSecret.id.in_(rows), finished)
+                .execution_options(synchronize_session=False)
+            )
         db.commit()
+    return int(rows[-1]) if len(rows) == batch_size else None

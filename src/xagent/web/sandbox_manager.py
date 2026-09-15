@@ -54,7 +54,11 @@ from ..sandbox.base import (
     canonical_sandbox_path,
     spec_matches_inspection,
 )
-from .sandbox_keys import USER_LIFECYCLE_TYPE, parse_user_lifecycle_id
+from .sandbox_keys import (
+    DURABLE_CHROME_LIFECYCLE_TYPE,
+    USER_LIFECYCLE_TYPE,
+    parse_user_lifecycle_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1797,6 +1801,8 @@ class SandboxManager:
                     lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
                 except ValueError:
                     continue
+                if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+                    continue
                 base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
                 if name != base_name:
                     # Workers are deleted with their primary.
@@ -2000,6 +2006,10 @@ class SandboxManager:
             lifecycle_type: e.g. task|user
             lifecycle_id: e.g. task_id|user_id
         """
+        if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+            raise SandboxContractError(
+                "durable Chrome sandboxes require delete_durable_sandbox_strict"
+            )
         sandbox_names = await self._find_lifecycle_sandbox_names(
             lifecycle_type,
             lifecycle_id,
@@ -2012,6 +2022,10 @@ class SandboxManager:
         self, lifecycle_type: str, lifecycle_id: str
     ) -> None:
         """Delete worker sandboxes for a lifecycle while preserving the primary."""
+        if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+            raise SandboxContractError(
+                "durable Chrome sandboxes require delete_durable_sandbox_strict"
+            )
         sandbox_names = await self._find_lifecycle_sandbox_names(
             lifecycle_type,
             lifecycle_id,
@@ -2019,6 +2033,40 @@ class SandboxManager:
             include_workers=True,
         )
         await self._delete_sandbox_names(sandbox_names)
+
+    async def delete_durable_sandbox_strict(self, lifecycle_id: str) -> None:
+        """Idempotently delete one fenced physical Chrome lifecycle.
+
+        This is the only destructive seam the durable protocol may use.
+        Backend ``not found`` is confirmation of absence; discovery and all
+        other deletion failures propagate so a caller cannot settle its
+        durable tombstone on an unconfirmed outcome.
+        """
+        if re.fullmatch(r"[0-9a-f]{64}", lifecycle_id) is None:
+            raise ValueError("durable lifecycle id must be a lowercase digest")
+        primary = self.make_sandbox_name(DURABLE_CHROME_LIFECYCLE_TYPE, lifecycle_id)
+        worker_prefix = self._worker_sandbox_prefix(
+            DURABLE_CHROME_LIFECYCLE_TYPE, lifecycle_id
+        )
+        listed = await self._service.list_sandboxes()
+        names = {
+            sb.name
+            for sb in listed or []
+            if isinstance(sb.name, str)
+            and (sb.name == primary or sb.name.startswith(worker_prefix))
+        }
+        names.add(primary)
+        for name in sorted(names, key=lambda item: item == primary):
+            try:
+                await self._service.delete(name)
+            except SandboxNotFoundError:
+                pass
+            self._cache.pop(name, None)
+            self._config_cache.pop(name, None)
+            self._locks.pop(name, None)
+            self._lease_providers.pop(name, None)
+            self._activity.pop(name, None)
+        self._reconcile_budget.pop(primary, None)
 
     async def _find_lifecycle_sandbox_names(
         self,
@@ -2135,6 +2183,8 @@ class SandboxManager:
             try:
                 lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
             except ValueError:
+                continue
+            if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
                 continue
             candidates.add(self._base_sandbox_name(lifecycle_type, lifecycle_id))
 
@@ -2256,6 +2306,12 @@ class SandboxManager:
         failed = 0
         stop_seconds = 0.0
         for sb in sandboxes or []:
+            try:
+                lifecycle_type, _ = self.parse_sandbox_name(sb.name)
+            except (TypeError, ValueError):
+                lifecycle_type = None
+            if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+                continue
             if sb.state != "running":
                 continue
             running += 1
@@ -2326,6 +2382,12 @@ class SandboxManager:
             image, config = self._get_sandbox_image_and_config()
 
             for sb in sandboxes:
+                try:
+                    protected_type, _ = self.parse_sandbox_name(sb.name)
+                except (TypeError, ValueError):
+                    protected_type = None
+                if protected_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+                    continue
                 if sb.state == "running":
                     running += 1
                 try:

@@ -1,4 +1,33 @@
-"""Background task execution, resume, and settlement without API route dependencies."""
+"""Background task execution, resume, and settlement without API route dependencies.
+
+Cross-repo public API
+---------------------
+The names in ``__all__`` are the runner entrypoints this module exports to
+the downstream deployment layer in xorbitsai/xagent-saas
+(``xagent_saas.services.external_input_dispatch`` and its runtime
+diagnostics), not only to this repo's API routes:
+
+* ``execute_resume_background`` -- resume after an interrupt or a deferred
+  user message. The downstream external-input path calls it directly and
+  passes its keyword set, including the ``preacquired_*`` lease hand-off.
+* ``BackgroundTaskManager`` / ``background_task_manager`` -- the downstream
+  drives the resume reservation protocol on it: ``reserve_resume``,
+  ``register_reserved_resume(task_id, task, run_id=...)``, and
+  ``release_resume_reservation``, and reads ``running_tasks`` to pick the
+  ``previous_task`` it hands to a resume.
+* ``execute_task_background`` -- start a task's first turn. The sibling
+  runner entrypoint; not imported downstream today, pinned alongside so the
+  two runner signatures evolve under the same review.
+
+Their parameter lists and defaults are pinned by
+``tests/web/services/test_task_execution_public_contract.py``. Adding,
+renaming, removing, or reordering a parameter is a cross-repo contract change
+(issue #2390): update the pinned test deliberately, ship the change either
+with a one-release shim that still accepts the old keywords and warns, or with
+an early failure whose message names the replacement, and land the matching
+consumer change in xagent-saas in the same release. Relocating one of these
+names must keep it importable from this module.
+"""
 
 import asyncio
 import enum
@@ -135,6 +164,15 @@ from .uploaded_file_store import (
 from .workforce_runtime import (
     sync_workforce_run_status,
 )
+
+# Cross-repo entrypoints; see the module docstring before changing this list
+# or any signature it names.
+__all__ = [
+    "BackgroundTaskManager",
+    "background_task_manager",
+    "execute_resume_background",
+    "execute_task_background",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -3402,6 +3440,11 @@ class BackgroundTaskManager:
         if self._shutting_down:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
+        from .task_coordinator_runtime import current_task_coordinator
+
+        coordinator = current_task_coordinator(task_id)
+        if coordinator is not None:
+            coordinator.track_execution(task)
         self.running_tasks[task_id] = task
         # Execution may run in a lease-guard child task, whose finally block
         # cannot remove this still-running outer owner. Release the registration
@@ -3505,6 +3548,11 @@ class BackgroundTaskManager:
             raise RuntimeError("Background task manager is shutting down")
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
+        from .task_coordinator_runtime import current_task_coordinator
+
+        coordinator = current_task_coordinator(task_id)
+        if coordinator is not None:
+            coordinator.track_execution(task)
         self._resume_reservations.discard(task_id)
         self._resume_owner_started_at.setdefault(task_id, time.monotonic())
         self.resume_tasks[task_id] = task

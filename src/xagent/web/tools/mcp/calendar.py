@@ -1,10 +1,14 @@
+import copy
 import json
 import logging
 import os
 import uuid
 from datetime import date
 from functools import cache
-from typing import Any
+from importlib import resources
+from pathlib import Path
+from typing import Any, cast
+from zoneinfo import TZPATH, available_timezones
 
 from dateutil import parser as _date_parser
 from google.oauth2.credentials import Credentials
@@ -430,6 +434,29 @@ def _classify_event_time(value: str, field_name: str) -> bool:
     return False
 
 
+def _merge_recurrence(
+    existing_recurrence: list[str] | None, new_rrule: str
+) -> list[str]:
+    """Build the `recurrence` list for an update: replace the RRULE line(s)
+    with `new_rrule`, but keep any EXDATE/RDATE/EXRULE lines already on the
+    event (e.g. a previously-cancelled single occurrence) intact.
+
+    Google's `recurrence` field is a flat list of RRULE/EXRULE/RDATE/EXDATE
+    lines, not just the RRULE - overwriting the whole list with only the
+    new RRULE would silently resurrect any occurrence the user had already
+    cancelled.
+
+    The caller validates the fetched recurrence list before this helper is
+    reached, so only supported string property lines can be preserved.
+    """
+    preserved = [
+        line
+        for line in existing_recurrence or []
+        if _recurrence_property_name(line) != "RRULE"
+    ]
+    return [new_rrule, *preserved]
+
+
 def _property_header(line: str) -> str:
     """Return the RFC 5545 property header before the first unquoted colon."""
     quoted = False
@@ -439,6 +466,29 @@ def _property_header(line: str) -> str:
         elif character == ":" and not quoted:
             return line[:index]
     return line
+
+
+def _property_value(line: str) -> str:
+    """Return the content after an RFC 5545 property's first unquoted colon."""
+    header = _property_header(line)
+    return "" if header == line else line[len(header) + 1 :]
+
+
+def _property_parameters(header: str) -> list[str]:
+    """Split an RFC 5545 property header on unquoted semicolons."""
+    parameters: list[str] = []
+    current: list[str] = []
+    quoted = False
+    for character in header:
+        if character == '"':
+            quoted = not quoted
+        if character == ";" and not quoted:
+            parameters.append("".join(current))
+            current = []
+        else:
+            current.append(character)
+    parameters.append("".join(current))
+    return parameters
 
 
 def _recurrence_property_name(line: str) -> str:
@@ -457,7 +507,10 @@ def _validated_recurrence_lines(value: Any) -> list[str]:
     allowed = {"RRULE", "EXRULE", "RDATE", "EXDATE"}
     for line in value:
         if not isinstance(line, str):
-            raise ValueError("the existing event recurrence must contain only strings")
+            raise ValueError(
+                "the existing event recurrence contains an unsupported property; "
+                "all recurrence lines must be strings"
+            )
         if "\r" in line or "\n" in line:
             raise ValueError(
                 "the existing event recurrence contains an embedded line break"
@@ -473,7 +526,25 @@ def _validated_recurrence_lines(value: Any) -> list[str]:
                 "the existing event recurrence contains an unsupported property; "
                 "expected RRULE, EXRULE, RDATE, or EXDATE"
             )
+    _recurrence_tzids(value)
     return value
+
+
+def _recurrence_tzids(recurrence_lines: list[Any]) -> set[str]:
+    """Return TZID parameter values used by recurrence property lines."""
+    tzids: set[str] = set()
+    for line in recurrence_lines:
+        if not isinstance(line, str):
+            continue
+        property_header = _property_header(line)
+        for parameter in _property_parameters(property_header)[1:]:
+            name, separator, value = parameter.partition("=")
+            normalized_value = value.strip().strip('"')
+            if separator and name.strip().upper() == "TZID":
+                if not normalized_value:
+                    raise ValueError("recurrence TZID parameter must not be empty")
+                tzids.add(normalized_value)
+    return tzids
 
 
 def _validated_stored_boundary(
@@ -483,21 +554,21 @@ def _validated_stored_boundary(
     if not isinstance(side, dict):
         raise ValueError(
             f"the existing event must contain a valid {field_name} boundary "
-            "before its recurrence can be updated"
+            "before its schedule or recurrence can be updated"
         )
     has_date = "date" in side
     has_datetime = "dateTime" in side
     if has_date == has_datetime:
         raise ValueError(
             f"the existing event {field_name} must contain exactly one of "
-            "date or dateTime before its recurrence can be updated"
+            "date or dateTime before its schedule or recurrence can be updated"
         )
     key = "date" if has_date else "dateTime"
     value = side.get(key)
     if not isinstance(value, str):
         raise ValueError(
             f"the existing event must contain a valid {field_name} boundary "
-            "before its recurrence can be updated"
+            "before its schedule or recurrence can be updated"
         )
     is_all_day = _classify_event_time(value, f"existing event {field_name}")
     if is_all_day != has_date:
@@ -508,6 +579,96 @@ def _validated_stored_boundary(
     if timezone is not None and not isinstance(timezone, str):
         raise ValueError(f"the existing event {field_name}.timeZone must be a string")
     return value, is_all_day, timezone
+
+
+def _event_time_changed(
+    old_value: str | None,
+    new_value: str | None,
+    *,
+    old_timezone: str | None,
+    new_timezone: str | None,
+) -> bool:
+    """Compare event boundaries by value, including their separate timeZones."""
+    if old_value is None or new_value is None:
+        return old_value != new_value
+    try:
+        old_key = _date_parser.isoparse(old_value)
+        new_key = _date_parser.isoparse(new_value)
+    except ValueError:
+        return old_value != new_value
+    if old_key.tzinfo is None and old_timezone:
+        old_key = _date_parser.isoparse(
+            _offset_datetime_string(old_value, old_timezone)
+        )
+    if new_key.tzinfo is None and new_timezone:
+        new_key = _date_parser.isoparse(
+            _offset_datetime_string(new_value, new_timezone)
+        )
+    if (old_key.tzinfo is None) != (new_key.tzinfo is None):
+        return True
+    return bool(old_key != new_key)
+
+
+@cache
+def _iana_timezone_link_targets() -> dict[str, str]:
+    """Load canonical IANA link targets from the active tzdata installation."""
+    targets: dict[str, str] = {}
+    sources: list[str] = []
+    for root in TZPATH:
+        try:
+            sources = (
+                (Path(root) / "tzdata.zi").read_text(encoding="utf-8").splitlines()
+            )
+        except OSError:
+            continue
+        if sources:
+            break
+    if not sources:
+        try:
+            sources = (
+                resources.files("tzdata.zoneinfo")
+                .joinpath("tzdata.zi")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
+        except (ModuleNotFoundError, OSError):
+            return targets
+    for line in sources:
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] in {"L", "Link"}:
+            target, alias = parts[1:3]
+            targets[alias.casefold()] = target.casefold()
+    return targets
+
+
+def _canonical_timezone_name(name: str) -> str | None:
+    """Return a canonical IANA key without conflating equal rule tables."""
+    current = name.casefold()
+    if current not in _iana_timezone_names():
+        return None
+    targets = _iana_timezone_link_targets()
+    seen: set[str] = set()
+    while current in targets and current not in seen:
+        seen.add(current)
+        current = targets[current]
+    return current
+
+
+@cache
+def _iana_timezone_names() -> frozenset[str]:
+    """Return case-normalized names loadable by the active IANA database."""
+    return frozenset(name.casefold() for name in available_timezones())
+
+
+def _timezone_names_equal(left: str | None, right: str | None) -> bool:
+    """Compare RFC 5545 timezone names, including true IANA links."""
+    if left is None or right is None:
+        return left is right
+    if left.casefold() == right.casefold():
+        return True
+    left_name = _canonical_timezone_name(left)
+    right_name = _canonical_timezone_name(right)
+    return left_name is not None and left_name == right_name
 
 
 def _require_datetime_matches_timezone(
@@ -524,6 +685,55 @@ def _require_datetime_matches_timezone(
             f"{timezone!r}; use a timeZone whose local wall time matches the "
             "dateTime value"
         )
+
+
+def _reject_nonpositive_event_window(
+    start_value: str,
+    end_value: str,
+    *,
+    is_all_day: bool,
+    start_timezone: str | None = None,
+    end_timezone: str | None = None,
+) -> None:
+    """Reject an event end that is not after its start.
+
+    Naive dateTimes are localized with their EventDateTime timeZone before
+    comparison. This keeps Google-valid naive values comparable with values
+    that carry an explicit offset instead of silently allowing a mixed
+    aware/naive window through.
+    """
+    if is_all_day:
+        if date.fromisoformat(end_value) <= date.fromisoformat(start_value):
+            raise ValueError(
+                "the all-day event end must be later than its start; end_time is "
+                "exclusive, so use the following date for a one-day event"
+            )
+        return
+
+    try:
+        start_key = _date_parser.isoparse(start_value)
+        end_key = _date_parser.isoparse(end_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "start_time and end_time must be valid ISO 8601 dateTimes"
+        ) from exc
+    if start_key.tzinfo is None and start_timezone:
+        start_key = _date_parser.isoparse(
+            _offset_datetime_string(start_value, start_timezone)
+        )
+    if end_key.tzinfo is None and end_timezone:
+        end_key = _date_parser.isoparse(
+            _offset_datetime_string(end_value, end_timezone)
+        )
+    try:
+        reversed_window = end_key <= start_key
+    except TypeError as exc:
+        raise ValueError(
+            "start_time and end_time must either both include UTC offsets or "
+            "have a timezone available for values without an offset"
+        ) from exc
+    if reversed_window:
+        raise ValueError(f"end ({end_value!r}) must be after start ({start_value!r}).")
 
 
 def _series_has_exceptions(
@@ -587,7 +797,7 @@ def _series_has_exceptions(
             if not saw_master:
                 raise ValueError(
                     "Google Calendar's exception scan did not return the recurring "
-                    "master event; refusing to replace its rule"
+                    "master event; refusing to change its recurrence schedule"
                 )
             return False
         if not isinstance(next_page_token, str):
@@ -637,10 +847,9 @@ def _stamp_timezone(
     when doing so would be malformed or, for a non-recurring event,
     redundant.
 
-    Skipped entirely when `current_value` is None: this side has no
-    "dateTime"/"date" value at all (a malformed fetched event), and
-    stamping a bare {"timeZone": ...} would send Google a structurally
-    invalid EventDateTime carrying neither key.
+    Skipped entirely when `current_value` is None or a bare date: the
+    former has no usable EventDateTime value, while an all-day date must
+    not carry a timeZone. Stamping either would create a malformed payload.
 
     Otherwise skipped only when `force` is False and `current_value`
     already carries its own UTC offset, to avoid a possibly-disagreeing
@@ -653,12 +862,50 @@ def _stamp_timezone(
     not redundant. For a plain reschedule timeZone is merely optional, so
     it's skipped there instead when the value is already self-describing.
     """
-    if current_value is None:
+    if current_value is None or is_bare_date(current_value):
         return
     if not force and _has_own_utc_offset(current_value):
         return
     event[side] = _event_side(event, side)
     event[side]["timeZone"] = timezone
+
+
+def _resolve_side(
+    event: dict[str, Any], side: str, new_value: str | None
+) -> tuple[str | None, bool]:
+    """Apply `new_value` (a start_time/end_time argument) to
+    ``event[side]`` if given, writing it under "date" or "dateTime"
+    depending on its shape, then return `(current_value, is_all_day)` for
+    that side as it now stands: `current_value` is the actual "dateTime"/
+    "date" string on the event (whether just written or already there),
+    and `is_all_day` is whether that value is a bare date.
+
+    Applying this once per side (rather than separate near-identical
+    start/end blocks) means a fix to this logic - e.g. the bare-date
+    whitespace-stripping fix - only has to be made once to cover both.
+    """
+    if new_value is not None:
+        normalized = new_value.strip()
+        is_all_day = _classify_event_time(normalized, f"{side}_time")
+        if is_all_day:
+            event[side] = {"date": normalized}
+        else:
+            event[side] = {"dateTime": normalized}
+    side_data = _event_side(event, side)
+    current_value = side_data.get("dateTime") or side_data.get("date")
+    return current_value, current_value is not None and is_bare_date(current_value)
+
+
+def _validate_retained_rrules_for_kind_conversion(
+    recurrence_lines: list[str], start_value: str, timezone: str | None
+) -> None:
+    """Validate retained RRULE bodies when DTSTART changes value type.
+
+    Auxiliary recurrence properties are rejected before this helper runs.
+    ``parse_rrule`` owns the DTSTART value-type and time-part validation.
+    """
+    for line in recurrence_lines:
+        parse_rrule(_property_value(line), start_value, timezone)
 
 
 def get_calendar_service() -> Any:
@@ -910,11 +1157,10 @@ def google_calendar_create_events(
     with timezone must use a UTC UNTIL ending in Z.
     timezone is an IANA name such as 'America/Los_Angeles' and is required
     for timed recurring events, including when start_time/end_time carry
-    their own offsets. An explicit offset must represent the same local wall
-    time in this timezone; the timezone governs later occurrences across DST
-    changes. It is validated but not written for all-day events.
-    google_calendar_update_events supports metadata changes and replacing a
-    recurrence rule, but does not combine a rule replacement with a reschedule.
+    their own offsets. For all-day events, it is validated when supplied
+    but is not written to the event boundaries.
+    google_calendar_update_events can reschedule an event while preserving
+    its existing all-day or timed kind, and can update recurrence rules.
     attendees is a list of email addresses to add to the event. Adding attendees does not, by
     itself, email them; set notify_attendees=True to have Google Calendar send them a native
     invite immediately. Confirm the recipient list with the user before setting notify_attendees=True.
@@ -952,16 +1198,16 @@ def google_calendar_create_events(
                 "a dateTime, never a mix - a Google Calendar event's start "
                 "and end must be the same kind"
             )
-        if start_is_all_day and date.fromisoformat(end_time) <= date.fromisoformat(
-            start_time
-        ):
-            raise ValueError(
-                "end_time is exclusive for an all-day event and must be later "
-                "than start_time; use the following date for a one-day event"
-            )
         if not start_is_all_day and not timezone:
             _require_offset_datetime(start_time, "start_time")
             _require_offset_datetime(end_time, "end_time")
+        _reject_nonpositive_event_window(
+            start_time,
+            end_time,
+            is_all_day=start_is_all_day,
+            start_timezone=timezone,
+            end_timezone=timezone,
+        )
         if recurrence is not None and not start_is_all_day and not timezone:
             raise ValueError(
                 "timezone is required when recurrence is set (Google expands "
@@ -978,15 +1224,15 @@ def google_calendar_create_events(
         check_start = start_time
         check_end = end_time
         if not start_is_all_day and timezone:
+            if recurrence is not None:
+                _require_datetime_matches_timezone(start_time, timezone, "start_time")
+                _require_datetime_matches_timezone(end_time, timezone, "end_time")
             if not _has_own_utc_offset(start_time):
                 check_start = _offset_datetime_string(start_time, timezone)
             if not _has_own_utc_offset(end_time):
                 check_end = _offset_datetime_string(end_time, timezone)
         if not start_is_all_day:
             _reject_reversed_window(check_start, check_end)
-        if recurrence is not None and not start_is_all_day and timezone:
-            _require_datetime_matches_timezone(start_time, timezone, "start_time")
-            _require_datetime_matches_timezone(end_time, timezone, "end_time")
 
         normalized_recurrence = (
             _normalize_rrule(recurrence, start_time, timezone)
@@ -1100,26 +1346,63 @@ def google_calendar_update_events(
     timezone: str | None = None,
     recurrence: str | None = None,
     ignore_conflicts: bool = False,
+    acknowledge_recurring_exception_risk: bool = False,
 ) -> str:
     """
     Update an existing event in Google Calendar.
-    start_time and end_time must be RFC3339 formatted if provided.
-    recurrence replaces the event's RFC 5545 RRULE. This rule-only operation
-    rejects a series that already has EXDATE/RDATE/EXRULE lines because their
-    meaning cannot be safely inferred after a rule change. This operation handles
-    rule updates only: do not combine recurrence with start_time or end_time.
-    When recurrence is first added, a timed series is normalized to one IANA
-    timezone on both boundaries. For offsetless boundaries without a stored
-    timezone, the primary calendar's timezone is used; pass timezone for
-    explicit-offset boundaries that do not store one. An offset-only boundary
-    is checked against that zone at the first occurrence; the caller must ensure
-    the zone also represents the intended wall-clock behavior across future DST
-    transitions. Replacing an existing rule preserves both boundaries exactly.
-    timezone is validated but not written for all-day events.
-    Updating a rule cannot be fully conflict-checked, so it requires
-    ignore_conflicts=True after the user confirms the resulting series is safe.
-    That flag also skips attendee
-    availability checks when attendees are added in the same call.
+    start_time and end_time must be RFC3339 formatted if provided, or
+    both a bare date (e.g. '2024-01-01') to convert the event to/from
+    all-day - if only one of the two is given, it must match the kind
+    (dateTime vs. bare date) the event already has on its other side.
+    recurrence works like it does in google_calendar_create_events: a
+    single RFC 5545 RRULE string turns this event into a repeating series,
+    or replaces its existing one. Any EXDATE/RDATE/EXRULE lines already on
+    the event (e.g. a previously-cancelled single occurrence) are kept verbatim -
+    there is no way to clear an existing recurrence back to a single
+    event through this parameter. Because those auxiliary lines can change
+    the meaning of a replacement rule, an event that has them requires
+    recurrence, start_time, and timezone together when its rule, series start,
+    or timezone changes (an all-day event does not require timezone). Converting
+    between all-day and timed requires both start_time and end_time and is not
+    supported when the event has existing EXDATE/RDATE/EXRULE lines. Any retained
+    RRULE is revalidated against the new start; pass a compatible replacement
+    recurrence in the same call when needed. The caller must ensure the retained
+    absolute EXDATE/RDATE values still identify the intended occurrences after a
+    fully-specified change. Google does not offer an atomic operation that checks
+    separately stored instance exceptions and updates their recurring master
+    together. Therefore, changing an existing series' rule, start time, or
+    expansion timezone also requires:
+    - acknowledge_recurring_exception_risk=True after the user verifies that
+      retained EXDATE/RDATE/EXRULE values still identify the intended occurrences;
+    - acceptance that another client could create, edit, or cancel an exception
+      in the brief interval between the check and update.
+    event_id must be the series' own id,
+    not one of its individual occurrences - google_calendar_search_events
+    lists occurrences (each carrying a recurringEventId pointing at the
+    actual series), and passing one of those here with recurrence set is
+    rejected with a clear error rather than silently targeting the wrong
+    resource.
+    timezone is an IANA timezone name; Google requires one for a
+    non-all-day recurring event - and does so unconditionally, even when
+    start_time/end_time (or the event's existing values) already carry
+    their own UTC offset. On recurring events, if timezone is omitted, each
+    boundary keeps its own existing timeZone; a missing side falls back to the
+    other boundary's zone.
+    If neither side has one, this call is rejected with a
+    clear error rather than sending an incomplete request to Google. Passing
+    timezone without also passing start_time/end_time reinterprets the
+    event's existing wall-clock time under the new zone rather than
+    converting the underlying instant - e.g. an event stored as
+    07:00/Asia/Manila becomes 07:00/America/New_York, a ~12h shift in
+    absolute time, not a same-instant re-labeling; pass start_time/
+    end_time as well to actually convert the instant. For a recurring event
+    whose stored value already carries its own UTC offset, that offset must
+    agree with an explicitly supplied timezone; otherwise the update is
+    rejected rather than sending a contradictory EventDateTime. timezone is
+    otherwise optional. When changing a non-recurring event, do not combine timezone
+    with offset-bearing start/end values, whether newly supplied or already
+    stored, because the two zone representations may disagree. For an all-day
+    event, timezone is validated when supplied but is not written to its boundaries.
     If the update moves the event to a new time, or adds attendees, that change is checked for
     conflicts the same way google_calendar_create_events is; pass ignore_conflicts=True to skip the
     check once the user has explicitly confirmed a conflict is fine. If an individual required
@@ -1135,6 +1418,9 @@ def google_calendar_update_events(
     here, not every occurrence the series will generate. Update a single occurrence directly by its
     own event id instead, or pass ignore_conflicts=True once the user has confirmed they've verified
     every occurrence themselves.
+    Adding or replacing recurrence likewise requires ignore_conflicts=True after the caller has
+    verified the resulting series, because checking only its first occurrence cannot establish that
+    all newly generated occurrences are free.
     attendees is a list of email addresses to add to the event; attendees already on the event are
     kept, and there is no way to remove an attendee through this parameter. Adding attendees does
     not, by itself, email anyone; set notify_attendees=True to have Google Calendar send a native
@@ -1154,29 +1440,35 @@ def google_calendar_update_events(
     """
     requested_conference = False
     try:
-        if timezone is not None:
-            timezone = timezone.strip() or None
         if recurrence is not None and not recurrence.strip():
             raise ValueError("recurrence rule must not be empty")
-        if recurrence is not None and (start_time is not None or end_time is not None):
-            raise ValueError(
-                "recurrence cannot be combined with start_time or end_time yet; "
-                "update the recurrence rule separately"
-            )
-        if timezone is not None and recurrence is None:
-            raise ValueError("timezone is only supported together with recurrence")
-        if timezone:
-            resolve_zoneinfo(timezone)
+        start_input_is_all_day = None
+        end_input_is_all_day = None
         if start_time is not None:
-            _require_offset_datetime(start_time, "start_time")
+            start_time = start_time.strip()
+            start_input_is_all_day = _classify_event_time(start_time, "start_time")
         if end_time is not None:
-            _require_offset_datetime(end_time, "end_time")
-        if recurrence is not None and not ignore_conflicts:
+            end_time = end_time.strip()
+            end_input_is_all_day = _classify_event_time(end_time, "end_time")
+        if (
+            start_input_is_all_day is not None
+            and end_input_is_all_day is not None
+            and start_input_is_all_day != end_input_is_all_day
+        ):
             raise ValueError(
-                "A recurring series cannot be fully conflict-checked from its first "
-                "occurrence. Pass ignore_conflicts=True only after the user confirms "
-                "they have verified every occurrence in the resulting series."
+                "start_time and end_time must both be a bare date or both "
+                "a dateTime, never a mix - a Google Calendar event's start "
+                "and end must be the same kind"
             )
+        if timezone is not None:
+            timezone = timezone.strip() or None
+        if timezone:
+            # Validate eagerly with a clean, actionable message - the
+            # only other path that would otherwise catch a bad IANA name
+            # is parse_rrule, which only runs when recurrence is also
+            # set, leaving an invalid timezone on a plain reschedule to
+            # surface as Google's own opaque server-side error instead.
+            resolve_zoneinfo(timezone)
         service = get_calendar_service()
 
         # Lazily fetched and cached - this
@@ -1192,148 +1484,381 @@ def google_calendar_update_events(
 
         # First get the existing event
         event = service.events().get(calendarId="primary", eventId=event_id).execute()
-        replacement_recurrence: list[str] | None = None
-
-        if recurrence is not None:
-            if event.get("recurringEventId"):
+        fetched_event = copy.deepcopy(event)
+        if recurrence is not None and event.get("recurringEventId"):
+            # A single occurrence of a recurring series (e.g. one row
+            # from google_calendar_search_events, which lists occurrences
+            # with singleEvents=True) carries recurringEventId pointing
+            # at the master event - it isn't itself a series, so setting
+            # recurrence here targets the wrong resource rather than
+            # actually changing the series. Reject rather than send
+            # Google a request whose effect wouldn't match the caller's
+            # intent.
+            raise ValueError(
+                f"event {event_id!r} is a single occurrence of a recurring "
+                f"series (recurringEventId={event['recurringEventId']!r}), not "
+                "the series itself - call this on the series' master event id "
+                "to change its recurrence"
+            )
+        # Captured before any of the reassignments below can overwrite
+        # event["start"]/["end"] - events().update() replaces the whole
+        # resource, so wholesale-replacing "start"/"end" with a bare
+        # {"dateTime": ...} below would otherwise silently strip the
+        # event's existing timeZone (not just for the recurrence fallback
+        # further down, but for a plain reschedule with no recurrence
+        # involved at all).
+        existing_start_side = _event_side(event, "start")
+        existing_end_side = _event_side(event, "end")
+        existing_start_timezone = existing_start_side.get("timeZone")
+        existing_end_timezone = existing_end_side.get("timeZone")
+        original_start_value = existing_start_side.get(
+            "dateTime"
+        ) or existing_start_side.get("date")
+        original_end_value = existing_end_side.get("dateTime") or existing_end_side.get(
+            "date"
+        )
+        raw_existing_recurrence = event.get("recurrence")
+        schedule_update_requested = (
+            start_time is not None or end_time is not None or timezone is not None
+        )
+        timing_update_requested = schedule_update_requested or recurrence is not None
+        for field_name, value in (
+            ("start", original_start_value),
+            ("end", original_end_value),
+        ):
+            if value is not None and not isinstance(value, str):
                 raise ValueError(
-                    f"event {event_id!r} is a single occurrence of a recurring "
-                    f"series (recurringEventId={event['recurringEventId']!r}), not "
-                    "the series itself - call this on the series' master event id "
-                    "to change its recurrence"
+                    f"the existing event {field_name} boundary must be a string"
                 )
-            existing_recurrence = _validated_recurrence_lines(event.get("recurrence"))
-            existing_rrules = [
+        for field_name, value in (
+            ("start.timeZone", existing_start_timezone),
+            ("end.timeZone", existing_end_timezone),
+        ):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"the existing event {field_name} must be a string")
+        existing_recurrence = (
+            _validated_recurrence_lines(raw_existing_recurrence)
+            if timing_update_requested
+            else raw_existing_recurrence
+        )
+        if timing_update_requested and start_time is None:
+            (
+                original_start_value,
+                original_is_all_day,
+                existing_start_timezone,
+            ) = _validated_stored_boundary(existing_start_side, "start")
+        if timing_update_requested and end_time is None:
+            (
+                original_end_value,
+                original_end_is_all_day,
+                existing_end_timezone,
+            ) = _validated_stored_boundary(existing_end_side, "end")
+        existing_rrules = (
+            [
                 line
                 for line in existing_recurrence
                 if _recurrence_property_name(line) == "RRULE"
             ]
-            if len(existing_rrules) > 1:
-                raise ValueError(
-                    "the existing series has multiple RRULE lines that cannot be "
-                    "safely collapsed by a rule-only update"
-                )
-            replacing_existing_rule = bool(existing_rrules)
-            start_side = event.get("start")
-            end_side = event.get("end")
-            start_value, start_is_all_day, start_timezone = _validated_stored_boundary(
-                start_side, "start"
+            if timing_update_requested and isinstance(existing_recurrence, list)
+            else []
+        )
+        if recurrence is not None and len(existing_rrules) > 1:
+            raise ValueError(
+                "the existing series has multiple RRULE lines that cannot be "
+                "safely collapsed by an update"
             )
-            end_value, end_is_all_day, end_timezone = _validated_stored_boundary(
-                end_side, "end"
+        # Also captured before any reassignment - whether the event was
+        # all-day or timed *before* this call, so a value-type change can
+        # be detected below even though _resolve_side below overwrites
+        # event["start"] in place.
+        original_is_all_day = original_start_value is not None and is_bare_date(
+            original_start_value
+        )
+        original_end_is_all_day = original_end_value is not None and is_bare_date(
+            original_end_value
+        )
+        resulting_start_is_all_day = (
+            start_input_is_all_day
+            if start_input_is_all_day is not None
+            else original_is_all_day
+        )
+        resulting_end_is_all_day = (
+            end_input_is_all_day
+            if end_input_is_all_day is not None
+            else original_end_is_all_day
+        )
+        kind_conversion_requested = bool(
+            (
+                original_start_value is not None
+                and original_is_all_day != resulting_start_is_all_day
             )
-            if start_is_all_day != end_is_all_day:
-                raise ValueError(
-                    "the existing event start and end must both be dates or both "
-                    "be dateTimes before its recurrence can be updated"
+            or (
+                original_end_value is not None
+                and original_end_is_all_day != resulting_end_is_all_day
+            )
+        )
+        if timing_update_requested and (
+            (start_time is None and original_start_value is None)
+            or (end_time is None and original_end_value is None)
+        ):
+            raise ValueError(
+                "the existing event must contain both a valid start and end before "
+                "its schedule or recurrence can be updated; a one-sided time update "
+                "requires a valid stored counterpart boundary"
+            )
+        if (
+            timing_update_requested
+            and resulting_start_is_all_day != resulting_end_is_all_day
+        ):
+            message = (
+                "a Google Calendar event's start and end must use the same kind: "
+                "both bare dates for an all-day event or both dateTimes for a "
+                "timed event"
+            )
+            if kind_conversion_requested:
+                message += (
+                    "; supply both start_time and end_time together to convert "
+                    "between all-day and timed"
                 )
-            expansion_timezone = None
-            if not start_is_all_day:
-                if not replacing_existing_rule and bool(start_timezone) != bool(
-                    end_timezone
-                ):
-                    missing_value = end_value if start_timezone else start_value
-                    if not _has_own_utc_offset(missing_value):
-                        raise ValueError(
-                            "the existing event has a timeZone on only one "
-                            "offsetless boundary; a rule-only update cannot infer "
-                            "the missing boundary's timezone safely"
-                        )
+            raise ValueError(message)
+        if start_input_is_all_day and end_input_is_all_day:
+            _reject_nonpositive_event_window(
+                cast(str, start_time), cast(str, end_time), is_all_day=True
+            )
+        # Whether this event is (or, after this call, remains) a
+        # recurring series - Google requires timeZone unconditionally for
+        # one, regardless of this call's own recurrence argument: leaving
+        # recurrence unset on an update doesn't clear it, so a plain
+        # reschedule of an already-recurring event still needs a
+        # correct timeZone on both sides.
+        event_is_recurring = recurrence is not None or bool(raw_existing_recurrence)
+
+        own_start_timezone = timezone or existing_start_timezone
+        own_end_timezone = timezone or existing_end_timezone
+        if event_is_recurring:
+            # Each EventDateTime has its own timeZone. Preserve both stored
+            # boundary zones on an existing cross-zone series unless the caller
+            # explicitly requests one replacement zone for both sides.
+            recurrence_timezone = (
+                timezone or existing_start_timezone or existing_end_timezone
+            )
+            if (
+                recurrence is not None
+                and not raw_existing_recurrence
+                and not resulting_start_is_all_day
+                and timezone is None
+            ):
                 if (
-                    not replacing_existing_rule
-                    and start_timezone
-                    and end_timezone
-                    and start_timezone != end_timezone
+                    existing_start_timezone
+                    and existing_end_timezone
+                    and not _timezone_names_equal(
+                        existing_start_timezone, existing_end_timezone
+                    )
                 ):
                     raise ValueError(
                         "the existing event uses different start and end timeZones; "
-                        "a rule-only update cannot convert it to the single timezone "
-                        "required for recurrence"
+                        "pass timezone explicitly when adding recurrence"
                     )
-                stored_timezone = start_timezone or end_timezone
-                if timezone and stored_timezone and timezone != stored_timezone:
-                    raise ValueError(
-                        "a rule-only update cannot change the event's existing timeZone"
-                    )
-                expansion_timezone = timezone or stored_timezone
-                has_offsetless_boundary = not _has_own_utc_offset(
-                    start_value
-                ) or not _has_own_utc_offset(end_value)
-                if not expansion_timezone and has_offsetless_boundary:
-                    # Google interprets a dateTime without an offset or sibling
-                    # timeZone in the primary calendar's zone. Use that same zone
-                    # when converting the event into a recurring series.
-                    expansion_timezone = primary_calendar_info()[1]
-                if not expansion_timezone:
-                    raise ValueError(
-                        "timezone is required when adding recurrence to a timed event "
-                        "that has no existing timeZone"
-                    )
-                if not stored_timezone and has_offsetless_boundary:
-                    calendar_timezone = primary_calendar_info()[1]
-                    if expansion_timezone != calendar_timezone:
-                        raise ValueError(
-                            "the existing event has offsetless boundaries without "
-                            "timeZone fields; timezone must match the primary "
-                            f"calendar timezone {calendar_timezone!r} to preserve "
-                            "its schedule"
-                        )
-                resolve_zoneinfo(expansion_timezone)
-                if not replacing_existing_rule:
-                    _require_datetime_matches_timezone(
-                        start_value, expansion_timezone, "the existing event start"
-                    )
-                    _require_datetime_matches_timezone(
-                        end_value, expansion_timezone, "the existing event end"
-                    )
-                    start_side["timeZone"] = expansion_timezone
-                    end_side["timeZone"] = expansion_timezone
-                comparable_start = (
-                    start_value
-                    if _has_own_utc_offset(start_value)
-                    else _offset_datetime_string(
-                        start_value, start_timezone or expansion_timezone
-                    )
+                missing_start_zone = (
+                    not existing_start_timezone
+                    and original_start_value is not None
+                    and not _has_own_utc_offset(original_start_value)
                 )
-                comparable_end = (
-                    end_value
-                    if _has_own_utc_offset(end_value)
-                    else _offset_datetime_string(
-                        end_value, end_timezone or expansion_timezone
-                    )
+                missing_end_zone = (
+                    not existing_end_timezone
+                    and original_end_value is not None
+                    and not _has_own_utc_offset(original_end_value)
                 )
-                _reject_reversed_window(comparable_start, comparable_end)
-            else:
-                if date.fromisoformat(end_value) <= date.fromisoformat(start_value):
+                if missing_start_zone != missing_end_zone:
                     raise ValueError(
-                        "the existing all-day event end must be later than its start"
+                        "the existing event has a timeZone on only one offsetless "
+                        "boundary; pass timezone explicitly when adding recurrence"
                     )
-            new_rrule = _normalize_rrule(
-                recurrence,
-                start_value,
-                expansion_timezone,
+                if missing_start_zone and missing_end_zone:
+                    recurrence_timezone = primary_calendar_info()[1]
+            effective_start_timezone = (
+                timezone or existing_start_timezone or recurrence_timezone
             )
-            auxiliary_lines = [
+            effective_end_timezone = (
+                timezone or existing_end_timezone or recurrence_timezone
+            )
+        else:
+            effective_start_timezone = own_start_timezone
+            effective_end_timezone = own_end_timezone
+        recurrence_timezone_changed = bool(
+            event_is_recurring
+            and not resulting_start_is_all_day
+            and timezone
+            and (
+                not _timezone_names_equal(timezone, existing_start_timezone)
+                or not _timezone_names_equal(timezone, existing_end_timezone)
+            )
+        )
+
+        prospective_start_value = start_time or original_start_value
+        prospective_end_value = end_time or original_end_value
+        preserve_stored_schedule = bool(
+            recurrence is not None
+            and raw_existing_recurrence
+            and not schedule_update_requested
+        )
+
+        if event_is_recurring and not resulting_start_is_all_day:
+            adding_first_recurrence = bool(
+                recurrence is not None and not raw_existing_recurrence
+            )
+            if (timezone or start_time is not None or adding_first_recurrence) and (
+                effective_start_timezone
+            ):
+                _require_datetime_matches_timezone(
+                    cast(str, prospective_start_value),
+                    effective_start_timezone,
+                    "start_time",
+                )
+            if (timezone or end_time is not None or adding_first_recurrence) and (
+                effective_end_timezone
+            ):
+                _require_datetime_matches_timezone(
+                    cast(str, prospective_end_value),
+                    effective_end_timezone,
+                    "end_time",
+                )
+
+        # Validate the prospective window before any availability lookup. A
+        # malformed or mixed aware/naive pair is an input error, not an
+        # incomplete conflict check, and must never trigger Calendar reads.
+        # This uses the stored counterpart for one-sided updates, matching the
+        # final payload that will be validated again after _resolve_side.
+        if (
+            timing_update_requested
+            and prospective_start_value is not None
+            and prospective_end_value is not None
+        ):
+            _reject_nonpositive_event_window(
+                prospective_start_value,
+                prospective_end_value,
+                is_all_day=resulting_start_is_all_day,
+                start_timezone=(
+                    existing_start_timezone
+                    if preserve_stored_schedule
+                    else effective_start_timezone
+                    if event_is_recurring
+                    else own_start_timezone
+                ),
+                end_timezone=(
+                    existing_end_timezone
+                    if preserve_stored_schedule
+                    else effective_end_timezone
+                    if event_is_recurring
+                    else own_end_timezone
+                ),
+            )
+
+        start_changed = bool(
+            timing_update_requested
+            and _event_time_changed(
+                original_start_value,
+                prospective_start_value,
+                old_timezone=(None if original_is_all_day else existing_start_timezone),
+                new_timezone=(
+                    None if resulting_start_is_all_day else own_start_timezone
+                ),
+            )
+        )
+        timezone_changes_schedule_zone = False
+        if timing_update_requested and isinstance(existing_recurrence, list):
+            auxiliary_recurrence = [
                 line
                 for line in existing_recurrence
                 if _recurrence_property_name(line) != "RRULE"
             ]
-            if auxiliary_lines:
+            if auxiliary_recurrence and kind_conversion_requested:
                 raise ValueError(
-                    "the existing series has EXDATE, RDATE, or EXRULE lines whose "
-                    "meaning cannot be safely inferred after a rule-only update"
+                    "cannot convert this event between all-day and timed while it "
+                    "has EXDATE/RDATE/EXRULE lines; their conversion is not supported"
                 )
-            if replacing_existing_rule and _series_has_exceptions(
-                service,
-                event_id,
-                event.get("iCalUID") if isinstance(event.get("iCalUID"), str) else None,
+            timezone_changes_schedule_zone = bool(
+                not resulting_start_is_all_day
+                and timezone
+                and any(
+                    not _timezone_names_equal(timezone, existing_timezone)
+                    for existing_timezone in (
+                        existing_start_timezone,
+                        existing_end_timezone,
+                    )
+                )
+            )
+            timezone_conflicts_with_line_tzid = bool(
+                not resulting_start_is_all_day
+                and timezone
+                and any(
+                    not _timezone_names_equal(recurrence_tzid, timezone)
+                    for recurrence_tzid in _recurrence_tzids(auxiliary_recurrence)
+                )
+            )
+            recurrence_exceptions_may_shift = (
+                (start_time is not None and start_changed)
+                or timezone_changes_schedule_zone
+                or timezone_conflicts_with_line_tzid
+            )
+            fully_specified_recurrence_change = bool(
+                recurrence is not None
+                and start_time is not None
+                and (resulting_start_is_all_day or timezone is not None)
+            )
+            recurrence_replacement_is_ambiguous = bool(
+                auxiliary_recurrence
+                and recurrence is not None
+                and not fully_specified_recurrence_change
+            )
+            if auxiliary_recurrence and timezone_conflicts_with_line_tzid:
+                raise ValueError(
+                    "timezone conflicts with a TZID stored on an existing EXDATE, "
+                    "RDATE, or EXRULE line"
+                )
+            if auxiliary_recurrence and (
+                recurrence_replacement_is_ambiguous
+                or (
+                    recurrence_exceptions_may_shift
+                    and not fully_specified_recurrence_change
+                )
             ):
                 raise ValueError(
-                    "the existing recurring series has edited or cancelled "
-                    "instances whose meaning cannot be safely preserved after a "
-                    "rule-only update"
+                    "cannot replace recurrence or change start_time/timezone while "
+                    "the event has EXDATE, RDATE, or EXRULE lines unless recurrence, "
+                    "start_time, and timezone are supplied together; their intended "
+                    "new occurrence times cannot be safely inferred"
                 )
-            replacement_recurrence = [new_rrule]
+
+        normalized_conversion_rrule: str | None = None
+        if kind_conversion_requested:
+            if recurrence is not None:
+                normalized_conversion_rrule = _normalize_rrule(
+                    recurrence,
+                    cast(str, prospective_start_value),
+                    effective_start_timezone,
+                )
+            elif isinstance(existing_recurrence, list):
+                _validate_retained_rrules_for_kind_conversion(
+                    existing_recurrence,
+                    cast(str, prospective_start_value),
+                    effective_start_timezone,
+                )
+
+        if not event_is_recurring and not resulting_start_is_all_day:
+            if start_time is not None and not own_start_timezone:
+                _require_offset_datetime(start_time, "start_time")
+            if end_time is not None and not own_end_timezone:
+                _require_offset_datetime(end_time, "end_time")
+            if timezone and (
+                _has_own_utc_offset(cast(str, prospective_start_value))
+                or _has_own_utc_offset(cast(str, prospective_end_value))
+            ):
+                raise ValueError(
+                    "timezone cannot be combined with an offset-bearing start_time "
+                    "or end_time on a non-recurring event; omit timezone or pass "
+                    "local dateTimes without offsets"
+                )
 
         existing_attendees_raw = [
             a["email"]
@@ -1485,18 +2010,6 @@ def google_calendar_update_events(
         existing_is_all_day = "date" in (event.get("start") or {}) or "date" in (
             event.get("end") or {}
         )
-        if existing_is_all_day and bool(start_time) != bool(end_time):
-            # The existing event's start/end are {"date": ...}; writing
-            # only one of start_time/end_time would overwrite just that
-            # side with {"dateTime": ...} while the other side keeps its
-            # {"date": ...} shape - Google rejects a body mixing the two
-            # formats between an event's start and end.
-            raise ValueError(
-                "Existing event is all-day (uses date-only start/end); "
-                "updating only one of start_time/end_time would mix "
-                "date-only and dateTime formats. Pass both start_time and "
-                "end_time together."
-            )
 
         # The calendar's own timezone is only needed to widen an all-day
         # boundary (see _event_boundary) so a moved window, a genuinely
@@ -1517,12 +2030,28 @@ def google_calendar_update_events(
         # empty regardless of timezone precision (both sides of that
         # comparison fall back to the same assumption consistently), so
         # that case alone still doesn't need the real zone.
-        needs_real_calendar_timezone = existing_is_all_day and (
+        needs_real_calendar_timezone = (
+            existing_is_all_day
+            or resulting_start_is_all_day
+            or resulting_end_is_all_day
+        ) and (
             bool(start_time)
             or bool(end_time)
             or bool(attendees_to_check)
             or organizer_newly_added
         )
+        conflict_window_needed = bool(schedule_update_requested or added_attendees)
+
+        def _normalized_boundary(
+            value: str | None, is_all_day: bool, side_timezone: str | None
+        ) -> str | None:
+            if not conflict_window_needed or value is None:
+                return None
+            field = {"date" if is_all_day else "dateTime": value}
+            if side_timezone and not is_all_day:
+                field["timeZone"] = side_timezone
+            return _event_boundary(field, calendar_timezone)
+
         try:
             calendar_timezone = (
                 primary_calendar_info()[1] if needs_real_calendar_timezone else "UTC"
@@ -1535,8 +2064,24 @@ def google_calendar_update_events(
             # lookup. Otherwise a malformed event would hard-fail this
             # call even when the caller explicitly opted out of the
             # check the docstring says this guards.
-            existing_start = _event_boundary(event.get("start"), calendar_timezone)
-            existing_end = _event_boundary(event.get("end"), calendar_timezone)
+            existing_start = _normalized_boundary(
+                original_start_value,
+                original_is_all_day,
+                (
+                    existing_start_timezone or existing_end_timezone
+                    if event_is_recurring
+                    else existing_start_timezone
+                ),
+            )
+            existing_end = _normalized_boundary(
+                original_end_value,
+                original_end_is_all_day,
+                (
+                    existing_end_timezone or existing_start_timezone
+                    if event_is_recurring
+                    else existing_end_timezone
+                ),
+            )
         except (InsufficientScopeError, ValueError, HttpError):
             # Besides a recognized missing-scope error or malformed-event
             # ValueError from _event_boundary, a bare HttpError here means
@@ -1556,6 +2101,24 @@ def google_calendar_update_events(
             calendar_timezone = "UTC"
             existing_start = None
             existing_end = None
+        conflict_start = (
+            _normalized_boundary(
+                cast(str, prospective_start_value),
+                resulting_start_is_all_day,
+                effective_start_timezone if event_is_recurring else own_start_timezone,
+            )
+            if start_time is not None or timezone is not None
+            else existing_start
+        )
+        conflict_end = (
+            _normalized_boundary(
+                cast(str, prospective_end_value),
+                resulting_end_is_all_day,
+                effective_end_timezone if event_is_recurring else own_end_timezone,
+            )
+            if end_time is not None or timezone is not None
+            else existing_end
+        )
         if bool(start_time) != bool(end_time):
             stored_counterpart = existing_end if start_time else existing_start
             if stored_counterpart is None:
@@ -1563,8 +2126,8 @@ def google_calendar_update_events(
                     "A one-sided time update requires a valid stored counterpart "
                     "boundary so the resulting event window can be validated."
                 )
-        effective_start = start_time or existing_start
-        effective_end = end_time or existing_end
+        effective_start = conflict_start or existing_start
+        effective_end = conflict_end or existing_end
         if (start_time or end_time) and effective_start and effective_end:
             # Only worth checking when this call is actually about to
             # write a (possibly partly-existing) window - an
@@ -1583,9 +2146,16 @@ def google_calendar_update_events(
             existing_end_key,
         )
 
+        if recurrence is not None and not ignore_conflicts:
+            raise ValueError(
+                "A recurring series cannot be fully conflict-checked from its first "
+                "occurrence. Pass ignore_conflicts=True only after the user confirms "
+                "they have verified every occurrence in the resulting series."
+            )
+
         if (
             not ignore_conflicts
-            and (start_time or end_time or added_attendees)
+            and (start_time or end_time or timezone or added_attendees)
             and (effective_start is None or effective_end is None)
         ):
             return _incomplete_check_response(
@@ -1601,7 +2171,7 @@ def google_calendar_update_events(
         if (
             event.get("recurrence")
             and not ignore_conflicts
-            and (window_changed or added_attendees)
+            and (window_changed or recurrence_timezone_changed or added_attendees)
         ):
             # A recurring MASTER event's `recurrence` field (its RRULE/
             # EXRULE/RDATE/EXDATE lines) is only present on the master itself;
@@ -1612,7 +2182,8 @@ def google_calendar_update_events(
             # window_changed is based on normalized datetime keys above.
             raise ValueError(
                 "This event is part of a recurring series (it has its "
-                "own recurrence rule) - moving it or adding an attendee "
+                "own recurrence rule) - moving it, changing its timezone, "
+                "or adding an attendee "
                 "can only be conflict-checked against the single "
                 "occurrence this call computes, not every occurrence the "
                 "series will generate, so this write was refused rather "
@@ -1852,18 +2423,229 @@ def google_calendar_update_events(
                     unchecked_attendees, effective_start, effective_end
                 )
 
-        if replacement_recurrence is not None:
-            event["recurrence"] = replacement_recurrence
         if summary:
             event["summary"] = summary
-        if start_time:
-            event["start"] = {"dateTime": start_time}
-        if end_time:
-            event["end"] = {"dateTime": end_time}
+        # An all-day event's start is a bare "date" (no "T"), never a
+        # "dateTime" - Google doesn't attach (or require) a timeZone to a
+        # whole-day occurrence. Determined from the CURRENT value (after
+        # any start_time/end_time reassignment, which now correctly
+        # writes "date" for a bare-date value), so moving an all-day
+        # event to a specific dateTime in this same call correctly stops
+        # treating it as all-day.
+        current_start_value, is_all_day = _resolve_side(event, "start", start_time)
+        # Google requires start and end to be the SAME kind (both a bare
+        # "date" or both a "dateTime") - never a mix. Passing only one of
+        # start_time/end_time to convert an all-day event to a timed one
+        # (or vice versa) would otherwise silently leave the other side in
+        # its old shape, producing a payload Google's API would reject.
+        current_end_value, end_is_all_day = _resolve_side(event, "end", end_time)
+        if (
+            timing_update_requested
+            and current_start_value is not None
+            and current_end_value is not None
+            and is_all_day != end_is_all_day
+        ):
+            raise ValueError(
+                "a Google Calendar event's start and end must use the same kind: "
+                "both bare dates for an all-day event or both dateTimes for a "
+                "timed event"
+            )
+        if timing_update_requested and (
+            current_start_value is None or current_end_value is None
+        ):
+            raise ValueError(
+                "the existing event must contain both a valid start and end before "
+                "its schedule or recurrence can be updated"
+            )
+        if schedule_update_requested:
+            _reject_nonpositive_event_window(
+                cast(str, current_start_value),
+                cast(str, current_end_value),
+                is_all_day=is_all_day,
+                start_timezone=(
+                    effective_start_timezone
+                    if event_is_recurring
+                    else own_start_timezone
+                ),
+                end_timezone=(
+                    effective_end_timezone if event_is_recurring else own_end_timezone
+                ),
+            )
+        # Single source of truth for what timeZone (if any) belongs on
+        # each side of this event. Previously computed independently in
+        # three separate places (a per-field "reuse existing" fallback on
+        # start_time/end_time reassignment, an explicit-timezone stamp,
+        # and the recurrence branch's own fallback) - between them they
+        # missed real combinations (a plain reschedule of an
+        # already-recurring event with no existing zone at all sent no
+        # timeZone whatsoever). Computed per side, not one shared value:
+        # start and end can legitimately have different timeZones (e.g. a
+        # flight), so falling back to *start's* zone for *end* too would
+        # silently clobber a genuinely-different existing end zone - each
+        # side's own zone (explicit override, else its own existing
+        # timeZone) only falls back to the *other* side's own zone as a
+        # last resort, when it has none of its own at all (symmetric:
+        # applies in both directions).
+        if (
+            event_is_recurring
+            and not is_all_day
+            and (recurrence is not None or start_time or end_time or timezone)
+        ):
+            # Google requires timeZone unconditionally for a recurring
+            # event, regardless of any offset already in
+            # current_start_value/current_end_value - the offset fixes
+            # this occurrence's instant, timeZone governs how the
+            # recurrence itself expands (e.g. across DST transitions).
+            # This applies whenever the event already has a recurrence,
+            # not just when this call's own recurrence argument sets one
+            # - leaving recurrence unset on an update doesn't clear it.
+            # Gated on this call actually touching recurrence, start/end,
+            # or timezone, not on every update to an already-recurring
+            # event. A metadata-only change (summary, attendees, ...) does
+            # not rewrite start/end, so it should not be blocked by a zone
+            # the *existing* (untouched) data happens to be missing.
+            if not effective_start_timezone:
+                raise ValueError(
+                    "timezone is required when setting recurrence or rescheduling "
+                    "a timed recurring event (Google expands its occurrences in "
+                    "this timezone, and the event doesn't already have one)"
+                )
+            if (
+                not timezone
+                and not own_start_timezone
+                and current_start_value is not None
+                and _has_own_utc_offset(current_start_value)
+            ):
+                raise ValueError(
+                    "the recurring event's start has a UTC offset but no "
+                    "timeZone; the end's timeZone cannot be safely applied to "
+                    "it, so pass timezone explicitly"
+                )
+            if (
+                not timezone
+                and not own_end_timezone
+                and current_end_value is not None
+                and _has_own_utc_offset(current_end_value)
+            ):
+                raise ValueError(
+                    "the recurring event's end has a UTC offset but no "
+                    "timeZone; the start's timeZone cannot be safely applied to "
+                    "it, so pass timezone explicitly"
+                )
+            # cast(), not a runtime check: the raise above already
+            # guarantees effective_start_timezone is set here, and
+            # effective_end_timezone always falls back to it.
+            rule_only_replacement = bool(
+                recurrence is not None
+                and raw_existing_recurrence
+                and not schedule_update_requested
+            )
+            if not rule_only_replacement:
+                _stamp_timezone(
+                    event,
+                    "start",
+                    current_start_value,
+                    cast(str, effective_start_timezone),
+                    force=True,
+                )
+                _stamp_timezone(
+                    event,
+                    "end",
+                    current_end_value,
+                    cast(str, effective_end_timezone),
+                    force=True,
+                )
+        elif (
+            not is_all_day
+            and timezone
+            and (
+                _has_own_utc_offset(cast(str, current_start_value))
+                or _has_own_utc_offset(cast(str, current_end_value))
+            )
+        ):
+            raise ValueError(
+                "timezone cannot be combined with an offset-bearing start_time or "
+                "end_time on a non-recurring event; omit timezone or pass local "
+                "dateTimes without offsets"
+            )
+        elif not is_all_day and (own_start_timezone or own_end_timezone):
+            # For a non-recurring event, timeZone is optional. Apply an explicit
+            # zone to naive values, or reuse each side's stored zone when safe.
+            if own_start_timezone:
+                _stamp_timezone(
+                    event,
+                    "start",
+                    current_start_value,
+                    own_start_timezone,
+                    force=False,
+                )
+            if own_end_timezone:
+                _stamp_timezone(
+                    event, "end", current_end_value, own_end_timezone, force=False
+                )
+
+        if (
+            recurrence is None
+            and start_changed
+            and not kind_conversion_requested
+            and isinstance(existing_recurrence, list)
+        ):
+            for retained_rrule in existing_recurrence:
+                if _recurrence_property_name(retained_rrule) == "RRULE":
+                    _normalize_rrule(
+                        _property_value(retained_rrule),
+                        cast(str, current_start_value),
+                        effective_start_timezone,
+                    )
+
+        stored_exceptions_may_shift = bool(
+            raw_existing_recurrence
+            and (
+                recurrence is not None
+                or (start_time is not None and start_changed)
+                or timezone_changes_schedule_zone
+                or kind_conversion_requested
+            )
+        )
+        if stored_exceptions_may_shift:
+            if not acknowledge_recurring_exception_risk:
+                raise ValueError(
+                    "Google Calendar cannot atomically check instance exceptions "
+                    "and update their recurring master; pass "
+                    "acknowledge_recurring_exception_risk=True only after the user "
+                    "accepts that retained EXDATE/RDATE/EXRULE values may need "
+                    "separate adjustment and that another client could create, "
+                    "edit, or cancel an exception between the check and update"
+                )
+            if _series_has_exceptions(
+                service,
+                event_id,
+                (
+                    event.get("iCalUID")
+                    if isinstance(event.get("iCalUID"), str)
+                    else None
+                ),
+            ):
+                raise ValueError(
+                    "the existing recurring series has edited or cancelled "
+                    "instances whose meaning cannot be safely preserved after "
+                    "changing its recurrence rule, start time, or expansion timezone"
+                )
+
         if description:
             event["description"] = description
         if location:
             event["location"] = location
+        if recurrence is not None:
+            # cast(): the earlier "could not determine the event's start
+            # time" check already guarantees current_start_value is set
+            # whenever recurrence is not None.
+            new_rrule = normalized_conversion_rrule or _normalize_rrule(
+                recurrence,
+                cast(str, current_start_value),
+                effective_start_timezone,
+            )
+            event["recurrence"] = _merge_recurrence(existing_recurrence, new_rrule)
         if added_attendees:
             # Only append the newly-added attendees - existing entries are
             # left completely untouched (dict identity and all), so their
@@ -1873,6 +2655,12 @@ def google_calendar_update_events(
                 {"email": address} for address in added_attendees
             ]
         requested_conference = _apply_conference_request(event, add_google_meet)
+
+        # `timezone` is validated but never belongs on an all-day boundary.
+        # Base the no-op decision on the effective body so syntactic attendee
+        # arguments and notification flags cannot re-enable an unchanged PUT.
+        if timezone and is_all_day and event == fetched_event:
+            return _event_response(event)
 
         request = service.events().update(
             calendarId="primary",

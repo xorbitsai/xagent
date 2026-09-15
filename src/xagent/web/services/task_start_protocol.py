@@ -1,17 +1,14 @@
-"""Dormant wire contract for an accepted CREATE or APPEND turn.
+"""Strict START inputs for accepted turns and explicit existing execution.
 
-No production producer or consumer uses START yet. Acceptance must persist the
-turn, transcript and file bindings in the same transaction as staging below.
-The future runner acquires its own lease; a request-process lease is never
-transferred through this protocol. Resume and process-local runtime inputs are
-outside this first version.
+The existing variant executes the stored description without adding a user
+transcript row. All variants begin execution under the worker coordinator's task ownership.
 """
 
 from __future__ import annotations
 
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -28,6 +25,15 @@ _Identity = Annotated[
     str, Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]+$")
 ]
 _FileId = Annotated[str, Field(min_length=1)]
+
+
+class ExistingExecutionContext(BaseModel):
+    """The three persisted legacy execution options used by execute_task."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    execution_mode: str | None = None
+    process_description: str | None = None
+    examples: list[JsonValue] | None = None
 
 
 class TaskStartPayload(BaseModel):
@@ -51,18 +57,41 @@ class TaskStartPayload(BaseModel):
 
     version: Annotated[int, Field(ge=1, le=1)]
     run_id: _Identity
-    state_version: Annotated[int, Field(ge=1)]
+    state_version: Annotated[int, Field(ge=0)]
+    expected_run_id: _Identity | None = None
     turn_id: _Identity
-    kind: Literal["create", "append"]
+    kind: Literal["create", "append", "existing"]
     message: str
     execution_message: str | None = None
     file_ids: list[_FileId] = Field(default_factory=list)
     before_message_id: Annotated[int, Field(gt=0)] | None = None
     timezone: str | None = None
     force_fresh: bool = False
+    runtime_values_ref: _Identity | None = None
+    existing_context: ExistingExecutionContext | None = None
 
     @model_validator(mode="after")
     def validate_turn_kind(self) -> Self:
+        if (
+            self.runtime_values_ref is not None
+            and self.runtime_values_ref != self.turn_id
+        ):
+            raise ValueError("Runtime values must belong to the accepted turn")
+        if self.kind == "existing":
+            if (
+                self.file_ids
+                or self.before_message_id is not None
+                or self.force_fresh
+                or self.runtime_values_ref is not None
+                or self.message != self.execution_message
+            ):
+                raise ValueError(
+                    "Existing execution cannot add a transcript turn or new inputs"
+                )
+            if self.existing_context is None:
+                raise ValueError("Existing execution requires its explicit context")
+        elif self.existing_context is not None:
+            raise ValueError("Only existing execution accepts legacy context")
         if self.kind == "create" and self.force_fresh:
             raise ValueError("CREATE has no previous execution to discard")
         return self
@@ -84,7 +113,7 @@ def stage_task_start_command(
     it is not the only lock in a valid acceptance transaction. This helper
     does not replace business acceptance.
 
-    Do not commit a RUNNING turn and call this in a later transaction. On any
+    Acceptance preserves the current run and ownership until consumption. On any
     failure the caller must roll back the entire acceptance transaction, as for
     ``stage_task_command``. A repeated identity returns its payload comparison;
     a mismatch must not be committed as a new acceptance.
@@ -107,22 +136,11 @@ def stage_task_start_command(
     if task is None:
         raise TaskCommandTaskMissing(f"Task {task_id} not found")
     if (
-        task.status != TaskStatus.RUNNING
-        or task.run_id != start.run_id
+        task.status == TaskStatus.RUNNING
+        or task.run_id != start.expected_run_id
         or task.state_version != start.state_version
-        or task.control_state != "running"
     ):
-        raise ValueError("START does not match the accepted task turn")
-    if any(
-        value is not None
-        for value in (
-            task.runner_id,
-            task.lease_attempt_id,
-            task.lease_expires_at,
-            task.last_heartbeat_at,
-        )
-    ):
-        raise ValueError("START acceptance must not own an execution lease")
+        raise ValueError("START does not match its admission snapshot")
     return stage_task_command(
         db,
         task_id=task_id,
@@ -130,6 +148,7 @@ def stage_task_start_command(
         command_id=start.turn_id,
         kind=TaskCommandKind.START,
         payload=start.model_dump(mode="json"),
+        target_run_id=start.run_id,
     )
 
 
@@ -137,7 +156,7 @@ def read_task_start_command(command: ClaimedTaskCommand) -> TaskStartPayload:
     """Decode persisted inputs and verify their immutable envelope identity.
 
     This does not authorize execution, acquire a lease or prove that a prior
-    attempt had no effect. Those are responsibilities of the future consumer.
+    attempt had no effect. Those are responsibilities of the START consumer.
     """
     if command.kind != TaskCommandKind.START:
         raise ValueError("Expected a START command")

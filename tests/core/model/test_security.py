@@ -218,6 +218,18 @@ def test_redact_url_credentials_for_logging_masks_sensitive_query_values() -> No
     assert "v=1" in redacted
 
 
+def test_redact_url_credentials_for_logging_can_mask_every_query_value() -> None:
+    url = (
+        "https://example.com/path?client_secret=secret-one"
+        "&subscription-key=secret-two&q=diagnostic"
+    )
+    redacted = redact_url_credentials_for_logging(url, redact_all_query_values=True)
+
+    assert "secret-one" not in redacted
+    assert "secret-two" not in redacted
+    assert "diagnostic" not in redacted
+
+
 def test_redact_url_credentials_for_logging_masks_embedded_userinfo() -> None:
     # The query string isn't the only -- or even the most common -- place a
     # URL carries a credential; a proxy URL's "user:pass@host" needs the

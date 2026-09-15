@@ -1035,6 +1035,11 @@ def test_offset_datetime_string_rejects_input_that_already_carries_an_offset():
         utils.offset_datetime_string("2026-08-27T10:00:00+00:00", "Asia/Shanghai")
 
 
+def test_offset_datetime_string_rejects_a_nonexistent_dst_gap_time():
+    with pytest.raises(ValueError, match="does not exist.*daylight-saving"):
+        utils.offset_datetime_string("2026-03-08T02:30:00", "America/Los_Angeles")
+
+
 def test_conflict_response_uncapped_when_it_fits(monkeypatch):
     monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "50000")
     conflicts = [{"calendar": "organizer", "summary": "1:1", "start": "a", "end": "b"}]

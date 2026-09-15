@@ -1933,9 +1933,11 @@ async def shutdown_event() -> None:
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.
+    from .services.task_coordinator_runtime import close_task_coordinators
     from .services.task_execution import background_task_manager
     from .services.task_lease_service import wait_for_heartbeat_manager_idle
 
+    await close_task_coordinators()
     await background_task_manager.shutdown()
     await wait_for_heartbeat_manager_idle()
 

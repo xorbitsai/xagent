@@ -436,11 +436,27 @@ def _mask_secret(value: str) -> str:
 _USERINFO_PREFIX_PATTERN = re.compile(r"://[^/\s@]*@")
 
 
-def redact_url_credentials_for_logging(url: str) -> str:
+def host_matches_suffix(hostname: str, suffix: str) -> bool:
+    """Return whether ``hostname`` is ``suffix`` or one of its subdomains."""
+    hostname = hostname.lower()
+    suffix = suffix.lower()
+    return hostname == suffix or hostname.endswith(f".{suffix}")
+
+
+def redact_url_credentials_for_logging(
+    url: str, *, redact_all_query_values: bool = False
+) -> str:
     """Redact sensitive query credentials and any embedded userinfo from a
     URL (e.g. a proxy URL's "user:pass@host", the single most common place
     a URL carries a credential -- a query-string-only check would silently
-    pass it through unchanged)."""
+    pass it through unchanged).
+
+    ``redact_all_query_values`` is for callers that accept arbitrary query
+    parameters and therefore cannot know which values are credentials. The
+    default remains selective because many existing diagnostic call sites
+    intentionally retain ordinary query values. See issue #2356 for the
+    broader, repository-wide limits of keyword-based secret redaction.
+    """
     if not url:
         return url
 
@@ -461,7 +477,7 @@ def redact_url_credentials_for_logging(url: str) -> str:
 
     redacted_items: list[tuple[str, str]] = []
     for key, value in query_items:
-        if key.lower() in SENSITIVE_QUERY_KEYS and value:
+        if value and (redact_all_query_values or key.lower() in SENSITIVE_QUERY_KEYS):
             redacted_items.append((key, _mask_secret(value)))
         else:
             redacted_items.append((key, value))

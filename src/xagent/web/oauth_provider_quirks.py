@@ -83,21 +83,6 @@ def matches_provider_family(provider: str, base_name: str) -> bool:
     return lowered == lowered_base_name or lowered.startswith(f"{lowered_base_name}-")
 
 
-def host_matches_suffix(hostname: str, suffix: str) -> bool:
-    """True if `hostname` is exactly `suffix` or a subdomain of it.
-
-    Callers are expected to pass an already-lowercased `hostname` (e.g.
-    from `urlparse(...).hostname`, which itself already lowercases) and a
-    lowercase `suffix` literal. Shared so this "exact match or dot-anchored
-    subdomain" comparison -- used to validate that a URL genuinely belongs
-    to a given provider's real domain before trusting it (see auth.py's
-    _normalize_deputy_endpoint and _is_employment_hero_token_url) -- has
-    exactly one implementation, the same reasoning matches_provider_family
-    above gives for its own "-"-anchored family matching.
-    """
-    return hostname == suffix or hostname.endswith(f".{suffix}")
-
-
 # Providers whose authorization-code grant requires PKCE (a code_challenge on
 # the authorize redirect, a code_verifier on the token exchange), with no
 # per-app way to disable it. Every PKCE-only code path must use this same

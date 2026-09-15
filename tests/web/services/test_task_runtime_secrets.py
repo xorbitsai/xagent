@@ -1,4 +1,4 @@
-"""Single-turn runtime inputs remain encrypted, scoped and transactional."""
+"""Run-scoped runtime inputs remain encrypted, scoped and transactional."""
 
 import pytest
 from cryptography.fernet import Fernet, InvalidToken
@@ -117,7 +117,7 @@ def test_compensation_preserves_queued_and_active_inputs(task_id):
     clean_finished_runtime_values()
     with get_session_local()() as db:
         assert db.query(TaskRuntimeSecret).count() == 1
-        db.get(Task, task_id).status = TaskStatus.PAUSED
+        db.get(Task, task_id).status = TaskStatus.COMPLETED
         db.commit()
     clean_finished_runtime_values()
     with get_session_local()() as db:
@@ -127,7 +127,7 @@ def test_compensation_preserves_queued_and_active_inputs(task_id):
 @pytest.mark.parametrize(
     "resting_status", [TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER]
 )
-def test_resumed_execution_requires_fresh_values_after_lease_release(
+def test_resumed_execution_reuses_run_values_after_lease_release(
     task_id, resting_status
 ):
     with get_session_local()() as db:
@@ -143,15 +143,13 @@ def test_resumed_execution_requires_fresh_values_after_lease_release(
         db.commit()
     clean_finished_runtime_values()
     with get_session_local()() as db:
-        assert db.query(TaskRuntimeSecret).count() == 0
+        assert db.query(TaskRuntimeSecret).count() == 1
         task = db.get(Task, task_id)
         task.status = TaskStatus.RUNNING
         task.runner_id = "resumed-worker"
-        with pytest.raises(ConnectorRuntimeError) as error:
-            load_runtime_values(db, task=task, turn_id="turn-1", required=True)
-        assert error.value.code == ERROR_RUNTIME_SECRET_UNAVAILABLE
-        stage(db, task_id)
-        assert load_runtime_values(db, task=task, turn_id="turn-1", required=True)
+        assert load_runtime_values(db, task=task, required=True) == {
+            ref.storage_key: values for ref, values in VALUES.items()
+        }
 
 
 def test_cleanup_cannot_observe_inputs_before_transaction_binds_run(task_id):
@@ -221,6 +219,73 @@ def test_store_does_not_reuse_cached_development_cipher(
         get_cipher.cache_clear()
 
 
+@pytest.mark.parametrize("status", [TaskStatus.COMPLETED, TaskStatus.FAILED])
+def test_terminal_cleanup_is_scoped_to_run(task_id, status):
+    with get_session_local()() as db:
+        stage(db, task_id)
+        db.get(Task, task_id).status = status
+        db.commit()
+    clean_finished_runtime_values(task_id=task_id, run_id="other-run")
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 1
+    clean_finished_runtime_values(task_id=task_id, run_id="run-1")
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 0
+
+
+def test_new_run_never_inherits_old_values_and_old_cleanup_preserves_new(task_id):
+    with get_session_local()() as db:
+        stage(db, task_id)
+        task = db.get(Task, task_id)
+        task.run_id = "run-2"
+        db.flush()
+        assert load_runtime_values(db, task=task) is None
+        stage_runtime_values(
+            db, task_id=task_id, turn_id="turn-2", values_by_ref=VALUES
+        )
+        bind_runtime_values_to_run(
+            db, task_id=task_id, turn_id="turn-2", run_id="run-2"
+        )
+        db.commit()
+    clean_finished_runtime_values(task_id=task_id, run_id="run-1")
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).one().run_id == "run-2"
+        assert load_runtime_values(db, task=db.get(Task, task_id), required=True)
+
+
+def test_missing_accepted_values_fail_even_when_optional(task_id):
+    from xagent.web.services.task_start_protocol import (
+        TaskStartPayload,
+        stage_task_start_command,
+    )
+
+    with get_session_local()() as db:
+        task = db.get(Task, task_id)
+        task.status = TaskStatus.PENDING
+        task.run_id = None
+        stage_task_start_command(
+            db,
+            task_id=task_id,
+            actor_user_id=task.user_id,
+            start=TaskStartPayload(
+                version=1,
+                run_id="run-1",
+                state_version=1,
+                turn_id="turn-1",
+                kind="create",
+                message="hello",
+                runtime_values_ref="turn-1",
+            ),
+        )
+        task.status = TaskStatus.RUNNING
+        task.run_id = "run-1"
+        db.commit()
+    with get_session_local()() as db:
+        with pytest.raises(ConnectorRuntimeError) as error:
+            load_runtime_values(db, task=db.get(Task, task_id))
+        assert error.value.code == ERROR_RUNTIME_SECRET_UNAVAILABLE
+
+
 @pytest.mark.parametrize(
     "key_state", ["unset", "empty", "default", "malformed", "rotated"]
 )
@@ -257,3 +322,61 @@ def test_read_distinguishes_key_configuration_from_decryption_failure(
         assert error.value.status_code == 503
         assert "synthetic-secret" not in str(error.value)
         assert db.query(TaskRuntimeSecret).count() == 1
+
+
+@pytest.mark.parametrize(
+    "status,removed",
+    [
+        (TaskStatus.COMPLETED, True),
+        (TaskStatus.FAILED, True),
+        (TaskStatus.PAUSED, False),
+        (TaskStatus.WAITING_FOR_USER, False),
+        (TaskStatus.RUNNING, False),
+    ],
+)
+def test_expired_terminal_owner_does_not_leak_inputs(task_id, status, removed):
+    from datetime import datetime, timedelta, timezone
+
+    with get_session_local()() as db:
+        stage(db, task_id)
+        task = db.get(Task, task_id)
+        task.status = status
+        task.runner_id = "dead-worker"
+        task.lease_attempt_id = "dead-attempt"
+        task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+        db.commit()
+    clean_finished_runtime_values()
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 1
+        db.get(Task, task_id).lease_expires_at = datetime.now(timezone.utc) - timedelta(
+            minutes=1
+        )
+        db.commit()
+    clean_finished_runtime_values()
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == (0 if removed else 1)
+
+
+def test_cleanup_pages_past_retained_inputs(task_id):
+    with get_session_local()() as db:
+        owner = db.get(Task, task_id).user_id
+        for i in range(5):
+            task = Task(
+                user_id=owner,
+                title=str(i),
+                run_id="run-1",
+                status=TaskStatus.WAITING_FOR_USER if i < 4 else TaskStatus.COMPLETED,
+            )
+            db.add(task)
+            db.flush()
+            stage(db, task.id)
+        db.commit()
+    cursor = clean_finished_runtime_values(batch_size=2)
+    assert cursor is not None
+    cursor = clean_finished_runtime_values(batch_size=2, after_id=cursor)
+    assert cursor is not None
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 5
+    assert clean_finished_runtime_values(batch_size=2, after_id=cursor) is None
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 4

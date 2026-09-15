@@ -67,6 +67,23 @@ _wall_clock = time.time
 _FORBIDDEN_REPO_CHARS = re.compile(r"[/?#]")
 
 
+class _GitHubAPIError(RuntimeError):
+    """Raised by _request_raw for a >=400 GitHub response.
+
+    Carries the response's `status_code` as structured state so callers can
+    branch on it directly instead of pattern-matching GitHub's rendered
+    English error text (fragile: reworded messages, or a 422 "errors" detail
+    that happens to mention an unrelated field, both defeat a substring
+    match) -- str(e) still equals the rendered message, so every existing
+    `except Exception as e: ... str(e)` call site is unaffected. Mirrors
+    slack.py's _SlackAPIError.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(message)
+
+
 def _encode_path_component(value: str, *, field: str) -> str:
     """Validate and percent-encode one owner/repo path segment.
 
@@ -114,6 +131,24 @@ def _encode_file_path_segment(value: str, *, field: str) -> str:
     if not value or value in (".", ".."):
         raise ValueError(f"{field} contains characters that are not allowed: {value!r}")
     return quote(value, safe="")
+
+
+def _encode_file_path(path: str) -> str:
+    """Percent-encode a repo-relative file path for direct interpolation
+    into a request URL ("" for the repo root).
+
+    Unlike a path sent as a query param (which requests percent-encodes
+    regardless of content), an interpolated one is validated/encoded per
+    segment via _encode_file_path_segment: legitimate filename characters
+    like '?'/'#' are allowed (percent-encoded away rather than reaching the
+    URL raw), while an empty segment (from a leading/trailing/double slash)
+    and dot-segments are rejected.
+    """
+    if not path:
+        return ""
+    return "/".join(
+        _encode_file_path_segment(segment, field="path") for segment in path.split("/")
+    )
 
 
 def _decode_base64_content(raw_content: str) -> bytes:
@@ -186,6 +221,32 @@ def _success(**payload: Any) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _forbidden_write_error(exc: "_GitHubAPIError", *, repo: str, path: str = "") -> str:
+    """A 403 on a write call, shared by github_create_branch and
+    github_create_or_update_file.
+
+    Deliberately non-committal between the rate-limit and read-only-grant
+    causes -- _request_raw already appends any rate-limit headers it saw to
+    `str(exc)`, so the caller sees that detail (if present) rather than
+    this hint having to duplicate it. `path` (file writes only) gets one
+    more targeted addition: this connector's OAuth scopes (builtin_mcp_
+    registry.py) deliberately omit `workflow`, so a write under
+    ".github/workflows/" 403s for a reason no amount of push access fixes.
+    """
+    workflow_note = (
+        " -- note: this connector's OAuth grant doesn't include GitHub's "
+        "`workflow` scope, so it can never write under '.github/workflows/', "
+        "regardless of push access"
+        if path.startswith(".github/workflows/")
+        else ""
+    )
+    return _error(
+        f"{exc} -- either rate-limited or the connected account can read "
+        f"but not write '{repo}' (check the account has push access, and "
+        f"that GITHUB_ACCESS_TOKEN's grant hasn't been revoked){workflow_note}"
+    )
 
 
 def _partial(**payload: Any) -> str:
@@ -283,6 +344,55 @@ def _require_nonblank(value: str, *, field: str) -> str:
     if not value or not value.strip():
         raise ValueError(f"{field} must not be empty")
     return value
+
+
+# git-check-ref-format's forbidden characters: ASCII control characters
+# (\x00-\x1f, \x7f) plus whitespace, "~", "^", ":", "?", "*", "[", and "\\".
+# "#" is a legal git ref character and deliberately NOT included here --
+# every place a branch name reaches a URL (the ref-lookup GET) goes through
+# _encode_file_path, which percent-encodes it regardless of content, so
+# there is no injection risk to guard against by over-rejecting it.
+_FORBIDDEN_BRANCH_CHARS = re.compile(r"[\x00-\x1f\x7f\s~^:?*\[\\]")
+
+
+def _validate_branch_name(value: str, *, field: str) -> str:
+    """Reject a blank, ref-qualified, or git-invalid branch name before it
+    is spliced into a "refs/heads/..." ref or a request URL.
+
+    Takes the bare name ("feature/x"), never "refs/heads/feature/x": the
+    tools add the "refs/heads/" prefix themselves, so accepting the
+    qualified form would create "refs/heads/refs/heads/feature/x". Follows
+    git-check-ref-format(1)'s rules closely enough to catch a malformed name
+    here (with the field it came from) rather than as an opaque, unlabeled
+    422 from GitHub -- not exhaustively (e.g. a name ending in "/" the OS
+    path-join already turns into an empty trailing segment, caught below).
+
+    A few of these rules apply to the whole name, not each "/"-separated
+    component: "cannot end with a dot" is one (so "foo./bar" is valid --
+    only the last segment must not end in "."), unlike "no component may
+    start with a dot" or "end with .lock", which are genuinely per-segment.
+    Conflating the two previously rejected valid names like "foo./bar".
+    """
+    name = _require_nonblank(value, field=field).strip()
+    if name.startswith("refs/"):
+        raise ValueError(
+            f'{field} must be a bare branch name, not a "refs/..." ref: {name!r}'
+        )
+    if (
+        name == "@"
+        or ".." in name
+        or "@{" in name
+        or name.endswith(".")
+        or _FORBIDDEN_BRANCH_CHARS.search(name)
+    ):
+        raise ValueError(f"{field} contains characters that are not allowed: {name!r}")
+    for segment in name.split("/"):
+        _encode_file_path_segment(segment, field=field)
+        if segment.startswith(".") or segment.endswith(".lock"):
+            raise ValueError(
+                f"{field} contains characters that are not allowed: {name!r}"
+            )
+    return name
 
 
 _ISSUE_OR_PR_STATES = frozenset({"open", "closed", "all"})
@@ -465,7 +575,7 @@ def _request_raw(
             message = f"{message} ({', '.join(rate_limit_bits)})"
         if len(message) > MAX_ERROR_RESPONSE_TEXT_CHARS:
             message = message[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
-        raise RuntimeError(message)
+        raise _GitHubAPIError(message, status_code=response.status_code)
     return response
 
 
@@ -1061,6 +1171,111 @@ def github_create_pull_request(
 
 
 @mcp.tool()
+def github_create_branch(repo: str, branch: str, from_ref: str = "") -> str:
+    """
+    Create a new branch in a repository.
+    repo: "owner/repo".
+    branch: the new branch's bare name (e.g. "docs/update-readme" -- not
+    "refs/heads/...").
+    from_ref: the existing BRANCH to start from (defaults to the repo's
+    default branch) -- a branch name only, not a tag or commit sha (unlike
+    the `ref` parameter elsewhere in this connector, e.g.
+    github_get_file_contents).
+
+    Use this before github_create_or_update_file when a change should be
+    reviewed rather than committed straight to the default branch, then
+    open it with github_create_pull_request.
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        branch = _validate_branch_name(branch, field="branch")
+        if not isinstance(from_ref, str):
+            raise ValueError(
+                f"from_ref must be a string, got: {type(from_ref).__name__}"
+            )
+        # Plain truthy check, not from_ref.strip() -- unlike a value
+        # _require_nonblank guards, from_ref="" (the default) legitimately
+        # means "not provided" here, but a whitespace-only value must still
+        # reach _validate_branch_name's rejection below rather than being
+        # silently treated as absent by a check that would strip it to "".
+        if from_ref:
+            source = _validate_branch_name(from_ref, field="from_ref")
+        else:
+            try:
+                repository = _request("GET", f"/repos/{owner}/{name}")
+            except _GitHubAPIError as exc:
+                if exc.status_code == 404:
+                    return _error(f"{exc} -- repository '{repo}' not found")
+                raise
+            _require_object(repository, context=f"repository '{repo}'")
+            default_branch = repository.get("default_branch")
+            if not isinstance(default_branch, str) or not default_branch:
+                return _error(
+                    f"Could not determine the default branch of '{repo}'; pass "
+                    "from_ref explicitly"
+                )
+            # GitHub-supplied, but validated identically to an explicit
+            # from_ref rather than trusted blind -- so a failure here (e.g.
+            # an edge-case empty repo) is labeled "from_ref", not the
+            # generic "path" _encode_file_path would otherwise raise it as
+            # below.
+            source = _validate_branch_name(default_branch, field="from_ref")
+        try:
+            ref = _request(
+                "GET",
+                f"/repos/{owner}/{name}/git/ref/heads/{_encode_file_path(source)}",
+            )
+        except _GitHubAPIError as exc:
+            # GitHub answers both a missing repo and a missing ref with 404
+            # (it doesn't distinguish the two here), so the message stays
+            # honestly ambiguous between them rather than picking one.
+            if exc.status_code == 404:
+                return _error(
+                    f"{exc} -- repository '{repo}' or branch '{source}' not found"
+                )
+            raise
+        _require_object(ref, context=f"ref 'heads/{source}' in '{repo}'")
+        source_sha = (ref.get("object") or {}).get("sha")
+        if not isinstance(source_sha, str) or not source_sha:
+            return _error(f"Ref 'heads/{source}' in '{repo}' has no commit sha")
+        try:
+            result = _request(
+                "POST",
+                f"/repos/{owner}/{name}/git/refs",
+                json_data={"ref": f"refs/heads/{branch}", "sha": source_sha},
+            )
+        except _GitHubAPIError as exc:
+            # Empirically confirmed against the live API (not just docs,
+            # which disagree with this): an existing ref answers with 422
+            # "Reference already exists", not 409. 422 is also this
+            # endpoint's generic validation-failure code, so unlike the
+            # 404/409 checks elsewhere in this file, this one additionally
+            # requires the message to actually say so before attributing an
+            # unrelated 422 to "already exists".
+            if exc.status_code == 422 and "already exists" in str(exc).lower():
+                return _error(
+                    f"{exc} -- branch '{branch}' already exists in '{repo}'; pass it "
+                    "as `branch` to github_create_or_update_file directly, or "
+                    "choose another name"
+                )
+            if exc.status_code == 403:
+                return _forbidden_write_error(exc, repo=repo)
+            raise
+        _require_object(result, context=f"created branch '{branch}' in '{repo}'")
+        return _success(
+            branch=branch,
+            ref=result.get("ref"),
+            sha=(result.get("object") or {}).get("sha"),
+            from_ref=source,
+        )
+    except Exception as e:
+        logger.error(
+            f"Error creating GitHub branch {repo}:{branch}: {e}", exc_info=True
+        )
+        return _error(str(e))
+
+
+@mcp.tool()
 def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
     """
     Read a file's contents, or list a directory, at a path in a repository.
@@ -1079,23 +1294,7 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
     """
     try:
         owner, name = _parse_repo(repo)
-        # path is interpolated directly into the request URL below (unlike
-        # github_list_commits' path, sent as a query param that requests
-        # percent-encodes regardless of content) -- each segment is
-        # validated/encoded individually via _encode_file_path_segment,
-        # which (unlike _parse_repo's owner/repo validator) allows
-        # legitimate filename characters like '?'/'#' since they're
-        # percent-encoded away rather than reaching the URL raw. An empty
-        # segment (from a leading/trailing/double slash) is rejected by its
-        # own emptiness check.
-        encoded_path = (
-            "/".join(
-                _encode_file_path_segment(segment, field="path")
-                for segment in path.split("/")
-            )
-            if path
-            else ""
-        )
+        encoded_path = _encode_file_path(path)
         params: dict[str, Any] = {"ref": ref} if ref else {}
         result = _request(
             "GET", f"/repos/{owner}/{name}/contents/{encoded_path}", params=params
@@ -1224,6 +1423,161 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
         logger.error(
             f"Error fetching GitHub file contents {repo}:{path}: {e}", exc_info=True
         )
+        return _error(str(e))
+
+
+_CONTENT_ENCODINGS = frozenset({"utf-8", "base64"})
+# The Contents API's write-side limit -- same order of magnitude as
+# github_get_file_contents' own ~1MB read-side limit (both referenced from
+# GitHub's docs; GitHub does not publish an exact byte count for either
+# side, so this is deliberately not claimed to be the precise cutoff).
+_CONTENTS_API_MAX_BYTES = 1_000_000
+# GitHub.com hosts SHA-1 repositories only (SHA-256 is git-upstream
+# experimental, not offered by any major host, GitHub included) -- every
+# blob/commit sha this connector's own tools return (github_get_file_contents,
+# github_list_commits, github_create_branch) is exactly this shape.
+_COMMIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+
+
+@mcp.tool()
+def github_create_or_update_file(
+    repo: str,
+    path: str,
+    content: str,
+    message: str,
+    branch: str = "",
+    sha: str = "",
+    content_encoding: str = "utf-8",
+) -> str:
+    """
+    Create a file, or replace an existing file's contents, in one commit.
+    repo: "owner/repo".
+    path: file path relative to the repo root (e.g. "docs/README.md").
+    content: the complete new file body (not a diff).
+    message: the commit message.
+    branch: branch to commit to (defaults to the repo's default branch).
+    sha: required when the file already exists -- the exact 40-character
+    hex `sha` returned by github_get_file_contents for the version being
+    replaced, unmodified. GitHub rejects the write if the file changed
+    since that read, so this also guards
+    against overwriting someone else's commit.
+    content_encoding: "utf-8" (default) for text, or "base64" when
+    `content` is already base64-encoded binary (the form
+    github_get_file_contents returns for non-UTF-8 files).
+
+    Commits directly to `branch`. When the change should be reviewed first,
+    create a branch with github_create_branch, commit there, and open it
+    with github_create_pull_request.
+    """
+    try:
+        owner, name = _parse_repo(repo)
+        # .strip() before validation/encoding: unlike branch/sha below, an
+        # unstripped path would otherwise pass _require_nonblank (it's not
+        # blank) and _encode_file_path (a leading/trailing space isn't a
+        # forbidden character) and reach GitHub as a literal, differently-
+        # named path -- e.g. " README.md" creates a stray file next to the
+        # intended one instead of updating it.
+        path = _require_nonblank(path, field="path").strip()
+        # .strip() for the same reason path is stripped above: an unstripped
+        # message would otherwise bake a stray leading/trailing space into
+        # the commit shown in `git log` and GitHub's UI.
+        message = _require_nonblank(message, field="message").strip()
+        if content_encoding not in _CONTENT_ENCODINGS:
+            raise ValueError(
+                f"content_encoding must be one of {sorted(_CONTENT_ENCODINGS)!r}, "
+                f"got: {content_encoding!r}"
+            )
+        if not isinstance(content, str):
+            raise ValueError(f"content must be a string, got: {type(content).__name__}")
+        if not isinstance(branch, str):
+            raise ValueError(f"branch must be a string, got: {type(branch).__name__}")
+        if not isinstance(sha, str):
+            raise ValueError(f"sha must be a string, got: {type(sha).__name__}")
+        encoded_path = _encode_file_path(path)
+        json_data: dict[str, Any] = {"message": message}
+        # Plain truthy check, not branch.strip() -- see the matching
+        # comment on from_ref in github_create_branch for why a
+        # whitespace-only value must not be silently treated as absent.
+        if branch:
+            json_data["branch"] = _validate_branch_name(branch, field="branch")
+        if sha:
+            # Reject a malformed sha outright rather than silently
+            # stripping it into shape (this module's "reject rather than
+            # repair" convention, see _encode_path_component) -- a caller
+            # bug that produces e.g. a whitespace-padded or truncated sha
+            # should surface here, not be silently coerced into either a
+            # request GitHub then 409s on, or a "no sha" write that
+            # skips the conflict check the caller thought they had.
+            if not _COMMIT_SHA_PATTERN.fullmatch(sha):
+                raise ValueError(f"sha must be a 40-character hex string, got: {sha!r}")
+            json_data["sha"] = sha
+        if content_encoding == "base64":
+            # Round-trip through the strict decoder so malformed input fails
+            # here rather than as an opaque 422 from GitHub, and so
+            # newline-wrapped base64 (as github_get_file_contents returns
+            # it) is normalized instead of sent with embedded whitespace.
+            raw_content = _decode_base64_content(content)
+        else:
+            raw_content = content.encode("utf-8")
+        if len(raw_content) > _CONTENTS_API_MAX_BYTES:
+            # Symmetric with github_get_file_contents' own ~1MB check --
+            # without this, an oversized write reaches GitHub and fails
+            # with whatever opaque error it emits, instead of the same
+            # clear, actionable message the read path already gives.
+            return _error(
+                f"File '{path}' is {len(raw_content)} bytes, over the "
+                f"Contents API's ~{_CONTENTS_API_MAX_BYTES // 1_000_000}MB write "
+                "limit -- this connector has no Git Data API tool for larger "
+                "files"
+            )
+        json_data["content"] = base64.b64encode(raw_content).decode("ascii")
+        try:
+            response = _request_raw(
+                "PUT",
+                f"/repos/{owner}/{name}/contents/{encoded_path}",
+                json_data=json_data,
+            )
+        except _GitHubAPIError as exc:
+            # Empirically confirmed against the live API (not just docs,
+            # which disagree with this): a missing sha on an existing file
+            # is 422, and a stale sha (one that no longer matches) is 409 --
+            # two distinct codes, so no message-text matching is needed;
+            # which hint applies is decided by what *we* sent (json_data).
+            if exc.status_code == 422 and "sha" not in json_data:
+                return _error(
+                    f"{exc} -- '{path}' already exists in '{repo}'; read it with "
+                    "github_get_file_contents and pass its `sha` to replace it"
+                )
+            if exc.status_code == 409 and "sha" in json_data:
+                return _error(
+                    f"{exc} -- '{path}' changed since it was read; re-read it with "
+                    "github_get_file_contents and retry with the current `sha`"
+                )
+            if exc.status_code == 404:
+                if "branch" in json_data:
+                    return _error(
+                        f"{exc} -- repository '{repo}' or branch "
+                        f"'{json_data['branch']}' not found"
+                    )
+                return _error(f"{exc} -- repository '{repo}' not found")
+            if exc.status_code == 403:
+                return _forbidden_write_error(exc, repo=repo, path=path)
+            raise
+        result = response.json() if response.content else {}
+        _require_object(result, context=f"file write to '{repo}:{path}'")
+        file_info = result.get("content") or {}
+        commit = result.get("commit") or {}
+        return _success(
+            action="created" if response.status_code == 201 else "updated",
+            path=file_info.get("path") or path,
+            content_sha=file_info.get("sha"),
+            html_url=file_info.get("html_url"),
+            commit_sha=commit.get("sha"),
+            commit_html_url=commit.get("html_url"),
+            branch=json_data.get("branch"),
+        )
+    except Exception as e:
+        logger.error(f"Error writing GitHub file {repo}:{path}: {e}", exc_info=True)
         return _error(str(e))
 
 

@@ -236,6 +236,14 @@ async def _start_a2a_turn(
             status_code=400,
             details={"taskId": exc.task_id},
         ) from exc
+    except task_resume_service.TaskResumeOutcomeUnknownError as exc:
+        raise a2a_error(
+            "reply_outcome_unknown",
+            "Reply was accepted but preparation has not finished. "
+            "Check task status before sending another reply.",
+            status_code=504,
+            details={"accepted": True, "taskId": task_id},
+        ) from exc
     except task_resume_service.TaskResumeBusyError as exc:
         raise a2a_error(
             "unsupported_operation",

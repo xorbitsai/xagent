@@ -1295,7 +1295,16 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
     claim_started = threading.Event()
     release_claim = threading.Event()
 
-    def slow_claim(task_id, task_owner_user_id, *, payload, kind):
+    def slow_claim(
+        task_id,
+        task_owner_user_id,
+        *,
+        payload,
+        kind,
+        context=None,
+        force_fresh=False,
+        actor_user_id=None,
+    ):
         claim_started.set()
         assert release_claim.wait(timeout=GUARD_TIMEOUT)
         return _ClaimedTurn(
@@ -1359,7 +1368,16 @@ async def test_repeated_cancellation_keeps_turn_command_gate_until_claim_settles
     release_claim = threading.Event()
     contender_entered = asyncio.Event()
 
-    def blocked_claim(task_id, task_owner_user_id, *, payload, kind):
+    def blocked_claim(
+        task_id,
+        task_owner_user_id,
+        *,
+        payload,
+        kind,
+        context=None,
+        force_fresh=False,
+        actor_user_id=None,
+    ):
         claim_started.set()
         assert release_claim.wait(timeout=2)
         return _ClaimedTurn(

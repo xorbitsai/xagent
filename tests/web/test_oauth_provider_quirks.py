@@ -1,7 +1,7 @@
 import pytest
 
+from xagent.core.utils.security import host_matches_suffix
 from xagent.web.oauth_provider_quirks import (
-    host_matches_suffix,
     matches_provider_family,
     meta_invalid_token_error_code,
     requires_json_accept_header,

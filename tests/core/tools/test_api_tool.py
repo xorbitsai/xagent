@@ -6,14 +6,294 @@ import json
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 
 from xagent.core.tools.adapters.vibe.api_tool import APICallArgs, APITool
-from xagent.core.tools.core.api_tool import APIClientCore, call_api
+from xagent.core.tools.core.api_tool import (
+    APIClientCore,
+    _hostname_matches_connector_domain,
+    _sanitize_final_url,
+    call_api,
+    has_auth_credentials,
+    match_known_connector_domain,
+    match_known_connector_url,
+)
 
 
 def _single_value_query_args(url: str) -> dict[str, str]:
     return {key: values[-1] for key, values in parse_qs(urlparse(url).query).items()}
+
+
+class TestMatchKnownConnectorDomain:
+    def test_matches_exact_host(self):
+        assert match_known_connector_domain("api.github.com") == "GitHub"
+
+    def test_matches_subdomain_of_a_multi_tenant_service(self):
+        assert match_known_connector_domain("acme.myshopify.com") == "Shopify"
+        assert match_known_connector_domain("acme.zendesk.com") == "Zendesk"
+
+    def test_matches_salesforce_and_xero(self):
+        """Both are live, registered OAuth connectors that were previously
+        missing from the domain list entirely, despite Salesforce being
+        named explicitly in the code's own comment."""
+        assert match_known_connector_domain("acme.my.salesforce.com") == "Salesforce"
+        assert match_known_connector_domain("login.salesforce.com") == "Salesforce"
+        assert match_known_connector_domain("api.xero.com") == "Xero"
+
+    def test_matches_specific_google_product_hosts(self):
+        assert match_known_connector_domain("gmail.googleapis.com") == "Gmail"
+        assert match_known_connector_domain("googleads.googleapis.com") == "Google Ads"
+        assert (
+            match_known_connector_domain("analyticsdata.googleapis.com")
+            == "Google Analytics"
+        )
+        assert (
+            match_known_connector_domain("searchconsole.googleapis.com")
+            == "Google Search Console"
+        )
+
+    def test_does_not_match_an_uncovered_googleapis_subdomain(self):
+        """Regression: a blanket "googleapis.com" entry used to match every
+        Google Cloud API subdomain, including ones with no xagent connector
+        at all (Cloud Storage, BigQuery, Translate, ...) - blocking them
+        with a "use the dedicated connector" message that was actively
+        wrong since no such connector exists for that API."""
+        assert match_known_connector_domain("storage.googleapis.com") is None
+        assert match_known_connector_domain("bigquery.googleapis.com") is None
+
+    def test_does_not_match_slack_incoming_webhook_subdomain(self):
+        """hooks.slack.com (incoming webhooks) is a different,
+        self-authenticating product from the credentialed Slack Web API at
+        slack.com/api - the guard must not touch it even though it shares
+        the slack.com suffix."""
+        assert match_known_connector_domain("slack.com") == "Slack"
+        assert match_known_connector_domain("hooks.slack.com") is None
+        assert match_known_connector_domain("tenant.hooks.slack.com") is None
+
+    def test_matches_search_console_on_shared_google_host_by_path(self):
+        assert (
+            match_known_connector_url(
+                "https://www.googleapis.com/webmasters/v3/sites/example.com"
+            )
+            == "Google Search Console"
+        )
+        assert match_known_connector_url("https://www.googleapis.com/drive/v3") is None
+
+    def test_is_case_insensitive(self):
+        assert match_known_connector_domain("API.HUBAPI.COM") == "HubSpot"
+
+    def test_does_not_match_an_unrelated_domain(self):
+        assert match_known_connector_domain("httpbin.org") is None
+
+    def test_does_not_match_a_lookalike_suffix(self):
+        """ "notzendesk.com" shares a suffix with "zendesk.com" as a raw
+        string but is not "*.zendesk.com" - the dot-boundary check in
+        _hostname_matches_connector_domain must reject it, not just do a
+        substring/endswith check on the bare strings."""
+        assert match_known_connector_domain("notzendesk.com") is None
+
+    def test_does_not_match_domain_as_a_trailing_path_look_alike(self):
+        """A hostname that merely contains the target domain as a substring
+        elsewhere (not as its own suffix) must not match."""
+        assert (
+            _hostname_matches_connector_domain(
+                "zendesk.com.evil.example", "zendesk.com"
+            )
+            is False
+        )
+
+    def test_real_connector_base_urls_are_covered(self):
+        """Keep the diagnostic inventory tied to connector-owned constants,
+        including Search Console's shared-host Webmasters endpoint."""
+        from xagent.web.tools.mcp.chartmogul import API_BASE_URL as chartmogul
+        from xagent.web.tools.mcp.employment_hero import (
+            EMPLOYMENT_HERO_BASE_URL as employment_hero,
+        )
+        from xagent.web.tools.mcp.github import GITHUB_BASE_URL as github
+        from xagent.web.tools.mcp.google_ads import GOOGLE_ADS_BASE_URL as google_ads
+        from xagent.web.tools.mcp.google_analytics import (
+            ADMIN_API_BASE_URL as analytics_admin,
+        )
+        from xagent.web.tools.mcp.google_analytics import (
+            DATA_API_BASE_URL as analytics_data,
+        )
+        from xagent.web.tools.mcp.google_search_console import (
+            SEARCH_CONSOLE_API_BASE_URL as search_console,
+        )
+        from xagent.web.tools.mcp.google_search_console import (
+            WEBMASTERS_API_BASE_URL as webmasters,
+        )
+        from xagent.web.tools.mcp.hubspot import HUBSPOT_BASE_URL as hubspot
+        from xagent.web.tools.mcp.intercom import INTERCOM_BASE_URL as intercom
+        from xagent.web.tools.mcp.meta_graph import GRAPH_BASE_URL as meta
+        from xagent.web.tools.mcp.myob import MYOB_BASE_URL as myob
+        from xagent.web.tools.mcp.onedrive import GRAPH_BASE_URL as microsoft_graph
+        from xagent.web.tools.mcp.slack import SLACK_BASE_URL as slack
+        from xagent.web.tools.mcp.stripe import BASE_URL as stripe
+        from xagent.web.tools.mcp.zoom import ZOOM_BASE_URL as zoom
+
+        expected = {
+            chartmogul: "ChartMogul",
+            employment_hero: "Employment Hero",
+            github: "GitHub",
+            google_ads: "Google Ads",
+            analytics_admin: "Google Analytics",
+            analytics_data: "Google Analytics",
+            search_console: "Google Search Console",
+            webmasters: "Google Search Console",
+            hubspot: "HubSpot",
+            intercom: "Intercom",
+            meta: "Meta Graph (Facebook/Instagram)",
+            myob: "MYOB",
+            microsoft_graph: "Microsoft Graph (Outlook/OneDrive/Teams)",
+            slack: "Slack",
+            stripe: "Stripe",
+            zoom: "Zoom",
+        }
+        for url, label in expected.items():
+            assert match_known_connector_url(url) == label
+
+
+class TestHasAuthCredentials:
+    def test_true_for_authorization_header(self):
+        assert has_auth_credentials(
+            "https://api.hubapi.com/x", {"Authorization": "Bearer tok"}
+        )
+
+    def test_true_for_service_specific_credential_header(self):
+        """Not every connector's direct-call convention uses the literal
+        "Authorization" header name - matching must key off any header
+        whose name looks credential-shaped, not an exact-name allowlist."""
+        assert has_auth_credentials(
+            "https://acme.myshopify.com/x",
+            {"X-Shopify-Access-Token": "shpat_abc"},
+        )
+
+    def test_true_for_auth_query_param_in_final_request_url(self):
+        assert has_auth_credentials("https://maps.googleapis.com/x?key=AIza123", None)
+
+    def test_true_for_hyphenated_api_key_query_param(self):
+        """The header-marker list already recognized both "api-key" and
+        "apikey" spellings; the query-param list was missing the hyphenated
+        one, so a real credential passed as ?api-key=... was incorrectly
+        treated as no-credential-attached."""
+        assert has_auth_credentials("https://api.hubapi.com/x?api-key=secret", None)
+
+    def test_true_for_basic_auth_userinfo_in_url(self):
+        """HTTP Basic-Auth credentials embedded directly in the URL
+        (user:pass@host) are a legitimate, already-authenticated call shape
+        that headers/query-param checks alone can't see."""
+        assert has_auth_credentials("https://user:pass@api.github.com/x", None)
+
+    def test_false_when_nothing_looks_like_a_credential(self):
+        assert not has_auth_credentials(
+            "https://api.hubapi.com/x?limit=10",
+            {"Content-Type": "application/json"},
+        )
+
+    def test_false_for_no_arguments_at_all(self):
+        assert not has_auth_credentials("https://api.hubapi.com/x", None)
+
+    def test_false_for_blank_header_value(self):
+        """A header whose NAME looks credential-shaped but whose VALUE is
+        blank carries nothing real - e.g. {"Authorization": ""}, which a
+        caller could send by accident (an unresolved template variable,
+        say). Treating the name alone as proof of a credential would skip
+        the connector hint on a 401 caused by exactly that missing value."""
+        assert not has_auth_credentials(
+            "https://api.hubapi.com/x", {"Authorization": ""}
+        )
+        assert not has_auth_credentials("https://api.hubapi.com/x?api_key=", None)
+
+    def test_false_for_authority_header(self):
+        """ "authority" (the HTTP/2 pseudo-header carrying the target host,
+        set automatically by many HTTP/2 clients and proxies - not a
+        credential) must not be treated as a credential."""
+        assert not has_auth_credentials(
+            "https://api.hubapi.com/x",
+            {"Content-Type": "application/json", "authority": "api.hubapi.com"},
+        )
+
+    def test_false_for_other_headers_merely_containing_auth_as_a_substring(self):
+        """Regression: the marker list used to include the bare "auth" and
+        "signature" substrings, which matched non-credential headers like
+        "X-Author", "X-OAuth-Client-Id" (a public client id, not a secret),
+        and GitHub's outbound "X-Hub-Signature-256" webhook-verification
+        header - silently treating an actually-unauthenticated call as
+        credentialed and defeating the guard entirely."""
+        assert not has_auth_credentials(
+            "https://api.github.com/x",
+            {"X-Author": "jane@example.com"},
+        )
+        assert not has_auth_credentials(
+            "https://api.github.com/x",
+            {"X-OAuth-Client-Id": "public-id"},
+        )
+        assert not has_auth_credentials(
+            "https://api.github.com/x",
+            {"X-Hub-Signature-256": "sha256=abc"},
+        )
+
+    def test_ignores_non_string_header_keys(self):
+        assert not has_auth_credentials("https://api.hubapi.com/x", {1: "x"})  # type: ignore[dict-item]
+
+
+class TestSanitizeFinalUrl:
+    """Regression: final_url reports the real post-redirect response URL,
+    but the raw URL can itself carry a credential - an api_key_query
+    auth_token merged into the query string, or Basic-Auth userinfo a
+    caller embedded directly in the URL. Only the host identifies which
+    connector answered, so everything else must be stripped before this
+    value leaves _make_request."""
+
+    def test_strips_query_string_credential(self):
+        assert (
+            _sanitize_final_url(
+                httpx.URL("https://api.hubapi.com/crm/v3/deals?api_key=secret")
+            )
+            == "https://api.hubapi.com/crm/v3/deals"
+        )
+
+    def test_strips_basic_auth_userinfo(self):
+        assert (
+            _sanitize_final_url(
+                httpx.URL("https://user:pass@api.hubapi.com/crm/v3/deals")
+            )
+            == "https://api.hubapi.com/crm/v3/deals"
+        )
+
+    def test_strips_both_userinfo_and_query_credential(self):
+        assert (
+            _sanitize_final_url(
+                httpx.URL("https://user:pass@example.com/path?api_key=secret")
+            )
+            == "https://example.com/path"
+        )
+
+    def test_preserves_port(self):
+        assert (
+            _sanitize_final_url(httpx.URL("https://example.com:8443/path?key=secret"))
+            == "https://example.com:8443/path"
+        )
+
+    def test_no_op_for_a_url_with_nothing_to_strip(self):
+        assert (
+            _sanitize_final_url(httpx.URL("https://api.hubapi.com/crm/v3/deals"))
+            == "https://api.hubapi.com/crm/v3/deals"
+        )
+
+    def test_ipv6_host_stays_bracketed(self):
+        """Regression: a hand-rolled string-based implementation (urlparse
+        + reassembling "host:port" by hand) drops the brackets an IPv6
+        literal needs, producing a URL later code can't even re-parse
+        (urlparse("https://::1:8443/x").hostname is None). Using
+        httpx.URL.copy_with keeps the URL in one already-bracket-aware
+        type throughout."""
+        assert (
+            _sanitize_final_url(httpx.URL("https://[::1]:8443/path?api_key=secret"))
+            == "https://[::1]:8443/path"
+        )
 
 
 @pytest.fixture
@@ -47,12 +327,30 @@ def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:
             body = {"authenticated": bool(token), "token": token}
         elif path == "/headers":
             body = {"headers": headers}
-        elif path == "/status/404":
-            status_code = 404
+        elif path.startswith("/status/"):
+            status_code = int(path.removeprefix("/status/"))
             body = {}
         else:
             status_code = 404
             body = {}
+
+        # A "__redirected_to__" query param lets a test simulate httpx
+        # having followed a cross-host redirect before landing on this
+        # response - the real _make_request reports response.url (the
+        # final, post-redirect URL) here, which can differ from the
+        # request's starting url.
+        final_url = _single_value_query_args(url).get("__redirected_to__", url)
+
+        # Mirror httpx's own redirect behavior (see
+        # httpx.Client._redirect_headers) closely enough for these tests:
+        # Authorization is dropped when the redirect crosses hosts, and a
+        # redirect target's own query string (not the original request's)
+        # is what the final request carries - final_url above already is
+        # that target URL, so no extra query handling is needed here.
+        final_headers = dict(headers)
+        if urlparse(final_url).hostname != parsed.hostname:
+            final_headers.pop("Authorization", None)
+        final_request_has_credential = has_auth_credentials(final_url, final_headers)
 
         return {
             "success": 200 <= status_code < 300,
@@ -60,6 +358,8 @@ def mock_httpbin(monkeypatch: pytest.MonkeyPatch) -> None:
             "headers": {"content-type": "application/json"},
             "body": body,
             "error": None if 200 <= status_code < 300 else f"HTTP {status_code}",
+            "final_url": final_url,
+            "final_request_has_credential": final_request_has_credential,
         }
 
     monkeypatch.setattr(APIClientCore, "_make_request", mock_make_request)
@@ -146,6 +446,27 @@ class TestAPIClientCore:
         assert result["body"]["args"]["token"] == "test-key-123"
 
     @pytest.mark.asyncio
+    async def test_api_key_query_auth_type_is_case_insensitive(
+        self, mock_httpbin: None
+    ):
+        """Regression: this check used to be an exact-case string compare,
+        unlike _prepare_headers' auth_type.lower() handling of bearer/
+        basic/api_key just below it and has_auth_credentials' own lower()
+        call - auth_type="API_KEY_QUERY" (or any non-lowercase spelling)
+        would silently attach no credential here while has_auth_credentials
+        reported one was present, suppressing the connector hint for
+        exactly the resulting unauthenticated 401/403."""
+        result = await call_api(
+            url="https://httpbin.org/get",
+            method="GET",
+            auth_type="API_KEY_QUERY",
+            auth_token="test-key-123",
+        )
+
+        assert result["success"] is True
+        assert result["body"]["args"]["api_key"] == "test-key-123"
+
+    @pytest.mark.asyncio
     async def test_custom_headers(self, mock_httpbin: None):
         """Test custom headers"""
         client = APIClientCore()
@@ -169,14 +490,180 @@ class TestAPIClientCore:
         assert "error" in result
 
     @pytest.mark.asyncio
-    async def test_retry_mechanism(self, mock_httpbin: None):
-        """Test retry mechanism on failure"""
-        client = APIClientCore(default_retry_count=2)
-        # This will fail with 404
-        result = await client.call_api(url="https://httpbin.org/status/404")
+    async def test_url_httpx_rejects_after_merging_params_does_not_raise(self):
+        """Regression: _is_valid_url's cheap urlparse-based check (scheme +
+        non-empty netloc) lets through a URL httpx.URL() itself later
+        rejects (e.g. a non-numeric port) - only reachable once query
+        params get merged into the URL, since a request with none never
+        reaches that merge step. That merge used to run outside the retry
+        loop's try/except, so it raised straight out of call_api instead of
+        returning the documented dict shape."""
+        client = APIClientCore()
+        result = await client.call_api(
+            url="http://example.com:abc/path", params={"q": "1"}
+        )
 
         assert result["success"] is False
-        assert result["status_code"] == 404
+        assert result["status_code"] == 0
+        assert isinstance(result["error"], str)
+
+    @pytest.mark.asyncio
+    async def test_retry_mechanism(self, monkeypatch: pytest.MonkeyPatch):
+        """Network exceptions are retried and the successful third call is returned."""
+        client = APIClientCore(default_retry_count=2)
+        call_count = 0
+
+        async def flaky_request(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise httpx.ConnectError("temporary failure")
+            return {
+                "success": True,
+                "status_code": 200,
+                "headers": {},
+                "body": {"ok": True},
+                "error": None,
+            }
+
+        monkeypatch.setattr(client, "_make_request", flaky_request)
+        result = await client.call_api(url="https://example.com/data")
+
+        assert call_count == 3
+        assert result["success"] is True
+        assert result["status_code"] == 200
+
+
+@pytest.fixture
+def mock_transport(monkeypatch: pytest.MonkeyPatch):
+    """Injects an httpx.MockTransport into every httpx.AsyncClient built
+    inside _make_request, exercising the REAL request/response path
+    (unlike mock_httpbin, which monkeypatches _make_request itself away) -
+    needed to verify behavior that depends on the real httpx.Response,
+    like final_url/final_request_has_credential gating below."""
+
+    def _install(handler):
+        original_init = httpx.AsyncClient.__init__
+
+        def patched_init(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+
+    return _install
+
+
+class TestFinalUrlCredentialGating:
+    """Regression: final_url and final_request_has_credential are only
+    ever read by the adapter's connector-domain hint, which only fires for
+    a 401/403 (see api_tool.py's run_json_async) - _make_request should
+    skip computing them entirely for any other status, not just skip
+    using them once computed."""
+
+    @pytest.mark.asyncio
+    async def test_not_computed_for_a_2xx_response(self, mock_transport):
+        mock_transport(lambda request: httpx.Response(200, json={"ok": True}))
+
+        result = await APIClientCore().call_api(url="https://example.com/ok")
+
+        assert result["success"] is True
+        assert result.get("final_url") is None
+        assert result.get("final_request_has_credential") is None
+
+    @pytest.mark.asyncio
+    async def test_computed_for_a_401_response(self, mock_transport):
+        mock_transport(lambda request: httpx.Response(401, json={"error": "nope"}))
+
+        result = await APIClientCore().call_api(url="https://api.hubapi.com/x")
+
+        assert result["status_code"] == 401
+        assert result["final_url"] == "https://api.hubapi.com/x"
+        assert result["final_request_has_credential"] is False
+
+
+class TestCredentialFreeLogging:
+    """Regression: call_api's own request/completion logs, and the
+    adapter's connector-hint log, used to interpolate the raw URL - which
+    can carry a real credential (Basic-Auth userinfo a caller embedded, or
+    an api_key_query auth_token merged into the query string before the
+    request runs). For CustomApiTool in particular, that URL can hold a
+    real decrypted, persisted secret (see api_tool_adapter.py's
+    _replace_secrets/decrypt_value), so this isn't just a hypothetical -
+    every one of these log lines needed the same redaction final_url
+    already got."""
+
+    @pytest.mark.asyncio
+    async def test_startup_log_does_not_leak_basic_auth_userinfo(
+        self, mock_httpbin: None, caplog: pytest.LogCaptureFixture
+    ):
+        caplog.set_level("INFO")
+        await call_api(url="https://user:leaked-secret@httpbin.org/get")
+
+        assert "leaked-secret" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_completion_log_does_not_leak_api_key_query_credential(
+        self, mock_httpbin: None, caplog: pytest.LogCaptureFixture
+    ):
+        caplog.set_level("INFO")
+        await call_api(
+            url="https://httpbin.org/get",
+            auth_type="api_key_query",
+            auth_token="leaked-secret",
+        )
+
+        assert "leaked-secret" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_logs_redact_all_arbitrary_query_values(
+        self, mock_httpbin: None, caplog: pytest.LogCaptureFixture
+    ):
+        """This call site accepts arbitrary params, so it cannot rely on the
+        incomplete keyword inventory tracked by open issue #2356."""
+        caplog.set_level("INFO")
+        await call_api(
+            url="https://httpbin.org/get?client_secret=url-secret",
+            params={"subscription-key": "param-secret", "q": "ordinary-value"},
+        )
+
+        assert "url-secret" not in caplog.text
+        assert "param-secret" not in caplog.text
+        assert "ordinary-value" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_invalid_merged_url_error_does_not_leak_query_values(self):
+        result = await call_api(
+            url="http://example.com:abc/path?client_secret=url-secret",
+            params={"q": "ordinary-value"},
+        )
+
+        assert "url-secret" not in result["error"]
+        assert "ordinary-value" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_adapter_hint_log_does_not_leak_url_embedded_credential(
+        self, mock_httpbin: None, caplog: pytest.LogCaptureFixture
+    ):
+        """The hint only fires when the ACTUAL final request carries no
+        credential - so the one realistic way to reach this log line with
+        a credential still sitting in api_args.url is a request that
+        started credentialed (Basic-Auth userinfo) and redirected
+        cross-origin to the connector host, where real httpx drops that
+        userinfo (it isn't part of the redirect target's own URL). The
+        hint correctly fires for the now-uncredentialed final request,
+        but the log line still names the caller's ORIGINAL url."""
+        caplog.set_level("INFO")
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://user:leaked-secret@httpbin.org/status/401"
+                "?__redirected_to__=https://api.hubapi.com/crm/v3/deals/1"
+            }
+        )
+
+        assert "HubSpot" in result["error"]
+        assert "leaked-secret" not in caplog.text
 
 
 class TestAPITool:
@@ -188,6 +675,7 @@ class TestAPITool:
 
         assert tool.name == "api_call"
         assert "HTTP requests to arbitrary APIs" in tool.description
+        assert "dedicated MCP connector" in tool.description
         assert "api" in tool.tags
         assert "http" in tool.tags
         assert tool.category.value == "basic"
@@ -334,6 +822,304 @@ class TestAPITool:
         assert result["success"] is True
         assert result["status_code"] == 200
         assert result["body"]["args"]["key"] == "my-secret-key-123"
+
+    @pytest.mark.asyncio
+    async def test_public_credential_less_call_to_known_connector_domain_succeeds(
+        self, mock_httpbin: None
+    ):
+        """The core regression this whole design is for: a domain covered
+        by a dedicated connector (GitHub) can still have genuinely public,
+        credential-less endpoints (e.g. GET /repos/{owner}/{repo}). An
+        earlier pre-flight version of this guard blocked every
+        credential-less call to a known connector domain outright,
+        converting a legitimate 200 into a synthetic local failure. The
+        request must actually be attempted and its real 2xx returned
+        untouched."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {"url": "https://api.github.com/get", "method": "GET"}
+        )
+
+        assert result["success"] is True
+        assert result["status_code"] == 200
+
+    @pytest.mark.asyncio
+    async def test_annotates_a_real_401_with_connector_hint_when_uncredentialed(
+        self, mock_httpbin: None
+    ):
+        """A request that actually reached a known connector domain and
+        actually got a 401/403 back, with no credential this tool
+        recognizes, gets that real status/body preserved plus a hint
+        pointing at the dedicated connector tools - not a synthetic
+        pre-flight refusal."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {"url": "https://api.hubapi.com/status/401", "method": "PATCH"}
+        )
+
+        assert result["success"] is False
+        assert result["status_code"] == 401
+        assert "HubSpot" in result["error"]
+        assert "connector tools" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_annotates_a_real_401_on_a_multi_tenant_subdomain(
+        self, mock_httpbin: None
+    ):
+        """Multi-tenant connectors (Zendesk, Shopify, etc.) are matched by
+        domain suffix, not just the exact host."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {"url": "https://acme.zendesk.com/status/403"}
+        )
+
+        assert result["status_code"] == 403
+        assert "Zendesk" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_annotate_a_401_with_credentials_attached(
+        self, mock_httpbin: None
+    ):
+        """A caller that already attached its own credential - even if that
+        credential turns out to be invalid and the real call still 401s -
+        genuinely intended a direct call, so the hint (which exists to
+        explain an UNEXPLAINED 401) must not be added."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://api.hubapi.com/status/401",
+                "auth_type": "bearer",
+                "auth_token": "a-private-app-token-that-happens-to-be-invalid",
+            }
+        )
+
+        assert result["status_code"] == 401
+        assert "connector tools" not in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_does_not_annotate_a_non_401_403_status(self, mock_httpbin: None):
+        """Only 401/403 are ambiguous ("is this a broken connection or a
+        missing credential?"); any other status is left exactly as the
+        server returned it."""
+        tool = APITool()
+        result = await tool.run_json_async({"url": "https://api.hubapi.com/status/500"})
+
+        assert result["status_code"] == 500
+        assert "connector tools" not in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_does_not_annotate_an_unrelated_domain(self, mock_httpbin: None):
+        tool = APITool()
+        result = await tool.run_json_async({"url": "https://httpbin.org/status/401"})
+
+        assert result["status_code"] == 401
+        assert "connector tools" not in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_annotates_a_trailing_dot_host(self, mock_httpbin: None):
+        """A trailing "." is a valid DNS root-label marker for the same
+        host (api.hubapi.com. == api.hubapi.com); the hint must still
+        apply, not silently skip a spelling a caller could legitimately
+        send."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {"url": "https://api.hubapi.com./status/401"}
+        )
+
+        assert "HubSpot" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_annotates_based_on_the_post_redirect_host_not_the_original(
+        self, mock_httpbin: None
+    ):
+        """Regression: allow_redirects defaults to True, so the response
+        that actually comes back can be from a different host than the URL
+        the caller started with. A request that starts on an unrelated host
+        and redirects to a known connector domain, which then 401s, must
+        still get the hint - matching against the original URL's host
+        (unrelated here) would silently miss it."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://httpbin.org/status/401"
+                "?__redirected_to__=https://api.hubapi.com/crm/v3/deals/1"
+            }
+        )
+
+        assert "HubSpot" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_annotates_when_a_cross_origin_redirect_drops_the_original_credential(
+        self, mock_httpbin: None
+    ):
+        """Regression: httpx strips the Authorization header when a
+        redirect crosses hosts (see httpx.Client._redirect_headers). A
+        request that started out credentialed can still land on a known
+        connector host with nothing attached on the actual final request -
+        the hint must reflect that, not the caller's original (now-
+        stripped) credential."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://httpbin.org/status/401"
+                "?__redirected_to__=https://api.hubapi.com/crm/v3/deals/1",
+                "auth_type": "bearer",
+                "auth_token": "original-host-token",
+            }
+        )
+
+        assert "HubSpot" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_real_cross_origin_redirect_drops_authorization_and_adds_hint(
+        self, mock_transport
+    ):
+        final_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "origin.example.com":
+                return httpx.Response(
+                    302,
+                    headers={"location": "https://api.hubapi.com/crm/v3/deals/1"},
+                )
+            final_requests.append(request)
+            return httpx.Response(401, json={"message": "unauthorized"})
+
+        mock_transport(handler)
+        result = await APITool().run_json_async(
+            {
+                "url": "https://origin.example.com/start",
+                "auth_type": "bearer",
+                "auth_token": "origin-only-token",
+            }
+        )
+
+        assert len(final_requests) == 1
+        assert "authorization" not in final_requests[0].headers
+        assert result["status_code"] == 401
+        assert "HubSpot" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_annotate_when_a_same_origin_redirect_keeps_the_credential(
+        self, mock_httpbin: None
+    ):
+        """Control for the cross-origin case above: a same-origin redirect
+        does not strip Authorization, so a genuinely still-credentialed
+        request must keep suppressing the hint."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://api.hubapi.com/status/401"
+                "?__redirected_to__=https://api.hubapi.com/crm/v3/deals/1",
+                "auth_type": "bearer",
+                "auth_token": "still-valid-token",
+            }
+        )
+
+        assert "connector tools" not in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_real_same_origin_redirect_keeps_authorization_and_skips_hint(
+        self, mock_transport
+    ):
+        final_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/start":
+                return httpx.Response(302, headers={"location": "/crm/v3/deals/1"})
+            final_requests.append(request)
+            return httpx.Response(401, json={"message": "unauthorized"})
+
+        mock_transport(handler)
+        result = await APITool().run_json_async(
+            {
+                "url": "https://api.hubapi.com/start",
+                "auth_type": "bearer",
+                "auth_token": "same-origin-token",
+            }
+        )
+
+        assert len(final_requests) == 1
+        assert final_requests[0].headers["authorization"] == "Bearer same-origin-token"
+        assert result["status_code"] == 401
+        assert "connector tools" not in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_does_not_annotate_when_redirected_off_a_known_connector_host(
+        self, mock_httpbin: None
+    ):
+        """Symmetric regression: a request starting on a known connector
+        host that redirects OFF that host to an unrelated 401 must not get
+        a hint naming the original (wrong) service."""
+        tool = APITool()
+        result = await tool.run_json_async(
+            {
+                "url": "https://api.github.com/status/401"
+                "?__redirected_to__=https://httpbin.org/status/401"
+            }
+        )
+
+        assert "connector tools" not in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_hint_does_not_produce_a_run_on_sentence(self, mock_httpbin: None):
+        """The existing error text ("HTTP 401") has no trailing punctuation,
+        so appending the hint sentence directly after it would otherwise
+        read as one run-on sentence - a period must be inserted between
+        them."""
+        tool = APITool()
+        result = await tool.run_json_async({"url": "https://api.hubapi.com/status/401"})
+
+        assert result["error"].startswith("HTTP 401. This looks like")
+
+    @pytest.mark.asyncio
+    async def test_malformed_url_does_not_crash(self):
+        """A malformed URL (invalid IPv6 host syntax) must still come back
+        as a normal structured result - not an uncaught exception. This URL
+        fails core's own validation (_is_valid_url) before a real request is
+        ever attempted, so status_code is 0 and the connector-hint check
+        never runs at all."""
+        tool = APITool()
+        result = await tool.run_json_async({"url": "https://[::1"})
+
+        assert result["success"] is False
+        assert result["status_code"] == 0
+        assert isinstance(result.get("error"), str)
+
+    @pytest.mark.asyncio
+    async def test_hint_failure_preserves_the_real_http_response(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        tool = APITool()
+
+        async def mock_call_api(**kwargs):
+            return {
+                "success": False,
+                "status_code": 401,
+                "headers": {"x-request-id": "request-1"},
+                "body": {"message": "unauthorized"},
+                "error": "HTTP 401",
+                "final_url": "https://api.hubapi.com/crm/v3/deals/1",
+                "final_request_has_credential": False,
+            }
+
+        def broken_hint(*args, **kwargs):
+            raise ValueError("diagnostic failure")
+
+        monkeypatch.setattr(tool._client, "call_api", mock_call_api)
+        monkeypatch.setattr(
+            tool, "_hint_known_connector_if_uncredentialed", broken_hint
+        )
+
+        result = await tool.run_json_async({"url": "https://api.hubapi.com/x"})
+
+        assert result == {
+            "success": False,
+            "status_code": 401,
+            "headers": {"x-request-id": "request-1"},
+            "body": {"message": "unauthorized"},
+            "error": "HTTP 401",
+        }
 
     def test_return_value_formatting(self):
         """Test return value formatting"""

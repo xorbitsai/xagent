@@ -19,6 +19,7 @@ from typing import Optional
 from ..core.execution_scope import validate_scope_component
 
 USER_LIFECYCLE_TYPE = "user"
+DURABLE_CHROME_LIFECYCLE_TYPE = "chrome-execution"
 
 
 def make_user_lifecycle_id(owner_id: int, suffix: Optional[str] = None) -> str:

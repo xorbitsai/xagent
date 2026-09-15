@@ -282,6 +282,7 @@ class TestMigrations:
         assert "alembic_version" in tables, "alembic_version table should exist"
         assert "public_mcp_apps" in tables, "public_mcp_apps table should exist"
         assert "user_oauth" in tables, "user_oauth table should exist"
+        assert "durable_sandbox_lifecycles" in tables
 
         # Verify agents table structure.
         columns = postgresql_tester.get_column_names("agents")
@@ -713,6 +714,58 @@ class TestMigrations:
                 ).scalar_one()
                 == 2
             )
+
+    @pytest.mark.postgresql
+    def test_postgresql_durable_lifecycle_cas_has_one_delete_claim_winner(
+        self, postgresql_tester
+    ):
+        """Two real PostgreSQL sessions cannot both own one backend deletion."""
+        from datetime import datetime, timedelta, timezone
+
+        from xagent.web.models.database import Base
+        from xagent.web.services.durable_sandbox_lifecycle import (
+            DurableSandboxLifecycleRepository,
+            RegisterLifecycle,
+        )
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        session_factory = sessionmaker(
+            bind=postgresql_tester.engine, expire_on_commit=False
+        )
+        now = datetime.now(timezone.utc)
+        with session_factory() as session:
+            fence = DurableSandboxLifecycleRepository(session).register(
+                RegisterLifecycle(
+                    scope_digest="a" * 64,
+                    task_id=42,
+                    run_id="run",
+                    lease_attempt_id="attempt",
+                    turn_digest=None,
+                    eligible_at=now - timedelta(minutes=2),
+                    owner_lease_expires_at=now - timedelta(minutes=1),
+                )
+            )
+            session.commit()
+
+        barrier = threading.Barrier(2)
+
+        def claim(_index):
+            with session_factory() as session:
+                barrier.wait(timeout=10)
+                result = DurableSandboxLifecycleRepository(session).claim_for_delete(
+                    fence,
+                    now=now,
+                    claim_ttl=timedelta(minutes=1),
+                )
+                session.commit()
+                return result
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(claim, range(2)))
+
+        winners = [outcome for outcome in outcomes if outcome is not None]
+        assert len(winners) == 1
+        assert winners[0].delete_attempts == 1
 
     def test_sqlite_incremental_upgrade(self, sqlite_tester):
         """Test incremental upgrades from b9d890ed31b5 to head on SQLite.

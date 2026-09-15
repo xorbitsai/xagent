@@ -157,22 +157,25 @@ def _utc_field_in_zone(field: dict[str, Any], zone_name: str) -> dict[str, Any]:
     matters for all-day bounds, whose local date can differ from the UTC date
     near a day boundary.
 
-    Falls back to `field` unchanged when there's nothing to convert (no
-    dateTime) or `zone_name` doesn't resolve - a wrong zone name here is
-    caught elsewhere (`_resolve_zoneinfo` is also used on the write path),
-    not silently swallowed by this being a no-op.
+    The sole caller uses a plain event GET without a Prefer header, so a naive
+    response value must be UTC. Reject a contradictory zone label or malformed
+    timestamp instead of silently using an unconverted value downstream.
     """
     date_time = field.get("dateTime")
     if not date_time:
         return field
-    try:
-        zone = _resolve_zoneinfo(zone_name, allow_windows_names=True)
-    except ValueError:
-        return field
+    zone = _resolve_zoneinfo(zone_name, allow_windows_names=True)
     try:
         parsed = _date_parser.isoparse(date_time)
-    except (TypeError, ValueError):
-        return field
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Outlook returned an invalid event boundary datetime: {date_time!r}."
+        ) from exc
+    if parsed.tzinfo is None and field.get("timeZone") not in (None, "UTC"):
+        raise ValueError(
+            "Outlook returned a non-UTC event boundary from a plain event GET; "
+            "the existing window cannot be converted safely."
+        )
     utc_instant = (
         parsed.replace(tzinfo=dt_timezone.utc)
         if parsed.tzinfo is None
@@ -247,8 +250,16 @@ def _naive_datetime_in_timezone(value: str, timezone: str) -> str:
                 f"{value!r} does not exist in timezone {timezone!r} because of "
                 "a daylight-saving transition"
             )
-        return normalized
-    return parsed.astimezone(zone).replace(tzinfo=None).isoformat()
+        result = normalized
+    else:
+        localized = parsed.astimezone(zone)
+        result = localized.replace(tzinfo=None).isoformat()
+    if _date_tz.datetime_ambiguous(localized):
+        raise ValueError(
+            f"{value!r} is ambiguous in timezone {timezone!r} because of a "
+            "daylight-saving transition"
+        )
+    return result
 
 
 def _reject_invalid_create_window(
@@ -859,8 +870,9 @@ def outlook_update_event(
     the changed boundary. Passing both together fully replaces the window, and
     timezone then describes both new values (defaulting to UTC if also left
     unset). Changing to or resizing an all-day window requires both boundaries
-    because Graph does not expose a reliable current boundary zone; all-day
-    boundaries are normalized to midnight values in one shared timezone.
+    and an explicit timezone because Graph does not expose a reliable current
+    boundary zone; all-day boundaries are normalized to midnight values in one
+    shared timezone.
     This update path checks the signed-in calendar when the event window
     changes; attendee availability is not checked yet. A detected conflict
     returns status="conflict" without updating the event. An incomplete
@@ -898,15 +910,21 @@ def outlook_update_event(
                 start_datetime if start_datetime is not None else end_datetime
             )
             assert supplied_boundary is not None
-            _naive_datetime_in_timezone(supplied_boundary, timezone or "UTC")
             if timezone is None:
                 raise ValueError(
                     "timezone is required when updating only start_datetime or "
                     "only end_datetime because Graph exposes original creation "
                     "zones, not the boundary's current timezone."
                 )
+            _naive_datetime_in_timezone(supplied_boundary, timezone)
         if both_boundaries_supplied:
             assert start_datetime is not None and end_datetime is not None
+            if not start_datetime.strip() or not end_datetime.strip():
+                raise ValueError(
+                    "Outlook event datetimes must use the extended ISO format "
+                    "YYYY-MM-DDTHH:MM:SS, optionally followed by fractional "
+                    "seconds and a UTC offset or Z suffix."
+                )
             _reject_invalid_create_window(
                 start_datetime,
                 end_datetime,
@@ -917,12 +935,7 @@ def outlook_update_event(
         # all-day and recurrence restrictions even when conflict checks are
         # explicitly bypassed.
         existing: dict[str, Any] = {}
-        needs_existing = (
-            single_boundary_update
-            or (not ignore_conflicts and touches_schedule)
-            or is_all_day is not None
-            or (is_all_day is None and both_boundaries_supplied)
-        )
+        needs_existing = touches_schedule
         if needs_existing:
             existing = _graph_request(
                 "GET",
@@ -934,6 +947,11 @@ def outlook_update_event(
         effective_is_all_day = (
             is_all_day if is_all_day is not None else existing_is_all_day
         )
+        if effective_is_all_day and both_boundaries_supplied and timezone is None:
+            raise ValueError(
+                "timezone is required when replacing an all-day event window "
+                "because its calendar dates cannot safely default to UTC."
+            )
         if effective_is_all_day != existing_is_all_day and not both_boundaries_supplied:
             raise ValueError(
                 "Changing is_all_day requires both start_datetime and "
@@ -1071,65 +1089,57 @@ def outlook_update_event(
         ):
             _reject_reversed_window(effective_start, effective_end)
 
-        unchecked_attendees: list[str] = []
-        if not ignore_conflicts and touches_schedule:
+        if not ignore_conflicts and schedule_semantics_supplied:
             # Graph does not expose a reliable current boundary timezone: a
             # no-Prefer GET returns UTC, while original*TimeZone is historical.
             # Therefore every supplied boundary is schedule-significant even
             # when its represented instant matches the snapshot.
-            window_changed = schedule_semantics_supplied
-
             query_start, query_end = effective_start, effective_end
-
-            if window_changed:
-                if not query_start or not query_end:
-                    raise ValueError(
-                        "Existing event has no complete time window; cannot safely "
-                        "check conflicts for this update."
-                    )
-                check_error: str | None = None
-                try:
-                    conflicts, unchecked_attendees = _find_conflicts(
-                        query_start,
-                        query_end,
-                        query_timezone,
-                        [],
-                        exclude_event_id=event_id,
-                        check_organizer=True,
-                        organizer_calendar_label="signed_in_calendar",
-                    )
-                except InsufficientScopeError as exc:
-                    check_error = str(exc)
-                    conflicts, unchecked_attendees = _merge_scope_error(exc, [], [])
-                except _ConflictCheckIncompleteError as exc:
-                    check_error = str(exc)
-                    conflicts = exc.conflicts
-                    unchecked_attendees = exc.unchecked_attendees
-                if conflicts:
-                    return _conflict_response(
-                        conflicts,
-                        unchecked_attendees,
-                        query_start,
-                        query_end,
-                        check_error=check_error,
-                    )
-                if check_error or unchecked_attendees:
-                    return _incomplete_check_response(
-                        unchecked_attendees,
-                        query_start,
-                        query_end,
-                        message=check_error,
-                    )
+            if not query_start or not query_end:
+                raise ValueError(
+                    "Existing event has no complete time window; cannot safely "
+                    "check conflicts for this update."
+                )
+            check_error: str | None = None
+            try:
+                conflicts, unchecked_attendees = _find_conflicts(
+                    query_start,
+                    query_end,
+                    query_timezone,
+                    [],
+                    exclude_event_id=event_id,
+                    check_organizer=True,
+                    organizer_calendar_label="signed_in_calendar",
+                )
+            except InsufficientScopeError as exc:
+                check_error = str(exc)
+                conflicts, unchecked_attendees = _merge_scope_error(exc, [], [])
+            except _ConflictCheckIncompleteError as exc:
+                check_error = str(exc)
+                conflicts = exc.conflicts
+                unchecked_attendees = exc.unchecked_attendees
+            if conflicts:
+                return _conflict_response(
+                    conflicts,
+                    unchecked_attendees,
+                    query_start,
+                    query_end,
+                    check_error=check_error,
+                )
+            if check_error or unchecked_attendees:
+                return _incomplete_check_response(
+                    unchecked_attendees,
+                    query_start,
+                    query_end,
+                    message=check_error,
+                )
 
         result = _graph_request(
             "PATCH",
             f"/me/events/{quote(event_id, safe='')}",
             body=payload,
         )
-        extra = (
-            {"unchecked_attendees": unchecked_attendees} if unchecked_attendees else {}
-        )
-        return _success(event=result, **extra)
+        return _success(event=result)
     except Exception as e:
         logger.error("Error updating Outlook event %s: %s", event_id, e)
         return _error(str(e))

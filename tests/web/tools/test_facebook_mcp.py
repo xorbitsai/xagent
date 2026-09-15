@@ -164,6 +164,65 @@ def test_list_page_posts_uses_page_access_token(monkeypatch):
         "status": "success",
         "posts": [{"id": "post-1", "message": "hello"}],
         "next_link": "https://graph.facebook.com/next",
+        "after_cursor": None,
+        "has_more": True,
+        "engagement_available": True,
+    }
+
+
+def test_list_page_posts_paginates_with_after_cursor(monkeypatch):
+    """First call returns has_more=True and an after_cursor; passing that
+    cursor back sends it as the Graph API's "after" param and fetches the
+    next page; the last page (no paging.next) reports has_more=False.
+    """
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    pages = [
+        MockResponse(
+            {
+                "data": [{"id": "post-1", "message": "first"}],
+                "paging": {
+                    "cursors": {"after": "cursor-1"},
+                    "next": "https://graph.facebook.com/next",
+                },
+            }
+        ),
+        MockResponse(
+            {
+                "data": [{"id": "post-2", "message": "second"}],
+                "paging": {"cursors": {"after": "cursor-2"}},
+            }
+        ),
+    ]
+
+    feed_params = []
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/accounts"):
+            return MockResponse(
+                {"data": [{"id": "page-1", "access_token": "page-token"}]}
+            )
+        feed_params.append(kwargs["params"])
+        return pages.pop(0)
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    first = _payload(facebook.facebook_list_page_posts("page-1", limit=1))
+    assert first["has_more"] is True
+    assert first["after_cursor"] == "cursor-1"
+    assert "after" not in feed_params[0]
+
+    second = _payload(
+        facebook.facebook_list_page_posts(
+            "page-1", limit=1, after_cursor=first["after_cursor"]
+        )
+    )
+    assert feed_params[1]["after"] == "cursor-1"
+    assert second == {
+        "status": "success",
+        "posts": [{"id": "post-2", "message": "second"}],
+        "next_link": None,
+        "after_cursor": "cursor-2",
+        "has_more": False,
         "engagement_available": True,
     }
 
@@ -202,6 +261,8 @@ def test_list_page_posts_falls_back_without_engagement_on_permission_error(
         "status": "success",
         "posts": [{"id": "post-1", "message": "hello"}],
         "next_link": None,
+        "after_cursor": None,
+        "has_more": False,
         "engagement_available": False,
     }
     assert len(feed_calls) == 2
@@ -289,7 +350,29 @@ def test_list_post_comments_uses_page_access_token(monkeypatch):
             }
         ],
         "next_link": "https://graph.facebook.com/next",
+        "after_cursor": None,
+        "has_more": True,
     }
+
+
+def test_list_post_comments_forwards_after_cursor(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/accounts"):
+            return MockResponse(
+                {"data": [{"id": "page-1", "access_token": "page-token"}]}
+            )
+        assert kwargs["params"]["after"] == "cursor-1"
+        return MockResponse({"data": []})
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    _payload(
+        facebook.facebook_list_post_comments(
+            "page-1", "page-1_post-1", after_cursor="cursor-1"
+        )
+    )
 
 
 def test_publish_text_post_uses_page_access_token_and_message_payload(monkeypatch):

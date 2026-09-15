@@ -8,11 +8,13 @@ from . import meta_graph
 from .meta_graph import (
     GraphAPIError,
 )
+from .meta_graph import apply_after_cursor as _apply_after_cursor
 from .meta_graph import bounded_limit as _bounded_limit
 from .meta_graph import error_response as _error
 from .meta_graph import graph_error_response as _graph_error
 from .meta_graph import graph_request as _graph_request
 from .meta_graph import is_public_image_url as _is_public_image_url
+from .meta_graph import pagination_fields as _pagination_fields
 from .meta_graph import success_response as _success
 from .utils import setup_proxy_env
 
@@ -123,24 +125,30 @@ def facebook_list_pages() -> str:
 
 
 @mcp.tool()
-def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
+def facebook_list_page_posts(
+    page_id: str, limit: int = 10, after_cursor: str | None = None
+) -> str:
     """List recent posts for a Facebook Page by page_id, including like/comment/share
     counts. If the connected token lacks pages_read_user_content, falls back to
     posts without those counts (engagement_available=false) instead of failing
     outright — the Graph API can reject the whole request when a field in a
     combined fields= expansion needs a permission the token doesn't have.
+    Pass the after_cursor returned by a previous call (while has_more is
+    true) to fetch the next page.
     """
     try:
         page_token = _page_access_token(page_id)
         path = _graph_path(page_id, "page_id", "feed")
         bounded_limit = _bounded_limit(limit)
+        base_params: dict[str, Any] = {"limit": bounded_limit}
+        _apply_after_cursor(base_params, after_cursor)
         engagement_available = True
         try:
             result = _graph_request(
                 "GET",
                 path,
                 token=page_token,
-                params={"fields": _POST_FIELDS_WITH_ENGAGEMENT, "limit": bounded_limit},
+                params={"fields": _POST_FIELDS_WITH_ENGAGEMENT, **base_params},
             )
         except GraphAPIError as engagement_error:
             if not _is_permission_error(engagement_error):
@@ -156,12 +164,12 @@ def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
                 "GET",
                 path,
                 token=page_token,
-                params={"fields": _POST_FIELDS_BASE, "limit": bounded_limit},
+                params={"fields": _POST_FIELDS_BASE, **base_params},
             )
         return _success(
             posts=result.get("data", []),
-            next_link=(result.get("paging") or {}).get("next"),
             engagement_available=engagement_available,
+            **_pagination_fields(result),
         )
     except GraphAPIError as e:
         logger.error("Error listing Facebook Page posts for %s: %s", page_id, e)
@@ -172,7 +180,9 @@ def facebook_list_page_posts(page_id: str, limit: int = 10) -> str:
 
 
 @mcp.tool()
-def facebook_list_post_comments(page_id: str, post_id: str, limit: int = 10) -> str:
+def facebook_list_post_comments(
+    page_id: str, post_id: str, limit: int = 10, after_cursor: str | None = None
+) -> str:
     """List comments on a Facebook Page post.
 
     post_id is the composite Graph API id ("{page_id}_{post_id}"), e.g. the
@@ -180,23 +190,26 @@ def facebook_list_post_comments(page_id: str, post_id: str, limit: int = 10) -> 
     suffix alone. Returns the full flattened comment stream, including
     replies to other comments, not just top-level ones; each comment's
     "parent" field distinguishes a reply (its "id") from a top-level comment
-    (absent).
+    (absent). Pass the after_cursor returned by a previous call (while
+    has_more is true) to fetch the next page.
     """
     try:
         page_token = _page_access_token(page_id)
+        params: dict[str, Any] = {
+            "fields": "id,message,created_time,from,parent",
+            "filter": "stream",
+            "limit": _bounded_limit(limit),
+        }
+        _apply_after_cursor(params, after_cursor)
         result = _graph_request(
             "GET",
             _graph_path(post_id, "post_id", "comments"),
             token=page_token,
-            params={
-                "fields": "id,message,created_time,from,parent",
-                "filter": "stream",
-                "limit": _bounded_limit(limit),
-            },
+            params=params,
         )
         return _success(
             comments=result.get("data", []),
-            next_link=(result.get("paging") or {}).get("next"),
+            **_pagination_fields(result),
         )
     except GraphAPIError as e:
         logger.error("Error listing comments for post %s: %s", post_id, e)

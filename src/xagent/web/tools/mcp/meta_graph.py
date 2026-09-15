@@ -139,6 +139,40 @@ def bounded_limit(limit: int, maximum: int = 100) -> int:
     return max(1, min(int(limit), maximum))
 
 
+def apply_after_cursor(
+    params: dict[str, Any], after_cursor: str | None
+) -> dict[str, Any]:
+    """Add the Graph API's ``after`` cursor query param to ``params`` in
+    place, if one was given -- the request-side counterpart to
+    ``pagination_fields``, so every paginated tool wires the ``after_cursor``
+    parameter through the same one place rather than repeating the guard.
+    """
+    if after_cursor:
+        params["after"] = after_cursor
+    return params
+
+
+def pagination_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """Derive the paginated-response fields every list/report tool returns.
+
+    ``next_link`` is kept verbatim for backward compatibility (it is the raw
+    ``paging.next`` URL, which already embeds the same cursor), while
+    ``after_cursor`` exposes just the reusable ``paging.cursors.after`` value
+    so a caller can pass it back as the tool's own ``after_cursor`` parameter
+    without having to parse a Graph API URL. ``has_more`` is derived from
+    ``paging.next`` rather than the mere presence of ``cursors.after``, which
+    the Graph API can still return on the last page.
+    """
+    paging = result.get("paging") or {}
+    cursors = paging.get("cursors") or {}
+    next_link = paging.get("next")
+    return {
+        "next_link": next_link,
+        "after_cursor": cursors.get("after"),
+        "has_more": bool(next_link),
+    }
+
+
 def is_public_image_url(image_url: str) -> bool:
     parsed = urlparse(image_url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)

@@ -172,7 +172,7 @@ def _relative_day_offset(value: str) -> int | None:
         return 0
     if normalized == "yesterday":
         return 1
-    match = _RELATIVE_DATE_PATTERN.match(value.strip())
+    match = _RELATIVE_DATE_PATTERN.match(normalized)
     return int(match.group(1)) if match else None
 
 

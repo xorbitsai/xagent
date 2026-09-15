@@ -6563,6 +6563,7 @@ def test_update_events_rejects_bare_date_start_time_on_a_timed_event(monkeypatch
 
     assert result["status"] == "error"
     assert "start and end must use the same kind" in result["message"]
+    assert "supply both start_time and end_time" in result["message"]
     service.events.return_value.update.assert_not_called()
 
 
@@ -7985,3 +7986,58 @@ def test_kind_conversion_allows_parameterized_rrule(monkeypatch):
     assert body["recurrence"] == event["recurrence"]
     assert body["start"] == {"date": "2026-08-26"}
     assert body["end"] == {"date": "2026-08-27"}
+
+
+def test_kind_conversion_requires_risk_ack_when_midnight_values_compare_equal(
+    monkeypatch,
+):
+    event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T00:00:00"},
+        "end": {"dateTime": "2026-08-27T00:00:00"},
+        "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26",
+            end_time="2026-08-27",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "acknowledge_recurring_exception_risk=True" in result["message"]
+    service.events.return_value.list.assert_not_called()
+    service.events.return_value.update.assert_not_called()
+
+
+def test_kind_conversion_validates_retained_rule_when_midnight_values_compare_equal(
+    monkeypatch,
+):
+    event = {
+        "id": "existing-1",
+        "start": {"dateTime": "2026-08-26T00:00:00"},
+        "end": {"dateTime": "2026-08-27T00:00:00"},
+        "recurrence": ["RRULE:FREQ=DAILY;UNTIL=20260930T235959"],
+    }
+    service = _fake_service({"id": "existing-1"}, existing_event=event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = json.loads(
+        calendar.google_calendar_update_events(
+            event_id="existing-1",
+            start_time="2026-08-26",
+            end_time="2026-08-27",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "UNTIL" in result["message"]
+    service.events.return_value.list.assert_not_called()
+    service.events.return_value.update.assert_not_called()

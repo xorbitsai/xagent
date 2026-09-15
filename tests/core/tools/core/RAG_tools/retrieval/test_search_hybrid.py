@@ -4,6 +4,10 @@ from unittest.mock import Mock
 
 import pytest
 
+from xagent.core.tools.core.RAG_tools.core.exceptions import (
+    DocumentValidationError,
+    VectorValidationError,
+)
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     DenseSearchResponse,
     FusionConfig,
@@ -269,6 +273,47 @@ class TestFusionFunctions:
 
 class TestSearchHybrid:
     """Tests for search_hybrid main function."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {
+                "collection": "",
+                "model_tag": "model",
+                "query_text": "query",
+                "query_vector": [0.1],
+                "top_k": 1,
+            },
+            {
+                "collection": "docs",
+                "model_tag": "",
+                "query_text": "query",
+                "query_vector": [0.1],
+                "top_k": 1,
+            },
+            {
+                "collection": "docs",
+                "model_tag": "model",
+                "query_text": "",
+                "query_vector": [0.1],
+                "top_k": 1,
+            },
+            {
+                "collection": "docs",
+                "model_tag": "model",
+                "query_text": "query",
+                "query_vector": [0.1],
+                "top_k": 0,
+            },
+        ],
+    )
+    def test_search_hybrid_validates_public_inputs(self, kwargs: dict) -> None:
+        with pytest.raises(DocumentValidationError):
+            search_hybrid(**kwargs)
+
+    def test_search_hybrid_validates_query_vector(self) -> None:
+        with pytest.raises(VectorValidationError):
+            search_hybrid("docs", "model", "query", [], top_k=1)
 
     def _patch_search_hybrid_module(self):
         """Helper method to import and patch search_hybrid module.

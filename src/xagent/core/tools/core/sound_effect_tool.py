@@ -8,8 +8,10 @@ from inspect import isawaitable
 from typing import Any, Optional
 
 from ...file_ref import build_workspace_file_ref
+from ...model.chat.token_context import MediaCallType
 from ...model.sound_effect import BaseSoundEffectModel, SoundEffectResult
 from ...workspace import TaskWorkspace
+from .media_usage import coerce_duration, record_media_seconds, resolve_billing_model
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +153,39 @@ The generated file is saved to the workspace and returned as file_id/file_ref.
                 loop=loop,
                 output_format=output_format,
             )
+            # Billing policy for the media tools: a provider call that has
+            # already happened is billable regardless of what fails afterwards,
+            # so usage is recorded before the response is validated — a call
+            # that returned empty or malformed audio was still charged for.
+            #
+            # ElevenLabs prices sound effects by duration, so seconds is the
+            # only meaningful unit here — an auto-length call with no reported
+            # duration records 0 seconds rather than switching to characters,
+            # which would be wrong in kind, not just in magnitude. `result` is
+            # not yet known to be a SoundEffectResult, so read via getattr.
+            raw_response = getattr(result, "raw_response", None)
+            reported_duration = (
+                raw_response.get("duration_seconds")
+                if isinstance(raw_response, dict)
+                else None
+            )
+            seconds = coerce_duration(reported_duration) or coerce_duration(
+                duration_seconds
+            )
+            record_media_seconds(
+                seconds,
+                # `model` is the provider name, `model_id` the configured id —
+                # see music_tool: passing configured_model_id as the first
+                # argument would put the same id in both fields and drop the
+                # provider name, while the fallback keeps it ahead of the
+                # class name for providers exposing no model_name.
+                model=resolve_billing_model(
+                    None, model, fallback=configured_model_id or type(model).__name__
+                ),
+                model_id=configured_model_id or "",
+                call_type=MediaCallType.SOUND_EFFECT,
+            )
+
             if not isinstance(result, SoundEffectResult):
                 raise RuntimeError(f"Unexpected sound effect response: {type(result)}")
             if not result.audio:

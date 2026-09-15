@@ -166,8 +166,15 @@ async def test_transcribe_uploaded_voice_files_uses_registered_input_file() -> N
         def __init__(self) -> None:
             self.calls: list[dict[str, str | None]] = []
 
-        async def transcribe(self, *, audio: str, format: str | None = None) -> str:
-            self.calls.append({"audio": audio, "format": format})
+        async def transcribe(
+            self,
+            *,
+            audio: str,
+            format: str | None = None,
+            verbose: bool = False,
+            **kwargs: object,
+        ) -> str:
+            self.calls.append({"audio": audio, "format": format, "verbose": verbose})
             return "今晚有世界杯比赛吗？"
 
     asr = FakeASR()
@@ -189,8 +196,14 @@ async def test_transcribe_uploaded_voice_files_uses_registered_input_file() -> N
     )
 
     assert transcripts == {"voice-file-id": "今晚有世界杯比赛吗？"}
+    # verbose=True is required: without it the provider returns a bare string
+    # with no timings and the ASR usage record is an unbillable 0 seconds.
     assert asr.calls == [
-        {"audio": "/workspace/input/voice-file-id.oga", "format": "ogg"}
+        {
+            "audio": "/workspace/input/voice-file-id.oga",
+            "format": "ogg",
+            "verbose": True,
+        }
     ]
     assert uploaded_info[0]["file_id"] == "workspace-file-id"
 
@@ -201,7 +214,12 @@ async def test_transcribe_uploaded_voice_files_extracts_result_text() -> None:
 
     class ResultASR:
         async def transcribe(
-            self, *, audio: str, format: str | None = None
+            self,
+            *,
+            audio: str,
+            format: str | None = None,
+            verbose: bool = False,
+            **kwargs: object,
         ) -> SimpleNamespace:
             return SimpleNamespace(text="今晚有世界杯比赛吗？")
 
@@ -242,7 +260,14 @@ async def test_transcribe_uploaded_voice_files_rejects_empty_result() -> None:
     bot = make_bot()
 
     class EmptyASR:
-        async def transcribe(self, *, audio: str, format: str | None = None) -> str:
+        async def transcribe(
+            self,
+            *,
+            audio: str,
+            format: str | None = None,
+            verbose: bool = False,
+            **kwargs: object,
+        ) -> str:
             return "  "
 
     with pytest.raises(

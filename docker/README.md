@@ -598,6 +598,20 @@ docker compose exec postgres pg_dump -U xagent xagent > backup.sql
 docker compose exec -T postgres psql -U xagent xagent < backup.sql
 ```
 
+### LanceDB full-text index rebuild
+
+Knowledge-base full-text indexes store their tokenizer at build time, so a database created before the jieba tokenizer switch keeps the old one until the index is rebuilt, and no ingestion or maintenance path rebuilds it on its own. Existing deployments run this once; new installations do not need it.
+
+```bash
+# Report what would be rebuilt
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes --dry-run
+
+# Rebuild (exit 1 means at least one table was not rebuilt; safe to re-run)
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes
+```
+
+Run it inside `backend` so it uses the same `LANCEDB_DIR` as the application. Full context, exit codes and verification are the dated entry in [`docs/deployment.md`](../docs/deployment.md).
+
 ### PostgreSQL major version upgrade (16 to 17)
 
 The bundled `postgres` service defaults to `postgres:17-bookworm`. PostgreSQL never upgrades a data directory across major versions: a v17 server refuses to open a v16 directory, exits with `FATAL: database files are incompatible with server`, and restart-loops as `unhealthy`, which blocks `backend`, `worker`, and `scheduler`. It does not modify the directory, so pinning `POSTGRES_IMAGE_TAG="16-bookworm"` restores service at any point.

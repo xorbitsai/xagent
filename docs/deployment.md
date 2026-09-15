@@ -329,3 +329,56 @@ Valid only until step 8 restarts the writers. Until that point a v17 server has 
 Roll back rather than repair in place when verification fails after a partial restore under v17. A cluster left half-populated by an interrupted restore is not a state to diagnose during an outage. If the v16 volume copy is unavailable, restore the verified dump from step 3 onto a v16 cluster initialized from `16-bookworm`.
 
 After v17 accepts writes the volume copy is stale, and restoring it discards everything written since the cutover. Recovery from that point means taking a fresh v17 backup and reconciling the two, not a copy-back.
+
+## 2026-09-15 — LanceDB FTS index rebuild for the jieba tokenizer
+
+### Deployment impact
+
+The knowledge-base full-text index now builds with the `jieba/default` tokenizer. The tokenizer is written into the index at build time and is never read back out, so an index built before this release keeps segmenting queries the old way until it is rebuilt. Chinese keyword search stays degraded on those tables, and nothing in the running system repairs them: `ensure_indexes` only creates an index that is missing, and the automatic rebuild inside `compact_tables` needs fresh ingestion plus a fragment or version threshold. A knowledge base that is only read from never reaches either, so a quiescent deployment stays on the old tokenizer indefinitely.
+
+Existing deployments therefore need one manual run of the migration below. New installations do not: their first index build already uses the new tokenizer.
+
+Embeddings tables are named `embeddings_<model>`, one per embedding model and shared by every tenant in that database, so the rebuild covers all tenants at once and the table count matches the number of models in use, not the number of collections.
+
+### Prerequisites and configuration
+
+The script talks to the same database as the application, so it must run with the same `LANCEDB_DIR` the backend uses. When `LANCEDB_DIR` is unset, both fall back to `~/.xagent/data/lancedb` inside the process's own home directory — which is the `xagent_data` volume in the container and a different directory on the host. Run it inside the `backend` container, or export `LANCEDB_DIR` explicitly, rather than relying on that default matching.
+
+Rebuilding reads every indexed row of a table and writes a new index, so size the window by row count, not by table count. It does not rewrite the data files and does not compact: compaction remains the ingestion path's job.
+
+The rebuild takes the same per-table lock that compaction uses, so a table being compacted by a concurrent ingestion is reported as unfinished rather than rebuilt. Run this while ingestion is idle, or re-run afterwards for the tables that were busy. Search keeps serving the old index until the new one commits; no maintenance window is required for readers.
+
+### Deployment and migration steps
+
+Deploy the release first, then run the migration once per database:
+
+```bash
+# 1. List what would be rebuilt, changing nothing
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes --dry-run
+
+# 2. Rebuild
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes
+
+# Optional: one table at a time
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes --table embeddings_<model>
+```
+
+The dry run classifies every `embeddings_*` table as would-rebuild, would-skip (no full-text index on the `text` column, so there is nothing to replace), or unreadable, and the real run acts on that same classification.
+
+Exit codes:
+
+- `0` — every table that needed a rebuild was rebuilt.
+- `1` — at least one table was not rebuilt: the rebuild raised, or the table's lock was held elsewhere. The other tables still completed.
+- `2` — the run never started, for example an unreadable database or a `--table` value that is not an embeddings table.
+
+The script is safe to re-run and rebuilding an already-rebuilt index is not an error, so recovery from exit code 1 is to fix the cause and run it again; with `--table` to retry only what failed.
+
+### Verification and monitoring
+
+Each table is logged with its index state before and after, so the run itself is the record: compare `version` and `indexed_rows` in the two lines, and confirm the closing summary reports the table under `Succeeded`. A table that was rebuilt reports `unindexed_rows: 0` afterwards.
+
+The tokenizer cannot be read back out of a built index, so there is no stored value to assert against. The behavioural check is a Chinese multi-word keyword search against a collection on that table: before the rebuild it returns nothing or unrelated hits, after it returns the documents containing those words.
+
+### Rollback
+
+No rollback path and none needed: the previous index is replaced by one built from the same rows, and the schema, the data files and the row contents are untouched. Reverting the application code leaves the new index in place and searching it with the old tokenizer restores the previous behavior, which is the degraded one this rebuild fixes.

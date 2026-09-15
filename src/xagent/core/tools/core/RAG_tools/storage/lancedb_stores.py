@@ -9,6 +9,7 @@ import threading
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple, cast
 
 import pyarrow as pa  # type: ignore
@@ -121,6 +122,30 @@ def _compaction_lock(conn: Any, table_name: str) -> Iterator[bool]:
             lock.release()
         except Exception as e:  # noqa: BLE001
             logger.debug("Could not release compaction lock for %s: %s", table_name, e)
+
+
+class FtsRebuildOutcome(Enum):
+    """Why :meth:`LanceDBVectorIndexStore.rebuild_text_fts_index` returned.
+
+    Failure is not a member: it propagates as the original exception, which
+    carries the cause a member would throw away.
+    """
+
+    REBUILT = "rebuilt"
+    SKIPPED_NO_INDEX = "skipped_no_index"
+    SKIPPED_LOCKED = "skipped_locked"
+
+
+def _has_text_fts_index(table: Any) -> bool:
+    """Whether ``table`` carries an FTS index on the ``text`` column.
+
+    Both halves matter: an FTS index on another column is not one this rebuild
+    can replace.
+    """
+    return any(
+        idx.index_type == "FTS" and "text" in idx.columns
+        for idx in table.list_indices()
+    )
 
 
 def _stale_version_count(table: Any, cutoff: datetime) -> int:
@@ -1638,16 +1663,40 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         Guarded because ``compact_tables`` routes documents, parses, chunks and
         ingestion_runs through the same path and only embeddings carries FTS.
         """
-        has_fts = any(
-            idx.index_type == "FTS" and "text" in idx.columns
-            for idx in table.list_indices()
-        )
-        if not has_fts:
+        if not _has_text_fts_index(table):
             return
 
         fts_params = {"with_position": True, **(DEFAULT_INDEX_POLICY.fts_params or {})}
         table.create_fts_index("text", replace=True, **fts_params)
-        logger.info("Rebuilt FTS index for %s before optimize", table_name)
+        logger.info("Rebuilt FTS index for %s", table_name)
+
+    def rebuild_text_fts_index(self, table_name: str) -> FtsRebuildOutcome:
+        """Rebuild one table's ``text`` FTS index, and nothing else.
+
+        Unlike :meth:`trigger_reindex` this neither compacts nor swallows a
+        failed rebuild: the return value says what happened and anything else
+        raises, so a caller can report the rebuild rather than infer it.
+
+        Shares ``trigger_reindex``'s per-table lock, so a concurrent ingestion
+        compacting the same table yields ``SKIPPED_LOCKED`` instead of racing
+        it into a lost rewrite.
+        """
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_connection()
+        with _compaction_lock(conn, table_name) as acquired:
+            if not acquired:
+                return FtsRebuildOutcome.SKIPPED_LOCKED
+            table = None
+            try:
+                table = conn.open_table(table_name)
+                if not _has_text_fts_index(table):
+                    return FtsRebuildOutcome.SKIPPED_NO_INDEX
+                self._rebuild_fts_index(table, table_name)
+                self.invalidate_table_cache(table_name)
+                return FtsRebuildOutcome.REBUILT
+            finally:
+                _safe_close_table(table)
 
     def should_compact(
         self, table_name: str, policy: Optional[IndexPolicy] = None

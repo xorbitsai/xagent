@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from datetime import date
 from typing import Any
 
 import requests
@@ -159,6 +160,44 @@ def _ends_today(date_range: dict[str, Any]) -> bool:
     return str(date_range.get("end_date", "")).strip().lower() == "today"
 
 
+_RELATIVE_DATE_PATTERN = re.compile(r"^(\d+)daysAgo$", re.IGNORECASE)
+
+
+def _relative_day_offset(value: str) -> int | None:
+    """Days before "today" a GA4 relative date term refers to (0 for
+    "today", 1 for "yesterday", N for "NdaysAgo"), or None if `value` isn't
+    one of those recognized relative terms (e.g. an explicit YYYY-MM-DD)."""
+    normalized = value.strip().lower()
+    if normalized == "today":
+        return 0
+    if normalized == "yesterday":
+        return 1
+    match = _RELATIVE_DATE_PATTERN.match(value.strip())
+    return int(match.group(1)) if match else None
+
+
+def _date_range_day_count(date_range: dict[str, Any]) -> int | None:
+    """Inclusive day span of a date_range (e.g. 2 for "yesterday"/"today",
+    7 for "7daysAgo"/"yesterday"), or None if it can't be computed -- either
+    an unrecognized value, or one bound given as a relative term and the
+    other as an explicit date (comparable only by knowing "today"'s actual
+    date, which this tool never resolves itself)."""
+    start = str(date_range.get("start_date", ""))
+    end = str(date_range.get("end_date", ""))
+    start_offset = _relative_day_offset(start)
+    end_offset = _relative_day_offset(end)
+    if start_offset is not None and end_offset is not None:
+        span = start_offset - end_offset + 1
+        return span if span > 0 else None
+    if start_offset is None and end_offset is None:
+        try:
+            span = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+        except ValueError:
+            return None
+        return span if span > 0 else None
+    return None
+
+
 @mcp.tool()
 def google_analytics_list_properties() -> str:
     """
@@ -299,6 +338,10 @@ def google_analytics_run_report(
       still-processing day on top and will read higher than the GA UI's
       report for the same nominal period. Only end at "today" when the user
       explicitly wants data including today, and call that out as partial.
+      When comparing two periods, give both date_ranges the same number of
+      days (e.g. current "7daysAgo"/"yesterday" against previous
+      "14daysAgo"/"8daysAgo", both 7 days) — a percentage change between
+      differently-sized periods isn't meaningful.
     dimensions: dimension names, e.g. ["sessionDefaultChannelGroup",
       "landingPagePlusQueryString"]. Use google_analytics_get_metadata to
       discover valid names for this property.
@@ -357,19 +400,42 @@ def google_analytics_run_report(
         rows = result.get("rows") or []
         row_count = result.get("rowCount") or 0
 
-        # Surface the inclusive-range gotcha in the result itself, so the
-        # LLM catches it even if it never reads the docstring: a date_range
-        # ending at "today" pulls in a partial, still-processing day that
-        # the GA UI's equivalent "last N days" report excludes.
-        extra_kwargs: dict[str, Any] = {}
+        # Surface two gotchas in the result itself, so the LLM catches them
+        # even if it never reads the docstring.
+        notes: list[str] = []
         if any(_ends_today(dr) for dr in date_ranges):
-            extra_kwargs["note"] = (
+            # A date_range ending at "today" pulls in a partial,
+            # still-processing day that the GA UI's equivalent "last N
+            # days" report excludes.
+            notes.append(
                 'One or more date_ranges end at "today", which includes '
                 "partial, still-processing data for the current day. This "
                 "will not exactly match a GA UI report for the same nominal "
                 "period, which uses only complete days. To match GA UI's "
                 '"Last N days", use "yesterday" as the end_date instead.'
             )
+        day_counts = [
+            (dr.get("name") or f"range {i + 1}", _date_range_day_count(dr))
+            for i, dr in enumerate(date_ranges)
+        ]
+        known_spans = {count for _, count in day_counts if count is not None}
+        if len(known_spans) > 1:
+            # Comparing date_ranges of different lengths (e.g. an 8-day
+            # "this_week" against a 7-day "last_week") makes any
+            # percentage change between them meaningless, independent of
+            # whether either range touches "today".
+            detail = ", ".join(
+                f"{name}={count}d" for name, count in day_counts if count is not None
+            )
+            notes.append(
+                f"date_ranges span different numbers of days ({detail}) -- "
+                "a percentage change between periods of unequal length "
+                "isn't meaningful. Make every compared date_range cover "
+                "the same number of days."
+            )
+        extra_kwargs: dict[str, Any] = {}
+        if notes:
+            extra_kwargs["note"] = " ".join(notes)
 
         # RUN_REPORT_MAX_LIMIT bounds row count, not bytes: several long
         # dimension values (e.g. full URLs) at once can still cross the

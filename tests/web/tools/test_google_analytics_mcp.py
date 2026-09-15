@@ -446,6 +446,108 @@ def test_run_report_omits_note_when_no_date_range_ends_today(monkeypatch):
     assert "note" not in result
 
 
+def test_run_report_flags_note_when_compared_date_ranges_have_unequal_length(
+    monkeypatch,
+):
+    """Regression for a real incident: comparing "7daysAgo"/"today" (8
+    inclusive days) against "14daysAgo"/"8daysAgo" (7 days) silently compares
+    unequal-length periods, making any percentage change between them
+    meaningless regardless of whether "today" is complete. The response
+    must call this out."""
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["activeUsers"],
+            date_ranges=[
+                {"start_date": "7daysAgo", "end_date": "today", "name": "this_week"},
+                {
+                    "start_date": "14daysAgo",
+                    "end_date": "8daysAgo",
+                    "name": "last_week",
+                },
+            ],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "different numbers of days" in result["note"]
+    assert "this_week=8d" in result["note"]
+    assert "last_week=7d" in result["note"]
+    # Both gotchas apply here (this_week also ends at "today") -- both notes
+    # must surface, not just whichever check runs last.
+    assert "today" in result["note"]
+
+
+def test_run_report_omits_length_note_when_compared_date_ranges_match(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["activeUsers"],
+            date_ranges=[
+                {
+                    "start_date": "7daysAgo",
+                    "end_date": "yesterday",
+                    "name": "current",
+                },
+                {
+                    "start_date": "14daysAgo",
+                    "end_date": "8daysAgo",
+                    "name": "previous",
+                },
+            ],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "note" not in result
+
+
+def test_run_report_omits_length_note_when_a_bound_is_unrecognized(monkeypatch):
+    """A date_range mixing a relative term with an explicit date (or any
+    other value _relative_day_offset/date.fromisoformat can't parse) can't
+    be compared without knowing "today"'s actual date -- must not false-
+    positive into a spurious mismatch note."""
+    mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["activeUsers"],
+            date_ranges=[
+                {"start_date": "7daysAgo", "end_date": "yesterday"},
+                {"start_date": "2026-08-01", "end_date": "2026-08-07"},
+            ],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert "note" not in result
+
+
+@pytest.mark.parametrize(
+    ("date_range", "expected"),
+    [
+        ({"start_date": "yesterday", "end_date": "today"}, 2),
+        ({"start_date": "7daysAgo", "end_date": "yesterday"}, 7),
+        ({"start_date": "7daysAgo", "end_date": "today"}, 8),
+        ({"start_date": "2026-08-01", "end_date": "2026-08-07"}, 7),
+        ({"start_date": "2026-08-01", "end_date": "2026-08-01"}, 1),
+        ({"start_date": "today", "end_date": "7daysAgo"}, None),  # reversed
+        ({"start_date": "7daysAgo", "end_date": "2026-08-07"}, None),  # mixed
+        ({"start_date": "not-a-date", "end_date": "today"}, None),
+    ],
+)
+def test_date_range_day_count(date_range, expected):
+    assert google_analytics._date_range_day_count(date_range) == expected
+
+
 def test_run_report_passes_through_filter_and_order(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
     monkeypatch.setattr(google_analytics.requests, "request", mock_request)

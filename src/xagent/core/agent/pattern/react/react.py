@@ -1811,6 +1811,12 @@ class ReActPattern(AgentPattern):
                     "written before user input arrived; the agent replans "
                     "from the user's response."
                 ),
+                # The user answer is already in context at this point (resume
+                # only runs after the reply arrives), so the cancellation
+                # results must land BEFORE it to stay adjacent to their
+                # assistant turn; appending would break the tool→assistant
+                # pairing and hide the question turn from the LLM view.
+                insert_before_last_user=True,
             )
         waiting_task = self.waiting_for_user_request.get("task_text")
         if waiting_task and self.task_text is None:
@@ -2804,7 +2810,12 @@ class ReActPattern(AgentPattern):
         return segment, "concurrent"
 
     def _backfill_result(
-        self, tool_call: dict[str, Any], result: Any, context: Any
+        self,
+        tool_call: dict[str, Any],
+        result: Any,
+        context: Any,
+        *,
+        insert_before_last_user: bool = False,
     ) -> None:
         """Record one tool result into the context and drop its cached content.
 
@@ -2815,11 +2826,16 @@ class ReActPattern(AgentPattern):
             tool_name=tool_call["name"],
             result=result,
             tool_call_id=tool_call.get("id"),
+            insert_before_last_user=insert_before_last_user,
         )
         self._forget_tool_call_content(tool_call)
 
     def _discard_pending_tool_plan_after_pause(
-        self, context: Any, *, reason: str | None = None
+        self,
+        context: Any,
+        *,
+        reason: str | None = None,
+        insert_before_last_user: bool = False,
     ) -> None:
         """Close unexecuted calls so resume always starts with a fresh LLM plan."""
 
@@ -2835,10 +2851,16 @@ class ReActPattern(AgentPattern):
                 "Discarded because an earlier tool requires user input; "
                 "the agent will replan after the user responds."
             ),
+            insert_before_last_user=insert_before_last_user,
         )
 
     def _cancel_tool_calls(
-        self, tool_calls: list[dict[str, Any]], context: Any, *, reason: str
+        self,
+        tool_calls: list[dict[str, Any]],
+        context: Any,
+        *,
+        reason: str,
+        insert_before_last_user: bool = False,
     ) -> None:
         """Close calls that will never run, one result each.
 
@@ -2848,7 +2870,12 @@ class ReActPattern(AgentPattern):
 
         for tool_call in tool_calls:
             result = {"success": False, "status": "cancelled", "error": reason}
-            self._backfill_result(tool_call, result, context)
+            self._backfill_result(
+                tool_call,
+                result,
+                context,
+                insert_before_last_user=insert_before_last_user,
+            )
             self._record_tool_call(
                 tool_call,
                 status="cancelled",

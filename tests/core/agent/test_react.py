@@ -5693,6 +5693,58 @@ async def test_react_resume_waiting_cancels_stale_pending_from_legacy_checkpoint
 
 
 @pytest.mark.asyncio
+async def test_react_resume_waiting_keeps_question_turn_in_llm_view() -> None:
+    """#2223: cancelling a stale sibling from a legacy checkpoint must not
+    elide the question turn from the resumed LLM view.
+
+    Pre-fix, `_discard_pending_tool_plan_after_pause` appended the
+    cancellation result AFTER the already-injected user answer. The
+    sanitizer then saw assistant[tool_calls: q, stale] -> tool(q) ->
+    user(answer) -> tool(stale, cancelled): the assistant's tool results
+    were no longer contiguous, so the whole question turn and both tool
+    results were dropped from the LLM view (it saw only
+    [system, user(task), user(framed answer)]). The cancellation results
+    must land BEFORE the user answer to stay adjacent to their assistant
+    turn.
+    """
+
+    state, context = _legacy_waiting_state_and_context(_STALE_FINAL_ANSWER)
+    context.add_user_message("B")
+    pattern = ReActPattern(max_iterations=3)
+    pattern.load_state(state)
+    resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
+
+    resumed = await pattern.run(context=context, tools=[], llm=resumed_llm)
+
+    assert resumed["success"] is True
+    resumed_messages = resumed_llm.calls[0]["messages"]
+    assistant_turns = [
+        message for message in resumed_messages if message.get("role") == "assistant"
+    ]
+    tool_messages = [
+        message for message in resumed_messages if message.get("role") == "tool"
+    ]
+    # The assistant question turn survives, carrying BOTH tool calls.
+    assert len(assistant_turns) >= 1
+    declared_ids = {
+        call["id"]
+        for call in assistant_turns[-1].get("tool_calls", [])
+        if isinstance(call, dict)
+    }
+    assert "call_question" in declared_ids
+    assert "call_stale_final" in declared_ids
+    # Both tool results stay adjacent to their assistant turn.
+    assert len(tool_messages) == 2
+    assert {message["tool_call_id"] for message in tool_messages} == {
+        "call_question",
+        "call_stale_final",
+    }
+    # The user answer still closes the resumed view for the LLM.
+    assert resumed_messages[-1]["role"] == "user"
+    assert resumed_messages[-1]["content"].endswith("B")
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_resume_binds_original_task_to_store_memory() -> None:
     llm = FakeLLM(
         responses=[

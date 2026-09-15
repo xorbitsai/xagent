@@ -1,4 +1,5 @@
 import json
+from unittest.mock import Mock
 
 import requests
 
@@ -56,3 +57,45 @@ def test_response_error_text_truncates_large_body():
     assert meta_graph.response_error_text(response) == (
         "x" * meta_graph.MAX_ERROR_RESPONSE_TEXT_CHARS + "... [truncated]"
     )
+
+
+def test_get_permissions_maps_permission_to_status(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    monkeypatch.setattr(
+        meta_graph.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "data": [
+                        {"permission": "pages_show_list", "status": "granted"},
+                        {"permission": "ads_read", "status": "declined"},
+                    ]
+                }
+            )
+        ),
+    )
+
+    assert meta_graph.get_permissions() == {
+        "pages_show_list": "granted",
+        "ads_read": "declined",
+    }
+
+
+def test_get_permissions_treats_non_list_data_as_empty(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    monkeypatch.setattr(
+        meta_graph.requests,
+        "request",
+        Mock(return_value=MockResponse({"data": None})),
+    )
+
+    assert meta_graph.get_permissions() == {}
+
+
+def test_missing_permissions_flags_ungranted_and_absent_permissions():
+    granted = {"pages_show_list": "granted", "ads_read": "declined"}
+
+    assert meta_graph.missing_permissions(
+        ["pages_show_list", "ads_read", "pages_manage_posts"], granted
+    ) == ["ads_read", "pages_manage_posts"]

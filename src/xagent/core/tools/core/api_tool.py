@@ -13,7 +13,7 @@ from urllib.parse import ParseResult, parse_qs, urlencode, urlparse
 
 import httpx
 
-from ...utils.security import redact_url_credentials_for_logging
+from ...utils.security import host_matches_suffix, redact_url_credentials_for_logging
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # token here, so the request is guaranteed to 401/403 regardless of whether
 # the connector itself is healthy. That failure was previously indistinguishable
 # from an actually-broken connection (see the HubSpot deal-write incident this
-# guard was added for: reads kept working the whole time via the real
+# hint was added for: reads kept working the whole time via the real
 # connector, but the raw fallback calls' 401s got diagnosed as "HubSpot
 # connection broken"). Entries are the domain as it would be matched by
 # _hostname_matches_connector_domain (exact host or "*.<domain>"), not a
@@ -36,11 +36,12 @@ logger = logging.getLogger(__name__)
 # Google, Microsoft Graph, and Meta Graph are each only PARTIALLY covered:
 # xagent's connectors wrap specific product APIs, not every API a customer
 # could reach on that host. Google's per-product hosts below (Ads, Analytics,
-# Search Console, Gmail, Docs, Sheets, Slides) are each dedicated to one
-# product, so listing them is precise. Calendar and Drive are deliberately
-# NOT listed: both share the general-purpose "www.googleapis.com" host with
-# many unrelated Google APIs xagent has no connector for, and guarding that
-# host would block those unrelated APIs too. graph.microsoft.com (Outlook /
+# Search Console inspection, Gmail, Docs, Sheets, Slides) are each dedicated
+# to one product, so listing them is precise. Search Console's Webmasters API
+# is handled separately by a host-plus-path rule. Calendar and Drive are
+# deliberately NOT listed: both share the general-purpose "www.googleapis.com" host with
+# many unrelated Google APIs xagent has no connector for, and annotating that
+# host would mislabel unrelated APIs too. graph.microsoft.com (Outlook /
 # OneDrive / Teams) and graph.facebook.com (Facebook / Instagram - also the
 # WhatsApp Business Cloud API's host, which xagent does not implement) can't
 # be narrowed the same way since Microsoft/Meta multiplex many products onto
@@ -78,29 +79,23 @@ _KNOWN_CONNECTOR_DOMAINS: tuple[tuple[str, str], ...] = (
     ("api.xero.com", "Xero"),
 )
 
+# Connector APIs hosted on a shared domain need a path-qualified rule. A
+# blanket www.googleapis.com match would incorrectly label unrelated Google
+# APIs, while Search Console's sites/sitemaps/analytics operations use this
+# legacy Webmasters endpoint rather than searchconsole.googleapis.com.
+_KNOWN_CONNECTOR_PATHS: tuple[tuple[str, str, str], ...] = (
+    ("www.googleapis.com", "/webmasters/v3", "Google Search Console"),
+)
+
 # Domains that match one of _KNOWN_CONNECTOR_DOMAINS by suffix but are
-# actually a different, self-authenticating product the guard must not
+# actually a different, self-authenticating product the hint must not
 # touch: hooks.slack.com (Slack incoming webhooks) carries its secret in the
 # URL path itself, not in a header/param/token, and is unrelated to the
-# credentialed Slack Web API at slack.com/api that the guard is meant to
-# protect.
+# credentialed Slack Web API at slack.com/api that the hint describes.
 _SELF_AUTHENTICATING_SUBDOMAINS = frozenset({"hooks.slack.com"})
 
 
 def _hostname_matches_connector_domain(hostname: str, domain: str) -> bool:
-    # Deferred import: xagent.web.oauth_provider_quirks.host_matches_suffix
-    # is the one shared implementation of "exact host or dot-anchored
-    # subdomain" (its own docstring says so, and auth.py's Deputy/Employment
-    # Hero endpoint checks already use it) - reusing it here instead of a
-    # second copy avoids the two silently diverging, which already happened
-    # once (this module's trailing-dot handling lives in the caller,
-    # match_known_connector_domain, not duplicated into this function).
-    # core doesn't import from web at module load time elsewhere in this
-    # codebase (see e.g. workspace.py's deferred `from ..web...` imports),
-    # so this follows that same lazy-import precedent rather than adding a
-    # new top-level core->web dependency.
-    from ....web.oauth_provider_quirks import host_matches_suffix
-
     return host_matches_suffix(hostname.lower(), domain.lower())
 
 
@@ -110,13 +105,30 @@ def match_known_connector_domain(hostname: str) -> Optional[str]:
     # A trailing "." is a valid DNS root-label marker (api.hubapi.com. is the
     # same host as api.hubapi.com) that a caller could legitimately send;
     # without stripping it, that spelling would silently skip this check.
-    hostname = hostname.lower().rstrip(".")
-    if hostname in _SELF_AUTHENTICATING_SUBDOMAINS:
+    hostname = hostname.lower().removesuffix(".")
+    if any(
+        _hostname_matches_connector_domain(hostname, exempted)
+        for exempted in _SELF_AUTHENTICATING_SUBDOMAINS
+    ):
         return None
     for domain, label in _KNOWN_CONNECTOR_DOMAINS:
         if _hostname_matches_connector_domain(hostname, domain):
             return label
     return None
+
+
+def match_known_connector_url(url: str) -> Optional[str]:
+    """Return the connector label for a complete URL, including precise
+    path-qualified rules for APIs that share a general-purpose host."""
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower().removesuffix(".")
+    path = parsed.path.rstrip("/")
+    for domain, path_prefix, label in _KNOWN_CONNECTOR_PATHS:
+        if _hostname_matches_connector_domain(hostname, domain) and (
+            path == path_prefix or path.startswith(f"{path_prefix}/")
+        ):
+            return label
+    return match_known_connector_domain(hostname)
 
 
 # Substrings of a header name that indicate the caller already attached
@@ -127,8 +139,8 @@ def match_known_connector_domain(hostname: str) -> Optional[str]:
 # matches non-credential headers like "X-Author" or the HTTP/2 ":authority"
 # pseudo-header, and "signature" matches non-credential headers like
 # GitHub's outbound "X-Hub-Signature-256" webhook-verification header - both
-# would silently defeat the guard below for a call that has no real
-# credential. "authorization" alone already covers the real "Authorization"
+# would silently suppress the hint for a call that has no real credential.
+# "authorization" alone already covers the real "Authorization"
 # case (it's a superset match of that word), so nothing is lost by dropping
 # the broader "auth".
 _AUTH_HEADER_NAME_MARKERS = (
@@ -144,15 +156,6 @@ _AUTH_QUERY_PARAM_NAMES = frozenset(
     {"key", "api_key", "api-key", "apikey", "token", "access_token"}
 )
 
-# auth_type values _prepare_headers()/call_api() actually know how to turn
-# into a real credential on the outgoing request. auth_token alone (without
-# one of these) is inert - _prepare_headers only attaches an Authorization
-# header when both auth_type and auth_token are set, and api_key_query is
-# handled separately in call_api's query-param step - so counting a bare
-# auth_token as "has a credential" would be wrong: the request that
-# actually goes out would carry none.
-_EFFECTIVE_AUTH_TYPES = frozenset({"bearer", "basic", "api_key", "api_key_query"})
-
 
 def _is_blank(value: Any) -> bool:
     # str(None) is the non-empty text "None", so None must be special-cased
@@ -162,14 +165,6 @@ def _is_blank(value: Any) -> bool:
     if value is None:
         return True
     return not str(value).strip()
-
-
-def _has_effective_auth_token(
-    auth_type: Optional[str], auth_token: Optional[str]
-) -> bool:
-    if _is_blank(auth_token) or not auth_type:
-        return False
-    return auth_type.lower() in _EFFECTIVE_AUTH_TYPES
 
 
 def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
@@ -184,13 +179,7 @@ def _has_auth_header(headers: Optional[Mapping[str, str]]) -> bool:
     return False
 
 
-def _has_auth_query_param(
-    parsed_url: ParseResult, params: Optional[Mapping[str, Any]]
-) -> bool:
-    if params:
-        for key, value in params.items():
-            if str(key).lower() in _AUTH_QUERY_PARAM_NAMES and not _is_blank(value):
-                return True
+def _has_auth_query_param(parsed_url: ParseResult) -> bool:
     # parse_qs defaults to keep_blank_values=False, so a blank value here
     # (e.g. "?key=") is already dropped for us - nothing extra to check.
     query_keys = {key.lower() for key in parse_qs(parsed_url.query)}
@@ -230,16 +219,9 @@ def _sanitize_final_url(url: httpx.URL) -> str:
 def has_auth_credentials(
     url: str,
     headers: Optional[Mapping[str, str]],
-    params: Optional[Mapping[str, Any]],
-    auth_type: Optional[str],
-    auth_token: Optional[str],
 ) -> bool:
-    """Whether the caller appears to already have their own credential for
-    this call, by any of the mechanisms api_call or a typical direct REST
-    call supports: auth_token paired with a supported auth_type, a
-    non-blank auth-looking header, a non-blank auth-looking query
-    parameter (in either `params` or the URL itself), or a credential
-    embedded directly in the URL (Basic-Auth userinfo).
+    """Whether the actual outgoing request carries a recognizable credential
+    in its headers, merged URL query, or Basic-Auth userinfo.
 
     A name-shaped match alone isn't enough for the header/param cases - an
     empty value (e.g. {"Authorization": ""}) or a name that merely
@@ -247,39 +229,15 @@ def has_auth_credentials(
     a request-deduplication id, not a secret) both look credential-shaped
     by name. That imprecision is why this is used only to decide whether
     to append an informational hint to an ALREADY-received 401/403 (see
-    known_connector_domain_hint / adapters/vibe/api_tool.py), never to
+    append_known_connector_domain_hint / adapters/vibe/api_tool.py), never to
     block a request outright: worst case here is a missed hint, not a
     request that should have succeeded being refused.
     """
     parsed_url = urlparse(url)
     return bool(
-        _has_effective_auth_token(auth_type, auth_token)
-        or _has_auth_header(headers)
-        or _has_auth_query_param(parsed_url, params)
+        _has_auth_header(headers)
+        or _has_auth_query_param(parsed_url)
         or _has_url_embedded_credentials(parsed_url)
-    )
-
-
-def known_connector_domain_hint(connector_label: str) -> str:
-    """A self-contained sentence (no leading/trailing whitespace) appended to
-    an ALREADY-received 401/403 from a domain covered by a dedicated MCP
-    connector, when the request carried no credential this tool recognizes
-    (see has_auth_credentials). Purely informational - it never gates
-    whether the request is made; a public, credential-less endpoint on the
-    same host (e.g. GitHub's public repo reads) still succeeds normally and
-    never sees this text. Callers append it after existing error text - see
-    append_known_connector_domain_hint, which handles the punctuation/
-    spacing needed to avoid a run-on sentence.
-    """
-    return (
-        f"This looks like a {connector_label} API endpoint, and this call "
-        f"carried no credential in a form this tool recognizes "
-        f"(auth_type/auth_token, a credential-shaped header, a "
-        f"credential-shaped query parameter, or Basic-Auth userinfo in the "
-        f"URL), which would explain a 401/403 here - if the dedicated "
-        f"{connector_label} connector tools cover this request, prefer "
-        "those (they carry the account's own OAuth credential); otherwise "
-        "pass your own credential via one of those mechanisms."
     )
 
 
@@ -288,12 +246,20 @@ def append_known_connector_domain_hint(
 ) -> str:
     """Combine `existing_error` (e.g. "HTTP 401", or the size-limit error
     text `_make_request` also uses on a 401/403) with
-    `known_connector_domain_hint`'s sentence, adding a period + space
-    between them when `existing_error` doesn't already end in sentence
+    the connector-guidance sentence, adding a period + space between it and
+    `existing_error` when the existing text doesn't already end in sentence
     punctuation - otherwise the two read as one run-on sentence (e.g.
     "...download aborted This looks like a HubSpot API endpoint...").
     """
-    hint = known_connector_domain_hint(connector_label)
+    hint = (
+        f"This looks like a {connector_label} API endpoint, and this call "
+        f"carried no credential in a form this tool recognizes "
+        f"(a credential-shaped header or query parameter, or Basic-Auth "
+        f"userinfo in the URL), which would explain a 401/403 here - if the "
+        f"dedicated {connector_label} connector tools cover this request, "
+        "prefer those (they carry the account's own OAuth credential); "
+        "otherwise pass your own credential via one of those mechanisms."
+    )
     existing_error = (existing_error or "").strip()
     if not existing_error:
         return hint
@@ -361,7 +327,8 @@ class APIClientCore:
             has_auth_credentials) - both are None on every other status.
         """
         logger.info(
-            f"🌐 API Call: {method} {redact_url_credentials_for_logging(url)}"
+            f"🌐 API Call: {method} "
+            f"{redact_url_credentials_for_logging(url, redact_all_query_values=True)}"
             + (f" (auth: {auth_type})" if auth_type else "")
         )
 
@@ -372,7 +339,10 @@ class APIClientCore:
                 "status_code": 0,
                 "headers": {},
                 "body": None,
-                "error": f"Invalid URL: {url}",
+                "error": (
+                    "Invalid URL: "
+                    f"{redact_url_credentials_for_logging(url, redact_all_query_values=True)}"
+                ),
             }
 
         # Prepare request
@@ -386,11 +356,8 @@ class APIClientCore:
 
         # Handle API key in query parameters. Case-insensitive to match
         # _prepare_headers' auth_type.lower() convention for bearer/basic/
-        # api_key below, and _has_effective_auth_token's - a caller sending
-        # auth_type="API_KEY_QUERY" would otherwise get no credential
-        # attached here while has_auth_credentials (which does lower()
-        # first) wrongly reports one was, suppressing the connector hint
-        # for exactly the resulting unauthenticated 401/403.
+        # api_key below. A caller sending auth_type="API_KEY_QUERY" must get
+        # the same query credential attached as its lowercase equivalent.
         request_params: Dict[str, Any] = dict(params) if params else {}
         if auth_type and auth_type.lower() == "api_key_query" and auth_token:
             request_params[api_key_param] = auth_token
@@ -418,7 +385,11 @@ class APIClientCore:
                     "status_code": 0,
                     "headers": {},
                     "body": None,
-                    "error": f"Invalid URL: {url} ({e})",
+                    "error": (
+                        "Invalid URL: "
+                        f"{redact_url_credentials_for_logging(url, redact_all_query_values=True)} "
+                        f"({e})"
+                    ),
                 }
 
         # Prepare headers
@@ -455,7 +426,7 @@ class APIClientCore:
                 status_icon = "✅" if result.get("success") else "⚠️"
                 logger.info(
                     f"{status_icon} API Call completed: {method} "
-                    f"{redact_url_credentials_for_logging(url)} -> "
+                    f"{redact_url_credentials_for_logging(url, redact_all_query_values=True)} -> "
                     f"{result['status_code']}"
                 )
                 return result
@@ -495,7 +466,10 @@ class APIClientCore:
         client_kwargs: Dict[str, Any] = {"timeout": timeout}
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
-            logger.debug(f"   Using proxy: {proxy_url}")
+            logger.debug(
+                "   Using proxy: "
+                f"{redact_url_credentials_for_logging(proxy_url, redact_all_query_values=True)}"
+            )
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             # Use streaming to limit download size
@@ -555,9 +529,6 @@ class APIClientCore:
                         final_request_has_credential = has_auth_credentials(
                             str(response.request.url),
                             response.request.headers,
-                            None,
-                            None,
-                            None,
                         )
                     except Exception as e:
                         logger.warning(

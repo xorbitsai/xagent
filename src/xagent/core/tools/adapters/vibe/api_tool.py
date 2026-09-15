@@ -6,7 +6,6 @@ HTTP client for making arbitrary API calls with support for various auth methods
 import json
 import logging
 from typing import Any, Dict, Mapping, Optional, Type, Union
-from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
@@ -14,7 +13,7 @@ from ....utils.security import redact_url_credentials_for_logging
 from ...core.api_tool import (
     APIClientCore,
     append_known_connector_domain_hint,
-    match_known_connector_domain,
+    match_known_connector_url,
 )
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
@@ -108,7 +107,7 @@ class APITool(AbstractBaseTool):
 
         # Make API call - api_key_query logic is now handled in core client.
         # Always actually attempted, even against a domain a dedicated MCP
-        # connector also covers: a domain-based preflight block was tried
+        # connector also covers: a domain-based preflight refusal was tried
         # first here and reverted (see git history) because it couldn't
         # distinguish a request that needs that connector's credential from
         # one that doesn't need any - e.g. GitHub's public, credential-less
@@ -129,7 +128,17 @@ class APITool(AbstractBaseTool):
         )
 
         if result.get("status_code") in (401, 403):
-            self._hint_known_connector_if_uncredentialed(result, api_args)
+            try:
+                self._hint_known_connector_if_uncredentialed(result, api_args)
+            except Exception as exc:
+                # Connector guidance is diagnostic-only. It must never turn
+                # an already-received HTTP response into a tool exception or
+                # discard its status, headers, body, or original error.
+                logger.warning(
+                    "Failed to derive connector guidance for a %s response: %s",
+                    result.get("status_code"),
+                    type(exc).__name__,
+                )
 
         return APICallResult.model_validate(result).model_dump()
 
@@ -153,9 +162,7 @@ class APITool(AbstractBaseTool):
         # is never missing here in practice; api_args.url is kept only as a
         # defensive fallback, not because it's expected to be used.
         response_url = result.get("final_url") or api_args.url
-        connector_label = match_known_connector_domain(
-            urlparse(response_url).hostname or ""
-        )
+        connector_label = match_known_connector_url(response_url)
         if not connector_label:
             return
         # Whether a credential actually reached the connector host - not
@@ -175,7 +182,7 @@ class APITool(AbstractBaseTool):
         )
         logger.info(
             f"ℹ️ API Call {api_args.method} "
-            f"{redact_url_credentials_for_logging(api_args.url)} got "
+            f"{redact_url_credentials_for_logging(api_args.url, redact_all_query_values=True)} got "
             f"{result['status_code']} with no recognized credential - "
             f"hinting at the {connector_label} connector"
         )

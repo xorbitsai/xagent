@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.models.sandbox import DurableSandboxLifecycle
+from xagent.web.services.chrome_lifecycle import ChromeLifecycleCoordinator
 from xagent.web.services.durable_sandbox_lifecycle import (
     DurableLifecycleConflict,
     DurableSandboxLifecycleRepository,
@@ -185,6 +187,34 @@ def test_age_only_never_reclaims_an_exact_active_attempt(sessions) -> None:
         assert claimed is None
 
 
+def test_current_owner_can_tombstone_active_attempt_before_backend_delete(
+    sessions,
+) -> None:
+    with sessions() as db:
+        repo = DurableSandboxLifecycleRepository(db)
+        registered = repo.register(_request())
+        _set_task(db, active=True)
+        deleting = repo.mark_deleting(
+            registered,
+            now=NOW,
+            claim_ttl=timedelta(minutes=1),
+        )
+
+        assert deleting is not None
+        assert deleting.state == "deleting"
+        assert deleting.owner_token != registered.owner_token
+        assert deleting.version == registered.version + 1
+        assert deleting.delete_attempts == 1
+        assert (
+            repo.mark_deleting(
+                registered,
+                now=NOW,
+                claim_ttl=timedelta(minutes=1),
+            )
+            is None
+        )
+
+
 def test_lost_attempt_can_be_claimed_and_tombstone_is_retryable(sessions) -> None:
     with sessions() as db:
         repo = DurableSandboxLifecycleRepository(db)
@@ -309,3 +339,86 @@ def test_stale_owner_or_version_cannot_settle(sessions) -> None:
         assert reclaimed is not None
         assert not repo.settle_delete(claim)
         assert repo.settle_delete(reclaimed)
+
+
+class _SharedBackend:
+    def __init__(self) -> None:
+        self.present: set[str] = set()
+        self.deleted: list[str] = []
+
+    async def delete_durable_sandbox_strict(self, lifecycle_id: str) -> None:
+        self.present.discard(lifecycle_id)
+        self.deleted.append(lifecycle_id)
+
+
+@pytest.mark.asyncio
+async def test_two_worker_sweepers_delete_one_registered_crash_generation(
+    sessions,
+) -> None:
+    service_a = DurableSandboxLifecycleService(sessions)
+    service_b = DurableSandboxLifecycleService(sessions)
+    fence = service_a.register(_request())
+    backend = _SharedBackend()
+    backend.present.add(fence.backend_lifecycle_digest)
+    coordinator_a = ChromeLifecycleCoordinator(service_a, backend, now=lambda: NOW)
+    coordinator_b = ChromeLifecycleCoordinator(service_b, backend, now=lambda: NOW)
+
+    outcomes = await asyncio.gather(
+        coordinator_a.sweep_once(), coordinator_b.sweep_once()
+    )
+
+    assert sum(outcomes) == 1
+    assert backend.deleted == [fence.backend_lifecycle_digest]
+    assert service_a.get_by_scope(fence.scope_digest) is None
+
+
+@pytest.mark.asyncio
+async def test_sweeper_recovers_ready_crash_only_after_exact_attempt_is_inactive(
+    sessions,
+) -> None:
+    service = DurableSandboxLifecycleService(sessions)
+    registered = service.register(_request())
+    with sessions() as db:
+        _set_task(db, active=True)
+        db.commit()
+    ready = service.mark_ready(
+        registered,
+        now=NOW,
+        owner_lease_expires_at=NOW - timedelta(seconds=1),
+    )
+    assert ready is not None
+    backend = _SharedBackend()
+    backend.present.add(ready.backend_lifecycle_digest)
+    coordinator = ChromeLifecycleCoordinator(service, backend, now=lambda: NOW)
+
+    assert await coordinator.sweep_once() == 0
+    with sessions() as db:
+        _set_task(db, active=False)
+        db.commit()
+    assert await coordinator.sweep_once() == 1
+    assert backend.present == set()
+    assert service.get_by_scope(ready.scope_digest) is None
+
+
+@pytest.mark.asyncio
+async def test_sweeper_settles_crash_after_physical_delete_idempotently(
+    sessions,
+) -> None:
+    service = DurableSandboxLifecycleService(sessions)
+    registered = service.register(_request())
+    deleting = service.mark_deleting(
+        registered,
+        now=NOW,
+        claim_ttl=timedelta(seconds=1),
+    )
+    assert deleting is not None
+    backend = _SharedBackend()
+    coordinator = ChromeLifecycleCoordinator(
+        service,
+        backend,
+        now=lambda: NOW + timedelta(seconds=2),
+    )
+
+    assert await coordinator.sweep_once() == 1
+    assert backend.deleted == [registered.backend_lifecycle_digest]
+    assert service.get_by_scope(registered.scope_digest) is None

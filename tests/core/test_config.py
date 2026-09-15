@@ -2917,3 +2917,24 @@ def test_task_reply_wait_timeout(value, expected, monkeypatch):
     if value is not None:
         monkeypatch.setenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", value)
     assert get_task_reply_wait_timeout_seconds() == expected
+
+
+def test_chrome_durable_lifecycle_config_defaults_and_overrides(monkeypatch):
+    keys = (
+        config.CHROME_SESSION_TTL_SECONDS,
+        config.CHROME_LIFECYCLE_SWEEP_INTERVAL_SECONDS,
+        config.CHROME_LIFECYCLE_SWEEP_BATCH_SIZE,
+    )
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+
+    assert config.get_chrome_session_ttl_seconds() == 900.0
+    assert config.get_chrome_lifecycle_sweep_interval_seconds() == 30.0
+    assert config.get_chrome_lifecycle_sweep_batch_size() == 100
+
+    monkeypatch.setenv(config.CHROME_SESSION_TTL_SECONDS, "45.5")
+    monkeypatch.setenv(config.CHROME_LIFECYCLE_SWEEP_INTERVAL_SECONDS, "2.5")
+    monkeypatch.setenv(config.CHROME_LIFECYCLE_SWEEP_BATCH_SIZE, "7")
+    assert config.get_chrome_session_ttl_seconds() == 45.5
+    assert config.get_chrome_lifecycle_sweep_interval_seconds() == 2.5
+    assert config.get_chrome_lifecycle_sweep_batch_size() == 7

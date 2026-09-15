@@ -108,6 +108,23 @@ class TestChromeDaemonLaunchSpec:
 
 class TestChromeDaemonClient:
     @pytest.mark.asyncio
+    async def test_database_unknown_before_operation_never_invokes_backend(self):
+        sandbox = _sandbox()
+        before_backend = AsyncMock(side_effect=RuntimeError("database unavailable"))
+        client = ChromeDaemonClient(
+            sandbox,
+            session_id="a" * 32,
+            before_backend=before_backend,
+        )
+
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await client.status()
+
+        before_backend.assert_awaited_once()
+        sandbox.exec.assert_not_awaited()
+        sandbox.read_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_every_operation_stays_inside_sandbox_and_passes_safe_env(self):
         sandbox = _sandbox()
         sandbox.exec.side_effect = [
@@ -359,8 +376,8 @@ class TestChromeExecutionSessionPool:
 
         assert first is duplicate
         assert distinct is not first
-        assert factory.await_args_list[0].args == (one.digest,)
-        assert factory.await_args_list[1].args == (two.digest,)
+        assert factory.await_args_list[0].args == (one,)
+        assert factory.await_args_list[1].args == (two,)
 
     @pytest.mark.asyncio
     async def test_factory_failure_propagates_without_fallback(self):

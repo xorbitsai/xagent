@@ -39,6 +39,7 @@ _SCOPE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _RESULT_FILE_PREFIX = "/tmp/xagent_chrome_daemon_"
 _RUNNER_TIMEOUT_SECONDS = 75.0
 _RESULT_CLEANUP_TIMEOUT_SECONDS = 5.0
+CHROME_BACKEND_OPERATION_TIMEOUT_SECONDS = 180.0
 _RUNNER_MAX_OUTPUT_BYTES = 64 * 1024
 _RUNNER_MAX_RESULT_BYTES = 64 * 1024 * 1024
 _CHROME_SANDBOX_ENV = {
@@ -156,6 +157,17 @@ class ChromeSandboxHandle:
 
     sandbox: Sandbox
     delete: Callable[[], Awaitable[None]]
+    before_backend: Callable[[], Awaitable[None]] | None = None
+
+
+@dataclass(frozen=True)
+class ChromeExecutionFence:
+    """Minimal durable task-attempt fence; the raw turn stays memory-only."""
+
+    task_id: int
+    run_id: str
+    lease_attempt_id: str
+    turn_id: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -164,6 +176,7 @@ class ChromeExecutionScope:
 
     key: tuple[Any, ...] = field(repr=False)
     digest: str
+    execution: ChromeExecutionFence | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.key:
@@ -175,11 +188,18 @@ class ChromeExecutionScope:
 class ChromeDaemonClient:
     """Run the pinned daemon controller exclusively inside one sandbox."""
 
-    def __init__(self, sandbox: Sandbox, *, session_id: str) -> None:
+    def __init__(
+        self,
+        sandbox: Sandbox,
+        *,
+        session_id: str,
+        before_backend: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         if re.fullmatch(r"[0-9a-f]{32}", session_id) is None:
             raise ValueError("session_id must be 32 lowercase hex characters")
         self._sandbox = sandbox
         self._session_id = session_id
+        self._before_backend = before_backend
         self._result_cleanup_failed = False
 
     @property
@@ -195,6 +215,19 @@ class ChromeDaemonClient:
         ).decode("ascii")
 
     async def _run(self, operation: str, *args: str) -> dict[str, Any]:
+        if self._before_backend is not None:
+            await self._before_backend()
+        try:
+            return await asyncio.wait_for(
+                self._run_bounded(operation, *args),
+                timeout=CHROME_BACKEND_OPERATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ChromeSessionTransportError(
+                f"sandbox Chrome {operation} exceeded its operation deadline"
+            ) from exc
+
+    async def _run_bounded(self, operation: str, *args: str) -> dict[str, Any]:
         result_file = f"{_RESULT_FILE_PREFIX}{uuid.uuid4().hex}.json"
         primary_failure: BaseException | None = None
         command_args = [
@@ -345,7 +378,11 @@ class ChromeExecutionSession:
         launch: ChromeDaemonLaunchSpec,
     ) -> None:
         self._handle = handle
-        self._client = ChromeDaemonClient(handle.sandbox, session_id=session_id)
+        self._client = ChromeDaemonClient(
+            handle.sandbox,
+            session_id=session_id,
+            before_backend=handle.before_backend,
+        )
         self._launch = launch
         self._lock = asyncio.Lock()
         self._started = False
@@ -359,6 +396,12 @@ class ChromeExecutionSession:
     @property
     def sandbox(self) -> Sandbox:
         return self._handle.sandbox
+
+    async def before_backend(self) -> None:
+        """Renew durable ownership before a non-daemon backend operation."""
+
+        if self._handle.before_backend is not None:
+            await self._handle.before_backend()
 
     def _status_matches_launch(self, payload: Mapping[str, Any]) -> bool:
         status = payload.get("status", payload)
@@ -477,7 +520,7 @@ class ChromeExecutionSession:
         await asyncio.shield(self._cleanup_task)
 
 
-ChromeSandboxFactory = Callable[[str], Awaitable[ChromeSandboxHandle]]
+ChromeSandboxFactory = Callable[[ChromeExecutionScope], Awaitable[ChromeSandboxHandle]]
 
 
 @dataclass
@@ -533,7 +576,7 @@ class ChromeExecutionSessionPool:
                         "one execution scope cannot change its Chrome launch spec"
                     )
                 return session
-            handle = await self._sandbox_factory(scope_digest)
+            handle = await self._sandbox_factory(scope)
             session = ChromeExecutionSession(
                 handle,
                 session_id=scope_digest[:32],

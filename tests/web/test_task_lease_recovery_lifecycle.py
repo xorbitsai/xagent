@@ -9,6 +9,7 @@ from types import ModuleType
 import pytest
 
 from xagent.web import app as app_module
+from xagent.web.services import chrome_mcp_runtime
 
 
 @pytest.mark.asyncio
@@ -162,6 +163,13 @@ async def test_application_shutdown_stops_task_lease_recovery(
         assert app_instance is app_module.app
         shutdown_order.append("telemetry")
 
+    async def fake_stop_chrome_recovery(app_instance) -> None:
+        assert app_instance is app_module.app
+        shutdown_order.append("chrome_sweeper")
+
+    async def fake_shutdown_chrome_sessions() -> None:
+        shutdown_order.append("chrome_sessions")
+
     class _FakeChannel:
         enabled = False
 
@@ -197,6 +205,16 @@ async def test_application_shutdown_stops_task_lease_recovery(
     monkeypatch.setattr(
         app_module, "stop_runtime_performance_monitor", fake_stop_telemetry
     )
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "stop_chrome_lifecycle_recovery",
+        fake_stop_chrome_recovery,
+    )
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "shutdown_chrome_execution_session_pool",
+        fake_shutdown_chrome_sessions,
+    )
     monkeypatch.setattr(app_module, "stop_task_lease_recovery_task", fake_stop)
     monkeypatch.setattr(
         app_module,
@@ -230,8 +248,10 @@ async def test_application_shutdown_stops_task_lease_recovery(
 
     assert stopped_for == [app_module.app]
     assert shutdown_order == [
+        "chrome_sweeper",
         "background_tasks",
         "heartbeat_idle",
         "telemetry",
+        "chrome_sessions",
         "sandbox",
     ]

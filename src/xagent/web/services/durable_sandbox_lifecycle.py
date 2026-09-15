@@ -271,6 +271,48 @@ class DurableSandboxLifecycleRepository:
         row = self._db.execute(stmt).scalar_one_or_none()
         return None if row is None else LifecycleFence.from_row(row)
 
+    def mark_deleting(
+        self,
+        fence: LifecycleFence,
+        *,
+        now: datetime,
+        claim_ttl: timedelta,
+    ) -> LifecycleFence | None:
+        """Tombstone a lifecycle still owned by the calling runtime.
+
+        Normal close, cancellation, and create compensation happen while the
+        exact task attempt may still be live.  They therefore cannot use the
+        stale-candidate classifier in :meth:`claim_for_delete`.  This owner
+        transition keeps the same immutable lifecycle/backend generation but
+        mints a fresh destructive-work fence before any backend delete.
+        """
+        if claim_ttl <= timedelta(0):
+            raise ValueError("claim_ttl must be positive")
+        claim_owner = new_opaque_token()
+        stmt = (
+            update(DurableSandboxLifecycle)
+            .where(
+                DurableSandboxLifecycle.id == fence.id,
+                DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
+                DurableSandboxLifecycle.owner_token == fence.owner_token,
+                DurableSandboxLifecycle.version == fence.version,
+                DurableSandboxLifecycle.state.in_(("registered", "ready")),
+            )
+            .values(
+                state="deleting",
+                owner_token=claim_owner,
+                version=DurableSandboxLifecycle.version + 1,
+                deleting_at=now,
+                delete_claim_expires_at=now + claim_ttl,
+                retry_at=None,
+                delete_attempts=DurableSandboxLifecycle.delete_attempts + 1,
+                updated_at=now,
+            )
+            .returning(DurableSandboxLifecycle)
+        )
+        row = self._db.execute(stmt).scalar_one_or_none()
+        return None if row is None else LifecycleFence.from_row(row)
+
     def reclaim_delete(
         self,
         fence: LifecycleFence,
@@ -401,6 +443,10 @@ class DurableSandboxLifecycleService:
         with self._session_factory() as db, db.begin():
             return DurableSandboxLifecycleRepository(db).register(request)
 
+    def get_by_scope(self, scope_digest: str) -> LifecycleFence | None:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).get_by_scope(scope_digest)
+
     def mark_ready(
         self, fence: LifecycleFence, *, now: datetime, owner_lease_expires_at: datetime
     ) -> LifecycleFence | None:
@@ -422,6 +468,14 @@ class DurableSandboxLifecycleService:
     ) -> LifecycleFence | None:
         with self._session_factory() as db, db.begin():
             return DurableSandboxLifecycleRepository(db).claim_for_delete(
+                fence, now=now, claim_ttl=claim_ttl
+            )
+
+    def mark_deleting(
+        self, fence: LifecycleFence, *, now: datetime, claim_ttl: timedelta
+    ) -> LifecycleFence | None:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).mark_deleting(
                 fence, now=now, claim_ttl=claim_ttl
             )
 

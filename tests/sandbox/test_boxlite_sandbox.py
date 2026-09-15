@@ -5,8 +5,10 @@ BoxliteSandbox tests
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
+import uuid
 
 import pytest
 
@@ -24,6 +26,7 @@ from xagent.sandbox.boxlite_sandbox import (
     BoxliteSandboxService,
     MemBoxliteStore,
 )
+from xagent.web.sandbox_manager import SandboxManager
 
 
 @pytest.fixture(scope="module")
@@ -829,3 +832,40 @@ class TestBoxliteSandbox:
                 await service.delete(name)
             except Exception:
                 pass
+
+
+@requires_boxlite
+class TestDurableChromeGenerationAcrossManagers:
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_stale_manager_delete_cannot_touch_successor_session(
+        self, boxlite_service
+    ) -> None:
+        first_id = hashlib.sha256(f"first-{uuid.uuid4()}".encode()).hexdigest()
+        second_id = hashlib.sha256(f"second-{uuid.uuid4()}".encode()).hexdigest()
+        lifecycle_type = "chrome-execution"
+        first_name = SandboxManager.make_sandbox_name(lifecycle_type, first_id)
+        second_name = SandboxManager.make_sandbox_name(lifecycle_type, second_id)
+        manager_a = SandboxManager(boxlite_service)
+        manager_b = SandboxManager(boxlite_service)
+        try:
+            first = await manager_a.get_or_create_lease_provider(
+                lifecycle_type, first_id
+            )
+            assert await manager_a.attach_provider(lifecycle_type, first_id, first)
+            await manager_a.delete_durable_sandbox_strict(first_id)
+
+            second = await manager_b.get_or_create_lease_provider(
+                lifecycle_type, second_id
+            )
+            assert await manager_b.attach_provider(lifecycle_type, second_id, second)
+            await manager_a.delete_durable_sandbox_strict(first_id)
+
+            names = {sandbox.name for sandbox in await boxlite_service.list_sandboxes()}
+            assert first_name not in names
+            assert second_name in names
+        finally:
+            for name in (first_name, second_name):
+                try:
+                    await boxlite_service.delete(name)
+                except Exception:
+                    pass

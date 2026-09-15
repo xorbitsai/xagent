@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from threading import Event, Lock, local
 from uuid import UUID
 
@@ -14,6 +15,7 @@ from xagent.core.file_storage.factory import (
 )
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
 from xagent.core.workspace import TaskWorkspace, WorkspaceManager
 from xagent.web.models import Base
 from xagent.web.models.task import Task
@@ -399,6 +401,10 @@ def test_auto_register_files_preserves_explicit_producer_mime(
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     get_unscoped_file_storage.cache_clear()
     monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
+    monkeypatch.setattr(
+        "xagent.web.services.uploaded_file_store.get_session_local",
+        lambda: SessionLocal,
+    )
     workspace = TaskWorkspace(
         id="web_task_9022",
         base_dir=str(tmp_path / "workspaces"),
@@ -407,7 +413,7 @@ def test_auto_register_files_preserves_explicit_producer_mime(
     workspace.db_session = db
     output_path = workspace.output_dir / filename
 
-    with workspace.auto_register_files(mime_type="image/png"):
+    with workspace.auto_register_files(mime_types={output_path: "image/png"}):
         output_path.write_bytes(b"\x89PNG\r\n\x1a\nproducer bytes")
 
     record = db.query(UploadedFile).filter(UploadedFile.filename == filename).one()
@@ -417,6 +423,147 @@ def test_auto_register_files_preserves_explicit_producer_mime(
     binding = workspace.resolve_file_binding_detached(file_id)
     assert binding is not None
     assert binding.mime_type == "image/png"
+
+
+def test_auto_register_files_does_not_broadcast_target_mime(
+    monkeypatch,
+    tmp_path,
+    mock_workspace_db,
+    constrained_workspace_db,
+):
+    del mock_workspace_db
+    _engine, SessionLocal, db = constrained_workspace_db
+    _seed_workspace_task(db, task_id=9023, username="workspace-target-mime")
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    get_unscoped_file_storage.cache_clear()
+    monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
+    workspace = TaskWorkspace(
+        id="web_task_9023",
+        base_dir=str(tmp_path / "workspaces"),
+        db_task_id=9023,
+    )
+    workspace.db_session = db
+    report_path = workspace.output_dir / "report.pdf"
+    report_path.write_bytes(b"%PDF-existing")
+    report_id = workspace.register_file(
+        str(report_path), db_session=db, mime_type="application/pdf"
+    )
+    db.rollback()
+    screenshot_path = workspace.output_dir / "capture.png"
+    screenshot_path.write_bytes(b"old capture")
+    screenshot_id = workspace.register_file(
+        str(screenshot_path),
+        db_session=db,
+        mime_type="application/octet-stream",
+    )
+    db.rollback()
+
+    with workspace.auto_register_files(mime_types={screenshot_path: "image/png"}):
+        screenshot_path.write_bytes(b"\x89PNG\r\n\x1a\nnew")
+
+    records = {
+        str(record.file_id): record
+        for record in db.query(UploadedFile).filter(
+            UploadedFile.filename.in_(["report.pdf", "capture.png"])
+        )
+    }
+    assert records[report_id].mime_type == "application/pdf"
+    assert records[screenshot_id].mime_type == "image/png"
+
+
+@pytest.mark.parametrize("filename", ["capture", "capture.jpg"])
+def test_preview_binding_preserves_explicit_mime(
+    monkeypatch,
+    tmp_path,
+    mock_workspace_db,
+    constrained_workspace_db,
+    filename,
+):
+    del mock_workspace_db
+    _engine, SessionLocal, db = constrained_workspace_db
+    monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
+    workspace = TaskWorkspace(id="preview_mime_snapshot", base_dir=str(tmp_path))
+    workspace.db_session = db
+    output_path = workspace.output_dir / filename
+    output_path.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+
+    file_id = workspace.register_file(
+        str(output_path), db_session=db, mime_type="image/png"
+    )
+    binding = workspace.resolve_file_binding_detached(file_id)
+
+    assert binding is not None
+    assert binding.filename == filename
+    assert binding.mime_type == "image/png"
+    assert binding.size == output_path.stat().st_size
+
+
+@pytest.mark.parametrize("operation", ["append", "edit", "replace"])
+def test_registered_mutations_refresh_same_file_generation(
+    monkeypatch,
+    tmp_path,
+    mock_workspace_db,
+    constrained_workspace_db,
+    operation,
+):
+    del mock_workspace_db
+    _engine, SessionLocal, db = constrained_workspace_db
+    _seed_workspace_task(db, task_id=9024, username=f"workspace-mutation-{operation}")
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    get_unscoped_file_storage.cache_clear()
+    monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
+    monkeypatch.setattr(
+        "xagent.web.services.uploaded_file_store.get_session_local",
+        lambda: SessionLocal,
+    )
+    workspace = TaskWorkspace(
+        id="web_task_9024",
+        base_dir=str(tmp_path / "workspaces"),
+        db_task_id=9024,
+    )
+    workspace.db_session = db
+    output_path = workspace.output_dir / "note.txt"
+    output_path.write_text("alpha\n", encoding="utf-8")
+    file_id = workspace.register_file(
+        str(output_path), db_session=db, mime_type="text/plain"
+    )
+    db.rollback()
+    original = db.query(UploadedFile).filter_by(file_id=file_id).one()
+    original.filename = "Original Note.txt"
+    db.commit()
+    old_storage_key = original.storage_key
+    old_checksum = original.checksum
+    db.rollback()
+    operations = WorkspaceFileOperations(workspace)
+
+    if operation == "append":
+        assert operations.append_file(file_id, "omega") is True
+        expected = b"alpha\nomega"
+    elif operation == "edit":
+        result = operations.edit_file(
+            file_id,
+            [{"operation_type": "replace", "line_number": 1, "content": "bravo"}],
+        )
+        assert result.success is True
+        expected = b"bravo\n"
+    else:
+        result = operations.find_and_replace(file_id, "alpha", "bravo")
+        assert result.success is True
+        expected = b"bravo\n"
+
+    db.rollback()
+    refreshed = db.query(UploadedFile).filter_by(file_id=file_id).one()
+    assert refreshed.storage_key != old_storage_key
+    assert refreshed.checksum != old_checksum
+    assert refreshed.checksum == sha256(expected).hexdigest()
+    assert refreshed.file_size == len(expected)
+    assert refreshed.filename == "Original Note.txt"
+    assert refreshed.mime_type == "text/plain"
+    db.rollback()
+    binding = workspace.resolve_file_binding_detached(file_id)
+    assert binding is not None
+    assert binding.file_id == file_id
+    assert binding.path.read_bytes() == expected
 
 
 def test_workspace_registration_commit_survives_caller_rollback(

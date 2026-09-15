@@ -131,6 +131,7 @@ class WorkspaceUploadedFileSnapshot:
     file_id: str
     user_id: int
     task_id: Optional[int]
+    filename: str
     mime_type: Optional[str]
     workspace_relative_path: Optional[str]
     workspace_category: Optional[str]
@@ -147,6 +148,17 @@ class WorkspaceUploadBinding:
     size: int
     device: int
     inode: int
+
+
+@dataclass(frozen=True)
+class WorkspaceEphemeralFileSnapshot:
+    """Trusted process-local metadata for a non-persistent FileRef."""
+
+    file_id: str
+    path: Path
+    filename: str
+    mime_type: Optional[str]
+    file_size: int
 
 
 @dataclass(frozen=True)
@@ -241,6 +253,7 @@ class TaskWorkspace:
         self._registration_lock = RLock()
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
+        self._ephemeral_file_snapshots: Dict[str, WorkspaceEphemeralFileSnapshot] = {}
         self.owner_user_id: Optional[int] = None
         # Server-derived rollout policy for File Operation. ``None`` means the
         # exact upstream legacy path and therefore requires no policy query.
@@ -530,6 +543,7 @@ class TaskWorkspace:
             self._remember_file_registration(
                 plan.file_id,
                 plan.registration.path,
+                registration=plan.registration,
             )
         unique_file_ids = tuple(plan.file_id for plan in plans)
         return tuple(unique_file_ids[index] for index in result_indexes)
@@ -761,6 +775,7 @@ class TaskWorkspace:
                     if existing_record.task_id is not None
                     else None
                 ),
+                filename=str(existing_record.filename),
                 mime_type=(
                     str(existing_record.mime_type)
                     if existing_record.mime_type is not None
@@ -846,7 +861,9 @@ class TaskWorkspace:
             user_id=plan.user_id,
             file_id=plan.file_id,
             task_id=plan.task_id,
-            filename=local_path.name,
+            filename=(
+                plan.existing.filename if plan.existing is not None else local_path.name
+            ),
             mime_type=mime_type,
             storage_key=build_task_output_storage_key(
                 plan.user_id,
@@ -1027,7 +1044,11 @@ class TaskWorkspace:
         if not normalized_file_id:
             raise ValueError("file_id is required for an already durable file")
         with self._registration_lock:
-            self._remember_file_registration(normalized_file_id, registration.path)
+            self._remember_file_registration(
+                normalized_file_id,
+                registration.path,
+                registration=registration,
+            )
         return normalized_file_id
 
     def describe_file_registration(
@@ -1105,11 +1126,47 @@ class TaskWorkspace:
         )
         return resolved_id
 
-    def _remember_file_registration(self, file_id: str, file_path: Path) -> None:
+    def _remember_file_registration(
+        self,
+        file_id: str,
+        file_path: Path,
+        *,
+        registration: Optional[WorkspaceFileRegistration] = None,
+    ) -> None:
+        resolved_path = file_path.resolve()
+        try:
+            file_size = resolved_path.stat().st_size
+        except OSError:
+            file_size = -1
         with self._registration_lock:
-            path_str = str(file_path)
+            path_str = str(resolved_path)
             self._recently_registered_files[path_str] = file_id
-            self._file_id_to_path[file_id] = file_path
+            self._file_id_to_path[file_id] = resolved_path
+            self._ephemeral_file_snapshots[file_id] = WorkspaceEphemeralFileSnapshot(
+                file_id=file_id,
+                path=resolved_path,
+                filename=resolved_path.name,
+                mime_type=(
+                    registration.mime_type if registration is not None else None
+                ),
+                file_size=file_size,
+            )
+
+    def refresh_file_registration(self, file_path: str) -> Optional[str]:
+        """Refresh one already-registered path after a successful mutation."""
+
+        resolved_path = Path(file_path).resolve(strict=True)
+        file_id = self.get_file_id_from_path(str(resolved_path))
+        if file_id is None:
+            return None
+        with self._registration_lock:
+            snapshot = self._ephemeral_file_snapshots.get(file_id)
+        return self.register_file(
+            str(resolved_path),
+            file_id=file_id,
+            db_session=self.db_session,
+            mime_type=(snapshot.mime_type if snapshot is not None else None),
+        )
 
     def _is_delegated_db_task_workspace(self, task_id: int) -> bool:
         if self.db_task_id is None:
@@ -1361,12 +1418,15 @@ class TaskWorkspace:
             return None
 
         record_snapshot: Optional[WorkspaceUploadedFileResolutionSnapshot] = None
+        ephemeral_snapshot: Optional[WorkspaceEphemeralFileSnapshot] = None
         path: Optional[Path] = None
         # Non-persistent executions (for example REST preview) have no Task or
         # UploadedFile row. Their opaque IDs are authoritative only in this
         # exact shared workspace instance, so consult that cache before any DB
         # access. Persisted tasks still load registered metadata from the DB.
         if self.current_task_id is None:
+            with self._registration_lock:
+                ephemeral_snapshot = self._ephemeral_file_snapshots.get(canonical_id)
             path = self._resolve_file_id(
                 canonical_id,
                 use_bound_db_session=False,
@@ -1442,7 +1502,19 @@ class TaskWorkspace:
 
         filename = resolved.name
         mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        if record_snapshot is not None:
+        if ephemeral_snapshot is not None:
+            if (
+                ephemeral_snapshot.path != resolved
+                or ephemeral_snapshot.file_size != stat.st_size
+            ):
+                logger.warning(
+                    "Rejected changed ephemeral workspace FileRef: %s",
+                    canonical_id,
+                )
+                return None
+            filename = ephemeral_snapshot.filename
+            mime_type = str(ephemeral_snapshot.mime_type or mime_type)
+        elif record_snapshot is not None:
             filename = record_snapshot.filename
             if record_snapshot.file_size != stat.st_size:
                 logger.warning(
@@ -2194,6 +2266,7 @@ class TaskWorkspace:
         self,
         *,
         mime_type: Optional[str] = None,
+        mime_types: Optional[Mapping[str | Path, str]] = None,
     ) -> "Iterator[TaskWorkspace]":
         """
         Context manager to automatically register files created during execution.
@@ -2205,9 +2278,17 @@ class TaskWorkspace:
                 process_and_save_image("output.png")
 
         This is safer than relying on manual register_file() calls.
+
+        ``mime_types`` applies trusted producer metadata only to its exact
+        paths. The legacy singular ``mime_type`` applies only to newly created
+        files so it cannot relabel unrelated existing registrations.
         """
         self._release_registration_session_if_clean(self.db_session)
         files_before = self._scan_all_files()
+        target_mime_types = {
+            str(Path(path).resolve()): value
+            for path, value in (mime_types or {}).items()
+        }
 
         try:
             yield self
@@ -2232,10 +2313,15 @@ class TaskWorkspace:
                 # per-file failure isolation.
                 for file_path in ordered_files:
                     try:
+                        target_mime_type = target_mime_types.get(
+                            str(file_path.resolve())
+                        )
+                        if target_mime_type is None and file_path not in files_before:
+                            target_mime_type = mime_type
                         file_id = self.register_file(
                             str(file_path),
                             db_session=self.db_session,
-                            mime_type=mime_type,
+                            mime_type=target_mime_type,
                         )
                         logger.debug(
                             "Auto-registered file: %s -> %s", file_path, file_id

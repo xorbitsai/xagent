@@ -105,8 +105,11 @@ class DownloadWebAssetTool(AbstractBaseTool):
                 detected_extension,
             )
             detected_mime_type = self._mime_type_for_extension(detected_extension)
-            with self._workspace.auto_register_files(mime_type=detected_mime_type):
-                target = self._write_unique_output(filename, content)
+            target = self._write_unique_output(filename, content)
+            self._workspace.register_file(
+                str(target),
+                mime_type=detected_mime_type,
+            )
             file_ref = build_workspace_file_ref(
                 workspace=self._workspace,
                 file_path=target,

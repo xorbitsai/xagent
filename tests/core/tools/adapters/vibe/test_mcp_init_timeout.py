@@ -309,3 +309,45 @@ async def test_generic_stdio_connection_never_serializes_live_workspace(monkeypa
         workspace=object(),
     )
     assert serialized == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_enabled", [False, True])
+async def test_trusted_workspace_capability_follows_actual_sandbox_path(
+    monkeypatch, sandbox_enabled
+):
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    workspace = object()
+    captured = {}
+
+    async def fake_load(connections, **kwargs):
+        captured.update(connections["drive"])
+        captured["sandbox"] = kwargs.get("sandbox")
+        return SimpleNamespace(tools=(), failures=())
+
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools_as_agent_tools", fake_load)
+    sandbox = object() if sandbox_enabled else None
+    await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "name": "drive",
+                "transport": "stdio",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "trusted-drive-launcher"],
+                    "workspace_file_ref_env": {"upload": "PRIVATE_BINDING"},
+                    "_trusted_workspace_file_ref": True,
+                },
+            }
+        ],
+        sandbox=sandbox,
+        workspace=workspace,
+    )
+
+    if sandbox_enabled:
+        assert "_workspace" not in captured
+        assert captured["sandbox"] is sandbox
+    else:
+        assert captured["_workspace"] is workspace
+        assert captured["sandbox"] is None

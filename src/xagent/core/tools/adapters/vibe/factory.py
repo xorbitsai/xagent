@@ -1210,14 +1210,20 @@ class ToolFactory:
                                 (server_name, connection_config, session_identity)
                             )
                             continue
-                        if workspace is not None and inner_config.get(
-                            "workspace_file_ref_env"
+                        if (
+                            workspace is not None
+                            and inner_config.get("workspace_file_ref_env")
+                            and inner_config.get("_trusted_workspace_file_ref") is True
                         ):
                             from .sandboxed_tool.sandboxed_mcp_tool_helper import (
                                 should_sandbox_mcp_connection,
                             )
 
-                            if not should_sandbox_mcp_connection(connection_config):
+                            will_run_in_sandbox = bool(
+                                sandbox is not None
+                                and should_sandbox_mcp_connection(connection_config)
+                            )
+                            if not will_run_in_sandbox:
                                 # Host-only capability for a trusted direct
                                 # connector; never serialize it into a sandbox.
                                 connection_config["_workspace"] = workspace

@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 from cryptography.fernet import Fernet
 
@@ -8,6 +10,7 @@ from xagent.core.utils.encryption import (
     decrypt_env_dict_strict,
     decrypt_value,
     decrypt_value_strict,
+    derive_secret_hmac,
     encrypt_env_dict,
     encrypt_value,
     get_cipher,
@@ -82,6 +85,16 @@ def test_get_encryption_key_with_env(monkeypatch):
     monkeypatch.setenv("ENCRYPTION_KEY", test_key)
     key = _get_encryption_key()
     assert key == test_key
+
+
+def test_secret_hmac_is_stable_purpose_separated_and_keyed(use_key):
+    use_key(STRICT_KEY_A)
+    first = derive_secret_hmac("weak-secret", purpose=b"authority")
+    assert first == derive_secret_hmac("weak-secret", purpose=b"authority")
+    assert first != derive_secret_hmac("weak-secret", purpose=b"other")
+    assert first != hashlib.sha256(b"weak-secret").hexdigest()
+    use_key(STRICT_KEY_B)
+    assert first != derive_secret_hmac("weak-secret", purpose=b"authority")
 
 
 STRICT_KEY_A = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="

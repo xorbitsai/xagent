@@ -1,6 +1,8 @@
 """Encryption utilities for sensitive data."""
 
 import base64
+import hashlib
+import hmac
 import logging
 import os
 from functools import lru_cache
@@ -31,6 +33,21 @@ def get_cipher() -> Fernet:
     return Fernet(
         encryption_key.encode() if isinstance(encryption_key, str) else encryption_key
     )
+
+
+_SECRET_HMAC_KDF_DOMAIN = b"xagent:secret-hmac-subkey:v1\0"
+
+
+def derive_secret_hmac(value: str, *, purpose: bytes) -> str:
+    """Return a deterministic HMAC under a purpose-derived protected subkey."""
+    if not purpose:
+        raise ValueError("Secret HMAC purpose must not be empty")
+    cipher = get_cipher()
+    # Use the cached cipher's exact live key, including when tests or operators
+    # have changed the environment without restarting the process.
+    master_key = cipher._signing_key + cipher._encryption_key
+    subkey = hmac.digest(master_key, _SECRET_HMAC_KDF_DOMAIN + purpose, "sha256")
+    return hmac.new(subkey, value.encode(), hashlib.sha256).hexdigest()
 
 
 def _is_encrypted(value: str) -> bool:

@@ -49,10 +49,11 @@ that declares it is checked; one that does not is not.
 | ``custom_api.update_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE``, on the payloads that write that row | no | ``True`` |
 | ``custom_api._recheck_team_access_under_definition_lock`` | the ``custom_apis`` definition row, ``FOR UPDATE``, taken by ``update_custom_api`` before this call | no | ``True`` |
 | ``custom_api.delete_custom_api`` | the ``custom_apis`` definition row, ``FOR UPDATE`` | no | ``True`` |
+| ``custom_api._resolve_custom_api_for_request`` | nothing -- this resolution runs before either of its two routes takes any lock | no | ``False`` |
 | ``mcp.update_mcp_server`` | the ``mcp_servers`` definition row, ``FOR UPDATE ... KEY SHARE``, on the payloads that write that row | no | ``True`` |
+| ``mcp._resolve_mcp_server_for_request`` | nothing; this is the gate both ``GET`` and ``PUT`` run before any lock exists | no | ``False`` |
 | ``mcp._teardown_mcp_app_server_locally`` | three row locks: ``public_mcp_apps``, ``mcp_servers``, ``user_mcpservers`` | no, within this function -- see the note below | ``True`` |
 | ``mcp.delete_mcp_server`` | two row locks: ``mcp_servers`` and ``user_mcpservers``, taken by ``_lock_active_mcp_oauth_lifecycle`` before this call | no | ``True`` |
-| ``custom_api._resolve_custom_api_for_request`` | nothing -- this resolution runs before either of its two routes takes any lock | no | ``False`` |
 
 ``mcp._teardown_mcp_app_server_locally`` is a helper, not a route: it has no
 route decorator, and its only caller in this repository outside tests is the

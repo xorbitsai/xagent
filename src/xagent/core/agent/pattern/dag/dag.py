@@ -198,8 +198,12 @@ class _DAGStepRuntime:
             metadata=step_metadata,
         )
 
-    async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
-        await self.parent.on_tool_start(tool_call=self._with_step(tool_call))
+    async def on_tool_start(
+        self, *, tool_call: dict[str, Any], metered: bool = True
+    ) -> None:
+        await self.parent.on_tool_start(
+            tool_call=self._with_step(tool_call), metered=metered
+        )
 
     async def on_tool_end(self, *, tool_call: dict[str, Any], result: Any) -> None:
         await self.parent.on_tool_end(

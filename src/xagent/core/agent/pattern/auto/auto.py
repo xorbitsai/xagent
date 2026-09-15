@@ -283,8 +283,10 @@ class _AutoChildRuntime:
             metadata=child_metadata,
         )
 
-    async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
-        await self.parent.on_tool_start(tool_call=tool_call)
+    async def on_tool_start(
+        self, *, tool_call: dict[str, Any], metered: bool = True
+    ) -> None:
+        await self.parent.on_tool_start(tool_call=tool_call, metered=metered)
 
     async def on_tool_end(self, *, tool_call: dict[str, Any], result: Any) -> None:
         await self.parent.on_tool_end(tool_call=tool_call, result=result)

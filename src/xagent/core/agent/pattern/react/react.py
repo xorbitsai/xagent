@@ -3916,7 +3916,12 @@ class ReActPattern(AgentPattern):
                     self._record_tool_call(
                         tool_call, status="completed", result=suppressed
                     )
-                await runtime.on_tool_start(tool_call=tool_call)
+                # The suppressed path must not be metered: no execution round
+                # was consumed (the tool never ran). The trace pair is kept so
+                # suppressions stay visible in transcripts; metered=False is a
+                # call-site contract on PatternRuntime.on_tool_start, so a
+                # tool-controlled payload cannot spoof its way out of billing.
+                await runtime.on_tool_start(tool_call=tool_call, metered=False)
                 await runtime.on_tool_end(tool_call=tool_call, result=suppressed)
                 return suppressed
         self._record_tool_call(tool_call, status="running")

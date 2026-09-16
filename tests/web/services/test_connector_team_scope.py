@@ -2049,7 +2049,9 @@ def test_the_access_slot_lets_the_boundary_error_through_its_wrapper(db_session)
     because the only ``access`` call site that holds a lock lives in
     ``custom_api.py``, and that path is covered by
     ``tests/web/api/test_custom_api_team_connector_edit.py`` instead. The
-    seam's own transient-outage error gets folded into
+    MCP gateway's ``access`` call site (``mcp._resolve_mcp_server_for_request``)
+    does not hold a lock: it runs before either ``GET`` or ``PUT`` takes
+    one. The seam's own transient-outage error gets folded into
     ``ConnectorRuntimeError`` by the surrounding ``except Exception``; this
     one must not -- a permanent defect in the installing application's
     code is a different failure than an outage, and folding it in would

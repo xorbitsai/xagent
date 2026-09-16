@@ -326,5 +326,57 @@ def deputy_query_resource(
         return _error(str(e))
 
 
+@mcp.tool()
+def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
+    """
+    Create a new record (POST /resource/{resource}).
+    resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
+    "Timesheet", or "Leave".
+    data: field name -> value pairs for the new record, e.g. {"FirstName":
+    "Peter", "LastName": "Parker", "Email": "peter.parker@example.com"}.
+    Use deputy_get_resource on an existing record of the same type first to
+    learn which field names Deputy expects.
+    """
+    try:
+        safe_resource = url_path_id(resource, "resource")
+        result = _request("POST", f"/resource/{safe_resource}", json_data=data)
+        if not isinstance(result, dict):
+            return _error(f"Deputy returned an unexpected response for {resource}")
+        return success_with_capped_dict("record", result)
+    except Exception as e:
+        logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
+        return _error(str(e))
+
+
+@mcp.tool()
+def deputy_update_resource(resource: str, resource_id: str, data: dict[str, Any]) -> str:
+    """
+    Update an existing record. Only the fields provided are changed
+    (POST /resource/{resource}/{id} -- Deputy's Resource API uses POST, not
+    PATCH/PUT, for updates).
+    resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
+    "Timesheet", or "Leave".
+    resource_id: the record's numeric id, as a string (e.g. "123").
+    data: field name -> value pairs to change, e.g. {"Mobile": "0400000000"}.
+    """
+    try:
+        if not data:
+            return _error("No fields provided to update")
+        safe_resource = url_path_id(resource, "resource")
+        safe_resource_id = url_path_id(resource_id, "resource_id")
+        result = _request(
+            "POST", f"/resource/{safe_resource}/{safe_resource_id}", json_data=data
+        )
+        if not isinstance(result, dict):
+            return _error(f"Deputy returned an unexpected response for {resource}")
+        return success_with_capped_dict("record", result)
+    except Exception as e:
+        logger.error(
+            f"Error updating Deputy {resource} record {resource_id}: {e}",
+            exc_info=True,
+        )
+        return _error(str(e))
+
+
 if __name__ == "__main__":
     mcp.run()

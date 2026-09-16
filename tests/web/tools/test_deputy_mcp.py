@@ -544,6 +544,156 @@ def test_query_resource_rejects_surrounding_whitespace_resource_without_raising(
 
 
 # ---------------------------------------------------------------------------
+# deputy_create_resource
+# ---------------------------------------------------------------------------
+
+
+def test_create_resource_sends_data_and_returns_record(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"Id": 123, "FirstName": "Peter"})
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_create_resource("Employee", {"FirstName": "Peter"})
+    )
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "FirstName": "Peter"}
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee"
+    )
+    assert mock_request.call_args.kwargs["method"] == "POST"
+    assert mock_request.call_args.kwargs["json"] == {"FirstName": "Peter"}
+
+
+def test_create_resource_returns_error_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400, json_data={"error": "invalid field"}
+            )
+        ),
+    )
+
+    result = json.loads(deputy.deputy_create_resource("Employee", {"Bad": "x"}))
+
+    assert result["status"] == "error"
+    assert "invalid field" in result["message"]
+
+
+def test_create_resource_rejects_non_dict_response(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected"])),
+    )
+
+    result = json.loads(deputy.deputy_create_resource("Employee", {"FirstName": "P"}))
+
+    assert result["status"] == "error"
+
+
+def test_create_resource_rejects_invalid_resource_without_raising(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource(" Employee", {"FirstName": "P"}))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# deputy_update_resource
+# ---------------------------------------------------------------------------
+
+
+def test_update_resource_sends_data_and_returns_record(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"Id": 123, "Mobile": "0400000000"})
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Mobile": "0400000000"})
+    )
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "Mobile": "0400000000"}
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee/123"
+    )
+    assert mock_request.call_args.kwargs["method"] == "POST"
+    assert mock_request.call_args.kwargs["json"] == {"Mobile": "0400000000"}
+
+
+def test_update_resource_rejects_empty_data_without_calling_api(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_update_resource("Employee", "123", {}))
+
+    assert result["status"] == "error"
+    assert "No fields provided" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_resource_returns_error_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=404, json_data={"error": "gone"})),
+    )
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "999", {"Mobile": "x"})
+    )
+
+    assert result["status"] == "error"
+    assert "gone" in result["message"]
+
+
+def test_update_resource_rejects_non_dict_response(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected"])),
+    )
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Mobile": "x"})
+    )
+
+    assert result["status"] == "error"
+
+
+@pytest.mark.parametrize(
+    "resource,resource_id",
+    [
+        (" Employee", "123"),
+        ("", "123"),
+        ("Employee", " 123"),
+        ("Employee", ""),
+    ],
+)
+def test_update_resource_rejects_invalid_ids_without_raising(
+    monkeypatch, resource, resource_id
+):
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource(resource, resource_id, {"Mobile": "x"})
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # _success_with_capped_list
 # ---------------------------------------------------------------------------
 

@@ -78,7 +78,7 @@ def _deputy_app_row() -> dict[str, object]:
     return {
         "app_id": APP_ID,
         "name": "Deputy",
-        "description": "Connect to Deputy to look up employees, view rosters/shifts, and read timesheets.",
+        "description": "Connect to Deputy to look up employees, view rosters/shifts, read timesheets, and create or update records such as employees, rosters, timesheets, and leave.",
         "icon": "https://www.google.com/s2/favicons?domain=deputy.com&sz=128",
         "transport": "oauth",
         "provider_name": "deputy",

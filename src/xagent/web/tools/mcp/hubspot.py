@@ -343,26 +343,53 @@ def _parse_properties(properties_json: str) -> dict[str, Any]:
     return properties
 
 
+_FILTER_GROUPS_SHAPE_ERROR = (
+    "filter_groups_json must be a JSON array of HubSpot filterGroups objects, "
+    'each with a non-empty "filters" list of filter objects that each have '
+    'a non-blank "propertyName" and "operator" (e.g. [{"filters": '
+    '[{"propertyName": "dealstage", "operator": "EQ", "value": '
+    '"appointmentscheduled"}]}]) - not a flat list of conditions, and not a '
+    "group with an empty or missing filters list (which HubSpot treats as "
+    "matching everything, defeating the point of filtering)."
+)
+
+
+def _is_valid_filter(filter_: Any) -> bool:
+    """Whether ``filter_`` has the two fields every HubSpot filter object
+    requires regardless of operator - confirmed against HubSpot's CRM
+    Search API docs: ``propertyName``/``operator`` are always required,
+    while ``value``/``values``/``highValue`` are operator-dependent (e.g.
+    HAS_PROPERTY/NOT_HAS_PROPERTY take no value at all) - so those are
+    deliberately NOT checked here, to avoid rejecting a legitimate filter
+    that has no value field by design.
+    """
+    return (
+        isinstance(filter_, dict)
+        and bool(filter_.get("propertyName"))
+        and bool(filter_.get("operator"))
+    )
+
+
+def _is_valid_filter_group(group: Any) -> bool:
+    if not isinstance(group, dict):
+        return False
+    filters = group.get("filters")
+    return (
+        isinstance(filters, list)
+        and bool(filters)
+        and all(_is_valid_filter(f) for f in filters)
+    )
+
+
 def _parse_filter_groups(filter_groups_json: str) -> list[dict[str, Any]]:
     try:
         filter_groups = json.loads(filter_groups_json)
     except json.JSONDecodeError as e:
         raise ValueError(f"filter_groups_json is not valid JSON: {e}") from e
     if not isinstance(filter_groups, list) or not all(
-        isinstance(group, dict)
-        and isinstance(group.get("filters"), list)
-        and group["filters"]
-        for group in filter_groups
+        _is_valid_filter_group(group) for group in filter_groups
     ):
-        raise ValueError(
-            "filter_groups_json must be a JSON array of HubSpot filterGroups "
-            'objects, each with a non-empty "filters" list, e.g. '
-            '[{"filters": [{"propertyName": "dealstage", "operator": "EQ", '
-            '"value": "appointmentscheduled"}]}] - not a flat list of '
-            "conditions, and not a group with an empty or missing filters "
-            "list (which HubSpot treats as matching everything, defeating "
-            "the point of filtering)."
-        )
+        raise ValueError(_FILTER_GROUPS_SHAPE_ERROR)
     return filter_groups
 
 

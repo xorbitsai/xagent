@@ -344,15 +344,24 @@ def _parse_properties(properties_json: str) -> dict[str, Any]:
 
 
 def _parse_filter_groups(filter_groups_json: str) -> list[dict[str, Any]]:
-    filter_groups = json.loads(filter_groups_json)
+    try:
+        filter_groups = json.loads(filter_groups_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"filter_groups_json is not valid JSON: {e}") from e
     if not isinstance(filter_groups, list) or not all(
-        isinstance(group, dict) for group in filter_groups
+        isinstance(group, dict)
+        and isinstance(group.get("filters"), list)
+        and group["filters"]
+        for group in filter_groups
     ):
         raise ValueError(
             "filter_groups_json must be a JSON array of HubSpot filterGroups "
-            'objects, e.g. [{"filters": [{"propertyName": "dealstage", '
-            '"operator": "EQ", "value": "appointmentscheduled"}]}] - not a '
-            "flat list of conditions."
+            'objects, each with a non-empty "filters" list, e.g. '
+            '[{"filters": [{"propertyName": "dealstage", "operator": "EQ", '
+            '"value": "appointmentscheduled"}]}] - not a flat list of '
+            "conditions, and not a group with an empty or missing filters "
+            "list (which HubSpot treats as matching everything, defeating "
+            "the point of filtering)."
         )
     return filter_groups
 
@@ -385,6 +394,7 @@ def _search(
     `hubspot_list_{object_type}` tool exists specifically for that case and
     says so up front instead of a plausible-looking but meaningless result.
     """
+    query = query.strip() if query else None
     filter_groups = (
         _parse_filter_groups(filter_groups_json) if filter_groups_json else None
     )

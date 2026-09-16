@@ -2080,6 +2080,80 @@ def test_search_contacts_rejects_non_array_filter_groups_json(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_search_contacts_rejects_a_flat_list_of_non_group_conditions(monkeypatch):
+    """Regression: _parse_filter_groups previously only checked the
+    top-level JSON was a list, so a caller mistake like a flat list of
+    condition strings (rather than HubSpot's `{"filters": [...]}` group
+    objects) passed local validation and reached HubSpot as-is, surfacing
+    only as an opaque upstream 400 instead of the same actionable local
+    error the top-level-not-a-list case already gets."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_search_contacts(filter_groups_json=json.dumps(["stage=won"]))
+    )
+
+    assert result["status"] == "error"
+    assert "filter_groups_json" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_rejects_no_query_and_no_filter(monkeypatch):
+    """Regression: query used to be a required, non-empty `str` (no
+    default), so an unfiltered search was structurally unreachable. Making
+    it optional (for the filter-only case) also made a call with NEITHER
+    query nor filter_groups_json newly possible - which would otherwise
+    silently return an arbitrary, unfiltered page that looks like a real
+    match instead of the caller's evidently-missing search criteria."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_search_contacts())
+
+    assert result["status"] == "error"
+    assert "hubspot_list_contacts" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_search_deals_rejects_no_query_and_no_filter(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_search_deals())
+
+    assert result["status"] == "error"
+    assert "hubspot_list_deals" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_rejects_an_empty_filter_groups_array(monkeypatch):
+    """An explicit `filter_groups_json="[]"` parses to an empty list, which
+    is exactly as unscoped as omitting it - it must not be treated as "a
+    filter was given" and bypass the no-criteria guard above."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_search_contacts(filter_groups_json="[]"))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_handles_an_explicit_null_total(monkeypatch):
+    """Regression: result.get("total", 0) only substitutes the default when
+    the key is absent, not when HubSpot returns an explicit JSON null -
+    the same class of bug already fixed for the "results" field."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": None, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_search_contacts(query="acme"))
+
+    assert result == {"status": "success", "total": 0, "results": []}
+
+
 def test_search_companies_sends_filter_groups(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"total": 0, "results": []})

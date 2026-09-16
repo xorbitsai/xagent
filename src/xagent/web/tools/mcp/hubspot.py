@@ -9,6 +9,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from .utils import clamp_limit as _clamp_limit
 from .utils import require_clean_identifier as _require_clean_identifier
 from .utils import setup_proxy_env
 from .utils import success_with_capped_dict as _success_with_capped_dict
@@ -344,11 +345,14 @@ def _parse_properties(properties_json: str) -> dict[str, Any]:
 
 def _parse_filter_groups(filter_groups_json: str) -> list[dict[str, Any]]:
     filter_groups = json.loads(filter_groups_json)
-    if not isinstance(filter_groups, list):
+    if not isinstance(filter_groups, list) or not all(
+        isinstance(group, dict) for group in filter_groups
+    ):
         raise ValueError(
             "filter_groups_json must be a JSON array of HubSpot filterGroups "
             'objects, e.g. [{"filters": [{"propertyName": "dealstage", '
-            '"operator": "EQ", "value": "appointmentscheduled"}]}]'
+            '"operator": "EQ", "value": "appointmentscheduled"}]}] - not a '
+            "flat list of conditions."
         )
     return filter_groups
 
@@ -368,13 +372,28 @@ def _search(
     properties: list[str],
     limit: int,
     query: str | None = None,
-    filter_groups: list[dict[str, Any]] | None = None,
+    filter_groups_json: str | None = None,
 ) -> dict[str, Any]:
     """Free-text search, property filtering, or both, against one HubSpot
-    CRM object type's /search endpoint. At least one of `query` or
-    `filter_groups` should normally be given - the endpoint accepts neither
-    and returns an unfiltered page in that case, but hubspot_list_* is the
-    more direct tool for that."""
+    CRM object type's /search endpoint.
+
+    filter_groups_json, when given, is HubSpot's native filterGroups JSON -
+    see _parse_filter_groups for the exact shape required. Requires at
+    least one of `query` or a non-empty `filter_groups_json`: the search
+    endpoint would otherwise silently accept neither and return an
+    arbitrary, unfiltered page that looks like a real match - the
+    `hubspot_list_{object_type}` tool exists specifically for that case and
+    says so up front instead of a plausible-looking but meaningless result.
+    """
+    filter_groups = (
+        _parse_filter_groups(filter_groups_json) if filter_groups_json else None
+    )
+    if not query and not filter_groups:
+        raise ValueError(
+            f"hubspot_search_{object_type} needs a query or filter_groups_json "
+            f"- to list every {object_type} with neither, use "
+            f"hubspot_list_{object_type} instead."
+        )
     body: dict[str, Any] = {
         "properties": properties,
         "limit": max(1, min(limit, 100)),
@@ -385,7 +404,7 @@ def _search(
         body["filterGroups"] = filter_groups
     result = _request("POST", f"/crm/v3/objects/{object_type}/search", body=body)
     return {
-        "total": result.get("total", 0),
+        "total": result.get("total") or 0,
         "results": _project_id_and_properties(result.get("results", [])),
     }
 
@@ -410,15 +429,12 @@ def hubspot_search_contacts(
     the more direct tool for that and doesn't need an empty search body.
     """
     try:
-        filter_groups = (
-            _parse_filter_groups(filter_groups_json) if filter_groups_json else None
-        )
         found = _search(
             "contacts",
             DEFAULT_CONTACT_PROPERTIES,
             limit,
             query=query,
-            filter_groups=filter_groups,
+            filter_groups_json=filter_groups_json,
         )
         return _success(**found)
     except Exception as e:
@@ -501,15 +517,12 @@ def hubspot_search_companies(
     hubspot_list_companies instead.
     """
     try:
-        filter_groups = (
-            _parse_filter_groups(filter_groups_json) if filter_groups_json else None
-        )
         found = _search(
             "companies",
             DEFAULT_COMPANY_PROPERTIES,
             limit,
             query=query,
-            filter_groups=filter_groups,
+            filter_groups_json=filter_groups_json,
         )
         return _success(**found)
     except Exception as e:
@@ -784,9 +797,12 @@ def hubspot_search_deals(
     limit: int = 10,
 ) -> str:
     """
-    Search HubSpot deals by free-text query (matches dealname), by property
-    filters (stage, pipeline, amount, close date, ...), or both - across
-    the whole portal, not scoped to one contact or company.
+    Search HubSpot deals by property filters (stage, pipeline, amount,
+    close date, ...), by free-text query, or both - across the whole
+    portal, not scoped to one contact or company. `query` only matches
+    `dealname` (deals have no broader default-searchable property set the
+    way contacts/companies do) - for anything else (owner, amount, a
+    stage), use filter_groups_json instead of expecting query to find it.
 
     filter_groups_json, when given, is HubSpot's native filterGroups JSON
     array, e.g. '[{"filters": [{"propertyName": "dealstage", "operator":
@@ -798,15 +814,12 @@ def hubspot_search_deals(
     every deal in the portal with no query or filter, use hubspot_list_deals.
     """
     try:
-        filter_groups = (
-            _parse_filter_groups(filter_groups_json) if filter_groups_json else None
-        )
         found = _search(
             "deals",
             DEFAULT_DEAL_PROPERTIES,
             limit,
             query=query,
-            filter_groups=filter_groups,
+            filter_groups_json=filter_groups_json,
         )
         return _success(**found)
     except Exception as e:
@@ -837,7 +850,7 @@ def hubspot_list_deals(limit: int = 100, after: str | None = None) -> str:
     """
     try:
         params: dict[str, Any] = {
-            "limit": max(1, min(limit, 100)),
+            "limit": _clamp_limit(limit, max_limit=100),
             "properties": ",".join(DEFAULT_DEAL_PROPERTIES),
         }
         if after:
@@ -869,7 +882,7 @@ def hubspot_list_companies(limit: int = 100, after: str | None = None) -> str:
     """
     try:
         params: dict[str, Any] = {
-            "limit": max(1, min(limit, 100)),
+            "limit": _clamp_limit(limit, max_limit=100),
             "properties": ",".join(DEFAULT_COMPANY_PROPERTIES),
         }
         if after:
@@ -901,7 +914,7 @@ def hubspot_list_contacts(limit: int = 100, after: str | None = None) -> str:
     """
     try:
         params: dict[str, Any] = {
-            "limit": max(1, min(limit, 100)),
+            "limit": _clamp_limit(limit, max_limit=100),
             "properties": ",".join(DEFAULT_CONTACT_PROPERTIES),
         }
         if after:

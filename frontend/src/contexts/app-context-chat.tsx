@@ -2192,6 +2192,10 @@ export function AppProvider({
   // produced by the preceding action before React commits the batch.
   const stateRef = useRef(state)
   const dispatch = useCallback((action: AppAction) => {
+    // Whatever cleared the transcript (reconnect, task switch, workforce run
+    // swap) will have it replayed back; a surviving 30s entry would swallow
+    // the replayed bubbles as duplicates.
+    if (action.type === "CLEAR_MESSAGES") recentMessagesRef.current.clear()
     const next = projectAppState(stateRef.current, action)
     stateRef.current = next
     privateCommit({ state: next })

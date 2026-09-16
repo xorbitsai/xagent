@@ -2832,6 +2832,53 @@ def test_update_event_all_day_attendee_addition_with_retained_attendee_fails_clo
     graph_request.assert_called_once()
 
 
+def test_update_event_adds_attendee_to_all_day_event_without_retained_attendees(
+    monkeypatch,
+):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "@odata.etag": 'W/"version-1"',
+                "start": {"dateTime": "2026-08-27T00:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-28T00:00:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": True,
+                "type": "singleInstance",
+            },
+            {"value": []},
+            {
+                "value": [
+                    {
+                        "scheduleId": "new@example.com",
+                        "availabilityView": "0",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+            {"id": "updated"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T00:00:00",
+            end_datetime="2026-08-28T00:00:00",
+            timezone="America/New_York",
+            is_all_day=True,
+            attendees=["new@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    schedule_call = graph_request.call_args_list[2]
+    assert schedule_call.args[:2] == ("POST", "/me/calendar/getSchedule")
+    assert schedule_call.kwargs["body"]["schedules"] == ["new@example.com"]
+    patch_call = graph_request.call_args_list[-1]
+    assert patch_call.kwargs["extra_headers"] == {"If-Match": 'W/"version-1"'}
+
+
 def test_update_event_treats_existing_attendee_case_insensitively(monkeypatch):
     """Regression test for a review finding: an existing attendee re-passed
     with different casing must still be recognized as "already there" -
@@ -3184,8 +3231,7 @@ def test_update_event_attendee_patch_rejects_concurrent_change(monkeypatch):
     )
 
     assert result["status"] == "error"
-    assert "changed while availability was being checked" in result["message"]
-    assert "No update was applied" in result["message"]
+    assert "changed before this update could be applied" in result["message"]
 
 
 def test_update_event_schedule_patch_rejects_concurrent_change(monkeypatch):
@@ -3213,9 +3259,36 @@ def test_update_event_schedule_patch_rejects_concurrent_change(monkeypatch):
     )
 
     assert result["status"] == "error"
-    assert "changed while availability was being checked" in result["message"]
+    assert "changed before this update could be applied" in result["message"]
     patch_call = graph_request.call_args_list[-1]
     assert patch_call.kwargs["extra_headers"] == {"If-Match": 'W/"version-1"'}
+
+
+def test_update_event_schedule_patch_requires_event_etag(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+            },
+            {"value": []},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T11:00:00",
+            end_datetime="2026-08-27T11:30:00",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "did not return an event version" in result["message"]
+    assert graph_request.call_count == 2
 
 
 def test_update_event_attendee_patch_does_not_treat_change_key_as_etag(monkeypatch):

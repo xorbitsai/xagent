@@ -1340,9 +1340,9 @@ def outlook_update_event(
         except _GraphRequestError as exc:
             if patch_headers and exc.status_code == 412:
                 raise ValueError(
-                    "The event changed while availability was being checked. No "
-                    "update was applied; read the latest event and retry so recent "
-                    "schedule, attendee, or RSVP changes are preserved."
+                    "The event changed before this update could be applied. Read "
+                    "the latest event and retry so recent schedule, attendee, or "
+                    "RSVP changes are preserved."
                 ) from exc
             raise
         return _success(event=result)

@@ -606,6 +606,17 @@ def test_create_resource_rejects_invalid_resource_without_raising(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_create_resource_rejects_empty_data_without_calling_api(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Employee", {}))
+
+    assert result["status"] == "error"
+    assert "No data provided" in result["message"]
+    mock_request.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # deputy_update_resource
 # ---------------------------------------------------------------------------

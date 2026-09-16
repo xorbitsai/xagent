@@ -26,8 +26,7 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 APP_ID = "deputy"
 
 PREVIOUS_DESCRIPTION = (
-    "Connect to Deputy to look up employees, view rosters/shifts, and read "
-    "timesheets."
+    "Connect to Deputy to look up employees, view rosters/shifts, and read timesheets."
 )
 CURRENT_DESCRIPTION = (
     "Connect to Deputy to look up employees, view rosters/shifts, read "

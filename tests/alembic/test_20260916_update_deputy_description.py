@@ -235,8 +235,7 @@ def test_upgrade_without_matching_row_is_a_noop(tmp_path):
             migration.upgrade()
         description = connection.execute(
             text(
-                "SELECT description FROM public_mcp_apps "
-                "WHERE app_id='employment-hero'"
+                "SELECT description FROM public_mcp_apps WHERE app_id='employment-hero'"
             )
         ).scalar()
         assert description == "unrelated"

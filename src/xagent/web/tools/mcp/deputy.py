@@ -338,6 +338,8 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     learn which field names Deputy expects.
     """
     try:
+        if not data:
+            return _error("No data provided to create record")
         safe_resource = url_path_id(resource, "resource")
         result = _request("POST", f"/resource/{safe_resource}", json_data=data)
         if not isinstance(result, dict):
@@ -349,7 +351,9 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
 
 
 @mcp.tool()
-def deputy_update_resource(resource: str, resource_id: str, data: dict[str, Any]) -> str:
+def deputy_update_resource(
+    resource: str, resource_id: str, data: dict[str, Any]
+) -> str:
     """
     Update an existing record. Only the fields provided are changed
     (POST /resource/{resource}/{id} -- Deputy's Resource API uses POST, not

@@ -1,7 +1,7 @@
 """update Deputy connector description for the new write tools
 
 Revision ID: 20260916_update_deputy_description
-Revises: 20260909_seed_whatsapp_mcp_app
+Revises: 20260911_global_memory_authority
 Create Date: 2026-09-16
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260916_update_deputy_description"
-down_revision: Union[str, None] = "20260909_seed_whatsapp_mcp_app"
+down_revision: Union[str, None] = "20260911_global_memory_authority"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

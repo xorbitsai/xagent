@@ -492,7 +492,13 @@ class WorkspaceFileOperations:
 
         with open(resolved_path, "a", encoding=encoding) as f:
             f.write(content)
+        self._refresh_registered_file(resolved_path)
         return True
+
+    def _refresh_registered_file(self, file_path: Path) -> None:
+        refresh = getattr(self.workspace, "refresh_file_registration", None)
+        if callable(refresh):
+            refresh(str(file_path))
 
     def delete_file(self, file_path: str) -> bool:
         """Delete file in workspace"""
@@ -766,6 +772,8 @@ class WorkspaceFileOperations:
 
         # Call the basic edit_file function with the resolved path
         result = basic_edit_file(str_path, operations, encoding, backup)
+        if result.lines_changed:
+            self._refresh_registered_file(resolved_path)
 
         logger.debug("edit_file result: %s", result)
         return result
@@ -802,6 +810,8 @@ class WorkspaceFileOperations:
         result = basic_find_and_replace(
             str_path, pattern, replacement, encoding, use_regex, case_sensitive, backup
         )
+        if result.lines_changed:
+            self._refresh_registered_file(resolved_path)
 
         logger.debug("find_and_replace result: %s", result)
         return result

@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 import re
 import subprocess
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
@@ -4282,3 +4284,234 @@ def test_truncated_error_message_does_not_leak_truncation_mark_outside_any_token
 
     assert len(message) < mcp_adapter_module._MCP_TOOL_ERROR_LOG_MAX_CHARS
     assert mcp_adapter_module._TEXT_TRUNCATION_MARK not in message
+
+
+def _workspace_upload_adapter(workspace) -> MCPToolAdapter:
+    schema = {
+        "type": "object",
+        "properties": {"file_id": {"type": "string"}},
+        "required": ["file_id"],
+    }
+    connection = {
+        "transport": "stdio",
+        "command": "python",
+        "args": [],
+        "workspace_file_ref_env": {
+            "google_drive_upload_file": "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE"
+        },
+        "_workspace": workspace,
+    }
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="google_drive_upload_file",
+            description="Upload a workspace file",
+            inputSchema=schema,
+        ),
+        connection=connection,
+    )
+
+
+@pytest.mark.asyncio
+async def test_workspace_upload_resolves_file_id_into_one_call_environment(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "external" / "stored-name-1.pptx"
+    source.parent.mkdir()
+    source.write_bytes(b"PK\x03\x04exact-pptx")
+    resolver_threads = []
+
+    def resolve(file_id):
+        resolver_threads.append(threading.get_ident())
+        return SimpleNamespace(
+            file_id="canonical-id",
+            path=source,
+            filename="Quarterly Review.pptx",
+            mime_type="application/vnd.test.presentation",
+            size=source.stat().st_size,
+            device=source.stat().st_dev,
+            inode=source.stat().st_ino,
+        )
+
+    workspace = SimpleNamespace(resolve_file_binding_detached=resolve)
+    adapter = _workspace_upload_adapter(workspace)
+    captured = {}
+    loop_thread = threading.get_ident()
+
+    assert adapter.write_hint is MCPWriteHint.UNDECLARED
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        captured["connection"] = connection
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({"file_id": "xagent-file-id"})
+
+    assert result["is_error"] is False
+    assert captured["arguments"] == {"file_id": "canonical-id"}
+    assert resolver_threads != [loop_thread]
+    env = captured["connection"]["env"]
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE"] == str(source.resolve())
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_ID"] == "canonical-id"
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_NAME"] == "Quarterly Review.pptx"
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_MIME"] == (
+        "application/vnd.test.presentation"
+    )
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_SIZE"] == str(source.stat().st_size)
+    assert str(source) not in json.dumps(captured["arguments"])
+
+
+@pytest.mark.asyncio
+async def test_workspace_upload_unknown_and_path_ids_fail_closed(monkeypatch):
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    for raw_id in ("unknown-id", "/etc/passwd"):
+        workspace = SimpleNamespace(resolve_file_binding_detached=lambda _file_id: None)
+        result = await _workspace_upload_adapter(workspace).run_json_async(
+            {"file_id": raw_id}
+        )
+        assert result["is_error"] is True
+        assert result["structured_content"]["message"] == (
+            "Workspace file is unavailable for this task."
+        )
+        assert raw_id not in json.dumps(result)
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_workspace_upload_settles_detached_resolution_before_cancellation(
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    def resolve(_file_id):
+        started.set()
+        release.wait(timeout=5)
+        return None
+
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+    adapter = _workspace_upload_adapter(
+        SimpleNamespace(resolve_file_binding_detached=resolve)
+    )
+
+    call = asyncio.create_task(adapter.run_json_async({"file_id": "opaque-id"}))
+    assert await asyncio.to_thread(started.wait, 2)
+    call.cancel()
+    await asyncio.sleep(0)
+    assert not call.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preview_producer_and_mcp_adapter_share_ephemeral_workspace(
+    monkeypatch,
+    tmp_path,
+):
+    from xagent.core.agent.service import AgentService
+    from xagent.core.tools.adapters.vibe.browser_tools import create_browser_tools
+    from xagent.core.tools.adapters.vibe.config import ToolConfig
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+    from xagent.core.tools.adapters.vibe.mcp_tools import create_mcp_tools
+
+    preview_id = "preview_deadbeef"
+    config = ToolConfig(
+        {
+            "task_id": preview_id,
+            "workspace": {
+                "base_dir": str(tmp_path),
+                "task_id": preview_id,
+            },
+            "mcp_servers": [
+                {
+                    "name": "google_drive",
+                    "transport": "stdio",
+                    "config": {"command": "python", "args": []},
+                }
+            ],
+        }
+    )
+    service = AgentService(
+        name="preview",
+        id=preview_id,
+        tool_config=config,
+        enable_workspace=True,
+        workspace_base_dir=str(tmp_path),
+    )
+    browser_tools = await create_browser_tools(config)
+    screenshot_tool = next(
+        tool for tool in browser_tools if tool.name == "browser_screenshot"
+    )
+    producer_workspace = screenshot_tool._workspace
+    assert producer_workspace is service.workspace
+
+    png_bytes = b"\x89PNG\r\n\x1a\npreview screenshot"
+
+    async def fake_browser_screenshot(**kwargs):
+        import base64
+
+        return {
+            "success": True,
+            "session_id": kwargs["session_id"],
+            "screenshot": "data:image/png;base64,"
+            + base64.b64encode(png_bytes).decode("ascii"),
+            "format": "png",
+            "full_page": False,
+            "wait_for_lazy_load": False,
+            "message": "ok",
+            "error": "",
+        }
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.browser_use.browser_screenshot",
+        fake_browser_screenshot,
+    )
+    produced = await screenshot_tool.run_json_async({"output_filename": "preview.png"})
+
+    captured = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(connection):
+        captured["connection"] = connection
+        yield _FakeSession()
+
+    async def fake_create_mcp_tools(mcp_configs, **kwargs):
+        assert mcp_configs
+        assert kwargs["workspace"] is producer_workspace
+        return [_workspace_upload_adapter(kwargs["workspace"])]
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(fake_create_mcp_tools),
+    )
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    mcp_tools = await create_mcp_tools(config)
+    result = await mcp_tools[0].run_json_async({"file_id": produced["file_id"]})
+
+    assert result["is_error"] is False
+    env = captured["connection"]["env"]
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_ID"] == produced["file_id"]
+    assert env["XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_MIME"] == "image/png"

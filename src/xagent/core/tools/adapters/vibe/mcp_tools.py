@@ -281,6 +281,9 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
                 actor_stdio_session_identities=session_identities,
                 actor_stdio_session_consumer=session_consumer,
             )
+        workspace = ToolFactory.get_or_create_runtime_workspace(config)
+        if workspace is not None:
+            create_kwargs["workspace"] = workspace
         tools = await ToolFactory._create_mcp_tools_from_configs(
             mcp_configs, **create_kwargs
         )

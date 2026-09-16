@@ -320,7 +320,7 @@ async def create_file_tools(config: "BaseToolConfig") -> List[Any]:
     if not config.get_file_tools_enabled():
         return []
 
-    workspace = ToolFactory.create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.get_or_create_runtime_workspace(config)
     if not workspace:
         return []
 

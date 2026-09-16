@@ -528,7 +528,7 @@ async def create_vision_tools(config: "BaseToolConfig") -> List[Any]:
     if not vision_model:
         return []
 
-    workspace = ToolFactory.create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.get_or_create_runtime_workspace(config)
 
     try:
         return get_vision_tool(vision_model=vision_model, workspace=workspace)

@@ -374,7 +374,13 @@ class TestWorkspaceFileToolConsistency:
                     file_id="foreign-file",
                     user_id=2,
                     task_id=None,
+                    filename="other-user.txt",
+                    mime_type="text/plain",
+                    file_size=len("private"),
                     storage_path=str(external_file),
+                    storage_key=None,
+                    storage_status="legacy",
+                    checksum=None,
                 )
 
         class FakeSession:
@@ -390,6 +396,7 @@ class TestWorkspaceFileToolConsistency:
         )
 
         assert workspace.resolve_file_id("foreign-file") is None
+        assert workspace.resolve_file_binding_detached("foreign-file") is None
 
     def test_resolve_file_id_detached_uses_worker_owned_session(self, tmp_path, mocker):
         """Detached resolution must not reuse the caller's SQLAlchemy session."""
@@ -411,6 +418,12 @@ class TestWorkspaceFileToolConsistency:
                     user_id=1,
                     task_id=None,
                     storage_path=str(registered_file),
+                    filename="Original Name.txt",
+                    mime_type="text/custom",
+                    file_size=len("content"),
+                    storage_key=None,
+                    storage_status="legacy",
+                    checksum=None,
                 )
 
         class WorkerSession:
@@ -430,6 +443,15 @@ class TestWorkspaceFileToolConsistency:
         )
 
         assert workspace.resolve_file_id_detached("registered-file") == registered_file
+        binding = workspace.resolve_file_binding_detached("registered-file")
+        assert binding is not None
+        assert (binding.filename, binding.mime_type, binding.size) == (
+            "Original Name.txt",
+            "text/custom",
+            len("content"),
+        )
+        registered_file.write_text("changed content")
+        assert workspace.resolve_file_binding_detached("registered-file") is None
         assert worker_session.closed is True
 
     def test_resolve_file_id_rejects_durable_only_other_user_records(

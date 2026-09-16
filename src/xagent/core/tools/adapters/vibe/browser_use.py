@@ -691,7 +691,9 @@ class BrowserScreenshotTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 file_path = self._workspace.output_dir / filename
 
                 # Save to file within auto_register context
-                with self._workspace.auto_register_files():
+                with self._workspace.auto_register_files(
+                    mime_types={file_path: "image/png"}
+                ):
                     with open(file_path, "wb") as f:
                         f.write(image_bytes)
 
@@ -1111,7 +1113,9 @@ class BrowserPdfTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 file_path = self._workspace.output_dir / filename
 
                 # Save to file within auto_register context
-                with self._workspace.auto_register_files():
+                with self._workspace.auto_register_files(
+                    mime_types={file_path: "application/pdf"}
+                ):
                     with open(file_path, "wb") as f:
                         f.write(pdf_bytes)
 

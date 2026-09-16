@@ -1059,6 +1059,27 @@ def test_get_form_submissions_reports_has_more(monkeypatch):
     )
 
 
+def test_get_form_submissions_handles_an_explicit_null_results_field(monkeypatch):
+    """Regression: _paged_list's default identity `project` (used here,
+    unlike hubspot_list_deals/companies/contacts which pass
+    _project_id_and_properties) used to pass an explicit HubSpot
+    "results": null straight through as None instead of an empty list -
+    result.get("results", []) only substitutes the default when the key
+    is absent, not when it's present with value None."""
+    mock_request = Mock(return_value=MockResponse(json_data={"results": None}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_form_submissions("form-1"))
+
+    assert result == {
+        "status": "success",
+        "submissions": [],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+    }
+
+
 def test_get_form_submissions_clamps_limit_to_valid_range(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
@@ -1820,8 +1841,9 @@ def test_get_campaign_metrics_passes_through_a_non_dict_body(monkeypatch):
 
 def test_list_campaigns_skips_non_dict_items(monkeypatch):
     """A non-dict item in the results (a malformed/unexpected upstream
-    shape) must be dropped rather than crash the whole page, matching the
-    guard _project_fields already applies for forms/emails."""
+    shape) must be dropped rather than crash the whole page - now routed
+    through the shared _project_id_and_properties helper instead of a
+    campaigns-specific inline lambda."""
     mock_request = Mock(
         return_value=MockResponse(
             json_data={"results": ["not-a-dict", {"id": "c1", "properties": {}}]}
@@ -1833,6 +1855,34 @@ def test_list_campaigns_skips_non_dict_items(monkeypatch):
 
     assert result["status"] == "success"
     assert result["campaigns"] == [{"id": "c1", "properties": {}}]
+
+
+def test_list_campaigns_treats_a_null_properties_value_as_empty(monkeypatch):
+    """Regression: the campaigns-specific projection this now shares with
+    hubspot_list_deals/companies/contacts used to do item.get("properties",
+    {}) - only substitutes the default when the key is absent, so an
+    explicit "properties": null (key present, value None) passed through
+    as None instead of {}."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"results": [{"id": "c1", "properties": None}]}
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_campaigns())
+
+    assert result["campaigns"] == [{"id": "c1", "properties": {}}]
+
+
+def test_list_campaigns_handles_an_explicit_null_results_field(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": None}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_campaigns())
+
+    assert result["status"] == "success"
+    assert result["campaigns"] == []
 
 
 def test_create_note_treats_empty_string_id_as_not_provided(monkeypatch):
@@ -2093,147 +2143,50 @@ def test_search_contacts_combines_query_and_filter_groups(monkeypatch):
     assert "filterGroups" in body
 
 
-def test_search_contacts_rejects_non_array_filter_groups_json(monkeypatch):
-    mock_request = Mock()
-    monkeypatch.setattr(hubspot.requests, "request", mock_request)
-
-    result = json.loads(
-        hubspot.hubspot_search_contacts(filter_groups_json=json.dumps({"filters": []}))
-    )
-
-    assert result["status"] == "error"
-    assert "filter_groups_json" in result["message"]
-    mock_request.assert_not_called()
-
-
-def test_search_contacts_rejects_a_flat_list_of_non_group_conditions(monkeypatch):
-    """Regression: _parse_filter_groups previously only checked the
-    top-level JSON was a list, so a caller mistake like a flat list of
-    condition strings (rather than HubSpot's `{"filters": [...]}` group
-    objects) passed local validation and reached HubSpot as-is, surfacing
-    only as an opaque upstream 400 instead of the same actionable local
-    error the top-level-not-a-list case already gets."""
-    mock_request = Mock()
-    monkeypatch.setattr(hubspot.requests, "request", mock_request)
-
-    result = json.loads(
-        hubspot.hubspot_search_contacts(filter_groups_json=json.dumps(["stage=won"]))
-    )
-
-    assert result["status"] == "error"
-    assert "filter_groups_json" in result["message"]
-    mock_request.assert_not_called()
-
-
-def test_search_contacts_rejects_a_filter_group_with_empty_filters(monkeypatch):
-    """Regression (Blocking): a group with an empty (or missing) "filters"
-    list is truthy as a Python list-of-one-dict, so it passed both the
-    old element-shape check and the no-criteria guard in _search - HubSpot
-    treats a filter group with no conditions as matching everything,
-    silently defeating the guard's entire purpose. A caller building
-    filter_groups_json programmatically (e.g. all conditions pruned
-    upstream but the outer group kept) can plausibly produce exactly this
-    shape."""
-    mock_request = Mock()
-    monkeypatch.setattr(hubspot.requests, "request", mock_request)
-
-    result = json.loads(
-        hubspot.hubspot_search_contacts(filter_groups_json=json.dumps([{}]))
-    )
-
-    assert result["status"] == "error"
-    assert "filter_groups_json" in result["message"]
-    mock_request.assert_not_called()
-
-
-def test_search_contacts_rejects_a_filter_group_with_non_list_filters(monkeypatch):
-    mock_request = Mock()
-    monkeypatch.setattr(hubspot.requests, "request", mock_request)
-
-    result = json.loads(
-        hubspot.hubspot_search_contacts(
-            filter_groups_json=json.dumps([{"filters": "not-a-list"}])
-        )
-    )
-
-    assert result["status"] == "error"
-    assert "filter_groups_json" in result["message"]
-    mock_request.assert_not_called()
-
-
-def test_search_contacts_rejects_a_group_with_an_empty_filters_list_directly(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "bad_filter_groups",
+    [
+        pytest.param({"filters": []}, id="top-level-not-a-list"),
+        pytest.param(["stage=won"], id="flat-list-of-conditions-not-groups"),
+        pytest.param([{}], id="group-missing-filters-key"),
+        pytest.param([{"filters": "not-a-list"}], id="filters-not-a-list"),
+        pytest.param([{"filters": []}], id="filters-list-empty"),
+        pytest.param([{"filters": [{}]}], id="filter-object-empty"),
+        pytest.param([{"filters": ["dealstage"]}], id="filter-entry-not-a-dict"),
+        pytest.param(
+            [{"filters": [{"propertyName": "dealstage"}]}],
+            id="filter-missing-operator",
+        ),
+        pytest.param(
+            [{"filters": [{"propertyName": "  ", "operator": "HAS_PROPERTY"}]}],
+            id="filter-whitespace-only-property-name",
+        ),
+        pytest.param(
+            [{"filters": [{"propertyName": "email", "operator": True}]}],
+            id="filter-non-string-operator",
+        ),
+    ],
+)
+def test_search_contacts_rejects_malformed_filter_groups_json(
+    monkeypatch, bad_filter_groups
 ):
-    """Isolates the "filters" list being present but empty, as distinct
-    from missing entirely ({}) or wrong-typed ("not-a-list") - all three
-    are separate branches of _is_valid_filter_group."""
+    """Each case exercises a distinct branch of _is_valid_filter/
+    _is_valid_filter_group/_parse_filter_groups, built up across several
+    rounds: not a list at all; a flat list of conditions instead of group
+    objects; a group with no/wrong-typed/empty "filters"; a non-empty
+    filters list containing an empty or non-dict filter (the "matches
+    everything" hole one level deeper than the top-level-empty case,
+    verified against HubSpot's CRM Search API docs: propertyName/operator
+    are required on every filter regardless of operator); and a filter
+    whose propertyName/operator is present but blank or non-string (the
+    check only tested truthiness at first, so whitespace and non-string
+    truthy values slipped through)."""
     mock_request = Mock()
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
 
     result = json.loads(
         hubspot.hubspot_search_contacts(
-            filter_groups_json=json.dumps([{"filters": []}])
-        )
-    )
-
-    assert result["status"] == "error"
-    assert "filter_groups_json" in result["message"]
-    mock_request.assert_not_called()
-
-
-def test_search_contacts_rejects_a_non_empty_filters_list_of_empty_filters(
-    monkeypatch,
-):
-    """Regression: the previous round's fix only checked the filters LIST
-    was non-empty, not that its individual filter objects were meaningful -
-    filter_groups_json='[{"filters": [{}]}]' is a non-empty list containing
-    one filter with neither propertyName nor operator, the same "matches
-    everything" hole one level deeper. Verified against HubSpot's CRM
-    Search API docs: propertyName and operator are required on every
-    filter regardless of operator type."""
-    mock_request = Mock()
-    monkeypatch.setattr(hubspot.requests, "request", mock_request)
-
-    result = json.loads(
-        hubspot.hubspot_search_contacts(
-            filter_groups_json=json.dumps([{"filters": [{}]}])
-        )
-    )
-
-    assert result["status"] == "error"
-    assert "filter_groups_json" in result["message"]
-    mock_request.assert_not_called()
-
-
-def test_search_contacts_rejects_a_filters_list_of_non_dict_entries(monkeypatch):
-    """filter_groups_json='[{"filters": ["dealstage"]}]' - a non-empty list
-    of strings rather than filter objects - must be rejected locally
-    instead of reaching HubSpot for an opaque 400."""
-    mock_request = Mock()
-    monkeypatch.setattr(hubspot.requests, "request", mock_request)
-
-    result = json.loads(
-        hubspot.hubspot_search_contacts(
-            filter_groups_json=json.dumps([{"filters": ["dealstage"]}])
-        )
-    )
-
-    assert result["status"] == "error"
-    assert "filter_groups_json" in result["message"]
-    mock_request.assert_not_called()
-
-
-def test_search_contacts_rejects_a_filter_missing_property_name_or_operator(
-    monkeypatch,
-):
-    mock_request = Mock()
-    monkeypatch.setattr(hubspot.requests, "request", mock_request)
-
-    result = json.loads(
-        hubspot.hubspot_search_contacts(
-            filter_groups_json=json.dumps(
-                [{"filters": [{"propertyName": "dealstage"}]}]
-            )
+            filter_groups_json=json.dumps(bad_filter_groups)
         )
     )
 

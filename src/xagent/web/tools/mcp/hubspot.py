@@ -165,7 +165,12 @@ def _paged_list(
     """
     result = _request("GET", path, params=params)
     next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
-    items = project(result.get("results", []))
+    # result.get("results", []) only substitutes the default when the key
+    # is ABSENT, not when HubSpot returns it as an explicit JSON null (key
+    # present, value None) - `or []` catches that too, so every caller of
+    # this function (including one with no custom `project`, which would
+    # otherwise pass None straight through) gets a list either way.
+    items = project(result.get("results") or [])
 
     max_output_length = get_tool_max_output_length()
     truncated = False
@@ -363,10 +368,11 @@ def _is_valid_filter(filter_: Any) -> bool:
     deliberately NOT checked here, to avoid rejecting a legitimate filter
     that has no value field by design.
     """
-    return (
-        isinstance(filter_, dict)
-        and bool(filter_.get("propertyName"))
-        and bool(filter_.get("operator"))
+    if not isinstance(filter_, dict):
+        return False
+    return all(
+        isinstance(filter_.get(field), str) and filter_[field].strip()
+        for field in ("propertyName", "operator")
     )
 
 
@@ -433,7 +439,7 @@ def _search(
         )
     body: dict[str, Any] = {
         "properties": properties,
-        "limit": max(1, min(limit, 100)),
+        "limit": _clamp_limit(limit, max_limit=100),
     }
     if query:
         body["query"] = query
@@ -461,9 +467,14 @@ def hubspot_search_contacts(
     array, e.g. '[{"filters": [{"propertyName": "createdate", "operator":
     "GTE", "value": "2026-09-01"}]}]' - filters within one group are ANDed,
     and groups are ORed. See HubSpot's CRM search API docs for the full set
-    of operators (EQ, GTE, LTE, CONTAINS_TOKEN, ...). To list every contact
-    with no query or filter at all, use hubspot_list_contacts instead - it's
-    the more direct tool for that and doesn't need an empty search body.
+    of operators (EQ, GTE, LTE, CONTAINS_TOKEN, ...). Every group needs a
+    non-empty "filters" list, and every filter needs a non-blank
+    "propertyName" and "operator" (the two fields HubSpot requires
+    regardless of operator - "value"/"values"/"highValue" are
+    operator-dependent, e.g. HAS_PROPERTY needs none of them). To list
+    every contact with no query or filter at all, use hubspot_list_contacts
+    instead - it's the more direct tool for that and doesn't need an empty
+    search body.
     """
     try:
         found = _search(
@@ -619,7 +630,7 @@ def _get_associated_deals(
     """
     deal_ids, next_after = _list_association_ids(
         f"/crm/v3/objects/{object_type}/{object_id}/associations/deals",
-        max(1, min(limit, 100)),
+        _clamp_limit(limit, max_limit=100),
         after,
     )
     if not deal_ids:
@@ -979,7 +990,7 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
         contact_id = _url_path_id(contact_id, "contact_id")
         note_ids, next_after = _list_association_ids(
             f"/crm/v3/objects/contacts/{contact_id}/associations/notes",
-            max(1, min(limit, 100)),
+            _clamp_limit(limit, max_limit=100),
         )
         if not note_ids:
             return _success(notes=[], has_more=bool(next_after))
@@ -993,10 +1004,7 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
             },
         )
         return _success(
-            notes=[
-                {"id": item.get("id"), "properties": item.get("properties", {})}
-                for item in notes.get("results", [])
-            ],
+            notes=_project_id_and_properties(notes.get("results") or []),
             has_more=bool(next_after),
         )
     except Exception as e:
@@ -1097,7 +1105,7 @@ def hubspot_list_forms(limit: int = 20, after: str | None = None) -> str:
     specific form.
     """
     try:
-        params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        params: dict[str, Any] = {"limit": _clamp_limit(limit, max_limit=100)}
         if after:
             params["after"] = after
         return _paged_list(
@@ -1127,7 +1135,7 @@ def hubspot_get_form_submissions(
     """
     try:
         form_id = _url_path_id(form_id, "form_id")
-        params: dict[str, Any] = {"limit": max(1, min(limit, 50))}
+        params: dict[str, Any] = {"limit": _clamp_limit(limit, max_limit=50)}
         if after:
             params["after"] = after
         return _paged_list(
@@ -1216,7 +1224,7 @@ def hubspot_list_marketing_emails(limit: int = 20, after: str | None = None) -> 
     works for every other tool.
     """
     try:
-        params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        params: dict[str, Any] = {"limit": _clamp_limit(limit, max_limit=100)}
         if after:
             params["after"] = after
         return _paged_list(
@@ -1304,7 +1312,7 @@ def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
     """
     try:
         params: dict[str, Any] = {
-            "limit": max(1, min(limit, 100)),
+            "limit": _clamp_limit(limit, max_limit=100),
             "properties": ",".join(DEFAULT_CAMPAIGN_PROPERTIES),
         }
         if after:
@@ -1314,11 +1322,7 @@ def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
             "campaigns",
             params=params,
             after=after,
-            project=lambda items: [
-                {"id": item.get("id"), "properties": item.get("properties", {})}
-                for item in items
-                if isinstance(item, dict)
-            ],
+            project=_project_id_and_properties,
         )
     except Exception as e:
         logger.error(f"Error listing campaigns: {e}")

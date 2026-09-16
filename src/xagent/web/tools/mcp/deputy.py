@@ -367,7 +367,7 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
         return _error(str(e))
 
 
-@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
 def deputy_update_resource(
     resource: str, resource_id: str, data: dict[str, Any]
 ) -> str:

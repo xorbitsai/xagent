@@ -705,6 +705,39 @@ def test_update_resource_rejects_invalid_ids_without_raising(
 
 
 # ---------------------------------------------------------------------------
+# deputy_create_resource / deputy_update_resource tool annotations
+# ---------------------------------------------------------------------------
+
+
+def test_create_resource_is_annotated_as_non_idempotent_write():
+    """deputy_create_resource must declare idempotentHint=False so the
+    ReAct duplicate-write guard (classify_non_idempotent_write) enrolls it
+    -- a retried create on a timeout/connection error is not safe to
+    silently repeat. A future accidental edit that swaps this tool's
+    annotations with deputy_update_resource's (or drops them) would
+    otherwise leave create unprotected without any test catching it."""
+    tool = deputy.mcp._tool_manager.get_tool("deputy_create_resource")
+
+    assert tool.annotations is not None
+    assert tool.annotations.idempotentHint is False
+    assert tool.annotations.destructiveHint is False
+
+
+def test_update_resource_is_annotated_as_idempotent_destructive_write():
+    """deputy_update_resource must declare idempotentHint=True (repeating
+    the same update has no additional effect, so it's safe to retry and
+    must NOT be enrolled in the duplicate-write guard) and
+    destructiveHint=True (it overwrites existing field values -- e.g.
+    deactivating an employee or rewriting a timesheet -- so it is not a
+    purely additive write like create)."""
+    tool = deputy.mcp._tool_manager.get_tool("deputy_update_resource")
+
+    assert tool.annotations is not None
+    assert tool.annotations.idempotentHint is True
+    assert tool.annotations.destructiveHint is True
+
+
+# ---------------------------------------------------------------------------
 # _success_with_capped_list
 # ---------------------------------------------------------------------------
 

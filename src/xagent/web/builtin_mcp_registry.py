@@ -789,6 +789,49 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "whatsapp",
+            "name": "WhatsApp Business",
+            "description": "Connect to the WhatsApp Business Platform to discover business accounts and phone numbers, browse message templates, and send text, template, and media messages to customers.",
+            "icon": "https://www.google.com/s2/favicons?domain=whatsapp.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "meta",
+            "category": "Communication",
+            # business_management is what lets /me/businesses enumerate the
+            # user's businesses -- the only route from a user token to their
+            # WhatsApp Business Accounts (WABAs) and, under those, the phone
+            # numbers messages are sent from. The two whatsapp_* scopes cover
+            # reading WABA assets/templates and sending messages respectively.
+            "oauth_scopes": [
+                "business_management",
+                "whatsapp_business_management",
+                "whatsapp_business_messaging",
+            ],
+            # Visible like the facebook/instagram rows above. Note the
+            # whatsapp_* scopes need Advanced Access on the Meta app before
+            # users outside the app's roles (admin/developer/tester) can
+            # grant them; until then the OAuth dialog simply won't offer them.
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.whatsapp"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+                # Stable ownership marker used by the seed migration, same
+                # mechanism the shopify row further below adopts. It is intentionally
+                # inside launch_config because current main has no dedicated
+                # catalog-provenance column; a pre-existing custom app_id
+                # "whatsapp" (created via POST /admin/mcp/apps before this
+                # migration ran) lacks this marker, so the builtin execution
+                # overlay (_matches_builtin_provenance) leaves it alone as
+                # the operator's own row instead of silently reinterpreting
+                # it as the Meta OAuth connector.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "whatsapp",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "zoom",
             "name": "Zoom",
             "description": "Connect to Zoom to look up meetings, and read cloud recordings and transcripts.",

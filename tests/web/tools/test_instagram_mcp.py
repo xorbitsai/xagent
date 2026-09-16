@@ -49,7 +49,6 @@ def test_auth_status_uses_injected_meta_token(monkeypatch):
             "Accept": "application/json",
         },
         params={"fields": "id,name,email"},
-        data=None,
         timeout=30,
     )
 
@@ -164,7 +163,6 @@ def test_get_profile_reads_selected_instagram_account(monkeypatch):
                 "follows_count,media_count,website"
             )
         },
-        data=None,
         timeout=30,
     )
 

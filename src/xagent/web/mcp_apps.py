@@ -54,8 +54,15 @@ from .models.public_mcp import PublicMCPApp
 # the meta provider's default_scopes and is brand new (no pre-existing bare
 # "meta" grant could ever have carried it), so a bare connect must never be
 # treated as satisfying it.
+#
+# whatsapp: same reasoning as facebook -- none of its scopes
+# (business_management, whatsapp_business_management,
+# whatsapp_business_messaging) is part of the meta provider's
+# default_scopes, and the connector is brand new (no pre-existing bare
+# "meta" grant could ever have carried them), so a bare connect must never
+# be treated as satisfying it.
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
-    {"facebook", "github", "myob", "meta-ads"}
+    {"facebook", "github", "myob", "meta-ads", "whatsapp"}
 )
 
 

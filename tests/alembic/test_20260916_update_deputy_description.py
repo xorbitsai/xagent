@@ -249,3 +249,13 @@ def test_migration_fields_match_registry():
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "deputy"
     )
     assert registry_row["description"] == migration.CURRENT_DESCRIPTION
+
+
+def test_down_revision_matches_current_head():
+    """Pin down_revision to the confirmed true head as of this branch's
+    last rebase onto upstream/main, so a future migration insertion
+    between them would be caught here rather than only surfacing as a
+    confusing multiple-heads error from `alembic heads`."""
+    migration = _load_migration_module()
+
+    assert migration.down_revision == "20260909_seed_whatsapp_mcp_app"

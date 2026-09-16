@@ -78,7 +78,7 @@ def _deputy_app_row() -> dict[str, object]:
     return {
         "app_id": APP_ID,
         "name": "Deputy",
-        "description": "Connect to Deputy to look up employees, view rosters/shifts, read timesheets, and create or update records such as employees, rosters, timesheets, and leave.",
+        "description": "Connect to Deputy to look up employees, view rosters/shifts, read timesheets, and create or update records such as employees, rosters, timesheets, and leave. Deputy has no granular OAuth scopes -- reads and writes run at whatever permission level the connected account has in Deputy.",
         "icon": "https://www.google.com/s2/favicons?domain=deputy.com&sz=128",
         "transport": "oauth",
         "provider_name": "deputy",
@@ -165,12 +165,25 @@ def downgrade() -> None:
         # _BUILTIN_PROTECTED_FIELDS blocks a PATCH from changing
         # oauth_scopes/launch_config away from the built-in registry's
         # values while this app_id stays registered as built-in, but
-        # description/is_visible_in_connector are freely PATCHable today,
-        # and a raw DB edit (or the app_id later being dropped from the
-        # built-in registry while this row persists) could diverge any of
-        # them -- so every one of this row's non-env-dependent columns is
+        # is_visible_in_connector is freely PATCHable today, and a raw DB
+        # edit (or the app_id later being dropped from the built-in
+        # registry while this row persists) could diverge any of them --
+        # so every one of this row's non-env-dependent columns is
         # compared, not just the always-PATCHable few. In Python, see
         # _row_matches_seeded_shape's docstring for why not in SQL.
+        #
+        # description is deliberately excluded from this set (unlike the
+        # other freely-PATCHable field, is_visible_in_connector): dedicated
+        # migrations like 20260916_update_deputy_description.py backfill it
+        # forward on already-seeded rows, and _deputy_app_row()["description"]
+        # here is kept equal to the *current* registry value (for
+        # test_seed_rows_match_registry's sake), not the value this
+        # migration originally seeded. On a full downgrade, 20260916's own
+        # downgrade() reverts the row's description to the *old* text
+        # before this migration's downgrade() ever runs -- comparing
+        # against the current description here would then never match,
+        # silently orphaning the row instead of removing it (reported in
+        # PR #2449's review).
         app_row = bind.execute(
             sa.select(PUBLIC_MCP_APPS_TABLE).where(
                 PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
@@ -181,7 +194,6 @@ def downgrade() -> None:
             _deputy_app_row(),
             {
                 "name",
-                "description",
                 "icon",
                 "transport",
                 "provider_name",

@@ -648,7 +648,7 @@ def test_update_resource_rejects_empty_data_without_calling_api(monkeypatch):
     result = json.loads(deputy.deputy_update_resource("Employee", "123", {}))
 
     assert result["status"] == "error"
-    assert "No fields provided" in result["message"]
+    assert "No data provided" in result["message"]
     mock_request.assert_not_called()
 
 

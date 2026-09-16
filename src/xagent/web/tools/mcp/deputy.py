@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
@@ -42,6 +43,23 @@ def _success(**payload: Any) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _record_response(context: str, result: Any, *, field_name: str = "record") -> str:
+    """Wrap a single dict-shaped Deputy API response, or an error if it
+    isn't one. Shared by every tool that expects exactly one record back
+    (deputy_get_current_user's "/me", deputy_get_resource's/
+    deputy_create_resource's/deputy_update_resource's {resource}), which
+    otherwise repeat this same isinstance-check-then-cap shape verbatim.
+
+    ``context`` is the resource name (or "/me") to name in the error
+    message on a malformed response -- not necessarily the same string as
+    ``field_name``, which is the JSON key the record is nested under on
+    success.
+    """
+    if not isinstance(result, dict):
+        return _error(f"Deputy returned an unexpected response for {context}")
+    return success_with_capped_dict(field_name, result)
 
 
 def _success_with_capped_list(
@@ -205,9 +223,7 @@ def deputy_get_current_user() -> str:
     """
     try:
         result = _request("GET", "/me")
-        if not isinstance(result, dict):
-            return _error("Deputy returned an unexpected response for /me")
-        return success_with_capped_dict("user", result)
+        return _record_response("/me", result, field_name="user")
     except Exception as e:
         logger.error(f"Error fetching authenticated Deputy user: {e}", exc_info=True)
         return _error(str(e))
@@ -266,9 +282,7 @@ def deputy_get_resource(resource: str, resource_id: str) -> str:
         safe_resource = url_path_id(resource, "resource")
         safe_resource_id = url_path_id(resource_id, "resource_id")
         result = _request("GET", f"/resource/{safe_resource}/{safe_resource_id}")
-        if not isinstance(result, dict):
-            return _error(f"Deputy returned an unexpected response for {resource}")
-        return success_with_capped_dict("record", result)
+        return _record_response(resource, result)
     except Exception as e:
         logger.error(
             f"Error fetching Deputy {resource} record {resource_id}: {e}",
@@ -326,7 +340,7 @@ def deputy_query_resource(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
 def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     """
     Create a new record (POST /resource/{resource}).
@@ -334,23 +348,26 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     "Timesheet", or "Leave".
     data: field name -> value pairs for the new record, e.g. {"FirstName":
     "Peter", "LastName": "Parker", "Email": "peter.parker@example.com"}.
-    Use deputy_get_resource on an existing record of the same type first to
-    learn which field names Deputy expects.
+    Use deputy_list_resource or deputy_query_resource on an existing record
+    of the same type first to learn which field names Deputy expects --
+    deputy_get_resource needs an id, which isn't available yet when
+    creating the first record of a type.
+    This is not idempotent: retrying after a timeout or connection error
+    can create a duplicate record. Use deputy_query_resource to check
+    whether the record already exists before retrying a failed call.
     """
     try:
         if not data:
             return _error("No data provided to create record")
         safe_resource = url_path_id(resource, "resource")
         result = _request("POST", f"/resource/{safe_resource}", json_data=data)
-        if not isinstance(result, dict):
-            return _error(f"Deputy returned an unexpected response for {resource}")
-        return success_with_capped_dict("record", result)
+        return _record_response(resource, result)
     except Exception as e:
         logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
 def deputy_update_resource(
     resource: str, resource_id: str, data: dict[str, Any]
 ) -> str:
@@ -365,15 +382,13 @@ def deputy_update_resource(
     """
     try:
         if not data:
-            return _error("No fields provided to update")
+            return _error("No data provided to update")
         safe_resource = url_path_id(resource, "resource")
         safe_resource_id = url_path_id(resource_id, "resource_id")
         result = _request(
             "POST", f"/resource/{safe_resource}/{safe_resource_id}", json_data=data
         )
-        if not isinstance(result, dict):
-            return _error(f"Deputy returned an unexpected response for {resource}")
-        return success_with_capped_dict("record", result)
+        return _record_response(resource, result)
     except Exception as e:
         logger.error(
             f"Error updating Deputy {resource} record {resource_id}: {e}",

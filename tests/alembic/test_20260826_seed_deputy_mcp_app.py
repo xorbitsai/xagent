@@ -281,6 +281,50 @@ def test_downgrade_preserves_provider_row_admin_edited_beyond_structural_fields(
         assert "deputy" in _provider_names(connection)
 
 
+def test_full_upgrade_downgrade_chain_with_description_migration_removes_row(
+    tmp_path,
+):
+    """Regression test for a full `alembic upgrade head` followed by a full
+    downgrade past this migration, with 20260916_update_deputy_description.py
+    in between (as it is on the real revision chain).
+
+    20260916's own downgrade() runs *before* this migration's downgrade()
+    (later migrations unwind first), reverting the row's description back
+    to the pre-write-tools text. If this migration's downgrade() guard
+    still compared "description" against _deputy_app_row()'s *current*
+    text, that comparison would never match at that point, and the delete
+    would be silently skipped -- orphaning the public_mcp_apps/
+    oauth_providers rows instead of removing them. See PR #2449 review.
+    """
+    description_migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260916_update_deputy_description.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "update_deputy_description_migration", description_migration_file
+    )
+    description_migration = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(description_migration)
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        ops = _operations(connection)
+        with (
+            patch.object(migration, "op", ops),
+            patch.object(description_migration, "op", ops),
+        ):
+            migration.upgrade()
+            description_migration.upgrade()
+            description_migration.downgrade()
+            migration.downgrade()
+
+        assert "deputy" not in _app_ids(connection)
+        assert "deputy" not in _provider_names(connection)
+
+
 def test_upgrade_and_downgrade_no_op_without_tables(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

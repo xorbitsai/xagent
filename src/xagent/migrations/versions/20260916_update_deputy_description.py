@@ -31,7 +31,9 @@ PREVIOUS_DESCRIPTION = (
 CURRENT_DESCRIPTION = (
     "Connect to Deputy to look up employees, view rosters/shifts, read "
     "timesheets, and create or update records such as employees, rosters, "
-    "timesheets, and leave."
+    "timesheets, and leave. Deputy has no granular OAuth scopes -- reads and "
+    "writes run at whatever permission level the connected account has in "
+    "Deputy."
 )
 
 

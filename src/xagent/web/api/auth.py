@@ -2330,8 +2330,11 @@ def _revoke_github_oauth_grant(
     expected "reconnect always re-prompts" behavior.
 
     Never raises: this runs after the local disconnect has already
-    committed, so a dead token (404), a scope/param GitHub rejects (422), or
-    GitHub being unreachable must not surface as a failed disconnect.
+    committed, so a dead token (404), an unreachable GitHub, or literally
+    anything else going wrong here must not surface as a failed disconnect
+    -- every caller up the chain (revoke_resolved_github_oauth_grant,
+    revoke_builtin_oauth_grant_if_unreferenced, revoke_builtin_oauth_grant)
+    documents that same guarantee and depends on it holding here at the leaf.
     """
     try:
         response = requests.delete(
@@ -2341,12 +2344,15 @@ def _revoke_github_oauth_grant(
             headers={"Accept": "application/vnd.github+json"},
             timeout=10,
         )
-    except requests.RequestException as exc:
-        # Not exc_info=True: the client_id above is embedded directly in the
-        # request URL, so a ConnectionError/Timeout's own str() -- which
-        # exc_info=True's traceback rendering includes -- would put it in
-        # the log. Same reasoning, same fix, as mcp.py's own provider
-        # revocation logging (exception_type only, never the full traceback).
+    except Exception as exc:
+        # Broad except, not just requests.RequestException: "never raises"
+        # above is a real contract other functions rely on, not just a
+        # description of the common case. Not exc_info=True either way: the
+        # client_id above is embedded directly in the request URL, so a
+        # ConnectionError/Timeout's own str() -- which exc_info=True's
+        # traceback rendering includes -- would put it in the log. Same
+        # reasoning, same fix, as mcp.py's own provider revocation logging
+        # (exception_type only, never the full traceback).
         logger.warning(
             "GitHub OAuth grant revocation request failed (exception_type=%s)",
             type(exc).__name__,
@@ -2409,6 +2415,10 @@ def resolve_builtin_oauth_revocation(
         .one_or_none()
     )
     if not db_provider:
+        logger.warning(
+            "Skipping GitHub OAuth grant revocation: no github OAuthProvider "
+            "row is configured"
+        )
         return None
     # oauth_providers.client_id/client_secret are stored encrypted (or left
     # blank to fall back to the GITHUB_CLIENT_ID/SECRET env vars) -- same
@@ -2421,6 +2431,15 @@ def resolve_builtin_oauth_revocation(
         "github", cast(Any, db_provider.client_secret), "CLIENT_SECRET"
     )
     if not client_id or not client_secret:
+        # Every other skip reason here logs (missing provider row above,
+        # unreachable/failing GitHub in _revoke_github_oauth_grant) -- silence
+        # here would hide a real misconfiguration (e.g. only one of
+        # GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET set) behind an
+        # indistinguishable "disconnect worked" outcome.
+        logger.warning(
+            "Skipping GitHub OAuth grant revocation: client_id/client_secret "
+            "could not be resolved"
+        )
         return None
     return BuiltinOAuthRevocation(
         access_token, client_id, client_secret, provider_user_id
@@ -2456,6 +2475,17 @@ def has_other_builtin_oauth_reference(
     other reference" so the caller still revokes, matching this function's
     behavior before this reference check existed, rather than silently
     disabling revocation for such a provider.
+
+    Synchronous ORM work on ``db``: an async caller must run this directly
+    on the event loop (this module's normal, always-safe pattern for a
+    single fast query -- see the many un-offloaded ``db.query(...)`` calls
+    throughout mcp.py's own disconnect handlers), never inside
+    ``asyncio.to_thread`` with a request-scoped session it doesn't own. A
+    thread-offloaded operation on ``db`` must create and close its own
+    Session in the worker thread instead (see
+    ``services.db_runtime.run_db_io_cancellation_safe``'s own docstring for
+    why: a cancelled request's ``db.close()`` can otherwise race a worker
+    thread still mid-query on that same Session).
     """
     if not provider_user_id:
         return False
@@ -2475,15 +2505,19 @@ def revoke_resolved_github_oauth_grant(
 ) -> None:
     """Public, database-free entry point for one resolved revoke triple.
 
-    Lets a caller resolve credentials (resolve_builtin_oauth_revocation)
-    while still holding its transaction's locks, then run this pure network
-    call afterward -- typically off a thread, since it blocks on I/O. Never
-    raises (see :func:`_revoke_github_oauth_grant`).
+    Touches no Session and no shared state, so it's always safe to run
+    inside ``asyncio.to_thread`` regardless of what owns the caller's
+    database session. Never raises (see :func:`_revoke_github_oauth_grant`).
 
     Does not itself check :func:`has_other_builtin_oauth_reference` --
-    callers that resolved a full :class:`BuiltinOAuthRevocation` should call
-    :func:`revoke_builtin_oauth_grant_if_unreferenced` instead so that check
-    always runs immediately before this one does.
+    every caller must have already confirmed that check passed. A
+    synchronous/off-event-loop caller should call
+    :func:`revoke_builtin_oauth_grant_if_unreferenced` instead, which does
+    both in one call; an async caller on the event loop should call
+    :func:`has_other_builtin_oauth_reference` directly (never via
+    ``asyncio.to_thread`` -- see that function's own docstring) and only
+    offload this pure network call, exactly like mcp.py's two disconnect
+    paths do.
     """
     _revoke_github_oauth_grant(access_token, client_id, client_secret)
 
@@ -2498,14 +2532,36 @@ def revoke_builtin_oauth_grant_if_unreferenced(
     Must run strictly after the disconnect that produced ``revocation`` has
     committed: the reference check is a fresh read of current ``UserOAuth``
     rows (see :func:`has_other_builtin_oauth_reference` for exactly what
-    that does and does not make safe). Never raises.
+    that does and does not make safe). Never raises: unlike
+    :func:`revoke_resolved_github_oauth_grant`, the reference check here
+    does real database work that can fail (a dropped connection, a pool
+    timeout), and this function -- not just its network-only half --
+    promises never to raise, so that failure is caught here too, rolling
+    the session back first so a caller that keeps using ``db`` afterward
+    doesn't inherit a transaction Postgres has already poisoned.
+
+    For a fully synchronous caller only (Toby's disconnect path, via
+    :func:`revoke_builtin_oauth_grant`, and this module's own tests): the
+    Session it does real query work on is ``db``, the caller's own, on
+    whatever thread the caller itself is already running on. An async
+    caller must NOT hand this whole function to ``asyncio.to_thread`` with
+    its request-scoped session -- see :func:`has_other_builtin_oauth_reference`
+    and :func:`revoke_resolved_github_oauth_grant` for the safe async shape.
     """
-    if has_other_builtin_oauth_reference(
-        db, provider="github", provider_user_id=revocation.provider_user_id
-    ):
-        logger.info(
-            "Skipping GitHub OAuth grant revocation: another local "
-            "connection still references this account"
+    try:
+        if has_other_builtin_oauth_reference(
+            db, provider="github", provider_user_id=revocation.provider_user_id
+        ):
+            logger.info(
+                "Skipping GitHub OAuth grant revocation: another local "
+                "connection still references this account"
+            )
+            return
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "GitHub OAuth grant reference check failed (exception_type=%s)",
+            type(exc).__name__,
         )
         return
     revoke_resolved_github_oauth_grant(

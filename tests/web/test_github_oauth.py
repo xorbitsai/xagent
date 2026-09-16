@@ -1554,6 +1554,58 @@ def test_resolve_builtin_oauth_revocation_is_none_when_nothing_to_revoke(db_sess
     )  # no OAuthProvider row seeded yet
 
 
+def test_resolve_builtin_oauth_revocation_warns_on_missing_provider_row(
+    db_session, monkeypatch
+):
+    """Every other skip reason logs (a network failure, an unexpected
+    status, a still-referenced sibling); silence here would hide a real
+    misconfiguration (the connector was never set up) behind an
+    indistinguishable "disconnect worked cleanly" outcome."""
+    db, _user = db_session
+    warning = Mock()
+    monkeypatch.setattr(auth_api.logger, "warning", warning)
+
+    auth_api.resolve_builtin_oauth_revocation(
+        db, provider="github", access_token="tok", provider_user_id="42"
+    )
+
+    warning.assert_called_once()
+
+
+def test_resolve_builtin_oauth_revocation_warns_on_unresolvable_secret(
+    db_session, monkeypatch
+):
+    """Same reasoning as the missing-provider-row case, for a
+    partially-configured provider row (e.g. only one of
+    GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET set)."""
+    db, _user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="github",
+            name="GitHub",
+            client_id="",
+            client_secret="",
+            auth_url="https://github.com/login/oauth/authorize",
+            token_url="https://github.com/login/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/github/callback",
+            userinfo_url="https://api.github.com/user",
+            user_id_path="id",
+            email_path="login",
+            default_scopes=["read:user"],
+        )
+    )
+    db.commit()
+    warning = Mock()
+    monkeypatch.setattr(auth_api.logger, "warning", warning)
+
+    result = auth_api.resolve_builtin_oauth_revocation(
+        db, provider="github", access_token="tok", provider_user_id="42"
+    )
+
+    assert result is None
+    warning.assert_called_once()
+
+
 def test_has_other_builtin_oauth_reference_true_for_a_live_sibling_row(db_session):
     """Any current row -- any user, any owner namespace -- sharing the same
     upstream (provider, provider_user_id) counts as a live reference."""
@@ -1671,3 +1723,49 @@ def test_revoke_builtin_oauth_grant_if_unreferenced_revokes_without_a_sibling(
     )
 
     delete.assert_called_once()
+
+
+def test_revoke_builtin_oauth_grant_if_unreferenced_rolls_back_a_failed_check():
+    """The reference check does real database work, unlike the pure network
+    call -- unlike revoke_resolved_github_oauth_grant, this function's own
+    "Never raises" promise depends on catching that failure itself, and on
+    rolling the session back first so a poisoned Postgres transaction
+    doesn't leak into whatever the caller does with `db` next."""
+
+    class FakeDB:
+        def __init__(self):
+            self.rolled_back = False
+
+        def query(self, *args, **kwargs):
+            raise RuntimeError("connection dropped")
+
+        def rollback(self):
+            self.rolled_back = True
+
+    db = FakeDB()
+
+    # Must not raise.
+    auth_api.revoke_builtin_oauth_grant_if_unreferenced(
+        db,
+        auth_api.BuiltinOAuthRevocation(
+            access_token="tok",
+            client_id="cid",
+            client_secret="secret",
+            provider_user_id="42",
+        ),
+    )
+
+    assert db.rolled_back is True
+
+
+def test_revoke_resolved_github_oauth_grant_swallows_a_non_request_exception(
+    monkeypatch,
+):
+    """ "Never raises" is a real contract other functions depend on, not
+    just a description of the common (requests.RequestException) case --
+    any exception from the network call must be swallowed the same way."""
+    monkeypatch.setattr(
+        auth_api.requests, "delete", Mock(side_effect=RuntimeError("boom"))
+    )
+
+    auth_api.revoke_resolved_github_oauth_grant("tok", "cid", "secret")

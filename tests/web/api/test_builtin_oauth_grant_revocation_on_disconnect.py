@@ -138,6 +138,43 @@ async def test_delete_mcp_server_revokes_the_github_grant(db, monkeypatch):
     _assert_github_grant_was_revoked(delete)
 
 
+async def test_delete_mcp_server_skips_revocation_with_a_live_sibling(db, monkeypatch):
+    """The end-to-end regression for the sibling-reference finding: a
+    second XAgent user connected to the same upstream GitHub account keeps
+    working after the first user disconnects. Exercised through the real
+    disconnect endpoint and the real _snapshot_builtin_oauth_revocations ->
+    has_other_builtin_oauth_reference path, not a hand-built
+    BuiltinOAuthRevocation -- a wiring bug that drops or miswires
+    provider_user_id anywhere along that path would go undetected by a
+    test built the other way."""
+    from xagent.web.api.mcp import delete_mcp_server
+
+    user, server, _user_mcp = _connected_github_server(db)
+    other_user = User(username="bob", password_hash="h", is_admin=False)
+    db.add(other_user)
+    db.flush()
+    db.add(
+        UserOAuth(
+            user_id=other_user.id,
+            provider="github",
+            provider_user_id="42",
+            access_token="bobs-still-live-token",
+        )
+    )
+    db.commit()
+
+    delete = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    await delete_mcp_server(server_id=int(server.id), current_user=user, db=db)
+
+    # The disconnecting user's own row is gone -- disconnect still worked --
+    # but GitHub was never called, so bob's still-live token survives.
+    assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
+    assert db.query(UserOAuth).filter(UserOAuth.user_id == other_user.id).count() == 1
+    delete.assert_not_called()
+
+
 async def test_delete_mcp_server_disconnect_survives_a_revoke_failure(db, monkeypatch):
     """A dead network to GitHub must not turn an otherwise-successful
     disconnect into a failed request."""
@@ -195,3 +232,42 @@ async def test_teardown_mcp_app_server_revokes_the_github_grant(
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
     _assert_github_grant_was_revoked(delete)
+
+
+async def test_teardown_mcp_app_server_skips_revocation_with_a_live_sibling(
+    teardown_db, monkeypatch
+):
+    from xagent.web.api.mcp import teardown_mcp_app_server
+
+    db = teardown_db
+    user, server, user_mcp = _connected_github_server(db)
+    other_user = User(username="bob", password_hash="h", is_admin=False)
+    db.add(other_user)
+    db.flush()
+    db.add(
+        UserOAuth(
+            user_id=other_user.id,
+            provider="github",
+            provider_user_id="42",
+            access_token="bobs-still-live-token",
+        )
+    )
+    db.commit()
+    app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "github").one()
+
+    delete = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    await teardown_mcp_app_server(
+        int(server.id),
+        app_id="github",
+        expected_provider_name="github",
+        expected_catalog_generation=app.generation,
+        expected_association_generation=user_mcp.lifecycle_generation,
+        current_user=user,
+        db=db,
+    )
+
+    assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
+    assert db.query(UserOAuth).filter(UserOAuth.user_id == other_user.id).count() == 1
+    delete.assert_not_called()

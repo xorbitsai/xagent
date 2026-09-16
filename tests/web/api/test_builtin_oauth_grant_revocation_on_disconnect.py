@@ -1,13 +1,14 @@
-"""Revoking a builtin OAuth grant when a GitHub-backed MCP server is
-disconnected through the generic connector endpoints.
+"""Revoking a builtin OAuth grant when a GitHub-backed connection is
+disconnected through any of the generic connector endpoints.
 
 Disconnecting only deletes the local ``UserOAuth`` row; GitHub's own grant
 stays alive unless something also calls its revoke API, which is exactly
 what lets a reconnect silently skip GitHub's consent screen (see
 auth.py's ``resolve_builtin_oauth_revocation`` /
-``revoke_resolved_github_oauth_grant``). This pins that *both* generic
-disconnect endpoints call it -- ``delete_mcp_server`` and the app-scoped
-``teardown_mcp_app_server`` -- not just Toby's own personal-connector
+``revoke_builtin_oauth_grants``). This pins that *every* generic disconnect
+endpoint calls it -- ``delete_mcp_server`` and the app-scoped
+``teardown_mcp_app_server`` in mcp.py, and cloud_storage.py's
+``delete_connected_account`` -- not just Toby's own personal-connector
 disconnect path (covered separately in ``xagent-saas``'s own test suite).
 """
 
@@ -271,3 +272,177 @@ async def test_teardown_mcp_app_server_skips_revocation_with_a_live_sibling(
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
     assert db.query(UserOAuth).filter(UserOAuth.user_id == other_user.id).count() == 1
     delete.assert_not_called()
+
+
+async def test_teardown_mcp_app_server_disconnect_survives_a_revoke_failure(
+    teardown_db, monkeypatch
+):
+    """A dead network to GitHub must not turn an otherwise-successful
+    teardown into a failed request -- the sibling case to
+    test_delete_mcp_server_disconnect_survives_a_revoke_failure, which only
+    covered delete_mcp_server's copy of this except/rollback block."""
+    from xagent.web.api.mcp import teardown_mcp_app_server
+
+    db = teardown_db
+    user, server, user_mcp = _connected_github_server(db)
+    app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "github").one()
+    monkeypatch.setattr(
+        auth_api.requests,
+        "delete",
+        Mock(side_effect=auth_api.requests.ConnectionError("network down")),
+    )
+
+    await teardown_mcp_app_server(
+        int(server.id),
+        app_id="github",
+        expected_provider_name="github",
+        expected_catalog_generation=app.generation,
+        expected_association_generation=user_mcp.lifecycle_generation,
+        current_user=user,
+        db=db,
+    )
+
+    assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
+
+
+async def test_snapshot_builtin_oauth_revocations_captures_every_matching_row(db):
+    """The core claim the whole feature rests on: the snapshot must read
+    *every* matching row before the bulk delete removes them, not just the
+    first one -- delete_scoped_user_oauth_accounts is a single SQL
+    statement with no per-row callback, so a snapshot that only captured
+    one row would silently lose the others' tokens with no error."""
+    from xagent.web.api.mcp import _snapshot_builtin_oauth_revocations
+
+    user = User(username="multi-github", password_hash="h", is_admin=False)
+    db.add(user)
+    _seed_github_catalog_and_provider(db)
+    db.commit()
+    db.refresh(user)
+
+    # Two distinct GitHub identities connected under one XAgent user --
+    # unusual, but nothing in the schema prevents it (the ordinary-row
+    # uniqueness index is on (user_id, provider, provider_user_id), so two
+    # different provider_user_id values are two legal rows).
+    db.add(
+        UserOAuth(
+            user_id=int(user.id),
+            provider="github",
+            provider_user_id="42",
+            access_token="first-account-token",
+        )
+    )
+    db.add(
+        UserOAuth(
+            user_id=int(user.id),
+            provider="github",
+            provider_user_id="43",
+            access_token="second-account-token",
+        )
+    )
+    db.commit()
+
+    resolved = _snapshot_builtin_oauth_revocations(
+        db, user_id=int(user.id), providers=["github"]
+    )
+
+    assert {r.access_token for r in resolved} == {
+        "first-account-token",
+        "second-account-token",
+    }
+    assert {r.provider_user_id for r in resolved} == {"42", "43"}
+
+
+def _seed_bare_github_account(db: Session) -> tuple[User, UserOAuth]:
+    """A GitHub UserOAuth row with no MCPServer/PublicMCPApp catalog
+    entry -- cloud_storage.py's delete_connected_account addresses a row
+    by id directly and doesn't go through the MCP catalog at all."""
+    user = User(username="cloud-octocat", password_hash="h", is_admin=False)
+    db.add(user)
+    db.add(
+        OAuthProvider(
+            provider_name="github",
+            name="GitHub",
+            client_id=encrypt_value("github-client-id"),
+            client_secret=encrypt_value("github-client-secret"),
+            auth_url="https://github.com/login/oauth/authorize",
+            token_url="https://github.com/login/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/github/callback",
+            userinfo_url="https://api.github.com/user",
+            user_id_path="id",
+            email_path="login",
+            default_scopes=["read:user"],
+        )
+    )
+    db.commit()
+    db.refresh(user)
+    account = UserOAuth(
+        user_id=int(user.id),
+        provider="github",
+        access_token="live-access-token",
+        provider_user_id="42",
+    )
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+    return user, account
+
+
+async def test_delete_connected_account_revokes_the_github_grant(db, monkeypatch):
+    """The third disconnect path: cloud_storage.py's generic
+    "delete any connected OAuth account" endpoint deletes UserOAuth rows
+    directly, with no provider restriction -- it must revoke a GitHub
+    grant exactly like the two MCP-catalog disconnect endpoints do."""
+    from xagent.web.api.cloud_storage import delete_connected_account
+
+    user, account = _seed_bare_github_account(db)
+    delete = Mock(return_value=MockResponse())
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    await delete_connected_account(int(account.id), db=db, user=user)
+
+    assert db.get(UserOAuth, int(account.id)) is None
+    _assert_github_grant_was_revoked(delete)
+
+
+async def test_delete_connected_account_skips_revocation_with_a_live_sibling(
+    db, monkeypatch
+):
+    from xagent.web.api.cloud_storage import delete_connected_account
+
+    user, account = _seed_bare_github_account(db)
+    other_user = User(username="bob", password_hash="h", is_admin=False)
+    db.add(other_user)
+    db.flush()
+    db.add(
+        UserOAuth(
+            user_id=other_user.id,
+            provider="github",
+            provider_user_id="42",
+            access_token="bobs-still-live-token",
+        )
+    )
+    db.commit()
+
+    delete = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    await delete_connected_account(int(account.id), db=db, user=user)
+
+    assert db.get(UserOAuth, int(account.id)) is None
+    assert db.query(UserOAuth).filter(UserOAuth.user_id == other_user.id).count() == 1
+    delete.assert_not_called()
+
+
+async def test_delete_connected_account_survives_a_revoke_failure(db, monkeypatch):
+    from xagent.web.api.cloud_storage import delete_connected_account
+
+    user, account = _seed_bare_github_account(db)
+    monkeypatch.setattr(
+        auth_api.requests,
+        "delete",
+        Mock(side_effect=auth_api.requests.ConnectionError("network down")),
+    )
+
+    await delete_connected_account(int(account.id), db=db, user=user)
+
+    assert db.get(UserOAuth, int(account.id)) is None

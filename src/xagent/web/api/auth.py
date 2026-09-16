@@ -2335,6 +2335,9 @@ def _revoke_github_oauth_grant(
     -- every caller up the chain (revoke_resolved_github_oauth_grant,
     revoke_builtin_oauth_grant_if_unreferenced, revoke_builtin_oauth_grant)
     documents that same guarantee and depends on it holding here at the leaf.
+
+    Deployments that restrict outbound traffic must allow api.github.com:
+    this is the one new outbound call a GitHub disconnect makes.
     """
     try:
         response = requests.delete(
@@ -2365,7 +2368,9 @@ def _revoke_github_oauth_grant(
     # block, neither of which means the grant is actually gone, so it must
     # surface as a genuine (still non-raising) failure instead of being
     # silently treated the same as "already revoked".
-    if response.status_code not in (204, 404):
+    if response.status_code == 204:
+        logger.info("GitHub OAuth grant revoked")
+    elif response.status_code != 404:
         logger.warning(
             "GitHub OAuth grant revocation returned unexpected status %s",
             response.status_code,
@@ -2380,10 +2385,23 @@ class BuiltinOAuthRevocation(NamedTuple):
     :func:`has_other_builtin_oauth_reference`.
     """
 
+    provider: str
     access_token: str
     client_id: str
     client_secret: str
     provider_user_id: str | None
+
+    def __repr__(self) -> str:
+        # The default NamedTuple repr would print access_token/client_secret
+        # in plain text -- a stray logger.debug(revocation) or an
+        # uncaught-exception traceback that includes this value as a local
+        # variable must not leak either one.
+        return (
+            f"BuiltinOAuthRevocation(provider={self.provider!r}, "
+            f"access_token=<redacted>, client_id={self.client_id!r}, "
+            f"client_secret=<redacted>, "
+            f"provider_user_id={self.provider_user_id!r})"
+        )
 
 
 def resolve_builtin_oauth_revocation(
@@ -2442,7 +2460,11 @@ def resolve_builtin_oauth_revocation(
         )
         return None
     return BuiltinOAuthRevocation(
-        access_token, client_id, client_secret, provider_user_id
+        provider="github",
+        access_token=access_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        provider_user_id=provider_user_id,
     )
 
 
@@ -2500,10 +2522,15 @@ def has_other_builtin_oauth_reference(
     )
 
 
-def revoke_resolved_github_oauth_grant(
-    access_token: str, client_id: str, client_secret: str
-) -> None:
-    """Public, database-free entry point for one resolved revoke triple.
+def revoke_resolved_github_oauth_grant(revocation: BuiltinOAuthRevocation) -> None:
+    """Public, database-free entry point for one already-resolved revocation.
+
+    Takes the whole record rather than three same-typed positional strings
+    on purpose: ``access_token``/``client_id``/``client_secret`` are all
+    plain ``str`` and trivially transposable if passed as separate
+    positional arguments (as this function briefly did) -- passing the
+    record itself, unpacked only here at the one place that needs to, is
+    what actually rules that out for every caller.
 
     Touches no Session and no shared state, so it's always safe to run
     inside ``asyncio.to_thread`` regardless of what owns the caller's
@@ -2516,10 +2543,12 @@ def revoke_resolved_github_oauth_grant(
     both in one call; an async caller on the event loop should call
     :func:`has_other_builtin_oauth_reference` directly (never via
     ``asyncio.to_thread`` -- see that function's own docstring) and only
-    offload this pure network call, exactly like mcp.py's two disconnect
-    paths do.
+    offload this pure network call, exactly like
+    :func:`revoke_builtin_oauth_grants` does.
     """
-    _revoke_github_oauth_grant(access_token, client_id, client_secret)
+    _revoke_github_oauth_grant(
+        revocation.access_token, revocation.client_id, revocation.client_secret
+    )
 
 
 def revoke_builtin_oauth_grant_if_unreferenced(
@@ -2550,7 +2579,9 @@ def revoke_builtin_oauth_grant_if_unreferenced(
     """
     try:
         if has_other_builtin_oauth_reference(
-            db, provider="github", provider_user_id=revocation.provider_user_id
+            db,
+            provider=revocation.provider,
+            provider_user_id=revocation.provider_user_id,
         ):
             logger.info(
                 "Skipping GitHub OAuth grant revocation: another local "
@@ -2564,9 +2595,7 @@ def revoke_builtin_oauth_grant_if_unreferenced(
             type(exc).__name__,
         )
         return
-    revoke_resolved_github_oauth_grant(
-        revocation.access_token, revocation.client_id, revocation.client_secret
-    )
+    revoke_resolved_github_oauth_grant(revocation)
 
 
 def revoke_builtin_oauth_grant(
@@ -2599,6 +2628,48 @@ def revoke_builtin_oauth_grant(
     if resolved is None:
         return
     revoke_builtin_oauth_grant_if_unreferenced(db, resolved)
+
+
+async def revoke_builtin_oauth_grants(
+    db: Session, revocations: list[BuiltinOAuthRevocation], *, context: str
+) -> None:
+    """Best-effort provider-side revoke of every already-resolved builtin
+    OAuth grant in ``revocations``, run strictly after the local disconnect
+    that produced them has committed.
+
+    The single shared implementation for every async disconnect endpoint
+    (mcp.py's ``delete_mcp_server`` and ``teardown_mcp_app_server``,
+    cloud_storage.py's ``delete_connected_account``) -- so the
+    reference-check-then-revoke sequence, and its cancellation-safety
+    shape, has exactly one place to get right instead of being copied at
+    each call site. Each entry's reference check
+    (:func:`has_other_builtin_oauth_reference`) runs synchronously on the
+    event loop against the caller's own ``db`` -- never via
+    ``asyncio.to_thread``, per that function's own docstring -- and only
+    the resulting network call is offloaded. Never raises: a dead network,
+    a still-live sibling reference, or a failed reference-check query must
+    not turn an already-successful local disconnect into a failed request.
+
+    ``context`` is folded into the warning log line so a failure can be
+    traced back to which disconnect path it came from.
+    """
+    for revocation in revocations:
+        try:
+            if has_other_builtin_oauth_reference(
+                db,
+                provider=revocation.provider,
+                provider_user_id=revocation.provider_user_id,
+            ):
+                logger.info(
+                    "Skipping GitHub OAuth grant revocation (%s): another "
+                    "local connection still references this account",
+                    context,
+                )
+                continue
+            await asyncio.to_thread(revoke_resolved_github_oauth_grant, revocation)
+        except Exception:
+            db.rollback()
+            logger.warning("Builtin OAuth grant revocation failed (%s)", context)
 
 
 def _generic_oauth_login(

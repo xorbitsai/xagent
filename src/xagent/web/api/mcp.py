@@ -4922,51 +4922,14 @@ async def teardown_mcp_app_server(
                 "MCP OAuth token revocation failed after teardown for grant %s",
                 revocation.grant_id,
             )
-    for builtin_revocation in builtin_oauth_revocations:
-        from .auth import (
-            has_other_builtin_oauth_reference,
-            revoke_resolved_github_oauth_grant,
-        )
+    if builtin_oauth_revocations:
+        from .auth import revoke_builtin_oauth_grants
 
-        try:
-            # The reference check is ordinary synchronous ORM work on this
-            # coroutine's own db -- run it directly here, never inside
-            # asyncio.to_thread: a thread-offloaded operation must own its
-            # Session end to end (create, use, close, entirely inside the
-            # worker), and this one doesn't -- it would share the
-            # request-scoped db across threads while this coroutine still
-            # owns it, which a cancelled request's own db.close() could then
-            # race (see has_other_builtin_oauth_reference's docstring, and
-            # services.db_runtime.run_db_io_cancellation_safe's). Only the
-            # pure network call below -- which touches no Session -- is
-            # safe to offload.
-            if has_other_builtin_oauth_reference(
-                db,
-                provider="github",
-                provider_user_id=builtin_revocation.provider_user_id,
-            ):
-                logger.info(
-                    "Skipping GitHub OAuth grant revocation after teardown "
-                    "for app %r, server %s: another local connection still "
-                    "references this account",
-                    app_id,
-                    server_id,
-                )
-                continue
-            await asyncio.to_thread(
-                revoke_resolved_github_oauth_grant,
-                builtin_revocation.access_token,
-                builtin_revocation.client_id,
-                builtin_revocation.client_secret,
-            )
-        except Exception:
-            db.rollback()
-            logger.warning(
-                "Builtin OAuth grant revocation failed after teardown for app %r, "
-                "server %s",
-                app_id,
-                server_id,
-            )
+        await revoke_builtin_oauth_grants(
+            db,
+            builtin_oauth_revocations,
+            context=f"teardown for app {app_id!r}, server {server_id}",
+        )
     logger.info(
         "Completed app-scoped MCP teardown for app %r, server %s, user %s",
         app_id,
@@ -5214,48 +5177,14 @@ async def delete_mcp_server(
         for snapshot in grant_revocations:
             await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
 
-        for revocation in builtin_oauth_revocations:
-            from .auth import (
-                has_other_builtin_oauth_reference,
-                revoke_resolved_github_oauth_grant,
-            )
+        if builtin_oauth_revocations:
+            from .auth import revoke_builtin_oauth_grants
 
-            try:
-                # The reference check is ordinary synchronous ORM work on
-                # this coroutine's own db -- run it directly here, never
-                # inside asyncio.to_thread: a thread-offloaded operation
-                # must own its Session end to end (create, use, close,
-                # entirely inside the worker), and this one doesn't -- it
-                # would share the request-scoped db across threads while
-                # this coroutine still owns it, which a cancelled request's
-                # own db.close() could then race (see
-                # has_other_builtin_oauth_reference's docstring, and
-                # services.db_runtime.run_db_io_cancellation_safe's). Only
-                # the pure network call below -- which touches no Session --
-                # is safe to offload.
-                if has_other_builtin_oauth_reference(
-                    db, provider="github", provider_user_id=revocation.provider_user_id
-                ):
-                    logger.info(
-                        "Skipping GitHub OAuth grant revocation after "
-                        "deleting MCP server %s: another local connection "
-                        "still references this account",
-                        server_id,
-                    )
-                    continue
-                await asyncio.to_thread(
-                    revoke_resolved_github_oauth_grant,
-                    revocation.access_token,
-                    revocation.client_id,
-                    revocation.client_secret,
-                )
-            except Exception:
-                db.rollback()
-                logger.warning(
-                    "Builtin OAuth grant revocation failed after deleting MCP "
-                    "server %s",
-                    server_id,
-                )
+            await revoke_builtin_oauth_grants(
+                db,
+                builtin_oauth_revocations,
+                context=f"deleting MCP server {server_id}",
+            )
 
         if retained_team_server:
             logger.info(f"Kept shared MCP server '{server_name}' after team disconnect")

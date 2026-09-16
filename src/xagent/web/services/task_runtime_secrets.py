@@ -42,11 +42,11 @@ def _runtime_cipher() -> Fernet:
             return Fernet(key.encode())
         except (ValueError, UnicodeError):
             pass
-    # Do not reuse get_cipher(): another feature may have cached the public
-    # development fallback. Never include the configured key in this error.
+    # Do not reuse get_cipher(): another feature may have cached a different
+    # key. Never include the configured key in this error.
     raise ConnectorRuntimeError(
         ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
-        "Connector runtime storage requires a valid, non-default ENCRYPTION_KEY.",
+        "Connector runtime storage requires a valid ENCRYPTION_KEY.",
         details={"reason": "encryption_key_unavailable"},
         status_code=503,
     )

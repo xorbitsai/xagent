@@ -2906,14 +2906,21 @@ def test_task_event_channel_prefix_default_and_override(monkeypatch):
     assert config.get_task_event_channel_prefix() == "xagent:staging:v1"
 
 
-@pytest.mark.parametrize(
-    "key", [None, "", "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="]
-)
-def test_task_runtime_secrets_reject_unconfigured_or_public_key(monkeypatch, key):
+@pytest.mark.parametrize("key", [None, ""])
+def test_task_runtime_secrets_reject_unconfigured_key(monkeypatch, key):
     monkeypatch.delenv(config.ENCRYPTION_KEY, raising=False)
     if key is not None:
         monkeypatch.setenv(config.ENCRYPTION_KEY, key)
     assert config.get_task_runtime_secrets_encryption_key() is None
+
+
+def test_task_runtime_secrets_use_explicit_fallback_key(monkeypatch):
+    monkeypatch.setenv(config.ENCRYPTION_KEY, config.DEV_FALLBACK_ENCRYPTION_KEY)
+
+    assert (
+        config.get_task_runtime_secrets_encryption_key()
+        == config.DEV_FALLBACK_ENCRYPTION_KEY
+    )
 
 
 def test_task_runtime_secrets_use_explicit_key(monkeypatch):

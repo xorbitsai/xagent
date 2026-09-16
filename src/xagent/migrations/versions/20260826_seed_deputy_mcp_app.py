@@ -214,6 +214,10 @@ def downgrade() -> None:
             _ORIGINAL_DEPUTY_DESCRIPTION,
         )
         if (
+            # Logically implied by description_is_uncustomized already
+            # being False when app_row is None, but mypy can't narrow
+            # app_row through that separately-computed bool -- kept
+            # explicit so _row_matches_seeded_shape below type-checks.
             app_row is not None
             and description_is_uncustomized
             and _row_matches_seeded_shape(

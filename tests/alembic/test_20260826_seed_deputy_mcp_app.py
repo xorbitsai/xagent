@@ -328,6 +328,34 @@ def test_downgrade_preserves_provider_row_admin_edited_beyond_structural_fields(
         assert "deputy" in _provider_names(connection)
 
 
+def test_original_description_constant_matches_backfill_migration():
+    """`_ORIGINAL_DEPUTY_DESCRIPTION` here and
+    20260916_update_deputy_description.py's `PREVIOUS_DESCRIPTION` are the
+    same historical text, hardcoded twice because migrations are
+    self-contained (not importing each other). Nothing else ties them
+    together, so a future edit to one without the other would silently
+    turn downgrade()'s description guard into a permanent no-op for
+    already-migrated rows -- this is that tripwire."""
+    description_migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260916_update_deputy_description.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "update_deputy_description_migration_for_constant_check",
+        description_migration_file,
+    )
+    description_migration = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(description_migration)
+
+    migration = _load_migration_module()
+
+    assert (
+        migration._ORIGINAL_DEPUTY_DESCRIPTION
+        == description_migration.PREVIOUS_DESCRIPTION
+    )
+
+
 def test_full_upgrade_downgrade_chain_with_description_migration_removes_row(
     tmp_path,
 ):

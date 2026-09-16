@@ -634,11 +634,13 @@ def test_request_requiring_membership_passes_through_on_success(monkeypatch):
 
 
 def test_request_requiring_membership_reraises_unrelated_errors(monkeypatch):
-    """channel_not_found isn't in the default not_a_member_codes (only
-    conversations.replies/reactions.* need the wider set) — this must raise
-    the raw _SlackAPIError, not get rewritten into the actionable
-    _SlackNotAMemberError, so a widening regression can't hide behind a
-    substring match on the (still-present) error code."""
+    """channel_not_found isn't in the default not_a_member_codes, and
+    chat.postMessage is deliberately kept out of the widened set (a DM
+    target's channel_not_found means something slack_join_channel can't
+    fix — see test_post_message_does_not_treat_dm_channel_not_found_as_actionable)
+    — this must raise the raw _SlackAPIError, not get rewritten into the
+    actionable _SlackNotAMemberError, so a widening regression can't hide
+    behind a substring match on the (still-present) error code."""
     monkeypatch.setattr(
         slack.requests,
         "request",
@@ -647,7 +649,7 @@ def test_request_requiring_membership_reraises_unrelated_errors(monkeypatch):
 
     with pytest.raises(slack._SlackAPIError, match="channel_not_found"):
         slack._request_requiring_membership(
-            "GET", "conversations.history", params={"channel": "C0123456789"}
+            "POST", "chat.postMessage", json_data={"channel": "C0123456789"}
         )
 
 
@@ -774,6 +776,62 @@ def test_request_requiring_membership_hedges_channel_not_found_for_invalid_raw_i
     result = json.loads(slack.slack_add_reaction("C0000000009", "1.1", "thumbsup"))
 
     assert result["status"] == "error"
+    assert "doesn't exist" in result["message"]
+    assert "slack_join_channel" in result["message"]
+
+
+def test_get_channel_history_hedges_channel_not_found_for_invalid_raw_id(monkeypatch):
+    """Production incident: conversations.history returned channel_not_found
+    for a channel id an agent had fabricated (a Slack id with its prefix
+    swapped for a channel one), and the bare code reached the caller with
+    no explanation of what to do about it. conversations.history now joins
+    conversations.replies/reactions.* in treating channel_not_found as
+    ambiguous-but-actionable rather than an opaque code."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "channel_not_found"})),
+    )
+
+    result = json.loads(slack.slack_get_channel_history("C0000000009"))
+
+    assert result["status"] == "error"
+    assert "channel_not_found" in result["message"]
+    assert "doesn't exist" in result["message"]
+    assert "slack_join_channel" in result["message"]
+
+
+def test_upload_file_hedges_channel_not_found_for_invalid_raw_id(tmp_path, monkeypatch):
+    """Production incident: files.completeUploadExternal returned
+    channel_not_found for the same kind of fabricated channel id, and
+    slack_upload_file surfaced the bare code — which is what let an agent
+    tell the user its "upload target wasn't available" instead of the real,
+    actionable reason. It now joins the same ambiguous-but-actionable group
+    as the read endpoints above."""
+    local_file = tmp_path / "report.txt"
+    local_file.write_text("incident report")
+    monkeypatch.setenv("XAGENT_SLACK_FILE_ALLOWED_DIRS", str(tmp_path))
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "upload_url": "https://files.slack.com/upload/v1/abc",
+                    "file_id": "F123",
+                }
+            ),
+            MockResponse({"ok": False, "error": "channel_not_found"}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+    monkeypatch.setattr(
+        slack.requests, "post", Mock(return_value=MockResponse({}, status_code=200))
+    )
+
+    result = json.loads(slack.slack_upload_file("C0000000009", str(local_file)))
+
+    assert result["status"] == "error"
+    assert "channel_not_found" in result["message"]
     assert "doesn't exist" in result["message"]
     assert "slack_join_channel" in result["message"]
 
@@ -1149,25 +1207,10 @@ def test_get_channel_history_reports_actionable_error_when_not_a_member(monkeypa
     assert mock_request.call_count == 1
 
 
-def test_get_channel_history_does_not_treat_channel_not_found_as_actionable(
-    monkeypatch,
-):
-    """conversations.history documents not_in_channel distinctly from
-    channel_not_found (unlike conversations.replies/reactions.*), so a
-    genuine channel_not_found here must stay a plain error — widening the
-    default code set to match the replies/reactions endpoints would make a
-    truly-missing channel get misreported as a membership problem."""
-    monkeypatch.setattr(
-        slack.requests,
-        "request",
-        Mock(return_value=MockResponse({"ok": False, "error": "channel_not_found"})),
-    )
-
-    result = json.loads(slack.slack_get_channel_history("C0123456789"))
-
-    assert result["status"] == "error"
-    assert "slack_join_channel" not in result["message"]
-    assert "channel_not_found" in result["message"]
+# (conversations.history's channel_not_found handling was flipped to
+# actionable by a production incident — see
+# test_get_channel_history_hedges_channel_not_found_for_invalid_raw_id above,
+# which replaces the test formerly here pinning the opposite behavior.)
 
 
 # ---------------------------------------------------------------------------
@@ -2252,6 +2295,52 @@ def test_search_messages_skips_thread_scan_after_channel_wide_membership_error(
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert "slack_join_channel" in result["error"]
+    # Exactly 2 calls: the failing page-2 history call, then nothing else —
+    # no conversations.replies attempt for the threaded parent from page 1.
+    assert mock_request.call_count == 2
+
+
+def test_search_messages_skips_thread_scan_after_channel_not_found_mid_pagination(
+    monkeypatch,
+):
+    """channel_not_found on a mid-pagination conversations.history call is
+    now actionable (widened alongside not_in_channel — see
+    _NOT_A_MEMBER_CODES_BY_PATH), so it must get the same channel-wide
+    treatment as the not_in_channel case above: the thread-scan loop must
+    not attempt conversations.replies for the already-collected threaded
+    parent, since that call would fail identically. Before the widening,
+    channel_not_found here was a plain _SlackAPIError (not
+    _SlackActionableError), so this same scenario would have let the
+    doomed thread-replies call through."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "ts": "1.1",
+                            "user": "U1",
+                            "text": "kickoff",
+                            "thread_ts": "1.1",
+                            "reply_count": 1,
+                        }
+                    ],
+                    "response_metadata": {"next_cursor": "page-2"},
+                }
+            ),
+            MockResponse({"ok": False, "error": "channel_not_found"}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert "channel_not_found" in result["error"]
+    assert "doesn't exist" in result["error"]
     assert "slack_join_channel" in result["error"]
     # Exactly 2 calls: the failing page-2 history call, then nothing else —
     # no conversations.replies attempt for the threaded parent from page 1.

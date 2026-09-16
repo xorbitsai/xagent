@@ -307,6 +307,21 @@ def _request(
 # channel". The raised message below is worded to cover both rather than
 # asserting the membership explanation outright.
 #
+# Production has since surfaced conversations.history and files.completeUploadExternal
+# also returning "channel_not_found", for a channel id that was never real to
+# begin with (an agent passed a fabricated id shaped like a real one —
+# concretely, another Slack id with its prefix swapped for a channel one).
+# _resolve_channel_id's pattern check confirms only the *shape* of a passed-in
+# id, never that Slack actually has such a conversation, so a fabricated id
+# reaches the API unresolved and this is the first place anything notices.
+# Slack's own docs already list channel_not_found for both endpoints
+# alongside not_in_channel — e.g. files.completeUploadExternal's own error
+# table: "channel_not_found: Value passed for `channel_id` was invalid."
+# Nothing was contradicted here; both were simply left out of this table's
+# original classification, under-scoped the same way conversations.info was
+# below. Both now join the same ambiguous-channel_not_found group as the
+# four below instead of staying on the unambiguous default.
+#
 # channel_not_found is deliberately NOT added for chat.postMessage: Slack's
 # own docs say a DM target returns channel_not_found specifically when the
 # app lacks permission to open that DM — a case slack_join_channel (which
@@ -320,10 +335,10 @@ def _request(
 # wrong guess here is exactly how conversations.info was first classified
 # (left off this table entirely, on the mistaken assumption that its
 # non-member error was no_permission rather than channel_not_found like its
-# siblings below). All four paths happen to share the same documented code
-# set today (none of them document not_in_channel), so this table doesn't
-# yet need per-path variation — but the shape is what a future endpoint
-# with a genuinely different set would extend, not a boolean flag.
+# siblings below). All six paths map to the same {not_in_channel,
+# no_permission, channel_not_found} set today, so this table doesn't yet
+# need per-path variation — but the shape is what a future endpoint with a
+# genuinely different set would extend, not a boolean flag.
 _DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel", "no_permission"})
 # Derived from _DEFAULT_NOT_A_MEMBER_CODES rather than re-listing both its
 # members: the two are meant to always differ by exactly channel_not_found,
@@ -339,6 +354,8 @@ _NOT_A_MEMBER_CODES_BY_PATH: dict[str, frozenset[str]] = dict.fromkeys(
         "conversations.info",
         "reactions.add",
         "reactions.remove",
+        "conversations.history",
+        "files.completeUploadExternal",
     ),
     _ALSO_OVERLOADS_CHANNEL_NOT_FOUND,
 )

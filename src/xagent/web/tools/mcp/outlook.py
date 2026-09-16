@@ -12,7 +12,6 @@ from dateutil import tz as _date_tz
 from mcp.server.fastmcp import FastMCP
 
 from .utils import InsufficientScopeError
-from .utils import attendees_to_add as _attendees_to_add
 from .utils import attendees_were_given as _attendees_were_given
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
@@ -901,8 +900,9 @@ def outlook_update_event(
     specific occurrence when possible.
     Because a plain Graph GET does not expose a reliable timezone for an
     existing all-day window, adding attendees to one requires resubmitting both
-    boundaries with an explicit timezone. Moving an all-day event that retains
-    attendees fails closed unless ignore_conflicts=True.
+    boundaries with an explicit timezone. Moving or expanding an all-day event
+    into new dates while retaining attendees fails closed unless
+    ignore_conflicts=True; unchanged and shrunken date windows remain safe.
     """
     try:
         attendees_given = _attendees_were_given(attendees)
@@ -962,16 +962,18 @@ def outlook_update_event(
             existing = _graph_request(
                 "GET",
                 f"/me/events/{quote(event_id, safe='')}",
-                params={"$select": "changeKey,start,end,attendees,isAllDay,type"},
+                params={"$select": "start,end,attendees,isAllDay,type"},
             )
 
         snapshot_start_field = existing.get("start") or {}
         snapshot_end_field = existing.get("end") or {}
-        existing_attendees_raw = [
-            attendee["emailAddress"]["address"].strip()
-            for attendee in (existing.get("attendees") or [])
-            if (attendee.get("emailAddress") or {}).get("address", "").strip()
-        ]
+        existing_attendees_raw = _normalize_addresses(
+            [
+                attendee["emailAddress"]["address"]
+                for attendee in (existing.get("attendees") or [])
+                if (attendee.get("emailAddress") or {}).get("address", "").strip()
+            ]
+        )
         existing_attendee_emails = {
             address.lower() for address in existing_attendees_raw
         }
@@ -1097,15 +1099,20 @@ def outlook_update_event(
             payload["body"] = _message_body(body, "text")
         if location is not None:
             payload["location"] = {"displayName": location}
-        added_attendees = _attendees_to_add(attendees, existing_attendee_emails)
+        desired_addresses = (
+            _normalize_addresses(attendees) if attendees_given and attendees else []
+        )
+        added_attendees = [
+            address
+            for address in desired_addresses
+            if address.lower() not in existing_attendee_emails
+        ]
         if attendees_given:
             existing_by_email = {
                 attendee["emailAddress"]["address"].strip().lower(): attendee
                 for attendee in (existing.get("attendees") or [])
                 if (attendee.get("emailAddress") or {}).get("address", "").strip()
             }
-            assert attendees is not None
-            desired_addresses = _normalize_addresses(attendees)
             desired_lower = {address.lower() for address in desired_addresses}
             if desired_lower != existing_attendee_emails:
                 payload["attendees"] = [
@@ -1324,14 +1331,12 @@ def outlook_update_event(
         patch_headers: dict[str, str] | None = None
         if "attendees" in payload:
             event_etag = existing.get("@odata.etag")
-            if not event_etag and existing.get("changeKey"):
-                event_etag = f'W/"{existing["changeKey"]}"'
-            if not event_etag:
+            if not isinstance(event_etag, str) or not event_etag.strip():
                 raise ValueError(
                     "Outlook did not return an event version, so attendee changes "
                     "cannot be applied safely. Read the event again and retry."
                 )
-            patch_headers = {"If-Match": event_etag}
+            patch_headers = {"If-Match": event_etag.strip()}
         try:
             result = _graph_request(
                 "PATCH",

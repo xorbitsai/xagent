@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -155,25 +156,210 @@ def test_chrome_identity_user_mismatch_fails_closed():
 
 @pytest.mark.asyncio
 async def test_dedicated_sandbox_uses_only_opaque_scope_and_attaches(monkeypatch):
+    events = []
     manager = SimpleNamespace(
         get_or_create_lease_provider=AsyncMock(),
         attach_provider=AsyncMock(return_value=True),
-        delete_sandbox=AsyncMock(),
+        delete_durable_sandbox_strict=AsyncMock(),
     )
     provider = SimpleNamespace(primary_sandbox=object())
-    manager.get_or_create_lease_provider.return_value = provider
+    manager.get_or_create_lease_provider.side_effect = lambda *args: (
+        events.append("backend-create") or provider
+    )
+    lifecycle = SimpleNamespace(
+        backend_lifecycle_digest="b" * 64,
+        mark_ready=AsyncMock(side_effect=lambda: events.append("ready")),
+        renew=AsyncMock(side_effect=lambda: events.append("renew")),
+        delete=AsyncMock(),
+        defer_unknown_create=AsyncMock(),
+    )
+    coordinator = SimpleNamespace(
+        register=AsyncMock(
+            side_effect=lambda **kwargs: events.append("register") or lifecycle
+        )
+    )
     monkeypatch.setattr(chrome_mcp_runtime, "get_sandbox_manager", lambda: manager)
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "get_chrome_lifecycle_coordinator",
+        lambda: coordinator,
+    )
 
-    handle = await _create_chrome_sandbox("a" * 64)
+    scope, _ = bind_chrome_execution_scope(
+        "chrome-devtools", _connection(), _identity()
+    )
+    handle = await _create_chrome_sandbox(scope)
+    await handle.before_backend()
     await handle.delete()
 
+    coordinator.register.assert_awaited_once_with(
+        scope_digest=scope.digest,
+        task_id=7,
+        run_id="run-one",
+        lease_attempt_id="attempt-one",
+        turn_id="turn-one",
+    )
     manager.get_or_create_lease_provider.assert_awaited_once_with(
-        "chrome-execution", "a" * 64
+        "chrome-execution", "b" * 64
     )
     manager.attach_provider.assert_awaited_once_with(
-        "chrome-execution", "a" * 64, provider
+        "chrome-execution", "b" * 64, provider
     )
-    manager.delete_sandbox.assert_awaited_once_with("chrome-execution", "a" * 64)
+    lifecycle.mark_ready.assert_awaited_once()
+    assert lifecycle.renew.await_count == 2
+    lifecycle.delete.assert_awaited_once()
+    assert events == ["register", "renew", "backend-create", "ready", "renew"]
+
+
+@pytest.mark.asyncio
+async def test_precreate_fence_failure_tombstones_without_backend_create(monkeypatch):
+    manager = SimpleNamespace(
+        get_or_create_lease_provider=AsyncMock(),
+        attach_provider=AsyncMock(),
+    )
+    lifecycle = SimpleNamespace(
+        backend_lifecycle_digest="b" * 64,
+        mark_ready=AsyncMock(),
+        renew=AsyncMock(side_effect=RuntimeError("database unknown")),
+        delete=AsyncMock(),
+        defer_unknown_create=AsyncMock(),
+    )
+    coordinator = SimpleNamespace(register=AsyncMock(return_value=lifecycle))
+    monkeypatch.setattr(chrome_mcp_runtime, "get_sandbox_manager", lambda: manager)
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "get_chrome_lifecycle_coordinator",
+        lambda: coordinator,
+    )
+    scope, _ = bind_chrome_execution_scope(
+        "chrome-devtools", _connection(), _identity()
+    )
+
+    with pytest.raises(ChromeSessionContractError, match="pre-create fence failed"):
+        await _create_chrome_sandbox(scope)
+
+    lifecycle.delete.assert_awaited_once()
+    lifecycle.defer_unknown_create.assert_not_awaited()
+    manager.get_or_create_lease_provider.assert_not_awaited()
+    manager.attach_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_backend_create_failure_tombstones_before_returning(monkeypatch):
+    manager = SimpleNamespace(
+        get_or_create_lease_provider=AsyncMock(
+            side_effect=RuntimeError("backend create unknown")
+        ),
+        attach_provider=AsyncMock(),
+    )
+    lifecycle = SimpleNamespace(
+        backend_lifecycle_digest="b" * 64,
+        mark_ready=AsyncMock(),
+        renew=AsyncMock(),
+        delete=AsyncMock(),
+        defer_unknown_create=AsyncMock(),
+    )
+    coordinator = SimpleNamespace(register=AsyncMock(return_value=lifecycle))
+    monkeypatch.setattr(chrome_mcp_runtime, "get_sandbox_manager", lambda: manager)
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "get_chrome_lifecycle_coordinator",
+        lambda: coordinator,
+    )
+    scope, _ = bind_chrome_execution_scope(
+        "chrome-devtools", _connection(), _identity()
+    )
+
+    with pytest.raises(ChromeSessionContractError, match="creation failed"):
+        await _create_chrome_sandbox(scope)
+
+    lifecycle.defer_unknown_create.assert_awaited_once()
+    lifecycle.delete.assert_not_awaited()
+    lifecycle.mark_ready.assert_not_awaited()
+    manager.attach_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_backend_create_drains_unknown_tombstone(monkeypatch):
+    create_started = asyncio.Event()
+    tombstoned = asyncio.Event()
+
+    async def create(*_args):
+        create_started.set()
+        await asyncio.Event().wait()
+
+    async def defer_unknown_create():
+        await asyncio.sleep(0)
+        tombstoned.set()
+
+    manager = SimpleNamespace(
+        get_or_create_lease_provider=AsyncMock(side_effect=create),
+        attach_provider=AsyncMock(),
+    )
+    lifecycle = SimpleNamespace(
+        backend_lifecycle_digest="b" * 64,
+        mark_ready=AsyncMock(),
+        renew=AsyncMock(),
+        delete=AsyncMock(),
+        defer_unknown_create=AsyncMock(side_effect=defer_unknown_create),
+    )
+    coordinator = SimpleNamespace(register=AsyncMock(return_value=lifecycle))
+    monkeypatch.setattr(chrome_mcp_runtime, "get_sandbox_manager", lambda: manager)
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "get_chrome_lifecycle_coordinator",
+        lambda: coordinator,
+    )
+    scope, _ = bind_chrome_execution_scope(
+        "chrome-devtools", _connection(), _identity()
+    )
+
+    task = asyncio.create_task(_create_chrome_sandbox(scope))
+    await create_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert tombstoned.is_set()
+    lifecycle.defer_unknown_create.assert_awaited_once()
+    lifecycle.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_at", ["attach", "ready"])
+async def test_post_create_failure_strictly_compensates(monkeypatch, failure_at):
+    provider = SimpleNamespace(primary_sandbox=object())
+    manager = SimpleNamespace(
+        get_or_create_lease_provider=AsyncMock(return_value=provider),
+        attach_provider=AsyncMock(return_value=True),
+    )
+    lifecycle = SimpleNamespace(
+        backend_lifecycle_digest="b" * 64,
+        mark_ready=AsyncMock(),
+        renew=AsyncMock(),
+        delete=AsyncMock(),
+        defer_unknown_create=AsyncMock(),
+    )
+    if failure_at == "attach":
+        manager.attach_provider.side_effect = RuntimeError("attach failed")
+    else:
+        lifecycle.mark_ready.side_effect = RuntimeError("ready failed")
+    coordinator = SimpleNamespace(register=AsyncMock(return_value=lifecycle))
+    monkeypatch.setattr(chrome_mcp_runtime, "get_sandbox_manager", lambda: manager)
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "get_chrome_lifecycle_coordinator",
+        lambda: coordinator,
+    )
+    scope, _ = bind_chrome_execution_scope(
+        "chrome-devtools", _connection(), _identity()
+    )
+
+    with pytest.raises(ChromeSessionContractError):
+        await _create_chrome_sandbox(scope)
+
+    lifecycle.delete.assert_awaited_once()
+    lifecycle.defer_unknown_create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -208,3 +394,67 @@ async def test_shutdown_resets_pool_even_when_drain_fails():
 
     assert chrome_mcp_runtime._chrome_pool is None
     assert chrome_mcp_runtime._chrome_pool_manager is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_runs_immediately_then_periodically_until_stopped(monkeypatch):
+    events: list[str] = []
+    loop_started = asyncio.Event()
+
+    async def sweep_once():
+        events.append("immediate-sweep")
+        return 0
+
+    async def run_sweep_loop():
+        events.append("periodic-loop")
+        loop_started.set()
+        await asyncio.Event().wait()
+
+    coordinator = SimpleNamespace(
+        sweep_once=AsyncMock(side_effect=sweep_once),
+        run_sweep_loop=run_sweep_loop,
+    )
+    app = SimpleNamespace(state=SimpleNamespace())
+    monkeypatch.setattr(chrome_mcp_runtime, "get_sandbox_manager", object)
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "get_chrome_lifecycle_coordinator",
+        lambda: coordinator,
+    )
+
+    task = await chrome_mcp_runtime.start_chrome_lifecycle_recovery(app)
+    await asyncio.wait_for(loop_started.wait(), timeout=1)
+    assert task is app.state.chrome_lifecycle_recovery_task
+    assert events == ["immediate-sweep", "periodic-loop"]
+
+    await chrome_mcp_runtime.stop_chrome_lifecycle_recovery(app)
+    assert task.cancelled()
+    assert app.state.chrome_lifecycle_recovery_task is None
+
+
+@pytest.mark.asyncio
+async def test_initial_database_unknown_does_not_disable_periodic_recovery(monkeypatch):
+    periodic_started = asyncio.Event()
+
+    async def run_sweep_loop():
+        periodic_started.set()
+        await asyncio.Event().wait()
+
+    coordinator = SimpleNamespace(
+        sweep_once=AsyncMock(side_effect=RuntimeError("database unavailable")),
+        run_sweep_loop=run_sweep_loop,
+    )
+    app = SimpleNamespace(state=SimpleNamespace())
+    monkeypatch.setattr(chrome_mcp_runtime, "get_sandbox_manager", object)
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "get_chrome_lifecycle_coordinator",
+        lambda: coordinator,
+    )
+
+    task = await chrome_mcp_runtime.start_chrome_lifecycle_recovery(app)
+    await asyncio.wait_for(periodic_started.wait(), timeout=1)
+
+    coordinator.sweep_once.assert_awaited_once()
+    assert task is not None and not task.done()
+    await chrome_mcp_runtime.stop_chrome_lifecycle_recovery(app)

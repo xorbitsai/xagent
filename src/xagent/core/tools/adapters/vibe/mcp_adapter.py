@@ -53,6 +53,7 @@ from .connector_runtime import (
     runtime_bindings_from_config,
 )
 from .sandboxed_tool.chrome_session import (
+    CHROME_BACKEND_OPERATION_TIMEOUT_SECONDS,
     ChromeDaemonLaunchSpec,
     ChromeExecutionScope,
     ChromeExecutionSessionPool,
@@ -2279,9 +2280,13 @@ async def load_execution_scoped_chrome_tools(
     pool = get_chrome_execution_session_pool()
     session = await pool.get_or_create(scope, launch)
     try:
-        mcp_tools = await list_tools_in_sandbox(
-            session.sandbox,
-            chrome_metadata_connection(connection),
+        await session.before_backend()
+        mcp_tools = await asyncio.wait_for(
+            list_tools_in_sandbox(
+                session.sandbox,
+                chrome_metadata_connection(connection),
+            ),
+            timeout=CHROME_BACKEND_OPERATION_TIMEOUT_SECONDS,
         )
     except BaseException:
         await pool.close_shielded(scope)

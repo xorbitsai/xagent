@@ -1298,7 +1298,9 @@ async def test_storage_to_tool_factory_uses_host_only_chrome_consumer(
     )
     configs = await config._load_mcp_server_configs()
     pool = AsyncMock(spec=ChromeExecutionSessionPool)
-    pool.get_or_create.return_value = SimpleNamespace(sandbox=object())
+    pool.get_or_create.return_value = SimpleNamespace(
+        sandbox=object(), before_backend=AsyncMock()
+    )
     serialized_connections: list[Mapping[str, object]] = []
 
     async def list_tools(_sandbox: object, connection: Mapping[str, object]):

@@ -130,6 +130,11 @@ SANDBOX_MAX_CONTAINERS = "XAGENT_SANDBOX_MAX_CONTAINERS"
 SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY = (
     "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY"
 )
+CHROME_SESSION_TTL_SECONDS = "XAGENT_CHROME_SESSION_TTL_SECONDS"
+CHROME_LIFECYCLE_SWEEP_INTERVAL_SECONDS = (
+    "XAGENT_CHROME_LIFECYCLE_SWEEP_INTERVAL_SECONDS"
+)
+CHROME_LIFECYCLE_SWEEP_BATCH_SIZE = "XAGENT_CHROME_LIFECYCLE_SWEEP_BATCH_SIZE"
 SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
@@ -2463,6 +2468,26 @@ def get_sandbox_allow_local_fallback_on_capacity() -> bool:
         True when local fallback on capacity exhaustion is allowed.
     """
     return _get_bool_env(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, False)
+
+
+def get_chrome_session_ttl_seconds() -> float:
+    """Age after which a durable Chrome row becomes eligible for classification."""
+
+    value = _get_positive_float_env(CHROME_SESSION_TTL_SECONDS, 900.0)
+    return 900.0 if value is None else value
+
+
+def get_chrome_lifecycle_sweep_interval_seconds() -> float:
+    """Interval between per-worker durable Chrome recovery passes."""
+
+    value = _get_positive_float_env(CHROME_LIFECYCLE_SWEEP_INTERVAL_SECONDS, 30.0)
+    return 30.0 if value is None else value
+
+
+def get_chrome_lifecycle_sweep_batch_size() -> int:
+    """Maximum durable Chrome rows considered by one worker in one pass."""
+
+    return _get_positive_int_env(CHROME_LIFECYCLE_SWEEP_BATCH_SIZE, 100)
 
 
 def get_lancedb_path() -> Path:

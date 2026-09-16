@@ -77,7 +77,8 @@ async def test_host_consumer_strips_identity_and_env_before_child_serializer(
     monkeypatch, sandbox
 ):
     pool = AsyncMock(spec=ChromeExecutionSessionPool)
-    pool.get_or_create.return_value = SimpleNamespace(sandbox=object())
+    session = SimpleNamespace(sandbox=object(), before_backend=AsyncMock())
+    pool.get_or_create.return_value = session
     serialized_connections = []
 
     async def list_tools(_sandbox, connection):
@@ -107,6 +108,7 @@ async def test_host_consumer_strips_identity_and_env_before_child_serializer(
     }
     assert "actor_stdio_session_identity" not in repr(serialized_connections)
     assert "toby:owner-secret" not in repr(serialized_connections)
+    session.before_backend.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -150,7 +152,9 @@ async def test_generic_loader_does_not_route_by_chrome_server_name(monkeypatch):
 @pytest.mark.asyncio
 async def test_chrome_adapter_reuses_scope_and_validates_daemon_result(monkeypatch):
     pool = AsyncMock(spec=ChromeExecutionSessionPool)
-    pool.get_or_create.return_value = SimpleNamespace(sandbox=object())
+    pool.get_or_create.return_value = SimpleNamespace(
+        sandbox=object(), before_backend=AsyncMock()
+    )
     pool.invoke_tool.return_value = {
         "content": [{"type": "text", "text": "same browser"}],
         "structuredContent": {"page": 2},
@@ -188,7 +192,9 @@ async def test_invalid_daemon_result_closes_scope_without_per_call_fallback(
     monkeypatch,
 ):
     pool = AsyncMock(spec=ChromeExecutionSessionPool)
-    pool.get_or_create.return_value = SimpleNamespace(sandbox=object())
+    pool.get_or_create.return_value = SimpleNamespace(
+        sandbox=object(), before_backend=AsyncMock()
+    )
     pool.invoke_tool.return_value = {"content": [], "isError": "false"}
     direct_session = AsyncMock()
     monkeypatch.setattr(mcp_adapter, "create_session", direct_session)
@@ -216,7 +222,9 @@ async def test_invalid_daemon_result_closes_scope_without_per_call_fallback(
 @pytest.mark.asyncio
 async def test_cancelled_teardown_does_not_abort_runner_cleanup(monkeypatch):
     pool = AsyncMock(spec=ChromeExecutionSessionPool)
-    pool.get_or_create.return_value = SimpleNamespace(sandbox=object())
+    pool.get_or_create.return_value = SimpleNamespace(
+        sandbox=object(), before_backend=AsyncMock()
+    )
     pool.close_shielded.side_effect = asyncio.CancelledError
     monkeypatch.setattr(
         mcp_adapter, "list_tools_in_sandbox", AsyncMock(return_value=[_tool()])

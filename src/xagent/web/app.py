@@ -1780,6 +1780,14 @@ async def startup_event() -> None:
             await sandbox_mgr.warmup()
         logger.info("Sandbox manager initialized and warmed up")
 
+        if not os.getenv("PYTEST_CURRENT_TEST"):
+            from .services.chrome_mcp_runtime import start_chrome_lifecycle_recovery
+
+            with _startup_phase("durable Chrome recovery"):
+                await start_chrome_lifecycle_recovery(app)
+        else:
+            logger.info("Skipping durable Chrome recovery loop (test environment)")
+
         from ..config import get_sandbox_idle_ttl
 
         if get_sandbox_idle_ttl() is not None:
@@ -1874,6 +1882,10 @@ async def shutdown_event() -> None:
     await stop_orphan_upload_gc_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_lease_recovery_task(app)
+
+    from .services.chrome_mcp_runtime import stop_chrome_lifecycle_recovery
+
+    await stop_chrome_lifecycle_recovery(app)
 
     if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():
         logger.info("Cancelling sandbox idle sweep task...")

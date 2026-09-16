@@ -1331,6 +1331,98 @@ def test_whatsapp_login_uses_its_own_config_id_override(db_session, monkeypatch)
     assert "scope" not in qs
 
 
+def test_whatsapp_login_falls_back_to_shared_config_id_when_unset(
+    db_session, monkeypatch
+):
+    """Mirrors the meta-ads equivalent above: without a dedicated
+    META_WHATSAPP_CONFIG_ID, whatsapp still falls back to the shared
+    META_CONFIG_ID -- preserving existing deployments that haven't split
+    their Login Configurations out per app."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.delenv("META_WHATSAPP_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="whatsapp",
+            name="WhatsApp Business",
+            description="WhatsApp connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["whatsapp_business_messaging"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="whatsapp",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["shared-config-id"]
+
+
+def test_whatsapp_login_config_id_override_survives_admin_app_id_casing(
+    db_session, monkeypatch
+):
+    """Mirrors the meta-ads equivalent above: an admin-created app row's
+    app_id is free-form (e.g. "WhatsApp" with different casing/spacing,
+    still normalizing to "whatsapp" for the app-scoped OAuth grant policy in
+    mcp_apps.py). The config_id override lookup must normalize the same
+    way, or a differently-cased app_id would silently miss
+    META_WHATSAPP_CONFIG_ID and fall back to the shared META_CONFIG_ID."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_WHATSAPP_CONFIG_ID", "whatsapp-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="WhatsApp",
+            name="WhatsApp Business",
+            description="WhatsApp connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["whatsapp_business_messaging"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="WhatsApp",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["whatsapp-only-config-id"]
+
+
 def test_meta_login_ignores_undocumented_legacy_config_id_alias(
     db_session, monkeypatch
 ):

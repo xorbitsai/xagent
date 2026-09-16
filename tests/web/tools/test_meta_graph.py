@@ -106,6 +106,26 @@ def test_graph_request_sends_no_json_kwarg_for_form_posts(monkeypatch):
     assert seen["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
 
 
+def test_graph_request_omits_data_and_json_kwargs_for_plain_get(monkeypatch):
+    """A bare GET (neither data nor json_body) must get neither kwarg at
+    all -- pinned directly against meta_graph.graph_request rather than only
+    indirectly through each connector's own auth_status test."""
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    seen = {}
+
+    def request(**kwargs):
+        seen.update(kwargs)
+        return MockResponse({"id": "u1"}, text="{}")
+
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+
+    meta_graph.graph_request("GET", "/me", params={"fields": "id"})
+
+    assert "data" not in seen
+    assert "json" not in seen
+    assert "Content-Type" not in seen["headers"]
+
+
 def test_graph_request_rejects_data_and_json_body_together(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     request = Mock()

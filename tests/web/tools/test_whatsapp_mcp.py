@@ -794,6 +794,23 @@ def test_send_template_message_adds_template_hint(token, monkeypatch):
     assert "whatsapp_list_message_templates" in result["details"]["hint"]
 
 
+def test_send_template_message_reports_sent_unconfirmed_when_no_message_id_returned(
+    token, monkeypatch
+):
+    """Same _MessageAcceptedUnparseable wiring as whatsapp_send_text_message
+    -- pinned separately because each send tool has its own except clause
+    and a copy-paste slip in this one wouldn't be caught by the text-send
+    test alone."""
+    _mock_request(monkeypatch, MockResponse({"messaging_product": "whatsapp"}))
+
+    result = _payload(
+        whatsapp.whatsapp_send_template_message("pn-1", "15551234567", "hello", "en_US")
+    )
+
+    assert result["status"] == "sent_unconfirmed"
+    assert "do not resend" in result["message"].lower()
+
+
 # --------------------------------------------------------------------------
 # sending: media
 # --------------------------------------------------------------------------
@@ -820,6 +837,25 @@ def test_send_media_message_image_with_caption(token, monkeypatch):
         "type": "image",
         "image": {"link": "https://cdn.example.com/a.png", "caption": "Look"},
     }
+
+
+def test_send_media_message_reports_sent_unconfirmed_when_no_message_id_returned(
+    token, monkeypatch
+):
+    """Same _MessageAcceptedUnparseable wiring as whatsapp_send_text_message
+    -- pinned separately because each send tool has its own except clause
+    and a copy-paste slip in this one wouldn't be caught by the text-send
+    test alone."""
+    _mock_request(monkeypatch, MockResponse({"messaging_product": "whatsapp"}))
+
+    result = _payload(
+        whatsapp.whatsapp_send_media_message(
+            "pn-1", "15551234567", "image", "https://cdn.example.com/a.png"
+        )
+    )
+
+    assert result["status"] == "sent_unconfirmed"
+    assert "do not resend" in result["message"].lower()
 
 
 def test_send_media_message_strips_caption_before_sending_and_measuring(

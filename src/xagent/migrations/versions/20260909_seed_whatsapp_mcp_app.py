@@ -166,9 +166,15 @@ def upgrade() -> None:
     # picker, not a misidentification risk, so it doesn't warrant the same
     # blast radius: failing this migration would abort every migration in
     # the same `alembic upgrade head` run (this one or any added after it),
-    # not just skip seeding whatsapp. Skip with a warning instead; an
-    # operator who wants the builtin row seeded can rename the conflicting
-    # app and re-run.
+    # not just skip seeding whatsapp. Skip with a warning instead.
+    #
+    # This skip is permanent, not "until the next upgrade": Alembic stamps
+    # this revision as applied whether or not the insert below ran, so a
+    # bare `alembic upgrade head` re-run afterwards is a no-op -- it will
+    # NOT retry seeding, even if the colliding row is later renamed away.
+    # Recovering the builtin row after the fact needs a manual INSERT (or a
+    # follow-up migration) using this file's ROW/BUILTIN_PROVENANCE as the
+    # template, not simply "rename and re-run".
     colliding_rows = [
         row
         for row in catalog_rows
@@ -176,9 +182,13 @@ def upgrade() -> None:
         or _collides_with_whatsapp_identity(row["name"])
     ]
     if colliding_rows:
-        logger.warning(
-            "Skipping builtin WhatsApp seed: public_mcp_apps row(s) with "
-            "app_id %s share its identity under a different app_id",
+        logger.error(
+            "Permanently skipping builtin WhatsApp seed: public_mcp_apps "
+            "row(s) with app_id %s share its identity under a different "
+            "app_id. Re-running `alembic upgrade head` will NOT retry this "
+            "-- the revision is already stamped applied. Seed the row "
+            "manually (see this migration's ROW/BUILTIN_PROVENANCE) once "
+            "the collision is resolved.",
             sorted({row["app_id"] for row in colliding_rows}),
         )
         return

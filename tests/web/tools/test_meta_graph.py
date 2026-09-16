@@ -77,7 +77,7 @@ def test_graph_request_sends_json_body_with_json_content_type(monkeypatch):
 
     assert result == {"messages": [{"id": "wamid.1"}]}
     assert seen["json"] == {"type": "text", "text": {"body": "hi"}}
-    assert seen["data"] is None
+    assert "data" not in seen
     assert seen["headers"] == {
         "Authorization": "Bearer user-token",
         "Accept": "application/json",
@@ -85,11 +85,11 @@ def test_graph_request_sends_json_body_with_json_content_type(monkeypatch):
     }
 
 
-def test_graph_request_sends_null_json_for_form_posts(monkeypatch):
-    """Existing form-encoded callers must keep sending a null json body (the
-    Facebook/Instagram tests assert `json=None` in their exact call shape) --
-    `requests` only substitutes a JSON body `if not data and json is not
-    None`, so this never changes what actually goes over the wire."""
+def test_graph_request_sends_no_json_kwarg_for_form_posts(monkeypatch):
+    """Existing form-encoded callers (Facebook/Instagram/Meta Ads) must keep
+    getting no `json` kwarg at all -- graph_request builds kwargs
+    conditionally rather than always passing `json=` and relying on
+    `requests`' own `if not data and json is not None` precedence."""
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     seen = {}
 
@@ -101,7 +101,7 @@ def test_graph_request_sends_null_json_for_form_posts(monkeypatch):
 
     meta_graph.graph_request("POST", "/page-1/feed", data={"message": "hi"})
 
-    assert seen["json"] is None
+    assert "json" not in seen
     assert seen["data"] == {"message": "hi"}
     assert seen["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
 

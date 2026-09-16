@@ -13,6 +13,7 @@ usual flow is ``whatsapp_list_business_accounts`` ->
 ``whatsapp_list_phone_numbers`` -> one of the ``whatsapp_send_*`` tools.
 """
 
+import json
 import logging
 import re
 from typing import Any
@@ -163,10 +164,10 @@ def _normalize_recipient(to: str) -> str:
         digits = cleaned[2:]
     else:
         digits = cleaned
-    if not digits.isdigit():
+    if not digits.isascii() or not digits.isdigit():
         raise ValueError(
-            "to must be a phone number in international format (digits with an "
-            "optional leading +), e.g. +15551234567"
+            "to must be a phone number in international format (ASCII digits "
+            "0-9 with an optional leading +), e.g. +15551234567"
         )
     if digits.startswith("0"):
         raise ValueError(
@@ -224,10 +225,24 @@ def _next_cursor(result: Any) -> str | None:
     if not isinstance(paging.get("next"), str) or not paging["next"]:
         return None
     cursors = paging.get("cursors")
-    if not isinstance(cursors, dict):
-        return None
-    after = cursors.get("after")
-    return after if isinstance(after, str) and after else None
+    after = cursors.get("after") if isinstance(cursors, dict) else None
+    if isinstance(after, str) and after:
+        return after
+    # `paging.next` says more data exists, but there's no cursor to hand
+    # back through this tool's `after` parameter -- every edge this
+    # connector actually paginates is cursor-based, so this shouldn't
+    # happen, but if Graph ever serves one of these edges with a different
+    # paging style, silently returning None here would look identical to
+    # "no more pages" and truncate results without any signal. Log it so
+    # that's at least visible, even though there's no cursor this function
+    # can return.
+    logger.warning(
+        "Graph paging.next is present but no usable cursors.after was found "
+        "(paging=%s); pagination will stop here even though more data may "
+        "exist",
+        paging,
+    )
+    return None
 
 
 def _apply_after_cursor(params: dict[str, Any], after: str | None) -> None:
@@ -322,6 +337,67 @@ def _list_business_accounts(
     return accounts, _next_cursor(result)
 
 
+class _MessageAcceptedUnparseable(Exception):
+    """Graph returned 2xx but no message id could be parsed out of it.
+
+    The send already happened at this point -- Meta accepted the request --
+    so this must never be handled the same way as an actual send failure. A
+    caller (human or agent) that sees a generic "error" here and retries
+    could duplicate a real message to a real customer.
+    """
+
+    def __init__(self, redacted_response: Any):
+        super().__init__("message accepted by WhatsApp but id unparsable")
+        self.redacted_response = redacted_response
+
+
+def _scrub_response_pii(result: Any) -> Any:
+    """Redact secrets, then also mask the recipient PII a /messages response
+    carries in `contacts` (phone number as `input`, plus `wa_id`) -- Meta's
+    documented error/echo shape, not a credential, so `redact_secrets` (which
+    only matches the access token string) leaves it untouched. Used only to
+    build safe text for an error message or log line, never the tool's normal
+    successful response.
+    """
+    redacted = _redact_secrets(result)
+    if isinstance(redacted, dict) and isinstance(redacted.get("contacts"), list):
+        redacted = {
+            **redacted,
+            "contacts": [
+                {
+                    key: ("[redacted]" if key in ("input", "wa_id") else value)
+                    for key, value in contact.items()
+                }
+                if isinstance(contact, dict)
+                else contact
+                for contact in redacted["contacts"]
+            ],
+        }
+    return redacted
+
+
+def _sent_but_unconfirmed_response(redacted_response: Any) -> str:
+    # Deliberately not _success (always "status": "success") or _error
+    # (always "status": "error") -- this outcome is neither: the send
+    # happened, but its result can't be confirmed, and a caller must not
+    # treat it the same as either a confirmed success or a real failure.
+    return json.dumps(
+        {
+            "status": "sent_unconfirmed",
+            "message": (
+                "WhatsApp accepted this message (Meta returned a successful "
+                "response) but no message id could be parsed out of it, so "
+                "the send could not be confirmed. Do not resend -- it was "
+                "very likely already delivered; verify manually (e.g. in "
+                "WhatsApp Manager or with the recipient) before trying "
+                "again."
+            ),
+            "details": redacted_response,
+        },
+        ensure_ascii=False,
+    )
+
+
 def _send_message(phone_number_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     result = _graph_request(
         "POST",
@@ -332,9 +408,7 @@ def _send_message(phone_number_id: str, payload: dict[str, Any]) -> dict[str, An
     contact = _first_dict(result.get("contacts") if isinstance(result, dict) else None)
     message_id = message.get("id")
     if not message_id:
-        raise ValueError(
-            f"WhatsApp did not return a message id; response: {_redact_secrets(result)}"
-        )
+        raise _MessageAcceptedUnparseable(_scrub_response_pii(result))
     summary: dict[str, Any] = {
         "message_id": message_id,
         "recipient": contact.get("input"),
@@ -511,6 +585,13 @@ def whatsapp_send_text_message(
         if reply_to_message_id and reply_to_message_id.strip():
             payload["context"] = {"message_id": reply_to_message_id.strip()}
         return _success(**_send_message(phone_number_id, payload))
+    except _MessageAcceptedUnparseable as e:
+        logger.error(
+            "WhatsApp accepted text message from %s but its id was unparsable: %s",
+            phone_number_id,
+            e.redacted_response,
+        )
+        return _sent_but_unconfirmed_response(e.redacted_response)
     except GraphAPIError as e:
         logger.error("Error sending WhatsApp text from %s: %s", phone_number_id, e)
         return _send_error(e)
@@ -564,6 +645,14 @@ def whatsapp_send_template_message(
             "template": template,
         }
         return _success(**_send_message(phone_number_id, payload))
+    except _MessageAcceptedUnparseable as e:
+        logger.error(
+            "WhatsApp accepted template %s from %s but its id was unparsable: %s",
+            template_name,
+            phone_number_id,
+            e.redacted_response,
+        )
+        return _sent_but_unconfirmed_response(e.redacted_response)
     except GraphAPIError as e:
         logger.error(
             "Error sending WhatsApp template %s from %s: %s",
@@ -636,6 +725,14 @@ def whatsapp_send_media_message(
             normalized_type: media,
         }
         return _success(**_send_message(phone_number_id, payload))
+    except _MessageAcceptedUnparseable as e:
+        logger.error(
+            "WhatsApp accepted %s message from %s but its id was unparsable: %s",
+            media_type,
+            phone_number_id,
+            e.redacted_response,
+        )
+        return _sent_but_unconfirmed_response(e.redacted_response)
     except GraphAPIError as e:
         logger.error(
             "Error sending WhatsApp %s from %s: %s", media_type, phone_number_id, e
@@ -670,12 +767,18 @@ def whatsapp_mark_message_read(phone_number_id: str, message_id: str) -> str:
                 "message_id": message_id.strip(),
             },
         )
-        return _success(
-            message_id=message_id.strip(),
-            marked_read=bool(result.get("success"))
-            if isinstance(result, dict)
-            else False,
-        )
+        marked_read = bool(result.get("success")) if isinstance(result, dict) else False
+        if not marked_read:
+            # A 2xx without a truthy "success" field is not the documented
+            # shape -- report it as an error rather than a top-level
+            # "status": "success" a caller could misread without checking
+            # the nested marked_read field too.
+            return _error(
+                "WhatsApp returned a response without confirming the "
+                "message was marked read",
+                details=_redact_secrets(result),
+            )
+        return _success(message_id=message_id.strip(), marked_read=True)
     except GraphAPIError as e:
         logger.error(
             "Error marking WhatsApp message %s read on %s: %s",

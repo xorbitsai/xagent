@@ -73,8 +73,6 @@ def test_auth_status_uses_injected_meta_token(token, monkeypatch):
         url=f"{GRAPH}/me",
         headers={"Authorization": "Bearer user-token", "Accept": "application/json"},
         params={"fields": "id,name,email"},
-        data=None,
-        json=None,
         timeout=30,
     )
 
@@ -231,6 +229,21 @@ def test_list_business_accounts_ignores_cursor_without_next_on_last_page(
 
     assert result["next_after"] is None
     mock.assert_called_once()
+
+
+def test_next_cursor_warns_when_next_present_without_a_usable_cursor(caplog):
+    """Every edge this connector paginates is cursor-based, so this
+    shouldn't happen in practice -- but if Graph ever serves `paging.next`
+    without a `cursors.after` to go with it, silently returning None here
+    would look identical to "no more pages" and truncate results with no
+    signal at all. It must at least be logged."""
+    with caplog.at_level("WARNING", logger="whatsapp-mcp"):
+        result = whatsapp._next_cursor(
+            {"data": [], "paging": {"next": "https://graph.facebook.com/x"}}
+        )
+
+    assert result is None
+    assert any("paging.next is present" in record.message for record in caplog.records)
 
 
 def test_list_business_accounts_forwards_after_cursor(token, monkeypatch):
@@ -467,7 +480,6 @@ def test_send_text_message_posts_json_payload(token, monkeypatch):
             "Content-Type": "application/json",
         },
         params=None,
-        data=None,
         timeout=30,
         json={
             "messaging_product": "whatsapp",
@@ -514,13 +526,41 @@ def test_send_text_message_surfaces_held_message_status(token, monkeypatch):
     assert result["message_status"] == "held_for_quality_assessment"
 
 
-def test_send_text_message_errors_when_no_message_id_returned(token, monkeypatch):
+def test_send_text_message_reports_sent_unconfirmed_when_no_message_id_returned(
+    token, monkeypatch
+):
+    """Meta already accepted the message (2xx) even though no id came back --
+    this must be distinguishable from a real send failure, or a caller could
+    retry and duplicate a real message to a real customer."""
     _mock_request(monkeypatch, MockResponse({"messaging_product": "whatsapp"}))
 
     result = _payload(whatsapp.whatsapp_send_text_message("pn-1", "15551234567", "x"))
 
-    assert result["status"] == "error"
-    assert "did not return a message id" in result["message"]
+    assert result["status"] == "sent_unconfirmed"
+    assert "do not resend" in result["message"].lower()
+
+
+def test_send_message_scrubs_recipient_pii_from_unconfirmed_response(
+    token, monkeypatch
+):
+    """redact_secrets only strips the access token; the recipient's phone
+    number/wa_id in `contacts` must also not leak into this response."""
+    _mock_request(
+        monkeypatch,
+        MockResponse(
+            {
+                "messaging_product": "whatsapp",
+                "contacts": [{"input": "15551234567", "wa_id": "15551234567"}],
+            }
+        ),
+    )
+
+    result = _payload(whatsapp.whatsapp_send_text_message("pn-1", "15551234567", "x"))
+
+    assert result["status"] == "sent_unconfirmed"
+    contact = result["details"]["contacts"][0]
+    assert contact["input"] == "[redacted]"
+    assert contact["wa_id"] == "[redacted]"
 
 
 @pytest.mark.parametrize(
@@ -562,6 +602,10 @@ def test_normalize_recipient_accepts_common_formats(to, expected):
         # rather than silently sent as an invalid "+0..." value.
         "07911123456",
         "0 7911 123456",
+        # str.isdigit() is Unicode-aware and accepts non-ASCII digit
+        # characters (Arabic-Indic here); Graph expects plain ASCII digits.
+        "١٥٥٥١٢٣٤٥٦٧",
+        "+١٥٥٥١٢٣٤٥٦٧",
     ],
 )
 def test_normalize_recipient_rejects_malformed(to):
@@ -970,6 +1014,17 @@ def test_mark_message_read(token, monkeypatch):
         "message_id": "wamid.IN",
     }
     assert mock.call_args.kwargs["headers"]["Content-Type"] == "application/json"
+
+
+def test_mark_message_read_reports_error_when_not_confirmed(token, monkeypatch):
+    """A 2xx without a truthy "success" field is not the documented success
+    shape; the top-level status must reflect that, not just a nested
+    marked_read=False a caller could miss."""
+    _mock_request(monkeypatch, MockResponse({}))
+
+    result = _payload(whatsapp.whatsapp_mark_message_read("pn-1", "wamid.IN"))
+
+    assert result["status"] == "error"
 
 
 def test_mark_message_read_requires_message_id(token, monkeypatch):

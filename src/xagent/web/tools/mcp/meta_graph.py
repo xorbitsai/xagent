@@ -115,11 +115,10 @@ def graph_request(
     take). ``json_body`` is sent as an ``application/json`` body instead --
     the WhatsApp Cloud API's ``/{phone_number_id}/messages`` endpoint takes
     nested objects (``template.components``, ``text.body``) that
-    form-encoding can't express. The two are mutually exclusive. ``json=``
-    is always passed to ``requests`` (as ``None`` when unused); `requests`
-    only substitutes a JSON body ``if not data and json is not None``, so a
-    stray ``json=None`` alongside a real ``data=`` value never changes what
-    goes over the wire.
+    form-encoding can't express. The two are mutually exclusive, and only
+    whichever one is actually given is passed on to ``requests`` -- not
+    relying on ``requests``' own ``if not data and json is not None``
+    precedence rule to sort out an unused one.
     """
     if data is not None and json_body is not None:
         raise ValueError("graph_request takes either data or json_body, not both")
@@ -130,14 +129,18 @@ def graph_request(
         content_type = "application/x-www-form-urlencoded"
     else:
         content_type = None
+    body_kwargs: dict[str, Any] = {}
+    if data is not None:
+        body_kwargs["data"] = data
+    if json_body is not None:
+        body_kwargs["json"] = json_body
     response = requests.request(
         method=method,
         url=f"{GRAPH_BASE_URL}{path}",
         headers=graph_headers(request_token, content_type=content_type),
         params=params,
-        data=data,
-        json=json_body,
         timeout=DEFAULT_TIMEOUT_SECONDS,
+        **body_kwargs,
     )
 
     try:

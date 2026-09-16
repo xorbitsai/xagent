@@ -1873,3 +1873,262 @@ def test_get_campaign_metrics_wraps_request_errors(monkeypatch):
 
     assert result["status"] == "error"
     assert "boom" in result["message"]
+
+
+def test_list_deals_hits_the_bare_deals_endpoint_with_properties(monkeypatch):
+    """Regression: a request for "all deals" (not scoped to a contact or
+    company) previously had no dedicated MCP tool at all, so an agent
+    would fall back to the credential-less generic api_call tool and
+    always get a 401 - see the 2026-09-16 incident. hubspot_list_deals
+    covers that gap the same way hubspot_list_forms already covers forms."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": [
+                    {
+                        "id": "d1",
+                        "properties": {"dealname": "Acme", "dealstage": "closedwon"},
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_deals(limit=50))
+
+    assert result == {
+        "status": "success",
+        "deals": [
+            {"id": "d1", "properties": {"dealname": "Acme", "dealstage": "closedwon"}}
+        ],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+    }
+    assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/deals")
+    params = mock_request.call_args.kwargs["params"]
+    assert params["limit"] == 50
+    assert "dealname" in params["properties"]
+
+
+def test_list_companies_hits_the_bare_companies_endpoint(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"results": [{"id": "c1", "properties": {"name": "Acme"}}]}
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_companies())
+
+    assert result["status"] == "success"
+    assert result["companies"] == [{"id": "c1", "properties": {"name": "Acme"}}]
+    assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/companies")
+
+
+def test_list_contacts_hits_the_bare_contacts_endpoint(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"results": [{"id": "p1", "properties": {"email": "a@b.com"}}]}
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_contacts())
+
+    assert result["status"] == "success"
+    assert result["contacts"] == [{"id": "p1", "properties": {"email": "a@b.com"}}]
+    assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/contacts")
+
+
+def test_list_deals_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_list_deals())
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+
+
+def test_search_contacts_sends_free_text_query_only(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_search_contacts(query="chelsea")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["query"] == "chelsea"
+    assert "filterGroups" not in body
+
+
+def test_search_contacts_sends_filter_groups_with_no_query(monkeypatch):
+    """Regression: the 2026-09-16 incident's failed request had a
+    filterGroups-only body with no "query" key at all (filtering contacts
+    created after a date) - the generic api_call tool was the only way to
+    express that. filter_groups_json must let hubspot_search_contacts send
+    exactly that shape without a query."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [
+            {
+                "filters": [
+                    {
+                        "propertyName": "createdate",
+                        "operator": "GTE",
+                        "value": "2026-09-01",
+                    }
+                ]
+            }
+        ]
+    )
+
+    hubspot.hubspot_search_contacts(filter_groups_json=filter_groups_json)
+
+    body = mock_request.call_args.kwargs["json"]
+    assert "query" not in body
+    assert body["filterGroups"] == [
+        {
+            "filters": [
+                {"propertyName": "createdate", "operator": "GTE", "value": "2026-09-01"}
+            ]
+        }
+    ]
+
+
+def test_search_contacts_combines_query_and_filter_groups(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [
+            {
+                "filters": [
+                    {
+                        "propertyName": "lifecyclestage",
+                        "operator": "EQ",
+                        "value": "lead",
+                    }
+                ]
+            }
+        ]
+    )
+
+    hubspot.hubspot_search_contacts(query="acme", filter_groups_json=filter_groups_json)
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["query"] == "acme"
+    assert "filterGroups" in body
+
+
+def test_search_contacts_rejects_non_array_filter_groups_json(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_search_contacts(filter_groups_json=json.dumps({"filters": []}))
+    )
+
+    assert result["status"] == "error"
+    assert "filter_groups_json" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_search_companies_sends_filter_groups(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [{"filters": [{"propertyName": "industry", "operator": "EQ", "value": "SAAS"}]}]
+    )
+
+    hubspot.hubspot_search_companies(filter_groups_json=filter_groups_json)
+
+    body = mock_request.call_args.kwargs["json"]
+    assert "query" not in body
+    assert body["filterGroups"] == [
+        {"filters": [{"propertyName": "industry", "operator": "EQ", "value": "SAAS"}]}
+    ]
+
+
+def test_search_deals_hits_the_deals_search_endpoint(monkeypatch):
+    """New tool: previously there was no way to search/filter deals at all
+    across the whole portal (only per-contact/per-company lookups), so an
+    agent asking for e.g. "deals in the qualifiedtobuy stage" had no MCP
+    tool for it and had to fall back to the credential-less api_call tool."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "total": 1,
+                "results": [
+                    {"id": "d1", "properties": {"dealstage": "qualifiedtobuy"}}
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [
+            {
+                "filters": [
+                    {
+                        "propertyName": "dealstage",
+                        "operator": "EQ",
+                        "value": "qualifiedtobuy",
+                    }
+                ]
+            }
+        ]
+    )
+
+    result = json.loads(
+        hubspot.hubspot_search_deals(filter_groups_json=filter_groups_json)
+    )
+
+    assert result == {
+        "status": "success",
+        "total": 1,
+        "results": [{"id": "d1", "properties": {"dealstage": "qualifiedtobuy"}}],
+    }
+    assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/deals/search")
+    body = mock_request.call_args.kwargs["json"]
+    assert "query" not in body
+    assert body["filterGroups"] == [
+        {
+            "filters": [
+                {
+                    "propertyName": "dealstage",
+                    "operator": "EQ",
+                    "value": "qualifiedtobuy",
+                }
+            ]
+        }
+    ]
+
+
+def test_search_deals_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_search_deals(query="acme"))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]

@@ -342,32 +342,82 @@ def _parse_properties(properties_json: str) -> dict[str, Any]:
     return properties
 
 
+def _parse_filter_groups(filter_groups_json: str) -> list[dict[str, Any]]:
+    filter_groups = json.loads(filter_groups_json)
+    if not isinstance(filter_groups, list):
+        raise ValueError(
+            "filter_groups_json must be a JSON array of HubSpot filterGroups "
+            'objects, e.g. [{"filters": [{"propertyName": "dealstage", '
+            '"operator": "EQ", "value": "appointmentscheduled"}]}]'
+        )
+    return filter_groups
+
+
+def _project_id_and_properties(items: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {"id": item.get("id"), "properties": item.get("properties", {})}
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
 def _search(
-    object_type: str, query: str, properties: list[str], limit: int
+    object_type: str,
+    properties: list[str],
+    limit: int,
+    query: str | None = None,
+    filter_groups: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Free-text search, property filtering, or both, against one HubSpot
+    CRM object type's /search endpoint. At least one of `query` or
+    `filter_groups` should normally be given - the endpoint accepts neither
+    and returns an unfiltered page in that case, but hubspot_list_* is the
+    more direct tool for that."""
     body: dict[str, Any] = {
-        "query": query,
         "properties": properties,
         "limit": max(1, min(limit, 100)),
     }
+    if query:
+        body["query"] = query
+    if filter_groups:
+        body["filterGroups"] = filter_groups
     result = _request("POST", f"/crm/v3/objects/{object_type}/search", body=body)
     return {
         "total": result.get("total", 0),
-        "results": [
-            {"id": item.get("id"), "properties": item.get("properties", {})}
-            for item in result.get("results", [])
-        ],
+        "results": _project_id_and_properties(result.get("results", [])),
     }
 
 
 @mcp.tool()
-def hubspot_search_contacts(query: str, limit: int = 10) -> str:
+def hubspot_search_contacts(
+    query: str | None = None,
+    filter_groups_json: str | None = None,
+    limit: int = 10,
+) -> str:
     """
-    Search HubSpot contacts by free-text query (matches name, email, phone, company).
-    Always search before creating a contact to avoid duplicates.
+    Search HubSpot contacts by free-text query (matches name, email, phone,
+    company), by property filters, or both. Always search before creating a
+    contact to avoid duplicates.
+
+    filter_groups_json, when given, is HubSpot's native filterGroups JSON
+    array, e.g. '[{"filters": [{"propertyName": "createdate", "operator":
+    "GTE", "value": "2026-09-01"}]}]' - filters within one group are ANDed,
+    and groups are ORed. See HubSpot's CRM search API docs for the full set
+    of operators (EQ, GTE, LTE, CONTAINS_TOKEN, ...). To list every contact
+    with no query or filter at all, use hubspot_list_contacts instead - it's
+    the more direct tool for that and doesn't need an empty search body.
     """
     try:
-        found = _search("contacts", query, DEFAULT_CONTACT_PROPERTIES, limit)
+        filter_groups = (
+            _parse_filter_groups(filter_groups_json) if filter_groups_json else None
+        )
+        found = _search(
+            "contacts",
+            DEFAULT_CONTACT_PROPERTIES,
+            limit,
+            query=query,
+            filter_groups=filter_groups,
+        )
         return _success(**found)
     except Exception as e:
         logger.error(f"Error searching contacts: {e}")
@@ -434,12 +484,31 @@ def hubspot_update_contact(contact_id: str, properties_json: str) -> str:
 
 
 @mcp.tool()
-def hubspot_search_companies(query: str, limit: int = 10) -> str:
+def hubspot_search_companies(
+    query: str | None = None,
+    filter_groups_json: str | None = None,
+    limit: int = 10,
+) -> str:
     """
-    Search HubSpot companies by free-text query (matches name, domain).
+    Search HubSpot companies by free-text query (matches name, domain), by
+    property filters, or both.
+
+    filter_groups_json, when given, is HubSpot's native filterGroups JSON
+    array - see hubspot_search_contacts for the exact shape and operator
+    semantics. To list every company with no query or filter at all, use
+    hubspot_list_companies instead.
     """
     try:
-        found = _search("companies", query, DEFAULT_COMPANY_PROPERTIES, limit)
+        filter_groups = (
+            _parse_filter_groups(filter_groups_json) if filter_groups_json else None
+        )
+        found = _search(
+            "companies",
+            DEFAULT_COMPANY_PROPERTIES,
+            limit,
+            query=query,
+            filter_groups=filter_groups,
+        )
         return _success(**found)
     except Exception as e:
         logger.error(f"Error searching companies: {e}")
@@ -703,6 +772,147 @@ def hubspot_update_deal(deal_id: str, properties_json: str) -> str:
         return _success(deal=deal)
     except Exception as e:
         logger.error(f"Error updating deal: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_search_deals(
+    query: str | None = None,
+    filter_groups_json: str | None = None,
+    limit: int = 10,
+) -> str:
+    """
+    Search HubSpot deals by free-text query (matches dealname), by property
+    filters (stage, pipeline, amount, close date, ...), or both - across
+    the whole portal, not scoped to one contact or company.
+
+    filter_groups_json, when given, is HubSpot's native filterGroups JSON
+    array, e.g. '[{"filters": [{"propertyName": "dealstage", "operator":
+    "EQ", "value": "appointmentscheduled"}]}]' - see hubspot_search_contacts
+    for the exact shape and operator semantics.
+
+    For every deal tied to one contact or company, hubspot_get_contact_deals
+    / hubspot_get_company_deals are cheaper and don't need a filter. To list
+    every deal in the portal with no query or filter, use hubspot_list_deals.
+    """
+    try:
+        filter_groups = (
+            _parse_filter_groups(filter_groups_json) if filter_groups_json else None
+        )
+        found = _search(
+            "deals",
+            DEFAULT_DEAL_PROPERTIES,
+            limit,
+            query=query,
+            filter_groups=filter_groups,
+        )
+        return _success(**found)
+    except Exception as e:
+        logger.error(f"Error searching deals: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_list_deals(limit: int = 100, after: str | None = None) -> str:
+    """
+    List every deal in the portal - not scoped to any one contact or
+    company - including deal stage, pipeline, amount, close date, and the
+    closed-state flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost; use
+    those flags to tell open from closed rather than
+    dealstage/pipeline/closedate (see hubspot_get_contact_deals for why
+    those aren't reliable alone). Returns at most `limit` deals (max 100);
+    `has_more` is true when the portal has more deals past this page
+    (`after` is the cursor to fetch it), and `truncated` is true when this
+    page itself was trimmed to fit the output size limit - retry with a
+    smaller `limit` to see the trimmed entries.
+
+    Use this for "list/show me all deals" requests. For deals tied to one
+    contact or company, hubspot_get_contact_deals / hubspot_get_company_deals
+    are cheaper and don't require paging the whole portal. For deals
+    matching a filter (stage, amount, date range, ...), use
+    hubspot_search_deals instead of listing everything and filtering
+    yourself.
+    """
+    try:
+        params: dict[str, Any] = {
+            "limit": max(1, min(limit, 100)),
+            "properties": ",".join(DEFAULT_DEAL_PROPERTIES),
+        }
+        if after:
+            params["after"] = after
+        return _paged_list(
+            "/crm/v3/objects/deals",
+            "deals",
+            params=params,
+            after=after,
+            project=_project_id_and_properties,
+        )
+    except Exception as e:
+        logger.error(f"Error listing deals: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_list_companies(limit: int = 100, after: str | None = None) -> str:
+    """
+    List every company in the portal. Returns at most `limit` companies
+    (max 100); `has_more` is true when the portal has more companies past
+    this page (`after` is the cursor to fetch it), and `truncated` is true
+    when this page itself was trimmed to fit the output size limit - retry
+    with a smaller `limit` to see the trimmed entries.
+
+    Use this for "list/show me all companies" requests. For a name/domain
+    lookup, use hubspot_search_companies instead - it's cheaper and doesn't
+    require paging the whole portal.
+    """
+    try:
+        params: dict[str, Any] = {
+            "limit": max(1, min(limit, 100)),
+            "properties": ",".join(DEFAULT_COMPANY_PROPERTIES),
+        }
+        if after:
+            params["after"] = after
+        return _paged_list(
+            "/crm/v3/objects/companies",
+            "companies",
+            params=params,
+            after=after,
+            project=_project_id_and_properties,
+        )
+    except Exception as e:
+        logger.error(f"Error listing companies: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_list_contacts(limit: int = 100, after: str | None = None) -> str:
+    """
+    List every contact in the portal. Returns at most `limit` contacts
+    (max 100); `has_more` is true when the portal has more contacts past
+    this page (`after` is the cursor to fetch it), and `truncated` is true
+    when this page itself was trimmed to fit the output size limit - retry
+    with a smaller `limit` to see the trimmed entries.
+
+    Use this for "list/show me all contacts" requests. For a name/email/
+    phone/company lookup, use hubspot_search_contacts instead - it's
+    cheaper and doesn't require paging the whole portal.
+    """
+    try:
+        params: dict[str, Any] = {
+            "limit": max(1, min(limit, 100)),
+            "properties": ",".join(DEFAULT_CONTACT_PROPERTIES),
+        }
+        if after:
+            params["after"] = after
+        return _paged_list(
+            "/crm/v3/objects/contacts",
+            "contacts",
+            params=params,
+            after=after,
+            project=_project_id_and_properties,
+        )
+    except Exception as e:
+        logger.error(f"Error listing contacts: {e}")
         return _error(str(e))
 
 

@@ -1942,6 +1942,40 @@ def test_list_contacts_hits_the_bare_contacts_endpoint(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/contacts")
 
 
+def test_list_deals_handles_an_explicit_null_results_field(monkeypatch):
+    """Regression: `result.get("results", [])` only falls back to `[]` when
+    the "results" key is ABSENT, not when HubSpot returns it as an explicit
+    JSON null - which is still a key that exists, just with value None. That
+    None used to reach _project_id_and_properties's `for item in items` and
+    raise TypeError instead of the tool's usual structured error."""
+    mock_request = Mock(return_value=MockResponse(json_data={"results": None}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_deals())
+
+    assert result == {
+        "status": "success",
+        "deals": [],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+    }
+
+
+def test_project_id_and_properties_treats_a_null_properties_value_as_empty():
+    """A single item with `"properties": null` (key present, value None)
+    must come back as `{}`, not None - item.get("properties", {}) only
+    substitutes the default when the key is missing, not when it's None."""
+    result = hubspot._project_id_and_properties(
+        [{"id": "d1", "properties": None}, {"id": "d2", "properties": {"amount": "5"}}]
+    )
+
+    assert result == [
+        {"id": "d1", "properties": {}},
+        {"id": "d2", "properties": {"amount": "5"}},
+    ]
+
+
 def test_list_deals_wraps_request_errors(monkeypatch):
     monkeypatch.setattr(
         hubspot.requests,

@@ -353,9 +353,11 @@ def _parse_filter_groups(filter_groups_json: str) -> list[dict[str, Any]]:
     return filter_groups
 
 
-def _project_id_and_properties(items: list[Any]) -> list[dict[str, Any]]:
+def _project_id_and_properties(items: list[Any] | None) -> list[dict[str, Any]]:
+    if not items:
+        return []
     return [
-        {"id": item.get("id"), "properties": item.get("properties", {})}
+        {"id": item.get("id"), "properties": item.get("properties") or {}}
         for item in items
         if isinstance(item, dict)
     ]

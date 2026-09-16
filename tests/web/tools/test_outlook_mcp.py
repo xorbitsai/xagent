@@ -1378,6 +1378,7 @@ def test_update_event_normalizes_and_dedupes_attendees(monkeypatch):
     graph_request = Mock(
         side_effect=[
             {
+                "changeKey": "version-1",
                 "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
                 "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
                 "attendees": [],
@@ -1650,7 +1651,7 @@ def test_update_event_rejects_ambiguous_untouched_snapshot_boundary(monkeypatch)
     graph_request.assert_called_once_with(
         "GET",
         "/me/events/self-1",
-        params={"$select": "start,end,attendees,isAllDay,type"},
+        params={"$select": "changeKey,start,end,attendees,isAllDay,type"},
     )
 
 
@@ -2565,6 +2566,7 @@ def test_update_event_same_window_only_checks_newly_added_attendee(monkeypatch):
     graph_request = Mock(
         side_effect=[
             {
+                "changeKey": "version-1",
                 "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
                 "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
                 "attendees": [
@@ -2597,6 +2599,23 @@ def test_update_event_same_window_only_checks_newly_added_attendee(monkeypatch):
     assert schedule_call.args[:2] == ("POST", "/me/calendar/getSchedule")
     assert schedule_call.kwargs["body"]["schedules"] == ["new@example.com"]
     assert graph_request.call_count == 3
+
+
+def test_update_event_attendee_only_update_rejects_unused_timezone(monkeypatch):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            attendees=["new@example.com"],
+            timezone="America/New_York",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "timezone can only be supplied" in result["message"]
+    graph_request.assert_not_called()
 
 
 def test_update_event_adding_attendee_to_all_day_event_requires_window(monkeypatch):
@@ -2650,6 +2669,117 @@ def test_update_event_all_day_move_with_retained_attendee_fails_closed(monkeypat
     graph_request.assert_called_once()
 
 
+def test_update_event_all_day_same_window_with_retained_attendee_is_allowed(
+    monkeypatch,
+):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T00:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-28T00:00:00", "timeZone": "UTC"},
+                "attendees": [{"emailAddress": {"address": "existing@example.com"}}],
+                "isAllDay": True,
+                "type": "singleInstance",
+            },
+            {"value": []},
+            {"id": "updated"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T00:00:00",
+            end_datetime="2026-08-28T00:00:00",
+            timezone="America/New_York",
+            is_all_day=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert graph_request.call_count == 3
+    assert all(
+        call.args[:2] != ("POST", "/me/calendar/getSchedule")
+        for call in graph_request.call_args_list
+    )
+
+
+def test_update_event_all_day_shrink_with_retained_attendee_is_allowed(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T00:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-29T00:00:00", "timeZone": "UTC"},
+                "attendees": [{"emailAddress": {"address": "existing@example.com"}}],
+                "isAllDay": True,
+                "type": "singleInstance",
+            },
+            {"value": []},
+            {"id": "updated"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T00:00:00",
+            end_datetime="2026-08-28T00:00:00",
+            timezone="America/New_York",
+            is_all_day=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert graph_request.call_count == 3
+
+
+def test_update_event_adds_attendee_to_unchanged_all_day_window(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "changeKey": "version-1",
+                "start": {"dateTime": "2026-08-27T00:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-28T00:00:00", "timeZone": "UTC"},
+                "attendees": [{"emailAddress": {"address": "existing@example.com"}}],
+                "isAllDay": True,
+                "type": "singleInstance",
+            },
+            {"value": []},
+            {
+                "value": [
+                    {
+                        "scheduleId": "new@example.com",
+                        "availabilityView": "0",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+            {"id": "updated"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T00:00:00",
+            end_datetime="2026-08-28T00:00:00",
+            timezone="America/New_York",
+            is_all_day=True,
+            attendees=["existing@example.com", "new@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    schedule_call = graph_request.call_args_list[2]
+    assert schedule_call.args[:2] == ("POST", "/me/calendar/getSchedule")
+    assert schedule_call.kwargs["body"]["schedules"] == ["new@example.com"]
+    patch_call = graph_request.call_args_list[-1]
+    assert patch_call.kwargs["extra_headers"] == {"If-Match": 'W/"version-1"'}
+
+
 def test_update_event_treats_existing_attendee_case_insensitively(monkeypatch):
     """Regression test for a review finding: an existing attendee re-passed
     with different casing must still be recognized as "already there" -
@@ -2659,6 +2789,7 @@ def test_update_event_treats_existing_attendee_case_insensitively(monkeypatch):
     graph_request = Mock(
         side_effect=[
             {
+                "changeKey": "version-1",
                 "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
                 "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
                 "attendees": [
@@ -2770,7 +2901,7 @@ def test_update_event_resubmitting_only_existing_attendees_does_not_touch_them(
                 "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
                 "attendees": [
                     {
-                        "emailAddress": {"address": "existing@example.com"},
+                        "emailAddress": {"address": "  existing@example.com  "},
                         "type": "required",
                         "status": {
                             "response": "accepted",
@@ -2794,6 +2925,7 @@ def test_update_event_resubmitting_only_existing_attendees_does_not_touch_them(
 
     assert result["status"] == "success"
     assert result["message"] == "No attendee changes were needed"
+    assert result["event"]["attendees"][0]["status"]["response"] == "accepted"
     graph_request.assert_called_once()
 
 
@@ -2807,6 +2939,7 @@ def test_update_event_attendees_replace_drops_addresses_left_out_of_the_new_list
     graph_request = Mock(
         side_effect=[
             {
+                "changeKey": "version-1",
                 "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
                 "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
                 "attendees": [
@@ -2844,6 +2977,7 @@ def test_update_event_attendees_empty_list_clears_every_attendee(monkeypatch):
     graph_request = Mock(
         side_effect=[
             {
+                "changeKey": "version-1",
                 "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
                 "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
                 "attendees": [
@@ -2880,11 +3014,12 @@ def test_update_event_attendees_replace_preserves_rsvp_state_for_retained_entrie
     graph_request = Mock(
         side_effect=[
             {
+                "changeKey": "version-1",
                 "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
                 "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
                 "attendees": [
                     {
-                        "emailAddress": {"address": "existing@example.com"},
+                        "emailAddress": {"address": "  existing@example.com  "},
                         "type": "required",
                         "status": {
                             "response": "accepted",
@@ -2920,7 +3055,8 @@ def test_update_event_attendees_replace_preserves_rsvp_state_for_retained_entrie
     assert result["status"] == "success"
     patch_call = graph_request.call_args_list[-1]
     by_address = {
-        a["emailAddress"]["address"]: a for a in patch_call.kwargs["body"]["attendees"]
+        a["emailAddress"]["address"].strip(): a
+        for a in patch_call.kwargs["body"]["attendees"]
     }
     assert by_address["existing@example.com"]["status"] == {
         "response": "accepted",
@@ -2930,6 +3066,106 @@ def test_update_event_attendees_replace_preserves_rsvp_state_for_retained_entrie
         "emailAddress": {"address": "new@example.com"},
         "type": "required",
     }
+    assert patch_call.kwargs["extra_headers"] == {"If-Match": 'W/"version-1"'}
+
+
+def test_update_event_attendee_patch_uses_graph_etag(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "@odata.etag": 'W/"etag-1"',
+                "changeKey": "different-fallback",
+                "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+            },
+            {
+                "value": [
+                    {
+                        "scheduleId": "new@example.com",
+                        "availabilityView": "0",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+            {"id": "updated"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(event_id="self-1", attendees=["new@example.com"])
+    )
+
+    assert result["status"] == "success"
+    assert graph_request.call_args_list[-1].kwargs["extra_headers"] == {
+        "If-Match": 'W/"etag-1"'
+    }
+
+
+def test_update_event_attendee_patch_rejects_concurrent_change(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "changeKey": "version-1",
+                "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+            },
+            {
+                "value": [
+                    {
+                        "scheduleId": "new@example.com",
+                        "availabilityView": "0",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+            outlook._GraphRequestError("412 Precondition Failed", status_code=412),
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(event_id="self-1", attendees=["new@example.com"])
+    )
+
+    assert result["status"] == "error"
+    assert "changed while attendee availability was being checked" in result["message"]
+    assert "No update was applied" in result["message"]
+
+
+def test_update_event_attendee_patch_requires_event_version(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+            },
+            {
+                "value": [
+                    {
+                        "scheduleId": "new@example.com",
+                        "availabilityView": "0",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(event_id="self-1", attendees=["new@example.com"])
+    )
+
+    assert result["status"] == "error"
+    assert "did not return an event version" in result["message"]
+    assert graph_request.call_count == 2
 
 
 def test_update_event_partial_overlap_nudge_only_checks_the_new_delta_segment(
@@ -3126,6 +3362,7 @@ def test_update_event_adding_attendee_queries_the_plain_get_utc_window(
     graph_request = Mock(
         side_effect=[
             {
+                "changeKey": "version-1",
                 "start": {"dateTime": "2026-08-27T02:00:00", "timeZone": "UTC"},
                 "end": {"dateTime": "2026-08-27T02:30:00", "timeZone": "UTC"},
                 "attendees": [],
@@ -3291,12 +3528,63 @@ def test_update_event_missing_schedule_scope_still_reports_an_already_confirmed_
     assert result["unchecked_attendees"] == ["outsider@gmail.com"]
 
 
+def test_update_event_scope_error_does_not_skip_retained_attendee_check(
+    monkeypatch,
+):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+            "attendees": [{"emailAddress": {"address": "existing@example.com"}}],
+            "isAllDay": False,
+        }
+    )
+    find_conflicts = Mock(
+        side_effect=[
+            outlook.InsufficientScopeError(
+                "Reconnect Outlook to grant schedule access.",
+                [],
+                ["new@example.com"],
+            ),
+            (
+                [
+                    {
+                        "calendar": "existing@example.com",
+                        "summary": "Busy",
+                        "start": "2026-08-27T11:00:00Z",
+                        "end": "2026-08-27T11:30:00Z",
+                    }
+                ],
+                [],
+            ),
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", find_conflicts)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T11:00:00",
+            end_datetime="2026-08-27T11:30:00",
+            attendees=["existing@example.com", "new@example.com"],
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert result["conflicts"][0]["calendar"] == "existing@example.com"
+    assert result["unchecked_attendees"] == ["new@example.com"]
+    assert find_conflicts.call_count == 2
+    assert find_conflicts.call_args_list[1].args[3] == ["existing@example.com"]
+
+
 def test_update_event_missing_schedule_scope_can_be_bypassed_with_ignore_conflicts(
     monkeypatch,
 ):
     graph_request = Mock(
         side_effect=[
             {
+                "changeKey": "version-1",
                 "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
                 "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
                 "attendees": [],

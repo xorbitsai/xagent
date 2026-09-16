@@ -12,7 +12,6 @@ from dateutil import tz as _date_tz
 from mcp.server.fastmcp import FastMCP
 
 from .utils import InsufficientScopeError
-from .utils import attendees_were_given as _attendees_were_given
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
 from .utils import incomplete_check_response as _incomplete_check_response
@@ -876,9 +875,10 @@ def outlook_update_event(
     body, location) without moving the event is never blocked.
     attendees, if given, fully replaces the event's attendee list: any
     address already on the event that's left out is removed, and passing
-    an explicit empty list clears every attendee. Leave attendees unset to
-    keep the existing list untouched. timezone is only valid together with
-    start_datetime or end_datetime; omit it for an attendee-only update.
+    an explicit empty list or empty string clears every attendee. Leave
+    attendees unset to keep the existing list untouched. timezone is only
+    valid together with start_datetime or end_datetime; omit it for an
+    attendee-only update.
     Passing only one of start_datetime/end_datetime nudges a timed event
     boundary while keeping the other as-is; timezone is required and describes
     the changed boundary. Passing both together fully replaces the window, and
@@ -900,12 +900,15 @@ def outlook_update_event(
     specific occurrence when possible.
     Because a plain Graph GET does not expose a reliable timezone for an
     existing all-day window, adding attendees to one requires resubmitting both
-    boundaries with an explicit timezone. Moving or expanding an all-day event
-    into new dates while retaining attendees fails closed unless
-    ignore_conflicts=True; unchanged and shrunken date windows remain safe.
+    boundaries with an explicit timezone. Any all-day window submission that
+    retains attendees fails closed unless ignore_conflicts=True because equal
+    date labels in an unknown old timezone do not prove equal absolute windows.
     """
     try:
-        attendees_given = _attendees_were_given(attendees)
+        # Outlook's existing replacement contract treats every non-None value,
+        # including an empty string, as an explicit attendee list. Normalizing
+        # the empty string yields [], which means clear all attendees.
+        attendees_given = attendees is not None
         touches_schedule = (
             start_datetime is not None
             or end_datetime is not None
@@ -977,6 +980,14 @@ def outlook_update_event(
         existing_attendee_emails = {
             address.lower() for address in existing_attendees_raw
         }
+        desired_addresses = (
+            _normalize_addresses(attendees) if attendees_given and attendees else []
+        )
+        added_attendees = [
+            address
+            for address in desired_addresses
+            if address.lower() not in existing_attendee_emails
+        ]
 
         existing_is_all_day = bool(existing.get("isAllDay"))
         effective_is_all_day = (
@@ -1009,12 +1020,12 @@ def outlook_update_event(
         if (
             not ignore_conflicts
             and existing.get("type") == "seriesMaster"
-            and schedule_semantics_supplied
+            and (schedule_semantics_supplied or added_attendees)
         ):
             raise ValueError(
-                "Cannot safely conflict-check a schedule or timezone change to "
-                "a recurring series master because it can affect multiple "
-                "occurrences. Update a specific occurrence, or pass "
+                "Cannot safely conflict-check a schedule, timezone, or attendee "
+                "addition to a recurring series master because it can affect "
+                "multiple occurrences. Update a specific occurrence, or pass "
                 "ignore_conflicts=True only after the user confirms every "
                 "occurrence is safe."
             )
@@ -1099,14 +1110,6 @@ def outlook_update_event(
             payload["body"] = _message_body(body, "text")
         if location is not None:
             payload["location"] = {"displayName": location}
-        desired_addresses = (
-            _normalize_addresses(attendees) if attendees_given and attendees else []
-        )
-        added_attendees = [
-            address
-            for address in desired_addresses
-            if address.lower() not in existing_attendee_emails
-        ]
         if attendees_given:
             existing_by_email = {
                 attendee["emailAddress"]["address"].strip().lower(): attendee
@@ -1190,25 +1193,14 @@ def outlook_update_event(
             retained_segments: list[tuple[datetime, datetime]] = []
             if schedule_semantics_supplied and retained_attendees:
                 if existing_is_all_day:
-                    # Graph exposes existing all-day boundaries as UTC-labeled
-                    # calendar-date values, not reliable instants. They are still
-                    # safe to compare as date labels to determine whether the new
-                    # window introduces any territory. An unchanged or shrunken
-                    # window therefore needs no retained-attendee query at all.
-                    retained_segments = _window_delta_segments(
-                        snapshot_start_field.get("dateTime"),
-                        snapshot_end_field.get("dateTime"),
-                        effective_start,
-                        effective_end,
+                    raise ValueError(
+                        "Outlook does not expose a reliable timezone for the "
+                        "existing all-day window, so retained attendee conflicts "
+                        "cannot be checked safely even when the submitted date "
+                        "labels are unchanged or narrower. Retry with "
+                        "ignore_conflicts=true only after the user confirms the "
+                        "attendee availability."
                     )
-                    if retained_segments:
-                        raise ValueError(
-                            "Outlook does not expose a reliable timezone for the "
-                            "existing all-day window, so retained attendee conflicts "
-                            "cannot be checked safely for newly introduced dates. "
-                            "Retry with ignore_conflicts=true only after the user "
-                            "confirms the attendee availability."
-                        )
                 else:
                     snapshot_start = _utc_field_in_zone(
                         snapshot_start_field, "UTC"
@@ -1329,12 +1321,13 @@ def outlook_update_event(
                 )
 
         patch_headers: dict[str, str] | None = None
-        if "attendees" in payload:
+        if schedule_semantics_supplied or "attendees" in payload:
             event_etag = existing.get("@odata.etag")
             if not isinstance(event_etag, str) or not event_etag.strip():
                 raise ValueError(
-                    "Outlook did not return an event version, so attendee changes "
-                    "cannot be applied safely. Read the event again and retry."
+                    "Outlook did not return an event version, so schedule or "
+                    "attendee changes cannot be applied safely. Read the event "
+                    "again and retry."
                 )
             patch_headers = {"If-Match": event_etag.strip()}
         try:
@@ -1347,9 +1340,9 @@ def outlook_update_event(
         except _GraphRequestError as exc:
             if patch_headers and exc.status_code == 412:
                 raise ValueError(
-                    "The event changed while attendee availability was being "
-                    "checked. No update was applied; read the latest event and "
-                    "retry so recent attendee or RSVP changes are preserved."
+                    "The event changed while availability was being checked. No "
+                    "update was applied; read the latest event and retry so recent "
+                    "schedule, attendee, or RSVP changes are preserved."
                 ) from exc
             raise
         return _success(event=result)

@@ -17,7 +17,18 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+    cast,
+)
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -83,6 +94,13 @@ from ..services.user_oauth import (
     list_scoped_user_oauth_accounts,
     normalize_user_oauth_resource_owner_key,
 )
+
+if TYPE_CHECKING:
+    # Type-checking only: a real module-level import here would be a
+    # circular import (auth.py itself defers its own imports of this module
+    # into function bodies for exactly this reason) -- every runtime use
+    # imports from .auth locally at the call site instead.
+    from .auth import BuiltinOAuthRevocation
 
 logger = logging.getLogger(__name__)
 
@@ -4528,24 +4546,26 @@ def _locked_catalog_app_for_server(
 
 def _snapshot_builtin_oauth_revocations(
     db: Session, *, user_id: int, providers: Sequence[str]
-) -> list[tuple[str, str, str]]:
-    """Resolve provider-side revocation credentials for the builtin
+) -> "list[BuiltinOAuthRevocation]":
+    """Resolve provider-side revocation records for the builtin
     ``UserOAuth`` rows ``delete_scoped_user_oauth_accounts`` is about to
     delete for ``providers``.
 
     Must run before that call -- it's a bulk SQL DELETE that never loads
     rows into Python, so this is the only chance to read each row's
-    access_token. Only reads the database (see
+    access_token and provider_user_id. Only reads the database (see
     ``auth.resolve_builtin_oauth_revocation``), so it's safe to call while
     still holding the disconnect transaction's locks; the caller revokes the
-    resolved credentials only after its own commit.
+    resolved credentials only after its own commit, and only once
+    ``auth.has_other_builtin_oauth_reference`` (checked at that later point,
+    not here) confirms no other local connection still needs the grant.
     """
     from .auth import resolve_builtin_oauth_revocation
 
     if not providers:
         return []
     provider_keys = set(providers)
-    resolved: list[tuple[str, str, str]] = []
+    resolved = []
     for account in list_scoped_user_oauth_accounts(
         db, user_id=user_id, resource_owner_key=None
     ):
@@ -4555,6 +4575,9 @@ def _snapshot_builtin_oauth_revocations(
             db,
             provider=str(account.provider),
             access_token=str(account.access_token),
+            provider_user_id=(
+                str(account.provider_user_id) if account.provider_user_id else None
+            ),
         )
         if snapshot is not None:
             resolved.append(snapshot)
@@ -4570,7 +4593,7 @@ def _teardown_mcp_app_server_locally(
     expected_association_generation: UUID,
     current_user: User,
     db: Session,
-) -> tuple[int, list[_MCPOAuthGrantRevocationSnapshot], list[tuple[str, str, str]]]:
+) -> "tuple[int, list[_MCPOAuthGrantRevocationSnapshot], list[BuiltinOAuthRevocation]]":
     """Own the local teardown transaction and report what still needs revoking.
 
     The caller pins both generations during preflight. This function owns the
@@ -4591,7 +4614,7 @@ def _teardown_mcp_app_server_locally(
     teardown after this function returns and needs the id to do it.
     """
     revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
-    builtin_oauth_revocations: list[tuple[str, str, str]] = []
+    builtin_oauth_revocations: "list[BuiltinOAuthRevocation]" = []
     try:
         with db.no_autoflush:
             user_id = int(current_user.id)
@@ -4888,17 +4911,15 @@ async def teardown_mcp_app_server(
                 "MCP OAuth token revocation failed after teardown for grant %s",
                 revocation.grant_id,
             )
-    for access_token, client_id, client_secret in builtin_oauth_revocations:
-        from .auth import revoke_resolved_github_oauth_grant
+    for builtin_revocation in builtin_oauth_revocations:
+        from .auth import revoke_builtin_oauth_grant_if_unreferenced
 
         try:
-            # A blocking network call -- keep it off the event loop, same as
+            # A blocking network call (and a DB read to check for another
+            # local reference first) -- keep it off the event loop, same as
             # every other worker offload in this module.
             await asyncio.to_thread(
-                revoke_resolved_github_oauth_grant,
-                access_token,
-                client_id,
-                client_secret,
+                revoke_builtin_oauth_grant_if_unreferenced, db, builtin_revocation
             )
         except Exception:
             logger.warning(
@@ -5007,7 +5028,7 @@ async def delete_mcp_server(
             )
 
         # If it's an OAuth server, also delete the corresponding OAuth tokens
-        builtin_oauth_revocations: list[tuple[str, str, str]] = []
+        builtin_oauth_revocations: "list[BuiltinOAuthRevocation]" = []
         if server.transport == "oauth":
             # Resolve by stable identity rather than by ``server.name``.
             # ``PublicMCPApp.name`` is mutable and carries no uniqueness
@@ -5154,17 +5175,15 @@ async def delete_mcp_server(
         for snapshot in grant_revocations:
             await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
 
-        for access_token, client_id, client_secret in builtin_oauth_revocations:
-            from .auth import revoke_resolved_github_oauth_grant
+        for revocation in builtin_oauth_revocations:
+            from .auth import revoke_builtin_oauth_grant_if_unreferenced
 
             try:
-                # A blocking network call -- keep it off the event loop, same
+                # A blocking network call (and a DB read to check for another
+                # local reference first) -- keep it off the event loop, same
                 # as every other worker offload in this module.
                 await asyncio.to_thread(
-                    revoke_resolved_github_oauth_grant,
-                    access_token,
-                    client_id,
-                    client_secret,
+                    revoke_builtin_oauth_grant_if_unreferenced, db, revocation
                 )
             except Exception:
                 logger.warning(

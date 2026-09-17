@@ -11,6 +11,7 @@ from dateutil import parser as _date_parser
 from dateutil import tz as _date_tz
 from mcp.server.fastmcp import FastMCP
 
+from .outlook_recurrence import build_graph_recurrence
 from .utils import InsufficientScopeError
 from .utils import conflict_response as _conflict_response
 from .utils import datetime_key_for_comparison as _datetime_key_for_comparison
@@ -755,10 +756,12 @@ def outlook_create_event(
     attendees: list[str] | str | None = None,
     is_all_day: bool = False,
     ignore_conflicts: bool = False,
+    recurrence: str | None = None,
 ) -> str:
     """Create an Outlook calendar event.
-    The organizer's primary/default calendar is always checked for scheduling
-    conflicts, matching Outlook's free/busy availability semantics.
+    For a one-off event, the organizer's primary/default calendar is checked
+    for scheduling conflicts, matching Outlook's free/busy availability
+    semantics.
     attendees, if given, are invited by email (Graph emails them the invite)
     and their schedules are checked too; a conflict returns status="conflict"
     instead of creating the event. Pass ignore_conflicts=True to create it
@@ -767,6 +770,16 @@ def outlook_create_event(
     offset). For an all-day event, bare YYYY-MM-DD dates are also accepted and
     end_datetime is an exclusive boundary: use the following date as the end
     of a one-day event.
+    recurrence, when supplied, is one RFC 5545 RRULE with DAILY, WEEKLY,
+    MONTHLY, or YEARLY frequency; the "RRULE:" prefix is optional. For
+    example, 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z'.
+    An all-day event must use a bare-date UNTIL such as UNTIL=20260911; a
+    timed event must use a UTC UNTIL ending in Z. Supported rules are
+    translated into Microsoft Graph's structured recurrence pattern and range.
+    A recurring series cannot be fully conflict-checked from its first
+    occurrence, so recurrence requires ignore_conflicts=True after the user
+    confirms the complete series is safe. This skips availability checks for
+    both the organizer and every attendee in the series.
     """
     try:
         # Timezone validity is part of the write contract, independent of
@@ -803,6 +816,21 @@ def outlook_create_event(
         _reject_invalid_create_window(
             effective_start, effective_end, is_all_day=is_all_day
         )
+
+        graph_recurrence = None
+        if recurrence is not None:
+            graph_recurrence = build_graph_recurrence(
+                recurrence,
+                effective_start,
+                timezone,
+                is_all_day=is_all_day,
+            )
+            if not ignore_conflicts:
+                raise ValueError(
+                    "Cannot safely conflict-check every occurrence in a recurring "
+                    "series. Pass ignore_conflicts=True only after the user confirms "
+                    "the complete series schedule is safe."
+                )
 
         unchecked_attendees: list[str] = []
         check_error: str | None = None
@@ -846,6 +874,8 @@ def outlook_create_event(
             payload["location"] = {"displayName": location}
         if normalized_attendees:
             payload["attendees"] = _attendee_list(normalized_attendees)
+        if graph_recurrence is not None:
+            payload["recurrence"] = graph_recurrence
 
         result = _graph_request("POST", "/me/events", body=payload)
         return _success(event=result)

@@ -4050,3 +4050,195 @@ def test_update_event_conflict_response_still_reports_unchecked_attendees(
 
     assert result["status"] == "conflict"
     assert result["unchecked_attendees"] == ["ghost@example.com"]
+
+
+def test_create_event_sends_translated_recurrence(monkeypatch):
+    graph_request = Mock(return_value={"id": "created"})
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", Mock(return_value=([], [])))
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Daily Catch up with Bright",
+            start_datetime="2026-08-26T07:00:00",
+            end_datetime="2026-08-26T07:15:00",
+            timezone="Asia/Manila",
+            recurrence="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20260911T235959Z",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    payload = graph_request.call_args.kwargs["body"]
+    assert payload["recurrence"]["pattern"]["type"] == "weekly"
+    assert payload["recurrence"]["pattern"]["daysOfWeek"] == [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+    ]
+    # 2026-09-11T23:59:59Z is 2026-09-12 07:59:59 in Asia/Manila (+08:00) -
+    # the correct local endDate is the 12th, not the UTC calendar date.
+    assert payload["recurrence"]["range"]["endDate"] == "2026-09-12"
+
+
+def test_create_recurring_event_with_attendees_skips_availability_and_invites_series(
+    monkeypatch,
+):
+    graph_request = Mock(return_value={"id": "created"})
+    find_conflicts = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", find_conflicts)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Weekly planning",
+            start_datetime="2026-08-26T09:00:00",
+            end_datetime="2026-08-26T09:30:00",
+            attendees=["alice@example.com", "bob@example.com"],
+            recurrence="FREQ=WEEKLY;BYDAY=WE;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    find_conflicts.assert_not_called()
+    payload = graph_request.call_args.kwargs["body"]
+    assert [
+        attendee["emailAddress"]["address"] for attendee in payload["attendees"]
+    ] == ["alice@example.com", "bob@example.com"]
+    assert payload["recurrence"]["range"]["numberOfOccurrences"] == 5
+
+
+def test_create_event_rejects_invalid_recurrence_without_calling_graph(monkeypatch):
+    graph_request = Mock()
+    find_conflicts = Mock(return_value=([], []))
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", find_conflicts)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Standup",
+            start_datetime="2026-08-26T09:00:00",
+            end_datetime="2026-08-26T09:15:00",
+            recurrence="FREQ=FORTNIGHTLY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "FORTNIGHTLY" in result["message"]
+    graph_request.assert_not_called()
+    find_conflicts.assert_not_called()
+
+
+def test_create_event_rejects_explicit_empty_recurrence(monkeypatch):
+    """Match google_calendar_create_events' explicit-value precedent:
+    recurrence="" must not be silently treated the same as omitting it."""
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", Mock(return_value=([], [])))
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Standup",
+            start_datetime="2026-08-26T09:00:00",
+            end_datetime="2026-08-26T09:15:00",
+            recurrence="",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "must not be empty" in result["message"]
+    graph_request.assert_not_called()
+
+
+def test_create_event_without_recurrence_has_no_recurrence_key(monkeypatch):
+    graph_request = Mock(return_value={"id": "created"})
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", Mock(return_value=([], [])))
+
+    outlook.outlook_create_event(
+        subject="One-off",
+        start_datetime="2026-08-26T09:00:00",
+        end_datetime="2026-08-26T09:15:00",
+    )
+
+    payload = graph_request.call_args.kwargs["body"]
+    assert "recurrence" not in payload
+
+
+def test_create_all_day_event_sends_date_based_recurrence(monkeypatch):
+    graph_request = Mock(return_value={"id": "created"})
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", Mock(return_value=([], [])))
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Daily leave",
+            start_datetime="2026-08-26",
+            end_datetime="2026-08-27",
+            timezone="Pacific Standard Time",
+            is_all_day=True,
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    payload = graph_request.call_args.kwargs["body"]
+    assert payload["recurrence"] == {
+        "pattern": {"type": "daily", "interval": 1},
+        "range": {
+            "type": "endDate",
+            "startDate": "2026-08-26",
+            "endDate": "2026-09-11",
+            "recurrenceTimeZone": "Pacific Standard Time",
+        },
+    }
+
+
+def test_create_all_day_event_rejects_datetime_until_before_availability_check(
+    monkeypatch,
+):
+    graph_request = Mock()
+    find_conflicts = Mock(return_value=([], []))
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", find_conflicts)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Daily leave",
+            start_datetime="2026-08-26",
+            end_datetime="2026-08-27",
+            is_all_day=True,
+            recurrence="FREQ=DAILY;UNTIL=20260911T235959Z",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "same DATE or DATE-TIME value type" in result["message"]
+    graph_request.assert_not_called()
+    find_conflicts.assert_not_called()
+
+
+def test_create_recurring_event_requires_explicit_conflict_override(monkeypatch):
+    graph_request = Mock()
+    find_conflicts = Mock(return_value=([], []))
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", find_conflicts)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Weekly planning",
+            start_datetime="2026-08-26T09:00:00",
+            end_datetime="2026-08-26T09:30:00",
+            recurrence="FREQ=WEEKLY;BYDAY=WE;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "complete series schedule is safe" in result["message"]
+    graph_request.assert_not_called()
+    find_conflicts.assert_not_called()

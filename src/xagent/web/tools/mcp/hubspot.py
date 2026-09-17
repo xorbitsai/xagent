@@ -129,33 +129,36 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-def _paged_list(
-    path: str,
+def _bounded_page(
     list_field: str,
+    items: list[Any],
     *,
-    params: dict[str, Any],
-    after: str | None,
-    project: Callable[[list[Any]], list[Any]] = lambda items: items,
+    has_more: bool,
+    next_after: str | None,
+    retry_after: str | None,
+    **extra_fields: Any,
 ) -> str:
-    """Fetch one page from a HubSpot cursor-paginated list endpoint, project
-    its items, and halve them until the response fits the platform's
-    output limit.
+    """Serialize a cursor-paginated page of already-projected items, halving
+    them until the response fits the platform's output limit.
 
-    Unprojected HubSpot objects (full property maps) can serialize past the
-    output filter's threshold and get hard-truncated into broken JSON, the
-    same failure mode documented in google_analytics.py's list/report
-    tools. Halving (rather than a fixed slice) keeps the cap adaptive to
-    whatever property payload size a given portal's objects happen to
-    have, and continues down to zero items - a single oversized item must
-    still be capped, not silently returned whole because there's nothing
-    left to halve away from it.
+    Shared by every cursor-paginated HubSpot list/search endpoint in this
+    file (GET list endpoints via _paged_list, and the POST /search endpoint
+    via _search). Unprojected HubSpot objects (full property maps) can
+    serialize past the output filter's threshold and get hard-truncated
+    into broken JSON, the same failure mode documented in
+    google_analytics.py's list/report tools. Halving (rather than a fixed
+    slice) keeps the cap adaptive to whatever property payload size a given
+    portal's objects happen to have, and continues down to zero items - a
+    single oversized item must still be capped, not silently returned whole
+    because there's nothing left to halve away from it.
 
-    On truncation, the returned ``after`` is deliberately this call's own
-    input cursor, not the server's next-page cursor: the server already
-    considers the full (untruncated) page consumed, so advancing to its
-    next page would permanently skip whatever this page didn't return for
-    space reasons. Retrying with the same ``after`` and a smaller ``limit``
-    is what actually surfaces the trimmed entries.
+    On truncation, the returned ``after`` is deliberately ``retry_after``
+    (the caller's own input cursor), not the server's next-page cursor
+    (``next_after``): the server already considers the full (untruncated)
+    page consumed, so advancing to its next page would permanently skip
+    whatever this page didn't return for space reasons. Retrying with the
+    same cursor and a smaller ``limit`` is what actually surfaces the
+    trimmed entries.
 
     The explanatory "dead end" message added when halving collapses to
     zero items is itself re-checked against the size limit before being
@@ -163,22 +166,14 @@ def _paged_list(
     converged could push an already-fitted response back over the limit,
     the exact failure mode this function exists to prevent.
     """
-    result = _request("GET", path, params=params)
-    next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
-    # result.get("results", []) only substitutes the default when the key
-    # is ABSENT, not when HubSpot returns it as an explicit JSON null (key
-    # present, value None) - `or []` catches that too, so every caller of
-    # this function (including one with no custom `project`, which would
-    # otherwise pass None straight through) gets a list either way.
-    items = project(result.get("results") or [])
-
     max_output_length = get_tool_max_output_length()
     truncated = False
     payload = {
         list_field: items,
         "truncated": truncated,
-        "has_more": bool(next_after),
+        "has_more": has_more,
         "after": next_after,
+        **extra_fields,
     }
     response = _success(**payload)
     while len(response) > max_output_length and items:
@@ -188,7 +183,8 @@ def _paged_list(
             list_field: items,
             "truncated": truncated,
             "has_more": True,
-            "after": after,
+            "after": retry_after,
+            **extra_fields,
         }
         response = _success(**payload)
     if truncated and not items:
@@ -219,6 +215,33 @@ def _paged_list(
         if len(response_with_message) <= max_output_length:
             response = response_with_message
     return response
+
+
+def _paged_list(
+    path: str,
+    list_field: str,
+    *,
+    params: dict[str, Any],
+    after: str | None,
+    project: Callable[[list[Any]], list[Any]] = lambda items: items,
+) -> str:
+    """Fetch one page from a HubSpot cursor-paginated GET list endpoint and
+    project its items - see _bounded_page for the output-size handling."""
+    result = _request("GET", path, params=params)
+    next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
+    # result.get("results", []) only substitutes the default when the key
+    # is ABSENT, not when HubSpot returns it as an explicit JSON null (key
+    # present, value None) - `or []` catches that too, so every caller of
+    # this function (including one with no custom `project`, which would
+    # otherwise pass None straight through) gets a list either way.
+    items = project(result.get("results") or [])
+    return _bounded_page(
+        list_field,
+        items,
+        has_more=bool(next_after),
+        next_after=next_after,
+        retry_after=after,
+    )
 
 
 def _require_date_format(
@@ -415,7 +438,8 @@ def _search(
     limit: int,
     query: str | None = None,
     filter_groups_json: str | None = None,
-) -> dict[str, Any]:
+    after: str | None = None,
+) -> str:
     """Free-text search, property filtering, or both, against one HubSpot
     CRM object type's /search endpoint.
 
@@ -426,6 +450,13 @@ def _search(
     arbitrary, unfiltered page that looks like a real match - the
     `hubspot_list_{object_type}` tool exists specifically for that case and
     says so up front instead of a plausible-looking but meaningless result.
+
+    `after` is HubSpot's search-cursor - pass back the `after` this call
+    returns to fetch the next page, the same cursor contract as
+    hubspot_list_{object_type}. Results are also routed through
+    _bounded_page (see its docstring) since an unprojected page of up to
+    100 records can otherwise serialize past the output filter's threshold
+    and get hard-truncated into invalid JSON.
     """
     query = query.strip() if query else None
     filter_groups = (
@@ -445,11 +476,19 @@ def _search(
         body["query"] = query
     if filter_groups:
         body["filterGroups"] = filter_groups
+    if after:
+        body["after"] = after
     result = _request("POST", f"/crm/v3/objects/{object_type}/search", body=body)
-    return {
-        "total": result.get("total") or 0,
-        "results": _project_id_and_properties(result.get("results", [])),
-    }
+    next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
+    items = _project_id_and_properties(result.get("results") or [])
+    return _bounded_page(
+        "results",
+        items,
+        has_more=bool(next_after),
+        next_after=next_after,
+        retry_after=after,
+        total=result.get("total") or 0,
+    )
 
 
 @mcp.tool()
@@ -457,6 +496,7 @@ def hubspot_search_contacts(
     query: str | None = None,
     filter_groups_json: str | None = None,
     limit: int = 10,
+    after: str | None = None,
 ) -> str:
     """
     Search HubSpot contacts by free-text query (matches name, email, phone,
@@ -475,16 +515,23 @@ def hubspot_search_contacts(
     every contact with no query or filter at all, use hubspot_list_contacts
     instead - it's the more direct tool for that and doesn't need an empty
     search body.
+
+    Returns at most `limit` contacts (max 100); `has_more` is true when
+    there are more matches past this page, either because of `limit` or
+    because the response was trimmed to fit the output size limit
+    (`truncated` is then also true). Pass the returned `after` cursor to
+    retrieve the next page; if `truncated` is true because results were
+    trimmed, retry that same cursor with a smaller `limit`.
     """
     try:
-        found = _search(
+        return _search(
             "contacts",
             DEFAULT_CONTACT_PROPERTIES,
             limit,
             query=query,
             filter_groups_json=filter_groups_json,
+            after=after,
         )
-        return _success(**found)
     except Exception as e:
         logger.error(f"Error searching contacts: {e}")
         return _error(str(e))
@@ -554,6 +601,7 @@ def hubspot_search_companies(
     query: str | None = None,
     filter_groups_json: str | None = None,
     limit: int = 10,
+    after: str | None = None,
 ) -> str:
     """
     Search HubSpot companies by free-text query (matches name, domain), by
@@ -563,16 +611,19 @@ def hubspot_search_companies(
     array - see hubspot_search_contacts for the exact shape and operator
     semantics. To list every company with no query or filter at all, use
     hubspot_list_companies instead.
+
+    Returns at most `limit` companies (max 100); `has_more`/`truncated`/
+    `after` behave as in hubspot_search_contacts.
     """
     try:
-        found = _search(
+        return _search(
             "companies",
             DEFAULT_COMPANY_PROPERTIES,
             limit,
             query=query,
             filter_groups_json=filter_groups_json,
+            after=after,
         )
-        return _success(**found)
     except Exception as e:
         logger.error(f"Error searching companies: {e}")
         return _error(str(e))
@@ -843,6 +894,7 @@ def hubspot_search_deals(
     query: str | None = None,
     filter_groups_json: str | None = None,
     limit: int = 10,
+    after: str | None = None,
 ) -> str:
     """
     Search HubSpot deals by property filters (stage, pipeline, amount,
@@ -857,19 +909,22 @@ def hubspot_search_deals(
     "EQ", "value": "appointmentscheduled"}]}]' - see hubspot_search_contacts
     for the exact shape and operator semantics.
 
+    Returns at most `limit` deals (max 100); `has_more`/`truncated`/`after`
+    behave as in hubspot_search_contacts.
+
     For every deal tied to one contact or company, hubspot_get_contact_deals
     / hubspot_get_company_deals are cheaper and don't need a filter. To list
     every deal in the portal with no query or filter, use hubspot_list_deals.
     """
     try:
-        found = _search(
+        return _search(
             "deals",
             DEFAULT_DEAL_PROPERTIES,
             limit,
             query=query,
             filter_groups_json=filter_groups_json,
+            after=after,
         )
-        return _success(**found)
     except Exception as e:
         logger.error(f"Error searching deals: {e}")
         return _error(str(e))

@@ -2279,6 +2279,77 @@ def test_search_hits_the_expected_search_endpoint(monkeypatch, tool, path):
 
 
 @pytest.mark.parametrize(
+    "tool",
+    [
+        hubspot.hubspot_search_contacts,
+        hubspot.hubspot_search_companies,
+        hubspot.hubspot_search_deals,
+    ],
+)
+def test_search_passes_after_cursor_and_reports_next_one(monkeypatch, tool):
+    """Regression: _search used to drop paging.next.after entirely, so a
+    search matching more records than one page could never be paged past
+    its first page - the caller had no cursor to ask for the rest."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "total": 2,
+                "results": [{"id": "1", "properties": {}}],
+                "paging": {"next": {"after": "server-next-cursor"}},
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(tool(query="acme", after="caller-cursor"))
+
+    assert mock_request.call_args.kwargs["json"]["after"] == "caller-cursor"
+    assert result["has_more"] is True
+    assert result["after"] == "server-next-cursor"
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        hubspot.hubspot_search_contacts,
+        hubspot.hubspot_search_companies,
+        hubspot.hubspot_search_deals,
+    ],
+)
+def test_search_truncates_an_oversized_page_into_valid_json(monkeypatch, tool):
+    """Regression: _search returned the full projected page straight to
+    _success with no size cap, unlike every other list/search-shaped tool
+    in this file - a wide page of real-sized property payloads could get
+    hard-truncated by the platform's output filter into invalid JSON. This
+    mirrors test_paged_list_reports_input_after_not_next_after_when_truncated
+    for the search path: a truncated page must report the caller's own
+    input cursor, not the server's next-page cursor, since the server
+    already considers the full (untruncated) page consumed."""
+    records = [{"id": str(i), "properties": {"name": "x" * 200}} for i in range(8)]
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "total": 8,
+                "results": records,
+                "paging": {"next": {"after": "server-next-cursor"}},
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 500)
+
+    raw = tool(query="acme", after="caller-input-cursor")
+    result = json.loads(raw)
+
+    assert len(raw) <= 500
+    assert result["status"] == "success"
+    assert 0 < len(result["results"]) < 8
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["after"] == "caller-input-cursor"
+
+
+@pytest.mark.parametrize(
     "tool, list_tool_name",
     [
         (hubspot.hubspot_search_contacts, "hubspot_list_contacts"),
@@ -2327,7 +2398,14 @@ def test_search_contacts_handles_an_explicit_null_total(monkeypatch):
 
     result = json.loads(hubspot.hubspot_search_contacts(query="acme"))
 
-    assert result == {"status": "success", "total": 0, "results": []}
+    assert result == {
+        "status": "success",
+        "results": [],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+        "total": 0,
+    }
 
 
 def test_search_companies_sends_filter_groups(monkeypatch):
@@ -2386,8 +2464,11 @@ def test_search_deals_hits_the_deals_search_endpoint(monkeypatch):
 
     assert result == {
         "status": "success",
-        "total": 1,
         "results": [{"id": "d1", "properties": {"dealstage": "qualifiedtobuy"}}],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+        "total": 1,
     }
     assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/deals/search")
     body = mock_request.call_args.kwargs["json"]

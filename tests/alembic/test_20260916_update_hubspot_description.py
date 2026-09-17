@@ -1,6 +1,7 @@
 """Tests for updating the HubSpot connector's description."""
 
 import importlib.util
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +18,20 @@ def _load_migration_module():
     )
     spec = importlib.util.spec_from_file_location(
         "update_hubspot_description_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_previous_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260914_add_hubspot_deals_write_scope.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_hubspot_deals_write_scope_migration", migration_file
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -247,3 +262,72 @@ def test_migration_fields_match_registry():
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "hubspot"
     )
     assert registry_row["description"] == migration.CURRENT_DESCRIPTION
+
+
+def test_previous_description_chains_from_the_prior_migration():
+    """This migration's PREVIOUS_DESCRIPTION must exactly equal 20260914's
+    CURRENT_DESCRIPTION - not just "close enough" - or the two migrations'
+    downgrade() calls stop being inverses of each other. This exact coupling
+    already broke once for the analogous 20260810/20260914 pair (see that
+    migration's own test_previous_fields_chain_from_the_prior_migration): a
+    historical migration's CURRENT_DESCRIPTION got bumped forward to match
+    the live registry, which desynced it from a later migration's
+    PREVIOUS_DESCRIPTION and broke the sequential downgrade chain. This test
+    pins the invariant directly instead of relying on it only showing up as
+    a full-chain downgrade failure.
+    """
+    migration = _load_migration_module()
+    previous_migration = _load_previous_migration_module()
+    assert migration.PREVIOUS_DESCRIPTION == previous_migration.CURRENT_DESCRIPTION
+
+
+def test_sequential_downgrade_from_head_restores_a_consistent_pre_0914_row():
+    """Downgrading head (this migration, then 20260914) must land on
+    20260914's PREVIOUS_DESCRIPTION *and* PREVIOUS_SCOPES together - a
+    consistent pre-deals-write snapshot - not a description from one
+    migration paired with scopes left over from another. A stale
+    CURRENT_DESCRIPTION on either migration would leave a description that
+    still claims deal-write capability after 20260914.downgrade() has
+    already revoked the crm.objects.deals.write scope.
+    """
+    migration = _load_migration_module()
+    previous_migration = _load_previous_migration_module()
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    description TEXT,
+                    oauth_scopes JSON
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, oauth_scopes, description) "
+                "VALUES ('hubspot', :scopes, :description)"
+            ),
+            {
+                "scopes": json.dumps(previous_migration.PREVIOUS_SCOPES),
+                "description": previous_migration.PREVIOUS_DESCRIPTION,
+            },
+        )
+        ops = _operations(connection)
+        with patch.object(previous_migration, "op", ops):
+            previous_migration.upgrade()
+        with patch.object(migration, "op", ops):
+            migration.upgrade()
+            migration.downgrade()
+        with patch.object(previous_migration, "op", ops):
+            previous_migration.downgrade()
+
+        row = connection.execute(
+            text("SELECT description, oauth_scopes FROM public_mcp_apps")
+        ).one()
+        description, scopes = row[0], json.loads(row[1])
+        assert description == previous_migration.PREVIOUS_DESCRIPTION
+        assert scopes == previous_migration.PREVIOUS_SCOPES

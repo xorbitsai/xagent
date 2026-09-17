@@ -2347,6 +2347,7 @@ def test_search_truncates_an_oversized_page_into_valid_json(monkeypatch, tool):
     assert result["truncated"] is True
     assert result["has_more"] is True
     assert result["after"] == "caller-input-cursor"
+    assert result["total"] == 8
 
 
 @pytest.mark.parametrize(
@@ -2371,6 +2372,33 @@ def test_search_rejects_no_query_and_no_filter(monkeypatch, tool, list_tool_name
 
     assert result["status"] == "error"
     assert list_tool_name in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        hubspot.hubspot_search_contacts,
+        hubspot.hubspot_search_companies,
+        hubspot.hubspot_search_deals,
+    ],
+)
+def test_search_rejects_after_alone_with_a_more_specific_message(monkeypatch, tool):
+    """Regression: adding `after` must not make a criteria-less call look
+    reachable via a documented-looking continuation flow. A caller with a
+    page-2+ cursor already had real search criteria on page 1 - this
+    endpoint is stateless and doesn't remember it, so `after` alone (query/
+    filter_groups_json dropped) must still be rejected, with a message
+    that says to resend the original criteria rather than pointing at
+    hubspot_list_* (which would drop the search criteria entirely)."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(tool(after="cursor-from-page-1"))
+
+    assert result["status"] == "error"
+    assert "after" in result["message"]
+    assert "list" not in result["message"]
     mock_request.assert_not_called()
 
 

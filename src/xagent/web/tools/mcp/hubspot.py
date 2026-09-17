@@ -129,6 +129,12 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
+def _next_cursor(result: dict[str, Any]) -> str | None:
+    """The next-page cursor from a HubSpot cursor-paginated response
+    (GET list or POST search alike - both nest it the same way)."""
+    return ((result.get("paging") or {}).get("next") or {}).get("after")
+
+
 def _bounded_page(
     list_field: str,
     items: list[Any],
@@ -136,7 +142,7 @@ def _bounded_page(
     has_more: bool,
     next_after: str | None,
     retry_after: str | None,
-    **extra_fields: Any,
+    total: int | None = None,
 ) -> str:
     """Serialize a cursor-paginated page of already-projected items, halving
     them until the response fits the platform's output limit.
@@ -168,13 +174,14 @@ def _bounded_page(
     """
     max_output_length = get_tool_max_output_length()
     truncated = False
-    payload = {
+    payload: dict[str, Any] = {
         list_field: items,
         "truncated": truncated,
         "has_more": has_more,
         "after": next_after,
-        **extra_fields,
     }
+    if total is not None:
+        payload["total"] = total
     response = _success(**payload)
     while len(response) > max_output_length and items:
         items = items[: len(items) // 2]
@@ -184,8 +191,9 @@ def _bounded_page(
             "truncated": truncated,
             "has_more": True,
             "after": retry_after,
-            **extra_fields,
         }
+        if total is not None:
+            payload["total"] = total
         response = _success(**payload)
     if truncated and not items:
         # Collapsing all the way to zero means even the single largest
@@ -228,7 +236,7 @@ def _paged_list(
     """Fetch one page from a HubSpot cursor-paginated GET list endpoint and
     project its items - see _bounded_page for the output-size handling."""
     result = _request("GET", path, params=params)
-    next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
+    next_after = _next_cursor(result)
     # result.get("results", []) only substitutes the default when the key
     # is ABSENT, not when HubSpot returns it as an explicit JSON null (key
     # present, value None) - `or []` catches that too, so every caller of
@@ -463,6 +471,17 @@ def _search(
         _parse_filter_groups(filter_groups_json) if filter_groups_json else None
     )
     if not query and not filter_groups:
+        if after:
+            # A continuation call: the caller has a page-2+ cursor, so they
+            # already had real search criteria on page 1 - this endpoint is
+            # stateless and doesn't remember it, so it must be resent
+            # alongside `after` on every page, not just the first.
+            raise ValueError(
+                f"hubspot_search_{object_type} needs a query or "
+                f"filter_groups_json on every call, including this one with "
+                f"`after` set - resend the same query/filter_groups_json you "
+                f"used to get this `after` cursor, not `after` alone."
+            )
         raise ValueError(
             f"hubspot_search_{object_type} needs a query or filter_groups_json "
             f"- to list every {object_type} with neither, use "
@@ -479,7 +498,7 @@ def _search(
     if after:
         body["after"] = after
     result = _request("POST", f"/crm/v3/objects/{object_type}/search", body=body)
-    next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
+    next_after = _next_cursor(result)
     items = _project_id_and_properties(result.get("results") or [])
     return _bounded_page(
         "results",
@@ -519,9 +538,12 @@ def hubspot_search_contacts(
     Returns at most `limit` contacts (max 100); `has_more` is true when
     there are more matches past this page, either because of `limit` or
     because the response was trimmed to fit the output size limit
-    (`truncated` is then also true). Pass the returned `after` cursor to
-    retrieve the next page; if `truncated` is true because results were
-    trimmed, retry that same cursor with a smaller `limit`.
+    (`truncated` is then also true). To retrieve the next page, call again
+    with the SAME `query`/`filter_groups_json` plus the returned `after`
+    cursor - HubSpot's search endpoint is stateless, so `after` alone
+    without resending the original criteria is rejected the same as
+    calling with no criteria at all. If `truncated` is true because results
+    were trimmed, retry that same cursor with a smaller `limit`.
     """
     try:
         return _search(

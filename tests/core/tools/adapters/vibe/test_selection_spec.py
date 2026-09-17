@@ -200,6 +200,9 @@ class _FakeConfig:
     def get_max_recursion_depth(self):  # noqa: D401
         return None
 
+    def get_max_structured_truncate_input_chars(self):  # noqa: D401
+        return None
+
 
 async def test_registry_runs_all_creators_when_spec_none(isolated_registry):
     """Backward-compat path: ``spec=None`` (or no spec attribute) means

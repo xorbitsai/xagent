@@ -411,6 +411,15 @@ class BaseToolConfig(ABC):
         """
         return _root_config.get_tool_max_recursion_depth()
 
+    def get_max_structured_truncate_input_chars(self) -> int:
+        """Get the size threshold above which JSON-aware output truncation
+        is skipped in favor of a plain character slice.
+
+        Reads from XAGENT_TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS env var
+        if set. See :mod:`xagent.config` for details.
+        """
+        return _root_config.get_tool_max_structured_truncate_input_chars()
+
 
 class ToolConfig(BaseToolConfig):
     """Tool configuration that uses provided config dict for standalone usage."""

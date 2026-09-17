@@ -140,6 +140,9 @@ class _FakeConfig:
     def get_max_recursion_depth(self):
         return 10
 
+    def get_max_structured_truncate_input_chars(self):
+        return 10_000_000
+
 
 _UNIVERSE = ["web_search", "python_executor", "mcp__server__do_thing"]
 

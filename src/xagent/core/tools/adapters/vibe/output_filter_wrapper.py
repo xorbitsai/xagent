@@ -70,6 +70,7 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         max_chars: int,
         max_fields: int,
         max_recursion: int,
+        max_structured_truncate_input_chars: int = 10_000_000,
     ):
         """
         Initialize output filter wrapper.
@@ -79,11 +80,16 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
             max_chars: Maximum output length in characters.
             max_fields: Maximum number of fields/items in dict/list.
             max_recursion: Maximum recursion depth.
+            max_structured_truncate_input_chars: Size threshold above which
+                JSON-aware output truncation is skipped in favor of a plain
+                character slice.
         """
         self._target = target_tool
 
         # Create output filter
-        self._filter = OutputValueFilter(max_chars, max_fields, max_recursion)
+        self._filter = OutputValueFilter(
+            max_chars, max_fields, max_recursion, max_structured_truncate_input_chars
+        )
 
     @property
     def is_sandboxed(self) -> bool:

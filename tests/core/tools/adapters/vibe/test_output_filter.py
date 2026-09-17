@@ -8,6 +8,7 @@ from xagent.config import (
     get_tool_max_field_count,
     get_tool_max_output_length,
     get_tool_max_recursion_depth,
+    get_tool_max_structured_truncate_input_chars,
 )
 from xagent.core.tools.adapters.vibe.output_filter import (
     CIRCULAR_REFERENCE_MESSAGE,
@@ -24,15 +25,21 @@ from xagent.core.tools.adapters.vibe.output_filter import (
 DEFAULT_MAX_OUTPUT_LENGTH = get_tool_max_output_length()
 DEFAULT_MAX_FIELDS = get_tool_max_field_count()
 DEFAULT_MAX_RECURSION = get_tool_max_recursion_depth()
+DEFAULT_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS = (
+    get_tool_max_structured_truncate_input_chars()
+)
 
 
 def _create_filter(
     max_chars: int = DEFAULT_MAX_OUTPUT_LENGTH,
     max_fields: int = DEFAULT_MAX_FIELDS,
     max_recursion: int = DEFAULT_MAX_RECURSION,
+    max_structured_truncate_input_chars: int = DEFAULT_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS,
 ) -> OutputValueFilter:
     """Helper to create filter with default values."""
-    return OutputValueFilter(max_chars, max_fields, max_recursion)
+    return OutputValueFilter(
+        max_chars, max_fields, max_recursion, max_structured_truncate_input_chars
+    )
 
 
 def test_string_within_limit():
@@ -538,8 +545,8 @@ def test_json_truncation_falls_back_gracefully_on_deep_nesting():
     assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
 
 
-def test_find_largest_list_does_not_reserialize_subtrees():
-    """`_find_largest_list` must size candidate lists without calling
+def test_find_trim_candidates_does_not_reserialize_subtrees():
+    """`_find_trim_candidates` must size candidate lists without calling
     `json.dumps` on them - re-serializing whole subtrees at every nesting
     level is what made the previous implementation quadratic (or worse) for
     JSON with several levels of nesting, which real hierarchical API
@@ -551,13 +558,13 @@ def test_find_largest_list_does_not_reserialize_subtrees():
     nested = {"a": [1, 2], "b": {"c": list(range(50)), "d": [{"e": [1]}]}}
 
     with mock.patch("json.dumps") as mocked_dumps:
-        result = _create_filter()._find_largest_list(nested)
+        result = _create_filter()._find_trim_candidates(nested)
 
     mocked_dumps.assert_not_called()
-    assert result == list(range(50))
+    assert result[0] == list(range(50))
 
 
-def test_find_largest_list_prefers_item_count_over_size():
+def test_find_trim_candidates_prefers_item_count_over_size():
     """A direct unit test on the selector itself, not just end-to-end through
     `.filter()`: when a list with fewer (but individually larger) items and a
     list with more (but individually smaller) items disagree, item count
@@ -572,9 +579,23 @@ def test_find_largest_list_prefers_item_count_over_size():
     many_but_small = [str(i) for i in range(20)]  # 20 items, ~30 chars total
     data = {"few_but_big": few_but_big, "many_but_small": many_but_small}
 
-    result = _create_filter()._find_largest_list(data)
+    result = _create_filter()._find_trim_candidates(data)
 
-    assert result is many_but_small
+    assert result[0] is many_but_small
+    assert result[1] is few_but_big
+
+
+def test_find_trim_candidates_ranks_all_qualifying_lists():
+    """`_find_trim_candidates` must return every qualifying list, ranked, not
+    just the single best one - this is what lets _try_json_truncate retry a
+    lower-ranked candidate when the top-ranked one can't be usefully
+    trimmed (see test_json_truncation_retries_next_candidate_when_top_one_
+    cannot_absorb_overflow)."""
+    data = {"a": [1, 2, 3], "b": [1, 2], "c": "not a list", "d": [1]}
+
+    result = _create_filter()._find_trim_candidates(data)
+
+    assert result == [data["a"], data["b"]]  # "d" excluded: only 1 item
 
 
 def test_json_truncation_ignores_single_item_envelope_wrapper():
@@ -594,9 +615,10 @@ def test_json_truncation_ignores_single_item_envelope_wrapper():
     result = filter.filter(payload, "test_tool")
     parsed = json.loads(result)
 
+    assert len(result) <= 300
     assert parsed["status"] == "ok"
     kept = parsed["results"][0]["items"]
-    assert len(kept) > 0, "wrapper should not swallow all real data"
+    assert 0 < len(kept) < 100, "expected real trimming, not just compaction"
     assert kept[0] == {"id": 0, "name": "row-0"}
 
 
@@ -825,24 +847,19 @@ def test_json_truncation_skips_pathologically_large_input():
     """Above the structured-truncation size safety valve, the JSON-aware path
     must bail out before ever parsing the input, rather than pay the
     repeated re-serialization cost a large structure would incur. Asserting
-    that `json.loads` is never called (with the threshold patched down, so
-    the test doesn't need a real multi-megabyte payload) is deterministic,
+    that `json.loads` is never called (with the threshold constructed small,
+    so the test doesn't need a real multi-megabyte payload) is deterministic,
     unlike a wall-clock timing assertion."""
     from unittest import mock
 
     data = {"data": list(range(50))}
     payload = json.dumps(data)
-    filter = _create_filter(max_chars=20)
-    assert 10 < len(payload)  # sanity: bigger than max_chars and the patched
-    # threshold below, so _try_json_truncate is actually entered.
+    filter = _create_filter(max_chars=20, max_structured_truncate_input_chars=10)
+    assert 10 < len(payload)  # sanity: bigger than max_chars and the
+    # constructed threshold, so _try_json_truncate is actually entered.
 
-    original_limit = OutputValueFilter._MAX_STRUCTURED_TRUNCATE_INPUT_CHARS
-    OutputValueFilter._MAX_STRUCTURED_TRUNCATE_INPUT_CHARS = 10
-    try:
-        with mock.patch("json.loads") as mocked_loads:
-            result = filter.filter(payload, "test_tool")
-    finally:
-        OutputValueFilter._MAX_STRUCTURED_TRUNCATE_INPUT_CHARS = original_limit
+    with mock.patch("json.loads") as mocked_loads:
+        result = filter.filter(payload, "test_tool")
 
     mocked_loads.assert_not_called()
     assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
@@ -884,3 +901,91 @@ def test_json_truncation_survives_oversized_integer():
     result = filter.filter(payload, "test_tool")  # must not raise
 
     assert result.endswith(DEFAULT_TRUNCATION_MESSAGE)
+
+
+def test_json_truncation_survives_nan_outside_trim_target():
+    """A regression found via review: allow_nan=False applied to the WHOLE
+    parsed structure meant a single NaN/Infinity anywhere - even in a field
+    completely unrelated to the list being trimmed - made every candidate's
+    serialization fail, so best_serialized was never set and the payload
+    fell through to the raw-slice fallback (invalid JSON), even though the
+    NaN has nothing to do with whether the real data list can be trimmed to
+    fit. Sanitizing non-finite floats to null during _cap_max_fields (before
+    any serialization is attempted) fixes this regardless of where the
+    non-finite value lives."""
+    data = {
+        "meta": float("nan"),
+        "data": [{"id": i, "name": f"row-{i}"} for i in range(100)],
+    }
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=500)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)  # must not raise
+
+    assert parsed["meta"] is None
+    assert 0 < len(parsed["data"]) < 100
+
+
+def test_json_truncation_retries_next_candidate_when_top_one_cannot_absorb_overflow():
+    """A regression found via review: ranking by item count first can still
+    rank a list first that, once trimmed all the way to zero items, still
+    can't bring the payload under budget - because its own items are small,
+    it was never going to reclaim much space regardless of how it's picked.
+    The previous single-candidate implementation gave up at that point, even
+    though a different (lower-ranked, but individually larger-item) list
+    could have been trimmed instead to fit. `codes` (20 tiny ints) ranks
+    above `records` (10 large strings) by item count, but only trimming
+    `records` can actually satisfy the budget."""
+    data = {"codes": list(range(20)), "records": ["x" * 200 for _ in range(10)]}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=800)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)  # must not raise
+
+    assert parsed["codes"] == list(range(20)), "codes should be untouched"
+    assert 0 < len(parsed["records"]) < 10
+
+
+def test_json_truncation_redacts_past_max_recursion_like_native_path():
+    """A regression found via review: _cap_max_fields returned deep subtrees
+    unchanged past max_recursion instead of substituting
+    NESTED_TOO_DEEP_MESSAGE (as _filter_with_depth does for native
+    dict/list values), and was always entered at depth=0 regardless of how
+    deep the JSON string itself sat in the outer structure - so a tool that
+    pre-serializes a deeply nested result to a JSON string escaped the
+    depth-based redaction entirely. Depth must now be threaded through and
+    continue counting from where the string was found."""
+    secret = "TOP-SECRET-VALUE"
+    inner_json_str = json.dumps({"a": {"b": {"c": [secret] * 50}}})
+    # Native nesting already 3 levels deep by the time the string is reached.
+    native = {"l1": {"l2": {"l3": inner_json_str}}}
+
+    filter = _create_filter(max_chars=100, max_recursion=5)
+    result = filter.filter(native, "test_tool")
+
+    serialized = json.dumps(result)
+    assert secret not in serialized
+    assert NESTED_TOO_DEEP_MESSAGE in serialized
+
+
+def test_json_truncation_compact_log_reflects_field_cap(caplog):
+    """A regression found via review: the "no items dropped" log message was
+    emitted even when _cap_max_fields had already dropped items via
+    max_fields before the compact re-serialization was attempted - so the
+    log claimed nothing was lost while the returned payload actually
+    contained a "... and N more items" marker."""
+    import logging
+
+    data = {"data": [f"item-{i:04d}" for i in range(500)]}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=3000, max_fields=10)
+
+    with caplog.at_level(logging.INFO):
+        result = filter.filter(payload, "test_tool")
+
+    assert "... and 490 more items" in result
+    assert not any("no items dropped" in record.message for record in caplog.records), (
+        "log claims nothing was dropped, but max_fields capping dropped 490 items"
+    )

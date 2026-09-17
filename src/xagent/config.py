@@ -154,6 +154,9 @@ TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
 TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
+TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS = (
+    "XAGENT_TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS"
+)
 MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
 
 WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
@@ -1917,6 +1920,32 @@ def get_tool_max_field_count() -> int:
         except ValueError:
             logger.warning("Invalid TOOL_MAX_FIELDS value: {env_str}")
     return 1000
+
+
+def get_tool_max_structured_truncate_input_chars() -> int:
+    """Get the size threshold above which JSON-aware output truncation is
+    skipped in favor of a plain O(1) character slice.
+
+    Structure-aware truncation (parsing an oversized JSON string, capping
+    field counts, and binary-searching how many list items fit) re-serializes
+    the parsed structure repeatedly, which is worth it for the moderately
+    oversized payloads this feature targets but would cost real CPU time on
+    pathologically large input.
+
+    Returns:
+        Maximum input length (in characters) from
+        TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS env var, or 10,000,000 by
+        default.
+    """
+    env_str = os.getenv(TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS)
+    if env_str:
+        try:
+            return int(env_str)
+        except ValueError:
+            logger.warning(
+                "Invalid TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS value: {env_str}"
+            )
+    return 10_000_000
 
 
 def get_max_trace_payload_bytes() -> int:

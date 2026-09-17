@@ -461,6 +461,9 @@ class ToolFactory:
         max_chars = config.get_max_output_length()
         max_fields = config.get_max_field_count()
         max_recursion = config.get_max_recursion_depth()
+        max_structured_truncate_input_chars = (
+            config.get_max_structured_truncate_input_chars()
+        )
 
         filtered_tools: list[Tool] = []
         for tool in tools:
@@ -471,6 +474,7 @@ class ToolFactory:
                     max_chars=max_chars,
                     max_fields=max_fields,
                     max_recursion=max_recursion,
+                    max_structured_truncate_input_chars=max_structured_truncate_input_chars,
                 )
                 filtered_tools.append(wrapper)
             else:

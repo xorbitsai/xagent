@@ -50,6 +50,9 @@ class _FakeConfig:
     def get_max_recursion_depth(self):
         return 5
 
+    def get_max_structured_truncate_input_chars(self):
+        return 10_000_000
+
 
 class _FailingPrepareConfig:
     def __init__(self, calls: list[str]) -> None:

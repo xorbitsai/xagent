@@ -184,6 +184,9 @@ class _FakeConfig:
     def get_max_recursion_depth(self) -> None:
         return None
 
+    def get_max_structured_truncate_input_chars(self) -> None:
+        return None
+
 
 @pytest.mark.parametrize(
     ("spec", "expected"),

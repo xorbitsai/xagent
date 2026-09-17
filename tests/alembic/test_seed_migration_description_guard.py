@@ -31,7 +31,10 @@ def _parse(path: Path) -> ast.Module:
 
 
 def _module_app_id(tree: ast.Module) -> str | None:
-    for node in ast.walk(tree):
+    # Only the module's top-level statements, not ast.walk(tree) -- APP_ID is
+    # a module-level constant by convention, and walking the whole tree would
+    # false-positive on a same-named local inside some other function.
+    for node in tree.body:
         if (
             isinstance(node, ast.Assign)
             and any(isinstance(t, ast.Name) and t.id == "APP_ID" for t in node.targets)
@@ -42,20 +45,10 @@ def _module_app_id(tree: ast.Module) -> str | None:
     return None
 
 
-def _defines_original_description_guard(tree: ast.Module) -> bool:
-    """True if the module defines a module-level "_ORIGINAL_..." constant,
-    the marker of the accept-original-or-current-text fix applied to
-    20260826_seed_deputy_mcp_app.py."""
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id.startswith("_ORIGINAL_"):
-                    return True
-    return False
-
-
 def _downgrade_function(tree: ast.Module) -> ast.FunctionDef | None:
-    for node in ast.walk(tree):
+    # Top-level only, for the same reason as _module_app_id: downgrade() is
+    # always a module-level function in these migrations.
+    for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name == "downgrade":
             return node
     return None
@@ -91,9 +84,14 @@ def _is_vulnerable(seed_path: Path, description_update_app_ids: set[str]) -> boo
         return False
     if app_id not in description_update_app_ids:
         return False
-    return _has_naive_description_guard(
-        downgrade
-    ) and not _defines_original_description_guard(tree)
+    # Deliberately not also gated on "does the module define an _ORIGINAL_
+    # constant": that alone doesn't prove the naive equality check was
+    # actually replaced, only that a same-named constant exists somewhere in
+    # the file. A migration is only actually protected once "description" is
+    # gone from the compare_columns set _has_naive_description_guard checks
+    # below -- exactly what the real fix (20260826_seed_deputy_mcp_app.py)
+    # does.
+    return _has_naive_description_guard(downgrade)
 
 
 def _seed_migrations() -> list[Path]:
@@ -137,10 +135,11 @@ def test_seed_migrations_with_paired_description_migration_guard_description_saf
 
 def test_is_vulnerable_flags_the_historical_deputy_bug_shape(tmp_path):
     """Self-test for the scanner above: reproduce the pre-fix shape (a seed
-    migration with a naive description guard and no _ORIGINAL_ constant) in
-    isolation and confirm the detector actually flags it once a matching
-    description-update migration exists -- otherwise the assertion above
-    could be passing for the wrong reason (e.g. a typo in the AST walk)."""
+    migration whose downgrade() still compares "description" for exact
+    equality) in isolation and confirm the detector actually flags it once a
+    matching description-update migration exists -- otherwise the assertion
+    above could be passing for the wrong reason (e.g. a typo in the AST
+    walk)."""
     seed_path = tmp_path / "20260101_seed_widget_mcp_app.py"
     seed_path.write_text(
         """
@@ -169,9 +168,11 @@ def downgrade():
 
 
 def test_is_vulnerable_accepts_the_deputy_fix_shape(tmp_path):
-    """Companion self-test: a seed migration that defines an
-    "_ORIGINAL_..." constant (the applied fix) must not be flagged even
-    when paired with a sibling description-update migration."""
+    """Companion self-test: a seed migration that removes "description" from
+    the compare_columns set entirely (the applied fix's actual shape --
+    _ORIGINAL_DEPUTY_DESCRIPTION is checked separately, outside
+    _row_matches_seeded_shape) must not be flagged, even when paired with a
+    sibling description-update migration."""
     seed_path = tmp_path / "20260101_seed_widget_mcp_app.py"
     seed_path.write_text(
         """
@@ -196,6 +197,39 @@ def downgrade():
     )
 
     assert not _is_vulnerable(seed_path, {"widget"})
+
+
+def test_is_vulnerable_flags_an_original_constant_that_was_never_wired_up(tmp_path):
+    """Regression test for a false negative caught in review: defining an
+    "_ORIGINAL_..." constant alone proves nothing if "description" is still
+    left in the compare_columns set -- the equality check it feeds is just
+    as naive as if the constant didn't exist. _is_vulnerable must key
+    entirely off compare_columns, not off whether some "_ORIGINAL_"-prefixed
+    name merely exists somewhere in the file."""
+    seed_path = tmp_path / "20260101_seed_widget_mcp_app.py"
+    seed_path.write_text(
+        """
+APP_ID = "widget"
+
+_ORIGINAL_WIDGET_DESCRIPTION = "old text"
+
+
+def _widget_app_row():
+    return {"description": "current text"}
+
+
+def downgrade():
+    app_row = None
+    if app_row is not None and _row_matches_seeded_shape(
+        app_row,
+        _widget_app_row(),
+        {"name", "description", "icon"},
+    ):
+        pass
+"""
+    )
+
+    assert _is_vulnerable(seed_path, {"widget"})
 
 
 def test_real_deputy_seed_migration_is_not_vulnerable():

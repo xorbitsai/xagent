@@ -2946,7 +2946,8 @@ def test_update_event_skips_timezone_resolution_when_nothing_new_to_check(monkey
     )
 
     assert result["status"] == "success"
-    graph_request.assert_called_once()
+    assert graph_request.call_count == 2
+    assert graph_request.call_args_list[1].args == ("GET", "/me/events/self-1")
 
 
 def test_update_event_moving_time_checks_organizer_and_all_attendees(monkeypatch):
@@ -3010,7 +3011,20 @@ def test_update_event_resubmitting_only_existing_attendees_does_not_touch_them(
                 ],
                 "isAllDay": False,
             },
-            {"id": "updated"},
+            {
+                "id": "self-1",
+                "subject": "Full event",
+                "attendees": [
+                    {
+                        "emailAddress": {"address": "existing@example.com"},
+                        "type": "required",
+                        "status": {
+                            "response": "accepted",
+                            "time": "2026-08-20T00:00:00Z",
+                        },
+                    }
+                ],
+            },
         ]
     )
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
@@ -3024,8 +3038,11 @@ def test_update_event_resubmitting_only_existing_attendees_does_not_touch_them(
 
     assert result["status"] == "success"
     assert result["message"] == "No attendee changes were needed"
+    assert result["event"]["id"] == "self-1"
+    assert result["event"]["subject"] == "Full event"
     assert result["event"]["attendees"][0]["status"]["response"] == "accepted"
-    graph_request.assert_called_once()
+    assert graph_request.call_count == 2
+    assert graph_request.call_args_list[1].args == ("GET", "/me/events/self-1")
 
 
 def test_update_event_attendees_replace_drops_addresses_left_out_of_the_new_list(
@@ -3230,7 +3247,7 @@ def test_update_event_attendee_patch_rejects_concurrent_change(monkeypatch):
         outlook.outlook_update_event(event_id="self-1", attendees=["new@example.com"])
     )
 
-    assert result["status"] == "error"
+    assert result["status"] == "conflict_stale_version"
     assert "changed before this update could be applied" in result["message"]
 
 
@@ -3258,7 +3275,7 @@ def test_update_event_schedule_patch_rejects_concurrent_change(monkeypatch):
         )
     )
 
-    assert result["status"] == "error"
+    assert result["status"] == "conflict_stale_version"
     assert "changed before this update could be applied" in result["message"]
     patch_call = graph_request.call_args_list[-1]
     assert patch_call.kwargs["extra_headers"] == {"If-Match": 'W/"version-1"'}
@@ -3356,6 +3373,74 @@ def test_update_event_deduplicates_snapshot_attendees_before_delta_checks(
     assert result["status"] == "success"
     assert find_conflicts.call_count == 2
     assert find_conflicts.call_args_list[1].args[3] == ["Existing@Example.com"]
+
+
+def test_update_event_rejects_snapshot_attendee_without_an_address(monkeypatch):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+            "attendees": [{"emailAddress": {"address": None}}],
+            "isAllDay": False,
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(event_id="self-1", attendees=["new@example.com"])
+    )
+
+    assert result["status"] == "error"
+    assert "attendee at index 0 has no valid email address" in result["message"]
+    graph_request.assert_called_once()
+
+
+def test_update_event_preserves_first_duplicate_snapshot_attendee(monkeypatch):
+    first_attendee = {
+        "emailAddress": {"address": "Existing@Example.com"},
+        "type": "required",
+        "status": {"response": "accepted"},
+    }
+    graph_request = Mock(
+        side_effect=[
+            {
+                "@odata.etag": 'W/"version-1"',
+                "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+                "attendees": [
+                    first_attendee,
+                    {
+                        "emailAddress": {"address": "existing@example.com"},
+                        "type": "optional",
+                        "status": {"response": "declined"},
+                    },
+                ],
+                "isAllDay": False,
+            },
+            {
+                "value": [
+                    {
+                        "scheduleId": "new@example.com",
+                        "availabilityView": "0",
+                        "scheduleItems": [],
+                    }
+                ]
+            },
+            {"id": "updated"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            attendees=["Existing@Example.com", "new@example.com"],
+        )
+    )
+
+    assert result["status"] == "success"
+    patch_call = graph_request.call_args_list[-1]
+    assert patch_call.kwargs["body"]["attendees"][0] == first_attendee
 
 
 def test_update_event_partial_overlap_nudge_only_checks_the_new_delta_segment(
@@ -3497,6 +3582,88 @@ def test_update_event_deduplicates_conflict_across_two_delta_segments(monkeypatc
     assert result["status"] == "conflict"
     assert len(result["conflicts"]) == 1
     assert result["conflicts"][0]["summary"] == "Long-running hold"
+    first_segment_call = graph_request.call_args_list[2]
+    second_segment_call = graph_request.call_args_list[3]
+    assert first_segment_call.kwargs["body"]["startTime"]["dateTime"] == (
+        "2026-08-27T09:00:00"
+    )
+    assert first_segment_call.kwargs["body"]["endTime"]["dateTime"] == (
+        "2026-08-27T10:00:00"
+    )
+    assert second_segment_call.kwargs["body"]["startTime"]["dateTime"] == (
+        "2026-08-27T11:00:00"
+    )
+    assert second_segment_call.kwargs["body"]["endTime"]["dateTime"] == (
+        "2026-08-27T12:00:00"
+    )
+
+
+def test_update_event_collects_distinct_conflicts_from_both_delta_segments(
+    monkeypatch,
+):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T11:00:00", "timeZone": "UTC"},
+            "attendees": [{"emailAddress": {"address": "existing@example.com"}}],
+            "isAllDay": False,
+            "type": "singleInstance",
+        }
+    )
+    find_conflicts = Mock(
+        side_effect=[
+            ([], []),
+            (
+                [
+                    {
+                        "calendar": "existing@example.com",
+                        "summary": "Early conflict",
+                        "start": "2026-08-27T09:15:00Z",
+                        "end": "2026-08-27T09:30:00Z",
+                    }
+                ],
+                [],
+            ),
+            (
+                [
+                    {
+                        "calendar": "existing@example.com",
+                        "summary": "Late conflict",
+                        "start": "2026-08-27T11:15:00Z",
+                        "end": "2026-08-27T11:30:00Z",
+                    }
+                ],
+                [],
+            ),
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", find_conflicts)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T09:00:00",
+            end_datetime="2026-08-27T12:00:00",
+        )
+    )
+
+    assert result["status"] == "conflict"
+    assert [conflict["summary"] for conflict in result["conflicts"]] == [
+        "Early conflict",
+        "Late conflict",
+    ]
+    assert find_conflicts.call_count == 3
+    assert find_conflicts.call_args_list[1].args[0:3] == (
+        "2026-08-27T09:00:00",
+        "2026-08-27T10:00:00",
+        "UTC",
+    )
+    assert find_conflicts.call_args_list[2].args[0:3] == (
+        "2026-08-27T11:00:00",
+        "2026-08-27T12:00:00",
+        "UTC",
+    )
 
 
 def test_update_event_disjoint_move_checks_existing_attendees(monkeypatch):
@@ -3683,6 +3850,48 @@ def test_update_event_missing_schedule_scope_rejects_the_write(monkeypatch):
 
     assert result["status"] == "error"
     assert "reconnect" in result["message"].lower()
+    assert result["details"]["unchecked_attendees"] == ["outsider@gmail.com"]
+
+
+def test_update_event_keeps_first_scope_error_and_all_unchecked_attendees(
+    monkeypatch,
+):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-27T10:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-27T10:30:00", "timeZone": "UTC"},
+            "attendees": [{"emailAddress": {"address": "existing@example.com"}}],
+            "isAllDay": False,
+        }
+    )
+    find_conflicts = Mock(
+        side_effect=[
+            outlook.InsufficientScopeError(
+                "First scope error", [], ["new@example.com"]
+            ),
+            outlook.InsufficientScopeError(
+                "Second scope error", [], ["existing@example.com"]
+            ),
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    monkeypatch.setattr(outlook, "_find_conflicts", find_conflicts)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="self-1",
+            start_datetime="2026-08-27T11:00:00",
+            end_datetime="2026-08-27T11:30:00",
+            attendees=["existing@example.com", "new@example.com"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["message"] == "First scope error"
+    assert result["details"]["unchecked_attendees"] == [
+        "new@example.com",
+        "existing@example.com",
+    ]
 
 
 def test_update_event_missing_schedule_scope_still_reports_an_already_confirmed_conflict(

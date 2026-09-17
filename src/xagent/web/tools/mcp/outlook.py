@@ -895,6 +895,9 @@ def outlook_update_event(
     status="error" for a missing OAuth scope, and also skips the update.
     The check and PATCH are separate Graph calls, so availability can still
     change between them.
+    If Graph rejects the conditional write because the event changed after the
+    check, the tool returns status="conflict_stale_version" so callers can
+    read the latest event and retry without string-matching an error message.
     Schedule changes to recurring series masters cannot be checked safely as
     one scalar window and are rejected unless ignore_conflicts=True. Update a
     specific occurrence when possible.
@@ -970,13 +973,23 @@ def outlook_update_event(
 
         snapshot_start_field = existing.get("start") or {}
         snapshot_end_field = existing.get("end") or {}
-        existing_attendees_raw = _normalize_addresses(
-            [
-                attendee["emailAddress"]["address"]
-                for attendee in (existing.get("attendees") or [])
-                if (attendee.get("emailAddress") or {}).get("address", "").strip()
-            ]
-        )
+        existing_attendees_raw: list[str] = []
+        existing_by_email: dict[str, dict[str, Any]] = {}
+        for attendee_index, attendee in enumerate(existing.get("attendees") or []):
+            address = (attendee.get("emailAddress") or {}).get("address")
+            if not isinstance(address, str) or not address.strip():
+                raise ValueError(
+                    "Existing Outlook attendee at index "
+                    f"{attendee_index} has no valid email address; the event "
+                    "cannot be updated safely."
+                )
+            normalized_address = address.strip()
+            address_key = normalized_address.lower()
+            if address_key not in existing_by_email:
+                # Keep the first Graph object and its casing, matching the
+                # first-seen behavior used by _normalize_addresses.
+                existing_by_email[address_key] = attendee
+                existing_attendees_raw.append(normalized_address)
         existing_attendee_emails = {
             address.lower() for address in existing_attendees_raw
         }
@@ -1055,13 +1068,13 @@ def outlook_update_event(
                 "Existing event has no complete time window; cannot safely "
                 "validate a single-boundary update."
             )
-        query_timezone = (
+        write_timezone = (
             resolved_timezone
             if (start_datetime is not None or end_datetime is not None)
             else existing_zone
         )
         if start_datetime is not None or end_datetime is not None or is_all_day is True:
-            _resolve_zoneinfo(query_timezone, allow_windows_names=True)
+            _resolve_zoneinfo(write_timezone, allow_windows_names=True)
 
         raw_effective_start = (
             start_datetime if start_datetime is not None else existing_start
@@ -1081,16 +1094,16 @@ def outlook_update_event(
         effective_end = raw_effective_end
         if effective_is_all_day and raw_effective_start and raw_effective_end:
             effective_start, effective_end = _normalize_all_day_window(
-                raw_effective_start, raw_effective_end, query_timezone
+                raw_effective_start, raw_effective_end, write_timezone
             )
         else:
             if start_datetime is not None:
                 effective_start = _naive_datetime_in_timezone(
-                    start_datetime, query_timezone
+                    start_datetime, write_timezone
                 )
             if end_datetime is not None:
                 effective_end = _naive_datetime_in_timezone(
-                    end_datetime, query_timezone
+                    end_datetime, write_timezone
                 )
 
         payload: dict[str, Any] = {}
@@ -1099,23 +1112,18 @@ def outlook_update_event(
         if start_datetime is not None:
             payload["start"] = {
                 "dateTime": effective_start,
-                "timeZone": query_timezone,
+                "timeZone": write_timezone,
             }
         if end_datetime is not None:
             payload["end"] = {
                 "dateTime": effective_end,
-                "timeZone": query_timezone,
+                "timeZone": write_timezone,
             }
         if body is not None:
             payload["body"] = _message_body(body, "text")
         if location is not None:
             payload["location"] = {"displayName": location}
         if attendees_given:
-            existing_by_email = {
-                attendee["emailAddress"]["address"].strip().lower(): attendee
-                for attendee in (existing.get("attendees") or [])
-                if (attendee.get("emailAddress") or {}).get("address", "").strip()
-            }
             desired_lower = {address.lower() for address in desired_addresses}
             if desired_lower != existing_attendee_emails:
                 payload["attendees"] = [
@@ -1136,7 +1144,12 @@ def outlook_update_event(
             payload["isAllDay"] = is_all_day
 
         if not payload and attendees_given:
-            return _success(event=existing, message="No attendee changes were needed")
+            current_event = _graph_request(
+                "GET", f"/me/events/{quote(event_id, safe='')}"
+            )
+            return _success(
+                event=current_event, message="No attendee changes were needed"
+            )
         if not payload:
             raise ValueError("at least one field must be provided to update the event")
 
@@ -1160,6 +1173,18 @@ def outlook_update_event(
 
         if not ignore_conflicts and (schedule_semantics_supplied or added_attendees):
             query_start, query_end = effective_start, effective_end
+            availability_timezone = write_timezone
+            snapshot_utc_window: tuple[str | None, str | None] | None = None
+
+            def _snapshot_window_in_utc() -> tuple[str | None, str | None]:
+                nonlocal snapshot_utc_window
+                if snapshot_utc_window is None:
+                    snapshot_utc_window = (
+                        _utc_field_in_zone(snapshot_start_field, "UTC").get("dateTime"),
+                        _utc_field_in_zone(snapshot_end_field, "UTC").get("dateTime"),
+                    )
+                return snapshot_utc_window
+
             if (
                 added_attendees
                 and not existing_is_all_day
@@ -1170,13 +1195,8 @@ def outlook_update_event(
                 # window. A plain event GET is documented to return UTC; validate
                 # that contract rather than pairing contradictory response clock
                 # values with their labels and querying the wrong instant.
-                query_start = _utc_field_in_zone(snapshot_start_field, "UTC").get(
-                    "dateTime"
-                )
-                query_end = _utc_field_in_zone(snapshot_end_field, "UTC").get(
-                    "dateTime"
-                )
-                query_timezone = "UTC"
+                query_start, query_end = _snapshot_window_in_utc()
+                availability_timezone = "UTC"
             if not query_start or not query_end:
                 raise ValueError(
                     "Existing event has no complete time window; cannot safely "
@@ -1202,12 +1222,7 @@ def outlook_update_event(
                         "attendee availability."
                     )
                 else:
-                    snapshot_start = _utc_field_in_zone(
-                        snapshot_start_field, "UTC"
-                    ).get("dateTime")
-                    snapshot_end = _utc_field_in_zone(snapshot_end_field, "UTC").get(
-                        "dateTime"
-                    )
+                    snapshot_start, snapshot_end = _snapshot_window_in_utc()
                     if not snapshot_start or not snapshot_end:
                         raise ValueError(
                             "Existing event has no complete time window; cannot safely "
@@ -1216,8 +1231,8 @@ def outlook_update_event(
                     retained_segments = _window_delta_segments(
                         _key(snapshot_start, "UTC"),
                         _key(snapshot_end, "UTC"),
-                        _key(query_start, query_timezone),
-                        _key(query_end, query_timezone),
+                        _key(query_start, availability_timezone),
+                        _key(query_end, availability_timezone),
                     )
 
             if existing_is_all_day and added_attendees and not both_boundaries_supplied:
@@ -1265,8 +1280,9 @@ def outlook_update_event(
                     unchecked_attendees.extend(unchecked)
                     return False
                 except InsufficientScopeError as exc:
-                    check_error = check_error or str(exc)
-                    pending_scope_error = exc
+                    if pending_scope_error is None:
+                        pending_scope_error = exc
+                        check_error = str(exc)
                     _extend_conflicts(exc.conflicts)
                     unchecked_attendees.extend(exc.unchecked_attendees)
                     return True
@@ -1279,7 +1295,7 @@ def outlook_update_event(
             _run_and_accumulate(
                 query_start,
                 query_end,
-                query_timezone,
+                availability_timezone,
                 added_attendees,
                 check_organizer=schedule_semantics_supplied,
             )
@@ -1303,7 +1319,10 @@ def outlook_update_event(
 
             unchecked_attendees = list(dict.fromkeys(unchecked_attendees))
             if pending_scope_error is not None and not all_conflicts:
-                raise pending_scope_error
+                return _error(
+                    str(pending_scope_error),
+                    details={"unchecked_attendees": unchecked_attendees},
+                )
             if all_conflicts:
                 return _conflict_response(
                     all_conflicts,
@@ -1322,6 +1341,10 @@ def outlook_update_event(
 
         patch_headers: dict[str, str] | None = None
         if schedule_semantics_supplied or "attendees" in payload:
+            # Microsoft Graph returns the event's @odata.etag annotation on
+            # GET responses, including when $select limits structural fields.
+            # OData annotations are not structural properties and therefore
+            # cannot be added to $select explicitly.
             event_etag = existing.get("@odata.etag")
             if not isinstance(event_etag, str) or not event_etag.strip():
                 raise ValueError(
@@ -1339,11 +1362,17 @@ def outlook_update_event(
             )
         except _GraphRequestError as exc:
             if patch_headers and exc.status_code == 412:
-                raise ValueError(
-                    "The event changed before this update could be applied. Read "
-                    "the latest event and retry so recent schedule, attendee, or "
-                    "RSVP changes are preserved."
-                ) from exc
+                return json.dumps(
+                    {
+                        "status": "conflict_stale_version",
+                        "message": (
+                            "The event changed before this update could be applied. "
+                            "Read the latest event and retry so recent schedule, "
+                            "attendee, or RSVP changes are preserved."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             raise
         return _success(event=result)
     except Exception as e:

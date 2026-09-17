@@ -1,7 +1,7 @@
 """update HubSpot connector description for the new list/search tools
 
 Revision ID: 20260916_update_hubspot_description
-Revises: 20260911_global_memory_authority
+Revises: 20260916_merge_delivery_memory
 Create Date: 2026-09-16
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260916_update_hubspot_description"
-down_revision: Union[str, None] = "20260911_global_memory_authority"
+down_revision: Union[str, None] = "20260916_merge_delivery_memory"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

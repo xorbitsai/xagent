@@ -27,9 +27,9 @@ import {
   getUserDefaultModels,
   setUserDefaultModel,
   removeUserDefaultModel,
-  DefaultModelConfig,
   DefaultModelType,
-  Model,
+  ModelWithAccess,
+  UserDefaultModelMap,
 } from "@/lib/models"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
@@ -89,64 +89,47 @@ const modelTypeConfig = {
   },
 }
 
-const defaultModelTypes = Object.keys(modelTypeConfig) as DefaultModelType[]
+type SettingsDefaultModelType = Exclude<DefaultModelType, 'rerank'>
+const defaultModelTypes = Object.keys(modelTypeConfig) as SettingsDefaultModelType[]
 
-const getModelCategory = (model: Model): string => {
-  return model.category || ''
-}
-
-const getModelAbilities = (model: Model): string[] => {
-  return model.abilities || []
-}
-
-const getModelDisplayName = (model: Model): string => {
-  if (model.model_name) return model.model_name
-  return model.name
-}
-
-const getModelProviderLabel = (model: Model): string => {
-  if (model.model_provider) return model.model_provider
-  return model.provider
-}
-
-const getCompatibleModels = (models: Model[], configType: DefaultModelType): Model[] => {
+const getCompatibleModels = (models: ModelWithAccess[], configType: SettingsDefaultModelType): ModelWithAccess[] => {
   if (configType === 'embedding') {
-    return models.filter((model) => getModelCategory(model) === 'embedding')
+    return models.filter((model) => model.category === 'embedding')
   }
   if (configType === 'image') {
-    return models.filter((model) => getModelCategory(model) === 'image')
+    return models.filter((model) => model.category === 'image')
   }
   if (configType === 'image_edit') {
-    return models.filter((model) => getModelCategory(model) === 'image' && getModelAbilities(model).includes('edit'))
+    return models.filter((model) => model.category === 'image' && (model.abilities || []).includes('edit'))
   }
   if (configType === 'video') {
-    return models.filter((model) => getModelCategory(model) === 'video' && getModelAbilities(model).includes('generate'))
+    return models.filter((model) => model.category === 'video' && (model.abilities || []).includes('generate'))
   }
   if (configType === 'asr') {
-    return models.filter((model) => getModelCategory(model) === 'speech' && getModelAbilities(model).includes('asr'))
+    return models.filter((model) => model.category === 'speech' && (model.abilities || []).includes('asr'))
   }
   if (configType === 'tts') {
-    return models.filter((model) => getModelCategory(model) === 'speech' && getModelAbilities(model).includes('tts'))
+    return models.filter((model) => model.category === 'speech' && (model.abilities || []).includes('tts'))
   }
   if (configType === 'speech') {
     return models.filter((model) => {
-      const abilities = getModelAbilities(model)
-      return getModelCategory(model) === 'speech' && abilities.includes('asr') && abilities.includes('tts')
+      const abilities = model.abilities || []
+      return model.category === 'speech' && abilities.includes('asr') && abilities.includes('tts')
     })
   }
   if (configType === 'sound_effect') {
-    return models.filter((model) => getModelCategory(model) === 'sound_effect')
+    return models.filter((model) => model.category === 'sound_effect')
   }
   if (configType === 'music') {
-    return models.filter((model) => getModelCategory(model) === 'music')
+    return models.filter((model) => model.category === 'music')
   }
-  return models.filter((model) => getModelCategory(model) === 'llm')
+  return models.filter((model) => model.category === 'llm')
 }
 
 export function DefaultModelsSettings() {
   const { token } = useAuth()
-  const [models, setModels] = useState<Model[]>([])
-  const [defaultModels, setDefaultModels] = useState<DefaultModelConfig>({})
+  const [models, setModels] = useState<ModelWithAccess[]>([])
+  const [defaultModels, setDefaultModels] = useState<UserDefaultModelMap>({})
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState<string | null>(null)
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
@@ -162,19 +145,19 @@ export function DefaultModelsSettings() {
     try {
       setLoading(true)
       const [modelsData, defaultsData] = await Promise.all([
-        getUserModels(token),
-        getUserDefaultModels(token),
+        getUserModels(),
+        getUserDefaultModels(),
       ])
       setModels(modelsData)
       setDefaultModels(defaultsData)
-    } catch (error) {
+    } catch {
       setMessage({ type: 'error', text: t('settings.defaultModels.messages.loadFailed') })
     } finally {
       setLoading(false)
     }
   }
 
-  const handleSetDefault = async (configType: DefaultModelType, modelId: number) => {
+  const handleSetDefault = async (configType: SettingsDefaultModelType, modelId: number) => {
     if (!token) return
 
     try {
@@ -184,19 +167,19 @@ export function DefaultModelsSettings() {
       await setUserDefaultModel(token, configType, modelId)
 
       // Reload defaults
-      const defaultsData = await getUserDefaultModels(token)
+      const defaultsData = await getUserDefaultModels()
       setDefaultModels(defaultsData)
 
       const typeTitle = t(`settings.defaultModels.types.${configType}.title`)
       setMessage({ type: 'success', text: t('settings.defaultModels.messages.updated', { type: typeTitle }) })
-    } catch (error) {
+    } catch {
       setMessage({ type: 'error', text: t('settings.defaultModels.messages.setFailed') })
     } finally {
       setSaving(null)
     }
   }
 
-  const handleRemoveDefault = async (configType: DefaultModelType) => {
+  const handleRemoveDefault = async (configType: SettingsDefaultModelType) => {
     if (!token) return
 
     try {
@@ -206,12 +189,12 @@ export function DefaultModelsSettings() {
       await removeUserDefaultModel(token, configType)
 
       // Reload defaults
-      const defaultsData = await getUserDefaultModels(token)
+      const defaultsData = await getUserDefaultModels()
       setDefaultModels(defaultsData)
 
       const typeTitle = t(`settings.defaultModels.types.${configType}.title`)
       setMessage({ type: 'success', text: t('settings.defaultModels.messages.removed', { type: typeTitle }) })
-    } catch (error) {
+    } catch {
       setMessage({ type: 'error', text: t('settings.defaultModels.messages.removeFailed') })
     } finally {
       setSaving(null)
@@ -286,16 +269,16 @@ export function DefaultModelsSettings() {
                       <div className="flex items-center justify-between">
                         <div className="flex-1 min-w-0">
                           <p className="text-sm font-medium truncate">
-                            {getModelDisplayName(currentDefault.model)}
+                            {currentDefault.model.model_name}
                           </p>
                           <div className="flex items-center gap-1 mt-1">
                             <Badge variant="secondary" className="text-xs">
-                              {getModelProviderLabel(currentDefault.model)}
+                              {currentDefault.model.model_provider}
                             </Badge>
                             <Badge variant="outline" className="text-xs">
                               {tDynamic(
-                                `models.tabs.${getModelCategory(currentDefault.model)}`,
-                                getModelCategory(currentDefault.model),
+                                `models.tabs.${currentDefault.model.category}`,
+                                currentDefault.model.category,
                               )}
                             </Badge>
                           </div>
@@ -324,7 +307,7 @@ export function DefaultModelsSettings() {
                         }
                         options={compatibleModels.map((model) => ({
                           value: model.id.toString(),
-                          label: `${getModelDisplayName(model)} (${getModelProviderLabel(model)})`,
+                          label: `${model.model_name} (${model.model_provider})`,
                         }))}
                         placeholder={t('settings.defaultModels.labels.selectModel')}
                       />

@@ -40,6 +40,7 @@ def _create_rerank_model(model_config: RerankModelConfig) -> BaseRerank:
         base_url=model_config.base_url,
         top_n=model_config.top_n,
         instruct=model_config.instruct,
+        timeout=model_config.timeout,
     )
 
 

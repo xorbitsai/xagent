@@ -16,8 +16,7 @@ The resolve and bind steps are deliberately split:
     caller-owned claim transaction. :func:`bind_turn_files` is the
     compatibility wrapper for owners that need an immediate commit.
 
-The WebSocket path keeps its resolve-then-bind-in-one behavior via
-``handle_file_upload_for_task``, which now delegates to both.
+Both transports call the two steps directly.
 """
 
 from __future__ import annotations
@@ -33,11 +32,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...core.agent.attachments import project_file_info_to_chip
-from ...core.execution_scope import (
-    ExecutionScope,
-    execution_scope_from_agent_config,
-    resolve_execution_scope,
-)
+from ...core.execution_scope import resolve_execution_scope
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ..models.database import release_db_connection_if_clean
 from ..models.task import Task
@@ -65,13 +60,28 @@ class _TurnFileRecordSnapshot:
 def _task_execution_scope_in_session(
     db: Session,
     task_id: int | None,
-) -> tuple[int | None, ExecutionScope | None]:
-    """Read the persisted half of canonical scope resolution in this Session."""
+) -> tuple[int | None, Any]:
+    """Read the raw ``agent_config`` this Session owns, undecoded.
+
+    The second element is whatever the untyped JSON column holds, which is why
+    it is not annotated as a mapping: nothing between the database and here
+    validates its shape, and claiming one would describe a guarantee no layer
+    provides. ``resolve_execution_scope`` narrows it, and rejects a value the
+    column should never have held.
+
+    The snapshot inside it is decoded by ``resolve_execution_scope``, not
+    here. Whether a malformed snapshot is tolerated depends on which
+    resolution branch is active -- an authoritative resolver can ignore a bad
+    candidate and answer on its own, while an abstaining resolver or no
+    resolver at all must fail closed, because there the snapshot is the only
+    namespace authority and "no candidate" would silently mean "unscoped".
+    Only the resolver knows which case it is in, so the decode belongs there.
+    """
 
     if task_id is None:
         return None, None
     row = db.query(Task.agent_config).filter(Task.id == task_id).first()
-    return task_id, execution_scope_from_agent_config(row[0] if row else None)
+    return task_id, (row[0] if row else None)
 
 
 def normalize_filename(filename: str) -> str:
@@ -212,7 +222,9 @@ def resolve_turn_file_infos(
             )
         )
 
-    scope_task_id, persisted_scope = _task_execution_scope_in_session(db, task_id)
+    scope_task_id, persisted_agent_config = _task_execution_scope_in_session(
+        db, task_id
+    )
     if snapshots and not release_db_connection_if_clean(db):
         raise RuntimeError(
             "Turn file materialization requires a read-only database phase"
@@ -220,7 +232,7 @@ def resolve_turn_file_infos(
     execution_scope = (
         resolve_execution_scope(
             scope_task_id,
-            persisted_snapshot=persisted_scope,
+            persisted_agent_config=persisted_agent_config,
         )
         if scope_task_id is not None
         else None

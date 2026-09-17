@@ -1,25 +1,13 @@
 ---
 name: pptx-editorial
 description: |
-  Generate a native PowerPoint (.pptx) file with magazine-grade editorial
-  styling — pitch decks, investor presentations (路演 PPT), board reviews,
-  executive memos, conference talks, product launches. Output is a single
-  .pptx file generated via pptxgenjs through the JavaScript executor runtime, openable
-  in PowerPoint / Keynote / Google Slides. Uses five named editorial palettes
-  (Monocle, Indigo Porcelain, Forest Ink, Kraft Paper, Dune) with strict
-  typography rules (Georgia display + Calibri body) and 10 numbered layouts
-  (L01 Cover, L02 Act Divider, L03 Big Numbers, ..., L10 Closing).
-  Prefer this skill over the builtin presentation-generator whenever the
-  user wants a polished editorial look, names one of the five palettes,
-  asks for a "美观 PPT" / "投资人路演 PPT" / "pitch deck", or otherwise
-  signals that visual quality matters beyond a generic deck.
-  Use `html-deck-editorial` instead only when the user explicitly wants HTML
-  output (more visual freedom but not Office-compatible).
+  A native .pptx deck with magazine-grade editorial styling: "pitch deck",
+  "投资人路演 PPT", "美观 PPT", board review, product launch. Named palettes,
+  fixed typography, 10 numbered layouts.
 when_to_use: |
-  When the user wants a polished native .pptx deliverable (pitch deck, 路演 PPT,
-  board review, executive memo) where visual quality matters and the file must
-  open in PowerPoint / Keynote / Google Slides. Use `html-deck-editorial`
-  instead when the user explicitly wants HTML output.
+  A polished .pptx that must open in PowerPoint / Keynote / Google Slides.
+  Prefer over presentation-generator when visual quality matters; use
+  html-deck-editorial when the user wants HTML output.
 tags:
   - presentation
   - pptx

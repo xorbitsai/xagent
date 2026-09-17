@@ -1,8 +1,8 @@
 "use client"
 
-import { useEffect } from "react"
+import React, { useEffect } from "react"
 import { useApp } from "@/contexts/app-context-chat"
-import { apiRequest } from "@/lib/api-wrapper"
+import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { FileViewer } from "@/components/file/file-viewer"
 import { isTextPreviewFile } from "@/lib/file-preview-utils"
@@ -12,7 +12,8 @@ interface FilePreviewContentProps {
 }
 
 export function FilePreviewContent({ open }: FilePreviewContentProps) {
-  const { state, dispatch, getFilePreviewUrl } = useApp()
+  const { state, dispatch, filesDisabled, getFilePreviewUrl } = useApp()
+  const fileAccess = useFileAccess()
   const { filePreview } = state
   const { t } = useI18n()
 
@@ -27,7 +28,7 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
           // downstream viewers.
           const url = getFilePreviewUrl(filePreview.fileId)
 
-          const response = await apiRequest(url, {
+          const response = await fileAccess.request(url, {
             cache: 'no-cache',
             headers: {
               'Cache-Control': 'no-cache',
@@ -103,7 +104,7 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
 
       loadFileContent()
     }
-  }, [open, filePreview.fileId, filePreview.content, filePreview.error, dispatch, getFilePreviewUrl, t, filePreview.fileName])
+  }, [open, fileAccess, filePreview.fileId, filePreview.content, filePreview.error, dispatch, getFilePreviewUrl, t, filePreview.fileName])
 
   return (
     <div className="w-full h-full flex flex-col">
@@ -116,6 +117,7 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
           isLoading={filePreview.isLoading}
           error={filePreview.error}
           viewMode={filePreview.viewMode}
+          filesDisabled={filesDisabled}
         />
       </div>
     </div>

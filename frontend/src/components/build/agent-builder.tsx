@@ -50,7 +50,7 @@ import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-crea
 import { toast } from "@/components/ui/sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
-import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches } from "@/lib/mcp-lookup"
+import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches, resolveMcpToolSelector } from "@/lib/mcp-lookup"
 import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
@@ -148,19 +148,37 @@ interface TemplateRequirements {
 // instead (issue #802), and `other` is an internal fallback bucket.
 const isAssignableToolCategory = (c: string) => c !== 'agent' && c !== 'other'
 
+// The single extraction every tool_categories -> selectedMcpServers site
+// must share: isDirty compares selectedMcpServers against this same
+// extraction applied to originalData.tool_categories with a plain string
+// compare, no name/id normalization -- so a caller that inlines its own
+// copy and drifts from this one silently reintroduces a permanently-dirty
+// isDirty state.
+function mcpServerNamesFromToolCategories(categories: string[]): string[] {
+  return categories
+    .filter((c) => c.startsWith('mcp:'))
+    .map((c) => c.replace('mcp:', ''))
+}
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
-function getAgentUpdateErrorMessage(error: unknown, fallback: string): string {
-  if (!isJsonRecord(error)) return fallback
+// Reduces a parsed error response body to a string that is safe to render.
+// Accepts, in order: a string `detail`, the readable message of an object
+// `detail`, the joined readable messages of an array `detail`, and a top-level
+// `message`. Anything else — including a body that failed to parse — yields the
+// supplied fallback, so an object or an array can never reach toast.error.
+function getBuilderErrorMessage(body: unknown, fallback: string): string {
+  if (!isJsonRecord(body)) return fallback
 
-  const detail = error.detail
+  const detail = body.detail
   const detailMessage = readNonEmptyString(detail)
   if (detailMessage) return detailMessage
 
   if (isJsonRecord(detail)) {
-    const message = readNonEmptyString(detail.message)
+    const message =
+      readNonEmptyString(detail.msg) ?? readNonEmptyString(detail.message)
     if (message) return message
   }
 
@@ -176,7 +194,7 @@ function getAgentUpdateErrorMessage(error: unknown, fallback: string): string {
     if (messages.length > 0) return messages.join("; ")
   }
 
-  return readNonEmptyString(error.message) ?? fallback
+  return readNonEmptyString(body.message) ?? fallback
 }
 
 // One-time reveal of auto-generated webhook secrets. Rendered both inside the
@@ -250,6 +268,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   // Set once loadAgent decides to load an owner-scoped MCP list for an admin
   // cross-user view, so the mount-time self-scoped fetch won't clobber it.
   const ownerScopedMcpRef = useRef(false)
+  // The CURRENT user's general default (not necessarily the agent owner's),
+  // kept so the edit-mode seed below can run whichever mount fetch lands last.
+  const userDefaultGeneralRef = useRef<number | null>(null)
+  const seededGeneralRef = useRef<number | null>(null)
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
@@ -770,22 +792,29 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         if (userDefaultsRes.ok) {
           const userDefaults = await userDefaultsRes.json()
 
-          // Set model config based on user defaults (only for new agent)
+          // One pass: the general-default ref is needed in edit mode too (the
+          // seed effect above reads it), the rest only seeds a new agent.
+          // The shape guards are defensive -- fetchData's catch already
+          // swallows a malformed response, so no test can tell them apart.
+          const config: AgentModelConfig = {
+            general: null,
+            small_fast: null,
+            visual: null,
+            compact: null,
+          }
+          for (const m of Array.isArray(userDefaults) ? userDefaults : []) {
+            const id = m?.model?.id
+            if (!id) continue
+            if (m.config_type === 'general') {
+              config.general = id
+              userDefaultGeneralRef.current = id
+            }
+            else if (m.config_type === 'small_fast') config.small_fast = id
+            else if (m.config_type === 'visual') config.visual = id
+            else if (m.config_type === 'compact') config.compact = id
+          }
+
           if (!isEditMode) {
-            const config: AgentModelConfig = {
-              general: null,
-              small_fast: null,
-              visual: null,
-              compact: null,
-            }
-
-            for (const m of userDefaults) {
-              if (m.config_type === 'general') config.general = m.model.id
-              else if (m.config_type === 'small_fast') config.small_fast = m.model.id
-              else if (m.config_type === 'visual') config.visual = m.model.id
-              else if (m.config_type === 'compact') config.compact = m.model.id
-            }
-
             // Fallback: If no general model set, pick first available LLM
             if (!config.general && availableModels.length > 0) {
               // models endpoint was called with ?category=llm so these should be LLMs
@@ -820,6 +849,22 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }
 
+  // Server-side creation paths persisted no model config, which rendered "--"
+  // and tripped the required-model guard on save. Both mount fetches must have
+  // landed before we can tell an unset slot from one still loading.
+  useEffect(() => {
+    // Not in a read-only cross-user view: the default below is the viewer's,
+    // so seeding there would render someone else's model as this agent's.
+    if (!isEditMode || readOnly || !isInitialDataLoaded || !originalData) return
+    if (seededGeneralRef.current !== null || modelConfig.general) return
+    const seeded = userDefaultGeneralRef.current
+    // Only an id the dropdown can actually show: seeding one that is missing
+    // from the fetched list renders an empty Select while counting as dirty.
+    if (!seeded || !models.some(m => m.id === seeded)) return
+    seededGeneralRef.current = seeded
+    setModelConfig(prev => ({ ...prev, general: seeded }))
+  }, [isEditMode, readOnly, isInitialDataLoaded, originalData, modelConfig.general, models])
+
   // Load agent data in edit mode
   useEffect(() => {
     if (!isEditMode || !localAgentId) return
@@ -839,6 +884,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           if (!active) return
           setOriginalData(agent)
           setReadOnly(agent.can_edit === false)
+          // Same synchronous block as originalData: React 18 does not batch
+          // across the await below, so leaving this after it lets the seed
+          // effect run against a committed originalData and then be clobbered
+          // -- with the ref already stamped, it would never seed again.
+          if (agent.models) {
+            setModelConfig({
+              general: agent.models.general || null,
+              small_fast: agent.models.small_fast || null,
+              visual: agent.models.visual || null,
+              compact: agent.models.compact || null,
+            })
+          }
           setName(agent.name || "")
           setDescription(agent.description || "")
           setInstructions(agent.instructions || "")
@@ -853,7 +910,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // never show or round-trip it.
           const rawToolCategories = agent.tool_categories || []
           setSelectedToolCategories(rawToolCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
-          setSelectedMcpServers(rawToolCategories.filter((c: string) => c.startsWith('mcp:')).map((c: string) => c.replace('mcp:', '')))
+          setSelectedMcpServers(mcpServerNamesFromToolCategories(rawToolCategories))
           // Seed the SSH auto-category from the saved config so a failed
           // bindings-load (which never fires onCount) can't leave "ssh" unset
           // at save time. A successful load overwrites this with the live count.
@@ -883,16 +940,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
           setLogoUrl(agent.logo_url || null)
           setLogoRemoved(false)
-
-          // Load models
-          if (agent.models) {
-            setModelConfig({
-              general: agent.models.general || null,
-              small_fast: agent.models.small_fast || null,
-              visual: agent.models.visual || null,
-              compact: agent.models.compact || null,
-            })
-          }
         } else if (response.status === 404) {
           setNotFound(true)
         }
@@ -921,6 +968,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         )
         if (response.ok) {
           const template = await response.json()
+          if (template.type === "workforce") {
+            // This builder only knows how to configure a single agent.
+            // A workforce template's agent_config is always null (see
+            // TemplateManager._enrich_template) - bail out loudly instead
+            // of silently publishing an agent with empty instructions.
+            toast.error(t("builds.editor.error.templateIsWorkforce"))
+            router.replace("/templates")
+            return
+          }
           setName(template.name || "")
           setDescription(template.description || "")
           setInstructions(template.agent_config?.instructions || "")
@@ -931,9 +987,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           const allCategories = template.agent_config?.tool_categories || []
           setSelectedToolCategories(allCategories.filter((c: string) => !c.startsWith('mcp:') && isAssignableToolCategory(c)))
 
-          const explicitlyConfiguredMcps = allCategories
-            .filter((c: string) => c.startsWith('mcp:'))
-            .map((c: string) => c.replace('mcp:', ''))
+          const explicitlyConfiguredMcps = mcpServerNamesFromToolCategories(allCategories)
 
           // _enrich_template merges connections into tool_categories as mcp: entries, so
           // iterating both explicitlyConfiguredMcps and connections would add each
@@ -1110,9 +1164,24 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       }
 
       const finalToolCategories = [...selectedToolCategories]
-      selectedMcpServers.forEach(server => {
-        finalToolCategories.push(`mcp:${server}`)
-      })
+      // Match handleCreate below: a preview session with a knowledge base
+      // selected must include "knowledge" too, or it runs with different
+      // categories than the agent it's a preview of.
+      if (selectedKbs.length > 0 && !finalToolCategories.includes("knowledge")) {
+        finalToolCategories.push("knowledge")
+      }
+      // Resolve each selection to the real, connected MCPServer row's name
+      // (see resolveMcpToolSelector for why a name/id fallback alone isn't
+      // enough -- the backend uses either convention depending on app
+      // type). Depends on mcpServers/officialApps having loaded; if a
+      // preview message is sent before they do, this falls back to the raw
+      // selector for every MCP tool (matching pre-existing behavior for
+      // this call site, not just this connector). Deduped: two distinct
+      // selectedMcpServers entries can resolve to the same real row.
+      const resolvedMcpSelectors = new Set(
+        selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
+      )
+      resolvedMcpSelectors.forEach(selector => finalToolCategories.push(`mcp:${selector}`))
       if (hasSshBindings && !finalToolCategories.includes("ssh")) {
         finalToolCategories.push("ssh")
       }
@@ -1229,7 +1298,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     })
   }
 
-  const isDirty = useMemo(() => {
+  const isDirtyBeyondGeneralModel = useMemo(() => {
     if (!originalData) return false
 
     // Helper to normalize arrays for comparison
@@ -1261,9 +1330,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if (normalize(selectedSkills) !== normalize(originalData.skills)) return true
 
     // Check MCP servers by extracting them from originalData.tool_categories
-    const originalMcpServers = (originalData.tool_categories || [])
-      .filter((c: string) => c.startsWith('mcp:'))
-      .map((c: string) => c.replace('mcp:', ''))
+    const originalMcpServers = mcpServerNamesFromToolCategories(originalData.tool_categories || [])
     if (normalize(selectedMcpServers) !== normalize(originalMcpServers)) return true
 
     // Check non-MCP tool categories
@@ -1271,15 +1338,33 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     const originalNonMcpCategories = (originalData.tool_categories || []).filter((c: string) => !c.startsWith('mcp:'))
     if (normalize(nonMcpCategories) !== normalize(originalNonMcpCategories)) return true
 
-    // Compare models
+    // Compare models. The general slot is compared outside this memo: the
+    // seed has to leave Update enabled (that is the only flow that persists
+    // it) while not blocking Publish.
     const origModels = originalData.models || {}
-    if ((modelConfig.general || null) !== (origModels.general || null)) return true
     if ((modelConfig.small_fast || null) !== (origModels.small_fast || null)) return true
     if ((modelConfig.visual || null) !== (origModels.visual || null)) return true
     if ((modelConfig.compact || null) !== (origModels.compact || null)) return true
 
     return false
   }, [name, description, instructions, executionMode, ownership, visibility, logoFile, logoRemoved, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
+
+  const generalModelDiffers =
+    (modelConfig.general || null) !== ((originalData?.models || {}).general || null)
+  // Enables Update, so the seeded value has a way into the database: Publish
+  // posts no body and never persists models.
+  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers
+  // ...but a slot holding the seeded value is not an edit worth blocking
+  // Publish over, for the very agents the seed exists to unblock. Picking the
+  // seeded model by hand is indistinguishable from the seed itself, which is
+  // harmless: either way the delegation resolves the same default. The
+  // stored-slot test retires the exemption once an Update has persisted a
+  // model, so re-picking the seeded one is then an ordinary unsaved edit.
+  const seedStillUnsaved = !(originalData?.models || {}).general
+  const publishBlockedByEdits =
+    isDirtyBeyondGeneralModel ||
+    (generalModelDiffers &&
+      !(seedStillUnsaved && modelConfig.general === seededGeneralRef.current))
 
   // After a successful save, align server-side ownership with the chosen control:
   // promote a personal agent to team (with visibility) or demote a team agent back
@@ -1432,12 +1517,16 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       finalToolCategories.push("ssh")
     }
 
-    // Add selected MCP servers back into tool_categories
-    selectedMcpServers.forEach(server => {
-      const connectedServer = findMatchingMcpServer(mcpServers, server)
-      const connectedApp = findMatchingMcpApp(officialApps, server)
-      finalToolCategories.push(`mcp:${connectedServer?.name || connectedApp?.name || server}`)
-    })
+    // Add selected MCP servers back into tool_categories, resolved to the
+    // real connected MCPServer row's name -- see resolveMcpToolSelector for
+    // why a hard-coded id/name fallback can't work for every app. Deduped:
+    // two distinct selectedMcpServers entries can resolve to the same real
+    // row, and the backend persists tool_categories verbatim (agents.py),
+    // so an unresolved duplicate here lands in the DB and stays there.
+    const resolvedMcpSelectors = new Set(
+      selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
+    )
+    resolvedMcpSelectors.forEach(selector => finalToolCategories.push(`mcp:${selector}`))
 
     setIsCreating(true)
 
@@ -1514,6 +1603,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             logo_url: updatedAgent.logo_url,
             ...(ownershipResult ?? {}),
           })
+          // Re-seed selectedMcpServers to match: see
+          // mcpServerNamesFromToolCategories's comment for why (isDirty
+          // would otherwise compare a resolved name against the
+          // display name the user picked, forever).
+          setSelectedMcpServers(mcpServerNamesFromToolCategories(finalToolCategories))
           // Sync the saved logo URL so the preview doesn't fall back to the
           // stale URL captured at initial load once logoFile is cleared below.
           setLogoUrl(updatedAgent.logo_url || null)
@@ -1549,7 +1643,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
           // Newly created agents are always personal; promote if the user chose Team.
           const ownershipResult = await reconcileOwnership(newAgent.id.toString(), newAgent.team_id)
-          setOriginalData({ ...newAgent, ...(ownershipResult ?? {}) })
+          // tool_categories: finalToolCategories explicitly, not whatever
+          // newAgent.tool_categories echoes back -- matches the edit-mode
+          // branch above, which sources both originalData and the reseed
+          // below from the same local value rather than mixing a server
+          // response with a local one.
+          setOriginalData({ ...newAgent, tool_categories: finalToolCategories, ...(ownershipResult ?? {}) })
+          // Same re-seed as the edit-mode branch above, and for the same
+          // reason: selectedMcpServers must hold the resolved selectors
+          // this request submitted, not the possibly-unresolved values it
+          // still held from before save.
+          setSelectedMcpServers(mcpServerNamesFromToolCategories(finalToolCategories))
           // Only confirm success once ownership resolved. If a promote was blocked
           // (the share-connectors dialog opened, ownershipResult is null), don't
           // stack a "created" dialog on top of it — but remember to show it when
@@ -1574,7 +1678,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       } else {
         const error: unknown = await response.json().catch(() => null)
         toast.error(
-          getAgentUpdateErrorMessage(error, t("builds.editor.error.unknown"))
+          getBuilderErrorMessage(error, t("builds.editor.error.unknown"))
         )
       }
     } catch (error) {
@@ -1602,8 +1706,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         })
         toast.success(t("builds.editor.success.published"))
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.editor.error.publishFailed"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.publishFailed"))
+        )
       }
     } catch (error) {
       console.error("Failed to publish agent:", error)
@@ -1630,8 +1736,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         })
         toast.success(t("builds.editor.success.unpublished"))
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.editor.error.unpublishFailed"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.unpublishFailed"))
+        )
       }
     } catch (error) {
       console.error("Failed to unpublish agent:", error)
@@ -1659,8 +1767,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           navPendingRef.current = true
         }
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.editor.error.publishFailed"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(error, t("builds.publication.publishFailed"))
+        )
       }
     } catch (error) {
       console.error("Failed to publish agent:", error)
@@ -1706,8 +1816,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         setInstructions(data.optimized_instructions)
         toast.success(t("builds.configForm.instructions.optimizeSuccess"))
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.configForm.instructions.optimizeError"))
+        const error: unknown = await response.json().catch(() => null)
+        toast.error(
+          getBuilderErrorMessage(
+            error,
+            t("builds.configForm.instructions.optimizeError")
+          )
+        )
       }
     } catch (error) {
       console.error("Failed to optimize instructions:", error)
@@ -1831,7 +1946,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       selectedMcpServers.map((serverName) => {
         const connectedServer = findMatchingMcpServer(mcpServers, serverName)
         const matchingApp = findMatchingMcpApp(officialApps, serverName)
-        return connectedServer?.name || matchingApp?.name || serverName
+        // matchingApp?.name (the catalog display name, e.g. "Chrome") first,
+        // not connectedServer?.name (the real MCPServer row name, e.g.
+        // "chrome-devtools"): this is a *display* label. Preferring the row
+        // name here made the chip flip from "Chrome" to "chrome-devtools"
+        // the instant selectedMcpServers gets re-seeded with the resolved
+        // name after a save (see mcpServerNamesFromToolCategories).
+        return matchingApp?.name || connectedServer?.name || serverName
       }),
     [selectedMcpServers, mcpServers, officialApps],
   )
@@ -1931,7 +2052,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   <Button
                     variant="secondary"
                     onClick={handlePublish}
-                    disabled={isCreating || loadingAgent || isDirty}
+                    disabled={isCreating || loadingAgent || publishBlockedByEdits}
                   >
                     {t("builds.editor.header.publish")}
                   </Button>
@@ -2596,7 +2717,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 statusDesc = t("tools.mcp.notSupported")
               }
 
-              const server = { name: connectedServer?.name || matchingApp?.name || serverName, description: statusDesc }
+              // Display label: matchingApp?.name first, same reasoning as
+              // connectorDisplayNames above.
+              const server = { name: matchingApp?.name || connectedServer?.name || serverName, description: statusDesc }
               const icon = getAppIcon(server.name)
               return (
                 <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && "opacity-50 bg-muted/50")}>

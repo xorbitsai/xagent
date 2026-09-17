@@ -5,10 +5,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...config import get_tool_max_concurrency, get_tool_parallel_enabled
+from ..context_ref import ContextReference
+from ..task_runtime import (
+    PREFERRED_INPUT_MODALITIES_METADATA_KEY,
+    normalize_input_modalities,
+)
 from .agent import Agent
+from .attachments import build_image_context_references
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
-from .runner import AgentRunner
+from .result import NO_OUTPUT_PLACEHOLDER
+from .runner import AgentRunner, UserMessageInjectionOutcome
 from .tracing import TraceEventCallback
 
 logger = logging.getLogger(__name__)
@@ -28,12 +35,14 @@ class AgentExecutionConfig:
     tracer: Any | None = None
     system_prompt: str | None = None
     workspace_base_dir: str = "workspace"
+    workspace_enabled: bool = True
     allowed_external_dirs: list[str] | None = None
     scope_segments: tuple[str, ...] = ()
     current_task_id: str | None = None
     service_id: str | None = None
     registry: ExecutionRegistry | None = None
     dag_max_concurrency: int = 4
+    react_max_iterations: int = 200
     tool_parallel_enabled: bool = field(default_factory=get_tool_parallel_enabled)
     tool_max_concurrency: int = field(default_factory=get_tool_max_concurrency)
     outbound_message_handler: Any | None = None
@@ -48,6 +57,11 @@ class AgentExecutionConfig:
     skill_manager: Any | None = None
     skill_scope_context: Any | None = None
     allowed_skills: list[str] | None = None
+    # Capability gate: False overrides an explicitly supplied manager/list.
+    skills_enabled: bool = True
+    user_interaction_enabled: bool = True
+    preferred_input_modalities: tuple[str, ...] = ()
+    execution_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentExecutionAdapter:
@@ -88,15 +102,15 @@ class AgentExecutionAdapter:
             runner,
             execution_id=execution_id,
             task=task,
-            metadata={
-                "execution_type": execution_type,
-                "pattern": self.config.pattern,
-                "request_context": dict(context or {}),
-                "selected_skill_context": self.config.recovered_skill_context,
-            },
+            metadata=self._execution_metadata(
+                execution_type=execution_type,
+                request_context=context,
+                include_request_context=True,
+            ),
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
+            task_context_refs=self._request_context_refs(context),
             interrupt_checker=self.config.interrupt_checker,
         )
         if handle.task is None:
@@ -127,15 +141,15 @@ class AgentExecutionAdapter:
             runner,
             execution_id=execution_id,
             task=task,
-            metadata={
-                "execution_type": execution_type,
-                "pattern": self.config.pattern,
-                "request_context": dict(context or {}),
-                "selected_skill_context": self.config.recovered_skill_context,
-            },
+            metadata=self._execution_metadata(
+                execution_type=execution_type,
+                request_context=context,
+                include_request_context=True,
+            ),
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
+            task_context_refs=self._request_context_refs(context),
             interrupt_checker=self.config.interrupt_checker,
         )
         return handle.to_dict()
@@ -148,16 +162,21 @@ class AgentExecutionAdapter:
         # Carry the mid-run quota checker into the resumed run too, so a
         # paused-and-resumed continuation is gated like a fresh run.
         kwargs.setdefault("interrupt_checker", self.config.interrupt_checker)
+        resume_metadata = dict(kwargs.get("metadata") or {})
+        preferred_modalities = normalize_input_modalities(
+            self.config.preferred_input_modalities
+        )
+        resume_metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+            preferred_modalities
+        )
+        kwargs["metadata"] = resume_metadata
         handle = self.registry.get(execution_id)
         if handle is None:
             runner, execution_type = self._build_runner()
             self.registry.register(
                 execution_id,
                 runner,
-                metadata={
-                    "execution_type": execution_type,
-                    "pattern": self.config.pattern,
-                },
+                metadata=self._execution_metadata(execution_type=execution_type),
             )
         else:
             execution_type = str(
@@ -184,18 +203,15 @@ class AgentExecutionAdapter:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> bool:
+    ) -> UserMessageInjectionOutcome:
         if self.registry.get(execution_id) is None:
             runner, execution_type = self._build_runner()
             self.registry.register(
                 execution_id,
                 runner,
-                metadata={
-                    "execution_type": execution_type,
-                    "pattern": self.config.pattern,
-                },
+                metadata=self._execution_metadata(execution_type=execution_type),
             )
-        context = await self.registry.post_user_message(
+        result = await self.registry.post_user_message(
             execution_id,
             message,
             execution_message=execution_message,
@@ -205,7 +221,7 @@ class AgentExecutionAdapter:
             request_interrupt=request_interrupt,
             reason=reason,
         )
-        return context is not None
+        return result.outcome
 
     def cancel(self, execution_id: str, reason: str | None = None) -> bool:
         return self.registry.cancel(execution_id, reason=reason)
@@ -221,10 +237,36 @@ class AgentExecutionAdapter:
             self.config.service_id or self.config.current_task_id or execution_id
         )
 
+    def _execution_metadata(
+        self,
+        *,
+        execution_type: str,
+        request_context: dict[str, Any] | None = None,
+        include_request_context: bool = False,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            **self.config.execution_metadata,
+            "execution_type": execution_type,
+            "pattern": self.config.pattern,
+        }
+        if include_request_context:
+            metadata["request_context"] = dict(request_context or {})
+            metadata["selected_skill_context"] = self.config.recovered_skill_context
+        preferred_modalities = normalize_input_modalities(
+            self.config.preferred_input_modalities
+        )
+        if preferred_modalities:
+            metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = list(
+                preferred_modalities
+            )
+        return metadata
+
     def _build_runner(self) -> tuple[AgentRunner, str]:
         pattern, execution_type = self._build_pattern()
-        skill_manager = self.config.skill_manager
-        if skill_manager is None:
+        skill_manager = (
+            self.config.skill_manager if self.config.skills_enabled else None
+        )
+        if self.config.skills_enabled and skill_manager is None:
             from ...skills.utils import create_skill_manager
 
             skill_manager = create_skill_manager(
@@ -237,11 +279,16 @@ class AgentExecutionAdapter:
             llm=self.config.llm,
             compact_llm=self.config.compact_llm,
             system_prompt=self.config.system_prompt,
-            metadata={"pattern": self.config.pattern},
+            metadata={
+                **self.config.execution_metadata,
+                "pattern": self.config.pattern,
+            },
             memory_store=self.config.memory_store,
             memory_similarity_threshold=self.config.memory_similarity_threshold,
             skill_manager=skill_manager,
-            allowed_skills=self.config.allowed_skills,
+            allowed_skills=(
+                self.config.allowed_skills if self.config.skills_enabled else None
+            ),
         )
         return (
             AgentRunner(
@@ -249,6 +296,7 @@ class AgentExecutionAdapter:
                 tracer=self.config.tracer,
                 callbacks=[TraceEventCallback()],
                 workspace_base_dir=self.config.workspace_base_dir,
+                workspace_enabled=self.config.workspace_enabled,
                 scope_segments=self.config.scope_segments,
                 outbound_message_handler=self.config.outbound_message_handler,
             ),
@@ -261,6 +309,7 @@ class AgentExecutionAdapter:
                 DAGPattern(
                     LLMPlanGenerator(),
                     max_concurrency=self.config.dag_max_concurrency,
+                    user_interaction_enabled=self.config.user_interaction_enabled,
                 ),
                 "agent_dag",
             )
@@ -268,12 +317,15 @@ class AgentExecutionAdapter:
             return (
                 AutoPattern(
                     react_pattern=ReActPattern(
+                        max_iterations=self.config.react_max_iterations,
                         tool_parallel_enabled=self.config.tool_parallel_enabled,
                         tool_max_concurrency=self.config.tool_max_concurrency,
+                        user_interaction_enabled=self.config.user_interaction_enabled,
                     ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
                         max_concurrency=self.config.dag_max_concurrency,
+                        user_interaction_enabled=self.config.user_interaction_enabled,
                     ),
                 ),
                 "agent_auto",
@@ -285,13 +337,16 @@ class AgentExecutionAdapter:
                     finalize_after_tool_result=True,
                     tool_parallel_enabled=self.config.tool_parallel_enabled,
                     tool_max_concurrency=self.config.tool_max_concurrency,
+                    user_interaction_enabled=self.config.user_interaction_enabled,
                 ),
                 "agent_single_call",
             )
         return (
             ReActPattern(
+                max_iterations=self.config.react_max_iterations,
                 tool_parallel_enabled=self.config.tool_parallel_enabled,
                 tool_max_concurrency=self.config.tool_max_concurrency,
+                user_interaction_enabled=self.config.user_interaction_enabled,
             ),
             "agent_react",
         )
@@ -301,6 +356,22 @@ class AgentExecutionAdapter:
             *self.config.execution_context_messages,
             *self.config.conversation_history,
         ]
+
+    @staticmethod
+    def _request_context_refs(
+        context: dict[str, Any] | None,
+    ) -> tuple[ContextReference, ...]:
+        if not isinstance(context, dict):
+            return ()
+        references: list[ContextReference] = []
+        seen: set[str] = set()
+        for key in ("file_info", "files", "attachments"):
+            for reference in build_image_context_references(context.get(key)):
+                if reference.file_id in seen:
+                    continue
+                seen.add(reference.file_id)
+                references.append(reference)
+        return tuple(references)
 
     def _execution_type(self) -> str:
         if self.config.pattern == "dag_plan_execute":
@@ -331,13 +402,38 @@ class AgentExecutionAdapter:
         else:
             output = result.get("output", result.get("response", result.get("error")))
             if not output:
+                # This backfill and the raw ``agent_result`` preserved below
+                # must stay distinguishable: the delegated-child classifier
+                # in ``agent_tool.py`` reads the pre-backfill answer from
+                # ``agent_result`` specifically so a backfilled preamble
+                # cannot be mistaken for a real final answer.
                 output = self._latest_assistant_message(result.get("context"))
+        if not output and result.get("success"):
+            # A run that reports success with nothing to show is a bug in the
+            # pattern that produced it, and the placeholder erases the evidence.
+            # Log before substituting so there is something to debug from.
+            #
+            # Gated on ``success`` because an empty output is legitimate on every
+            # non-success path: a ``waiting_for_user`` pause carries only its
+            # message, so warning on emptiness alone would fire on the ordinary
+            # first-turn clarification and drown the real signal.
+            logger.warning(
+                "Agent %r produced no output; substituting the placeholder. "
+                "execution_type=%s pattern=%s status=%s success=%s task_id=%s",
+                self.config.name,
+                execution_type,
+                self.config.pattern,
+                status,
+                result.get("success"),
+                execution_id,
+            )
         normalized = {
             "status": status,
-            "output": output or "No output provided",
+            "output": output or NO_OUTPUT_PLACEHOLDER,
             "success": result.get("success", False),
             "error": result.get("error"),
             "metadata": {
+                **self.config.execution_metadata,
                 "agent_name": self.config.name,
                 "execution_type": execution_type,
                 "pattern": self.config.pattern,
@@ -363,7 +459,34 @@ class AgentExecutionAdapter:
                         if isinstance(interactions, list)
                         else [],
                     },
+                    # This top-level key is the supported contract for
+                    # readers of the clarification draft. ``agent_result``
+                    # above is a diagnostic snapshot of the raw pattern
+                    # result, already read by ``agent_tool.py`` and
+                    # ``websocket.py`` for other purposes -- it happens to
+                    # carry the same draft too, but callers should not dig
+                    # it out from there.
+                    "clarification_draft": result.get("clarification_draft"),
+                    # Empty list rather than ``None`` so a reader only ever
+                    # needs one check (``if superseded:``) instead of also
+                    # distinguishing "key absent" from "key present but
+                    # empty".
+                    "clarification_superseded_step_ids": (
+                        result.get("clarification_superseded_step_ids") or []
+                    ),
                 }
+            )
+        if status == "interrupted":
+            # A losing waiting step can still be superseded in a batch whose
+            # winner is an interrupt rather than a question (the DAG ranks
+            # an interrupt ahead of a waiting result within the same
+            # wakeup), so this key must reach the top level here too --
+            # otherwise a reader has no way to tell "no sibling was
+            # superseded" apart from "this status never carries the key".
+            # Same empty-list default as the waiting branch above, for the
+            # same reason: one ``if superseded:`` check covers both.
+            normalized["clarification_superseded_step_ids"] = (
+                result.get("clarification_superseded_step_ids") or []
             )
         return normalized
 

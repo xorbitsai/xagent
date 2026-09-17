@@ -9,12 +9,9 @@ What this test pins:
        The test asserts the loader's ``threading.get_ident()`` differs
        from the loop thread's.
 
-    2. While the loader is sleeping, the event loop is still able to
-       drive other coroutines forward. We verify by kicking off a
-       concurrent ``asyncio.sleep`` task and confirming it advances
-       during the snapshot load window. This is the core invariant
-       the off-loop snapshot loader exists to provide -- main-loop
-       release during the synchronous DB block (issue #427).
+    2. While the loader is parked on a release event, the event loop resumes
+       the test coroutine. The test releases the worker only after observing
+       that the load is still pending (issue #427).
 
     3. The snapshot's fields are observed by ``get_agent_for_task``
        on the loop thread without lazy-loading from the loader's
@@ -39,14 +36,15 @@ from sqlalchemy.pool import QueuePool
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 from xagent.core.workspace import TaskWorkspace
-from xagent.web.api import chat as chat_module
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models import Base, Task
 from xagent.web.models import database as database_module
+from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services import uploaded_file_store as uploaded_file_store_module
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.managed_file_ref import ensure_uploaded_file_local_path
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -59,7 +57,11 @@ def _make_user() -> User:
     return User(id=1, username="snap-int-user", password_hash="hash", is_admin=False)
 
 
-def _build_snapshot(*, source: str | None = "internal") -> TaskSetupSnapshot:
+def _build_snapshot(
+    *,
+    source: str | None = "internal",
+    agent_config: Any = None,
+) -> TaskSetupSnapshot:
     return TaskSetupSnapshot(
         task=_TaskFields(
             id=42,
@@ -67,7 +69,7 @@ def _build_snapshot(*, source: str | None = "internal") -> TaskSetupSnapshot:
             status=TaskStatus.PENDING,
             source=source,
             agent_id=None,
-            agent_config=None,
+            agent_config=agent_config,
             model_name=None,
             compact_model_name=None,
             execution_mode="flash",
@@ -129,7 +131,7 @@ async def test_live_request_session_releases_clean_read_before_snapshot_worker(
     request_user = request_db.get(User, user_id)
     assert request_user is not None
     loaded_snapshots: list[TaskSetupSnapshot] = []
-    real_loader = chat_module.load_task_setup_snapshot_sync
+    real_loader = agent_runtime_service.load_task_setup_snapshot_sync
 
     def tracking_loader(
         loaded_task_id: int,
@@ -146,6 +148,7 @@ async def test_live_request_session_releases_clean_read_before_snapshot_worker(
         runtime_user = kwargs["user"]
         assert isinstance(runtime_user, RuntimeUserFields)
         runtime_users.append(runtime_user)
+        assert kwargs["db_task_id"] == task_id
         assert engine.pool.checkedout() == 0
         await asyncio.sleep(0.03)
         assert engine.pool.checkedout() == 0
@@ -154,18 +157,24 @@ async def test_live_request_session_releases_clean_read_before_snapshot_worker(
     manager = AgentServiceManager()
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             side_effect=tracking_loader,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=observed_create_default_tools,
         ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService", return_value=MagicMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService",
+            return_value=MagicMock(),
+        ),
     ):
         await manager.get_agent_for_task(task_id, request_db, user=request_user)
 
@@ -247,7 +256,7 @@ def test_selected_file_registration_materializes_after_read_session_closes(
         return ensure_uploaded_file_local_path(record)
 
     monkeypatch.setattr(
-        chat_module,
+        agent_runtime_service,
         "ensure_uploaded_file_local_path",
         observed_materialization,
     )
@@ -257,7 +266,7 @@ def test_selected_file_registration_materializes_after_read_session_closes(
         allowed_external_dirs=[str(source_dir)],
     )
 
-    chat_module._register_selected_task_files_isolated(
+    agent_runtime_service._register_selected_task_files_isolated(
         workspace,
         task_id=task_id,
         task_owner_id=user_id,
@@ -289,16 +298,18 @@ async def test_snapshot_worker_rejects_caller_session_with_pending_writes() -> N
     worker = AsyncMock()
     with (
         patch(
-            "xagent.web.api.chat.release_db_connection_if_clean",
+            "xagent.web.services.agent_service_manager.release_db_connection_if_clean",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat.run_db_io_cancellation_safe",
+            "xagent.web.services.agent_service_manager.run_db_io_cancellation_safe",
             new=worker,
         ),
         pytest.raises(RuntimeError, match="pending writes"),
     ):
-        await chat_module._load_task_setup_snapshot_for_agent(42, 1, caller_db)
+        await agent_runtime_service._load_task_setup_snapshot_for_agent(
+            42, 1, caller_db
+        )
 
     worker.assert_not_awaited()
 
@@ -336,13 +347,19 @@ async def test_snapshot_pool_timeout_is_not_replaced_by_default_runtime(
     with (
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService", new=agent_constructor),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService",
+            new=agent_constructor,
+        ),
         pytest.raises(SQLAlchemyTimeoutError),
     ):
         await manager.get_agent_for_task(42, caller_db, user=_make_user())
@@ -379,24 +396,24 @@ async def test_snapshot_runs_off_loop_thread() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             side_effect=fake_loader,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=None,
         ),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ):
         try:
             await manager.get_agent_for_task(task_id=42, db=db, user=user)
@@ -420,39 +437,17 @@ async def test_snapshot_runs_off_loop_thread() -> None:
 
 @pytest.mark.asyncio
 async def test_event_loop_stays_responsive_during_snapshot_load() -> None:
-    """The other half of the off-loop contract: while the snapshot
-    loader is sleeping (simulating a slow DB read), other coroutines
-    on the same loop must still be able to make progress.
-
-    We block the loader for 0.3s and concurrently schedule a tight
-    polling task that records its tick count. If ``to_thread`` works,
-    the polling task progresses across many ticks during the loader's
-    sleep. If the loader regresses back to an inline synchronous
-    call, the polling task records at most one tick (no progress
-    until the blocking sleep returns).
-    """
+    """The loop resumes while the actual snapshot loader is parked off-loop."""
     snapshot = _build_snapshot()
-    ticks: list[float] = []
-    loader_done = asyncio.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
 
     def slow_loader(task_id: int, user_id: int | None) -> TaskSetupSnapshot:
-        # Synchronous sleep on the worker thread. If the call is
-        # actually executed inline on the loop thread, this freezes
-        # the entire loop and the poll task can't tick.
-        import time
-
-        time.sleep(0.3)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "snapshot loader was never released"
         return snapshot
-
-    async def poll() -> None:
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        while not loader_done.is_set():
-            ticks.append(loop.time() - start)
-            # Short sleep to yield, but the *loop* must run to come
-            # back to us. If the loader is hogging the loop this
-            # await never resumes until the sleep returns.
-            await asyncio.sleep(0.02)
 
     manager = AgentServiceManager()
     user = _make_user()
@@ -464,42 +459,36 @@ async def test_event_loop_stays_responsive_during_snapshot_load() -> None:
     async def driver() -> None:
         with (
             patch(
-                "xagent.web.api.chat.load_task_setup_snapshot_sync",
+                "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
                 side_effect=slow_loader,
             ),
             patch.object(manager, "_load_persisted_conversation_history"),
             patch(
-                "xagent.web.api.chat.create_task_tracer",
+                "xagent.web.services.agent_service_manager.create_task_tracer",
                 return_value=MagicMock(),
             ),
             patch(
-                "xagent.web.api.chat.create_default_tools",
+                "xagent.web.services.agent_service_manager.create_default_tools",
                 new=AsyncMock(return_value=([], MagicMock())),
             ),
             patch(
                 "xagent.web.sandbox_manager.get_sandbox_manager",
                 return_value=None,
             ),
-            patch("xagent.web.api.chat.AgentService"),
+            patch("xagent.web.services.agent_service_manager.AgentService"),
         ):
             try:
                 await manager.get_agent_for_task(task_id=42, db=db, user=user)
             except Exception:
                 pass
-        loader_done.set()
 
-    await asyncio.gather(driver(), poll())
-
-    # With a 0.3s blocking sleep on the worker thread and 0.02s
-    # polling intervals on the loop, we expect on the order of ~10
-    # ticks. Use a permissive floor of >= 5 to keep the test stable
-    # under busy CI while still failing loudly if the loop genuinely
-    # freezes (which would yield 0-1 ticks).
-    assert len(ticks) >= 5, (
-        f"Loop ticked only {len(ticks)} times during the 0.3s snapshot "
-        "load -- the loader appears to be running inline on the loop "
-        "thread (the off-loop invariant regressed)."
-    )
+    loading = asyncio.create_task(driver())
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not loading.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(loading, timeout=30)
 
 
 @pytest.mark.asyncio
@@ -528,7 +517,9 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
 
         def cleanup_workspace(self) -> None: ...
 
-        def set_conversation_history(self, _messages: list[dict[str, str]]) -> None: ...
+        def set_conversation_history(
+            self, _messages: list[dict[str, str]], *, watermark: int | None = None
+        ) -> None: ...
 
         def set_execution_context_messages(self, _messages: list[Any]) -> None: ...
 
@@ -543,24 +534,27 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=None,
         ),
-        patch("xagent.web.api.chat.AgentService", new=_FakeAgentService),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService",
+            new=_FakeAgentService,
+        ),
     ):
         await manager.get_agent_for_task(task_id=42, db=db, user=user)
 
@@ -570,6 +564,119 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
     # before reaching this point.
     assert constructed.get("pattern") == "single_call"
     assert constructed.get("task_id") == "42"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_excluded"),
+    [
+        (AgentStatus.PUBLISHED, True),
+        (AgentStatus.DRAFT, False),
+    ],
+)
+async def test_get_agent_for_task_snapshot_reader_uses_persisted_task_owner(
+    tmp_path,
+    monkeypatch,
+    status,
+    expected_excluded,
+) -> None:
+    """The reachable get-agent path delegates preview exclusion to its snapshot."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'preview-owner.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
+
+    with session_factory() as setup_db:
+        owner = User(username="preview-owner", password_hash="hash", is_admin=False)
+        actor = User(username="preview-actor", password_hash="hash", is_admin=False)
+        setup_db.add_all([owner, actor])
+        setup_db.flush()
+        preview_agent = Agent(
+            user_id=int(owner.id),
+            name="preview-agent",
+            status=status,
+            instructions="preview instructions",
+            execution_mode="flash",
+            models={},
+            knowledge_bases=[],
+            skills=[],
+            tool_categories=[],
+        )
+        setup_db.add(preview_agent)
+        setup_db.flush()
+        task = Task(
+            user_id=int(owner.id),
+            title="preview task",
+            description="preview",
+            status=TaskStatus.PENDING,
+            execution_mode="flash",
+            agent_config={
+                "instructions": "preview instructions",
+                "skills": [],
+                "knowledge_bases": [],
+                "tool_categories": [],
+                "preview_agent_id": str(int(preview_agent.id)),
+            },
+        )
+        setup_db.add(task)
+        setup_db.commit()
+        owner_id = int(owner.id)
+        actor_id = int(actor.id)
+        preview_agent_id = int(preview_agent.id)
+        task_id = int(task.id)
+
+    resolved_owner_ids: list[int] = []
+    from xagent.web.services import agent_team_scope
+
+    real_resolver = agent_team_scope.resolve_authorized_agent
+
+    def observe_resolver(session, owner_user_id, candidate_id):
+        resolved_owner_ids.append(owner_user_id)
+        return real_resolver(session, owner_user_id, candidate_id)
+
+    observed_excluded_ids: list[int | None] = []
+
+    async def capture_tools(*_args: Any, **kwargs: Any):
+        observed_excluded_ids.append(kwargs["excluded_agent_id"])
+        return [], MagicMock()
+
+    manager = AgentServiceManager()
+    agent_service = MagicMock()
+    agent_service.workspace = None
+    request_db = session_factory()
+    actor_user = request_db.get(User, actor_id)
+    assert actor_user is not None
+    monkeypatch.setattr(agent_team_scope, "resolve_authorized_agent", observe_resolver)
+    try:
+        with (
+            patch.object(manager, "_load_persisted_conversation_history"),
+            patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+            patch(
+                "xagent.web.services.agent_service_manager.create_task_tracer",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "xagent.web.services.agent_service_manager.create_default_tools",
+                new=capture_tools,
+            ),
+            patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+            patch(
+                "xagent.web.services.agent_service_manager.AgentService",
+                return_value=agent_service,
+            ),
+        ):
+            await manager.get_agent_for_task(task_id, request_db, user=actor_user)
+    finally:
+        request_db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+    assert actor_id != owner_id
+    assert resolved_owner_ids == [owner_id]
+    assert observed_excluded_ids == [preview_agent_id if expected_excluded else None]
 
 
 @pytest.mark.asyncio
@@ -596,21 +703,67 @@ async def test_snapshot_source_controls_mcp_failure_policy(
     tracer = MagicMock()
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=tracer),
-        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=tracer,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ):
         await manager.get_agent_for_task(task_id=42, db=db, user=user)
 
     assert create_tools.await_args.kwargs["mcp_failure_policy"] is expected_policy
     assert create_tools.await_args.kwargs["mcp_load_summary_tracer"] is tracer
     assert create_tools.await_args.kwargs["mcp_load_summary_trace_task_id"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_fresh_public_snapshot_forwards_file_operation_policy() -> None:
+    snapshot = _build_snapshot(
+        source="shared_link",
+        agent_config={
+            "auth_mode": "share",
+            "__xagent_file_operation_access_version": 1,
+        },
+    )
+    manager = AgentServiceManager()
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        status=TaskStatus.PENDING
+    )
+    create_tools = AsyncMock(return_value=([], MagicMock()))
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ),
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
+    ):
+        await manager.get_agent_for_task(task_id=42, db=db, user=_make_user())
+
+    assert create_tools.await_args.kwargs["db_task_id"] == 42
+    assert create_tools.await_args.kwargs["file_operation_access_version"] == 1
 
 
 @pytest.mark.asyncio
@@ -690,24 +843,24 @@ async def test_snapshot_fallback_raises_on_no_default_llm_with_agent_builder() -
 
     with (
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=agent_builder_snapshot,
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=None,
         ),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ):
         with pytest.raises(HTTPException) as exc_info:
             await manager.get_agent_for_task(task_id=42, db=db, user=user)

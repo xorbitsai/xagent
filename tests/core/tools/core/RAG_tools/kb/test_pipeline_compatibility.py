@@ -27,6 +27,7 @@ from xagent.core.tools.core.RAG_tools.kb.models import (
     RollbackFailedIngestionRequest,
     RollbackFailedIngestionResult,
 )
+from xagent.core.tools.core.RAG_tools.web_crawler.crawler import STOPPED_NO_LINKS
 
 
 class _FakeMetadataStore:
@@ -554,6 +555,9 @@ class _SinglePageCrawler:
     ) -> None:
         self.total_urls_found = 1
         self.failed_urls: dict[str, str] = {}
+
+    def get_statistics(self) -> dict:
+        return {"stop_reason": STOPPED_NO_LINKS, "link_rejections": {}}
 
     async def crawl(self) -> list[CrawlResult]:
         return [

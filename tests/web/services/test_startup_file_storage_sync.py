@@ -746,3 +746,67 @@ def test_sync_waits_for_file_lock_then_runs_idempotent_pass(monkeypatch, tmp_pat
     assert result.uploaded == 1
     assert storage.put_calls == [(local_path, expected_key)]
     assert record.storage_status == "available"
+
+
+def test_sync_reports_the_provider_fault_behind_an_adoption_failure(tmp_path, caplog):
+    """An adoption failure must arrive classified, not just as a traceback.
+
+    ``adopt_existing_object``'s stat and content-hash calls are two of the raise
+    sites #1467 asked to cover, and this sync is their only caller. The bare
+    ``except Exception`` here already produced a traceback via
+    ``logger.exception``, so the cause was never lost -- what was missing is the
+    classified provider fields, which is what makes a burst of these
+    aggregatable by cause rather than readable one at a time.
+    """
+    import logging
+
+    db = _session()
+    user = _user(db)
+    local_path = tmp_path / "uploads" / "input.txt"
+    local_path.parent.mkdir()
+    local_path.write_text("content", encoding="utf-8")
+    key = f"users/{int(user.id)}/uploads/file-123/input.txt"
+    _record(
+        db,
+        user=user,
+        local_path=local_path,
+        file_id="file-123",
+        storage_key=key,
+        storage_status="legacy",
+    )
+    db.commit()
+
+    class ThrottledStorage(FakeStorage):
+        def stat(self, stat_key):
+            # Shaped like the real chain: botocore ClientError under s3fs's
+            # translation under the wrap ManagedFileRef applies.
+            class ClientError(Exception):
+                def __init__(self) -> None:
+                    super().__init__("An error occurred (SlowDown)")
+                    self.response = {
+                        "Error": {"Code": "SlowDown"},
+                        "ResponseMetadata": {"HTTPStatusCode": 503},
+                    }
+
+            raise OSError(16, "SlowDown occurred") from ClientError()
+
+    storage = ThrottledStorage({key})
+    logger_name = "xagent.web.services.startup_file_storage_sync"
+
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        result = sync_registered_files_to_durable_storage(db, storage=storage)
+
+    assert result.failed == 1
+    records = [
+        logging.Formatter("%(message)s").format(entry)
+        for entry in caplog.records
+        if entry.name == logger_name and entry.levelno == logging.WARNING
+    ]
+    assert len(records) == 1, caplog.records
+    rendered = records[0]
+    assert "during startup durable adoption" in rendered
+    assert "file_id=file-123" in rendered
+    assert f"storage_key={key}" in rendered
+    # The code recovered from below the errno, not the EBUSY that masked it.
+    assert "provider_code=SlowDown" in rendered
+    assert "provider_http_status=503" in rendered

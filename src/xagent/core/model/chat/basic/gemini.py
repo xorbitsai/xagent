@@ -10,7 +10,9 @@ from google import genai  # type: ignore[import-untyped,unused-ignore]
 from google.genai import errors as genai_errors
 
 from ....utils.security import redact_sensitive_text
+from ..error import is_context_length_error
 from ..exceptions import (
+    LLMContextLengthError,
     LLMEmptyContentError,
     LLMInvalidResponseError,
     LLMRetryableError,
@@ -308,6 +310,12 @@ class GeminiLLM(BaseLLM):
         self, messages: List[Dict[str, Any]]
     ) -> tuple[Optional[str], List[Dict[str, Any]]]:
         """Convert OpenAI format messages to Gemini format."""
+        # No explicit ``_xagent_``-prefixed key stripping happens here: every
+        # output message below is rebuilt field-by-field, never a
+        # ``dict(msg)`` copy, so an internal marker like
+        # ``_xagent_provider_state`` on the input is never read and cannot
+        # leak into the Gemini request. Switching any branch here to copy
+        # ``msg`` wholesale would reopen that leak.
         gemini_messages = []
         system_instruction = None
 
@@ -649,6 +657,9 @@ class GeminiLLM(BaseLLM):
         except Exception as e:
             logger.error("Gemini SDK API error: %s", redact_sensitive_text(str(e)))
 
+            if is_context_length_error(e):
+                raise LLMContextLengthError(str(e)) from e
+
             error_text = str(e)
             error_text_lower = error_text.lower()
 
@@ -938,6 +949,9 @@ class GeminiLLM(BaseLLM):
             logger.error(
                 "Gemini SDK streaming error: %s", redact_sensitive_text(str(e))
             )
+
+            if is_context_length_error(e):
+                raise LLMContextLengthError(str(e)) from e
 
             error_text = str(e)
             error_text_lower = error_text.lower()

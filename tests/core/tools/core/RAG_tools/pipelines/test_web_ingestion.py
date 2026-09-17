@@ -18,6 +18,11 @@ from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
 )
 from xagent.core.tools.core.RAG_tools.utils.string_utils import sanitize_for_doc_id
 from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
+from xagent.core.tools.core.RAG_tools.web_crawler.crawler import (
+    STOPPED_NO_ELIGIBLE_LINKS,
+    STOPPED_NO_LINKS,
+    STOPPED_PAGE_CAP,
+)
 
 
 class TestWebIngestionPipeline:
@@ -1345,3 +1350,150 @@ class TestWebIngestionFileHandler:
 
         assert result.status == "success"
         assert events == [("commit", successful_ingestion)]
+
+
+class TestCrawlStopReasonDrivesStatus:
+    """A crawl that ends because the site refused every link is not a success,
+    but one that ends because the operator capped or filtered it is.
+
+    Predicates here read the crawler's stop reason rather than link counts:
+    `total_urls_found` is raw extractor output taken before URLFilter, so it
+    cannot tell a page cap or a deliberate filter from a site that blocked us.
+    """
+
+    @pytest.fixture
+    def crawl_config(self):
+        return WebCrawlConfig(
+            start_url="https://example.com",
+            max_pages=3,
+            max_depth=1,
+            concurrent_requests=1,
+            request_delay=0,
+        )
+
+    @pytest.fixture
+    def ingestion_config(self):
+        return IngestionConfig(chunk_size=500, chunk_overlap=100)
+
+    async def _run(self, crawl_config, ingestion_config, *, stop_reason, rejections):
+        ingestion_result = IngestionResult(
+            status="success",
+            doc_id="d",
+            parse_hash="h",
+            chunk_count=6,
+            embedding_count=6,
+            vector_count=6,
+            completed_steps=[],
+            failed_step=None,
+            message="Success",
+            warnings=[],
+        )
+        page = MagicMock(
+            url="https://example.com/",
+            title="Home",
+            content_markdown="# Home",
+            status="success",
+            depth=0,
+            timestamp=datetime(2025, 1, 1, 12, 0, 0),
+            content_length=50,
+        )
+        with patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+        ) as mock_crawler_class:
+            crawler = MagicMock()
+            crawler.crawl = AsyncMock(return_value=[page])
+            crawler.total_urls_found = sum(rejections.values())
+            crawler.failed_urls = {}
+            crawler.get_statistics.return_value = {
+                "stop_reason": stop_reason,
+                "link_rejections": rejections,
+                "total_links_queued": 0,
+            }
+            mock_crawler_class.return_value = crawler
+            with patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.run_document_ingestion",
+                return_value=ingestion_result,
+            ):
+                return await run_web_ingestion(
+                    collection="test_collection",
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                )
+
+    @pytest.mark.asyncio
+    async def test_every_link_refused_by_the_site_is_flagged(
+        self, crawl_config, ingestion_config
+    ):
+        """status stays success: the pages that landed were ingested and
+        published, which is what it means to every consumer of that enum. The
+        block is a separate fact and travels as its own flag and warning."""
+        result = await self._run(
+            crawl_config,
+            ingestion_config,
+            stop_reason=STOPPED_NO_ELIGIBLE_LINKS,
+            rejections={"robots_txt": 5},
+        )
+
+        assert result.status == "success"
+        assert result.crawl_blocked_by_site is True
+        assert "every link found was refused" in result.message
+        assert "5 blocked by robots.txt rules" in result.message
+        assert "robots_txt" not in result.message
+        assert result.message in result.warnings
+
+    @pytest.mark.asyncio
+    async def test_configured_rejections_stay_out_of_the_refusal_message(
+        self, crawl_config, ingestion_config
+    ):
+        """The same-domain rule is the operator's own scope restriction. Listing
+        it inside a sentence blaming the site reports that filtering as a
+        refusal, which is the distinction SITE_REJECTIONS exists to draw."""
+        result = await self._run(
+            crawl_config,
+            ingestion_config,
+            stop_reason=STOPPED_NO_ELIGIBLE_LINKS,
+            rejections={"off_domain": 40, "robots_txt": 5},
+        )
+
+        assert "5 blocked by robots.txt rules" in result.message
+        assert "same-domain" not in result.message
+        assert "40" not in result.message
+
+    @pytest.mark.asyncio
+    async def test_page_cap_is_a_success(self, crawl_config, ingestion_config):
+        result = await self._run(
+            crawl_config,
+            ingestion_config,
+            stop_reason=STOPPED_PAGE_CAP,
+            rejections={},
+        )
+
+        assert result.status == "success"
+        assert result.crawl_blocked_by_site is False
+        assert "Web ingestion completed" in result.message
+
+    @pytest.mark.asyncio
+    async def test_deliberate_filtering_is_a_success(
+        self, crawl_config, ingestion_config
+    ):
+        """Every outgoing link was off-domain: the filter did its job."""
+        result = await self._run(
+            crawl_config,
+            ingestion_config,
+            stop_reason=STOPPED_NO_LINKS,
+            rejections={"off_domain": 7},
+        )
+
+        assert result.status == "success"
+        assert "Web ingestion completed" in result.message
+
+    @pytest.mark.asyncio
+    async def test_single_page_site_is_a_success(self, crawl_config, ingestion_config):
+        result = await self._run(
+            crawl_config,
+            ingestion_config,
+            stop_reason=STOPPED_NO_LINKS,
+            rejections={},
+        )
+
+        assert result.status == "success"

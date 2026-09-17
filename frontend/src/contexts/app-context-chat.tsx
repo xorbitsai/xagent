@@ -1,6 +1,6 @@
 "use client"
 
-import React, { createContext, useContext, useReducer, useCallback, useEffect, useState, useRef, useMemo } from "react"
+import React, { createContext, useContext, useReducer, useCallback, useEffect, useLayoutEffect, useState, useRef, useMemo } from "react"
 import { useRouter } from "next/navigation"
 import { FileText, Target, Zap, CheckCircle, XCircle, Wrench, Activity, Search, Lightbulb, AlertTriangle, Info, Brain, Bot } from "lucide-react"
 import { JsonRenderer, MarkdownRenderer } from "../components/ui/markdown-renderer"
@@ -9,6 +9,15 @@ import { ReplayScheduler } from '@/lib/replay-scheduler'
 import { CollapsibleSection } from "@/components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
 import { ClarificationForm } from "@/components/chat/clarification-form"
+import {
+  AgentCardPresentationCapability,
+  LinksOpenInNewTabCapability,
+  resolveAgentCardPresentationCapability,
+} from "@/contexts/presentation-capabilities"
+import {
+  FileAccessProvider,
+  type FileAccessPolicy,
+} from "@/contexts/file-access-context"
 
 interface WebSocketMessage {
   type: string
@@ -19,6 +28,8 @@ interface WebSocketMessage {
   event_type?: string
   event_id?: string
   run_id?: string | null
+  stream_run_id?: string | null
+  stream_attempt_id?: string | null
   state_version?: number
   control_state?: TaskControlState
   status?: unknown
@@ -35,6 +46,14 @@ type TaskControlState =
   | "completed"
   | "failed"
 
+// The structured half of a terminal task_error frame: the stable error code
+// the client renders and localizes. The frame carries nothing else
+// connector-specific -- its audience includes anonymous widget and
+// share-link visitors.
+type TaskErrorProjection = {
+  code: string
+}
+
 type TaskControlEnvelope = {
   isStateEvent: boolean
   taskId?: number
@@ -45,6 +64,7 @@ type TaskControlEnvelope = {
 }
 
 const VERSIONED_TASK_EVENT_TYPES = new Set([
+  "task_stream_snapshot",
   "agent_error",
   "error",
   "task_completed",
@@ -55,7 +75,147 @@ const VERSIONED_TASK_EVENT_TYPES = new Set([
   "task_started",
   "task_waiting_for_user",
 ])
+// Action types that describe state scoped to one specific task's
+// conversation (chat/trace/DAG/status). Used by handleMessage's dispatch
+// wrapper to drop these when a message's task_id doesn't match the task
+// actually being viewed - see the wrapper's own comment for why. Kept at
+// module scope (built once) rather than inside handleMessage, matching
+// VERSIONED_TASK_EVENT_TYPES above.
+// TRIGGER_TASK_UPDATE is deliberately NOT in this set: it only bumps
+// lastTaskUpdate to tell the sidebar's task list to refetch (sidebar.tsx),
+// which should happen for ANY task's status change regardless of which task
+// is currently being viewed - unlike every action below, it isn't part of
+// the viewed task's own displayed state.
+const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
+  "SET_DAG_EXECUTION",
+  "SET_STEPS",
+  // Not currently dispatched from inside handleMessage (its only two call
+  // sites use the raw, unwrapped dispatch), so this has no effect today -
+  // included so a future call site inside handleMessage inherits the same
+  // scoping SET_DAG_EXECUTION/SET_STEPS already get individually, instead of
+  // silently bypassing it.
+  "RESET_DAG_STATE",
+  "ADD_STEP",
+  "UPDATE_STEP",
+  "UPDATE_TASK_STATUS",
+  "SET_CURRENT_TASK",
+  "SET_PROCESSING",
+  "SET_HISTORY_LOADING",
+  "ADD_MESSAGE",
+  "UPSERT_STREAMING_FINAL_ANSWER",
+  "SET_STREAM_RECOVERY",
+  "RECONCILE_STREAM_OUTPUT",
+  "ADD_TRACE_EVENT",
+  "SET_CONTEXT_USAGE",
+  "SET_PLAN_MEMORY_INFO",
+  "OPEN_FILE_PREVIEW",
+])
 const MAX_TRACKED_TASK_STATE_VERSIONS = 500
+// A Session may reset repeatedly during its absolute lifetime. Retired ids are
+// retained only to reject late frames, so bound this lineage guard separately
+// from the unrelated task-state ordering cache.
+const MAX_RETIRED_SESSION_TASK_IDS = 500
+const SESSION_RESET_ACK_TIMEOUT_MS = 30_000
+const SESSION_TASK_ADOPTION_TIMEOUT_MS = 30_000
+const MAX_SESSION_PRE_ADOPTION_FRAMES = 64
+const MAX_SESSION_PRE_ADOPTION_BYTES = 256 * 1024
+
+type SessionConversationState =
+  | { phase: "unbound"; connectionIdentity: string | null; taskId: null }
+  | { phase: "bound"; connectionIdentity: string; taskId: number }
+  | { phase: "reset_requested"; connectionIdentity: string; taskId: number }
+  | { phase: "replacement_ready"; connectionIdentity: string; taskId: null }
+  | { phase: "replacement_sending"; connectionIdentity: string; taskId: null }
+  | { phase: "replacement_awaiting_task"; connectionIdentity: string; taskId: null }
+  | { phase: "reload_required"; connectionIdentity: string | null; taskId: null }
+
+type SessionConversationAction =
+  | { type: "SESSION_TASK_INFO"; connectionIdentity: string; taskId: number }
+  | { type: "SESSION_RESET_REQUESTED"; connectionIdentity: string; taskId: number }
+  | { type: "SESSION_RESET_NOT_SENT"; connectionIdentity: string }
+  | { type: "SESSION_RESET_ACKNOWLEDGED"; connectionIdentity: string }
+  | { type: "SESSION_REPLACEMENT_SENDING"; connectionIdentity: string }
+  | { type: "SESSION_REPLACEMENT_ACCEPTED"; connectionIdentity: string }
+  | { type: "SESSION_REPLACEMENT_REJECTED"; connectionIdentity: string }
+  | { type: "SESSION_BOUND_CONNECTION_REBOUND"; connectionIdentity: string }
+  | { type: "SESSION_RELOAD_REQUIRED"; connectionIdentity: string | null }
+
+const initialSessionConversationState: SessionConversationState = {
+  phase: "unbound",
+  connectionIdentity: null,
+  taskId: null,
+}
+
+const reduceSessionConversation = (
+  state: SessionConversationState,
+  action: SessionConversationAction,
+): SessionConversationState => {
+  if (state.phase === "reload_required") return state
+  switch (action.type) {
+    case "SESSION_TASK_INFO":
+      if (state.phase === "unbound") {
+        return { phase: "bound", connectionIdentity: action.connectionIdentity, taskId: action.taskId }
+      }
+      if (
+        state.phase === "replacement_awaiting_task"
+        && state.connectionIdentity === action.connectionIdentity
+      ) {
+        return { phase: "bound", connectionIdentity: action.connectionIdentity, taskId: action.taskId }
+      }
+      return state
+    case "SESSION_RESET_REQUESTED":
+      return state.phase === "bound" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "reset_requested", connectionIdentity: action.connectionIdentity, taskId: action.taskId }
+        : state
+    case "SESSION_RESET_NOT_SENT":
+      return state.phase === "reset_requested" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "bound", connectionIdentity: state.connectionIdentity, taskId: state.taskId }
+        : state
+    case "SESSION_RESET_ACKNOWLEDGED":
+      return state.phase === "reset_requested" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "replacement_ready", connectionIdentity: action.connectionIdentity, taskId: null }
+        : state
+    case "SESSION_REPLACEMENT_SENDING":
+      return state.phase === "replacement_ready" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "replacement_sending", connectionIdentity: action.connectionIdentity, taskId: null }
+        : state
+    case "SESSION_REPLACEMENT_ACCEPTED":
+      return state.phase === "replacement_sending" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "replacement_awaiting_task", connectionIdentity: action.connectionIdentity, taskId: null }
+        : state
+    case "SESSION_REPLACEMENT_REJECTED":
+      return state.phase === "replacement_sending" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "replacement_ready", connectionIdentity: action.connectionIdentity, taskId: null }
+        : state
+    case "SESSION_BOUND_CONNECTION_REBOUND":
+      return state.phase === "bound"
+        ? { ...state, connectionIdentity: action.connectionIdentity }
+        : state
+    case "SESSION_RELOAD_REQUIRED":
+      return { phase: "reload_required", connectionIdentity: action.connectionIdentity, taskId: null }
+  }
+}
+
+type SessionConversationTransition = {
+  accepted: boolean
+  changed: boolean
+  next: SessionConversationState
+}
+
+const transitionSessionConversation = (
+  current: SessionConversationState,
+  action: SessionConversationAction,
+): SessionConversationTransition => {
+  const next = reduceSessionConversation(current, action)
+  const changed = next !== current
+  const accepted = changed || (
+    action.type === "SESSION_TASK_INFO"
+    && current.phase === "bound"
+    && current.connectionIdentity === action.connectionIdentity
+    && current.taskId === action.taskId
+  )
+  return { accepted, changed, next }
+}
 
 const asMessageRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? value as Record<string, unknown> : {}
@@ -70,19 +230,30 @@ const parseInteger = (value: unknown): number | undefined => {
 export const extractTaskControlEnvelope = (message: WebSocketMessage): TaskControlEnvelope => {
   const root = message as unknown as Record<string, unknown>
   const data = asMessageRecord(root.data)
+  const nestedData = asMessageRecord(data.data)
   const task = asMessageRecord(root.task)
   const eventType = String(root.event_type || data.event_type || "")
   const isStateEvent = VERSIONED_TASK_EVENT_TYPES.has(message.type)
     || (message.type === "trace_event" && eventType === "task_info")
   if (!isStateEvent) return { isStateEvent: false }
 
-  const rawTaskId = root.task_id ?? task.id ?? data.id
+  const rawTaskId = root.task_id ?? task.id ?? data.id ?? nestedData.id
   const parsedTaskId = parseInteger(rawTaskId)
-  const rawVersion = root.state_version ?? task.state_version ?? data.state_version
+  const rawVersion =
+    root.state_version
+    ?? task.state_version
+    ?? data.state_version
+    ?? nestedData.state_version
   const parsedVersion = parseInteger(rawVersion)
-  const rawRunId = root.run_id ?? task.run_id ?? data.run_id
-  const rawControlState = root.control_state ?? task.control_state ?? data.control_state
-  const rawStatus = root.status ?? task.status ?? data.status
+  const rawRunId =
+    root.run_id ?? task.run_id ?? data.run_id ?? nestedData.run_id
+  const rawControlState =
+    root.control_state
+    ?? task.control_state
+    ?? data.control_state
+    ?? nestedData.control_state
+  const rawStatus =
+    root.status ?? task.status ?? data.status ?? nestedData.status
 
   return {
     isStateEvent: true,
@@ -109,8 +280,64 @@ const taskEventMatchesControlState = (
   const allowed = expected[message.type]
   return !allowed || !envelope.controlState || allowed.includes(envelope.controlState)
 }
+
+type TaskStateVersionEntry = {
+  version: number
+  runId?: string | null
+}
+
+const canAcceptTaskControlVersion = (
+  message: WebSocketMessage,
+  envelope: TaskControlEnvelope,
+  versions: Map<number, TaskStateVersionEntry>,
+): boolean => {
+  if (!envelope.isStateEvent || envelope.taskId === undefined) return true
+
+  const knownState = versions.get(envelope.taskId)
+  if (envelope.stateVersion === undefined) {
+    // Once the server establishes versioned state for a Task, an unversioned
+    // replay cannot roll it back. Error frames remain informational.
+    const isErrorEvent =
+      message.type === "error" || message.type === "agent_error"
+    return !knownState || isErrorEvent
+  }
+
+  const isOlderVersion =
+    knownState && envelope.stateVersion < knownState.version
+  const isDifferentRunAtSameVersion =
+    knownState
+    && envelope.stateVersion === knownState.version
+    && knownState.runId !== undefined
+    && envelope.runId !== undefined
+    && knownState.runId !== envelope.runId
+  if (isOlderVersion || isDifferentRunAtSameVersion) return false
+
+  return true
+}
+
+const acceptTaskControlVersion = (
+  message: WebSocketMessage,
+  envelope: TaskControlEnvelope,
+  versions: Map<number, TaskStateVersionEntry>,
+): boolean => {
+  if (!canAcceptTaskControlVersion(message, envelope, versions)) return false
+  if (!envelope.isStateEvent || envelope.taskId === undefined) return true
+  if (envelope.stateVersion === undefined) return true
+
+  versions.delete(envelope.taskId)
+  versions.set(envelope.taskId, {
+    version: envelope.stateVersion,
+    runId: envelope.runId,
+  })
+  if (versions.size > MAX_TRACKED_TASK_STATE_VERSIONS) {
+    const oldestTaskId = versions.keys().next().value
+    if (oldestTaskId !== undefined) versions.delete(oldestTaskId)
+  }
+  return true
+}
+
 export interface Interaction {
-  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards";
+  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards" | "connect_apps";
   field: string;
   label: string;
   options?: Array<{ label: string; value: string; description?: string; action_type?: string }>;
@@ -122,12 +349,21 @@ export interface Interaction {
   default_value?: string | number | boolean | null;
   accept?: string[] | string;
   multiple?: boolean;
+  /** For "connect_apps": connector app display names (matched against
+   * useMcpApps()'s McpApp.name) to group by OAuth provider and render as
+   * connect cards - e.g. ["Gmail", "Google Calendar", "HubSpot"]. */
+  apps?: string[];
 }
-import { useWebSocket } from "@/hooks/use-websocket"
-import { useAuth } from "@/contexts/auth-context"
+import {
+  useWebSocket,
+  type WebSocketConnection,
+  type WebSocketConnectionFailure,
+} from "@/hooks/use-websocket"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
-import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
-import { useI18n } from "@/contexts/i18n-context"
+import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
 import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
@@ -143,6 +379,10 @@ import {
   shouldBufferMessageForHistoricalReplay,
 } from "@/lib/streaming-final-answer"
 import { extractSharedChatResponse } from "@/lib/chat-response"
+import {
+  isStableAssistantMessageId,
+  stableAssistantMessageId,
+} from "@/lib/assistant-message-identity"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -150,8 +390,9 @@ const generateMessageId = (prefix: string) => {
   return `${prefix}-${++messageIdCounter}-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
 }
 
-// Simple deduplication for all messages
-const recentMessages = new Set<string>()
+// Providers own their own dedupe cache. The window hook is retained solely for
+// legacy hot-reload callers and clears registered provider-local caches.
+const duplicateMessageCacheClearers = new Set<() => void>()
 
 // Helper function to compare arrays
 const arraysEqual = (a: string[], b: string[]): boolean => {
@@ -208,7 +449,6 @@ const dispatchAutoOpenPreview = (
   })
 }
 
-const OPTIMISTIC_USER_MESSAGE_PREFIX = "msg-user-optimistic"
 const USER_TURN_MESSAGE_PREFIX = "msg-user-turn"
 const USER_EVENT_MESSAGE_PREFIX = "msg-user-event"
 const USER_MESSAGE_REPLACE_WINDOW_MS = 30000
@@ -255,11 +495,29 @@ const normalizeMessageContent = (content: string | React.ReactNode): string => {
   return ''
 }
 
+// A user message id minted from a stable per-turn identity: the wire's
+// `turn_id` / `event_id` (stableUserMessageId) or the sender's own
+// client_message_id (userTurnMessageId), which the backend echoes back as
+// that turn's id.
+const hasStableUserTurnIdentity = (id: string): boolean =>
+  id.startsWith(`${USER_TURN_MESSAGE_PREFIX}-`) ||
+  id.startsWith(`${USER_EVENT_MESSAGE_PREFIX}-`)
+
 const findOptimisticUserMessageIndex = (
   messages: Message[],
   incomingMessage: Message,
 ): number => {
   if (incomingMessage.role !== "user") {
+    return -1
+  }
+
+  // Identity beats text: a message carrying one is reconciled by
+  // ADD_MESSAGE's id branch alone. Merging by text instead can drop a turn
+  // from the transcript with no error, and repeated text is routine here -
+  // a clarification form with no free-text field serializes to a fixed
+  // string. Only identity-less legacy events still need text. See the commit
+  // for which same-turn pairs this gives up on, and why they are unreachable.
+  if (hasStableUserTurnIdentity(incomingMessage.id)) {
     return -1
   }
 
@@ -272,14 +530,7 @@ const findOptimisticUserMessageIndex = (
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const existingMessage = messages[index]
-    if (
-      existingMessage.role !== "user" ||
-      typeof existingMessage.id !== "string" ||
-      (
-        !existingMessage.isOptimistic &&
-        !existingMessage.id.startsWith(OPTIMISTIC_USER_MESSAGE_PREFIX)
-      )
-    ) {
+    if (existingMessage.role !== "user" || !existingMessage.isOptimistic) {
       continue
     }
 
@@ -302,50 +553,13 @@ const findOptimisticUserMessageIndex = (
   return -1
 }
 
-// Function to clear duplicate message cache
-const clearDuplicateMessageCache = () => {
-  recentMessages.clear()
-}
-
-// Function to start delayed playback
-let startDelayedPlayback = () => {
-  // Will be initialized later
-}
-
 // Expose to window for global access
 if (typeof window !== 'undefined') {
-  ; (window as any).clearDuplicateMessageCache = clearDuplicateMessageCache
-}
-// Flag to track if we're loading historical data
-let isHistoricalDataLoading = false
-// Store pending task info for auto-execution after historical data loads
-let pendingTaskToExecute: { description: string } | null = null
-const isDuplicateMessage = (content: string | React.ReactNode, type: string = 'general', force: boolean = false, shouldCache: boolean = true) => {
-  const contentStr = normalizeMessageContent(content)
-
-  const key = `${type}:${contentStr}`
-  if (!force && recentMessages.has(key)) {
-    return true
+  ; (window as any).clearDuplicateMessageCache = () => {
+    duplicateMessageCacheClearers.forEach(clear => clear())
   }
-
-  if (shouldCache) {
-    recentMessages.add(key)
-    // Clean up old messages after 30 seconds
-    setTimeout(() => {
-      recentMessages.delete(key)
-    }, 30000)
-  }
-
-  return false
 }
-
-// Backward compatibility for result messages
-const isDuplicateResult = (content: string) => {
-  return isDuplicateMessage(content, 'result')
-}
-
-
-const normalizeInteractions = (value: unknown): Interaction[] => {
+export const normalizeInteractions = (value: unknown): Interaction[] => {
   if (!Array.isArray(value)) {
     return []
   }
@@ -374,7 +588,7 @@ const normalizeInteractions = (value: unknown): Interaction[] => {
       const field = seenFields.has(baseField) ? `${baseField}_${index}` : baseField
       seenFields.add(field)
       if (
-        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input", "action_cards"].includes(type) ||
+        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input", "action_cards", "connect_apps"].includes(type) ||
         typeof field !== "string" ||
         !field.trim()
       ) {
@@ -413,6 +627,9 @@ const normalizeInteractions = (value: unknown): Interaction[] => {
       if (typeof item.default !== "undefined") normalized.default = item.default
       if (Array.isArray(item.accept) || typeof item.accept === "string") normalized.accept = item.accept
       if (typeof item.multiple === "boolean") normalized.multiple = item.multiple
+      if (Array.isArray(item.apps)) {
+        normalized.apps = item.apps.filter((app: unknown): app is string => typeof app === "string")
+      }
 
       return normalized
     })
@@ -446,8 +663,20 @@ interface Message {
   streamMessageId?: string
   traceEvents?: TraceEvent[]
   interactions?: Interaction[]
+  interactionRequestId?: string
   isSystemNotice?: boolean
   isOptimistic?: boolean
+}
+
+export type TaskRuntimeExtensions = Record<string, Record<string, unknown>>
+
+const normalizeTaskRuntimeExtensions = (value: unknown): TaskRuntimeExtensions => {
+  if (!isJsonRecord(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, Record<string, unknown>] => (
+      isJsonRecord(entry[1])
+    )),
+  )
 }
 
 export interface Task {
@@ -466,23 +695,158 @@ export interface Task {
   smallFastModelName?: string
   visualModelName?: string
   compactModelName?: string
-  executionMode?: "flash" | "balanced" | "think"
+  executionMode?: "auto" | "flash" | "balanced" | "think"
   isDag?: boolean
   agentId?: number
   agentName?: string
   agentLogoUrl?: string
+  runtimeExtensionBindings?: string[]
   waitingQuestion?: string
   waitingInteractions?: Interaction[]
+  waitingRequestId?: string
   runId?: string | null
   stateVersion?: number
   controlState?: TaskControlState
+  // Frontend-only, distinct from updatedAt: stamped once by UPDATE_TASK_STATUS
+  // when this run actually terminates (completed/failed), cleared when it
+  // starts running again, and deliberately preserved across SET_CURRENT_TASK
+  // refreshes for the same task (see that reducer case) - updatedAt is
+  // general task metadata that can legitimately change again later (a title
+  // edit, another field's update) for reasons that have nothing to do with
+  // when this execution actually ended, and the Progress panel's frozen
+  // elapsed time must not drift when that happens.
+  dagTerminatedAt?: string | number
+  // True when dagTerminatedAt was BACKFILLED from mutable task metadata
+  // (updatedAt, by withDagTerminatedAt below) rather than stamped by an
+  // actual terminal event - a cold history load fetches the Task row before
+  // any terminal event replays, and updatedAt may by then reflect a
+  // post-execution metadata change (a title edit) rather than the real end
+  // time. A later authoritative terminal event may replace a provisional
+  // value (see UPDATE_TASK_STATUS); a non-provisional one stays
+  // first-write-wins.
+  dagTerminatedAtProvisional?: boolean
 }
+
+// Exported so every consumer of dagTerminatedAt's "is this task done" gate
+// (currently just page-client.tsx's isDagFinished) shares the exact
+// definition this field is stamped/cleared against - the two must never
+// drift apart, or isDagFinished can read true while dagTerminatedAt was
+// never set (or vice versa), leaving the Progress panel's clock either
+// stuck or never frozen.
+export const isTerminalTaskStatus = (status: TaskStatus | null | undefined): boolean =>
+  status === "completed" || status === "failed"
+
+// Applies dagTerminatedAt's full set of rules to a Task about to be stored:
+// preserve an already-set value (never re-derive it from a later, unrelated
+// updatedAt change), backfill it once from updatedAt if this task arrives
+// already terminal without one, and clear it if the task isn't terminal (a
+// stale value from a prior run must not linger once it starts running
+// again). Shared by every reducer case that can hand the app a whole Task
+// object - SET_CURRENT_TASK and ADOPT_SESSION_TASK - so neither can
+// individually forget a rule the other already gets right.
+const withDagTerminatedAt = (task: Task | null): Task | null => {
+  if (!task) return task
+  if (!isTerminalTaskStatus(task.status)) {
+    return task.dagTerminatedAt === undefined && task.dagTerminatedAtProvisional === undefined
+      ? task
+      : { ...task, dagTerminatedAt: undefined, dagTerminatedAtProvisional: undefined }
+  }
+  // Checked for presence, not truthiness, when preserving: updatedAt (what
+  // the backfill below uses) is a real epoch value that can legitimately be
+  // 0 - a truthy check would treat that as "absent" and re-derive it from a
+  // LATER updatedAt on every subsequent refresh, drifting the frozen time
+  // exactly the way this field exists to prevent.
+  if (task.dagTerminatedAt !== undefined) return task
+  // Backfill from updatedAt, but MARKED provisional: updatedAt is mutable
+  // metadata, so this is only the best available guess until (if ever) an
+  // actual terminal event replays with its own timestamp - which
+  // UPDATE_TASK_STATUS lets replace a provisional value, unlike a
+  // non-provisional one.
+  return { ...task, dagTerminatedAt: task.updatedAt, dagTerminatedAtProvisional: true }
+}
+
+type SessionTaskBinding =
+  | { present: false }
+  | { present: true; valid: false }
+  | { present: true; valid: true; taskId: number }
+
+const hasOwn = (
+  record: Record<string, unknown>,
+  key: string,
+): boolean => Object.prototype.hasOwnProperty.call(record, key)
+
+const extractSessionTaskBinding = (
+  message: WebSocketMessage,
+): SessionTaskBinding => {
+  const root = asMessageRecord(message)
+  const data = asMessageRecord(root.data)
+  const nestedData = asMessageRecord(data.data)
+  const task = asMessageRecord(root.task)
+  const dataTask = asMessageRecord(data.task)
+  const nestedTask = asMessageRecord(nestedData.task)
+  const candidates: unknown[] = []
+
+  const collect = (record: Record<string, unknown>, key: string) => {
+    if (hasOwn(record, key) && record[key] !== undefined) {
+      candidates.push(record[key])
+    }
+  }
+  collect(root, "task_id")
+  collect(task, "id")
+  collect(data, "task_id")
+  collect(dataTask, "id")
+  collect(nestedData, "task_id")
+  collect(nestedTask, "id")
+
+  if (candidates.length === 0) return { present: false }
+  const parsed = candidates.map(parseInteger)
+  if (parsed.some(taskId => taskId === undefined || taskId <= 0)) {
+    return { present: true, valid: false }
+  }
+  const taskIds = new Set(parsed as number[])
+  if (taskIds.size !== 1) return { present: true, valid: false }
+  return { present: true, valid: true, taskId: parsed[0] as number }
+}
+
+const getSessionTaskInfoData = (
+  message: WebSocketMessage,
+): Record<string, unknown> | null => {
+  if (message.type !== "trace_event") return null
+  const data = asMessageRecord(message.data)
+  const eventType = message.event_type ?? data.event_type
+  if (eventType !== "task_info") return null
+  const nestedData = asMessageRecord(data.data)
+  return Object.keys(nestedData).length > 0 ? nestedData : data
+}
+
+// The backend's DAG step status contract, shared verbatim by every UI model
+// that projects a step (StepExecution here, progress-panel.tsx's
+// ProgressStepView, center-panel.tsx's DAGNode.data) - previously each
+// redeclared the same seven-value union independently, so a future backend
+// status could be accepted by one and silently fall through to an "unknown"
+// rendering in another. Import this instead of redeclaring the union.
+//
+// "interrupted" and "clarification_invalidated" are both non-terminal (a
+// step in either state transitions back to "running" once its blocking
+// condition clears - see dag.py's _ready_steps/_invalidate_batch_siblings)
+// - they must render and count distinctly from "pending" (never started)
+// and from the terminal statuses. "skipped" has no current backend producer
+// (dag_step_skipped is never emitted) but is kept for the branch-derivation
+// path that can still locally construct it.
+export type StepStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "interrupted"
+  | "clarification_invalidated"
 
 interface StepExecution {
   id: string
   name: string
   description: string
-  status: "pending" | "running" | "completed" | "failed" | "skipped"
+  status: StepStatus
   tool_names?: string[]
   dependencies: string[]
   started_at?: string | number
@@ -504,7 +868,14 @@ interface TraceEvent {
 }
 
 const normalizeStepStatus = (status: unknown): StepExecution["status"] => {
-  return status === "running" || status === "completed" || status === "failed" || status === "skipped"
+  return (
+    status === "running"
+    || status === "completed"
+    || status === "failed"
+    || status === "skipped"
+    || status === "interrupted"
+    || status === "clarification_invalidated"
+  )
     ? status
     : "pending"
 }
@@ -512,10 +883,80 @@ const normalizeStepStatus = (status: unknown): StepExecution["status"] => {
 const getString = (value: unknown, fallback = ""): string => typeof value === "string" ? value : fallback
 const getStringArray = (value: unknown): string[] => Array.isArray(value) ? value.map(item => String(item)) : []
 
-const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
+const taskFromTaskInfoData = (
+  taskData: Record<string, unknown>,
+  taskId: number,
+): Task => ({
+  id: String(taskId),
+  title: taskData.title as string,
+  description: taskData.description as string,
+  status: normalizeTaskStatus(taskData.status) || "pending",
+  createdAt: taskData.created_at as string | number,
+  updatedAt: taskData.updated_at as string | number,
+  modelId: taskData.model_id as string | undefined,
+  smallFastModelId: taskData.small_fast_model_id as string | undefined,
+  visualModelId: taskData.visual_model_id as string | undefined,
+  compactModelId: taskData.compact_model_id as string | undefined,
+  modelName: taskData.model_name as string | undefined,
+  smallFastModelName: taskData.small_fast_model_name as string | undefined,
+  visualModelName: taskData.visual_model_name as string | undefined,
+  compactModelName: taskData.compact_model_name as string | undefined,
+  executionMode: taskData.execution_mode as Task["executionMode"],
+  isDag: taskData.is_dag as boolean | undefined,
+  agentId: taskData.agent_id as number | undefined,
+  agentName: taskData.agent_name as string | undefined,
+  agentLogoUrl: taskData.agent_logo_url as string | undefined,
+  runtimeExtensionBindings: getStringArray(taskData.runtime_extension_bindings),
+  waitingQuestion: taskData.waiting_question as string | undefined,
+  waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
+  runId: taskData.run_id as string | null | undefined,
+  stateVersion: parseInteger(taskData.state_version),
+  controlState: taskData.control_state as TaskControlState | undefined,
+})
+
+const getWebSocketErrorCodeField = (message: WebSocketMessage): {
+  present: boolean
+  value: unknown
+} => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
+  if (data && Object.prototype.hasOwnProperty.call(data, "error_code")) {
+    return { present: true, value: data.error_code }
+  }
+  if (Object.prototype.hasOwnProperty.call(root, "error_code")) {
+    return { present: true, value: root.error_code }
+  }
+  return { present: false, value: undefined }
+}
+
+const getWebSocketErrorMessage = (
+  message: WebSocketMessage,
+  trustLegacyErrorProse: boolean,
+): string => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  if (getWebSocketErrorCodeField(message).present) return "Unknown error"
+  if (!trustLegacyErrorProse) return "Unknown error"
   return getString(data?.message) || getString(data?.error) || getString(root.message) || getString(root.error) || "Unknown error"
+}
+
+const getWebSocketErrorCode = (message: WebSocketMessage) => {
+  const errorCode = getWebSocketErrorCodeField(message)
+  return errorCode.present ? readClientErrorCode(errorCode.value) : null
+}
+
+// The frame deliberately carries nothing connector-specific beyond the code:
+// its audience includes anonymous widget and share-link visitors. Which
+// connector, which key, and each key's declared type all come from the
+// per-task requirements endpoint, which selects on
+// `Task.id == task_id AND Task.user_id == current_user.id`.
+const getTaskErrorProjection = (
+  message: WebSocketMessage,
+): TaskErrorProjection | null => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  const code = getString(data?.code) || getString(root.code)
+  return code ? { code } : null
 }
 
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
@@ -528,6 +969,117 @@ const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | nul
 
 const shouldStopProcessingForTaskStatus = (status: unknown): boolean =>
   isStoppedTaskStatus(status)
+
+export type ErrorFrameDisplay = {
+  /** Terminal (`task_error`) or a rejection on the mixed root `error` channel. */
+  isTerminal: boolean
+  /** Status carried by the frame, or null when it carries none. */
+  taskStatus: Task["status"] | null
+  stopsProcessing: boolean
+  /** First argument to the dedup check: the server sentence, or the constant
+   *  that stands in for it on a transport that marks legacy prose untrusted. */
+  dedupText: string
+  /** Third argument to the dedup check. Undefined means "no identity, key on
+   *  the text alone". */
+  occurrenceIdentity: string | undefined
+  bubbleContent: string
+  isResult: boolean
+}
+
+// One place where a frame on the error/task_error handler becomes the five
+// values the handler needs: the bubble's wording, the dedup text, the dedup
+// identity, the result flag, and the task status to dispatch. Each of those
+// needs a different subset of "is this terminal / is legacy prose trusted /
+// did a code survive / is there a state version", and deriving each subset at
+// its own use site is what let five separate defects land in this handler.
+// Pure on purpose: no dispatch, no refs, nothing
+// outside its arguments, so every cell of that matrix is unit-testable
+// without rendering the provider -- the same shape extractTaskControlEnvelope
+// above already uses.
+export const projectErrorFrameForDisplay = (
+  message: WebSocketMessage,
+  options: {
+    trustLegacyErrorProse: boolean
+    translate: Translate
+    controlEnvelope: TaskControlEnvelope
+  },
+): ErrorFrameDisplay => {
+  const { trustLegacyErrorProse, translate, controlEnvelope } = options
+  const websocketErrorCode = getWebSocketErrorCode(message)
+  const dedupText = websocketErrorCode
+    ? translate(clientErrorTranslationKey(websocketErrorCode))
+    : getWebSocketErrorMessage(message, trustLegacyErrorProse)
+  const taskStatus = getWebSocketTaskStatus(message)
+  // Only task_error is terminal. Every frame of that type is emitted after
+  // the row has been committed FAILED -- task_orchestrator.py's settled
+  // branch, and websocket.py's legacy helper, which settles under
+  // only_if_running=True and does not broadcast when that update matches
+  // no row -- and task_error is also the only frame that carries the
+  // structured code. The root "error" type is a mixed
+  // channel: rejected chat messages, rejected pause and rejected resume
+  // all arrive on it while the viewed task is still RUNNING or
+  // WAITING_FOR_USER, and a rejection is not this turn's answer.
+  const isTerminal = message.type === "task_error"
+  const projection = isTerminal ? getTaskErrorProjection(message) : null
+  // The frame's own code decides the wording, and one code has one sentence
+  // for every audience. This is the same table the root error channel already
+  // uses for its error_code field, extended with the connector-runtime codes
+  // that reach this frame -- not a second vocabulary beside it. It also fixes
+  // what the relayed sentence could not: on a transport that marks legacy
+  // prose untrusted, getWebSocketErrorMessage returns a constant by design
+  // (#1938: never render server free text there), so before this the curated
+  // sentence existed for three codes and every other code read "Unknown
+  // error". Nothing here relays server prose; the wording is the client's own,
+  // selected by code. A code the table does not list keeps the generic
+  // prefixed wording.
+  const projectedCode = projection ? readClientErrorCode(projection.code) : null
+  const connectorRuntimeBubble = projectedCode
+    ? translate(clientErrorTranslationKey(projectedCode))
+    : null
+  // The dedup identity has to name WHICH occurrence this frame reports, not
+  // which class of failure it belongs to. broadcast_to_task stamps every frame
+  // of this type with the row's (run_id, state_version) pair before it goes
+  // out -- task_error is in websocket.py's _VERSIONED_TASK_EVENT_TYPES -- and
+  // state_version is bumped by every control transition that actually changes
+  // (status, control_state). So one settlement broadcast twice carries one
+  // version and still collapses, while two failed turns are at least two
+  // versions apart (the retry takes the lease FAILED -> RUNNING, then settles
+  // RUNNING -> FAILED) and both are shown. Keying on the failure's class
+  // instead -- the code, the reason, or the rendered sentence -- cannot tell
+  // those two apart, and on this handler the collapsed frame is the turn's
+  // result. The identity is withheld when the frame carries no version (the
+  // row was already gone when it was broadcast, so no state tuple was
+  // attached), which falls back to keying on the text alone:
+  // canAcceptTaskControlVersion drops such a frame once any versioned event
+  // has been seen for the task, and when none has, two of them key on the
+  // same text and the second still collapses -- the behaviour that predates
+  // this change. Withholding the identity is the honest answer there;
+  // attaching a state tuple needs the row, and a settled FAILED task has one.
+  const occurrenceIdentity =
+    isTerminal && controlEnvelope.stateVersion !== undefined
+      ? `${controlEnvelope.runId ?? ""}:${controlEnvelope.stateVersion}`
+      : undefined
+  return {
+    isTerminal,
+    taskStatus,
+    stopsProcessing: shouldStopProcessingForTaskStatus(taskStatus),
+    dedupText,
+    occurrenceIdentity,
+    bubbleContent:
+      connectorRuntimeBubble
+      ?? `${translate('agent.logs.event.messages.errorPrefix')} ${dedupText}`,
+    // A terminal failure IS this turn's result: without the flag the
+    // conversation panel (which renders only user / isResult / system-notice
+    // messages) filters the bubble out and falls back to a virtual "unknown
+    // error" placeholder until reload. A non-terminal rejection is not, and
+    // flagging it would close the live progress indicator and the
+    // waiting-answer form of a turn that is still running, and drain this
+    // turn's accumulated trace events into the rejection bubble (see the
+    // ADD_MESSAGE reducer case's isResult branch, which merges
+    // state.traceEvents into the message and clears it).
+    isResult: isTerminal,
+  }
+}
 
 const stepsFromPlanData = (planData: unknown, existingSteps: StepExecution[]): StepExecution[] | null => {
   const planRecord = planData && typeof planData === "object" ? planData as Record<string, unknown> : null
@@ -564,16 +1116,76 @@ const stepsFromPlanData = (planData: unknown, existingSteps: StepExecution[]): S
   })
 }
 
-interface DAGExecution {
-  phase: "planning" | "executing" | "completed" | "failed"
+// "replanning" and "completion_assessment" are real, live phase values the
+// backend emits via on_dag_execution (dag.py) - the type previously omitted
+// them, silently treating a normal mid-run replan or completion check as an
+// unmodeled state for any consumer that read `.phase` directly.
+// "completed"/"failed" are never sent by that backend broadcast (terminal
+// state arrives via a separate dag_execute_end/checkpoint flow) but ARE
+// constructed locally by handleMessage's own dag_execute_end/agent_error
+// handlers below, so they remain valid runtime values of this field.
+export type DAGExecutionPhase = "planning" | "replanning" | "executing" | "completion_assessment" | "completed" | "failed"
+
+const DAG_EXECUTION_PHASES: ReadonlySet<string> = new Set<DAGExecutionPhase>([
+  "planning", "replanning", "executing", "completion_assessment", "completed", "failed",
+])
+
+export interface DAGExecution {
+  phase: DAGExecutionPhase
   current_plan: Record<string, unknown>
   created_at: string | number
   updated_at: string | number
+  // The backend's existing per-turn identity (runtime.py's _dag_turn_id,
+  // read off the current user message's own turn_id - not a new concept,
+  // and NOT the same field as the top-level WebSocketMessage.run_id/
+  // Task.runId lease identity used elsewhere in this file) - undefined for
+  // older backends/patterns that don't set it, or for a dagExecution
+  // constructed locally rather than from a raw wire payload (dag_execute_end/
+  // agent_error's local phase updates below, which spread the EXISTING
+  // dagExecution and so already carry whatever turn_id it had). Lets the
+  // dag_execution handlers tell "still this same run" apart from "a new run
+  // started" instead of assuming every event belongs to whatever run is
+  // already in state.
+  turn_id?: string
 }
 
-interface AppState {
+// The backend's on_dag_execution broadcast never actually includes
+// current_plan (only counts/step lists depending on phase) despite the
+// frontend type declaring it required, and its phase is a raw string with no
+// guarantee it's one of DAG_EXECUTION_PHASES (a future backend phase addition
+// would otherwise flow through unchecked). Normalizes a raw wire payload
+// before it's ever cast to DAGExecution, rather than trusting `as
+// DAGExecution` to paper over the mismatch.
+//
+// Returns null for a payload whose phase is absent, non-string, or unknown -
+// callers must DROP that update rather than dispatch it. An earlier version
+// defaulted unknown phases to "executing", which synthesized an active DAG
+// run out of malformed data (an empty `{}` payload on the bare legacy
+// message type was enough to conjure a blank in-progress Progress panel and
+// auto-open it); keeping the previous state untouched loses at most one
+// unrecognized update, while fabricating "executing" invents a whole run. A
+// deliberate future backend phase addition should extend
+// DAG_EXECUTION_PHASES and its consumers, not lean on a silent default.
+const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecution | null => {
+  const rawPhase = raw.phase
+  if (typeof rawPhase !== "string" || !DAG_EXECUTION_PHASES.has(rawPhase)) return null
+  const phase = rawPhase as DAGExecutionPhase
+  const currentPlan =
+    raw.current_plan && typeof raw.current_plan === "object" && !Array.isArray(raw.current_plan)
+      ? raw.current_plan as Record<string, unknown>
+      : {}
+  return {
+    ...raw,
+    phase,
+    current_plan: currentPlan,
+  } as DAGExecution
+}
+
+export interface AppState {
+  streamRecoveryTaskId?: number | null
   messages: Message[]
   currentTask: Task | null
+  taskRuntimeExtensions: TaskRuntimeExtensions
   dagExecution: DAGExecution | null
   steps: StepExecution[]
   traceEvents: TraceEvent[]
@@ -614,16 +1226,24 @@ interface AppState {
   isHistoryLoading: boolean
   // Current context-window usage from the latest LLM call, for the usage gauge.
   contextUsage: { tokens: number; threshold: number } | null
+  sessionConversation: SessionConversationState
 }
 
 type AppAction =
+  | { type: "SET_STREAM_RECOVERY"; payload: number | null }
+  | { type: "RECONCILE_STREAM_OUTPUT"; payload: { runId: string; output: string; timestamp: string; interrupted: boolean } }
+  | { type: "SESSION_CONVERSATION"; payload: SessionConversationAction }
   | { type: "SET_TASK_ID"; payload: number | null }
+  | { type: "ADOPT_SESSION_TASK"; payload: { taskId: number; task: Task } }
+  | { type: "RESET_SESSION_CONVERSATION" }
   | { type: "ADD_MESSAGE"; payload: Message }
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
-  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState } }
+  | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
+  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
+  | { type: "RESET_DAG_STATE" }
   | { type: "SET_CONTEXT_USAGE"; payload: { tokens: number; threshold: number } | null }
   | { type: "ADD_STEP"; payload: StepExecution }
   | { type: "UPDATE_STEP"; payload: { stepId: string; updates: Partial<StepExecution> } }
@@ -660,9 +1280,10 @@ type AppAction =
   | { type: "SET_HISTORY_LOADING"; payload: boolean }
   | { type: "SYNC_PROCESSING_STATUS" }
 
-const initialState: AppState = {
+const createInitialState = (): AppState => ({
   messages: [],
   currentTask: null,
+  taskRuntimeExtensions: {},
   dagExecution: null,
   steps: [],
   traceEvents: [],
@@ -691,12 +1312,21 @@ const initialState: AppState = {
   lastTaskUpdate: Date.now(),
   isHistoryLoading: false,
   contextUsage: null,
-}
+  sessionConversation: { ...initialSessionConversationState },
+})
 
-function appReducer(state: AppState, action: AppAction): AppState {
+function projectAppState(state: AppState, action: AppAction): AppState {
   console.log('🔍 Reducer called with action:', action.type, action)
 
   switch (action.type) {
+    case "SESSION_CONVERSATION":
+      return {
+        ...state,
+        sessionConversation: reduceSessionConversation(
+          state.sessionConversation,
+          action.payload,
+        ),
+      }
     case "SET_HISTORY_LOADING":
       return { ...state, isHistoryLoading: action.payload }
 
@@ -719,9 +1349,44 @@ function appReducer(state: AppState, action: AppAction): AppState {
       const taskChanged = state.taskId !== action.payload
       const messages = taskChanged ? [] : state.messages
       const contextUsage = taskChanged ? null : state.contextUsage
-      const newState = { ...state, taskId: action.payload, messages, contextUsage }
+      const taskRuntimeExtensions = taskChanged ? {} : state.taskRuntimeExtensions
+      // Also clear the previous task's DAG plan/phase here - otherwise
+      // switching tasks via the sidebar (no page reload) leaves the Progress
+      // panel showing the OLD task's steps and elapsed time until the new
+      // task's own dag_execution history replay arrives.
+      const dagExecution = taskChanged ? null : state.dagExecution
+      const steps = taskChanged ? [] : state.steps
+      const newState = {
+        ...state,
+        taskId: action.payload,
+        messages,
+        contextUsage,
+        taskRuntimeExtensions,
+        dagExecution,
+        steps,
+      }
       console.log('🔄 Reducer returning new state:', newState)
       return newState
+
+    case "ADOPT_SESSION_TASK":
+      // A session can adopt a task that's already terminal (e.g. a fast
+      // single-call turn that finishes before the adoption handshake
+      // completes) - route through the same dagTerminatedAt rules
+      // SET_CURRENT_TASK applies, or the Progress panel's elapsed clock would
+      // never freeze for it (isDagFinished true, progressEndedAt undefined).
+      return {
+        ...state,
+        taskId: action.payload.taskId,
+        currentTask: withDagTerminatedAt(action.payload.task),
+        taskRuntimeExtensions: {},
+      }
+
+    case "RESET_SESSION_CONVERSATION":
+      return {
+        ...createInitialState(),
+        lastTaskUpdate: Date.now(),
+        sessionConversation: state.sessionConversation,
+      }
 
     case "ADD_MESSAGE": {
       const newMessage = action.payload
@@ -760,6 +1425,39 @@ function appReducer(state: AppState, action: AppAction): AppState {
           if (streamingIndex >= 0) {
             return replaceMessageAt(streamingIndex)
           }
+        }
+      }
+
+      // One assistant question can be delivered twice -- live, then replayed
+      // from the transcript after a reconnect -- under one event identity but
+      // with different text, because the replayed copy carries the rendered
+      // interaction list. Identity decides, never text: #2250 is the record
+      // of what text matching costs. The mounted bubble is kept rather than
+      // replaced so an open clarification form is not remounted under the
+      // visitor; the re-delivery only fills in what the bubble lacks. Content
+      // is deliberately not among those fields: one event id is one question,
+      // and the replayed copy differs only by the rendered interaction list
+      // the form already draws.
+      if (messageToAdd.role === "assistant" && isStableAssistantMessageId(messageToAdd.id)) {
+        const deliveredIndex = state.messages.findIndex(
+          message => message.role === "assistant" && message.id === messageToAdd.id,
+        )
+        if (deliveredIndex >= 0) {
+          const updatedMessages = state.messages.map((message, index) =>
+            index === deliveredIndex
+              ? {
+                ...message,
+                interactions: message.interactions ?? messageToAdd.interactions,
+                interactionRequestId:
+                  message.interactionRequestId ?? messageToAdd.interactionRequestId,
+                traceEvents: mergeTraceEventsById(
+                  message.traceEvents,
+                  messageToAdd.traceEvents,
+                ),
+              }
+              : message
+          )
+          return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
         }
       }
 
@@ -818,6 +1516,40 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
     }
 
+    case "SET_STREAM_RECOVERY":
+      return { ...state, streamRecoveryTaskId: action.payload }
+
+    case "RECONCILE_STREAM_OUTPUT": {
+      const { runId, output, timestamp, interrupted } = action.payload
+      let resultIndex = -1
+      for (let index = state.messages.length - 1; index >= 0; index--) {
+        const message = state.messages[index]
+        if (message.role === "user") break
+        if (message.role === "assistant" && message.isResult) {
+          resultIndex = index
+          break
+        }
+      }
+      const existing = state.messages[resultIndex]
+      // Preserve richer live formatting/files when a complete result already
+      // arrived. A partial stream, or a missed result, needs the durable text.
+      if (existing?.status === "completed" && !interrupted) return state
+      const restored: Message = {
+        ...existing,
+        id: existing?.id ?? `final_answer_recovered_${runId}`,
+        role: "assistant",
+        content: output,
+        rawContent: output,
+        timestamp: existing?.timestamp ?? timestamp,
+        status: "completed",
+        isResult: true,
+      }
+      const messages = [...state.messages]
+      if (resultIndex >= 0) messages[resultIndex] = restored
+      else messages.push(restored)
+      return { ...state, messages, streamRecoveryTaskId: null }
+    }
+
     case "UPSERT_STREAMING_FINAL_ANSWER": {
       const { messageId, delta, content, status, timestamp } = action.payload
       const existing = state.messages.find(message => message.id === messageId)
@@ -863,9 +1595,17 @@ function appReducer(state: AppState, action: AppAction): AppState {
         }
         : null
 
-      const currentTask = (state.currentTask && incomingTask && state.currentTask.id === incomingTask.id)
+      const mergedTask = (state.currentTask && incomingTask && state.currentTask.id === incomingTask.id)
         ? { ...state.currentTask, ...incomingTask, agentName: incomingTask.agentName || state.currentTask.agentName, agentLogoUrl: incomingTask.agentLogoUrl || state.currentTask.agentLogoUrl }
         : incomingTask
+      // A task can arrive here already terminal without ever passing through
+      // UPDATE_TASK_STATUS (loading a finished task fresh - page load,
+      // switching to it, history replay's own task_info), and a task_info
+      // reporting this SAME task back to a non-terminal status (a rerun)
+      // never passes through UPDATE_TASK_STATUS either - withDagTerminatedAt
+      // backfills the former and clears the latter so a prior run's
+      // dagTerminatedAt can't linger into this one.
+      const currentTask = withDagTerminatedAt(mergedTask)
 
       return {
         ...state,
@@ -875,6 +1615,13 @@ function appReducer(state: AppState, action: AppAction): AppState {
           : state.isProcessing,
       }
     }
+
+    case "SET_TASK_RUNTIME_EXTENSIONS":
+      if (state.taskId !== action.payload.taskId) return state
+      return {
+        ...state,
+        taskRuntimeExtensions: action.payload.extensions,
+      }
 
     case "UPDATE_TASK_STATUS": {
       if (!state.currentTask) {
@@ -887,6 +1634,41 @@ function appReducer(state: AppState, action: AppAction): AppState {
       }
 
       const isWaitingForUser = nextStatus === "waiting_for_user"
+      // Set once, on the transition into a terminal status - and cleared
+      // when the task starts running again, so a stale prior run's terminal
+      // time doesn't linger into the next one. Deliberately NOT recomputed
+      // from `updatedAt`: unlike this field, `updatedAt` keeps changing
+      // after termination for reasons unrelated to this execution (see the
+      // Task.dagTerminatedAt comment), so it can't double as the frozen end
+      // time itself. An already-set AUTHORITATIVE (non-provisional) value is
+      // preserved (first-write-wins): a second terminal event for the same
+      // episode - a duplicate delivery, or an agent_error followed by the
+      // formal task_completed broadcast - must not push the frozen elapsed
+      // time forward. A PROVISIONAL value (withDagTerminatedAt's backfill
+      // from mutable task metadata on a cold history load) is the one thing
+      // a terminal event's own timestamp is allowed to replace - the event
+      // knows when the run actually ended; the backfill only guessed.
+      let dagTerminatedAt: Task["dagTerminatedAt"]
+      let dagTerminatedAtProvisional: boolean | undefined
+      if (isTerminalTaskStatus(nextStatus)) {
+        const previous = state.currentTask.dagTerminatedAt
+        const previousProvisional = state.currentTask.dagTerminatedAtProvisional === true
+        if (previous !== undefined && !previousProvisional) {
+          dagTerminatedAt = previous
+        } else if (action.payload.updatedAt !== undefined) {
+          dagTerminatedAt = action.payload.updatedAt
+        } else if (previous !== undefined) {
+          // Still provisional: a terminal event with no timestamp of its own
+          // is no more authoritative than the backfill it would replace.
+          dagTerminatedAt = previous
+          dagTerminatedAtProvisional = true
+        } else {
+          dagTerminatedAt = new Date().toISOString()
+        }
+      }
+      const replacesWaitingOccurrence = isWaitingForUser
+        && action.payload.waitingRequestId !== undefined
+        && action.payload.waitingRequestId !== state.currentTask.waitingRequestId
       return {
         ...state,
         isProcessing: shouldStopProcessingForTaskStatus(nextStatus)
@@ -895,12 +1677,32 @@ function appReducer(state: AppState, action: AppAction): AppState {
         currentTask: {
           ...state.currentTask,
           status: nextStatus,
-          updatedAt: new Date().toISOString(),
+          // Prefer the originating event's own timestamp over the client's
+          // current wall-clock time - during historical replay, every event
+          // gets processed at "now", so stamping updatedAt with the reducer's
+          // own clock would make a long-finished task's Progress panel freeze
+          // its elapsed time against the moment it was REPLAYED, not the
+          // moment it actually completed.
+          updatedAt: action.payload.updatedAt ?? new Date().toISOString(),
+          dagTerminatedAt,
+          dagTerminatedAtProvisional,
           waitingQuestion: isWaitingForUser
-            ? action.payload.waitingQuestion ?? state.currentTask.waitingQuestion
+            ? action.payload.waitingQuestion ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingQuestion
+            )
             : undefined,
           waitingInteractions: isWaitingForUser
-            ? action.payload.waitingInteractions ?? state.currentTask.waitingInteractions
+            ? action.payload.waitingInteractions ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingInteractions
+            )
+            : undefined,
+          waitingRequestId: isWaitingForUser
+            ? action.payload.waitingRequestId ?? (
+              action.payload.waitingQuestion === undefined
+              && action.payload.waitingInteractions === undefined
+                ? state.currentTask.waitingRequestId
+                : undefined
+            )
             : undefined,
           runId: action.payload.runId ?? state.currentTask.runId,
           stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
@@ -911,6 +1713,14 @@ function appReducer(state: AppState, action: AppAction): AppState {
 
     case "SET_DAG_EXECUTION":
       return { ...state, dagExecution: action.payload }
+
+    // Single action for the "clear dagExecution + steps together" couplet
+    // needed at every site that isn't a task switch (task switches already
+    // get this via SET_TASK_ID's own taskChanged branch) - same-task
+    // reconnect and a successful new turn on the same task both need it, and
+    // a single action keeps them from drifting out of sync with each other.
+    case "RESET_DAG_STATE":
+      return { ...state, dagExecution: null, steps: [] }
 
     case "SET_CONTEXT_USAGE":
       return { ...state, contextUsage: action.payload }
@@ -1015,7 +1825,10 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, messages: [] }
 
     case "RESET_STATE":
-      return initialState
+      return {
+        ...createInitialState(),
+        sessionConversation: state.sessionConversation,
+      }
 
     case "OPEN_FILE_PREVIEW":
       // Support passing single file or multiple file list
@@ -1188,12 +2001,20 @@ function appReducer(state: AppState, action: AppAction): AppState {
   }
 }
 
+type AppStateCommit = { state: AppState }
+
+const commitProjectedAppState = (
+  _: AppState,
+  commit: AppStateCommit,
+): AppState => commit.state
+
 interface PendingMessage {
   message: string
   files?: File[]
   targetTaskId?: number
   force?: boolean
   clientMessageId?: string
+  requestId?: string
   resolve?: () => void
   reject?: (error: Error) => void
 }
@@ -1201,6 +2022,10 @@ interface PendingMessage {
 interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
+  filesDisabled: boolean
+  agentCardsEnabled: boolean
+  voiceInputEnabled: boolean
+  taskControlsEnabled: boolean
   sendMessage: (message: string, config?: any, files?: File[]) => Promise<void>
   executeTask: (description: string) => void
   pauseTask: () => void
@@ -1209,6 +2034,11 @@ interface AppContextType {
   clearMessages: () => void
   isConnected: boolean
   connectionError: Error | null
+  startNewConversation: () => Promise<void>
+  isConversationResetPending: boolean
+  isMessageDeliveryPending: boolean
+  isSessionInteractionLocked: boolean
+  sessionConversationState: SessionConversationState["phase"]
   setTaskId: (taskId: number | null, options?: { navigate?: boolean }) => void
   requestStatus: () => void
   getFilePreviewUrl: (fileId: string) => string
@@ -1226,15 +2056,93 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | undefined>(undefined)
 
-export interface AppProviderTransportConfig {
-  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
-  buildFilePreviewUrl?: (params: { baseUrl: string; fileId: string }) => string
-  buildFileDownloadUrl?: (params: { baseUrl: string; fileId: string }) => string
-  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+type TransportCapabilityState = "enabled" | "disabled"
+
+export interface AppProviderTransportCapabilities {
+  files?: TransportCapabilityState
+  agentCards?: TransportCapabilityState
+  voice?: TransportCapabilityState
+  taskControls?: TransportCapabilityState
+  // Unlike the capabilities above, this defaults closed for every transport
+  // (including "page"): only the embedded Chat Widget opts in, since that is
+  // the only surface where an in-tab navigation abandons the visitor's iframe.
+  linksOpenInNewTab?: TransportCapabilityState
 }
 
-// Global ref to track historical data requests per task ID
-const historicalDataRequestMap = new Map<number, boolean>()
+export interface AppProviderTransportConfig {
+  /**
+   * Whether no-code error frames may render server prose during a temporary
+   * old-backend/new-frontend deployment skew. Public and external-credential
+   * transports must opt out; the authenticated page keeps its legacy default.
+   */
+  legacyErrorProse?: "trusted" | "untrusted"
+  buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
+  /**
+   * Owns every file URL and request made below this provider. Public
+   * transports use this to keep guest credentials instance-scoped.
+   */
+  fileAccess?: FileAccessPolicy
+  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+  capabilities?: AppProviderTransportCapabilities
+  session?: {
+    connection: WebSocketConnection | null
+    onConnectionClose: (
+      event: CloseEvent,
+      connectionIdentity?: string,
+    ) => "handled"
+    onConnectionFailure: (
+      failure: WebSocketConnectionFailure,
+      connectionIdentity?: string,
+    ) => void
+    onConnectionOpen?: (connectionIdentity: string) => void
+    allowTasklessChat: true
+    supportsConversationReset: true
+    history: "none"
+    files: "disabled"
+    agentCards: "disabled"
+    voice: "disabled"
+    taskControls: "disabled"
+  }
+}
+
+interface SessionResetFlight {
+  connectionIdentity: string
+  deliveryGeneration: number
+  promise: Promise<void>
+  resolve: () => void
+  reject: (error: Error) => void
+  timeout: ReturnType<typeof setTimeout>
+}
+
+interface SessionMessageOwner {
+  connectionIdentity: string
+}
+
+interface SessionPreAdoptionBuffer {
+  connectionIdentity: string
+  candidate: { message: WebSocketMessage; taskId: number } | null
+  frames: WebSocketMessage[]
+  bytes: number
+  timeout: ReturnType<typeof setTimeout> | null
+}
+
+const serializedWebSocketMessageBytes = (message: WebSocketMessage): number =>
+  new TextEncoder().encode(JSON.stringify(message)).byteLength
+
+function resolveTransportCapability(
+  sessionTransport: AppProviderTransportConfig["session"],
+  sessionState: TransportCapabilityState | undefined,
+  transportState: TransportCapabilityState | undefined,
+): boolean {
+  // Session transports are external credential domains and therefore default
+  // closed when a required runtime descriptor is malformed. Other transports
+  // preserve the existing enabled behavior unless they opt out explicitly.
+  return (
+    sessionTransport
+      ? sessionState ?? "disabled"
+      : transportState ?? "enabled"
+  ) === "enabled"
+}
 
 export function AppProvider({
   children,
@@ -1245,21 +2153,352 @@ export function AppProvider({
   token?: string
   transport?: AppProviderTransportConfig
 }) {
-  const [state, dispatch] = useReducer(appReducer, initialState)
+  const [state, privateCommit] = useReducer(
+    commitProjectedAppState,
+    undefined,
+    createInitialState,
+  )
+  const pendingTaskToExecuteRef = useRef<{ description: string } | null>(null)
+  const startDelayedPlaybackRef = useRef<() => void>(() => {})
+  const isHistoricalDataLoadingRef = useRef(false)
+  const historicalDataRequestMapRef = useRef(new Map<number, boolean>())
+  const recentMessagesRef = useRef(new Map<string, ReturnType<typeof setTimeout>>())
+  const isDuplicateMessage = useCallback((
+    content: string | React.ReactNode,
+    type = "general",
+    force = false,
+    shouldCache = true,
+    occurrenceIdentity?: string,
+  ) => {
+    const contentStr = normalizeMessageContent(content)
+    const key = JSON.stringify([type, contentStr])
+    const occurrenceKey = occurrenceIdentity
+      ? JSON.stringify([type, contentStr, occurrenceIdentity])
+      : undefined
+    const cache = recentMessagesRef.current
+    if (!force && cache.has(occurrenceKey || key)) return true
+    if (shouldCache) {
+      for (const cacheKey of occurrenceKey ? [key, occurrenceKey] : [key]) {
+        clearTimeout(cache.get(cacheKey))
+        const expiry = setTimeout(() => {
+          if (cache.get(cacheKey) === expiry) cache.delete(cacheKey)
+        }, 30_000)
+        cache.set(cacheKey, expiry)
+      }
+    }
+    return false
+  }, [])
+  // All actions are projected synchronously so each action observes the state
+  // produced by the preceding action before React commits the batch.
+  const stateRef = useRef(state)
+  const dispatch = useCallback((action: AppAction) => {
+    // Whatever cleared the transcript (reconnect, task switch, workforce run
+    // swap) will have it replayed back; a surviving 30s entry would swallow
+    // the replayed bubbles as duplicates.
+    if (action.type === "CLEAR_MESSAGES") recentMessagesRef.current.clear()
+    const next = projectAppState(stateRef.current, action)
+    stateRef.current = next
+    privateCommit({ state: next })
+  }, [])
+  const sessionConversationRef = useRef<SessionConversationState>(initialSessionConversationState)
+  const dispatchSessionConversation = useCallback(
+    (action: SessionConversationAction) => {
+      const current = sessionConversationRef.current
+      const transition = transitionSessionConversation(current, action)
+      if (transition.changed) {
+        sessionConversationRef.current = transition.next
+        dispatch({ type: "SESSION_CONVERSATION", payload: action })
+      }
+      return transition
+    },
+    [dispatch],
+  )
+  useLayoutEffect(() => {
+    sessionConversationRef.current = state.sessionConversation
+  }, [state.sessionConversation])
   const [pendingMessage, setPendingMessage] = useState<PendingMessage | null>(null)
-  const { token: authToken } = useAuth() // Get auth token from context
+  const pendingMessageRef = useRef(pendingMessage)
+  pendingMessageRef.current = pendingMessage
+  useEffect(() => {
+    const clear = () => recentMessagesRef.current.clear()
+    duplicateMessageCacheClearers.add(clear)
+    return () => {
+      duplicateMessageCacheClearers.delete(clear)
+    }
+  }, [])
+  const sessionTransport = transport?.session
+  const trustLegacyErrorProse = transport?.legacyErrorProse !== "untrusted"
+  const filesDisabled = !resolveTransportCapability(
+    sessionTransport,
+    sessionTransport?.files,
+    transport?.capabilities?.files,
+  )
+  const rejectDisabledFileUpload = useCallback(async () => {
+    throw new Error("Files are disabled for this conversation.")
+  }, [])
+  const requestedAgentCardsEnabled = resolveTransportCapability(
+    sessionTransport,
+    sessionTransport?.agentCards,
+    transport?.capabilities?.agentCards,
+  )
+  const agentCardsEnabled = resolveAgentCardPresentationCapability(
+    filesDisabled,
+    requestedAgentCardsEnabled,
+  )
+  // Deliberately not resolveTransportCapability: that helper defaults every
+  // other capability to "enabled" for non-session transports, which is the
+  // wrong default here — this must stay off everywhere except the transports
+  // that explicitly request it.
+  const linksOpenInNewTab = transport?.capabilities?.linksOpenInNewTab === "enabled"
+  const voiceInputEnabled = resolveTransportCapability(
+    sessionTransport,
+    sessionTransport?.voice,
+    transport?.capabilities?.voice,
+  )
+  const taskControlsEnabled = resolveTransportCapability(
+    sessionTransport,
+    sessionTransport?.taskControls,
+    transport?.capabilities?.taskControls,
+  )
+  const sessionConnectionIdentity =
+    sessionTransport?.connection?.identity ?? null
+  const [deliveryGeneration, setDeliveryGeneration] = useState(0)
+  const deliveryGenerationRef = useRef(deliveryGeneration)
+  deliveryGenerationRef.current = deliveryGeneration
+  const [messageDeliveryCount, setMessageDeliveryCount] = useState(0)
+  const messageDeliveryCountRef = useRef(0)
+  const sessionConnectionIdentityRef = useRef(sessionConnectionIdentity)
+  sessionConnectionIdentityRef.current = sessionConnectionIdentity
+  const previousSessionConnectionIdentityRef = useRef(
+    sessionConnectionIdentity
+  )
+  const sessionResetFlightRef = useRef<SessionResetFlight | null>(null)
+  const sessionPreAdoptionBufferRef = useRef<SessionPreAdoptionBuffer | null>(null)
+  const flushingSessionPreAdoptionCandidateRef = useRef<WebSocketMessage | null>(null)
+  const retiredSessionTaskIdsRef = useRef(new Set<number>())
+  const sessionMessageHandlerRef = useRef<
+    (message: WebSocketMessage, owner: SessionMessageOwner) => void
+  >(() => {})
+  const mountedRef = useRef(false)
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
+  const sharedStreamRef = useRef<{
+    taskId?: number
+    runId?: string | null
+    attemptId?: string | null
+    interrupted: boolean
+    prefixSeen: boolean
+    complete: boolean
+  }>({ interrupted: false, prefixSeen: false, complete: false })
   const taskStateVersionsRef = useRef(
-    new Map<number, { version: number; runId?: string | null }>()
+    new Map<number, TaskStateVersionEntry>()
   )
 
-  // Ref to track current state for WebSocket message handler
-  const stateRef = useRef(state)
-  stateRef.current = state
+  // Session task ownership is established only by a current-socket task_info;
+  // never import a legacy route/storage Task id into this protocol state.
+  const sessionTaskIdRef = useRef<number | null>(null)
+
+  const rejectSessionResetFlight = useCallback(
+    (
+      resetFlight: SessionResetFlight | null,
+      error: Error,
+    ): boolean => {
+      if (
+        !resetFlight
+        || sessionResetFlightRef.current !== resetFlight
+      ) {
+        return false
+      }
+
+      sessionResetFlightRef.current = null
+      clearTimeout(resetFlight.timeout)
+      resetFlight.reject(error)
+      return true
+    },
+    [],
+  )
+
+  const discardSessionPreAdoptionBuffer = useCallback(() => {
+    const buffer = sessionPreAdoptionBufferRef.current
+    if (!buffer) return
+    if (buffer.timeout !== null) clearTimeout(buffer.timeout)
+    sessionPreAdoptionBufferRef.current = null
+  }, [])
+
+  const requireSessionReload = useCallback((error: Error) => {
+    discardSessionPreAdoptionBuffer()
+    rejectSessionResetFlight(sessionResetFlightRef.current, error)
+    dispatchSessionConversation({
+      type: "SESSION_RELOAD_REQUIRED",
+      connectionIdentity: sessionConnectionIdentityRef.current,
+    })
+  }, [discardSessionPreAdoptionBuffer, dispatchSessionConversation, rejectSessionResetFlight])
+
+  const beginSessionPreAdoptionBuffer = useCallback((connectionIdentity: string) => {
+    discardSessionPreAdoptionBuffer()
+    sessionPreAdoptionBufferRef.current = {
+      connectionIdentity,
+      candidate: null,
+      frames: [],
+      bytes: 0,
+      timeout: null,
+    }
+  }, [discardSessionPreAdoptionBuffer])
+
+  const activateSessionPreAdoptionBuffer = useCallback((connectionIdentity: string) => {
+    const buffer = sessionPreAdoptionBufferRef.current
+    if (!buffer || buffer.connectionIdentity !== connectionIdentity) {
+      requireSessionReload(
+        new Error("Replacement conversation transaction is missing; reload required.")
+      )
+      return
+    }
+    if (buffer.timeout !== null) return
+    buffer.timeout = setTimeout(() => {
+      const buffer = sessionPreAdoptionBufferRef.current
+      if (buffer?.connectionIdentity !== connectionIdentity) return
+      requireSessionReload(
+        new Error("Replacement conversation did not publish task_info before its deadline; reload required.")
+      )
+    }, SESSION_TASK_ADOPTION_TIMEOUT_MS)
+    if (buffer.candidate) {
+      flushingSessionPreAdoptionCandidateRef.current = buffer.candidate.message
+      try {
+        sessionMessageHandlerRef.current(buffer.candidate.message, { connectionIdentity })
+      } finally {
+        flushingSessionPreAdoptionCandidateRef.current = null
+      }
+    }
+  }, [requireSessionReload])
+
+  const bufferSessionPreAdoptionFrame = useCallback((
+    message: WebSocketMessage,
+    owner: SessionMessageOwner,
+    candidateTaskId?: number,
+  ): boolean => {
+    const buffer = sessionPreAdoptionBufferRef.current
+    if (!buffer || buffer.connectionIdentity !== owner.connectionIdentity) {
+      requireSessionReload(
+        new Error("Replacement frame ownership is unknown; reload required.")
+      )
+      return false
+    }
+    const bytes = serializedWebSocketMessageBytes(message)
+    if (candidateTaskId !== undefined && buffer.candidate) {
+      if (buffer.candidate.taskId === candidateTaskId) return true
+      requireSessionReload(
+        new Error("Replacement conversation published conflicting task_info; reload required.")
+      )
+      return false
+    }
+    if (
+      buffer.frames.length + (buffer.candidate ? 1 : 0) >= MAX_SESSION_PRE_ADOPTION_FRAMES
+      || buffer.bytes + bytes > MAX_SESSION_PRE_ADOPTION_BYTES
+    ) {
+      requireSessionReload(
+        new Error("Replacement frame buffer exceeded its safe bound; reload required.")
+      )
+      return false
+    }
+    if (candidateTaskId !== undefined) {
+      buffer.candidate = { message, taskId: candidateTaskId }
+    } else {
+      buffer.frames.push(message)
+    }
+    buffer.bytes += bytes
+    return true
+  }, [requireSessionReload])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      messageDeliveryCountRef.current = 0
+      discardSessionPreAdoptionBuffer()
+      rejectSessionResetFlight(
+        sessionResetFlightRef.current,
+        new Error("Conversation reset was cancelled because chat was closed.")
+      )
+    }
+  }, [discardSessionPreAdoptionBuffer, rejectSessionResetFlight])
+
+  useEffect(() => {
+    const taskId = state.taskId
+    const hasRuntimeExtensionBinding = (
+      state.currentTask?.id === String(taskId)
+      && (state.currentTask.runtimeExtensionBindings?.length || 0) > 0
+    )
+    if (taskId === null || sessionTransport || !hasRuntimeExtensionBinding) return
+
+    let cancelled = false
+    const loadRuntimeExtensions = async () => {
+      try {
+        const response = await apiRequest(
+          `${getApiUrl()}/api/chat/task/${taskId}/runtime-extensions`,
+          { cache: "no-store" },
+        )
+        if (!response || !response.ok) return
+        const payload = await response.json()
+        if (cancelled) return
+        dispatch({
+          type: "SET_TASK_RUNTIME_EXTENSIONS",
+          payload: {
+            taskId,
+            extensions: normalizeTaskRuntimeExtensions(payload?.runtime_extensions),
+          },
+        })
+      } catch (error) {
+        // Runtime metadata only decorates the transcript. A temporary metadata
+        // failure must not block loading or running the task itself.
+        console.warn("Failed to load task runtime metadata", error)
+      }
+    }
+    void loadRuntimeExtensions()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    dispatch,
+    sessionTransport,
+    state.currentTask?.id,
+    state.currentTask?.runtimeExtensionBindings,
+    state.taskId,
+  ])
+
+  useEffect(() => {
+    const previousIdentity = previousSessionConnectionIdentityRef.current
+    previousSessionConnectionIdentityRef.current = sessionConnectionIdentity
+    if (previousIdentity === sessionConnectionIdentity) return
+
+    if (sessionConversationRef.current.phase === "bound") {
+      if (sessionConnectionIdentity) {
+        dispatchSessionConversation({
+          type: "SESSION_BOUND_CONNECTION_REBOUND",
+          connectionIdentity: sessionConnectionIdentity,
+        })
+      }
+      return
+    }
+    if (sessionConversationRef.current.phase !== "unbound") {
+      requireSessionReload(
+        new Error("Conversation outcome is unknown after a connection refresh; reload required.")
+      )
+    }
+  }, [dispatchSessionConversation, requireSessionReload, sessionConnectionIdentity])
 
   const onConnect = useCallback(() => {
+    if (sessionTransport?.history === "none") {
+      const connectionIdentity = sessionConnectionIdentityRef.current
+      if (connectionIdentity && connectionIdentity === sessionConnectionIdentity) {
+        sessionTransport.onConnectionOpen?.(connectionIdentity)
+      }
+      isHistoricalDataLoadingRef.current = false
+      dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+      return
+    }
+
     // Fix: If we should be in replay mode but got disconnected, restore replay state
     if (stateRef.current.replayTaskId && stateRef.current.taskId === stateRef.current.replayTaskId && !stateRef.current.isReplaying) {
       dispatch({ type: "SET_REPLAY_PLAYING", payload: true })
@@ -1277,14 +2516,18 @@ export function AppProvider({
         },
       })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
-      dispatch({ type: "SET_STEPS", payload: [] })
+      // Clear dagExecution alongside steps - otherwise the Progress panel
+      // stays open (it only needs dagExecution to be non-null) rendering an
+      // empty step list for the gap between reconnecting and history replay
+      // repopulating both together.
+      dispatch({ type: "RESET_DAG_STATE" })
     } else {
       // New task connection -> Update tracker, Don't clear (handled by setTaskId)
       lastConnectedTaskId.current = stateRef.current.taskId
     }
 
     // Set history loading state
-    isHistoricalDataLoading = true
+    isHistoricalDataLoadingRef.current = true
     dispatch({ type: "SET_HISTORY_LOADING", payload: true })
 
     // Safety timeout: if no history arrives within 2 seconds, assume empty or done
@@ -1294,29 +2537,40 @@ export function AppProvider({
 
     // Auto-execute PENDING tasks from Agent Builder
     setTimeout(() => {
-      if (pendingTaskToExecute) {
+      if (pendingTaskToExecuteRef.current) {
         const hasUserMessages = stateRef.current.messages.some(m => m.role === 'user')
         console.log('🔍 onConnect - checking auto-execute:', {
-          hasPendingTask: !!pendingTaskToExecute,
-          pendingDescription: pendingTaskToExecute.description,
+          hasPendingTask: !!pendingTaskToExecuteRef.current,
+          pendingDescription: pendingTaskToExecuteRef.current.description,
           hasUserMessages,
         })
 
         if (!hasUserMessages) {
-          console.log('🚀 Auto-executing PENDING task from Agent Builder (onConnect):', pendingTaskToExecute.description)
+          console.log('🚀 Auto-executing PENDING task from Agent Builder (onConnect):', pendingTaskToExecuteRef.current.description)
           // sendChatMessage(pendingTaskToExecute.description, []) // Cannot access sendChatMessage
-          pendingTaskToExecute = null
+          pendingTaskToExecuteRef.current = null
         } else {
           console.log('⏭️ Skipping auto-execute, already has user messages')
-          pendingTaskToExecute = null
+          pendingTaskToExecuteRef.current = null
         }
       }
     }, 1000)
-  }, [])
+  }, [
+    sessionConnectionIdentity,
+    sessionTransport?.history,
+    sessionTransport?.onConnectionOpen,
+  ])
+
+  const sessionMessageOwner = sessionConnectionIdentity
+    ? {
+      connectionIdentity: sessionConnectionIdentity,
+    }
+    : null
 
   const {
     isConnected,
     connectionError,
+    sendMessage: sendRawMessage,
     sendChatMessage,
     executeTask: wsExecuteTask,
     pauseTask: wsPauseTask,
@@ -1327,13 +2581,53 @@ export function AppProvider({
     taskId: state.taskId || undefined,
     token,
     buildWebSocketUrl: transport?.buildWebSocketUrl,
-    uploadFiles: transport?.uploadFiles,
+    uploadFiles: filesDisabled
+      ? rejectDisabledFileUpload
+      : transport?.uploadFiles,
+    connection:
+      sessionTransport === undefined
+        ? undefined
+        : sessionTransport.connection,
+    deliveryGeneration:
+      sessionTransport === undefined
+        ? undefined
+        : deliveryGeneration,
+    legacyErrorProse: trustLegacyErrorProse ? "trusted" : "untrusted",
+    onSessionConnectionClose: sessionTransport?.onConnectionClose,
+    onSessionConnectionFailure: sessionTransport?.onConnectionFailure,
     onMessage: (message) => {
-      handleMessage(message, dispatch, stateRef.current)
+      if (sessionTransport) {
+        if (
+          !mountedRef.current
+          || !sessionMessageOwner
+          || sessionMessageOwner.connectionIdentity
+            !== sessionConnectionIdentityRef.current
+        ) {
+          return
+        }
+        sessionMessageHandlerRef.current(message, sessionMessageOwner)
+        return
+      }
+      handleMessage(message, dispatch, stateRef.current, { filesDisabled })
     },
     onConnect: onConnect, // Pass the callback
     autoConnect: true,
   })
+
+  useEffect(() => {
+    if (!sessionTransport || isConnected) return
+    if (
+      sessionConversationRef.current.phase !== "reset_requested"
+      && sessionConversationRef.current.phase !== "replacement_ready"
+      && sessionConversationRef.current.phase !== "replacement_sending"
+      && sessionConversationRef.current.phase !== "replacement_awaiting_task"
+    ) {
+      return
+    }
+    requireSessionReload(
+      new Error("Conversation outcome is unknown because the Session disconnected; reload required.")
+    )
+  }, [isConnected, requireSessionReload, sessionTransport])
 
   // Handle pending messages separately since we need sendChatMessage
   useEffect(() => {
@@ -1365,6 +2659,7 @@ export function AppProvider({
           pendingMessage.files,
           pendingMessage.force,
           pendingMessage.clientMessageId,
+          pendingMessage.requestId,
         )
       ).then(() => {
         pendingMessage.resolve?.()
@@ -1376,6 +2671,19 @@ export function AppProvider({
       })
     }
   }, [isConnected, pendingMessage, sendChatMessage])
+
+  // A queued message can only ever flush to its target task. If the task is
+  // switched away before that socket connects (e.g. the widget's "New
+  // conversation" reset), fail it immediately — left queued it would sit out
+  // the 30s timeout and vanish as an unhandled rejection with no visible error.
+  useEffect(() => {
+    if (!pendingMessage?.targetTaskId) return
+    if (state.taskId === pendingMessage.targetTaskId) return
+    pendingMessage.reject?.(
+      new Error('Message not sent: the conversation was reset before it could be delivered.')
+    )
+    setPendingMessage(current => (current === pendingMessage ? null : current))
+  }, [pendingMessage, state.taskId])
 
   const queuePendingMessage = useCallback((message: Omit<PendingMessage, 'resolve' | 'reject'>) => {
     return new Promise<void>((resolve, reject) => {
@@ -1401,18 +2709,18 @@ export function AppProvider({
 
   // Handle auto-execute pending task separately
   useEffect(() => {
-    if (isConnected && pendingTaskToExecute) {
+    if (isConnected && pendingTaskToExecuteRef.current) {
       // Logic moved to effect
       // But wait, pendingTaskToExecute is not state, it's a let variable.
       // Effect won't run when it changes.
       // But it runs when isConnected changes.
 
       const timer = setTimeout(() => {
-        if (pendingTaskToExecute) {
+        if (pendingTaskToExecuteRef.current) {
           const hasUserMessages = stateRef.current.messages.some(m => m.role === 'user')
           if (!hasUserMessages) {
-            sendChatMessage(pendingTaskToExecute.description, [])
-            pendingTaskToExecute = null
+            sendChatMessage(pendingTaskToExecuteRef.current.description, [])
+            pendingTaskToExecuteRef.current = null
           }
         }
       }, 1000)
@@ -1439,15 +2747,299 @@ export function AppProvider({
     })
   }, [isConnected, state.taskId, connectionError])
 
-  const handleMessage = useCallback((message: WebSocketMessage, dispatch: React.Dispatch<AppAction>, currentState: AppState) => {
+  const handleMessage = useCallback((
+    message: WebSocketMessage,
+    rawDispatch: React.Dispatch<AppAction>,
+    currentState: AppState,
+    options?: {
+      skipHistory?: boolean
+      filesDisabled?: boolean
+    },
+  ) => {
+    // A task's WebSocket connection is per-task (or, for session transports,
+    // multiplexes a sequence of tasks over one socket) - either way, a
+    // just-superseded socket/task can still have events in flight after the
+    // app has moved on to a different task (e.g. the user starts a new chat
+    // while a previous DAG run is still executing in the background). Those
+    // stray events must not repaint TASK_SCOPED_ACTION_TYPES's state for
+    // whatever task is now on screen - not just DAG/step state, but the chat
+    // transcript, trace log, context/memory display, and processing/status
+    // flags too, since a background task's reply or tool trace has no
+    // business appearing in a different task's conversation. Deliberately
+    // keyed ONLY off currentState.taskId (not currentTask.id): switching
+    // tasks via setTaskId leaves a real window where taskId has already
+    // advanced to the new task but currentTask still describes the old one
+    // (until that task's own task_info arrives) - matching against
+    // currentTask.id in that window would let the old task's stray events
+    // right back through, defeating the whole guard.
+    const messageTaskId = (message as unknown as { task_id?: unknown }).task_id
+    // No task is even being viewed (currentState.taskId null/undefined) but
+    // this message names a specific task - that can only be a stray event
+    // for a task other than "the current view", so it counts as "for another
+    // task" too (not just the "viewing a *different* task" case).
+    const isMessageForOtherTask =
+      messageTaskId !== undefined && messageTaskId !== null && messageTaskId !== ""
+      && String(messageTaskId) !== String(currentState.taskId)
+    const dispatch: React.Dispatch<AppAction> = (action) => {
+      if (TASK_SCOPED_ACTION_TYPES.has(action.type) && isMessageForOtherTask) return
+      // Stamp every UPDATE_TASK_STATUS dispatched from this handler with the
+      // originating event's own timestamp here, once, rather than relying on
+      // each call site to remember to pass it - a forgotten `updatedAt` at a
+      // future call site would otherwise silently fall back to client-now in
+      // the reducer, quietly reintroducing the wrong-elapsed-time-on-replay
+      // bug this field exists to fix. External UI callers of UPDATE_TASK_STATUS
+      // (outside this handler, e.g. sendMessage's optimistic status flip)
+      // don't go through this wrapper and keep their own client-now fallback.
+      if (action.type === "UPDATE_TASK_STATUS" && action.payload.updatedAt === undefined) {
+        rawDispatch({ ...action, payload: { ...action.payload, updatedAt: message.timestamp } })
+        return
+      }
+      rawDispatch(action)
+    }
+    if (!isMessageForOtherTask && typeof messageTaskId === "number") {
+      let stream = sharedStreamRef.current
+      if (stream.taskId !== messageTaskId) {
+        stream = { taskId: messageTaskId, interrupted: false, prefixSeen: false, complete: false }
+        sharedStreamRef.current = stream
+      }
+      if (message.type === "stream_unavailable" || message.type === "stream_resync_required") {
+        stream.interrupted = true
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
+        return
+      }
+      if (message.type === "task_stream_snapshot") {
+        if (isHistoricalDataLoadingRef.current) return
+        const envelope = extractTaskControlEnvelope(message)
+        if (!acceptTaskControlVersion(message, envelope, taskStateVersionsRef.current)) return
+        const data = asMessageRecord(message.data)
+        if (stream.runId !== envelope.runId) {
+          stream.runId = envelope.runId
+          stream.prefixSeen = false
+          stream.complete = false
+        }
+        stream.attemptId = typeof data.lease_attempt_id === "string" ? data.lease_attempt_id : null
+        const active = envelope.status === "running"
+        stream.interrupted = stream.interrupted || (active && !stream.prefixSeen)
+        if (envelope.status) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: {
+            status: envelope.status, runId: envelope.runId,
+            stateVersion: envelope.stateVersion, controlState: envelope.controlState,
+            ...(envelope.status === "waiting_for_user" ? {
+              waitingQuestion: typeof data.question === "string" ? data.question : undefined,
+              waitingInteractions: normalizeInteractions(data.interactions),
+            } : {}),
+          } })
+          dispatch({ type: "SET_PROCESSING", payload: active })
+        }
+        if (typeof data.output === "string" && typeof envelope.runId === "string") {
+          dispatch({ type: "RECONCILE_STREAM_OUTPUT", payload: {
+            runId: envelope.runId, output: data.output,
+            timestamp: message.timestamp, interrupted: stream.interrupted,
+          } })
+          stream.interrupted = false
+          stream.complete = true
+        } else if (envelope.status && envelope.status !== "running") {
+          stream.interrupted = false
+        }
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: stream.interrupted ? messageTaskId : null })
+        return
+      }
+      if (message.stream_run_id !== undefined) {
+        const known = taskStateVersionsRef.current.get(messageTaskId)
+        if (known?.runId !== undefined && known.runId !== message.stream_run_id) {
+          const envelope = extractTaskControlEnvelope(message)
+          if (!envelope.isStateEvent || envelope.runId !== message.stream_run_id
+            || envelope.stateVersion === undefined || envelope.stateVersion <= known.version) return
+        }
+        if (stream.runId !== message.stream_run_id) {
+          stream.runId = message.stream_run_id
+          stream.attemptId = message.stream_attempt_id
+          stream.prefixSeen = false
+          stream.interrupted = false
+          stream.complete = false
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+        }
+        if (stream.attemptId && message.stream_attempt_id !== stream.attemptId) return
+      }
+      const streamType = getWebSocketEventType(message)
+      if (stream.complete && isFinalAnswerStreamEventType(streamType)) return
+      if (streamType === "final_answer_start") {
+        stream.prefixSeen = true
+        stream.interrupted = false
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+      }
+      if (isFinalAnswerStreamEventType(streamType)) {
+        const sharedFrame = message.stream_run_id !== undefined
+        const data = asMessageRecord(message.data)
+        const eventData = message.type === "trace_event"
+          ? asMessageRecord(data.data ?? data)
+          : { ...data, ...message }
+        const replacesContent = sharedFrame && (
+          (streamType === "final_answer_end" && typeof eventData.content === "string")
+          || (streamType === "final_answer_error" && typeof eventData.error === "string")
+        )
+        if (sharedFrame && streamType === "final_answer_delta" && !stream.prefixSeen) {
+          stream.interrupted = true
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
+          return
+        }
+        if (replacesContent) {
+          stream.prefixSeen = true
+          stream.interrupted = false
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+        }
+        if (stream.interrupted) return
+        if (replacesContent) stream.complete = true
+      }
+    }
+    // The 30s dedup cache below is keyed on message content/type only, not
+    // task id - several dedupKeys (e.g. dag-execute-end's "task end, this
+    // iteration") are templated purely on generic fields like iteration
+    // count, so a background task and the currently-viewed task can produce
+    // the exact same key. A stale event for another task never reaches
+    // `dispatch` (filtered above), but if it were still allowed to *insert*
+    // into the cache, it would silently swallow the viewed task's own
+    // legitimate ADD_MESSAGE as a "duplicate" moments later. Skip caching
+    // (not skip the check itself) whenever the message belongs elsewhere.
+    const isDuplicateMessageForViewedTask = (
+      content: string | React.ReactNode,
+      type = "general",
+      occurrenceIdentity?: string,
+    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask, occurrenceIdentity)
+    // Shared by both dag_execution shapes this handler processes below (the
+    // modern trace_event-wrapped one, and the legacy bare "dag_execution"
+    // message type) - duplicating this logic per call site is exactly how a
+    // past version of this fix ended up only covering one of the two and
+    // missing the other, so it stays a single function both branches call.
+    // A turn_id present on BOTH sides that DIFFERS means this event belongs
+    // to a genuinely different DAG execution - e.g. turn 2's DAG starting
+    // while turn 1's dagExecution/steps are still in state because
+    // sendMessage's RESET_DAG_STATE guard raced and lost. Only that specific
+    // case counts as a new run: if turn_id is missing on EITHER side (an
+    // older backend, a legacy/history event that predates this field, or
+    // some other pattern that never sets it), there's no reliable identity to
+    // compare, so this falls back to "not a new run" rather than guessing -
+    // a false "new run" here would wipe live steps out from under a mid-run
+    // legacy event, which is worse than occasionally missing a real
+    // transition this fallback can't detect.
+    const applyDagExecutionUpdate = (
+      rawEventData: Record<string, unknown>,
+      sourceTimestamp: string | number,
+    ) => {
+      // Malformed frame (absent/unknown phase): drop the WHOLE update -
+      // including its steps - before any dispatch, matching the normalizer's
+      // own contract. Applying the steps but not the execution object would
+      // leave the two halves of DAG state describing different events.
+      if (typeof rawEventData.phase !== "string" || !DAG_EXECUTION_PHASES.has(rawEventData.phase)) {
+        return
+      }
+      const incomingTurnId = (rawEventData as { turn_id?: string }).turn_id
+      const trackedTurnId = currentState.dagExecution?.turn_id
+      const isNewRun = Boolean(incomingTurnId) && Boolean(trackedTurnId) && incomingTurnId !== trackedTurnId
+      const steps = stepsFromPlanData(rawEventData, isNewRun ? [] : currentState.steps)
+      if (steps) {
+        dispatch({ type: "SET_STEPS", payload: steps })
+      } else if (isNewRun) {
+        // This specific event (e.g. a bare "planning"/"replanning" phase
+        // update with no steps field) doesn't itself carry step data, but
+        // it's still the first event of a new run - the prior run's steps
+        // must not linger just because this event happened not to include a
+        // fresh list to replace them with.
+        dispatch({ type: "SET_STEPS", payload: [] })
+      }
+      // The backend's dag_execution payload (dag.py's on_dag_execution) never
+      // actually carries a created_at - only completed_step_count/
+      // plan_step_count/steps. Without a fallback here, the DAG run never
+      // gets a stable "started at" timestamp, so the Progress panel's total
+      // elapsed time never renders. Keep whatever created_at this run
+      // already established (planning's first event sets it; later phase
+      // updates for the SAME run must not reset it) whenever turn_id says
+      // this is a continuation; use this event's own timestamp for a
+      // genuinely new run instead of inheriting the prior run's.
+      const dagCreatedAt =
+        !isNewRun
+          ? currentState.dagExecution?.created_at
+            ?? (rawEventData as { created_at?: string | number }).created_at
+            ?? sourceTimestamp
+          : (rawEventData as { created_at?: string | number }).created_at
+            ?? sourceTimestamp
+      // Same gap as created_at above: the backend's dag_execution payload
+      // never carries updated_at either, so without this fallback every
+      // phase update after the first would leave it undefined despite
+      // DAGExecution declaring it required - center-panel.tsx uses it both
+      // as a React key and as displayed text. Unlike created_at, this
+      // always takes the event's own timestamp - it's meant to track "last
+      // touched," not "run started," so a continuation must still advance it.
+      const dagUpdatedAt =
+        (rawEventData as { updated_at?: string | number }).updated_at ?? sourceTimestamp
+      // SET_DAG_EXECUTION replaces the whole object, so a turn_id-less
+      // continuation event (a legacy/history shape mid-run) would otherwise
+      // silently WIPE the tracked turn_id - and once it's gone, the next
+      // genuinely new run's differing turn_id can no longer be recognized as
+      // new (the both-sides-present rule above would see tracked=undefined
+      // and fall back to "not a new run"), inheriting the old run's
+      // created_at and steps. Carrying the tracked id forward through such
+      // events keeps the run's identity stable for as long as it lives.
+      // (When incomingTurnId is present it always wins - including on a new
+      // run, where it IS the new identity; isNewRun can never be true while
+      // incomingTurnId is absent, so the fallback only ever applies to
+      // continuations.)
+      const dagTurnId = incomingTurnId ?? trackedTurnId
+      // Can't be null here (the phase was already validated at the top of
+      // this function), but the normalizer's null-on-malformed contract is
+      // typed, so honor it rather than asserting it away.
+      const normalizedDagExecution = normalizeDagExecutionPayload({
+        ...rawEventData,
+        created_at: dagCreatedAt,
+        updated_at: dagUpdatedAt,
+        turn_id: dagTurnId,
+      })
+      if (normalizedDagExecution) {
+        dispatch({ type: "SET_DAG_EXECUTION", payload: normalizedDagExecution })
+      }
+    }
+    // Activity events (dag_execute_start, llm_call_start, react_task_start,
+    // skill_select_start) optimistically infer "the task is running" from the
+    // fact that work is happening. During a history load those same events
+    // are REPLAYED for work that already finished - letting them flip an
+    // authoritative terminal task back to "running" makes the page briefly
+    // believe a finished task is live again (clearing dagTerminatedAt,
+    // unfreezing the Progress panel's elapsed clock, and passing the panel's
+    // auto-open terminal gate) until the terminal event replays. A terminal
+    // task's status during history load comes from task_info/terminal
+    // events, never from inferred liveness. Keyed off the REF, not
+    // state.isHistoryLoading: several handlers clear the state flag early
+    // (to show live UI as soon as anything renders) while the ref stays true
+    // until historical_data_complete actually arrives. Scoped to terminal
+    // tasks only, so a stuck ref (a backend that never sends
+    // historical_data_complete) can't permanently suppress liveness for a
+    // task that was never finished in the first place.
+    const dispatchInferredRunningStatus = () => {
+      if (
+        isHistoricalDataLoadingRef.current
+        && isTerminalTaskStatus(currentState.currentTask?.status)
+      ) return
+      dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
+      dispatch({ type: "SET_PROCESSING", payload: true })
+    }
     // If we're in replay mode, don't process immediately - collect for delayed playback
     if (
-      shouldBufferMessageForHistoricalReplay({
+      !options?.skipHistory
+      && shouldBufferMessageForHistoricalReplay({
         isReplaying: currentState.isReplaying,
-        isHistoryLoading: currentState.isHistoryLoading || isHistoricalDataLoading,
+        isHistoryLoading: currentState.isHistoryLoading || isHistoricalDataLoadingRef.current,
         message,
       })
     ) {
+      // A stray background task's message reaching this branch would
+      // otherwise get buffered into the VIEWED task's own replay cache (and
+      // its historical_data_complete would flip isHistoricalDataLoadingRef -
+      // a plain ref, not gated by the dispatch wrapper below - ending the
+      // viewed task's history load early based on a different task's data).
+      // None of this branch's effects belong to any task but the one
+      // currently loading history, so drop it outright rather than only
+      // filtering the dispatches inside it.
+      if (isMessageForOtherTask) return
       // Add to replay cache
       dispatch({ type: "ADD_TO_REPLAY_CACHE", payload: message })
 
@@ -1456,12 +3048,12 @@ export function AppProvider({
         getWebSocketEventType(message) === "historical_data_complete"
 
       if (isHistoricalComplete) {
-        isHistoricalDataLoading = false
+        isHistoricalDataLoadingRef.current = false
         dispatch({ type: "SET_HISTORY_LOADING", payload: false })
         dispatch({ type: "SYNC_PROCESSING_STATUS" })
         // Add a small delay to ensure all events are collected before starting playback
         setTimeout(() => {
-          startDelayedPlayback()
+          startDelayedPlaybackRef.current()
         }, 500) // 500ms delay to collect remaining events
       }
 
@@ -1470,37 +3062,13 @@ export function AppProvider({
 
     const controlEnvelope = extractTaskControlEnvelope(message)
     if (controlEnvelope.isStateEvent && controlEnvelope.taskId !== undefined) {
-      const knownState = taskStateVersionsRef.current.get(controlEnvelope.taskId)
-      if (controlEnvelope.stateVersion === undefined) {
-        // Once the server has established the versioned protocol for a task,
-        // legacy/unversioned replay events must not be allowed to roll it back.
-        // Error events carry information rather than a state transition, so a
-        // rare unversioned error must still reach the user.
-        const isErrorEvent = message.type === "error" || message.type === "agent_error"
-        if (knownState && !isErrorEvent) return
-      } else {
-        const isOlderVersion = knownState
-          && controlEnvelope.stateVersion < knownState.version
-        // Backend transitions currently advance the version whenever run_id
-        // changes. Keep this defensive guard for malformed or future emitters.
-        const isDifferentRunAtSameVersion = knownState
-          && controlEnvelope.stateVersion === knownState.version
-          && knownState.runId !== undefined
-          && controlEnvelope.runId !== undefined
-          && knownState.runId !== controlEnvelope.runId
-        if (isOlderVersion || isDifferentRunAtSameVersion) return
-        taskStateVersionsRef.current.delete(controlEnvelope.taskId)
-        taskStateVersionsRef.current.set(controlEnvelope.taskId, {
-          version: controlEnvelope.stateVersion,
-          runId: controlEnvelope.runId,
-        })
-        if (taskStateVersionsRef.current.size > MAX_TRACKED_TASK_STATE_VERSIONS) {
-          const oldestTaskId = taskStateVersionsRef.current.keys().next().value
-          if (oldestTaskId !== undefined) {
-            taskStateVersionsRef.current.delete(oldestTaskId)
-          }
-        }
-      }
+      if (
+        !acceptTaskControlVersion(
+          message,
+          controlEnvelope,
+          taskStateVersionsRef.current,
+        )
+      ) return
 
       // A late event may have an old semantic type (for example
       // ``task_paused``) after a newer run is already RUNNING. The backend
@@ -1538,23 +3106,6 @@ export function AppProvider({
     }
 
     switch (message.type) {
-      case "chat":
-        const chatData = message as any
-        const messageContent = chatData.message || ""
-
-        if (!isDuplicateMessage(messageContent, 'user-message')) {
-          dispatch({
-            type: "ADD_MESSAGE",
-            payload: {
-              id: generateMessageId("msg-user"),
-              role: "user",
-              content: messageContent,
-              timestamp: message.timestamp?.toString() || Date.now().toString(),
-            }
-          })
-        }
-        break
-
       case "trace_event":
         const traceEventData = (message.data ?? {}) as any
 
@@ -1586,71 +3137,44 @@ export function AppProvider({
 
           // Handle structured trace events
           if (eventType === "task_info") {
-            const taskData = eventData
-            const taskStatus = normalizeTaskStatus(taskData.status) || "pending"
+            const taskData = eventData as Record<string, unknown>
+            const taskId = parseInteger(taskData.id)
+            if (taskId === undefined || taskId <= 0) return
+            const task = taskFromTaskInfoData(taskData, taskId)
+            const taskStatus = task.status
             console.log('📥 Received task_info event:', {
               taskData,
               status: taskData.status,
               statusType: typeof taskData.status
             })
 
-            // Store pending task for auto-execution
-            if (taskStatus === 'pending' && taskData.description) {
-              pendingTaskToExecute = { description: taskData.description }
+            // Store pending task for auto-execution - a plain ref write, not
+            // gated by the dispatch wrapper's task scoping, so a stray
+            // background task's own pending task_info must not overwrite
+            // what's about to be auto-sent for the task actually being
+            // viewed/connected.
+            if (taskStatus === 'pending' && task.description && !isMessageForOtherTask) {
+              pendingTaskToExecuteRef.current = { description: task.description }
               console.log('💾 Stored pending task for auto-execution:', taskData.description)
             }
 
             // Check if status changed and trigger update if so
-            if (currentState.currentTask?.id === taskData.id.toString() && currentState.currentTask?.status !== taskStatus) {
+            if (currentState.currentTask?.id === task.id && currentState.currentTask?.status !== taskStatus) {
               dispatch({ type: "TRIGGER_TASK_UPDATE" })
             }
 
             dispatch({
               type: "SET_CURRENT_TASK",
-              payload: {
-                id: taskData.id.toString(),
-                title: taskData.title,
-                description: taskData.description,
-                status: taskStatus,
-                createdAt: taskData.created_at,
-                updatedAt: taskData.updated_at,
-                modelId: taskData.model_id,
-                smallFastModelId: taskData.small_fast_model_id,
-                visualModelId: taskData.visual_model_id,
-                compactModelId: taskData.compact_model_id,
-                modelName: taskData.model_name,
-                smallFastModelName: taskData.small_fast_model_name,
-                visualModelName: taskData.visual_model_name,
-                compactModelName: taskData.compact_model_name,
-                executionMode: taskData.execution_mode,
-                isDag: taskData.is_dag,
-                agentId: taskData.agent_id,
-                agentName: taskData.agent_name,
-                agentLogoUrl: taskData.agent_logo_url,
-                waitingQuestion: taskData.waiting_question,
-                waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
-                runId: taskData.run_id,
-                stateVersion: taskData.state_version,
-                controlState: taskData.control_state,
-              }
+              payload: task,
             })
-
             // Check if this is a new task (created within last 5 seconds)
             // If so, we don't expect historical messages, so stop loading
-            const createdAt = typeof taskData.created_at === 'number'
-              ? (taskData.created_at > 10000000000 ? taskData.created_at : taskData.created_at * 1000) // Handle ms vs s
-              : new Date(taskData.created_at).getTime()
-
             // We do NOT stop loading here for new tasks anymore.
             // We wait for the user_message event or the timeout to handle it.
             // This prevents the empty state flash when task_info arrives before user_message.
           } else if (eventType === "dag_execution") {
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
-            const steps = stepsFromPlanData(eventData, currentState.steps)
-            if (steps) {
-              dispatch({ type: "SET_STEPS", payload: steps })
-            }
-            dispatch({ type: "SET_DAG_EXECUTION", payload: eventData })
+            applyDagExecutionUpdate(eventData, message.timestamp)
           } else if (eventType === "dag_step_info") {
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
             const stepInfo = eventData
@@ -1707,12 +3231,12 @@ export function AppProvider({
             // legacy events without either identity fall back to short-lived
             // content-based deduplication.
             const isDuplicate = userMessageId === null
-              ? isDuplicateMessage(messageContent, 'user-message', false, true)
+              ? isDuplicateMessageForViewedTask(messageContent, 'user-message')
               : false
             console.log('🔍 Duplicate check:', {
               messageContent,
               isDuplicate,
-              recentMessages: Array.from(recentMessages)
+              recentMessages: Array.from(recentMessagesRef.current)
             })
 
             if (isDuplicate) {
@@ -1738,7 +3262,7 @@ export function AppProvider({
                 <UserMessageContent
                   message={messageContent}
                   files={files}
-                  onPreview={(file, previewFiles) => {
+                  onPreview={options?.filesDisabled ? undefined : (file, previewFiles) => {
                     const currentFileId = file.file_id || ""
                     const normalizedFiles = previewFiles.map((previewFile) => ({
                       fileId: previewFile.file_id || "",
@@ -1854,6 +3378,9 @@ export function AppProvider({
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
+            const interactionRequestId = typeof eventData.request_id === "string"
+              ? eventData.request_id
+              : undefined
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =
@@ -1891,6 +3418,7 @@ export function AppProvider({
                   status: "waiting_for_user",
                   waitingQuestion: messageContent,
                   waitingInteractions: interactions.length > 0 ? interactions : undefined,
+                  waitingRequestId: interactionRequestId,
                 }
               })
             }
@@ -1901,10 +3429,19 @@ export function AppProvider({
             if (shouldHideAgentMessage) {
               return
             }
-            if (!streamMessageId && isDuplicateMessage(messageContent, 'agent-message')) {
+            if (!streamMessageId && isDuplicateMessageForViewedTask(
+              messageContent,
+              'agent-message',
+              isAgentMessage ? interactionRequestId : undefined,
+            )) {
               return
             }
-            const msgId = generateMessageId("msg-agent")
+            const msgId =
+              (isAgentMessage
+                ? stableAssistantMessageId(
+                  message.event_id || traceEventData.event_id || eventData.event_id,
+                )
+                : null) ?? generateMessageId("msg-agent")
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -1917,6 +3454,7 @@ export function AppProvider({
                 isResult: true,
                 streamMessageId,
                 interactions: interactions.length > 0 ? interactions : undefined,
+                interactionRequestId,
               }
             })
             if (eventData.status === "completed") {
@@ -1938,17 +3476,17 @@ export function AppProvider({
             )
 
             // Set DAG execution state to planning phase (only if not already executing or completed)
-            if (!state.dagExecution || state.dagExecution.phase === "planning") {
-              const dagExecution: DAGExecution = {
-                phase: phase as "planning" | "executing" | "completed" | "failed",
+            if (!currentState.dagExecution || currentState.dagExecution.phase === "planning") {
+              const dagExecution = normalizeDagExecutionPayload({
+                phase,
                 current_plan: {},
                 created_at: message.timestamp,
                 updated_at: message.timestamp,
-              }
+              })
 
               // Use consistent string format for deduplication
               const dedupKey = `plan-start:${phase}`
-              if (!isDuplicateMessage(dedupKey, 'dag-plan-start')) {
+              if (!isDuplicateMessageForViewedTask(dedupKey, 'dag-plan-start')) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -1960,8 +3498,15 @@ export function AppProvider({
                   }
                 })
 
-                // Set DAG execution state to show loading state
-                dispatch({ type: "SET_DAG_EXECUTION", payload: dagExecution })
+                // Set DAG execution state to show loading state - unless the
+                // event carried an unrecognized phase string, in which case
+                // the normalizer returned null and only the chat message
+                // above is kept (fabricating an "executing" run out of an
+                // unknown phase is exactly what the normalizer exists to
+                // prevent).
+                if (dagExecution) {
+                  dispatch({ type: "SET_DAG_EXECUTION", payload: dagExecution })
+                }
               }
             }
           } else if (eventType === "dag_plan_end") {
@@ -1973,7 +3518,7 @@ export function AppProvider({
               <>
                 <CheckCircle className="h-4 w-4 inline mr-2 text-green-500" />
                 {t('agent.logs.event.messages.planEnd', { planId, stepsCount })}
-                {state.planMemoryInfo && (
+                {currentState.planMemoryInfo && (
                   <div className="mt-2">
                     <CollapsibleSection
                       title={t('agent.planDetails.memory.title')}
@@ -1983,26 +3528,26 @@ export function AppProvider({
                       <div className="grid grid-cols-2 gap-2 text-xs">
                         <div className="flex items-center gap-1 p-2 bg-muted/30 rounded">
                           <Search className="h-3 w-3" />
-                          <span>{t('agent.planDetails.memory.stats.found', { count: state.planMemoryInfo.memoriesFound })}</span>
+                          <span>{t('agent.planDetails.memory.stats.found', { count: currentState.planMemoryInfo.memoriesFound })}</span>
                         </div>
                         <div className="flex items-center gap-1 p-2 bg-muted/30 rounded">
                           <Target className="h-3 w-3" />
-                          <span>{t('agent.planDetails.memory.stats.used', { count: state.planMemoryInfo.memoriesUsed })}</span>
+                          <span>{t('agent.planDetails.memory.stats.used', { count: currentState.planMemoryInfo.memoriesUsed })}</span>
                         </div>
                       </div>
-                      {state.planMemoryInfo.enhancedGoal && (
+                      {currentState.planMemoryInfo.enhancedGoal && (
                         <div className="mt-2">
                           <div className="text-xs font-medium text-muted-foreground mb-1">{t('agent.planDetails.memory.enhancedGoalTitle')}</div>
                           <div className="text-xs bg-blue-500/10 p-2 rounded border border-blue-500/20">
-                            {state.planMemoryInfo.enhancedGoal}
+                            {currentState.planMemoryInfo.enhancedGoal}
                           </div>
                         </div>
                       )}
-                      {state.planMemoryInfo.memories && state.planMemoryInfo.memories.length > 0 && (
+                      {currentState.planMemoryInfo.memories && currentState.planMemoryInfo.memories.length > 0 && (
                         <div className="mt-2">
                           <div className="text-xs font-medium text-muted-foreground mb-1">{t('agent.planDetails.memory.relatedTitle')}</div>
                           <div className="space-y-1">
-                            {state.planMemoryInfo.memories.map((memory, index) => (
+                            {currentState.planMemoryInfo.memories.map((memory, index) => (
                               <div
                                 key={index}
                                 className="text-xs p-2 bg-muted/20 rounded border border-border/50"
@@ -2034,7 +3579,7 @@ export function AppProvider({
             }
 
             const dedupKey = t('agent.logs.event.messages.planEnd', { planId, stepsCount })
-            if (!isDuplicateMessage(dedupKey, 'plan-end')) {
+            if (!isDuplicateMessageForViewedTask(dedupKey, 'plan-end')) {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
@@ -2047,9 +3592,9 @@ export function AppProvider({
               })
 
               // Update DAG execution state to executing phase (only if not already completed or failed)
-              if (state.dagExecution && state.dagExecution.phase !== "completed" && state.dagExecution.phase !== "failed") {
+              if (currentState.dagExecution && currentState.dagExecution.phase !== "completed" && currentState.dagExecution.phase !== "failed") {
                 const updatedDAGExecution = {
-                  ...state.dagExecution,
+                  ...currentState.dagExecution,
                   phase: "executing" as const,
                   current_plan: planData,
                   updated_at: message.timestamp,
@@ -2065,13 +3610,12 @@ export function AppProvider({
             const taskPreview = eventData.task_preview || t('agent.header.badge.task')
 
             // Set processing state to true when task execution starts
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
 
             // Update DAG execution state to executing phase
-            if (state.dagExecution) {
+            if (currentState.dagExecution) {
               const updatedDAGExecution = {
-                ...state.dagExecution,
+                ...currentState.dagExecution,
                 phase: "executing" as const,
                 updated_at: message.timestamp,
               }
@@ -2088,7 +3632,7 @@ export function AppProvider({
 
             // Use consistent string format for deduplication
             const dedupKey = t('agent.logs.event.messages.taskStart', { iteration })
-            if (!isDuplicateMessage(dedupKey, 'dag-execute-start')) {
+            if (!isDuplicateMessageForViewedTask(dedupKey, 'dag-execute-start')) {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
@@ -2118,9 +3662,9 @@ export function AppProvider({
             dispatch({ type: "SET_PROCESSING", payload: false })
 
             // Update DAG execution state to completed phase
-            if (state.dagExecution) {
+            if (currentState.dagExecution) {
               const updatedDAGExecution = {
-                ...state.dagExecution,
+                ...currentState.dagExecution,
                 phase: "completed" as const,
                 updated_at: message.timestamp,
               }
@@ -2129,7 +3673,7 @@ export function AppProvider({
 
             // Use consistent string format for deduplication
             const dedupKey = t('agent.logs.event.messages.taskEnd', { iteration })
-            if (!isDuplicateMessage(dedupKey, 'dag-execute-end')) {
+            if (!isDuplicateMessageForViewedTask(dedupKey, 'dag-execute-end')) {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
@@ -2201,7 +3745,7 @@ export function AppProvider({
               // the same step, or with identical token counts) each show, while
               // a re-dispatched same event is still deduped.
               const noticeKey = `compact-notice-${stepId}-${message.timestamp}`
-              if (!isDuplicateMessage(noticeText, noticeKey)) {
+              if (!isDuplicateMessageForViewedTask(noticeText, noticeKey)) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -2223,7 +3767,7 @@ export function AppProvider({
 
             // dag_step_start has step_id, should update the right-side step data, do not display message on the left
             // Find existing step first, preserve dependencies
-            const existingStep = state.steps.find(s => s.id === (message.step_id || eventData.step_id || stepName))
+            const existingStep = currentState.steps.find(s => s.id === (message.step_id || eventData.step_id || stepName))
             const step: StepExecution = {
               id: message.step_id || eventData.step_id || stepName,
               name: stepName,
@@ -2264,7 +3808,7 @@ export function AppProvider({
 
             // dag_step_end has step_id, should update right-side step data, do not display message on the left
             const stepId = message.step_id || eventData.step_id || stepName
-            const existingStep = state.steps.find(s => s.id === stepId)
+            const existingStep = currentState.steps.find(s => s.id === stepId)
             const step: StepExecution = {
               id: stepId,
               name: stepName,
@@ -2306,12 +3850,12 @@ export function AppProvider({
           } else if (eventType === "dag_step_failed") {
             const stepName = eventData.step_name || eventData.name || eventData.title || `${t('agent.logs.event.messages.execStepPrefix')}${eventData.step_id || t('common.errors.unknown')}`
             const stepId = message.step_id || eventData.step_id || stepName
-            const existingStep = state.steps.find(s => s.id === stepId)
+            const existingStep = currentState.steps.find(s => s.id === stepId)
 
             // Update DAG execution state to failed
-            if (state.dagExecution) {
+            if (currentState.dagExecution) {
               const updatedDAGExecution = {
-                ...state.dagExecution,
+                ...currentState.dagExecution,
                 phase: "failed" as const,
                 updated_at: message.timestamp,
               }
@@ -2393,7 +3937,7 @@ export function AppProvider({
             if (eventData.task_type === "final_answer_generation") {
               // Check for duplicate final_answer_generation start events
               const content = t('agent.logs.event.messages.finalAnswerGenerating')
-              if (!isDuplicateMessage(content, 'final_answer_start')) {
+              if (!isDuplicateMessageForViewedTask(content, 'final_answer_start')) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -2453,7 +3997,7 @@ export function AppProvider({
             if (eventData.task_type === "final_answer_generation") {
               // Check for duplicate final_answer_generation end events
               const content = t('agent.logs.event.messages.finalAnswerCompleted')
-              if (!isDuplicateMessage(content, 'final_answer_end')) {
+              if (!isDuplicateMessageForViewedTask(content, 'final_answer_end')) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -2538,8 +4082,7 @@ export function AppProvider({
 
           // Step-level LLM Call Events - add to traceEvents for step execution logs
           else if (eventType === "llm_call_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
             if (Number.isFinite(eventData.context_tokens) && Number.isFinite(eventData.context_threshold) && eventData.context_threshold > 0) {
               dispatch({
                 type: "SET_CONTEXT_USAGE",
@@ -2812,7 +4355,11 @@ export function AppProvider({
                   id: msgId,
                   role: "assistant",
                   content: <div className="space-y-2">
-                    <MarkdownRenderer content={clarificationMessage} />
+                    <MarkdownRenderer
+                      content={clarificationMessage}
+                      filesDisabled={options?.filesDisabled}
+                      agentCardsEnabled={agentCardsEnabled}
+                    />
                     <ClarificationForm
                       interactions={clarification.interactions}
                       messageId={msgId}
@@ -2974,11 +4521,17 @@ export function AppProvider({
                     <span>{t('agent.logs.event.messages.metaTitle')}</span>
                   </div>
                   <div className="ml-6">
-                    <JsonRenderer data={metaInfo} onFileClick={openFilePreview} onAgentClick={(agentId) => router.push(`/agent/${agentId}`)} />
+                    <JsonRenderer
+                      data={metaInfo}
+                      filesDisabled={options?.filesDisabled}
+                      agentCardsEnabled={agentCardsEnabled}
+                      onFileClick={options?.filesDisabled ? undefined : openFilePreview}
+                      onAgentClick={(agentId) => router.push(`/agent/${agentId}`)}
+                    />
                   </div>
                 </div>
               )
-              if (!isDuplicateResult(`📋 ${t('agent.logs.event.messages.metaTitle')}: ${JSON.stringify(metaInfo)}`)) {
+              if (!isDuplicateMessageForViewedTask(`📋 ${t('agent.logs.event.messages.metaTitle')}: ${JSON.stringify(metaInfo)}`, "result")) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3018,6 +4571,7 @@ export function AppProvider({
                           <span className="text-sm font-mono">{fileName}</span>
                           <button
                             onClick={() => {
+                              if (options?.filesDisabled) return
                               // Dispatch custom event to open file preview with all files
                               const allFiles = normalizeGeneratedPreviewFiles(fileOutputsData)
 
@@ -3034,7 +4588,7 @@ export function AppProvider({
                                 }
                               }))
                             }}
-                            disabled={!filePath}
+                            disabled={options?.filesDisabled || !filePath}
                             className="text-xs bg-primary/10 hover:bg-primary/20 text-primary px-2 py-1 rounded transition-colors"
                           >
                             {t('agent.logs.event.messages.previewLabel')}
@@ -3046,7 +4600,7 @@ export function AppProvider({
                 </>
               )
 
-              if (!isDuplicateResult(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
+              if (!isDuplicateMessageForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`, "result")) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3060,7 +4614,9 @@ export function AppProvider({
                 })
               }
 
-              dispatchAutoOpenPreview(fileOutputsData, dispatch)
+              if (!options?.filesDisabled) {
+                dispatchAutoOpenPreview(fileOutputsData, dispatch)
+              }
             }
 
             // Update task status and trigger sidebar update
@@ -3159,6 +4715,22 @@ export function AppProvider({
                   status: "failed",
                 }
               })
+              // This event alone never decides the task failed (a global
+              // trace_error can be logged without the task actually stopping,
+              // and some OTHER terminal event - task_completed/agent_error -
+              // is what actually settles that) - but if the task is ALREADY
+              // known failed (task_info established that on cold history
+              // load, backfilling dagTerminatedAt from mutable updatedAt as a
+              // PROVISIONAL guess) and no proper terminal broadcast ever
+              // followed this trace_error to replace that guess, the frozen
+              // elapsed time would stay wrong forever. Re-stamping the
+              // ALREADY-failed status with this event's own timestamp lets it
+              // replace a provisional value (see UPDATE_TASK_STATUS) without
+              // ever using this event to newly decide the outcome.
+              if (currentState.currentTask?.status === "failed") {
+                dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "failed" } })
+                dispatch({ type: "TRIGGER_TASK_UPDATE" })
+              }
             }
           }
 
@@ -3183,8 +4755,7 @@ export function AppProvider({
 
           // ReAct Pattern Events - these should be displayed in the right panel
           else if (eventType === "react_task_start" || eventType === "task_start_react") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
 
             // Add to trace events for displaying execution logs
             const traceEvent: TraceEvent = {
@@ -3218,7 +4789,7 @@ export function AppProvider({
               result && typeof result === "object" && result.status === "waiting_for_user"
                 ? result.message || ""
                 : ""
-            if (messageContent && !isDuplicateMessage(messageContent, 'agent-message')) {
+            if (messageContent && !isDuplicateMessageForViewedTask(messageContent, 'agent-message')) {
               const interactions = normalizeInteractions(result.interactions)
               const msgId = generateMessageId("msg-agent")
               dispatch({
@@ -3263,8 +4834,7 @@ export function AppProvider({
             }
             dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "llm_call_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
             const stepId = message.step_id || traceEventData.step_id
             const traceEvent: TraceEvent = {
               event_id: generateMessageId("llm-call-start"),
@@ -3415,8 +4985,7 @@ export function AppProvider({
           }
           // Skill Selection Events
           else if (eventType === "skill_select_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
 
             const traceEvent: TraceEvent = {
               event_id: generateMessageId("skill-select-start"),
@@ -3849,16 +5418,19 @@ export function AppProvider({
 
           // Historical Data Events - handled by the main message handler below
           else if (eventType === "historical_data_complete") {
-            isHistoricalDataLoading = false
+            // A plain ref write, not gated by the dispatch wrapper's task
+            // scoping - a stray background task's own historical_data_complete
+            // must not end the VIEWED task's history-loading state early.
+            if (!isMessageForOtherTask) isHistoricalDataLoadingRef.current = false
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
             dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
             // If we're in replay mode, initialize the replay scheduler
-            if (state.isReplaying && state.replayTaskId && state.replayEventCache.length > 0) {
+            if (currentState.isReplaying && currentState.replayTaskId && currentState.replayEventCache.length > 0) {
               initializeReplayScheduler()
             } else {
               // Fix: If we have cache but replay mode is not set, force start replay
-              if (state.replayEventCache.length > 0 && state.replayTaskId && !state.isReplaying) {
+              if (currentState.replayEventCache.length > 0 && currentState.replayTaskId && !currentState.isReplaying) {
                 dispatch({ type: "SET_REPLAY_PLAYING", payload: true })
                 setTimeout(() => {
                   initializeReplayScheduler()
@@ -3877,7 +5449,15 @@ export function AppProvider({
           // Handle direct trace events (without event_type wrapper) - infer type from content
           // Check if this is DAG execution data
           if (traceEventData.phase && (traceEventData.current_plan !== undefined)) {
-            dispatch({ type: "SET_DAG_EXECUTION", payload: traceEventData })
+            // Same shared handler the two explicit dag_execution shapes use -
+            // this legacy, unwrapped shape predates it and used to dispatch
+            // the raw payload directly, bypassing the phase/current_plan
+            // normalizer, the created_at/updated_at backfill, and the
+            // turn_id-based new-run detection all at once.
+            applyDagExecutionUpdate(
+              traceEventData as Record<string, unknown>,
+              message.timestamp,
+            )
           }
           // Check if this is step data (has id and status)
           else if (traceEventData.id && traceEventData.status) {
@@ -3910,7 +5490,7 @@ export function AppProvider({
           else if (traceEventData.goal) {
             // For now, create a basic task structure
             const task = {
-              id: state.taskId?.toString() || "unknown",
+              id: currentState.taskId?.toString() || "unknown",
               title: traceEventData.task_preview || traceEventData.goal,
               description: traceEventData.goal,
               status: "completed" as const,
@@ -3997,20 +5577,6 @@ export function AppProvider({
         }
         break
 
-      case "chat_message":
-        console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (chat_message)')
-        const messageData = message.data as any
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: `msg-${messageData.id}`,
-            role: messageData.role,
-            content: messageData.content,
-            timestamp: messageData.timestamp,
-          },
-        })
-        break
-
       case "task_completed":
         const taskData = normalizeTaskCompletedMessage(message)
         dispatch({
@@ -4078,27 +5644,32 @@ export function AppProvider({
           }
         }
 
-        // Update DAG execution status to completed
-        if (state.dagExecution) {
+        // Sync DAG execution status to completed/failed - but only for a
+        // task that actually had a DAG plan running (currentState.dagExecution
+        // already set by an earlier dag_execution/dag_step_* event this turn).
+        // Fabricating a fresh DAGExecution for every completed task regardless
+        // of pattern (the previous `else` branch here) made every flash/ReAct
+        // task look like a completed zero-step DAG run to any DAG-only UI
+        // (e.g. the Progress panel), popping it open for plain replies.
+        if (currentState.dagExecution) {
           const updatedDAGExecution = {
-            ...state.dagExecution,
+            ...currentState.dagExecution,
             phase: taskData.status,
-            updated_at: new Date().toISOString()
+            updated_at: message.timestamp,
           }
           dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution })
-        } else {
-          const dagExecution: DAGExecution = {
-            phase: taskData.status,
-            current_plan: {},
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          }
-          dispatch({ type: "SET_DAG_EXECUTION", payload: dagExecution })
         }
 
-        // Mark that historical data should not be requested again for completed/failed tasks
-        if (state.taskId) {
-          historicalDataRequestMap.set(state.taskId, true)
+        // Mark that historical data should not be requested again for
+        // completed/failed tasks - keyed by this event's OWN task (falling
+        // back to the viewed one only if the envelope doesn't carry its
+        // own id, matching the emitTaskError pattern above), not
+        // unconditionally the viewed task: a background task's own
+        // completion must not mark the currently-viewed task as "done
+        // requesting history" if the two differ.
+        const historicalDataTaskId = controlEnvelope.taskId ?? currentState.taskId
+        if (historicalDataTaskId) {
+          historicalDataRequestMapRef.current.set(historicalDataTaskId, true)
         }
 
         // Handle file outputs
@@ -4124,6 +5695,7 @@ export function AppProvider({
                       <span className="text-sm font-mono">{fileName}</span>
                       <button
                         onClick={() => {
+                          if (options?.filesDisabled) return
                           // Dispatch custom event to open file preview with all files
                           const allFiles = normalizeGeneratedPreviewFiles(taskData.fileOutputs)
 
@@ -4140,7 +5712,7 @@ export function AppProvider({
                             }
                           }))
                         }}
-                        disabled={!filePath}
+                        disabled={options?.filesDisabled || !filePath}
                         className="text-xs bg-primary/10 hover:bg-primary/20 text-primary px-2 py-1 rounded transition-colors"
                       >
                         {t('agent.logs.event.messages.previewLabel')}
@@ -4152,7 +5724,7 @@ export function AppProvider({
             </>
           )
 
-          if (!isDuplicateResult(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
+          if (!isDuplicateMessageForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`, "result")) {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -4166,7 +5738,9 @@ export function AppProvider({
             })
           }
 
-          dispatchAutoOpenPreview(taskData.fileOutputs, dispatch)
+          if (!options?.filesDisabled) {
+            dispatchAutoOpenPreview(taskData.fileOutputs, dispatch)
+          }
         }
 
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -4204,15 +5778,15 @@ export function AppProvider({
 
         // Update DAG execution status
         // Update overall DAG status based on step status
-        if (state.dagExecution) {
-          const updatedDAGExecution = { ...state.dagExecution }
+        if (currentState.dagExecution) {
+          const updatedDAGExecution = { ...currentState.dagExecution }
 
           // Update DAG phase based on step status
           if (stepInfo.status === "running") {
             updatedDAGExecution.phase = "executing" as const
           } else if (stepInfo.status === "completed") {
             // Check if all steps are completed
-            const allStepsCompleted = state.steps.every(step =>
+            const allStepsCompleted = currentState.steps.every(step =>
               step.id === stepInfo.id ? stepInfo.status === "completed" : step.status === "completed"
             )
             if (allStepsCompleted) {
@@ -4232,11 +5806,14 @@ export function AppProvider({
         break
 
       case "dag_execution":
-        const dagSteps = stepsFromPlanData(message.data, state.steps)
-        if (dagSteps) {
-          dispatch({ type: "SET_STEPS", payload: dagSteps })
-        }
-        dispatch({ type: "SET_DAG_EXECUTION", payload: message.data as DAGExecution })
+        // The bare-message-type shape (as opposed to the trace_event-wrapped
+        // one handled above) - this is the one a LIVE single-connection
+        // tracer actually uses while a task is running (see
+        // create_stream_event's callers), not just a replay/legacy path, so
+        // it needs the exact same turn_id-aware reset logic or a live run
+        // transition here reintroduces the stale-steps/stale-created_at bug
+        // this feature exists to fix.
+        applyDagExecutionUpdate((message.data ?? {}) as Record<string, unknown>, message.timestamp)
         break
 
 
@@ -4270,15 +5847,26 @@ export function AppProvider({
 
       case "task_waiting_for_user":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_waiting_for_user)')
-        const waitingData = message.data as any
-        const waitingMessage = waitingData?.question || waitingData?.message || ""
-        const interactions = normalizeInteractions(waitingData?.interactions)
+        const waitingRoot = asMessageRecord(message)
+        const waitingData = asMessageRecord(message.data)
+        const waitingMessage = getString(waitingRoot.question)
+          || getString(waitingData.question)
+          || getString(waitingRoot.message)
+          || getString(waitingData.message)
+        const interactions = normalizeInteractions(
+          waitingRoot.interactions ?? waitingData.interactions
+        )
+        const waitingRequestIdValue = waitingRoot.request_id ?? waitingData.request_id
+        const waitingRequestId = typeof waitingRequestIdValue === "string"
+          ? waitingRequestIdValue
+          : undefined
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
             status: controlEnvelope.status || "waiting_for_user",
             waitingQuestion: waitingMessage && waitingMessage !== "Task waiting for user response" ? waitingMessage : undefined,
             waitingInteractions: interactions.length > 0 ? interactions : undefined,
+            waitingRequestId,
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "waiting_for_user",
@@ -4288,7 +5876,11 @@ export function AppProvider({
         if (
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
-          !isDuplicateMessage(waitingMessage, 'agent-message')
+          !isDuplicateMessageForViewedTask(
+            waitingMessage,
+            'agent-message',
+            waitingRequestId,
+          )
         ) {
           dispatch({
             type: "ADD_MESSAGE",
@@ -4301,6 +5893,7 @@ export function AppProvider({
               status: "running",
               isResult: true,
               interactions: interactions.length > 0 ? interactions : undefined,
+              interactionRequestId: waitingRequestId,
             }
           })
         }
@@ -4321,7 +5914,10 @@ export function AppProvider({
 
       case "agent_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (agent_error)')
-        const agentErrorMessage = getWebSocketErrorMessage(message)
+        const agentErrorCode = getWebSocketErrorCode(message)
+        const agentErrorMessage = agentErrorCode
+          ? t(clientErrorTranslationKey(agentErrorCode))
+          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const agentErrorTaskStatus = getWebSocketTaskStatus(message)
 
         if (agentErrorTaskStatus) {
@@ -4337,9 +5933,9 @@ export function AppProvider({
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
 
-        if (agentErrorTaskStatus === "failed" && state.dagExecution) {
+        if (agentErrorTaskStatus === "failed" && currentState.dagExecution) {
           const updatedDAGExecution = {
-            ...state.dagExecution,
+            ...currentState.dagExecution,
             phase: "failed" as const,
             updated_at: message.timestamp,
           }
@@ -4363,32 +5959,43 @@ export function AppProvider({
         break
 
       case "error":
-      case "task_error":
+      case "task_error": {
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (error)')
-        const websocketErrorMessage = getWebSocketErrorMessage(message)
-        const websocketTaskStatus = getWebSocketTaskStatus(message)
+        const errorFrame = projectErrorFrameForDisplay(message, {
+          trustLegacyErrorProse,
+          translate: t,
+          controlEnvelope,
+        })
 
-        if (websocketTaskStatus) {
-          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
+        if (errorFrame.taskStatus) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: errorFrame.taskStatus } })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
-        if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
+        if (errorFrame.stopsProcessing) {
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
-        if (!isDuplicateMessage(websocketErrorMessage, "agent-error")) {
+        if (
+          !isDuplicateMessageForViewedTask(
+            errorFrame.dedupText,
+            "agent-error",
+            errorFrame.occurrenceIdentity,
+          )
+        ) {
           dispatch({
             type: "ADD_MESSAGE",
             payload: {
               id: generateMessageId("msg-error"),
               role: "assistant",
-              content: `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`,
+              content: errorFrame.bubbleContent,
               timestamp: message.timestamp,
               status: "failed",
+              isResult: errorFrame.isResult,
             },
           })
         }
         break
+      }
 
       case "message_received":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (message_received)')
@@ -4397,18 +6004,253 @@ export function AppProvider({
         break
 
       case "historical_data_complete":
-        // Historical data loading complete
-        isHistoricalDataLoading = false
+        // Historical data loading complete. The ref write is not gated by
+        // the dispatch wrapper's task scoping - a stray background task's
+        // own historical_data_complete must not end the VIEWED task's
+        // history-loading state early.
+        if (!isMessageForOtherTask) isHistoricalDataLoadingRef.current = false
         dispatch({ type: "SET_HISTORY_LOADING", payload: false })
         dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
         // If we're in replay mode, initialize the replay scheduler
-        if (state.isReplaying && state.replayTaskId && state.replayEventCache.length > 0) {
+        if (currentState.isReplaying && currentState.replayTaskId && currentState.replayEventCache.length > 0) {
           initializeReplayScheduler()
         }
         break
     }
-  }, [])
+  }, [trustLegacyErrorProse])
+
+  const handleSessionMessage = (
+    message: WebSocketMessage,
+    owner: SessionMessageOwner,
+  ) => {
+    if (!mountedRef.current) return
+    if (
+      owner.connectionIdentity !== sessionConnectionIdentityRef.current
+    ) {
+      return
+    }
+
+    if (message.type === "conversation_reload_required") {
+      const binding = extractSessionTaskBinding(message)
+      const lifecycle = sessionConversationRef.current
+      if (
+        !binding.present
+        || !binding.valid
+        || (
+          lifecycle.phase !== "bound"
+          && lifecycle.phase !== "reset_requested"
+        )
+        || lifecycle.connectionIdentity !== owner.connectionIdentity
+        || lifecycle.taskId !== binding.taskId
+        || sessionTaskIdRef.current !== binding.taskId
+      ) {
+        return
+      }
+      requireSessionReload(
+        new Error("The current conversation cannot be restored; reload required.")
+      )
+      return
+    }
+
+    if (message.type === "conversation_reset") {
+      const resetFlight = sessionResetFlightRef.current
+      if (
+        !resetFlight
+        || resetFlight.connectionIdentity !== owner.connectionIdentity
+        || resetFlight.deliveryGeneration !== deliveryGenerationRef.current
+      ) {
+        return
+      }
+
+      const transition = dispatchSessionConversation({
+        type: "SESSION_RESET_ACKNOWLEDGED",
+        connectionIdentity: owner.connectionIdentity,
+      })
+      if (!transition.accepted) return
+
+      const retiredTaskId = sessionTaskIdRef.current
+      if (retiredTaskId !== null) {
+        retiredSessionTaskIdsRef.current.add(retiredTaskId)
+        if (
+          retiredSessionTaskIdsRef.current.size
+          > MAX_RETIRED_SESSION_TASK_IDS
+        ) {
+          const oldestTaskId =
+            retiredSessionTaskIdsRef.current.values().next().value
+          if (oldestTaskId !== undefined) {
+            retiredSessionTaskIdsRef.current.delete(oldestTaskId)
+          }
+        }
+      }
+
+      sessionResetFlightRef.current = null
+      clearTimeout(resetFlight.timeout)
+      sessionTaskIdRef.current = null
+      taskStateVersionsRef.current.clear()
+      stateRef.current.replayScheduler?.stop()
+      pendingTaskToExecuteRef.current = null
+      lastConnectedTaskId.current = null
+      recentMessagesRef.current.clear()
+      const pending = pendingMessageRef.current
+      pendingMessageRef.current = null
+      setPendingMessage(null)
+      pending?.reject?.(
+        new Error("Message delivery was cancelled by conversation reset.")
+      )
+
+      const nextDeliveryGeneration = deliveryGenerationRef.current + 1
+      deliveryGenerationRef.current = nextDeliveryGeneration
+      setDeliveryGeneration(nextDeliveryGeneration)
+      dispatch({ type: "RESET_SESSION_CONVERSATION" })
+      resetFlight.resolve()
+      return
+    }
+
+    const binding = extractSessionTaskBinding(message)
+    if (binding.present && !binding.valid) return
+
+    const taskInfoData = getSessionTaskInfoData(message)
+    if (taskInfoData) {
+      const taskId = parseInteger(taskInfoData.id)
+      if (
+        taskId === undefined
+        || taskId <= 0
+        || retiredSessionTaskIdsRef.current.has(taskId)
+        || (
+          binding.present
+          && binding.valid
+          && binding.taskId !== taskId
+        )
+      ) {
+        return
+      }
+      const lifecycle = sessionConversationRef.current
+      const isFlushingCandidate =
+        flushingSessionPreAdoptionCandidateRef.current === message
+      if (
+        !isFlushingCandidate
+        && (
+          lifecycle.phase === "replacement_sending"
+          || lifecycle.phase === "replacement_awaiting_task"
+        )
+      ) {
+        if (!bufferSessionPreAdoptionFrame(message, owner, taskId)) return
+        const buffer = sessionPreAdoptionBufferRef.current
+        if (
+          lifecycle.phase === "replacement_awaiting_task"
+          && buffer?.timeout != null
+        ) {
+          flushingSessionPreAdoptionCandidateRef.current = message
+          try {
+            handleSessionMessage(message, owner)
+          } finally {
+            flushingSessionPreAdoptionCandidateRef.current = null
+          }
+        }
+        return
+      }
+      if (
+        lifecycle.phase === "reset_requested"
+        || lifecycle.phase === "replacement_ready"
+        || lifecycle.phase === "reload_required"
+      ) {
+        return
+      }
+
+      const currentTaskId = sessionTaskIdRef.current
+      if (
+        currentTaskId !== null
+        && currentTaskId !== taskId
+      ) {
+        requireSessionReload(
+          new Error("Session task lineage changed without a reset; reload required.")
+        )
+        return
+      }
+      const taskInfoEnvelope = extractTaskControlEnvelope(message)
+      if (
+        taskInfoEnvelope.taskId !== taskId
+        || !canAcceptTaskControlVersion(
+          message,
+          taskInfoEnvelope,
+          taskStateVersionsRef.current,
+        )
+      ) {
+        return
+      }
+
+      const bufferedFrames = lifecycle.phase === "replacement_awaiting_task"
+        ? sessionPreAdoptionBufferRef.current?.frames.slice() ?? []
+        : []
+      discardSessionPreAdoptionBuffer()
+      const transition = dispatchSessionConversation({
+        type: "SESSION_TASK_INFO",
+        connectionIdentity: owner.connectionIdentity,
+        taskId,
+      })
+      if (!transition.accepted || transition.next.phase !== "bound") return
+      if (!acceptTaskControlVersion(
+        message,
+        taskInfoEnvelope,
+        taskStateVersionsRef.current,
+      )) return
+      sessionTaskIdRef.current = taskId
+      dispatch({
+        type: "ADOPT_SESSION_TASK",
+        payload: {
+          taskId,
+          task: taskFromTaskInfoData(taskInfoData, taskId),
+        },
+      })
+      for (const bufferedFrame of bufferedFrames) {
+        handleSessionMessage(bufferedFrame, owner)
+      }
+      return
+    }
+
+    if (
+      binding.present
+      && binding.valid
+      && retiredSessionTaskIdsRef.current.has(binding.taskId)
+    ) {
+      return
+    }
+    if (
+      sessionConversationRef.current.phase === "replacement_sending"
+      || sessionConversationRef.current.phase === "replacement_awaiting_task"
+    ) {
+      bufferSessionPreAdoptionFrame(message, owner)
+      return
+    }
+    if (
+      sessionConversationRef.current.phase === "reset_requested"
+      || sessionConversationRef.current.phase === "replacement_ready"
+      || sessionConversationRef.current.phase === "reload_required"
+    ) return
+    if (binding.present && binding.valid) {
+      if (
+        sessionTaskIdRef.current === null
+      ) {
+        return
+      }
+      if (sessionTaskIdRef.current !== binding.taskId) {
+        requireSessionReload(
+          new Error("Session task lineage changed without a reset; reload required.")
+        )
+        return
+      }
+    }
+
+    handleMessage(message, dispatch, stateRef.current, {
+      skipHistory: true,
+      filesDisabled,
+    })
+  }
+
+  useLayoutEffect(() => {
+    sessionMessageHandlerRef.current = handleSessionMessage
+  }, [handleSessionMessage])
 
   const getLLMIdsFromConfig = (config?: any) => {
     if (!config || !config.model) {
@@ -4430,12 +6272,56 @@ export function AppProvider({
     return llmIds
   }
 
+  const beginSessionMessageDelivery = useCallback(() => {
+    if (!mountedRef.current) return
+    const nextCount = messageDeliveryCountRef.current + 1
+    messageDeliveryCountRef.current = nextCount
+    setMessageDeliveryCount(nextCount)
+  }, [])
+
+  const endSessionMessageDelivery = useCallback(() => {
+    const nextCount = Math.max(0, messageDeliveryCountRef.current - 1)
+    messageDeliveryCountRef.current = nextCount
+    if (mountedRef.current) setMessageDeliveryCount(nextCount)
+  }, [])
+
   const sendMessage = useCallback(async (message: string, config?: any, files?: File[]) => {
     console.log('🚀 sendMessage called:', { message, files: files?.map(f => f.name), taskId: state.taskId })
 
-    const clientMessageId = typeof config?.clientMessageId === 'string'
-      ? config.clientMessageId
-      : generateClientMessageId()
+    if (sessionTransport && !mountedRef.current) {
+      throw new Error("Message not sent: the Session chat is closed.")
+    }
+    if (
+      filesDisabled
+      && files
+      && files.length > 0
+    ) {
+      throw new Error("Files are disabled for this conversation.")
+    }
+    if (sessionTransport && sessionConversationRef.current.phase === "reset_requested") {
+      throw new Error(
+        "Message delivery is blocked while conversation reset is pending."
+      )
+    }
+
+    // Mirrors stableUserMessageId's trim guard. `config` is untyped, so a
+    // blank id would reach userTurnMessageId and mint a bare
+    // `msg-user-turn-` that every other blank-id turn collides on.
+    const requestedClientMessageId =
+      typeof config?.clientMessageId === 'string'
+        ? config.clientMessageId.trim()
+        : ''
+    const clientMessageId = requestedClientMessageId || generateClientMessageId()
+    const requestId = typeof config?.metadata?.request_id === 'string'
+      ? config.metadata.request_id
+      : undefined
+    const sessionDeliveryOwner =
+      sessionTransport && sessionConnectionIdentityRef.current
+        ? {
+          connectionIdentity: sessionConnectionIdentityRef.current,
+          deliveryGeneration: deliveryGenerationRef.current,
+        }
+        : null
 
     // Optimistic copy of the sender's own bubble, added once delivery is
     // acknowledged. The live user_message trace event only exists after the
@@ -4444,11 +6330,25 @@ export function AppProvider({
     // invisible until a reload replays the persisted transcript row. The
     // reducer reconciles by turn id / content, keeping the persisted event
     // when it already arrived and replacing this copy when it arrives later.
-    const addOptimisticUserMessage = (intendedTaskId: number) => {
+    const addOptimisticUserMessage = (intendedTaskId: number | null) => {
       // Delivery acknowledgement can arrive after the user has navigated to a
       // different task. Never append this turn to whichever task happens to be
       // active when the async send resumes.
-      if (stateRef.current.taskId !== intendedTaskId) {
+      if (sessionTransport) {
+        if (
+          !mountedRef.current
+          || !sessionDeliveryOwner
+          || sessionDeliveryOwner.connectionIdentity
+            !== sessionConnectionIdentityRef.current
+          || sessionDeliveryOwner.deliveryGeneration
+            !== deliveryGenerationRef.current
+        ) {
+          return
+        }
+      } else if (
+        intendedTaskId === null
+        || stateRef.current.taskId !== intendedTaskId
+      ) {
         return
       }
       let content: React.ReactNode = message
@@ -4477,6 +6377,114 @@ export function AppProvider({
     }
 
     const targetTaskId = typeof config?.targetTaskId === 'number' ? config.targetTaskId : null
+    if (
+      sessionTransport
+      && targetTaskId !== null
+      && state.taskId !== targetTaskId
+    ) {
+      throw new Error(
+        "The Session connection does not own the requested task."
+      )
+    }
+
+    if (sessionTransport?.allowTasklessChat) {
+      if (!sessionDeliveryOwner) {
+        throw new Error(
+          "Message not sent: the Session connection is not ready."
+        )
+      }
+
+      if (sessionConversationRef.current.phase === "reload_required") {
+        throw new Error("Conversation outcome is unknown; reload required.")
+      }
+      if (
+        sessionConversationRef.current.phase === "replacement_sending"
+        || sessionConversationRef.current.phase === "replacement_awaiting_task"
+      ) {
+        throw new Error("The replacement conversation is already starting.")
+      }
+
+      const startsReplacementConversation =
+        sessionConversationRef.current.phase === "replacement_ready"
+      const replacementSendStillOwned = () => {
+        const lifecycle: SessionConversationState = sessionConversationRef.current
+        return (
+          mountedRef.current
+          && sessionConnectionIdentityRef.current === sessionDeliveryOwner.connectionIdentity
+          && deliveryGenerationRef.current === sessionDeliveryOwner.deliveryGeneration
+          && lifecycle.phase === "replacement_sending"
+        )
+      }
+      if (startsReplacementConversation) {
+        const transition = dispatchSessionConversation({
+          type: "SESSION_REPLACEMENT_SENDING",
+          connectionIdentity: sessionDeliveryOwner.connectionIdentity,
+        })
+        if (!transition.accepted) {
+          throw new Error("The replacement conversation is no longer available.")
+        }
+        beginSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
+      }
+      beginSessionMessageDelivery()
+      try {
+        await sendChatMessage(
+          message,
+          files,
+          config?.force,
+          clientMessageId,
+          requestId,
+        )
+        if (startsReplacementConversation) {
+          if (!replacementSendStillOwned()) {
+            return
+          }
+          const transition = dispatchSessionConversation({
+            type: "SESSION_REPLACEMENT_ACCEPTED",
+            connectionIdentity: sessionDeliveryOwner.connectionIdentity,
+          })
+          if (!transition.accepted) return
+          activateSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
+        }
+        addOptimisticUserMessage(state.taskId)
+      } catch (error) {
+        if (startsReplacementConversation) {
+          if (!replacementSendStillOwned()) {
+            throw error
+          }
+          const candidatePresent = sessionPreAdoptionBufferRef.current?.candidate != null
+          const disposition = (
+            error
+            && typeof error === "object"
+            && "disposition" in error
+            && (
+              error.disposition === "not_sent"
+              || error.disposition === "rejected"
+              || error.disposition === "outcome_unknown"
+            )
+          )
+            ? error.disposition
+            : "outcome_unknown"
+          if (disposition === "outcome_unknown" || candidatePresent) {
+            requireSessionReload(
+              error instanceof Error
+                ? error
+                : new Error("Conversation outcome is unknown; reload required."),
+            )
+          } else {
+            discardSessionPreAdoptionBuffer()
+            dispatchSessionConversation({
+              type: "SESSION_REPLACEMENT_REJECTED",
+              connectionIdentity: sessionDeliveryOwner.connectionIdentity,
+            })
+          }
+        }
+        throw error
+      } finally {
+        endSessionMessageDelivery()
+      }
+      return
+    }
+
     if (targetTaskId !== null && state.taskId !== targetTaskId) {
       await queuePendingMessage({
         message,
@@ -4529,28 +6537,37 @@ export function AppProvider({
 
               const parsed = await parseApiResponse(uploadResponse)
 
-              if (uploadResponse.ok && isJsonRecord(parsed.data)) {
-                const uploadData = parsed.data
-                if (uploadData.success && Array.isArray(uploadData.files)) {
-                  uploadData.files
-                    .filter((f): f is { file_id: string } => isJsonRecord(f) && typeof f.file_id === 'string')
-                    .forEach(f => uploadedFileIds.push(f.file_id))
-                }
-              } else {
-                throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
-                  generic: t("files.uploadFailed") || "Upload failed",
-                  ...UPLOAD_ERROR_MESSAGES,
-                }))
+              if (
+                !uploadResponse.ok
+                || !isJsonRecord(parsed.data)
+                || parsed.data.success !== true
+                || !Array.isArray(parsed.data.files)
+              ) {
+                const uploadError = classifyUploadError(uploadResponse, parsed)
+                throw new Error(t(clientErrorTranslationKey(uploadError.errorCode)))
               }
+              const newFileIds = normalizeUploadFileIds(
+                parsed.data.files.map(f => isJsonRecord(f) ? f.file_id : null),
+                filesToUpload.length,
+              )
+              if (!newFileIds) {
+                throw new Error(t("clientErrors.uploadFailed"))
+              }
+              uploadedFileIds.push(...newFileIds)
             } catch (e) {
               console.error('Error uploading files before task creation:', e)
               throw e
             }
           }
 
-          if (uploadedFileIds.length > 0) {
-            requestBody.files = uploadedFileIds
+          const normalizedFileIds = normalizeUploadFileIds(
+            uploadedFileIds,
+            files.length,
+          )
+          if (!normalizedFileIds) {
+            throw new Error(t("clientErrors.uploadFailed"))
           }
+          requestBody.files = normalizedFileIds
         }
 
         // Agent chats should use the published agent's own model configuration.
@@ -4573,6 +6590,9 @@ export function AppProvider({
         if (config?.agentConfig) {
           requestBody.agent_config = config.agentConfig
         }
+        if (config?.runtimeExtensions) {
+          requestBody.runtime_extensions = config.runtimeExtensions
+        }
 
         const response = await apiRequest(`${apiUrl}/api/chat/task/create`, {
           method: 'POST',
@@ -4594,6 +6614,14 @@ export function AppProvider({
           console.log('🎯 About to call setTaskId with payload:', newTaskId)
           setTaskId(newTaskId)
           console.log('🎯 setTaskId completed')
+
+          dispatch({
+            type: "SET_TASK_RUNTIME_EXTENSIONS",
+            payload: {
+              taskId: newTaskId,
+              extensions: normalizeTaskRuntimeExtensions(taskData.runtime_extensions),
+            },
+          })
 
           // Create a new task from response
           const newTask: Task = {
@@ -4642,6 +6670,7 @@ export function AppProvider({
             targetTaskId: newTaskId,
             force: config?.force,
             clientMessageId,
+            requestId,
           })
           addOptimisticUserMessage(newTaskId)
         } else {
@@ -4669,12 +6698,95 @@ export function AppProvider({
         taskId: state.taskId
       })
 
+      // The backend executes the turn as an independent background task and
+      // can start broadcasting its own dag_execution/trace events before this
+      // ack resolves - capture the pre-send dagExecution (its turn_id and its
+      // created_at) so the reset below can detect that case and skip
+      // clearing, rather than wiping out the new turn's own freshly-arrived
+      // state. The pre-send currentTask is captured for the optimistic
+      // status flip further below, for the same reason: events landing
+      // during the await must be able to veto it.
+      const dagExecutionBeforeSend = stateRef.current.dagExecution
+      const dagTurnIdBeforeSend = dagExecutionBeforeSend?.turn_id
+      const currentTaskBeforeSend = stateRef.current.currentTask
+
       // Wait for the server's durable-delivery acknowledgement. If the socket
       // is disconnected or the backend rejects the turn, this throws and the
-      // composer keeps both its text and attached files.
-      await sendChatMessage(message, files, config?.force, clientMessageId)
+      // composer keeps both its text and attached files. The DAG reset below
+      // deliberately runs only after this succeeds - clearing dagExecution/
+      // steps first and then throwing would remove the Progress panel and its
+      // header toggle for a run that never actually changed.
+      await sendChatMessage(message, files, config?.force, clientMessageId, requestId)
 
-      if (state.currentTask?.status === 'completed') {
+      // A prior turn's DAG plan/steps must not linger into this turn - otherwise
+      // the Progress panel would auto-open (or stay open) showing stale steps
+      // from a different execution mode/run before this turn's own dag_execution
+      // event (if any) arrives. But sending into a run that's still actively
+      // going - answering a mid-run clarification, or the "live guidance" input
+      // ChatInput allows while running/paused/waiting_for_user (see
+      // ChatInput.tsx's `allowsLiveGuidanceInput`; the task page never passes
+      // onSend/onSendInteraction, so all of these fall back to this same
+      // sendMessage) - is a CONTINUATION of that run, not a new turn. Clearing
+      // here would wipe out the in-progress DAG plan/steps the Progress panel
+      // is actively showing.
+      const isContinuingActiveRun =
+        state.currentTask?.status === "running"
+        || state.currentTask?.status === "paused"
+        || state.currentTask?.status === "waiting_for_user"
+      // Prefer turn_id equality when BOTH sides actually have one - it sees
+      // through the task_completed handler's clone-for-phase-sync (which
+      // makes a NEW object with the SAME turn_id, see that handler above),
+      // where reference equality alone would wrongly look like "something
+      // new arrived" and skip the reset. But turn_id is optional (older
+      // backends/patterns that never set it), so a no-turn_id fallback is
+      // still needed - and it compares created_at, not object reference:
+      // the same clone-for-phase-sync problem applies on this path too (a
+      // no-turn_id dagExecution recloned by a racing task_completed changed
+      // reference but kept its created_at, so it still correctly reads as
+      // stale), while the case the fallback exists to protect - a genuinely
+      // new dagExecution arriving from NOTHING during the await - still
+      // reads as fresh (created_at went from undefined to a value). A new
+      // no-turn_id run arriving OVER an existing old one inherits the old
+      // created_at (applyDagExecutionUpdate can't tell legacy runs apart -
+      // that's #1433) and so gets reset here; that's the right bias, since a
+      // live run repopulates itself on its next event, whereas a wrongly
+      // retained stale panel has no later event to ever correct it.
+      const dagExecutionStillStale =
+        dagTurnIdBeforeSend && stateRef.current.dagExecution?.turn_id
+          ? stateRef.current.dagExecution.turn_id === dagTurnIdBeforeSend
+          : stateRef.current.dagExecution?.created_at === dagExecutionBeforeSend?.created_at
+      if (!isContinuingActiveRun && dagExecutionStillStale) {
+        dispatch({ type: "RESET_DAG_STATE" })
+      }
+
+      // Optimistically flips a terminal task back to "running" once its
+      // retry/new-turn send is acked, so the user isn't staring at a
+      // "completed"/"failed" badge while the backend spins the turn up.
+      // Three fences, because this dispatch has no task id of its own for
+      // the reducer to validate against:
+      // - taskId still matches: the user can navigate to a different task
+      //   while this send is in flight, and a delayed ack for task A's
+      //   retried send must not mark whatever task the user has since
+      //   navigated to as "running" (same guard addOptimisticUserMessage
+      //   applies to its own dispatch).
+      // - the send began FROM a terminal status: the flip is only meaningful
+      //   for a rerun of a finished task - a send into an active run has
+      //   nothing to flip.
+      // - currentTask is untouched since the send began (reference
+      //   equality): ANY task update landing during the await - most
+      //   critically this new turn's OWN terminal event, when a fast
+      //   non-DAG turn completes before the ack resolves - is newer truth
+      //   than this optimistic guess. Flipping over it would mark a
+      //   genuinely finished run as running again AND clear the
+      //   dagTerminatedAt the reducer just stamped, unfreezing the Progress
+      //   panel's elapsed clock. Skipping the flip is always safe: if the
+      //   turn really is running, the backend's own status events say so
+      //   moments later.
+      if (
+        state.taskId === stateRef.current.taskId
+        && stateRef.current.currentTask === currentTaskBeforeSend
+        && isTerminalTaskStatus(currentTaskBeforeSend?.status)
+      ) {
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: { status: 'running' }
@@ -4684,7 +6796,126 @@ export function AppProvider({
 
       addOptimisticUserMessage(state.taskId)
     }
-  }, [state.taskId, sendChatMessage, wsExecuteTask, state.currentTask?.status, queuePendingMessage])
+  }, [
+    beginSessionMessageDelivery,
+    beginSessionPreAdoptionBuffer,
+    activateSessionPreAdoptionBuffer,
+    discardSessionPreAdoptionBuffer,
+    dispatchSessionConversation,
+    endSessionMessageDelivery,
+    filesDisabled,
+    queuePendingMessage,
+    sendChatMessage,
+    sessionTransport,
+    state.currentTask?.status,
+    state.taskId,
+  ])
+
+  const startNewConversation = useCallback((): Promise<void> => {
+    const existingReset = sessionResetFlightRef.current
+    if (existingReset) return existingReset.promise
+    if (sessionConversationRef.current.phase === "reload_required") {
+      return Promise.reject(
+        new Error("Conversation outcome is unknown; reload required.")
+      )
+    }
+    if (!sessionTransport?.supportsConversationReset) {
+      return Promise.reject(
+        new Error("Conversation reset is not supported by this transport.")
+      )
+    }
+    if (!mountedRef.current) {
+      return Promise.reject(
+        new Error("Conversation reset is unavailable after chat is closed.")
+      )
+    }
+    if (messageDeliveryCountRef.current > 0) {
+      return Promise.reject(
+        new Error(
+          "Conversation reset is blocked while message delivery is pending."
+        )
+      )
+    }
+    const establishedSessionTaskId = sessionTaskIdRef.current
+    if (establishedSessionTaskId === null) {
+      return Promise.reject(
+        new Error("Conversation reset requires an established Session task.")
+      )
+    }
+    if (sessionConversationRef.current.phase !== "bound") {
+      return Promise.reject(
+        new Error(
+          "Start the replacement conversation before resetting again."
+        )
+      )
+    }
+
+    const connectionIdentity = sessionConnectionIdentityRef.current
+    if (!connectionIdentity || !isConnected) {
+      return Promise.reject(
+        new Error("Conversation reset requires a connected Session.")
+      )
+    }
+
+    let resolveReset!: () => void
+    let rejectReset!: (error: Error) => void
+    const promise = new Promise<void>((resolve, reject) => {
+      resolveReset = resolve
+      rejectReset = reject
+    })
+    const resetFlight: SessionResetFlight = {
+      connectionIdentity,
+      deliveryGeneration: deliveryGenerationRef.current,
+      promise,
+      resolve: resolveReset,
+      reject: rejectReset,
+      timeout: setTimeout(() => {
+        if (sessionResetFlightRef.current !== resetFlight) return
+        requireSessionReload(
+          new Error("Conversation reset acknowledgement timed out; reload required.")
+        )
+      }, SESSION_RESET_ACK_TIMEOUT_MS),
+    }
+    sessionResetFlightRef.current = resetFlight
+    const transition = dispatchSessionConversation({
+      type: "SESSION_RESET_REQUESTED",
+      connectionIdentity,
+      taskId: establishedSessionTaskId,
+    })
+    if (!transition.accepted) {
+      rejectSessionResetFlight(
+        resetFlight,
+        new Error("Conversation reset is no longer available."),
+      )
+      return promise
+    }
+
+    try {
+      const sent = sendRawMessage({ type: "new_conversation" })
+      if (sent !== "sent") {
+        dispatchSessionConversation({
+          type: "SESSION_RESET_NOT_SENT",
+          connectionIdentity,
+        })
+        rejectSessionResetFlight(
+          resetFlight,
+          new Error("Conversation reset was not sent; retry the request."),
+        )
+      }
+    } catch (error) {
+      const resetError =
+        error instanceof Error ? error : new Error(String(error))
+      requireSessionReload(resetError)
+    }
+    return promise
+  }, [
+    isConnected,
+    dispatchSessionConversation,
+    rejectSessionResetFlight,
+    requireSessionReload,
+    sendRawMessage,
+    sessionTransport?.supportsConversationReset,
+  ])
 
   // Initialize the replay scheduler function
   const initializeReplayScheduler = useCallback(() => {
@@ -4710,7 +6941,7 @@ export function AppProvider({
         // but with isReplaying: false to ensure it gets processed for display
         const message = event.data as WebSocketMessage
         const tempState = { ...stateRef.current, isReplaying: false }
-        handleMessage(message, dispatch, tempState)
+        handleMessage(message, dispatch, tempState, { filesDisabled })
       },
       () => {
         // Replay completed
@@ -4728,7 +6959,7 @@ export function AppProvider({
 
     // Always start the scheduler since this function is called when we want to replay
     scheduler.play()
-  }, [state.isReplaying, state.replayTaskId, state.replayEventCache, state.replaySpeed, dispatch])
+  }, [state.isReplaying, state.replayTaskId, state.replayEventCache, state.replaySpeed, dispatch, filesDisabled])
 
   const executeTask = useCallback((description: string) => {
     if (!state.taskId) return
@@ -4747,28 +6978,29 @@ export function AppProvider({
 
   const selectStep = useCallback((stepId: string | null) => {
     dispatch({ type: "SELECT_STEP", payload: stepId })
-  }, [])
+  }, [dispatch])
 
   const clearMessages = useCallback(() => {
     dispatch({ type: "CLEAR_MESSAGES" })
-  }, [])
+  }, [dispatch])
 
   const setTaskId = useCallback((taskId: number | null, options?: { navigate?: boolean }) => {
     // Only reset historical data request flag when changing to a different task
     if (taskId !== stateRef.current.taskId) {
       if (taskId) {
-        historicalDataRequestMap.set(taskId, false)
+        historicalDataRequestMapRef.current.set(taskId, false)
       }
       // Clear recentMessages cache when switching tasks to prevent false duplicates
-      recentMessages.clear()
-      isHistoricalDataLoading = false
+      recentMessagesRef.current.clear()
+      isHistoricalDataLoadingRef.current = false
 
       // Clear existing data immediately when switching tasks to prevent stale data display
       // This fixes the issue where messages from the previous task might be cleared
       // by the connection effect AFTER the new task's history has already arrived.
       dispatch({ type: "CLEAR_MESSAGES" })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
-      dispatch({ type: "SET_STEPS", payload: [] })
+      // steps/dagExecution are cleared by the SET_TASK_ID dispatch below (its
+      // reducer case resets them whenever taskChanged) rather than here.
     }
 
     if (options?.navigate !== false) {
@@ -4783,12 +7015,13 @@ export function AppProvider({
     dispatch({ type: "SET_TASK_ID", payload: taskId })
     // Set history loading state immediately when switching tasks to prevent empty state flash
     if (taskId) {
-      isHistoricalDataLoading = true
+      isHistoricalDataLoadingRef.current = true
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
     }
-  }, [router])
+  }, [dispatch, router])
 
   const openFilePreview = useCallback((fileId: string, fileName: string, files?: Array<{ fileId: string; fileName: string }>, index?: number) => {
+    if (filesDisabled) return
     console.log('🎯 openFilePreview called:', {
       fileId,
       fileName,
@@ -4797,92 +7030,114 @@ export function AppProvider({
       index
     })
     dispatch({ type: "OPEN_FILE_PREVIEW", payload: { fileId, fileName, files, index } })
-  }, [])
+  }, [dispatch, filesDisabled])
 
   const switchFilePreview = useCallback((index: number) => {
+    if (filesDisabled) return
     const { availableFiles } = state.filePreview
     if (index >= 0 && index < availableFiles.length) {
       const file = availableFiles[index]
       dispatch({ type: "SWITCH_FILE_PREVIEW", payload: { fileId: file.fileId, fileName: file.fileName, index } })
     }
-  }, [state.filePreview.availableFiles])
+  }, [filesDisabled, state.filePreview.availableFiles])
 
   const closeFilePreview = useCallback(() => {
     dispatch({ type: "CLOSE_FILE_PREVIEW" })
-  }, [])
+  }, [dispatch])
 
   const getFilePreviewUrl = useCallback((fileId: string) => {
-    const baseUrl = getApiUrl()
-    return transport?.buildFilePreviewUrl
-      ? transport.buildFilePreviewUrl({ baseUrl, fileId })
-      : `${baseUrl}/api/files/preview/${encodeURIComponent(fileId)}`
-  }, [transport])
+    if (filesDisabled) {
+      throw new Error("Files are disabled for this conversation.")
+    }
+    if (transport?.fileAccess) {
+      return transport.fileAccess.previewUrl(fileId)
+    }
+    return `${getApiUrl()}/api/files/preview/${encodeURIComponent(fileId)}`
+  }, [filesDisabled, transport])
 
   const getFileDownloadUrl = useCallback((fileId: string) => {
-    const baseUrl = getApiUrl()
-    return transport?.buildFileDownloadUrl
-      ? transport.buildFileDownloadUrl({ baseUrl, fileId })
-      : `${baseUrl}/api/files/download/${encodeURIComponent(fileId)}`
-  }, [transport])
+    if (filesDisabled) {
+      throw new Error("Files are disabled for this conversation.")
+    }
+    if (transport?.fileAccess) {
+      return transport.fileAccess.downloadUrl(fileId)
+    }
+    return `${getApiUrl()}/api/files/download/${encodeURIComponent(fileId)}`
+  }, [filesDisabled, transport])
 
 
   // Replay control methods
   const startReplay = useCallback((taskId: number, events: TraceEvent[]) => {
     dispatch({ type: "START_REPLAY", payload: { taskId, events } })
-  }, [])
+  }, [dispatch])
 
   const stopReplay = useCallback(() => {
     dispatch({ type: "STOP_REPLAY" })
-  }, [])
+  }, [dispatch])
 
   const setReplayPlaying = useCallback((isPlaying: boolean) => {
     dispatch({ type: "SET_REPLAY_PLAYING", payload: isPlaying })
-  }, [])
+  }, [dispatch])
 
   const setReplaySpeed = useCallback((speed: number) => {
     dispatch({ type: "SET_REPLAY_SPEED", payload: speed })
-  }, [])
+  }, [dispatch])
 
   const setReplayProgress = useCallback((progress: number) => {
     dispatch({ type: "SET_REPLAY_PROGRESS", payload: progress })
-  }, [])
+  }, [dispatch])
 
-  // Initialize the delayed playback function
-  startDelayedPlayback = useCallback(() => {
-    // Use the replay scheduler to play all events with proper time intervals
-    initializeReplayScheduler()
-  }, [state.replayEventCache, initializeReplayScheduler])
+  useLayoutEffect(() => {
+    startDelayedPlaybackRef.current = initializeReplayScheduler
+  }, [initializeReplayScheduler])
 
   return (
-    <AppContext.Provider
-      value={{
-        state,
-        dispatch,
-        sendMessage,
-        executeTask,
-        pauseTask,
-        resumeTask,
-        selectStep,
-        clearMessages,
-        isConnected,
-        connectionError,
-        setTaskId,
-        requestStatus,
-        getFilePreviewUrl,
-        getFileDownloadUrl,
-        openFilePreview,
-        switchFilePreview,
-        closeFilePreview,
-        startReplay,
-        stopReplay,
-        setReplayPlaying,
-        setReplaySpeed,
-        setReplayProgress,
-        setPendingMessage,
-      }}
-    >
-      {children}
-    </AppContext.Provider>
+    <AgentCardPresentationCapability.Provider value={agentCardsEnabled}>
+      <LinksOpenInNewTabCapability.Provider value={linksOpenInNewTab}>
+        <FileAccessProvider policy={transport?.fileAccess}>
+          <AppContext.Provider
+          value={{
+          state,
+          dispatch,
+          filesDisabled,
+          agentCardsEnabled,
+          voiceInputEnabled,
+          taskControlsEnabled,
+          sendMessage,
+          executeTask,
+          pauseTask,
+          resumeTask,
+          selectStep,
+          clearMessages,
+          isConnected,
+          connectionError,
+          startNewConversation,
+          isConversationResetPending:
+            state.sessionConversation.phase === "reset_requested",
+          isMessageDeliveryPending: messageDeliveryCount > 0,
+          isSessionInteractionLocked:
+            state.sessionConversation.phase === "reload_required",
+          sessionConversationState: state.sessionConversation.phase,
+          setTaskId,
+          requestStatus,
+          getFilePreviewUrl,
+          getFileDownloadUrl,
+          openFilePreview,
+          switchFilePreview,
+          closeFilePreview,
+          startReplay,
+          stopReplay,
+          setReplayPlaying,
+          setReplaySpeed,
+          setReplayProgress,
+          setPendingMessage,
+          }}
+        >
+          {children}
+          </AppContext.Provider>
+        </FileAccessProvider>
+      </LinksOpenInNewTabCapability.Provider>
+    </AgentCardPresentationCapability.Provider>
   )
 }
 

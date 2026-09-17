@@ -16,49 +16,85 @@ export function getApiUrl(): string {
   return apiUrl
 }
 
-const PUBLIC_ACCESS_TOKEN_STORAGE_KEY = 'xagent_public_access_token'
+const ASCII_CONTROL_OR_DEL = /[\u0000-\u001F\u007F]/
+const EXPLICIT_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/
+const HTTP_AUTHORITY = /^https?:\/\/[^/?#\\]/i
 
-export function setPublicAccessToken(token: string | null): void {
-  if (typeof window === 'undefined') return
-  if (!token) {
-    window.sessionStorage.removeItem(PUBLIC_ACCESS_TOKEN_STORAGE_KEY)
-    return
-  }
-  window.sessionStorage.setItem(PUBLIC_ACCESS_TOKEN_STORAGE_KEY, token)
+function hasUnsafeUrlText(value: string): boolean {
+  return (
+    value.length === 0
+    || value.trim() !== value
+    || ASCII_CONTROL_OR_DEL.test(value)
+    || value.includes("\\")
+  )
 }
 
-export function getPublicAccessToken(): string | null {
-  if (typeof window === 'undefined') return null
-  return window.sessionStorage.getItem(PUBLIC_ACCESS_TOKEN_STORAGE_KEY)
-}
-
-export function withPublicAccessToken(url: string): string {
-  const publicToken = getPublicAccessToken()
-  if (!publicToken) {
-    return url
-  }
-
+function isHttpUrlWithAuthority(value: string): boolean {
+  if (!HTTP_AUTHORITY.test(value)) return false
   try {
-    const resolved = new URL(url, typeof window !== 'undefined' ? window.location.origin : 'http://localhost')
-    if (!resolved.searchParams.has('token')) {
-      resolved.searchParams.set('token', publicToken)
-    }
-    const apiUrl = getApiUrl()
-    if (apiUrl) {
-      return resolved.toString()
-    }
-    return `${resolved.pathname}${resolved.search}${resolved.hash}`
+    const parsed = new URL(value)
+    return (
+      (parsed.protocol === "http:" || parsed.protocol === "https:")
+      && parsed.hostname.length > 0
+    )
   } catch {
-    return url
+    return false
   }
+}
+
+function normalizeRelativeLogoBase(apiBase: string): string | null {
+  if (
+    apiBase.trim() !== apiBase
+    || ASCII_CONTROL_OR_DEL.test(apiBase)
+    || apiBase.includes("\\")
+    || apiBase.includes("?")
+    || apiBase.includes("#")
+  ) return null
+
+  if (apiBase === "" || /^\/+$/u.test(apiBase)) return ""
+
+  if (HTTP_AUTHORITY.test(apiBase)) {
+    return isHttpUrlWithAuthority(apiBase)
+      ? apiBase.replace(/\/+$/u, "")
+      : null
+  }
+
+  if (
+    EXPLICIT_SCHEME.test(apiBase)
+    || apiBase.startsWith("//")
+    || !/^\/[^/]/u.test(apiBase)
+  ) return null
+
+  return apiBase.replace(/\/+$/u, "")
+}
+
+/**
+ * Resolves an Agent logo API value to an image URL without accepting
+ * protocol-relative, scheme-like, or malformed URL forms.
+ */
+export function resolveAgentLogoUrl(value: unknown, apiBase: string): string | null {
+  if (typeof value !== "string" || hasUnsafeUrlText(value)) return null
+
+  if (/^https?:/i.test(value)) {
+    return isHttpUrlWithAuthority(value) ? value : null
+  }
+
+  if (EXPLICIT_SCHEME.test(value) || value.startsWith("//")) return null
+
+  const relativePath = value.startsWith("/") ? value.slice(1) : value
+  if (relativePath.length === 0 || /^\/+$/u.test(relativePath)) return null
+
+  const normalizedBase = normalizeRelativeLogoBase(apiBase)
+  if (normalizedBase === null) return null
+  return `${normalizedBase}/${relativePath}`
 }
 
 export function getFilePublicPreviewUrl(fileId: string, apiUrl = getApiUrl()): string {
-  return withPublicAccessToken(`${apiUrl}/api/files/public/preview/${encodeURIComponent(fileId)}`)
+  return `${apiUrl}/api/files/public/preview/${encodeURIComponent(fileId)}`
 }
 
 export function getFilePublicDownloadUrl(fileId: string, apiUrl = getApiUrl()): string {
-  return withPublicAccessToken(`${apiUrl}/api/files/public/download/${encodeURIComponent(fileId)}`)
+  return `${apiUrl}/api/files/public/download/${encodeURIComponent(fileId)}`
 }
 
 export function getFileRelativePreviewUrl(

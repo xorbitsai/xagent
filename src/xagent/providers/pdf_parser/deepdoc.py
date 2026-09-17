@@ -16,6 +16,7 @@ from openpyxl.utils.exceptions import InvalidFileException
 
 from ...core.tools.core.RAG_tools.core.config import ARTIFACTS_DIR
 from ...core.tools.core.RAG_tools.utils.string_utils import sanitize_for_doc_id
+from . import deepdoc_remote
 from .base import (
     DocumentParser,
     FigureParsing,
@@ -93,15 +94,20 @@ def _build_element_metadata(
 ) -> Dict[str, Any]:
     """Build metadata dict for an element."""
     layout_type = bbox.get("layout_type", "text")
+    # page_number and col_id are coerced for the same reason positions are: on
+    # the remote path they come from an untrusted server, and a string sneaking
+    # into either one is persisted straight into chunk metadata. Locally deepdoc
+    # already supplies ints, so this is a no-op there. A value that will not
+    # coerce raises, which the caller turns into a fallback to local parsing.
     metadata = {
         "layout_type": layout_type,
         "doc_id": doc_id,
-        "page_number": bbox.get("page_number", 1),
+        "page_number": int(bbox.get("page_number", 1)),
         **kwargs,
     }
 
     # Extract col_id for two-column layout support
-    col_id = bbox.get("col_id", 0)
+    col_id = int(bbox.get("col_id", 0))
     metadata["col_id"] = col_id
 
     # Extract positions for PDF visualization (format: [[page_num, left, right, top, bottom], ...])
@@ -221,6 +227,108 @@ def _translate_pdf_bboxes(
 
     logger.info(
         f"Translated {len(bboxes)} bboxes into {len(text_segments)} text segments, {len(tables)} tables, {len(figures)} figures"
+    )
+    return ParseResult(
+        text_segments=text_segments, figures=figures, tables=tables, metadata=kwargs
+    )
+
+
+def _discard_remote_crops(elements: List[Dict[str, Any]]) -> None:
+    """Delete crop files named by remote elements, ignoring anything unusable.
+
+    Called when translation failed after the client had already written crops,
+    so those files describe a result nobody will use.
+    """
+    for element in elements:
+        path = element.get("image") if isinstance(element, dict) else None
+        if not isinstance(path, str):
+            continue
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not remove orphaned crop %s: %s", path, exc)
+
+
+def _element_metadata_dict(element: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a remote element's ``metadata`` as a dict, whatever the server sent.
+
+    ``metadata`` is untrusted: it can be absent, null, or not an object at all.
+    Every reader has to treat those the same way, because ``{**None}`` raises and
+    an unexpected shape must never be able to fail a parse the local path would
+    have completed.
+    """
+    metadata = element.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _translate_remote_elements(
+    doc_id: str, elements: List[Dict[str, Any]], **kwargs: Any
+) -> ParseResult:
+    """Translate remote DeepDoc elements into our ParseResult format.
+
+    The remote server runs the same ``parse_into_bboxes`` pipeline this file
+    calls locally and returns its elements as a flat list, so each one is
+    reshaped back into the bbox dict the local PDF helpers already consume.
+    That keeps table and figure handling (including image paths), ``positions``
+    and cross-page coordinates identical to local parsing.
+
+    Metadata keys ``_build_element_metadata`` does not know about -- ``x0``,
+    ``bottom``, ``layoutno`` and friends -- are merged in afterwards so nothing
+    the server reported is dropped.
+
+    Args:
+        doc_id: Document ID.
+        elements: Normalized elements from ``deepdoc_remote.parse_document_remote``.
+        **kwargs: Additional metadata applied to every element.
+
+    Returns:
+        ParseResult with text_segments, tables, and figures.
+    """
+    text_segments: List[ParsedTextSegment] = []
+    figures: List[ParsedFigures] = []
+    tables: List[ParsedTable] = []
+
+    for element in elements:
+        element_metadata = _element_metadata_dict(element)
+
+        # `or` rather than a .get() default: the server may send an explicit
+        # null, which .get() would hand straight through as None and blow up
+        # ParsedTextSegment validation downstream.
+        layout_type = element.get("type") or "text"
+        # Reshape into the bbox dict the local helpers expect. The metadata keys
+        # are flattened in so _build_element_metadata can pick up
+        # positions/col_id/page_number where the server reported them.
+        bbox: Dict[str, Any] = {
+            **element_metadata,
+            "layout_type": layout_type,
+            "text": element.get("text") or "",
+            "image": element.get("image"),
+        }
+        base_metadata = _build_element_metadata(bbox, doc_id, **kwargs)
+        # Carry the raw bbox keys (x0, x1, top, bottom, layoutno, ...) that
+        # _build_element_metadata does not know about.
+        for key, value in element_metadata.items():
+            base_metadata.setdefault(key, value)
+
+        if layout_type == "table":
+            tables.append(_process_table_element(bbox, base_metadata, doc_id))
+        elif layout_type == "figure":
+            figures.append(_process_figure_element(bbox, base_metadata, doc_id))
+        else:
+            if layout_type != "text":
+                logger.debug(
+                    f"Unhandled remote element type '{layout_type}', treating as text"
+                )
+            text_segments.append(
+                ParsedTextSegment(
+                    text=bbox.get("text", ""),
+                    metadata=base_metadata,
+                )
+            )
+
+    logger.info(
+        f"Translated {len(elements)} remote elements into {len(text_segments)} text "
+        f"segments, {len(tables)} tables, {len(figures)} figures"
     )
     return ParseResult(
         text_segments=text_segments, figures=figures, tables=tables, metadata=kwargs
@@ -371,12 +479,14 @@ def _translate_docx_output(
                     ParsedTable(html=table_html, image=None, metadata=table_metadata)
                 )
 
-    return ParseResult(text_segments=text_segments, figures=figures, tables=tables)
+    return ParseResult(
+        text_segments=text_segments, figures=figures, tables=tables, metadata=kwargs
+    )
 
 
 def _translate_excel_output(raw_output: Any, **kwargs: Any) -> ParseResult:
     text_segments = [ParsedTextSegment(text=row, metadata=kwargs) for row in raw_output]
-    return ParseResult(text_segments=text_segments)
+    return ParseResult(text_segments=text_segments, metadata=kwargs)
 
 
 def _translate_text_output(raw_output: Any, **kwargs: Any) -> ParseResult:
@@ -390,7 +500,7 @@ def _translate_text_output(raw_output: Any, **kwargs: Any) -> ParseResult:
                 text_segments.append(ParsedTextSegment(text=item[0], metadata=kwargs))
     elif isinstance(raw_output, str):
         text_segments.append(ParsedTextSegment(text=raw_output, metadata=kwargs))
-    return ParseResult(text_segments=text_segments)
+    return ParseResult(text_segments=text_segments, metadata=kwargs)
 
 
 def _translate_markdown_output(raw_output: Any, **kwargs: Any) -> ParseResult:
@@ -406,7 +516,7 @@ def _translate_markdown_output(raw_output: Any, **kwargs: Any) -> ParseResult:
             table_meta = kwargs.copy()
             table_meta["type"] = "table"
             text_segments.append(ParsedTextSegment(text=tbl, metadata=table_meta))
-    return ParseResult(text_segments=text_segments)
+    return ParseResult(text_segments=text_segments, metadata=kwargs)
 
 
 def _parse_docx_with_python_docx(
@@ -476,11 +586,6 @@ class DeepDocParser(
         self._parsers: dict[str, Any] = {}
         self.enable_raw_output = enable_raw_output
 
-    def _get_parser(self, file_path: str) -> Tuple[Any, str]:
-        """Get parser and extension for a file path."""
-        ext = Path(file_path).suffix.lower()
-        return self._get_parser_for_ext(ext), ext
-
     def _get_parser_for_ext(self, ext: str) -> Any:
         """Get parser for a specific file extension (used for file paths and BytesIO objects)."""
         if ext not in self._parsers:
@@ -527,12 +632,15 @@ class DeepDocParser(
             # Handle different file path types (string path or BytesIO object)
             nonlocal file_path  # Access the potentially modified file_path
 
+            # Determine the extension only. Instantiating a local parser is
+            # deferred until a local branch actually needs one, because
+            # DeepDocPdfParser() eagerly loads ONNX models (and may download
+            # them from ModelScope) -- work that is pure waste in remote mode.
             if isinstance(file_path, BytesIO):
                 # For BytesIO objects, we need to determine file type from kwargs or use a default
                 ext = kwargs.get("file_ext", ".xlsx")  # Default to Excel for BytesIO
-                parser = self._get_parser_for_ext(ext)
             else:
-                parser, ext = self._get_parser(file_path)
+                ext = Path(file_path).suffix.lower()
 
             # Extract doc_id from kwargs if available, otherwise use file_path as fallback
             if isinstance(file_path, BytesIO):
@@ -552,32 +660,14 @@ class DeepDocParser(
                 **base_kwargs,
             }
 
-            if ext == ".xlsx":
-                return _parse_xlsx_rows(file_path, **metadata)
-
-            # Dispatch to correct parser method and translator
-            if ext == ".md":
-                if isinstance(file_path, BytesIO):
-                    markdown_text = file_path.getvalue().decode("utf-8")
-                    file_path.seek(0)  # Reset position for parser
-                else:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        markdown_text = f.read()
-                markdown_output = parser.extract_tables_and_remainder(markdown_text)
-                return _translate_markdown_output(markdown_output, **metadata)
-
-            # For TXT files, read directly to preserve original format and punctuation
-            if ext == ".txt":
-                if isinstance(file_path, BytesIO):
-                    text_content = file_path.getvalue().decode("utf-8")
-                    file_path.seek(0)  # Reset position for parser
-                else:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        text_content = f.read()
-                return _translate_text_output(text_content, **metadata)
-
             # Validate Office document format (.docx, .xlsx, .pptx)
-            # Skip validation for BytesIO objects as they're already validated during conversion
+            # Skip validation for BytesIO objects as they're already validated
+            # during conversion. This says nothing about the remote path -- that
+            # only runs for .pdf, so these extensions never reach it. Hoisting
+            # the check above the local dispatch does mean an .xlsx whose
+            # BytesIO conversion failed now gets validated where it previously
+            # went straight to _parse_xlsx_rows; failing fast on a mislabelled
+            # file is the better outcome there.
             if ext in [".docx", ".xlsx", ".pptx"] and not isinstance(
                 file_path, BytesIO
             ):
@@ -596,22 +686,145 @@ class DeepDocParser(
                 parser_call_kwargs.setdefault("need_image", True)
                 # Note: __call__ doesn't accept need_position, we'll extract positions separately
 
+            # Built once here so the remote and local PDF paths below share a
+            # single adapter. Only those two consume it, so it is scoped to
+            # .pdf rather than paid for on every format.
+            callback = None
+            if ext == ".pdf" and progress_callback is not None:
+                from ...core.tools.core.RAG_tools.progress.adapters import (
+                    DeepDocProgressAdapter,
+                )
+
+                adapter = DeepDocProgressAdapter(progress_callback)
+                callback = adapter.get_callback()
+
+            # Remote-first dispatch for PDFs: when a remote server is
+            # configured the document goes there, and any failure falls back to
+            # local parsing. No local parser is instantiated on the remote path.
+            #
+            # The gate is deliberately narrow. Xinference serves DeepDoc's
+            # whole-document pipeline as task="parse", which consumes a PDF and
+            # nothing else, so sending a .docx would only buy a failed round
+            # trip before the same local parse ran anyway.
+            if ext == ".pdf" and deepdoc_remote.is_remote_configured():
+                # Held outside the try so the handler can clean up crops the
+                # client already wrote before translation failed.
+                elements: List[Dict[str, Any]] = []
+                try:
+                    elements = deepdoc_remote.parse_document_remote(
+                        file_path,
+                        ext=ext,
+                        save_image=lambda image_bytes: _save_bytes_to_disk(
+                            doc_id, image_bytes, ".png"
+                        ),
+                        callback=callback,
+                        zoomin=parser_call_kwargs.get("zoomin", 3),
+                    )
+                    remote_metadata = {**metadata, "deepdoc_backend": "remote"}
+                    parse_result = _translate_remote_elements(
+                        doc_id, elements, **remote_metadata
+                    )
+                    # Mirror the local branch's passthrough so the flag means
+                    # the same thing on both paths. ParseResult's own
+                    # visualization helpers read "bboxes" and expect the
+                    # coordinate keys flat, so the remote elements are
+                    # flattened back into that shape rather than passed through
+                    # nested under "metadata" -- keying this differently would
+                    # leave has_visualization_data true while
+                    # get_visualization_elements() returned nothing.
+                    if self.enable_raw_output:
+                        # Guard the metadata the same way the translator does. A
+                        # debug flag must never decide whether a parse succeeds,
+                        # and `{**None}` raises, so a server sending a null or
+                        # non-object `metadata` would otherwise parse fine with
+                        # the flag off and fall back with it on.
+                        bboxes = [
+                            {
+                                **_element_metadata_dict(element),
+                                "layout_type": element.get("type") or "text",
+                                "text": element.get("text") or "",
+                                # `has_image` in the visualization helpers tests
+                                # for key *presence*, so dropping this makes
+                                # every remote element report no image.
+                                "image": element.get("image"),
+                            }
+                            for element in elements
+                        ]
+                        parse_result.raw_parser_output = {
+                            "format": "deepdoc_pdf",
+                            "bboxes": bboxes,
+                            "total_elements": len(bboxes),
+                            "has_positions": any(
+                                "positions" in bbox for bbox in bboxes
+                            ),
+                        }
+                        parse_result.parser_engine = "deepdoc"
+                    return parse_result
+                # Deliberately broad. The point of the remote path is that it is
+                # an optimization, so *nothing* it does may cost us a parse we
+                # could have done locally. Narrowing this to DeepDocRemoteError
+                # only covers the client's own failures, while the try also
+                # wraps the translation of server-supplied data: an unexpected
+                # `metadata` shape reaches _build_element_metadata and raises
+                # from a bare int()/float(), which would escape and fail the
+                # ingest. Validating each field as it bites is a losing game --
+                # this closes the class.
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Remote DeepDoc parse failed (%s); falling back to local", exc
+                    )
+                    # The client cleans up after its own failures, but a crop
+                    # written before translation raised is stranded: the local
+                    # fallback writes a fresh set under new names beside it and
+                    # nothing prunes that tree.
+                    _discard_remote_crops(elements)
+                    if callback:
+                        # Reporting the fallback must never be able to prevent
+                        # it: a progress sink that raises would otherwise turn a
+                        # recoverable remote failure into a hard parse failure.
+                        try:
+                            callback(0.01, "Remote parse failed; running local DeepDoc")
+                        except Exception as callback_exc:
+                            logger.warning(
+                                "Progress callback failed while reporting the "
+                                "DeepDoc fallback: %s",
+                                callback_exc,
+                            )
+
+            metadata["deepdoc_backend"] = "local"
+
+            if ext == ".xlsx":
+                return _parse_xlsx_rows(file_path, **metadata)
+
+            # Dispatch to correct parser method and translator
+            if ext == ".md":
+                if isinstance(file_path, BytesIO):
+                    markdown_text = file_path.getvalue().decode("utf-8")
+                    file_path.seek(0)  # Reset position for parser
+                else:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        markdown_text = f.read()
+                parser = self._get_parser_for_ext(ext)
+                markdown_output = parser.extract_tables_and_remainder(markdown_text)
+                return _translate_markdown_output(markdown_output, **metadata)
+
+            # For TXT files, read directly to preserve original format and punctuation
+            if ext == ".txt":
+                if isinstance(file_path, BytesIO):
+                    text_content = file_path.getvalue().decode("utf-8")
+                    file_path.seek(0)  # Reset position for parser
+                else:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        text_content = f.read()
+                return _translate_text_output(text_content, **metadata)
+
             try:
                 # For PDF, use parse_into_bboxes for unified document structure with positions
                 if ext == ".pdf":
                     # Use standard DeepDoc parser
                     zoomin = parser_call_kwargs.get("zoomin", 3)
 
-                    # Set up progress callback for DeepDoc if provided
-                    callback = None
-                    if progress_callback is not None:
-                        from ...core.tools.core.RAG_tools.progress.adapters import (
-                            DeepDocProgressAdapter,
-                        )
-
-                        adapter = DeepDocProgressAdapter(progress_callback)
-                        callback = adapter.get_callback()
-
+                    parser = self._get_parser_for_ext(ext)
                     bboxes = parser.parse_into_bboxes(
                         file_path, callback=callback, zoomin=zoomin
                     )
@@ -619,6 +832,7 @@ class DeepDocParser(
                         f"Parsed PDF into {len(bboxes)} unified elements with position information"
                     )
                 else:
+                    parser = self._get_parser_for_ext(ext)
                     # Handle DOCX with DoclingParser
                     if ext == ".docx" and isinstance(parser, DeepDocDoclingParser):
                         if isinstance(file_path, BytesIO):
@@ -789,6 +1003,6 @@ def _parse_xlsx_rows(file_path: str | BytesIO, **kwargs: Any) -> ParseResult:
                     ParsedTextSegment(text=row_text, metadata=metadata)
                 )
 
-        return ParseResult(text_segments=text_segments)
+        return ParseResult(text_segments=text_segments, metadata=kwargs)
     finally:
         workbook.close()

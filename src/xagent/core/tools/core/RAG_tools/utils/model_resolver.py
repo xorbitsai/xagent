@@ -24,10 +24,12 @@ if TYPE_CHECKING:
     from langchain_core.runnables import Runnable
 
 from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import OperationalError as SAOperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+from xagent.config import get_db_pool_kwargs
 from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.langchain import create_base_chat_model_with_retry
@@ -63,6 +65,11 @@ _MODEL_HUB_SESSION_LOCAL: Any = None
 _MODEL_HUB_MODEL: Any = None
 _MODEL_HUB_DB_URL: Optional[str] = None
 _MODEL_HUB_LOCK = threading.Lock()
+
+# get_db_pool_kwargs' sizing applies per engine, and a worker already holds the
+# web engine's pool, so adopting it here would double this process's ceiling.
+# pool_timeout stays: it is the acquisition wait, not capacity.
+_POOL_SIZING_KEYS = frozenset({"pool_size", "max_overflow"})
 
 
 def _reset_model_hub_cache() -> None:
@@ -168,12 +175,28 @@ def _get_or_init_model_hub() -> Any:
             with _MODEL_HUB_LOCK:
                 if _MODEL_HUB_ENGINE is None or _MODEL_HUB_DB_URL != database_url:
                     old_engine = _MODEL_HUB_ENGINE
+                    is_sqlite = make_url(database_url).get_backend_name() == "sqlite"
+                    pool_kwargs: dict[str, Any] = (
+                        {}
+                        if is_sqlite
+                        else {
+                            key: value
+                            for key, value in get_db_pool_kwargs().items()
+                            if key not in _POOL_SIZING_KEYS
+                        }
+                    )
                     engine = create_engine(
                         database_url,
-                        connect_args={"check_same_thread": False}
-                        if "sqlite" in database_url
-                        else {},
-                        pool_pre_ping="sqlite" not in database_url,
+                        connect_args={"check_same_thread": False} if is_sqlite else {},
+                        # Every non-sizing knob comes from the shared policy, so
+                        # a new health kwarg there reaches this engine too.
+                        **pool_kwargs,
+                        # Same database as the shared web engine
+                        # (web/models/database.py) -- the Model table this
+                        # hub reads/writes has an encrypted API key column,
+                        # so a bind/commit failure here must not surface it
+                        # as a bound SQL parameter either.
+                        hide_parameters=True,
                     )
                     Base = declarative_base()
                     Model = create_model_table(Base)

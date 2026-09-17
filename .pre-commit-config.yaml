@@ -20,9 +20,11 @@ repos:
         additional_dependencies:
           - "pydantic[mypy]"
           - aiohttp
+          - redis==6.4.0
           - types-PyYAML
           - types-beautifulsoup4
           - types-requests
+          - types-python-dateutil
           - httpx
           - fastapi
           - uvicorn
@@ -60,6 +62,7 @@ repos:
           - python-pptx
           - cloudpickle
           - exa-py
+          - slack-sdk==3.43.0
           - limits
           - google-genai==1.66.0
           - elevenlabs==2.56.0

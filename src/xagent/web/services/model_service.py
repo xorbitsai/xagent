@@ -10,10 +10,10 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, cast
 
+from sqlalchemy import and_, case, or_
 from sqlalchemy.orm import Session
 
-from xagent.core.model.image.base import BaseImageModel
-from xagent.web.api.model import DBModel
+from xagent.core.model.image.base import BaseImageModel, default_image_abilities
 
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.image.dashscope import DashScopeImageModel
@@ -21,6 +21,8 @@ from ...core.model.image.gemini import GeminiImageModel
 from ...core.model.image.openai import OpenAIImageModel
 from ...core.model.image.xinference import XinferenceImageModel
 from ...core.model.video.base import BaseVideoModel
+from ..models.model import Model as DBModel
+from .llm_utils import AutoModelUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +137,20 @@ def _is_model_visible_to_user(
         return False
 
 
+def _create_default_llm_instance(
+    db: Session, db_model: Any, user_id: Optional[int]
+) -> Optional[BaseLLM]:
+    """Create a default chat model, hydrating configured Auto when needed."""
+    from ...core.model.providers import ROUTER_PROVIDER, is_auto_router_model
+    from .llm_utils import UserAwareModelStorage, _create_llm_instance
+
+    if db_model.model_provider == ROUTER_PROVIDER and is_auto_router_model(
+        db_model.model_provider, db_model.model_name
+    ):
+        return UserAwareModelStorage(db).get_llm_by_id(str(db_model.model_id), user_id)
+    return _create_llm_instance(db_model)
+
+
 def get_default_vision_model(
     user_id: Optional[int] = None,
     *,
@@ -153,7 +169,6 @@ def get_default_vision_model(
         # Try to get from database (requires web context)
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
-        from .llm_utils import _create_llm_instance
 
         # This won't work in non-web contexts, so we'll fallback to environment
         try:
@@ -175,14 +190,18 @@ def get_default_vision_model(
                         if _is_model_visible_to_user(
                             model_db, vision_default.model.id, user_id
                         ):
-                            return _create_llm_instance(vision_default.model)
+                            return _create_default_llm_instance(
+                                model_db, vision_default.model, user_id
+                            )
 
                 # Fallback to visible users' shared defaults
                 admin_vision_defaults = (
                     model_db.query(UserDefaultModel)
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "visual",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)
@@ -193,8 +212,12 @@ def get_default_vision_model(
                 )
 
                 if admin_vision_defaults:
-                    return _create_llm_instance(admin_vision_defaults[0].model)
+                    return _create_default_llm_instance(
+                        model_db, admin_vision_defaults[0].model, user_id
+                    )
 
+        except AutoModelUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to get vision model from database: {e}")
             pass
@@ -204,6 +227,103 @@ def get_default_vision_model(
 
     # No fallback to environment variables - require database configuration
     return None
+
+
+def resolve_default_model_id(
+    db: Session, user_id: int, config_type: str
+) -> Optional[int]:
+    """Resolve the ``DBModel.id`` a user's default for *config_type* points at.
+
+    The user's own default first, then one belonging to a visible user -- the
+    same two layers ``agent_tool``, ``llm_utils`` and the LLM-returning
+    resolvers here apply. A default row pointing at a model the caller cannot
+    see is simply not a candidate, and the next one is tried instead.
+
+    Visibility is the SQL form of ``_is_model_visible_to_user``, which is what
+    decides at run time whether a configured id can actually be loaded
+    (``llm_utils``, ``agent_tool``, ``api/chat``): injecting an id it rejects
+    would hand the agent a ``general`` slot that cannot resolve. It is spelled
+    out rather than taken from ``build_user_model_visibility_filter`` because
+    that filter's own-row branch deliberately omits ``is_owner`` -- the model
+    list endpoints show borrowed rows and sort by it (``model_store``) -- so it
+    is one notch wider than the run-time check.
+
+    Reads the rows directly rather than through ``ModelStore``, whose getter
+    opens with a ``cache_get`` -- a Redis round-trip inside the caller's write
+    transaction (the pattern issue #889 is about).
+    """
+    # Opened outside the try: begin_nested() flushes the session first, which
+    # autoflush=False otherwise suppresses here, and swallowing a caller's
+    # failed flush below would leave the session in PendingRollbackError while
+    # workforce_creator's `except IntegrityError` retry never sees it.
+    nested = db.begin_nested()
+    try:
+        # Own savepoint: a failed read aborts the transaction on PostgreSQL, so
+        # returning None would only move the error to the caller's next
+        # statement -- and in workforce_creator's begin_nested retry loops
+        # (which catch IntegrityError alone) that escapes as a 500.
+        model_id = _query_default_model_id(db, user_id, config_type)
+        nested.commit()
+        return model_id
+    except Exception as exc:
+        nested.rollback()
+        logger.warning(
+            "Failed to resolve the %s default model for user %s: %s",
+            config_type,
+            user_id,
+            exc,
+        )
+        return None
+
+
+def _query_default_model_id(
+    db: Session, user_id: int, config_type: str
+) -> Optional[int]:
+    from ..models.user import UserDefaultModel, UserModel
+
+    visible_ids = _get_visible_user_ids(db, user_id)
+    row = (
+        db.query(UserDefaultModel.model_id)
+        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+        .join(UserModel, UserModel.model_id == UserDefaultModel.model_id)
+        .filter(
+            UserDefaultModel.config_type == config_type,
+            DBModel.is_active.is_(True),
+            or_(
+                UserDefaultModel.user_id == user_id,
+                UserDefaultModel.user_id.in_(visible_ids),
+            ),
+            or_(
+                and_(UserModel.user_id == user_id, UserModel.is_owner.is_(True)),
+                and_(UserModel.user_id.in_(visible_ids), UserModel.is_shared.is_(True)),
+            ),
+        )
+        .order_by(
+            # Own default wins; uq_user_default_model is per (user, config_type),
+            # so several visible users can each hold one -- take the newest.
+            case((UserDefaultModel.user_id == user_id, 0), else_=1),
+            UserDefaultModel.id.desc(),
+        )
+        .first()
+    )
+    return int(row[0]) if row is not None else None
+
+
+def with_default_general_model(db: Session, models: Any, *, user_id: int) -> Any:
+    """Fill an omitted ``general`` slot from the owner's default model.
+
+    An explicit ``{"general": None}`` means "no main model" and is kept; a
+    non-dict payload is unvalidated template YAML this layer must not reject.
+    """
+    if models is not None and not isinstance(models, dict):
+        return models
+    if models is not None and "general" in models:
+        return models
+
+    default_model_id = resolve_default_model_id(db, user_id, "general")
+    if default_model_id is None:
+        return models
+    return {**(models or {}), "general": default_model_id}
 
 
 def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
@@ -220,7 +340,6 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
         from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
-        from .llm_utils import _create_llm_instance
 
         try:
             db = next(get_db())
@@ -240,14 +359,18 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
                 if general_default and general_default.model:
                     if _is_model_visible_to_user(db, general_default.model.id, user_id):
-                        return _create_llm_instance(general_default.model)
+                        return _create_default_llm_instance(
+                            db, general_default.model, user_id
+                        )
 
             # Fallback to visible users' shared defaults
             admin_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "general",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
@@ -256,8 +379,12 @@ def get_default_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             )
 
             if admin_defaults:
-                return _create_llm_instance(admin_defaults[0].model)
+                return _create_default_llm_instance(
+                    db, admin_defaults[0].model, user_id
+                )
 
+        except AutoModelUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to get default model from database: {e}")
             pass
@@ -283,7 +410,6 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
         from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
-        from .llm_utils import _create_llm_instance
 
         try:
             db = next(get_db())
@@ -303,14 +429,18 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
                 if fast_default and fast_default.model:
                     if _is_model_visible_to_user(db, fast_default.model.id, user_id):
-                        return _create_llm_instance(fast_default.model)
+                        return _create_default_llm_instance(
+                            db, fast_default.model, user_id
+                        )
 
             # Fallback to visible users' shared defaults
             admin_fast_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "small_fast",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
@@ -319,8 +449,12 @@ def get_fast_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             )
 
             if admin_fast_defaults:
-                return _create_llm_instance(admin_fast_defaults[0].model)
+                return _create_default_llm_instance(
+                    db, admin_fast_defaults[0].model, user_id
+                )
 
+        except AutoModelUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to get fast model from database: {e}")
             pass
@@ -346,7 +480,6 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
         from ..models.database import get_db
         from ..models.model import Model as DBModel
         from ..models.user import UserDefaultModel, UserModel
-        from .llm_utils import _create_llm_instance
 
         try:
             db = next(get_db())
@@ -366,14 +499,18 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
 
                 if compact_default and compact_default.model:
                     if _is_model_visible_to_user(db, compact_default.model.id, user_id):
-                        return _create_llm_instance(compact_default.model)
+                        return _create_default_llm_instance(
+                            db, compact_default.model, user_id
+                        )
 
             # Fallback to visible users' shared defaults
             admin_compact_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "compact",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
@@ -382,8 +519,12 @@ def get_compact_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             )
 
             if admin_compact_defaults:
-                return _create_llm_instance(admin_compact_defaults[0].model)
+                return _create_default_llm_instance(
+                    db, admin_compact_defaults[0].model, user_id
+                )
 
+        except AutoModelUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to get compact model from database: {e}")
             pass
@@ -437,8 +578,10 @@ def get_embedding_model(user_id: Optional[int] = None) -> Optional[BaseLLM]:
             admin_embedding_defaults = (
                 db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "embedding",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
                 )
@@ -559,36 +702,41 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                 raise ValueError("Image model base URL cannot be empty")
             model_provider = str(db_model.model_provider).strip().lower()
             try:
+                model_name = str(db_model.model_name)
+                abilities = list(
+                    db_model.abilities
+                    or default_image_abilities(model_provider, model_name)
+                )
                 if model_provider == "dashscope":
                     image_model = DashScopeImageModel(
-                        model_name=str(db_model.model_name),
+                        model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
-                        abilities=list(db_model.abilities or ["generate"]),  # pyright: ignore[reportArgumentType]
+                        abilities=abilities,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "gemini":
                     image_model = GeminiImageModel(
-                        model_name=str(db_model.model_name),
+                        model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
-                        abilities=list(db_model.abilities or ["generate"]),  # pyright: ignore[reportArgumentType]
+                        abilities=abilities,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "openai":
                     image_model = OpenAIImageModel(
-                        model_name=str(db_model.model_name),
+                        model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
-                        abilities=list(db_model.abilities or ["generate", "edit"]),  # pyright: ignore[reportArgumentType]
+                        abilities=abilities,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "xinference":
                     image_model = XinferenceImageModel(
-                        model_name=str(db_model.model_name),
+                        model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
-                        abilities=list(db_model.abilities or ["generate", "edit"]),  # pyright: ignore[reportArgumentType]
+                        abilities=abilities,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
             except Exception as e:
@@ -734,6 +882,7 @@ def get_default_image_generate_model(
                     .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "image",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)
@@ -825,8 +974,10 @@ def get_default_image_edit_model(
                 admin_image_defaults = (
                     model_db.query(UserDefaultModel)
                     .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "image_edit",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)
@@ -1000,8 +1151,10 @@ def get_default_embedding_model(
         admin_embedding_defaults = (
             model_db.query(UserDefaultModel)
             .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+            .join(DBModel, UserDefaultModel.model_id == DBModel.id)
             .filter(
                 UserDefaultModel.config_type == "embedding",
+                DBModel.is_active,
                 UserModel.is_shared.is_(True),
                 UserDefaultModel.user_id.in_(_get_visible_user_ids(model_db, user_id)),
             )
@@ -1051,8 +1204,10 @@ def get_default_rerank_model(
             admin_rerank_defaults = (
                 model_db.query(UserDefaultModel)
                 .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
                 .filter(
                     UserDefaultModel.config_type == "rerank",
+                    DBModel.is_active,
                     UserModel.is_shared.is_(True),
                     UserDefaultModel.user_id.in_(
                         _get_visible_user_ids(model_db, user_id)
@@ -1326,6 +1481,7 @@ def get_default_asr_model(
                     .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "asr",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)
@@ -1402,6 +1558,7 @@ def get_default_tts_model(
                     .join(DBModel, UserModel.model_id == DBModel.id)
                     .filter(
                         UserDefaultModel.config_type == "tts",
+                        DBModel.is_active,
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
                             _get_visible_user_ids(model_db, user_id)
@@ -1471,6 +1628,11 @@ def get_default_sound_effect_model(
                     .filter(
                         UserDefaultModel.config_type == "sound_effect",
                         DBModel.category == "sound_effect",
+                        # Mirrors the user-default branch above: without this an
+                        # inactive shared default still resolves to a model
+                        # instance that is absent from the tool's own registry,
+                        # so usage records fall back to a phantom model name.
+                        DBModel.is_active,
                         sa_cast(DBModel.abilities, String).contains('"generate"'),
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
@@ -1534,6 +1696,10 @@ def get_default_music_model(
                     .filter(
                         UserDefaultModel.config_type == "music",
                         DBModel.category == "music",
+                        # Mirrors the user-default branch above; see the
+                        # sound-effect getter for why an inactive shared
+                        # default corrupts usage attribution.
+                        DBModel.is_active,
                         sa_cast(DBModel.abilities, String).contains('"generate"'),
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(

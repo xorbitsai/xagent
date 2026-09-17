@@ -499,7 +499,6 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
             super().__init__(CollectionInfo(name="old"))
             self.loaded_configs: list[dict[str, object]] = []
             self.deleted_metadata: list[dict[str, object]] = []
-            self.deleted_entries: list[str] = []
             self.renamed: list[dict[str, object]] = []
             self.config_owner_ids = {7, 8}
 
@@ -518,9 +517,6 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
         async def delete_collection_metadata(self, **kwargs: object) -> dict[str, int]:
             self.deleted_metadata.append(kwargs)
             return {"collection_config": 1}
-
-        async def delete_collection(self, collection_name: str) -> None:
-            self.deleted_entries.append(collection_name)
 
         def list_collection_config_owner_ids(self, collection_name: str) -> set[int]:
             assert collection_name == "old"
@@ -572,7 +568,6 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
             is_admin=False,
             delete_orphaned_metadata=True,
         )
-        assert await facade.delete_collection_metadata_entry("old") is True
         assert facade.list_collection_config_owner_ids("old") == {7, 8}
         assert await facade.rename_collection_data(
             collection_name="old",
@@ -599,7 +594,6 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
     assert outer_metadata.saved_configs == []
     assert outer_metadata.loaded_configs == []
     assert outer_metadata.deleted_metadata == []
-    assert outer_metadata.deleted_entries == []
     assert outer_metadata.renamed == []
     assert outer_status.renamed == []
 
@@ -626,7 +620,6 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
             "delete_orphaned_metadata": True,
         }
     ]
-    assert inner_metadata.deleted_entries == ["old"]
     assert inner_metadata.renamed == [
         {"old_name": "old", "new_name": "new", "user_id": 7, "is_admin": False}
     ]

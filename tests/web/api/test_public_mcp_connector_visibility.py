@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import xagent.web.api.mcp as mcp_api
+from tests.shared.auth_database import auth_db_override
 from xagent.web.api.admin_mcp import (
     PublicMCPAppCreate,
     PublicMCPAppUpdate,
@@ -24,6 +25,7 @@ from xagent.web.api.auth import (
     auth_router,
 )
 from xagent.web.api.mcp import mcp_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
@@ -47,6 +49,7 @@ app_for_tests.include_router(auth_router)
 app_for_tests.include_router(mcp_router)
 app_for_tests.include_router(admin_mcp_router)
 app_for_tests.dependency_overrides[get_db] = override_get_db
+app_for_tests.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 client = TestClient(app_for_tests)
 
 
@@ -219,7 +222,9 @@ def _connect_custom_stdio_mcp_for_user(username: str, server_name: str) -> None:
         db.close()
 
 
-def _connect_oauth_account_for_user(username: str, provider: str) -> None:
+def _connect_oauth_account_for_user(
+    username: str, provider: str, *, resource_owner_key: str | None = None
+) -> None:
     db = next(get_db())
     try:
         user = db.query(User).filter(User.username == username).first()
@@ -229,6 +234,7 @@ def _connect_oauth_account_for_user(username: str, provider: str) -> None:
             UserOAuth(
                 user_id=user.id,
                 provider=provider,
+                resource_owner_key=resource_owner_key,
                 access_token="access-token",
                 provider_user_id=f"{provider}-user",
                 email=f"{provider}@example.com",
@@ -409,6 +415,60 @@ def test_remote_connector_builds_oauth_connectability_once_per_account(
             pass
 
 
+def test_remote_connector_ignores_actor_owned_oauth_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+        _connect_oauth_account_for_user(
+            "regular",
+            "microsoft",
+            resource_owner_key="toby:slack:41:UALICE",
+        )
+
+        checked_providers: list[str] = []
+
+        def count_connectability_check(oauth_account: object) -> bool:
+            checked_providers.append(str(getattr(oauth_account, "provider")))
+            return True
+
+        monkeypatch.setattr(
+            mcp_api, "_oauth_account_can_connect", count_connectability_check
+        )
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+
+        assert response.status_code == 200
+        assert checked_providers == []
+        microsoft_apps = [
+            app for app in response.json() if app.get("provider") == "microsoft"
+        ]
+        assert microsoft_apps
+        for app in microsoft_apps:
+            assert app["is_connected"] is False
+            assert "connected_account" not in app
+            assert "server_id" not in app
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_oauth_account_can_connect_with_sqlite_naive_utc_expiry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -456,6 +516,61 @@ def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
         app_ids = {app["id"] for app in response.json()}
         assert "visible-app" in app_ids
         assert "hidden-app" not in app_ids
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_real_shipped_chrome_row_is_excluded_from_the_connector_list() -> None:
+    """Round-7/8 open nit: the synthetic hidden-app test above pins the
+    listing filter's mechanics, and the connect-endpoint 404 is pinned
+    elsewhere against the real app id — but nothing asserted the listing
+    filter on the row this PR actually ships. init_db seeds the real
+    registry rows (chrome-devtools included, hidden), so this drives the
+    exact shipped state end to end: the row exists in the DB (asserted, so
+    the listing check can't pass vacuously) yet never reaches the catalog
+    listing. A registry visibility flip cannot ship silently with the suite
+    green."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        # Guard against a vacuous pass: the row really is in the DB (seeded
+        # by init_db from the registry), and really is hidden.
+        db = next(get_db())
+        try:
+            seeded = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "chrome-devtools")
+                .one()
+            )
+            assert seeded.is_visible_in_connector is False, (
+                "chrome-devtools must ship hidden -- if this flips to True, "
+                "update this test's premise together with the unhide checklist"
+            )
+        finally:
+            db.close()
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+        app_ids = {app["id"] for app in response.json()}
+        assert "chrome-devtools" not in app_ids
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
@@ -531,7 +646,7 @@ def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
             ) as exc:
                 _ensure_user_mcp_server(
                     db,
-                    str(user.id),
+                    int(user.id),
                     {
                         "id": "teams",
                         "name": "Teams",
@@ -655,6 +770,7 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "pages_show_list",
             "pages_read_engagement",
             "pages_manage_posts",
+            "pages_read_user_content",
         ]
         assert facebook_app.launch_config == {
             "command": "python",
@@ -715,6 +831,14 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
             "xagent.web.tools.mcp.google_slides",
             {"GOOGLE_ACCESS_TOKEN": "access_token"},
         ),
+        "google-analytics": (
+            "xagent.web.tools.mcp.google_analytics",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "google-search-console": (
+            "xagent.web.tools.mcp.google_search_console",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
         "hubspot": (
             "xagent.web.tools.mcp.hubspot",
             {"HUBSPOT_ACCESS_TOKEN": "access_token"},
@@ -739,6 +863,10 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
             "xagent.web.tools.mcp.instagram",
             {"META_ACCESS_TOKEN": "access_token"},
         ),
+        "slack": (
+            "xagent.web.tools.mcp.slack",
+            {"SLACK_ACCESS_TOKEN": "access_token"},
+        ),
     }
     rows_by_app_id = {row["app_id"]: row for row in get_builtin_public_mcp_app_rows()}
 
@@ -754,6 +882,48 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
         "args": ["-y", "@cablate/mcp-google-map", "--stdio"],
         "required_env": ["GOOGLE_MAPS_API_KEY"],
     }
+
+    assert rows_by_app_id["aws"]["launch_config"] == {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.aws"],
+        "required_env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
+    }
+
+
+def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
+    """Granola and Notion have no local launch command at all — they host
+    their own MCP server and are reached over streamable_http. This is
+    intentionally split out of
+    test_builtin_registry_uses_runtime_available_launch_commands, whose name
+    is about local launch *commands* and would misdescribe these
+    remote-only entries."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    rows_by_app_id = {row["app_id"]: row for row in get_builtin_public_mcp_app_rows()}
+
+    assert rows_by_app_id["granola"]["transport"] == "streamable_http"
+    assert rows_by_app_id["granola"]["launch_config"] == {
+        "url": "https://mcp.granola.ai/mcp",
+        "auth": {"type": "mcp_oauth"},
+    }
+
+    assert rows_by_app_id["notion"]["transport"] == "streamable_http"
+    assert rows_by_app_id["notion"]["launch_config"] == {
+        "url": "https://mcp.notion.com/mcp",
+        "auth": {"type": "mcp_oauth"},
+    }
+
+
+@pytest.mark.parametrize("app_id", ["granola", "notion"])
+def test_builtin_registry_classifies_remote_mcp_apps_as_mcp_oauth(app_id) -> None:
+    """The registry shape must classify as mcp_oauth — anything else means the
+    catalog entry is uninstallable (connect_mcp_app rejects non-api_key apps
+    and generic_oauth_login rejects non-"oauth" transports)."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+    from xagent.web.mcp_apps import classify_app_auth
+
+    row = next(r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == app_id)
+    assert classify_app_auth(row["transport"], row["launch_config"]) == "mcp_oauth"
 
 
 def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() -> None:
@@ -801,6 +971,66 @@ def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() ->
     assert fresh_app["oauth_scopes"] == expected_execution_fields["oauth_scopes"]
     assert fresh_app["launch_config"] == expected_execution_fields["launch_config"]
     assert get_builtin_execution_fields("gmail") == expected_execution_fields
+
+
+def test_get_builtin_execution_fields_and_optional_scopes() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        get_builtin_execution_fields,
+        get_builtin_execution_fields_and_optional_scopes,
+    )
+
+    execution_fields, optional_scopes = (
+        get_builtin_execution_fields_and_optional_scopes("hubspot")
+    )
+    assert execution_fields == get_builtin_execution_fields("hubspot")
+    assert optional_scopes == [
+        "business-intelligence",
+        "marketing-email",
+        "marketing.campaigns.read",
+    ]
+
+    # Most builtin apps have no optional_oauth_scopes key at all.
+    gmail_fields, gmail_optional = get_builtin_execution_fields_and_optional_scopes(
+        "gmail"
+    )
+    assert gmail_fields == get_builtin_execution_fields("gmail")
+    assert gmail_optional == []
+
+    assert get_builtin_execution_fields_and_optional_scopes("unknown-app") == (
+        None,
+        [],
+    )
+
+
+def test_app_to_dict_exposes_optional_oauth_scopes_for_builtin_and_custom_apps() -> (
+    None
+):
+    from xagent.web.mcp_apps import _app_to_dict
+    from xagent.web.models.public_mcp import PublicMCPApp
+
+    hubspot_app = PublicMCPApp(
+        app_id="hubspot",
+        name="HubSpot",
+        transport="oauth",
+        provider_name="hubspot",
+        oauth_scopes=["crm.objects.contacts.read"],
+        launch_config={},
+    )
+    assert _app_to_dict(hubspot_app)["optional_oauth_scopes"] == [
+        "business-intelligence",
+        "marketing-email",
+        "marketing.campaigns.read",
+    ]
+
+    custom_app = PublicMCPApp(
+        app_id="some-custom-app",
+        name="Custom",
+        transport="oauth",
+        provider_name="custom",
+        oauth_scopes=["custom.scope"],
+        launch_config={},
+    )
+    assert _app_to_dict(custom_app)["optional_oauth_scopes"] == []
 
 
 def test_builtin_registry_drift_validation_reports_safe_read_only_summaries() -> None:
@@ -879,6 +1109,89 @@ def test_builtin_registry_drift_validation_accepts_canonical_rows() -> None:
         with get_engine().begin() as connection:
             assert validate_builtin_public_mcp_apps(connection) == []
     finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_shopify_provenance_version_drift_keeps_ownership_and_is_reported() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+        is_builtin_public_mcp_app,
+        validate_builtin_public_mcp_apps,
+    )
+    from xagent.web.mcp_apps import _app_to_dict
+
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        shopify_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "shopify").one()
+        )
+        launch_config = dict(shopify_app.launch_config)
+        marker = dict(launch_config["builtin_provenance"])
+        marker["version"] = 999
+        launch_config["builtin_provenance"] = marker
+        shopify_app.launch_config = launch_config
+        db.commit()
+
+        assert _persisted_builtin_provenance_matches("shopify", launch_config) is True
+        assert is_builtin_public_mcp_app("shopify") is True
+        assert (
+            _app_to_dict(shopify_app)["launch_config"]["builtin_provenance"]["version"]
+            == 1
+        )
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        shopify_mismatch = next(
+            mismatch for mismatch in mismatches if mismatch["app_id"] == "shopify"
+        )
+        assert shopify_mismatch["mismatched_fields"] == ["launch_config"]
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_shopify_foreign_provenance_is_not_owned_but_is_reported() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+        validate_builtin_public_mcp_apps,
+    )
+
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        shopify_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "shopify").one()
+        )
+        launch_config = dict(shopify_app.launch_config)
+        marker = dict(launch_config["builtin_provenance"])
+        marker["registry"] = "custom"
+        launch_config["builtin_provenance"] = marker
+        shopify_app.launch_config = launch_config
+        db.commit()
+
+        assert _persisted_builtin_provenance_matches("shopify", launch_config) is False
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        shopify_mismatch = next(
+            mismatch for mismatch in mismatches if mismatch["app_id"] == "shopify"
+        )
+        assert shopify_mismatch["mismatched_fields"] == ["builtin_provenance"]
+    finally:
+        db.close()
         Base.metadata.drop_all(bind=get_engine())
         try:
             import shutil
@@ -1130,29 +1443,31 @@ def test_mixed_case_oauth_transport_app_is_marked_connected(
             pass
 
 
-def test_admin_create_app_rejects_keyless_command_entry() -> None:
-    """Write-time constraint (#764): a non-oauth entry with a launch command but
-    no required_env would classify as "unconnectable", so the admin API rejects
-    it instead of silently persisting an unconnectable row."""
+def test_admin_create_app_accepts_keyless_and_rejects_partial_key_shapes() -> None:
+    """Write-time constraint (#764), updated for the keyless class: a stdio
+    entry with a launch command and no required_env classifies as "keyless"
+    (e.g. Chrome) and is accepted; the genuinely partial shapes — required_env
+    without a command, or a command on a remote transport — still classify as
+    "unconnectable" and are rejected."""
     temp_dir = _setup_test_db()
     try:
         _setup_admin()
         admin_headers = _login("admin", "admin123")
 
-        # Shape 1: command without required_env.
+        # A stdio command without required_env is a valid keyless app.
         resp = client.post(
             "/api/admin/mcp/apps",
             headers=admin_headers,
             json={
-                "app_id": "bad-keyless",
-                "name": "BadKeyless",
+                "app_id": "ok-keyless",
+                "name": "OkKeyless",
                 "transport": "stdio",
                 "launch_config": {"command": "npx", "args": ["-y", "x"]},
             },
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 200
 
-        # Shape 2 (the reverse asymmetric shape): required_env without command.
+        # required_env without command stays rejected.
         resp = client.post(
             "/api/admin/mcp/apps",
             headers=admin_headers,
@@ -1164,6 +1479,95 @@ def test_admin_create_app_rejects_keyless_command_entry() -> None:
             },
         )
         assert resp.status_code == 422
+
+        # A command on a remote transport is not keyless — still rejected.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-remote-command",
+                "name": "BadRemoteCommand",
+                "transport": "streamable_http",
+                "launch_config": {"command": "npx", "args": ["-y", "x"]},
+            },
+        )
+        assert resp.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_create_app_rejects_partial_remote_oauth_entry() -> None:
+    """Same write-time constraint (#764), for the remote-MCP-OAuth shape: a
+    streamable_http/sse/websocket entry needs BOTH launch_config.url and
+    launch_config.auth.type == "mcp_oauth", or it classifies as
+    "unconnectable" and must be rejected rather than silently persisted."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        # Shape 1: url without auth.type=mcp_oauth.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-no-auth-type",
+                "name": "BadNoAuthType",
+                "transport": "streamable_http",
+                "launch_config": {"url": "https://mcp.example.com/mcp"},
+            },
+        )
+        assert resp.status_code == 422
+
+        # Shape 2 (the reverse asymmetric shape): auth.type=mcp_oauth without url.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-no-url",
+                "name": "BadNoUrl",
+                "transport": "streamable_http",
+                "launch_config": {"auth": {"type": "mcp_oauth"}},
+            },
+        )
+        assert resp.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_create_app_accepts_full_remote_oauth_entry() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "good-remote-oauth",
+                "name": "GoodRemoteOAuth",
+                "transport": "streamable_http",
+                "launch_config": {
+                    "url": "https://mcp.example.com/mcp",
+                    "auth": {"type": "mcp_oauth"},
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["launch_config"]["url"] == "https://mcp.example.com/mcp"
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
@@ -1195,6 +1599,9 @@ def test_admin_update_app_enforces_auth_classification() -> None:
         assert created.status_code == 200
         app_pk = created.json()["id"]
 
+        # Dropping the command (keeping required_env) is a genuinely partial
+        # shape and must be rejected. (Dropping required_env instead would be a
+        # legitimate api_key -> keyless transition, not a violation.)
         updated = client.put(
             f"/api/admin/mcp/apps/{app_pk}",
             headers=admin_headers,
@@ -1202,10 +1609,142 @@ def test_admin_update_app_enforces_auth_classification() -> None:
                 "app_id": "good-keyed",
                 "name": "GoodKeyed",
                 "transport": "stdio",
-                "launch_config": {"command": "npx"},
+                "launch_config": {"required_env": ["KEY"]},
             },
         )
         assert updated.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_put_removing_required_env_transitions_api_key_row_to_connectable_keyless() -> (
+    None
+):
+    """Round-4 MINOR-7b / round-5 m4: this loosening is real and previously
+    untested via PUT (only the CREATE/POST acceptance of a fresh keyless
+    shape was covered). An admin-created stdio row with required_env
+    classifies api_key; removing required_env via PUT is a legitimate
+    transition to keyless (not the genuinely partial shape rejected in
+    test_admin_update_app_enforces_auth_classification above, which drops
+    command instead) -- the write-time validator must accept it (200, not
+    422), and the resulting row must actually be connectable through the
+    real user-facing endpoint afterward, not just pass admin validation.
+    """
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "transitioning-app",
+                "name": "TransitioningApp",
+                "transport": "stdio",
+                "launch_config": {"command": "npx", "required_env": ["KEY"]},
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        from xagent.web.mcp_apps import classify_app_auth
+
+        assert (
+            classify_app_auth("stdio", {"command": "npx", "required_env": ["KEY"]})
+            == "api_key"
+        )
+
+        updated = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={
+                "app_id": "transitioning-app",
+                "name": "TransitioningApp",
+                "transport": "stdio",
+                "launch_config": {"command": "npx"},
+            },
+        )
+        assert updated.status_code == 200
+        assert classify_app_auth("stdio", {"command": "npx"}) == "keyless"
+
+        # Connectable through the real endpoint post-transition, with no env
+        # at all -- the keyless shape's defining behavior.
+        connected = client.post(
+            "/api/mcp/apps/transitioning-app/connect",
+            headers=admin_headers,
+            json={"is_active": True},
+        )
+        assert connected.status_code == 200
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_update_grandfathers_a_preexisting_bad_shape_row_for_unrelated_edits() -> (
+    None
+):
+    """F4: a row already in an "unconnectable" partial shape (created directly,
+    simulating one that predates a shape rule tightening) must stay editable
+    for fields the shape check doesn't read — otherwise the write-time
+    constraint permanently locks out even an icon change on that row. A PUT
+    that also touches transport/launch_config must still be rejected."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        db = next(get_db())
+        try:
+            db.add(
+                PublicMCPApp(
+                    app_id="legacy-partial-oauth",
+                    name="LegacyPartialOAuth",
+                    icon="old-icon",
+                    transport="streamable_http",
+                    launch_config={"url": "https://mcp.example.com/mcp"},
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        db = next(get_db())
+        try:
+            app_pk = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "legacy-partial-oauth")
+                .one()
+                .id
+            )
+        finally:
+            db.close()
+
+        unrelated_edit = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"icon": "new-icon"},
+        )
+        assert unrelated_edit.status_code == 200
+        assert unrelated_edit.json()["icon"] == "new-icon"
+
+        shape_touching_edit = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"launch_config": {"url": "https://mcp.example.com/mcp"}},
+        )
+        assert shape_touching_edit.status_code == 422
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
@@ -1233,7 +1772,9 @@ def test_admin_list_apps_does_not_500_on_partial_launch_config_row() -> None:
                     app_id="legacy-bad",
                     name="LegacyBad",
                     transport="stdio",
-                    launch_config={"command": "npx"},
+                    # required_env without a command: still a genuinely partial
+                    # shape (command-only now classifies "keyless", not partial).
+                    launch_config={"required_env": ["KEY"]},
                 )
             )
             db.commit()
@@ -1601,10 +2142,13 @@ def test_admin_custom_patch_validates_merged_state_and_keeps_app_id_immutable() 
         assert updated.json()["launch_config"]["command"] == "new-command"
         assert updated.json()["is_builtin"] is False
 
+        # required_env without a command is still a partial shape on the merged
+        # state. (command without required_env would now merge into a valid
+        # keyless app instead.)
         invalid = client.patch(
             f"/api/admin/mcp/apps/{app_pk}",
             headers=admin_headers,
-            json={"launch_config": {"command": "incomplete-command"}},
+            json={"launch_config": {"required_env": ["CUSTOM_TOKEN"]}},
         )
         assert invalid.status_code == 422
 

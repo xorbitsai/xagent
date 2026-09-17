@@ -9,9 +9,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
+    DeferToSnapshot,
     ExecutionScope,
-    set_execution_scope_resolver,
+    ExecutionScopeAuthorityError,
+    ExecutionScopeResolverContractError,
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.models import database as database_module
@@ -268,7 +271,7 @@ def test_resolve_preserves_registered_scope_fallback_without_nested_checkout(
     monkeypatch.setattr(database_module, "_engine", engine)
     monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     set_execution_scope_snapshot_loader(load_task_execution_scope_snapshot)
-    set_execution_scope_resolver(lambda _task_id: isolated_scope)
+    register_scope_resolver(lambda _task_id: isolated_scope)
     try:
         with SessionLocal() as db:
             user = User(
@@ -330,6 +333,251 @@ def test_resolve_preserves_registered_scope_fallback_without_nested_checkout(
         assert observed_checked_out == [0]
         assert observed_prefixes == ["users/1/clients/3/end_users/7"]
     finally:
-        set_execution_scope_resolver(None)
+        register_scope_resolver(None)
         set_execution_scope_snapshot_loader(None)
+        engine.dispose()
+
+
+def test_resolve_fails_closed_on_registered_scope_authority_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A turn face: the resolved scope selects the namespace files are read
+    back from, and this call passes the persisted snapshot it already read
+    in its own Session explicitly via ``persisted_agent_config``, so a
+    disagreement between the registered resolver and that snapshot must
+    propagate ``ExecutionScopeAuthorityError`` instead of being downgraded,
+    and no file may be materialized on the mismatched path."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'authority-mismatch.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    local_path = tmp_path / "disputed.txt"
+    local_path.write_text("payload")
+
+    register_scope_resolver(
+        lambda _task_id: ExecutionScope(workspace_segments=("resolver-tenant",))
+    )
+    try:
+        with SessionLocal() as db:
+            user = User(username="disputed-owner", password_hash="hash", is_admin=False)
+            db.add(user)
+            db.flush()
+            task = Task(
+                user_id=int(user.id),
+                title="disputed task",
+                description="disputed task",
+                status=TaskStatus.COMPLETED,
+                source="sdk",
+                agent_config={
+                    "execution_scope": ExecutionScope(
+                        workspace_segments=("snapshot-tenant",),
+                    ).to_dict()
+                },
+            )
+            db.add(task)
+            db.flush()
+            db.add(
+                UploadedFile(
+                    file_id="disputed",
+                    user_id=int(user.id),
+                    task_id=int(task.id),
+                    filename="disputed.txt",
+                    storage_path=str(local_path),
+                    file_size=local_path.stat().st_size,
+                )
+            )
+            db.commit()
+            user_id = int(user.id)
+            task_id = int(task.id)
+
+        materialize_calls: list[str] = []
+        original_ensure_local = ManagedFileRef.ensure_local
+
+        def track_materialize(self: ManagedFileRef) -> Path:
+            materialize_calls.append(self.storage_key)
+            return original_ensure_local(self)
+
+        monkeypatch.setattr(ManagedFileRef, "ensure_local", track_materialize)
+
+        with SessionLocal() as db:
+            with pytest.raises(ExecutionScopeAuthorityError):
+                resolve_turn_file_infos(
+                    file_ids=["disputed"],
+                    owner_user_id=user_id,
+                    task_id=task_id,
+                    db=db,
+                )
+
+        assert materialize_calls == []
+    finally:
+        register_scope_resolver(None)
+        engine.dispose()
+
+
+def test_malformed_snapshot_is_ignored_when_the_resolver_is_authoritative(
+    tmp_path: Path,
+) -> None:
+    """An authoritative resolver can answer without the snapshot, so a row
+    whose snapshot fails field validation is ignored and the turn proceeds.
+    Tolerance is a property of this branch only -- see the two tests below for
+    the branches where the same row must fail the turn."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'malformed-snapshot.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    local_path = tmp_path / "attached.txt"
+    local_path.write_text("payload")
+
+    register_scope_resolver(
+        lambda _task_id: ExecutionScope(workspace_segments=("resolver-tenant",))
+    )
+    try:
+        with SessionLocal() as db:
+            user = User(username="corrupt-owner", password_hash="hash", is_admin=False)
+            db.add(user)
+            db.flush()
+            task = Task(
+                user_id=int(user.id),
+                title="corrupt snapshot task",
+                description="corrupt snapshot task",
+                status=TaskStatus.COMPLETED,
+                source="sdk",
+                # workspace_segments must be a list/tuple: this row cannot be
+                # decoded into a scope at all.
+                agent_config={"execution_scope": {"workspace_segments": 5}},
+            )
+            db.add(task)
+            db.flush()
+            db.add(
+                UploadedFile(
+                    file_id="attached",
+                    user_id=int(user.id),
+                    task_id=int(task.id),
+                    filename="attached.txt",
+                    storage_path=str(local_path),
+                    file_size=local_path.stat().st_size,
+                )
+            )
+            db.commit()
+            user_id = int(user.id)
+            task_id = int(task.id)
+
+        with SessionLocal() as db:
+            infos, missing = resolve_turn_file_infos(
+                file_ids=["attached"],
+                owner_user_id=user_id,
+                task_id=task_id,
+                db=db,
+            )
+
+        assert missing == []
+        assert [info["file_id"] for info in infos] == ["attached"]
+    finally:
+        register_scope_resolver(None)
+        engine.dispose()
+
+
+def _seed_malformed_snapshot_task(SessionLocal, local_path: Path) -> tuple[int, int]:
+    with SessionLocal() as db:
+        user = User(username="corrupt-owner", password_hash="hash", is_admin=False)
+        db.add(user)
+        db.flush()
+        task = Task(
+            user_id=int(user.id),
+            title="corrupt snapshot task",
+            description="corrupt snapshot task",
+            status=TaskStatus.COMPLETED,
+            source="sdk",
+            # workspace_segments must be a list/tuple: this row cannot be
+            # decoded into a scope at all.
+            agent_config={"execution_scope": {"workspace_segments": 5}},
+        )
+        db.add(task)
+        db.flush()
+        db.add(
+            UploadedFile(
+                file_id="attached",
+                user_id=int(user.id),
+                task_id=int(task.id),
+                filename="attached.txt",
+                storage_path=str(local_path),
+                file_size=local_path.stat().st_size,
+            )
+        )
+        db.commit()
+        return int(user.id), int(task.id)
+
+
+def test_malformed_snapshot_fails_the_turn_with_no_resolver_registered(
+    tmp_path: Path,
+) -> None:
+    """No resolver registered is the shape this repository ships in, and there
+    the persisted snapshot is the only namespace authority. A row that cannot
+    be decoded therefore has to fail the turn: treating it as "no candidate"
+    would resolve the task to unscoped, which is a namespace decision made by
+    accident rather than by an authority."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'no-resolver.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    local_path = tmp_path / "attached.txt"
+    local_path.write_text("payload")
+    try:
+        user_id, task_id = _seed_malformed_snapshot_task(SessionLocal, local_path)
+
+        with SessionLocal() as db:
+            with pytest.raises(ExecutionScopeResolverContractError):
+                resolve_turn_file_infos(
+                    file_ids=["attached"],
+                    owner_user_id=user_id,
+                    task_id=task_id,
+                    db=db,
+                )
+    finally:
+        engine.dispose()
+
+
+def test_malformed_snapshot_fails_the_turn_when_the_resolver_abstains(
+    tmp_path: Path,
+) -> None:
+    """An abstaining resolver has just said it does not know this task's
+    namespace, so a snapshot it cannot read leaves nobody who knows. The turn
+    must fail rather than fall through to the abstention's fallback on the
+    strength of a row that never decoded."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'abstain.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    local_path = tmp_path / "attached.txt"
+    local_path.write_text("payload")
+
+    register_scope_resolver(
+        lambda _task_id: DeferToSnapshot(fallback=ExecutionScope()),
+    )
+    try:
+        user_id, task_id = _seed_malformed_snapshot_task(SessionLocal, local_path)
+
+        with SessionLocal() as db:
+            with pytest.raises(ExecutionScopeResolverContractError):
+                resolve_turn_file_infos(
+                    file_ids=["attached"],
+                    owner_user_id=user_id,
+                    task_id=task_id,
+                    db=db,
+                )
+    finally:
+        register_scope_resolver(None)
         engine.dispose()

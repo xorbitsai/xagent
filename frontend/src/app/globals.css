@@ -193,6 +193,36 @@ body .hover\:\text-\[\#E6EDF3\]:hover {
   font-weight: 600;
 }
 
+/* Keep wide Markdown tables inside the conversation, with readable columns.
+   Also applies to Markdown file previews; other file renderers own their layout. */
+.prose .markdown-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  margin-bottom: 1em;
+}
+
+.prose .markdown-table-scroll:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+.prose .markdown-table-scroll > table {
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+}
+
+.prose .markdown-table-scroll th,
+.prose .markdown-table-scroll td {
+  min-width: 6rem;
+  max-width: 24rem;
+  vertical-align: top;
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
 .prose a {
   color: var(--primary);
   text-decoration: underline;

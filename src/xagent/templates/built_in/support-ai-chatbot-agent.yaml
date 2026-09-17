@@ -14,6 +14,49 @@ features:
   - 回答公司/群组的常见问题
   - 同时处理多个客户聊天
   - 帮助客户排查问题
+sample_prompts:
+  en:
+  - title: Answer common questions
+    prompt: 'Answer commonly asked questions about company / product using our knowledge base, handling many customer chats at the same time.'
+    highlights:
+    - company / product
+  - title: Troubleshooting helper
+    prompt: 'Help customers troubleshoot product area step by step, escalating to a human when needed.'
+    highlights:
+    - product area
+  zh:
+  - title: 回答常见问题
+    prompt: 使用我们的知识库回答关于 公司 / 产品 的常见问题，可同时处理多个客户对话。
+    highlights:
+    - 公司 / 产品
+  - title: 故障排查助手
+    prompt: 帮助客户逐步排查 产品领域 的问题，必要时上报人工处理。
+    highlights:
+    - 产品领域
+persona:
+  name: Sophie
+  role:
+    en: AI Support Chatbot
+    zh: AI 客服机器人
+  avatar: /marketplace/avatars/sophie.png
+  intro:
+    en: |-
+      Hi there — I'm Sophie, your AI Chatbot Agent.
+
+      I answer customer questions from your knowledge base and walk people through problems.
+    zh: |-
+      你好，我是 Sophie，你的 AI 客服机器人。
+
+      我会依据你的知识库回答客户问题，并引导他们解决问题。
+  kickoff_questions:
+    en:
+    - Which knowledge base should I answer from, and is it current?
+    - Where am I talking to customers — the help widget, a chat channel, somewhere else?
+    - When I can't answer something, who should I hand the conversation to?
+    zh:
+    - 我该依据哪个知识库来回答，内容是最新的吗？
+    - 我在哪里和客户对话——帮助中心组件、聊天渠道，还是别的地方？
+    - 遇到回答不了的问题，该转交给谁？
 connections:
 - name: Google Drive
   logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64

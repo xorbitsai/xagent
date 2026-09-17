@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from ...utils.security import redact_sensitive_text, redact_url_credentials_for_logging
-from .base import BaseImageModel
+from .base import BaseImageModel, default_image_abilities
 
 logger = logging.getLogger(__name__)
 
@@ -168,18 +168,8 @@ class GeminiImageModel(BaseImageModel):
         ).rstrip("/")
         self.timeout = timeout
 
-        # Determine supported abilities based on model name
         # Newer models like gemini-3-pro-image-preview-2k support editing
-        if abilities is not None and len(abilities) > 0:
-            # Use explicitly provided abilities
-            self._abilities = abilities
-        else:
-            # Auto-detect abilities based on model name
-            model_lower = model_name.lower()
-            if "3-pro" in model_lower or "edit" in model_lower:
-                self._abilities = ["generate", "edit"]
-            else:
-                self._abilities = ["generate"]
+        self._abilities = abilities or default_image_abilities("gemini", model_name)
 
     @property
     def abilities(self) -> List[str]:

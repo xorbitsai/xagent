@@ -141,6 +141,7 @@ class PythonExecutorTool(AbstractBaseTool):
         "numpy>=1.21.0",
         "matplotlib>=3.5.0",
         "openpyxl>=3.1.0",  # required by the xlsx-financial-report skill
+        "python-docx>=1.1.0",  # for .docx generation; skill lands in #1640
     ]
 )
 class PythonExecutorToolForBasic(PythonExecutorTool):

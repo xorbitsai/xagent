@@ -5,8 +5,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Button } from "@/components/ui/button"
 import { FileText, ChevronLeft, ChevronRight } from "lucide-react"
 import { useApp } from "@/contexts/app-context-chat"
-import { getApiUrl, getFilePublicPreviewUrl } from "@/lib/utils"
-import { apiRequest } from "@/lib/api-wrapper"
+import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { FileViewer } from "@/components/file/file-viewer"
 import { FilePreviewActionButtons } from "@/components/file/file-preview-action-buttons"
@@ -18,7 +17,15 @@ interface FilePreviewDialogProps {
 }
 
 export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps) {
-  const { state, dispatch, switchFilePreview } = useApp()
+  const {
+    state,
+    dispatch,
+    filesDisabled,
+    switchFilePreview,
+    getFilePreviewUrl,
+    getFileDownloadUrl,
+  } = useApp()
+  const fileAccess = useFileAccess()
   const { filePreview } = state
   const [viewMode, setViewMode] = useState<'preview' | 'code'>('preview')
 
@@ -33,8 +40,6 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
     if (open && filePreview.fileId && !filePreview.content && !filePreview.error) {
       const loadFileContent = async () => {
         try {
-          const apiUrl = getApiUrl()
-
           // .pptx is routed through /preview (raw bytes for PptxPreviewRenderer
           // to render in-browser); everything else (including legacy .ppt, which
           // pptxviewjs does not support) streams via /download.
@@ -42,12 +47,12 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
 
           let url: string
           if (isPptxFile) {
-            url = `${apiUrl}/api/files/preview/${encodeURIComponent(filePreview.fileId)}`
+            url = getFilePreviewUrl(filePreview.fileId)
           } else {
-            url = `${apiUrl}/api/files/download/${encodeURIComponent(filePreview.fileId)}`
+            url = getFileDownloadUrl(filePreview.fileId)
           }
 
-          const response = await apiRequest(url, {
+          const response = await fileAccess.request(url, {
             cache: 'no-cache',
             headers: {
               'Cache-Control': 'no-cache',
@@ -110,12 +115,12 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
 
       loadFileContent()
     }
-  }, [open, filePreview.fileId, filePreview.content, filePreview.error, filePreview.fileName, dispatch])
+  }, [open, fileAccess, filePreview.fileId, filePreview.content, filePreview.error, filePreview.fileName, dispatch, getFileDownloadUrl, getFilePreviewUrl])
 
   const handleDownload = async () => {
     if (filePreview.fileId) {
       try {
-        const response = await apiRequest(`${getApiUrl()}/api/files/download/${encodeURIComponent(filePreview.fileId)}`)
+        const response = await fileAccess.request(getFileDownloadUrl(filePreview.fileId))
 
         if (!response.ok) {
           throw new Error(`Download failed: ${response.statusText}`)
@@ -154,11 +159,10 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
       // raw bytes pretending to be one. Browser-rendered .pptx
       // previews live inside PptxPreviewRenderer (canvas-based),
       // mounted by the in-app dialog rather than a standalone tab.
-      const apiUrl = getApiUrl()
       const isPptx = filePreview.fileName.toLowerCase().endsWith('.pptx')
       const fileUrl = isPptx
-        ? `${apiUrl}/api/files/download/${encodeURIComponent(filePreview.fileId)}`
-        : getFilePublicPreviewUrl(filePreview.fileId, apiUrl)
+        ? getFileDownloadUrl(filePreview.fileId)
+        : fileAccess.inlinePreviewUrl(filePreview.fileId)
 
       // Open in new window/tab
       window.open(fileUrl, '_blank')
@@ -272,6 +276,7 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
               isLoading={filePreview.isLoading}
               error={filePreview.error}
               viewMode={viewMode}
+              filesDisabled={filesDisabled}
             />
           </div>
         </div>

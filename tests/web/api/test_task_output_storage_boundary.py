@@ -16,6 +16,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -47,6 +48,7 @@ def _seed_running_task(*, runner_id: str, run_id: str) -> tuple[int, int]:
             user_id=int(user.id),
             title="Durable output",
             status=TaskStatus.RUNNING,
+            lease_attempt_id="test-attempt",
             runner_id=runner_id,
             run_id=run_id,
         )
@@ -84,7 +86,7 @@ def test_output_prepare_excludes_compensating_metadata() -> None:
     finally:
         db.close()
 
-    prepared = websocket_api._prepare_task_file_outputs_isolated(
+    prepared = task_execution_service._prepare_task_file_outputs_isolated(
         task_id=task_id,
         task_user_id=user_id,
         file_outputs=[{"file_id": "compensating-output"}],
@@ -117,7 +119,7 @@ async def test_output_path_resolution_releases_pool_between_multiple_outputs(
 
     second_resolution_started = threading.Event()
     allow_second_resolution = threading.Event()
-    original_resolve = websocket_api._resolve_output_storage_path
+    original_resolve = task_execution_service._resolve_output_storage_path
     resolution_count = 0
 
     def gated_resolve(raw_path: str):
@@ -130,15 +132,15 @@ async def test_output_path_resolution_releases_pool_between_multiple_outputs(
         return resolved
 
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "_resolve_output_storage_path",
         gated_resolve,
     )
-    prepared: websocket_api._PreparedTaskFileOutputs | None = None
+    prepared: task_execution_service._PreparedTaskFileOutputs | None = None
     try:
         worker = asyncio.create_task(
             asyncio.to_thread(
-                websocket_api._prepare_task_file_outputs_isolated,
+                task_execution_service._prepare_task_file_outputs_isolated,
                 task_id=task_id,
                 task_user_id=user_id,
                 file_outputs=[
@@ -154,7 +156,7 @@ async def test_output_path_resolution_releases_pool_between_multiple_outputs(
     finally:
         allow_second_resolution.set()
         if prepared is not None:
-            websocket_api._settle_prepared_task_file_outputs(
+            task_execution_service._settle_prepared_task_file_outputs(
                 prepared,
                 metadata_committed=False,
             )
@@ -184,7 +186,7 @@ async def test_output_path_resolution_releases_pool_after_owner_lookup(
 
     resolution_started = threading.Event()
     allow_resolution = threading.Event()
-    original_resolve = websocket_api._resolve_output_storage_path
+    original_resolve = task_execution_service._resolve_output_storage_path
 
     def gated_resolve(raw_path: str):
         resolved = original_resolve(raw_path)
@@ -193,15 +195,15 @@ async def test_output_path_resolution_releases_pool_after_owner_lookup(
         return resolved
 
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "_resolve_output_storage_path",
         gated_resolve,
     )
-    prepared: websocket_api._PreparedTaskFileOutputs | None = None
+    prepared: task_execution_service._PreparedTaskFileOutputs | None = None
     try:
         worker = asyncio.create_task(
             asyncio.to_thread(
-                websocket_api._prepare_task_file_outputs_isolated,
+                task_execution_service._prepare_task_file_outputs_isolated,
                 task_id=task_id,
                 task_user_id=None,
                 file_outputs=[{"path": str(output_path), "filename": output_path.name}],
@@ -215,7 +217,7 @@ async def test_output_path_resolution_releases_pool_after_owner_lookup(
     finally:
         allow_resolution.set()
         if prepared is not None:
-            websocket_api._settle_prepared_task_file_outputs(
+            task_execution_service._settle_prepared_task_file_outputs(
                 prepared,
                 metadata_committed=False,
             )
@@ -259,7 +261,7 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
     try:
         staging = asyncio.create_task(
             asyncio.to_thread(
-                websocket_api._prepare_task_file_outputs_isolated,
+                task_execution_service._prepare_task_file_outputs_isolated,
                 task_id=task_id,
                 task_user_id=user_id,
                 file_outputs=[{"path": str(output_path), "filename": "a.txt"}],
@@ -282,13 +284,14 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
         prepared = await staging
         assert "/_versions/" in prepared.staged_files[0].storage_key
 
-        finalized = websocket_api._finalize_task_execution_result_isolated(
+        finalized = task_execution_service._finalize_task_execution_result_isolated(
             task_id=task_id,
             task_user_id=user_id,
             pre_run_status=TaskStatus.RUNNING,
             result={"success": True, "output": "done", "file_outputs": []},
             expected_run_id="run-a",
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="runner-a",
                 run_id="run-a",
@@ -300,6 +303,7 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
         assert not finalized.late_result
         check_db = _direct_db_session()
         try:
+            assert check_db.get(Task, task_id).output == "done"
             assert (
                 check_db.query(UploadedFile)
                 .filter(UploadedFile.task_id == task_id)
@@ -351,7 +355,7 @@ async def test_takeover_during_output_upload_cannot_commit_old_run_metadata(
     try:
         staging = asyncio.create_task(
             asyncio.to_thread(
-                websocket_api._prepare_task_file_outputs_isolated,
+                task_execution_service._prepare_task_file_outputs_isolated,
                 task_id=task_id,
                 task_user_id=user_id,
                 file_outputs=[{"path": str(output_path), "filename": "stale.txt"}],
@@ -371,13 +375,14 @@ async def test_takeover_during_output_upload_cannot_commit_old_run_metadata(
 
         allow_put.set()
         prepared = await staging
-        finalized = websocket_api._finalize_task_execution_result_isolated(
+        finalized = task_execution_service._finalize_task_execution_result_isolated(
             task_id=task_id,
             task_user_id=user_id,
             pre_run_status=TaskStatus.RUNNING,
             result={"success": True, "output": "stale", "file_outputs": []},
             expected_run_id="run-old",
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="runner-old",
                 run_id="run-old",
@@ -441,7 +446,7 @@ def test_metadata_version_change_rolls_back_entire_task_finalization(
             db.close()
 
         output_path.write_text("stale finalizer bytes", encoding="utf-8")
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": "cas.txt"}],
@@ -469,7 +474,7 @@ def test_metadata_version_change_rolls_back_entire_task_finalization(
             concurrent_db.close()
 
         with pytest.raises(UploadedFileVersionConflict):
-            websocket_api._finalize_task_execution_result_isolated(
+            task_execution_service._finalize_task_execution_result_isolated(
                 task_id=task_id,
                 task_user_id=user_id,
                 pre_run_status=TaskStatus.RUNNING,
@@ -480,6 +485,7 @@ def test_metadata_version_change_rolls_back_entire_task_finalization(
                 },
                 expected_run_id="cas-run",
                 task_lease=TaskLease(
+                    attempt_id="test-attempt",
                     task_id=task_id,
                     runner_id="cas-runner",
                     run_id="cas-run",
@@ -530,13 +536,13 @@ def test_resumed_finalizer_uses_same_prepared_output_transaction(
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     get_unscoped_file_storage.cache_clear()
     try:
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": "resume.txt"}],
             resolved_scope_segments=(),
         )
-        finalized = websocket_api._finalize_resumed_task(
+        finalized = task_execution_service._finalize_resumed_task(
             task_id,
             status="completed",
             success=True,
@@ -544,6 +550,7 @@ def test_resumed_finalizer_uses_same_prepared_output_transaction(
             task_owner_user_id=user_id,
             result={"success": True, "output": "resume done", "file_outputs": []},
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="resume-runner",
                 run_id="resume-run",
@@ -610,7 +617,7 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
             db.close()
 
         output_path.write_text("stale replacement", encoding="utf-8")
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": "versioned.txt"}],
@@ -627,7 +634,7 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
         finally:
             takeover_db.close()
 
-        finalized = websocket_api._finalize_resumed_task(
+        finalized = task_execution_service._finalize_resumed_task(
             task_id,
             status="completed",
             success=True,
@@ -635,6 +642,7 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
             task_owner_user_id=user_id,
             result={"success": True, "output": "stale", "file_outputs": []},
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="version-runner-old",
                 run_id="version-run-old",
@@ -706,7 +714,7 @@ def test_superseded_output_is_deleted_only_after_exact_metadata_commit(
             db.close()
 
         output_path.write_text("new bytes", encoding="utf-8")
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": "committed.txt"}],
@@ -717,7 +725,9 @@ def test_superseded_output_is_deleted_only_after_exact_metadata_commit(
         assert storage.exists(old_key)
         assert storage.exists(new_key)
 
-        original_cleanup = websocket_api.cleanup_superseded_uploaded_file_objects
+        original_cleanup = (
+            task_execution_service.cleanup_superseded_uploaded_file_objects
+        )
         cleanup_observations: list[tuple[str, TaskStatus]] = []
 
         def observe_committed_metadata(claims):  # type: ignore[no-untyped-def]
@@ -737,17 +747,18 @@ def test_superseded_output_is_deleted_only_after_exact_metadata_commit(
             return original_cleanup(claims)
 
         monkeypatch.setattr(
-            websocket_api,
+            task_execution_service,
             "cleanup_superseded_uploaded_file_objects",
             observe_committed_metadata,
         )
-        finalized = websocket_api._finalize_task_execution_result_isolated(
+        finalized = task_execution_service._finalize_task_execution_result_isolated(
             task_id=task_id,
             task_user_id=user_id,
             pre_run_status=TaskStatus.RUNNING,
             result={"success": True, "output": "done", "file_outputs": []},
             expected_run_id="commit-run",
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="commit-runner",
                 run_id="commit-run",
@@ -811,7 +822,7 @@ def _assert_cleanup_failure_does_not_reclassify_committed_finalization(
             db.close()
 
         output_path.write_text("new bytes", encoding="utf-8")
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": output_path.name}],
@@ -843,17 +854,18 @@ def _assert_cleanup_failure_does_not_reclassify_committed_finalization(
             raise RuntimeError("cleanup reference query unavailable")
 
         monkeypatch.setattr(
-            websocket_api,
+            task_execution_service,
             "cleanup_superseded_uploaded_file_objects",
             fail_cleanup_after_commit,
         )
         lease = TaskLease(
+            attempt_id="test-attempt",
             task_id=task_id,
             runner_id=runner_id,
             run_id=run_id,
         )
         if resume:
-            resumed_finalization = websocket_api._finalize_resumed_task(
+            resumed_finalization = task_execution_service._finalize_resumed_task(
                 task_id,
                 status="completed",
                 success=True,
@@ -867,7 +879,7 @@ def _assert_cleanup_failure_does_not_reclassify_committed_finalization(
             assert resumed_finalization["final_status"] == TaskStatus.COMPLETED.value
         else:
             background_finalization = (
-                websocket_api._finalize_task_execution_result_isolated(
+                task_execution_service._finalize_task_execution_result_isolated(
                     task_id=task_id,
                     task_user_id=user_id,
                     pre_run_status=TaskStatus.RUNNING,
@@ -1096,15 +1108,17 @@ async def test_cancelled_output_staging_compensates_late_result_before_return(
     stage_started = threading.Event()
     allow_stage = threading.Event()
     compensation_finished = threading.Event()
-    prepared = websocket_api._PreparedTaskFileOutputs((), (), ())
+    prepared = task_execution_service._PreparedTaskFileOutputs((), (), ())
 
-    def gated_stage(**_kwargs: Any) -> websocket_api._PreparedTaskFileOutputs:
+    def gated_stage(
+        **_kwargs: Any,
+    ) -> task_execution_service._PreparedTaskFileOutputs:
         stage_started.set()
         assert allow_stage.wait(timeout=3)
         return prepared
 
     def record_compensation(
-        actual: websocket_api._PreparedTaskFileOutputs,
+        actual: task_execution_service._PreparedTaskFileOutputs,
         *,
         metadata_committed: bool,
     ) -> None:
@@ -1113,18 +1127,18 @@ async def test_cancelled_output_staging_compensates_late_result_before_return(
         compensation_finished.set()
 
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "_prepare_task_file_outputs_isolated",
         gated_stage,
     )
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "_settle_prepared_task_file_outputs",
         record_compensation,
     )
 
     staging = asyncio.create_task(
-        websocket_api._prepare_task_file_outputs_cancellation_safe(
+        task_execution_service._prepare_task_file_outputs_cancellation_safe(
             task_id=42,
             task_user_id=1,
             file_outputs=[{"path": "/slow/output.txt"}],
@@ -1145,11 +1159,16 @@ async def test_cancelled_output_staging_compensates_late_result_before_return(
 
 @pytest.mark.asyncio
 async def test_resume_output_staging_finishes_while_heartbeat_is_still_active() -> None:
-    lease = TaskLease(task_id=42, runner_id="resume-runner", run_id="resume-run")
+    lease = TaskLease(
+        attempt_id="test-attempt",
+        task_id=42,
+        runner_id="resume-runner",
+        run_id="resume-run",
+    )
     heartbeat_stop = asyncio.Event()
     stage_started = threading.Event()
     allow_stage = threading.Event()
-    prepared = websocket_api._PreparedTaskFileOutputs((), (), ())
+    prepared = task_execution_service._PreparedTaskFileOutputs((), (), ())
 
     async def heartbeat() -> TaskLeaseHeartbeatOutcome:
         await heartbeat_stop.wait()
@@ -1176,7 +1195,9 @@ async def test_resume_output_staging_finishes_while_heartbeat_is_still_active() 
         async def interrupt_reason_for_quota(self) -> None:
             return None
 
-    def gated_stage(**_kwargs: Any) -> websocket_api._PreparedTaskFileOutputs:
+    def gated_stage(
+        **_kwargs: Any,
+    ) -> task_execution_service._PreparedTaskFileOutputs:
         assert not heartbeat_stop.is_set()
         assert not heartbeat_task.done()
         stage_started.set()
@@ -1216,23 +1237,27 @@ async def test_resume_output_staging_finishes_while_heartbeat_is_still_active() 
 
     with (
         patch(
-            "xagent.web.api.websocket._prepare_task_file_outputs_isolated",
+            "xagent.web.services.task_execution._prepare_task_file_outputs_isolated",
             side_effect=gated_stage,
         ),
         patch(
-            "xagent.web.api.websocket._finalize_resumed_task",
+            "xagent.web.services.task_execution._finalize_resumed_task",
             side_effect=finalize,
         ),
         patch(
             "xagent.web.api.websocket.manager",
             MagicMock(broadcast_to_task=AsyncMock()),
         ),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
-        patch("xagent.web.api.websocket.background_task_manager.cleanup_task"),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+        ),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager.cleanup_task"
+        ),
         patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
     ):
         resume_task = asyncio.create_task(
-            websocket_api.execute_resume_background(
+            task_execution_service.execute_resume_background(
                 task_id=42,
                 agent_service=agent_service,
                 task_owner_user_id=1,

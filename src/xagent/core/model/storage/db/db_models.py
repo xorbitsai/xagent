@@ -7,6 +7,8 @@ from cryptography.fernet import Fernet
 from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String, Text
 from sqlalchemy.sql import func
 
+from .....config import DEV_FALLBACK_ENCRYPTION_KEY
+
 
 def create_model_table(Base: Type[Any]) -> Type[Any]:
     """
@@ -46,6 +48,7 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
             JSON, nullable=True
         )  # Model abilities: ["chat", "vision", etc.]
         description = Column(Text, nullable=True)
+        managed_by = Column(String(50), nullable=True)
         max_retries = Column(Integer, nullable=True, default=10)
         created_at = Column(DateTime(timezone=True), server_default=func.now())
         updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -67,7 +70,7 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
             encryption_key = os.getenv("ENCRYPTION_KEY")
             if not encryption_key:
                 # FIXME: For dev only
-                return "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
+                return DEV_FALLBACK_ENCRYPTION_KEY
             return encryption_key
 
         @property

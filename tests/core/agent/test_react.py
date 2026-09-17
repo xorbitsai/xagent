@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
 import re
+import unicodedata
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +22,15 @@ from xagent.core.agent import (
     ToolCallInterrupted,
     ToolCallRecord,
 )
+from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
+from xagent.core.agent.pattern.react.react import (
+    _INTERACTION_TRIM_CHARS,
+    _normalize_ask_user_interactions,
+)
+from xagent.core.agent.result import tool_result_succeeded
+from xagent.core.agent.runtime import NO_DELIVERABLE_FINAL_ANSWER_REASON
+from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -41,6 +54,10 @@ class SearchArgs(BaseModel):
     count: int = 10
 
 
+class EmptyArgs(BaseModel):
+    pass
+
+
 class FakeTool:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -58,6 +75,18 @@ class FakeTool:
         self.calls.append(args)
         expression = args["expression"]
         return {"result": eval(expression), "expression": expression}  # noqa: S307
+
+
+class FakeWorkspaceOutputTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = WORKSPACE_OUTPUT_FILES_TOOL_NAME
+            description = "List output files from the current workspace."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
 
 
 class FakeWriteFileTool:
@@ -239,6 +268,26 @@ class IsErrorResultTool:
         }
 
 
+class ClassifiedFailureResultTool:
+    def __init__(self) -> None:
+        class Metadata:
+            name = "classified_failure_result"
+            description = "Returns a classified delegated-agent failure."
+
+        self.metadata = Metadata()
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {
+            "success": False,
+            "is_error": True,
+            "status": "error",
+            "failure_code": "unsupported_nested_interaction",
+            "error": "Nested agent calls cannot forward interactive prompts.",
+            "output": "Nested agent calls cannot forward interactive prompts.",
+            "response": "Nested agent calls cannot forward interactive prompts.",
+        }
+
+
 class FakeAskUserTool:
     def __init__(self) -> None:
         class Metadata:
@@ -287,6 +336,12 @@ class FakeLLM:
     async def chat(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         return self.responses.pop(0)
+
+
+class FakeNamedLLM(FakeLLM):
+    """FakeLLM carrying a ``model_name``, for tests that assert on it in logs."""
+
+    model_name = "fake-model"
 
 
 class StreamingFinalAnswerLLM:
@@ -655,29 +710,116 @@ class StreamingFinalAnswerToolLLM:
 
 
 class StreamingMixedFinalAnswerAndToolLLM:
+    """First call bundles final_answer with a work tool; the retry answers for real."""
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
     async def chat(self, **kwargs: Any) -> Any:
         raise AssertionError("streaming mixed tool path should not call chat()")
 
     async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Candidate"}',
+                        },
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
         yield StreamChunk(
             type=ChunkType.TOOL_CALL,
             tool_calls=[
                 {
-                    "index": 0,
-                    "id": "call_final",
+                    "id": "call_final_2",
                     "function": {
                         "name": "final_answer",
-                        "arguments": '{"answer":"Candidate"}',
+                        "arguments": '{"answer":"4"}',
                     },
-                },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingAnswerThenWorkToolLLM:
+    """Streams a final_answer candidate before the batch also names a work tool.
+
+    Exercises the case where the answer streamer has already emitted content
+    by the time the work tool's name shows up in a later chunk of the same
+    response, so the strip point is the only place left to close the stream.
+    """
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming answer-then-tool path should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            prefix = '{"answer":"'
+            for arguments in [
+                prefix + "Looking",
+                prefix + "Looking that up now.",
+                prefix + 'Looking that up now."}',
+            ]:
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_final",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
+                )
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 1,
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
                 {
-                    "index": 1,
-                    "id": "call_calc",
+                    "id": "call_final_2",
                     "function": {
-                        "name": "calculator",
-                        "arguments": '{"expression":"2+2"}',
+                        "name": "final_answer",
+                        "arguments": '{"answer":"4"}',
                     },
-                },
+                }
             ],
         )
         yield StreamChunk(type=ChunkType.END)
@@ -751,6 +893,44 @@ class StreamingRepeatedGuardFinalAnswerLLM:
                     }
                 ],
             )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class ScriptedStreamLLM:
+    """Streams one scripted tool-call batch per ``stream_chat`` call.
+
+    Each batch is a list of ``(tool_name, args_dict)`` pairs. Every call's
+    arguments are streamed in two fragments (a truncated prefix, then the
+    full JSON) so the answer streamer sees a partial candidate before the
+    complete one, matching the production streaming shape. This is the one
+    general-purpose fake model for the #486 batch-shape matrix - covering a
+    new shape means adding a batch here, not a new fake model class.
+    """
+
+    def __init__(self, batches: list[list[tuple[str, dict[str, Any]]]]) -> None:
+        self.batches = batches
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("ScriptedStreamLLM should not fall back to chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        index = min(len(self.stream_calls) - 1, len(self.batches) - 1)
+        for position, (name, args) in enumerate(self.batches[index]):
+            serialized = json.dumps(args)
+            cut = max(1, len(serialized) // 2)
+            for fragment in (serialized[:cut], serialized):
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": position,
+                            "id": f"call_{position}",
+                            "function": {"name": name, "arguments": fragment},
+                        }
+                    ],
+                )
         yield StreamChunk(type=ChunkType.END)
 
 
@@ -932,10 +1112,11 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert llm.calls[0]["tools"][0]["function"]["name"] == "calculator"
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "latest user message" in system_prompt
-    assert re.search(r"Current date \(UTC\): \d{4}-\d{2}-\d{2}", system_prompt)
+    assert re.search(r"Turn-start date \(UTC\): \d{4}-\d{2}-\d{2}", system_prompt)
     assert "use this date when forming search queries" in system_prompt
     assert "not supported by the conversation" in system_prompt
     assert "available context is insufficient" in system_prompt
+    assert "quantitative data" in system_prompt
     assert "Do not write assistant text in the same response as a work tool call" in (
         system_prompt
     )
@@ -1067,6 +1248,10 @@ async def test_react_pattern_streams_only_final_answer_after_tool_call() -> None
     assert [tool["function"]["name"] for tool in llm.stream_calls[1]["tools"]] == [
         "final_answer"
     ]
+    forced_answer_description = llm.stream_calls[1]["tools"][0]["function"][
+        "parameters"
+    ]["properties"]["answer"]["description"]
+    assert "get_workspace_output_files" not in forced_answer_description
     assert llm.stream_calls[1]["tool_choice"] == "required"
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
@@ -1103,6 +1288,13 @@ async def test_react_recovers_unavailable_forced_final_with_full_tool_set() -> N
         "Re-decide this turn using the complete current tool set"
         in llm.stream_calls[2]["messages"][0]["content"]
     )
+    # stream_calls[1] is the forced final-answer turn. Assert the no-tools
+    # grounding variant specifically: both branches carry the rule, so only the
+    # can_call_tools=False wording proves run() reached the forced branch.
+    forced_final_prompt = llm.stream_calls[1]["messages"][0]["content"]
+    assert "quantitative data" in forced_final_prompt
+    assert "invented values" in forced_final_prompt
+    assert "use an appropriate tool" not in forced_final_prompt
     recovery_starts = [
         event
         for event in tracer.events
@@ -1304,6 +1496,193 @@ def test_react_accepts_null_tool_calls_in_forced_final_response() -> None:
     )
 
 
+def test_react_grounding_rule_present_in_both_answer_paths() -> None:
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Build a KPI report")
+
+    tool_prompt = pattern._messages_for_llm(
+        context, has_tools=True, tool_names=["calculator"]
+    )[0]["content"]
+    lookup_tool_prompt = pattern._messages_for_llm(
+        context,
+        has_tools=True,
+        tool_names=[WORKSPACE_OUTPUT_FILES_TOOL_NAME, "final_answer"],
+    )[0]["content"]
+    forced_prompt = pattern._messages_for_llm(
+        context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
+    )[0]["content"]
+
+    for prompt in (tool_prompt, lookup_tool_prompt, forced_prompt):
+        assert "quantitative data" in prompt
+        assert (
+            "a current user request that explicitly asks you to write a template"
+            in prompt
+        )
+        assert "This does not restrict the wording you compose" in prompt
+    assert "use an appropriate tool to verify" in tool_prompt
+    assert "use an appropriate tool" not in forced_prompt
+    for prompt in (tool_prompt, lookup_tool_prompt):
+        assert "tool-call arguments that assert facts" in prompt
+        assert "never guess one" in prompt
+    assert "tool-call arguments that assert facts" not in forced_prompt
+    assert "## FINAL DELIVERABLE FILE REFERENCES" not in tool_prompt
+    assert "exact markdown_link" in tool_prompt
+    assert "lookup is unavailable" in tool_prompt
+    assert "call get_workspace_output_files once before finalizing" not in tool_prompt
+    assert (
+        "call get_workspace_output_files once before finalizing" in lookup_tool_prompt
+    )
+    assert forced_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
+    assert "call get_workspace_output_files once before finalizing" not in forced_prompt
+
+
+def test_react_forced_final_answer_respects_prior_clarification_scope() -> None:
+    """A selected subset must stay the scope at the moment the model writes
+    the user-visible answer, not just while it can still call tools.
+
+    Without this, a sweep that already ran before the user narrowed the
+    request (list every conversation, then ask which to review) leaves data
+    about the unselected ones sitting in tool results — and nothing stopped
+    the forced final-answer turn from reporting on it anyway (PR #2099
+    review, F4)."""
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("check my channels for action items")
+
+    forced_prompt = pattern._messages_for_llm(
+        context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
+    )[0]["content"]
+
+    assert "narrowed the request to a selected" in forced_prompt
+    assert (
+        "leave out anything outside it even if an earlier tool call already "
+        "returned data about it" in forced_prompt
+    )
+
+
+@pytest.mark.parametrize("user_interaction_enabled", [True, False])
+def test_react_missing_argument_value_instruction_matches_interaction_policy(
+    user_interaction_enabled: bool,
+) -> None:
+    """A missing argument value routes to whichever remedy the run allows.
+
+    The grounding rule tells the model to classify an unsourced fact-carrying
+    argument as missing information; this instruction is what turns that
+    classification into an action, and the two branches must never both be
+    present.
+    """
+    ask_instruction = (
+        "including a fact-carrying argument value (one that asserts a "
+        "real-world fact) the user has not provided, call ask_user_question"
+    )
+    blocked_instruction = (
+        "including a fact-carrying argument value (one that asserts a "
+        "real-world fact) the user has not provided, do not ask the user"
+    )
+    pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("update Jane Doe")
+
+    # tool_names is derived per branch only to keep the input shaped like
+    # production, where the interaction control tools are filtered out of the
+    # schema when interaction is disabled. It drives nothing here:
+    # missing_information_instruction never reads tool_names, so every
+    # assertion below is driven solely by user_interaction_enabled.
+    tool_names = ["update_record"]
+    if user_interaction_enabled:
+        tool_names.append("ask_user_question")
+    prompt = pattern._messages_for_llm(context, has_tools=True, tool_names=tool_names)[
+        0
+    ]["content"]
+
+    # The subset-selection rule describes how to read an ask_user_question
+    # answer, so it travels with the branch where that tool exists; a run that
+    # cannot ask must not be told how to interpret an answer it can't receive.
+    # It's scoped to questions about which items/resources to act on (not
+    # every ask_user_question, e.g. a format pick) — see PR #2099 review.
+    subset_instruction = (
+        "that asked which items or resources to act on by selecting a "
+        "subset of the offered options, that selection is the complete "
+        "scope for that work"
+    )
+
+    if user_interaction_enabled:
+        assert ask_instruction in prompt
+        assert blocked_instruction not in prompt
+        assert "do not fill the value in yourself" in prompt
+        assert subset_instruction in prompt
+        assert "even ones that are already accessible" in prompt
+        assert "or that fit the original request" in prompt
+    else:
+        assert blocked_instruction in prompt
+        assert ask_instruction not in prompt
+        assert "finish with outcome=blocked and explain what is missing" in prompt
+        assert subset_instruction not in prompt
+
+
+@pytest.mark.asyncio
+async def test_react_tool_argument_rule_tracks_ask_user_question_availability() -> None:
+    """The prohibition and its remedy must reach the model on the same call.
+
+    The grounding rule tells the model to treat an unsourceable fact-carrying
+    argument as missing information; ask_user_question is the tool that acts on
+    that classification. Telling the model not to invent a value on a turn
+    where it cannot ask for one would leave it with no legal move. Both are
+    gated by ``force_final_answer`` today, so the coupling holds only
+    incidentally; this pins both directions of it against a later change that
+    narrows one gate without the other.
+    """
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Need calculation.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "final_call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"The result is 4."}',
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Calculate 2+2")
+
+    result = await pattern.run(context=context, tools=[FakeTool()], llm=llm)
+
+    assert result["success"] is True
+    coupling = [
+        (
+            "ask_user_question"
+            in [schema["function"]["name"] for schema in call["tools"]],
+            "tool-call arguments that assert facts" in call["messages"][0]["content"],
+        )
+        for call in llm.calls
+    ]
+    # One run covers both cells: the open turn offers ask_user_question and
+    # carries the rule, the forced final turn offers neither.
+    assert coupling == [(True, True), (False, False)]
+
+
 @pytest.mark.asyncio
 async def test_react_closes_invalid_initial_final_answer_stream_before_retry() -> None:
     llm = StreamingInvalidToolProtocolFinalAnswerLLM(
@@ -1500,24 +1879,811 @@ async def test_react_pattern_streams_final_answer_control_tool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_react_pattern_does_not_stream_mixed_final_answer_candidate() -> None:
+async def test_react_strips_final_answer_bundled_before_work_tool() -> None:
+    """I-2: a final_answer bundled before a work tool is stripped too - the
+    work tool is no longer silently discarded, and the candidate answer text
+    is never streamed to the frontend."""
+
     llm = StreamingMixedFinalAnswerAndToolLLM()
-    pattern = ReActPattern(max_iterations=1)
+    pattern = ReActPattern(max_iterations=3)
     context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
     context.add_user_message("Calculate 2+2")
     outbound = OutboundCollector()
     runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    tool = FakeTool()
 
     result = await pattern.run(
         context=context,
-        tools=[FakeTool()],
+        tools=[tool],
         llm=llm,
         runtime=runtime,
     )
 
     assert result["success"] is True
-    assert result["response"] == "Candidate"
-    assert outbound.events == []
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert not any(
+        event.get("content") == "Candidate" or event.get("delta") == "Candidate"
+        for event in outbound.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_strips_final_answer_bundled_after_work_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-1/I-3/I-5: a final_answer bundled after a work tool is stripped, the
+    work tool executes and its result reaches the next turn, and the strip is
+    logged once with the model name and the pre-strip tool list, bounded and
+    escaped."""
+
+    llm = FakeNamedLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+
+    # I-3: the stripped final_answer leaves no trace in the assistant
+    # message, the tool-result messages, or the ledger.
+    assistant_messages = context.get_messages_by_role("assistant")
+    first_turn_tool_names = [
+        call["function"]["name"] for call in (assistant_messages[0].tool_calls or [])
+    ]
+    assert first_turn_tool_names == ["calculator"]
+    tool_result_ids = {
+        message.tool_call_id for message in context.get_messages_by_role("tool")
+    }
+    assert "call_final" not in tool_result_ids
+    assert "call_final" not in pattern.tool_ledger
+
+    # Regression-only guard, not a mutation-effective assertion on its own:
+    # no orphaned tool_call may ever appear in history.
+    assistant_tool_call_ids = {
+        call["id"]
+        for message in assistant_messages
+        for call in (message.tool_calls or [])
+    }
+    assert assistant_tool_call_ids == tool_result_ids
+
+    all_content = json.dumps(
+        [message.content for message in context.messages], default=str
+    )
+    assert "Looking that up now." not in all_content
+
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["messages"][-1]["role"] == "tool"
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 1
+    assert "final_answer" in messages[0]
+    assert "calculator" in messages[0]
+    assert "fake-model" in messages[0]
+
+    # I-5 (bound): the tool-name list in the warning is capped, escaped, and
+    # never exposes an unbounded or unescaped model-controlled string.
+    caplog.clear()
+    long_name = "x" * 200 + "\n" + "y"
+    overflow_tool_calls = [
+        {"id": "call_long", "function": {"name": long_name, "arguments": "{}"}},
+        *(
+            {
+                "id": f"call_work_{index}",
+                "function": {"name": f"work_tool_{index}", "arguments": "{}"},
+            }
+            for index in range(10)
+        ),
+        {
+            "id": "call_overflow_final",
+            "function": {
+                "name": "final_answer",
+                "arguments": '{"answer":"Looking that up now."}',
+            },
+        },
+    ]
+    overflow_llm = FakeNamedLLM(responses=[{"tool_calls": overflow_tool_calls}])
+    overflow_pattern = ReActPattern(max_iterations=1)
+    overflow_context = ExecutionContext(
+        system_prompt="You are helpful.", execution_id="task-2"
+    )
+    overflow_context.add_user_message("Run many tools")
+    overflow_runtime = PatternRuntime(execution_id="task-2")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        await overflow_pattern.run(
+            context=overflow_context,
+            tools=[],
+            llm=overflow_llm,
+            runtime=overflow_runtime,
+        )
+
+    overflow_messages = [record.getMessage() for record in caplog.records]
+    assert len(overflow_messages) == 1
+    overflow_message = overflow_messages[0]
+    assert "(+4 more)" in overflow_message
+    assert "\n" not in overflow_message
+    assert ("x" * 64) in overflow_message
+    assert ("x" * 65) not in overflow_message
+
+
+def test_tool_names_for_log_tolerates_non_mapping_entries() -> None:
+    """Matches the isinstance(dict) defense in _batch_carries_work_tool and
+    _strip_final_answer_bundled_with_work_tools: a non-mapping batch entry
+    must render a placeholder instead of crashing the log line it appears
+    in."""
+
+    pattern = ReActPattern()
+
+    rendered = pattern._tool_names_for_log(
+        [
+            {"id": "call_1", "name": "calculator"},
+            "not-a-tool-call",
+            None,
+        ]
+    )
+
+    assert "calculator" in rendered
+    assert "non-mapping tool_call: str" in rendered
+    assert "non-mapping tool_call: NoneType" in rendered
+
+
+@pytest.mark.asyncio
+async def test_react_strips_every_final_answer_in_a_mixed_batch() -> None:
+    """I-4: every final_answer in a batch is stripped, not only the first."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_a",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"A"}',
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_b",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"B"}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["response"] not in {"A", "B"}
+    assert result["response"] == "4"
+    assistant_messages = context.get_messages_by_role("assistant")
+    first_turn_tool_calls = assistant_messages[0].tool_calls or []
+    assert len(first_turn_tool_calls) == 1
+    assert first_turn_tool_calls[0]["function"]["name"] == "calculator"
+
+
+@pytest.mark.asyncio
+async def test_react_closes_open_answer_stream_when_bundled_final_answer_is_stripped() -> (
+    None
+):
+    """I-6: an answer stream already open when the batch turns out to bundle
+    a work tool is closed explicitly instead of left open forever, and it is
+    never closed as though the candidate text were the real final answer."""
+
+    llm = StreamingAnswerThenWorkToolLLM()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+
+    started_id = next(
+        event["message_id"]
+        for event in outbound.events
+        if event["type"] == "final_answer_start"
+    )
+    first_stream_events = []
+    for event in outbound.events:
+        if event.get("message_id") != started_id:
+            continue
+        first_stream_events.append(event)
+        if event["type"] == "final_answer_error":
+            break
+
+    assert [event["type"] for event in first_stream_events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_error",
+    ]
+    assert not any(
+        event["type"] == "final_answer_end"
+        and event.get("content") == "Looking that up now."
+        for event in outbound.events
+    )
+    assert outbound.events[-1]["type"] == "final_answer_end"
+    assert outbound.events[-1]["content"] == "4"
+
+
+@pytest.mark.asyncio
+async def test_react_keeps_send_message_bundled_with_work_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Guards against a future change that widens the strip from final_answer
+    to every control tool. This test stays green if the strip is removed
+    entirely - it pins behavior that must not change, not behavior this fix
+    introduces."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_message",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Still working",'
+                                '"message_type":"progress","expect_response":false}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(runtime.outbound_messages) == 1
+    assert runtime.outbound_messages[0]["message"] == "Still working"
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_react_keeps_control_only_final_answer_batch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same guard shape as the send_message case: a batch of control tools
+    only has no result the answer could be missing, so the strip must not
+    touch it. Green with or without the strip."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_message",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Still working",'
+                                '"message_type":"progress","expect_response":false}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Done."}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Do the thing")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "Done."
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_react_forced_final_answer_recovers_full_tool_set_after_mixed_batch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-9a: guards the forced-final-answer turn's existing recovery path.
+    This test stays green if the strip is removed entirely - it pins
+    behavior that must not change, not behavior this fix introduces."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_2",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    second_call_tool_names = {
+        schema["function"]["name"] for schema in llm.calls[1]["tools"]
+    }
+    assert "calculator" in second_call_tool_names
+    assert pattern.force_final_answer_next is False
+    assert tool.calls == [{"expression": "2+2"}]
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_react_forced_final_answer_fails_when_recovery_retry_bundles_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-9b: anchor test - pins the strip's position, not its existence.
+    Deleting the strip helper entirely leaves this green. Moving the strip
+    call to run ahead of either tool-protocol-retry guard check instead of
+    after both turns it red: on the first guard, because the strip fires and
+    logs before that response is discarded wholesale for an unrelated reason,
+    leaving a stray "discarding" warning behind; on the second (retry) guard,
+    because stripping the retried batch's final_answer erases the very
+    mixed-call shape that guard exists to reject, so the run no longer fails
+    at all - it runs the retried calculator and needs a third response the
+    fixture never provides."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_2",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert tool.calls == []
+    # The run fails through the existing invalid-protocol path, which logs
+    # its own unrelated warning; only the strip's warning must be absent.
+    assert not any("discarding" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_react_strips_empty_final_answer_from_a_retried_batch_when_not_reforcing() -> (
+    None
+):
+    """Guards the retry recheck's accepted behavior change: a retried batch
+    that is neither a forced turn nor itself rejecting mixed control calls
+    (reject_mixed_control_calls=False from a provider protocol error on the
+    first response, force_final_answer=False because this was never a forced
+    turn) now lets a bundled empty final_answer strip and the work tool run,
+    instead of hard-failing as "invalid tool protocol after retry". The
+    first response's provider-level protocol error is what puts the run on
+    the retry path at all; the retried response is the one carrying the
+    mixed batch this test is pinning."""
+
+    llm = FakeLLM(
+        responses=[
+            tool_protocol_error_response(
+                ToolProtocolViolation(
+                    provider="deepseek",
+                    code="serialized_tool_call_content",
+                    message="Invalid provider tool protocol.",
+                )
+            ),
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_work",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":""}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_react_strips_empty_final_answer_bundled_with_work_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-11: an empty-answer final_answer bundled with a work tool is
+    stripped like any other bundled final_answer, instead of discarding the
+    whole response the way a control-only empty answer does."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":""}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.calls) == 2
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("carried no answer text" in message for message in messages)
+    assert any(
+        "final_answer" in message and "calculator" in message for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_pauses_for_user_after_stripping_bundled_final_answer() -> None:
+    """I-12: a batch that turns out to need user input after the bundled
+    final_answer is stripped still pauses cleanly, with the unexecuted work
+    tool cancelled rather than silently dropped."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Done."}',
+                        },
+                    },
+                    {
+                        "id": "call_ask",
+                        "function": {
+                            "name": "ask_user_question",
+                            "arguments": '{"message":"Which one?"}',
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2 then ask me something")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert tool.calls == []
+    assert "call_final" not in pattern.tool_ledger
+    assert pattern.tool_ledger["call_calc"].status == "cancelled"
+    assert pattern.tool_ledger["call_ask"].status == "completed"
+
+    assistant_messages = context.get_messages_by_role("assistant")
+    assistant_tool_call_ids = {
+        call["id"]
+        for message in assistant_messages
+        for call in (message.tool_calls or [])
+    }
+    tool_result_ids = {
+        message.tool_call_id for message in context.get_messages_by_role("tool")
+    }
+    assert assistant_tool_call_ids == {"call_ask", "call_calc"}
+    assert assistant_tool_call_ids <= tool_result_ids
 
 
 @pytest.mark.asyncio
@@ -1542,6 +2708,42 @@ async def test_react_passes_runtime_step_to_browser_tool_call() -> None:
         {
             "url": "poster_en.html",
             "_xagent_step_id": "render_english_poster",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_passes_runtime_step_to_computer_tool_call() -> None:
+    class FakeComputerTool:
+        name = "computer"
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append(args)
+            return {"success": True}
+
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "inspect_browser"
+    tool = FakeComputerTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-computer",
+            "name": "computer",
+            "args": {"actions": [{"type": "screenshot"}]},
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is True
+    assert tool.calls == [
+        {
+            "actions": [{"type": "screenshot"}],
+            "_xagent_step_id": "inspect_browser",
         }
     ]
 
@@ -1903,6 +3105,9 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
     assert "Do not put user-facing final answer text in this decision" in (
         decision_prompt
     )
+    assert "private observations are evidence for reasoning" in decision_prompt
+    assert "requested computer screenshot" in decision_prompt
+    assert "artifact, file_ref, or markdown_link" in decision_prompt
     assert "future tool action" in decision_prompt
     assert "response_language" not in decision_prompt
     decision_schema = llm.calls[2]["tools"][0]["function"]["parameters"]
@@ -2834,7 +4039,10 @@ async def test_react_pattern_injects_memory_context_and_skill_index() -> None:
     skill_manager = FakeSkillManager()
     pattern = ReActPattern(max_iterations=3)
     context = ExecutionContext(system_prompt="You are helpful.")
-    context.add_user_message("Do the thing")
+    context.add_user_message(
+        "Do the thing\n\nAttached file: /private/runtime/input.txt",
+        metadata={"display_message": "Do the thing"},
+    )
 
     result = await pattern.run(
         context=context,
@@ -2849,6 +4057,10 @@ async def test_react_pattern_injects_memory_context_and_skill_index() -> None:
     assert [search["filters"]["category"] for search in memory_store.searches] == [
         "react_memory",
         "general",
+    ]
+    assert [search["query"] for search in memory_store.searches] == [
+        "Do the thing",
+        "Do the thing",
     ]
     first_system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "Use the stored project preference." in first_system_prompt
@@ -2980,20 +4192,35 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     )
     assert "Do not use it to confirm execution strategy" in ask_user_description
     assert "whether to use memory" in ask_user_description
+    assert (
+        "a fact-carrying value (one that asserts a real-world fact) for a tool "
+        "argument that the user has not provided" in ask_user_description
+    )
+    # The qualifier must match the grounding rule's scope: without it the
+    # description would invite pausing for a search query the model composes.
+    assert "require inventing a fact-carrying argument value" in ask_user_description
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "Only call tools that are present in the current tool schema" in (
         system_prompt
     )
     assert "tool names mentioned in memory" in system_prompt
     assert "call the final_answer tool exactly once" in system_prompt
+    assert (
+        "Never put final_answer in the same response as any other tool call"
+        in system_prompt
+    )
     final_answer_schema = next(
         schema
         for schema in llm.calls[0]["tools"]
         if schema["function"]["name"] == "final_answer"
     )["function"]
     assert (
-        "same natural language as the current user request"
+        "canonical language contract provided by the system context"
         in final_answer_schema["description"]
+    )
+    assert (
+        "Call this tool alone: never place it in the same response as any "
+        "other tool call" in final_answer_schema["description"]
     )
     assert "response_language" in final_answer_schema["parameters"]["required"]
     assert "outcome" in final_answer_schema["parameters"]["required"]
@@ -3010,7 +4237,97 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     assert "generic Chinese" in response_language_schema["description"]
     answer_schema = final_answer_schema["parameters"]["properties"]["answer"]
     assert "response_language" in answer_schema["description"]
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "canonical language contract" in answer_schema["description"]
+    assert "## FINAL DELIVERABLE FILE REFERENCES" not in answer_schema["description"]
+    assert "exact markdown_link" in answer_schema["description"]
+    assert "get_workspace_output_files" not in answer_schema["description"]
+
+
+def test_interaction_type_list_has_one_source() -> None:
+    from xagent.core.tools.adapters.vibe.ask_user_tool import InteractionArg
+    from xagent.core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+    from xagent.web.services.task_interaction_service import _V1_INTERACTION_TYPES
+
+    assert INTERACTION_TYPES == (
+        "select_one",
+        "select_multiple",
+        "text_input",
+        "file_upload",
+        "confirm",
+        "number_input",
+        "action_cards",
+    )
+    assert InteractionArg.model_fields["type"].description == (
+        "Type of interaction: select_one, select_multiple, text_input, "
+        "file_upload, confirm, number_input, action_cards"
+    )
+    assert frozenset(INTERACTION_TYPES) == _V1_INTERACTION_TYPES
+
+
+async def test_react_pattern_ask_user_question_schema_derives_its_type_enum_from_one_source() -> (
+    None
+):
+    """The ask_user_question tool's ``interactions[].type`` enum is built
+    from ``interaction_types.INTERACTION_TYPES`` rather than a copy written
+    out in this schema; a name added or reordered there must show up here
+    unchanged."""
+
+    from xagent.core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+
+    llm = FakeLLM(responses=[{"content": "No tools needed."}])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Say hi")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeAskUserTool()],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    ask_user_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "ask_user_question"
+    )["function"]
+    type_enum = ask_user_schema["parameters"]["properties"]["interactions"]["items"][
+        "properties"
+    ]["type"]["enum"]
+    assert type_enum == list(INTERACTION_TYPES)
+
+
+def test_react_module_pulls_in_no_web_modules() -> None:
+    """react.py must not depend on xagent.web. The interaction type list it
+    reads lives in an import-free module for exactly this reason -- putting
+    it beside InteractionArg in ask_user_tool pulls the tool-registration
+    chain and 61 xagent.web modules into every import of this pattern."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys; import xagent.core.agent.pattern.react.react; "
+        "print(len([m for m in sys.modules if m.startswith('xagent.web')]))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == "0"
+
+
+def test_react_final_answer_lookup_instruction_tracks_active_workspace_tool() -> None:
+    pattern = ReActPattern()
+
+    assert not inspect.signature(pattern._final_answer_tool_schema).parameters
+    schemas = pattern._tool_schemas_with_builtin_controls([FakeWorkspaceOutputTool()])
+    final_answer_schema = next(
+        schema for schema in schemas if schema["function"]["name"] == "final_answer"
+    )
+    answer_description = final_answer_schema["function"]["parameters"]["properties"][
+        "answer"
+    ]["description"]
+
+    assert "get_workspace_output_files" in answer_description
 
 
 @pytest.mark.asyncio
@@ -3062,6 +4379,11 @@ async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
 async def test_react_pattern_final_answer_clears_trailing_pending_before_checkpoint() -> (
     None
 ):
+    # The trailing call is another control tool (send_message), not a work
+    # tool: a work tool here would instead be stripped from the batch before
+    # final_answer ever reaches this point (see the strip tests above), which
+    # would defeat what this test is pinning - that a control result of
+    # "completed" clears whatever is still queued behind it.
     llm = FakeLLM(
         responses=[
             {
@@ -3074,10 +4396,13 @@ async def test_react_pattern_final_answer_clears_trailing_pending_before_checkpo
                         },
                     },
                     {
-                        "id": "call_calc",
+                        "id": "call_message",
                         "function": {
-                            "name": "calculator",
-                            "arguments": '{"expression":"9+1"}',
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Still working",'
+                                '"message_type":"progress","expect_response":false}'
+                            ),
                         },
                     },
                 ],
@@ -3300,7 +4625,8 @@ async def test_react_pattern_ask_user_question_pauses_with_structured_payload() 
                             "name": "ask_user_question",
                             "arguments": (
                                 '{"message":"Pick one","interactions":'
-                                '[{"type":"select_one","field":"choice","label":"Choice"}]}'
+                                '[{"type":"select_one","field":"choice","label":"Choice",'
+                                '"options":[{"label":"A","value":"a"}]}]}'
                             ),
                         },
                     }
@@ -3327,11 +4653,14 @@ async def test_react_pattern_ask_user_question_pauses_with_structured_payload() 
     assert outbound_message["expect_response"] is True
     assert outbound_message["visible"] is True
     assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
+    # Carries real options: a picker with nothing to select gets the engine's
+    # free-text field appended, which would make this a test of that instead.
     assert outbound_message["metadata"]["interactions"] == [
         {
             "type": "select_one",
             "field": "choice",
             "label": "Choice",
+            "options": [{"label": "A", "value": "a"}],
         }
     ]
     assert pattern.tool_ledger["call_question_form"].status == "completed"
@@ -3379,6 +4708,524 @@ async def test_react_pattern_ask_user_question_drops_invalid_options() -> None:
     assert result["interactions"][0]["options"] == [
         {"label": "A", "value": "a"},
         {"label": "B", "value": "b", "description": "Bee"},
+    ]
+
+
+# Independent reference for JavaScript's String.prototype.trim() semantics,
+# derived from unicodedata rather than the production _INTERACTION_TRIM_CHARS
+# constant -- reusing that constant here would make every assertion below
+# self-proving instead of an independent check. Built once at module scope
+# and reused, instead of being rebuilt inline in each function that needs it.
+_JS_TRIM = {chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) == "Zs"}
+_JS_TRIM |= {"\t", "\n", "\v", "\f", "\r", "\ufeff", "\u2028", "\u2029"}
+
+
+def _js_trim_equivalent(value: str) -> str:
+    """Reference JavaScript String.prototype.trim(), via the independent
+    _JS_TRIM set above."""
+    return value.strip("".join(_JS_TRIM))
+
+
+def test_trim_table_covers_every_javascript_trimmed_code_point() -> None:
+    """Coverage check, superset half: _INTERACTION_TRIM_CHARS must contain
+    every code point JavaScript's trim() removes, or writing the normalized
+    field back into item["field"] and relying on the frontend's own trim()
+    being a no-op on it stops holding."""
+    assert _JS_TRIM <= set(_INTERACTION_TRIM_CHARS)
+
+
+def test_trim_table_python_only_difference_is_exactly_five_code_points() -> None:
+    """Coverage check, differential half: pins the five Python-only code
+    points exactly. The superset check above alone would still pass if one
+    of these five were mistyped (e.g. U+001C typoed into U+001B), since a
+    typo like that only shrinks the Python-only difference by one member and
+    stays within a superset of the JavaScript table."""
+    assert set(_INTERACTION_TRIM_CHARS) - _JS_TRIM == {
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x1f",
+        "\x85",
+    }
+
+
+def test_python_whitespace_set_is_a_subset_of_the_frozen_trim_table() -> None:
+    """task_interaction_service.py's write-side field/option checks use
+    plain str.strip() rather than importing _INTERACTION_TRIM_CHARS -- that
+    is only safe to reason about at all if every code point Python's own
+    str.isspace() treats as whitespace is already inside the frozen table.
+    Computed independently (via isspace(), not by re-deriving from
+    _INTERACTION_TRIM_CHARS or from _JS_TRIM), so a typo that dropped one of
+    the five Python-only code points from the frozen table would be caught
+    here even if it happened to still pass the two JS-side checks above."""
+    python_whitespace = {chr(c) for c in range(0x110000) if chr(c).isspace()}
+    assert python_whitespace <= set(_INTERACTION_TRIM_CHARS)
+
+
+def test_normalize_keeps_well_formed_options_and_fields() -> None:
+    """A normal option and a normal field pass through unchanged."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "A", "value": "a"}],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+    assert normalized[0]["field"] == "choice"
+
+
+def test_normalize_returns_empty_list_for_non_list_interactions() -> None:
+    """A top-level interactions value that is not a list -- the model
+    sending a dict or a string instead of an array, say -- is rejected
+    outright rather than partially processed."""
+    assert _normalize_ask_user_interactions("not-a-list") == []
+    assert _normalize_ask_user_interactions({"field": "choice"}) == []
+    assert _normalize_ask_user_interactions(None) == []
+
+
+def test_normalize_skips_non_dict_elements_within_the_list() -> None:
+    """A non-dict element inside an otherwise well-formed interactions list
+    is dropped, and the well-formed interactions around it are still
+    normalized -- one malformed element does not fail the whole batch."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            "not-a-dict",
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "A", "value": "a"}],
+            },
+            42,
+            None,
+        ]
+    )
+    assert len(normalized) == 1
+    assert normalized[0]["field"] == "choice"
+
+
+_BLANK_TEXT_CASES = [
+    ("v1_empty", ""),
+    ("v2_ascii_spaces", "   "),
+    ("v3_mixed_whitespace", "\t\n "),
+    ("v4_fullwidth_space", "\u3000"),
+    ("v5_bom_only", "\ufeff"),
+    ("v8_python_only_control", "\x1c"),
+    ("v9_js_line_separator", "\u2028"),
+    ("v10_nbsp", "\xa0"),
+]
+
+
+@pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
+def test_normalize_drops_blank_options(case_id: str, value: str) -> None:
+    """An option whose label or value is blank under
+    _INTERACTION_TRIM_CHARS is dropped -- the same treatment the existing
+    empty-string-label case already gets (see the regression test above
+    for missing/empty label or value), widened from "the empty string" to
+    "blank under the trim table"."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [
+                    {"label": value, "value": "kept-value"},
+                    {"label": "kept-label", "value": value},
+                    {"label": "A", "value": "a"},
+                ],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+
+
+@pytest.mark.parametrize("case_id,value", _BLANK_TEXT_CASES)
+def test_normalize_substitutes_blank_field(case_id: str, value: str) -> None:
+    """A field name blank under _INTERACTION_TRIM_CHARS falls back to
+    response_{index}."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    assert normalized[0]["field"] == "response_0"
+
+
+def test_normalize_substitutes_blank_field_using_its_own_index() -> None:
+    """The fallback is f"response_{index}" for the interaction's own
+    position, not a fixed "response_0" -- a well-formed interaction ahead
+    of the blank one must not shift what the blank one falls back to."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {"type": "select_one", "field": "choice", "label": "Choice"},
+            {"type": "select_one", "field": "   ", "label": "Other"},
+        ]
+    )
+    assert normalized[0]["field"] == "choice"
+    assert normalized[1]["field"] == "response_1"
+
+
+@pytest.mark.parametrize(
+    "case_id,value,expected",
+    [
+        ("v6_bom_prefix", "\ufeffabc", "abc"),
+        ("v7_bom_and_space_both_ends", "\ufeff abc\ufeff", "abc"),
+    ],
+)
+def test_normalize_field_bom_normalizes_to_frontend_equivalent(
+    case_id: str, value: str, expected: str
+) -> None:
+    """A field wrapped in a BOM (with or without interior spacing)
+    normalizes to the same string the frontend's own trim() produces. The
+    same normalization applies when the value arrives through the field/id/
+    name alias chain rather than "field" directly."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    assert normalized[0]["field"] == expected
+
+    normalized_via_alias = _normalize_ask_user_interactions(
+        [{"type": "select_one", "id": value, "label": "Choice"}]
+    )
+    assert normalized_via_alias[0]["field"] == expected
+
+
+@pytest.mark.parametrize(
+    "case_id,value",
+    [
+        ("v1_empty", ""),
+        ("v2_ascii_spaces", "   "),
+        ("v3_mixed_whitespace", "\t\n "),
+        ("v4_fullwidth_space", "\u3000"),
+        ("v5_bom_only", "\ufeff"),
+        ("v6_bom_prefix", "\ufeffabc"),
+        ("v7_bom_and_space_both_ends", "\ufeff abc\ufeff"),
+        ("v8_python_only_control", "\x1c"),
+        ("v9_js_line_separator", "\u2028"),
+    ],
+)
+def test_normalized_field_is_stable_under_javascript_trim(
+    case_id: str, value: str
+) -> None:
+    """Whatever field the normalizer produces must already be a fixed
+    point of the frontend's own trim(). If it were not, writing the result
+    back into item["field"] and trusting the frontend to leave it alone
+    would silently stop being true for that input."""
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": value, "label": "Choice"}]
+    )
+    field = normalized[0]["field"]
+    assert _js_trim_equivalent(field) == field
+
+
+def test_normalize_logs_when_all_options_are_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An interaction whose options are all blank keeps the
+    interaction (the question still goes out) and logs exactly one warning.
+    The warning's extra keys are exactly {dropped, total, interaction_index},
+    all ints, and its message format args are also all ints -- no
+    model-controlled string (the field name, a label, a value) is allowed
+    into either half of this log line."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [
+                {
+                    "type": "select_one",
+                    "field": "choice",
+                    "options": [
+                        {"label": "   ", "value": "   "},
+                        {"label": "\ufeff", "value": "\ufeff"},
+                    ],
+                }
+            ]
+        )
+
+    assert len(normalized) == 1
+    assert normalized[0]["options"] == []
+
+    dropped_records = [r for r in caplog.records if "dropped all" in r.getMessage()]
+    assert len(dropped_records) == 1
+    record = dropped_records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # "taskName" is a LogRecord attribute added in 3.12. "message" and
+    # (when some other test module's logging setup is still attached to the
+    # root logger) "asctime" are added by a Formatter.format() pass -- set
+    # record.message / record.asctime as a side effect of formatting, not by
+    # this log call's own extra= payload. All three are excluded so this
+    # comparison is stable regardless of Python version, test runner, or
+    # which other test modules ran earlier in the same process.
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"dropped", "total", "interaction_index"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+    # Both options in this interaction were blank, so dropped == total == 2,
+    # not just "some int" -- pins the actual count, not merely its type.
+    assert record.__dict__["dropped"] == 2
+    assert record.__dict__["total"] == 2
+    assert record.__dict__["interaction_index"] == 0
+
+
+def test_normalize_keeps_surviving_option_text_verbatim() -> None:
+    """An option that survives the blank filter keeps its label and
+    value exactly as given -- normalization only judges blankness, it never
+    rewrites content. A BOM-wrapped value is the only kind of input that can
+    tell "judge blank" apart from "judge blank and also rewrite": a purely
+    blank value would be dropped under either implementation, so it would
+    not catch a rewrite regression."""
+    raw = {"label": "\ufeffImport", "value": "\ufeffimport"}
+    normalized = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "choice", "options": [raw]}]
+    )
+    assert normalized[0]["options"] == [raw]
+
+
+def test_normalize_keeps_colliding_fields_at_single_tool_callsite(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Within one ask_user_question call, a BOM-wrapped field name and
+    its plain counterpart now normalize to the same field. This function
+    does not deduplicate -- both interactions are kept unchanged. Both
+    call sites deduplicate afterward: the multi-tool one is covered
+    below in this file, the single-tool one in
+    test_react_ask_user_question_dedup.py. One warning is logged, with
+    an integer-only extra/message-args payload."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [
+                {"type": "select_one", "field": "\ufeffchoice"},
+                {"type": "select_one", "field": "choice"},
+            ]
+        )
+
+    assert [item["field"] for item in normalized] == ["choice", "choice"]
+
+    collision_records = [
+        r for r in caplog.records if "colliding field name" in r.getMessage()
+    ]
+    assert len(collision_records) == 1
+    record = collision_records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # "taskName" is a LogRecord attribute added in 3.12. "message" and
+    # (when some other test module's logging setup is still attached to the
+    # root logger) "asctime" are added by a Formatter.format() pass -- set
+    # record.message / record.asctime as a side effect of formatting, not by
+    # this log call's own extra= payload. All three are excluded so this
+    # comparison is stable regardless of Python version, test runner, or
+    # which other test modules ran earlier in the same process.
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"colliding_field_count", "total"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+
+
+def test_normalize_blank_alias_does_not_fall_through_to_next_key() -> None:
+    """The field/id/name alias chain keeps its raw truthiness
+    check on purpose. A BOM-only field is truthy before normalization, so it
+    wins the alias chain and is only normalized away to blank afterward --
+    id="ok" is never reached. Widening the blankness judgment to include BOM
+    does not create a new alias-chain outcome, it only adds a new way to
+    reach the one a plain whitespace field already produced (the second
+    case below, pinned as a regression)."""
+    normalized_bom = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "\ufeff", "id": "ok"}]
+    )
+    assert normalized_bom[0]["field"] == "response_0"
+
+    normalized_whitespace = _normalize_ask_user_interactions(
+        [{"type": "select_one", "field": "   ", "id": "ok"}]
+    )
+    assert normalized_whitespace[0]["field"] == "response_0"
+
+
+@pytest.mark.parametrize(
+    "case_id,raw",
+    [
+        (
+            "case1_alias_only",
+            {
+                "type": "select_one",
+                "field": "f",
+                "actions": [{"label": "A", "value": "a"}],
+            },
+        ),
+        (
+            "case2_options_and_unrelated_actions",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": [{"label": "A", "value": "a"}],
+                "actions": [{"label": "X", "value": "x"}],
+            },
+        ),
+        (
+            "case3_options_not_a_list",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": [{"label": "B", "value": "b"}],
+            },
+        ),
+        (
+            "case4_actions_not_a_list",
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": "bad",
+            },
+        ),
+    ],
+)
+def test_normalize_strips_actions_alias_from_output(case_id: str, raw: dict) -> None:
+    """The output never carries an actions key, unconditionally --
+    whether options was missing, a well-formed list, or a malformed
+    non-list value, and whether actions itself was a list or not. Case 1
+    additionally asserts the alias survived into options: without that
+    second assertion, moving the pop above the alias branch would still
+    pass this case (actions is gone either way, just for the wrong reason)
+    while silently losing the alias's only copy of the data -- a gap only
+    test_normalize_aliases_actions_when_options_is_not_a_list below would
+    otherwise catch alone."""
+    normalized = _normalize_ask_user_interactions([raw])
+    assert "actions" not in normalized[0]
+    if case_id == "case1_alias_only":
+        assert normalized[0]["options"] == [{"label": "A", "value": "a"}]
+
+
+def test_normalize_aliases_actions_when_options_is_not_a_list() -> None:
+    """When options is present but not a list, the alias branch --
+    widened from "options" not in item to "options is not a list" -- still
+    rescues actions into options, and the usual blank-option filter still
+    runs on what it rescued. This is the test that would catch the pop
+    running before the alias branch: with the pop moved earlier, actions
+    would already be gone by the time the alias branch runs, options would
+    stay "auto", and this assertion would fail even though every case in
+    test_normalize_strips_actions_alias_from_output would still pass (that
+    test only checks that actions is gone, not that its data went
+    anywhere)."""
+    normalized = _normalize_ask_user_interactions(
+        [
+            {
+                "type": "select_one",
+                "field": "f",
+                "options": "auto",
+                "actions": [
+                    {"label": "   ", "value": "   "},
+                    {"label": "B", "value": "b"},
+                ],
+            }
+        ]
+    )
+    assert normalized[0]["options"] == [{"label": "B", "value": "b"}]
+    assert "actions" not in normalized[0]
+
+
+def test_normalize_logs_when_options_is_not_a_list(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """options present but neither a list nor rescued by an actions alias
+    is a malformed shape the model produced; today it silently renders as
+    no available options (the renderer falls back to interaction.options ||
+    []), and this warning is the only signal that it happened. Same
+    integer-only payload discipline as the other two warnings in this
+    same function (the all-options-blank warning and the colliding-field-
+    name warning)."""
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        normalized = _normalize_ask_user_interactions(
+            [{"type": "select_one", "field": "choice", "options": "auto"}]
+        )
+
+    assert normalized[0]["options"] == "auto"
+    assert "actions" not in normalized[0]
+
+    records = [r for r in caplog.records if "non-list options" in r.getMessage()]
+    assert len(records) == 1
+    record = records[0]
+
+    baseline_attrs = set(
+        logging.LogRecord("n", logging.WARNING, "p", 1, "m", None, None).__dict__
+    )
+    # Same three attributes excluded for the same reasons as the other two
+    # warning tests in this module: "taskName" (3.12+ LogRecord attribute),
+    # "message" and "asctime" (added by a Formatter.format() pass, not by
+    # this call's own extra= payload).
+    extra_keys = (
+        set(record.__dict__) - baseline_attrs - {"taskName", "message", "asctime"}
+    )
+    assert extra_keys == {"interaction_index"}
+    assert all(isinstance(record.__dict__[k], int) for k in extra_keys)
+    assert record.args is None or all(isinstance(a, int) for a in record.args)
+
+
+@pytest.mark.asyncio
+async def test_pause_for_tool_results_deduplicates_normalized_fields() -> None:
+    """_pause_for_tool_results runs its own field-name dedup after
+    calling the normalizer for each tool. Two tools whose fields now
+    normalize (via the BOM fix) to the same string still end up with
+    distinct field names in the published interactions -- narrowing the
+    normalizer's output domain does not break the existing dedup loop."""
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-1")
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+
+    tool_call_a = {"id": "call_a", "name": "tool_a"}
+    tool_call_b = {"id": "call_b", "name": "tool_b"}
+    result_a = {
+        "status": "waiting_for_user",
+        "message": "Pick one",
+        "message_type": "question",
+        # Options are what keep these answerable, so the published list is the
+        # deduplicated one with no free-text field appended.
+        "interactions": [
+            {
+                "type": "select_one",
+                "field": "\ufeffchoice",
+                "options": [{"label": "A", "value": "a"}],
+            }
+        ],
+    }
+    result_b = {
+        "status": "waiting_for_user",
+        "message": "Pick another",
+        "message_type": "question",
+        "interactions": [
+            {
+                "type": "select_one",
+                "field": "choice",
+                "options": [{"label": "B", "value": "b"}],
+            }
+        ],
+    }
+
+    outcome = await pattern._pause_for_tool_results(
+        waiting_pairs=[(tool_call_a, result_a), (tool_call_b, result_b)],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert outcome["status"] == "waiting_for_user"
+    assert [item["field"] for item in outcome["interactions"]] == [
+        "choice",
+        "choice_2",
     ]
 
 
@@ -3446,7 +5293,7 @@ async def test_react_pattern_resume_waiting_after_user_response_continues() -> N
     first = await pattern.run(context=context, tools=[], llm=llm)
 
     assert first["status"] == "waiting_for_user"
-    context.add_user_message("B")
+    context.add_user_message("B", metadata={"response_to_waiting_for_user": "legacy"})
 
     resumed_pattern = ReActPattern(max_iterations=2)
     resumed_pattern.load_state(pattern.get_state())
@@ -3461,8 +5308,7 @@ async def test_react_pattern_resume_waiting_after_user_response_continues() -> N
     resumed_messages = resumed_llm.calls[0]["messages"]
     assert resumed_messages[-1]["role"] == "user"
     assert "answer to a pending agent question" in resumed_messages[-1]["content"]
-    assert "Pending question: Choose A or B" in resumed_messages[-1]["content"]
-    assert "User answer: B" in resumed_messages[-1]["content"]
+    assert resumed_messages[-1]["content"].endswith("B")
 
 
 @pytest.mark.asyncio
@@ -3542,6 +5388,310 @@ async def test_react_pattern_replans_after_waiting_control_tool() -> None:
     assert "cancelled" in cancelled_tool_result["content"]
 
 
+def _ask_then_stale_final_answer_llm() -> FakeLLM:
+    """One response bundling ask_user_question with a stale final_answer."""
+
+    return FakeLLM(
+        responses=[
+            {
+                "content": "Choose A or B",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "ask_user_question",
+                            "arguments": (
+                                '{"message":"Choose A or B","interactions":[]}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_stale_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Choose A or B"}',
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+
+
+def _send_message_then_stale_final_answer_llm() -> FakeLLM:
+    """One response bundling send_message(expect_response) with a stale
+    final_answer."""
+
+    return FakeLLM(
+        responses=[
+            {
+                "content": "Choose A or B",
+                "tool_calls": [
+                    {
+                        "id": "call_question",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Choose A or B",'
+                                '"message_type":"question",'
+                                '"expect_response":true}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_stale_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Choose A or B"}',
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+
+
+async def _park_on_question_with_stale_sibling(
+    llm: FakeLLM | None = None,
+) -> dict[str, Any]:
+    """Run one turn that parks on a control tool with a bundled sibling.
+
+    Returns the ``waiting_for_user`` checkpoint payload the runtime persisted
+    at pause time -- the exact state a production resume restores.
+    """
+
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext()
+    context.add_user_message("Ask, then answer")
+    runtime = PatternRuntime()
+
+    first = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm or _ask_then_stale_final_answer_llm(),
+        runtime=runtime,
+    )
+
+    assert first["status"] == "waiting_for_user"
+    waiting_checkpoints = [
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "waiting_for_user"
+    ]
+    assert waiting_checkpoints
+    return waiting_checkpoints[-1]
+
+
+@pytest.mark.asyncio
+async def test_react_waiting_checkpoint_persists_discarded_pending_plan() -> None:
+    """#2216: the checkpoint written when a control tool parks the run must
+    already reflect the discarded tool plan. Persisting the batch's unexecuted
+    siblings made a resume replay them instead of replanning."""
+
+    checkpoint = await _park_on_question_with_stale_sibling()
+
+    assert checkpoint["pattern_state"]["pending_tool_calls"] == []
+    persisted_context = ExecutionContext.from_dict(checkpoint["context"])
+    cancelled = [
+        message
+        for message in persisted_context.messages
+        if message.role == "tool" and message.tool_call_id == "call_stale_final"
+    ]
+    assert len(cancelled) == 1
+
+
+@pytest.mark.asyncio
+async def test_react_resume_from_waiting_checkpoint_without_answer_stays_parked() -> (
+    None
+):
+    """The pause-time cancellation results in the persisted context must not
+    make a resume without a new user message look like an answered question."""
+
+    checkpoint = await _park_on_question_with_stale_sibling()
+
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    resumed_llm = FakeLLM([{"content": "Should not run"}])
+
+    resumed = await restored_pattern.run(
+        context=restored_context, tools=[], llm=resumed_llm
+    )
+
+    assert resumed["status"] == "waiting_for_user"
+    assert resumed["message"] == "Choose A or B"
+    assert resumed_llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_react_resume_from_waiting_checkpoint_replans_instead_of_replaying() -> (
+    None
+):
+    """#2216 production signature: resuming the parked run with the user's
+    answer must reason over it, never finalize off a stale sibling call."""
+
+    checkpoint = await _park_on_question_with_stale_sibling()
+
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.add_user_message("B")
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
+
+    resumed = await restored_pattern.run(
+        context=restored_context, tools=[], llm=resumed_llm
+    )
+
+    assert resumed["success"] is True
+    assert len(resumed_llm.calls) == 1
+    assert resumed["response"] == "You chose B."
+
+
+@pytest.mark.asyncio
+async def test_react_send_message_waiting_checkpoint_resume_replans() -> None:
+    """send_message(expect_response=True) parks through the same control
+    branch as ask_user_question; its persisted waiting checkpoint must carry
+    an empty plan and resume by replanning, not by replaying the stale
+    sibling (#2216)."""
+
+    checkpoint = await _park_on_question_with_stale_sibling(
+        llm=_send_message_then_stale_final_answer_llm()
+    )
+
+    assert checkpoint["pattern_state"]["pending_tool_calls"] == []
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.add_user_message("B")
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
+
+    resumed = await restored_pattern.run(
+        context=restored_context, tools=[], llm=resumed_llm
+    )
+
+    assert resumed["success"] is True
+    assert len(resumed_llm.calls) == 1
+    assert resumed["response"] == "You chose B."
+
+
+def _legacy_waiting_state_and_context(
+    *stale_pendings: dict[str, Any],
+) -> tuple[dict[str, Any], ExecutionContext]:
+    """Build the state a pre-fix waiting_for_user checkpoint persisted: the
+    parked question plus the batch's unexecuted siblings still pending."""
+
+    context = ExecutionContext()
+    context.add_user_message("Ask, then answer")
+    context.add_assistant_message(
+        "Choose A or B",
+        tool_calls=[
+            {
+                "id": "call_question",
+                "type": "function",
+                "function": {
+                    "name": "ask_user_question",
+                    "arguments": '{"message": "Choose A or B", "interactions": []}',
+                },
+            },
+            *(
+                {
+                    "id": stale_pending["id"],
+                    "type": "function",
+                    "function": {
+                        "name": stale_pending["name"],
+                        "arguments": json.dumps(stale_pending["args"]),
+                    },
+                }
+                for stale_pending in stale_pendings
+            ),
+        ],
+    )
+    context.add_tool_result(
+        tool_name="ask_user_question",
+        result={
+            "status": "waiting_for_user",
+            "message": "Choose A or B",
+            "message_type": "question",
+            "interactions": [],
+        },
+        tool_call_id="call_question",
+    )
+    state = {
+        "status": "waiting_for_user",
+        "waiting_for_user_request": {
+            "event_id": "evt_legacy",
+            "tool_call_id": "call_question",
+            "tool_name": "ask_user_question",
+            "message": "Choose A or B",
+            "message_type": "question",
+            "interactions": [],
+            "task_text": "Ask, then answer",
+            "message_count": len(context.messages),
+        },
+        "pending_tool_calls": list(stale_pendings),
+    }
+    return state, context
+
+
+_STALE_FINAL_ANSWER = {
+    "id": "call_stale_final",
+    "name": "final_answer",
+    "args": {"answer": "Choose A or B"},
+}
+_STALE_WORK_TOOL = {
+    "id": "call_stale_calc",
+    "name": "calculator",
+    "args": {"expression": "5+5"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_pendings",
+    [
+        pytest.param([_STALE_FINAL_ANSWER], id="stale-final-answer"),
+        pytest.param([_STALE_WORK_TOOL], id="stale-work-tool"),
+        pytest.param(
+            [_STALE_FINAL_ANSWER, _STALE_WORK_TOOL],
+            id="stale-final-answer-and-work-tool",
+        ),
+    ],
+)
+async def test_react_resume_waiting_cancels_stale_pending_from_legacy_checkpoint(
+    stale_pendings: list[dict[str, Any]],
+) -> None:
+    """Checkpoints written before the discard-order fix still carry the parked
+    batch's siblings; the waiting-resume path must cancel them all -- never
+    finalize off a stale final_answer, never execute a stale work tool -- and
+    the healed state must re-persist with an empty plan."""
+
+    state, context = _legacy_waiting_state_and_context(*stale_pendings)
+    context.add_user_message("B")
+    pattern = ReActPattern(max_iterations=3)
+    pattern.load_state(state)
+    tool = FakeTool()
+    resumed_llm = FakeLLM([{"content": "You chose B.", "done": True}])
+    runtime = PatternRuntime()
+
+    resumed = await pattern.run(
+        context=context, tools=[tool], llm=resumed_llm, runtime=runtime
+    )
+
+    assert resumed["success"] is True
+    assert resumed["response"] == "You chose B."
+    assert len(resumed_llm.calls) == 1
+    assert tool.calls == []
+    for stale_pending in stale_pendings:
+        assert pattern.tool_ledger[stale_pending["id"]].status == "cancelled"
+    resume_checkpoints = [
+        checkpoint
+        for checkpoint in runtime.checkpoints
+        if checkpoint["label"] == "tool_interaction_response_received"
+    ]
+    assert resume_checkpoints
+    assert resume_checkpoints[-1]["pattern_state"]["pending_tool_calls"] == []
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_resume_binds_original_task_to_store_memory() -> None:
     llm = FakeLLM(
@@ -3561,14 +5711,20 @@ async def test_react_pattern_resume_binds_original_task_to_store_memory() -> Non
     )
     pattern = ReActPattern(max_iterations=3)
     context = ExecutionContext()
-    context.add_user_message("Ask, then calculate")
+    context.add_user_message(
+        "Ask, then calculate\n\nAttached file: /private/runtime/input.txt",
+        metadata={"display_message": "Ask, then calculate"},
+    )
 
     first = await pattern.run(context=context, tools=[], llm=llm)
 
     assert first["status"] == "waiting_for_user"
-    context.add_user_message("B")
+    rebuilt_context = ExecutionContext.from_dict(context.to_dict())
+    rebuilt_context.add_user_message("B")
     resumed_pattern = ReActPattern(max_iterations=3)
-    resumed_pattern.load_state(pattern.get_state())
+    legacy_state = pattern.get_state()
+    legacy_state.pop("memory_input_text")
+    resumed_pattern.load_state(legacy_state)
     resumed_llm = FakeLLM(
         responses=[
             {
@@ -3593,7 +5749,7 @@ async def test_react_pattern_resume_binds_original_task_to_store_memory() -> Non
     memory_store = MemoryToolStore()
 
     resumed = await resumed_pattern.run(
-        context=context,
+        context=rebuilt_context,
         tools=[],
         llm=resumed_llm,
         memory_store=memory_store,
@@ -3810,6 +5966,66 @@ async def test_react_pattern_mcp_is_error_result_is_failed_without_failure_code(
 
 
 @pytest.mark.asyncio
+async def test_react_pattern_classified_failure_preserves_failure_code() -> None:
+    """A classified delegated failure's ``failure_code`` survives end to end.
+
+    ``AgentTool`` returns a classified failure dict (see
+    ``_classified_failure`` in agent_tool.py) carrying a ``failure_code``.
+    A real ``ReActPattern`` run must preserve it on all three parent-level
+    surfaces: the tool ledger record, the tool message's ``raw_result``
+    metadata, and the ``action_error_tool`` trace event's data.
+    """
+    tracer = TraceEventRecorder()
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Use classified failure tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_classified",
+                        "function": {
+                            "name": "classified_failure_result",
+                            "arguments": '{"value":3}',
+                        },
+                    }
+                ],
+            },
+            {"content": "Recovered after classified failure."},
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(execution_id="classified-failure-result")
+    context.add_user_message("Recover")
+    runtime = PatternRuntime(tracer=tracer)
+
+    result = await pattern.run(
+        context=context,
+        tools=[ClassifiedFailureResultTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert pattern.tool_ledger["call_classified"].status == "failed"
+    assert (
+        pattern.tool_ledger["call_classified"].result["failure_code"]
+        == "unsupported_nested_interaction"
+    )
+
+    tool_message = context.get_messages_by_role("tool")[0]
+    assert (
+        tool_message.metadata["raw_result"]["failure_code"]
+        == "unsupported_nested_interaction"
+    )
+
+    failure_events = [
+        event for event in tracer.events if event["event_type"] == "action_error_tool"
+    ]
+    assert len(failure_events) == 1
+    assert failure_events[0]["data"]["failure_code"] == "unsupported_nested_interaction"
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_generates_new_step_id_per_run() -> None:
     tracer = TraceEventRecorder()
     runtime = PatternRuntime(tracer=tracer)
@@ -3853,11 +6069,16 @@ async def test_react_pattern_traces_context_compaction() -> None:
     context.compact_config.threshold = 1
     for index in range(3):
         context.add_user_message(f"message {index}")
+    llm = FakeLLM([{"content": "summary"}, {"content": "done"}])
+    llm.context_window = 32_000
 
     result = await ReActPattern(max_iterations=1).run(
         context=context,
         tools=[],
-        llm=FakeLLM([{"content": "done"}]),
+        # Two responses: compaction now summarizes with the main model when no
+        # compact model is configured, so it consumes one before the turn's
+        # own call.
+        llm=llm,
         runtime=runtime,
     )
 
@@ -3897,6 +6118,7 @@ async def test_react_pattern_uses_compact_llm_for_context_compaction() -> None:
             }
         ]
     )
+    compact_llm.context_window = 32_000
 
     result = await ReActPattern(max_iterations=1).run(
         context=context,
@@ -4198,6 +6420,7 @@ def test_react_pattern_state_roundtrip() -> None:
     pattern.status = "acting"
     pattern.current_iteration = 2
     pattern.task_text = "Original task"
+    pattern.memory_input_text = "Clean original task"
     pattern.pending_tool_calls = [{"id": "call_1", "name": "calculator", "args": {}}]
     pattern._record_tool_call(
         {"id": "call_1", "name": "calculator", "args": {"expression": "1+1"}},
@@ -4213,8 +6436,19 @@ def test_react_pattern_state_roundtrip() -> None:
     assert restored.max_iterations == 5
     assert restored.repeated_tool_decision_after_consecutive_work_tool_calls == 7
     assert restored.task_text == "Original task"
+    assert restored.memory_input_text == "Clean original task"
     assert restored.reasoning_mode == ReActReasoningMode.TOOL_CALLING
     assert restored.tool_ledger["call_1"].result == {"result": 2}
+
+
+def test_react_pattern_loads_legacy_state_without_overwriting_memory_input() -> None:
+    restored = ReActPattern()
+    restored.memory_input_text = "Clean task from the rebuilt root context"
+
+    restored.load_state({"task_text": "Augmented execution task"})
+
+    assert restored.task_text == "Augmented execution task"
+    assert restored.memory_input_text == "Clean task from the rebuilt root context"
 
 
 def test_react_pattern_state_roundtrip_preserves_disabled_decision_thresholds() -> None:
@@ -4330,6 +6564,8 @@ class MemoryToolStore:
     def __init__(self) -> None:
         self.searches: list[dict[str, Any]] = []
         self.added: list[Any] = []
+        self.notes: dict[str, Any] = {}
+        self.updated: list[Any] = []
 
     def search(self, **kwargs: Any) -> list[Any]:
         self.searches.append(kwargs)
@@ -4338,6 +6574,17 @@ class MemoryToolStore:
     def add(self, note: Any) -> Any:
         self.added.append(note)
         return SimpleNamespace(success=True, memory_id=f"mem-{len(self.added)}")
+
+    def get(self, memory_id: str) -> Any:
+        note = self.notes.get(memory_id)
+        if note is None:
+            return SimpleNamespace(success=False, content=None)
+        return SimpleNamespace(success=True, content=note)
+
+    def update(self, note: Any) -> Any:
+        self.updated.append(note)
+        self.notes[note.id] = note
+        return SimpleNamespace(success=True, memory_id=note.id)
 
 
 def _tool_names_from_llm_call(call: dict[str, Any]) -> list[str]:
@@ -4409,6 +6656,56 @@ async def test_react_pattern_exposes_store_memory_tool_with_memory_store() -> No
 
 
 @pytest.mark.asyncio
+async def test_react_update_memory_uses_clean_task_metadata() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Correcting stale memory.",
+                "tool_calls": [
+                    {
+                        "id": "call_update_memory",
+                        "function": {
+                            "name": "update_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "memory_id": "mem-existing",
+                                    "content": "Use the current release channel.",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Done.", "done": True},
+        ]
+    )
+    memory_store = MemoryToolStore()
+    memory_store.notes["mem-existing"] = SimpleNamespace(
+        id="mem-existing",
+        content="Use the legacy release channel.",
+        metadata={"source": "test"},
+    )
+    pattern = ReActPattern(max_iterations=3)
+    typed = "Update the release notes"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    context = ExecutionContext()
+    context.add_user_message(augmented, metadata={"display_message": typed})
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True
+    assert len(memory_store.updated) == 1
+    assert memory_store.updated[0].metadata["updated_by_task"] == typed
+    assert augmented not in memory_store.updated[0].metadata.values()
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_without_memory_store_has_no_store_memory_tool() -> None:
     llm = FakeLLM(responses=[{"content": "Done.", "done": True}])
     pattern = ReActPattern(max_iterations=1, tool_choice="none")
@@ -4439,6 +6736,58 @@ async def test_react_pattern_skips_store_memory_tool_in_single_call_mode() -> No
     assert result["success"] is True
     assert "store_memory" not in _tool_names_from_llm_call(llm.calls[0])
     assert memory_store.added == []
+
+
+@pytest.mark.asyncio
+async def test_tool_result_user_interaction_fails_closed_when_disabled() -> None:
+    class WaitingTool:
+        metadata = SimpleNamespace(
+            name="approval_gate",
+            description="Request approval.",
+        )
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "message": "Approve this action?",
+            }
+
+    pattern = ReActPattern(max_iterations=2, user_interaction_enabled=False)
+    runtime = PatternRuntime(execution_id="unattended-task")
+    context = ExecutionContext(execution_id="unattended-task")
+    context.add_user_message("Run unattended.")
+
+    result = await pattern.run(
+        context=context,
+        tools=[WaitingTool()],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert "interaction is disabled" in result["error"]
+    assert runtime.outbound_messages == []
+    assert pattern.status == "failed"
+    assert pattern.waiting_for_user_request is None
 
 
 @pytest.mark.asyncio
@@ -4722,7 +7071,10 @@ async def test_callback_less_tool_interaction_resumes_by_replanning() -> None:
         if message.role == "user" and message.content == "Use 42"
     )
     waiting_metadata = response_message.metadata["response_to_waiting_for_user"]
-    assert waiting_metadata["requests"][0]["tool_name"] == "clarification_gate"
+    assert waiting_metadata == {
+        "question": "Which value should be used?",
+        "message_type": "question",
+    }
 
 
 @pytest.mark.asyncio
@@ -4969,3 +7321,1995 @@ async def test_final_answer_preserves_semantic_completion_outcome() -> None:
     assert result["success"] is True
     assert result["status"] == "completed"
     assert result["completion_outcome"] == "partial"
+
+
+class StreamingEmptyFinalAnswerLLM:
+    """Calls ``final_answer`` with an unusable answer, then optionally recovers.
+
+    Models the two observed shapes of xorbitsai/xagent#1312: an arguments object
+    that omits ``answer`` entirely (truncated output), and an arguments payload
+    that fails JSON parsing.
+    """
+
+    RECOVERED_ARGUMENTS = (
+        '{"response_language":"English","answer":"The result is 4.",'
+        '"outcome":"completed"}'
+    )
+
+    def __init__(
+        self,
+        *,
+        recover: bool = True,
+        broken_arguments: str = '{"response_language":"English","outcome":"completed"}',
+        preamble: str = "",
+        trailing_work_tool: bool = False,
+    ) -> None:
+        self.recover = recover
+        self.broken_arguments = broken_arguments
+        self.preamble = preamble
+        self.trailing_work_tool = trailing_work_tool
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("empty final answer path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        arguments = (
+            self.RECOVERED_ARGUMENTS
+            if call_index > 0 and self.recover
+            else self.broken_arguments
+        )
+        if self.preamble:
+            yield StreamChunk(type=ChunkType.TOKEN, delta=self.preamble)
+        tool_calls = [
+            {
+                "id": f"call_final_{call_index}",
+                "function": {"name": "final_answer", "arguments": arguments},
+            }
+        ]
+        if call_index == 0 and self.trailing_work_tool:
+            tool_calls.append(
+                {
+                    "id": "call_work_0",
+                    "function": {
+                        "name": "calculator",
+                        "arguments": '{"expression":"2+2"}',
+                    },
+                }
+            )
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=tool_calls,
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+def _react_empty_final_answer_fixture() -> tuple[
+    ReActPattern,
+    ExecutionContext,
+    PatternRuntime,
+    OutboundCollector,
+    TraceEventRecorder,
+]:
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    outbound = OutboundCollector()
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(
+        execution_id="task-1",
+        tracer=tracer,
+        outbound_message_handler=outbound,
+    )
+    return pattern, context, runtime, outbound, tracer
+
+
+@pytest.mark.asyncio
+async def test_react_retries_final_answer_that_omits_the_answer_field() -> None:
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, outbound, tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+
+    retry_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "empty_final_answer_recovery"
+    ]
+    assert len(retry_starts) == 1
+    assert retry_starts[0]["data"]["recovery_reason"] == "empty_final_answer"
+
+    # The discarded turn must not leak a partial stream to the user.
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "The result is 4."
+
+
+@pytest.mark.asyncio
+async def test_react_strips_empty_final_answer_with_trailing_work_call() -> None:
+    """An empty-answer final_answer bundled with a work tool is stripped like
+    any other bundled final_answer: the work tool executes instead of being
+    discarded along with the empty answer (I-11, streaming path)."""
+
+    llm = StreamingEmptyFinalAnswerLLM(trailing_work_tool=True)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.stream_calls) == 2
+
+    assistant_tool_call_ids = {
+        tool_call["id"]
+        for message in context.messages
+        for tool_call in (message.tool_calls or [])
+    }
+    tool_result_ids = {
+        message.tool_call_id for message in context.messages if message.role == "tool"
+    }
+    assert "call_final_0" not in assistant_tool_call_ids
+    assert "call_final_0" not in pattern.tool_ledger
+    assert assistant_tool_call_ids <= tool_result_ids
+
+
+@pytest.mark.asyncio
+async def test_react_fails_when_final_answer_stays_empty_after_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, outbound, tracer = _react_empty_final_answer_fixture()
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[FakeTool()],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    # The core regression: an empty answer must never finalize as success with
+    # the "No output provided" placeholder.
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert "output" not in result
+    assert len(llm.stream_calls) == 2
+    assert outbound.events == []
+
+    discarded = [
+        event["data"]["phase"]
+        for event in tracer.events
+        if event["event_type"] == "action_end_llm"
+        and event["data"].get("success") is False
+    ]
+    assert discarded == [
+        "discarded_invalid_tool_protocol",
+        "discarded_invalid_tool_protocol_retry",
+    ]
+
+    # Neither condition was logged before this fix, leaving nothing to debug from.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("final_answer carried no answer text" in m for m in messages)
+    assert any(
+        "invalid tool protocol after retry" in m and "failing the run" in m
+        for m in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_retries_final_answer_with_malformed_arguments() -> None:
+    llm = StreamingEmptyFinalAnswerLLM(
+        broken_arguments='{"response_language":"English","answer":"The res',
+    )
+    pattern, context, runtime, outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+    # Truncated arguments can stream a partial answer before the call is
+    # rejected. That partial is closed with an error and superseded by a fresh
+    # stream, matching how the pattern already handles a protocol retry - the
+    # point is that the run ends with a real answer instead of nothing.
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "The result is 4."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blank_answer",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"answer": ""}, id="empty-string"),
+        pytest.param({"answer": "   \n"}, id="whitespace"),
+        # ``str(None)`` is the literal "None", which would sail past a naive
+        # ``str(args.get("answer", "")).strip()`` check and be finalized as the
+        # user-facing answer.
+        pytest.param({"answer": None}, id="none"),
+    ],
+)
+async def test_react_re_requests_final_answer_for_resumed_empty_pending_call(
+    blank_answer: dict[str, Any],
+) -> None:
+    """A pending call restored from a checkpoint bypasses response normalization."""
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {
+                "response_language": "English",
+                "outcome": "completed",
+                **blank_answer,
+            },
+        }
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert pattern.tool_ledger["call_resumed"].status == "failed"
+    assert pattern.pending_tool_calls == []
+    # The next turn is forced back to final_answer only.
+    assert [
+        tool["function"]["name"] for tool in llm.stream_calls[0].get("tools") or []
+    ] == ["final_answer"]
+
+
+def test_final_answer_text_treats_none_as_absent() -> None:
+    """One coercion for both the protocol check and finalization.
+
+    ``str(None)`` is the literal "None"; if the two sites coerce independently
+    they drift, and a null answer gets finalized as the string "None".
+    """
+
+    pattern = ReActPattern()
+
+    assert pattern._final_answer_text({"answer": None}) == ""
+    assert pattern._final_answer_text({}) == ""
+    assert pattern._final_answer_text(None) == ""
+    assert pattern._final_answer_text({"answer": ""}) == ""
+    assert pattern._final_answer_text({"answer": "  hi  "}) == "  hi  "
+    assert pattern._final_answer_text({"answer": 0}) == "0"
+
+
+def test_coerce_arguments_drops_unusable_control_tool_payloads() -> None:
+    pattern = ReActPattern()
+
+    # Work tools keep the opaque passthrough so existing behavior is unchanged.
+    assert pattern._coerce_arguments("not json", tool_name="calculator") == {
+        "input": "not json"
+    }
+    assert pattern._coerce_arguments("[1, 2]", tool_name="calculator") == {
+        "input": [1, 2]
+    }
+
+    # Blank payloads have nothing to preserve, whether the raw string is blank
+    # or the JSON literal of a blank string.
+    assert pattern._coerce_arguments("", tool_name="calculator") == {}
+    assert pattern._coerce_arguments('""', tool_name="calculator") == {}
+    assert pattern._coerce_arguments('"   "', tool_name="calculator") == {}
+
+    # Control tools must not smuggle a malformed payload through as ``input``,
+    # which would silently strip ``answer`` and finalize with nothing to show.
+    assert pattern._coerce_arguments("not json", tool_name="final_answer") == {}
+    assert pattern._coerce_arguments('"just a string"', tool_name="final_answer") == {}
+    assert pattern._coerce_arguments("not json", tool_name="send_message") == {}
+
+    # Well-formed payloads are untouched.
+    assert pattern._coerce_arguments('{"answer":"hi"}', tool_name="final_answer") == {
+        "answer": "hi"
+    }
+
+
+def test_empty_final_answer_call_detects_blank_answers() -> None:
+    pattern = ReActPattern()
+
+    def normalized(args: Any) -> dict[str, Any]:
+        return {"tool_calls": [{"id": "c1", "name": "final_answer", "args": args}]}
+
+    assert pattern._empty_final_answer_call(normalized({})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": ""})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": "  \n"})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": None})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": "done"})) is None
+    # Coercion must match ``_handle_control_tool``, which stringifies the value,
+    # so a scalar answer is not mistaken for a missing one.
+    assert pattern._empty_final_answer_call(normalized({"answer": 0})) is None
+    assert pattern._empty_final_answer_call({"tool_calls": []}) is None
+    assert (
+        pattern._empty_final_answer_call(
+            {"tool_calls": [{"id": "c1", "name": "calculator", "args": {}}]}
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_discards_rest_of_resumed_batch_after_empty_final_answer() -> None:
+    """A rejected resume batch cancels its still-pending sibling calls.
+
+    On resume the whole batch's assistant envelope is already recorded in
+    history before execution starts, so every queued call must end with a
+    result row; the only safe outcome for siblings behind a rejected empty
+    ``final_answer`` is cancellation. A fresh-turn ``[final_answer(""),
+    work_tool]`` batch instead strips the ``final_answer`` before anything
+    is recorded and runs the work tool, so the two paths diverge on purpose.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        },
+        {"id": "call_work", "name": "calculator", "args": {"expression": "2+2"}},
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    # The side-effecting tool never ran.
+    assert tool.calls == []
+    # I2: the abandoned call still got exactly one result.
+    assert pattern.tool_ledger["call_work"].status == "cancelled"
+    assert pattern.tool_ledger["call_resumed"].status == "failed"
+    assert pattern.pending_tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_react_finalizes_a_scalar_zero_answer() -> None:
+    """``answer=0`` is an answer, not an absent one.
+
+    The empty check coerces before testing, so a falsy scalar must survive the
+    guard and reach the user rather than being rejected as blank.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(
+        broken_arguments='{"response_language":"English","answer":0,"outcome":"completed"}',
+    )
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "0"
+    # Accepted on the first turn: no repair retry was spent.
+    assert len(llm.stream_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_react_marks_the_abandoned_run_when_the_answer_stayed_empty() -> None:
+    """The abandoned result distinguishes "never answered" from other violations.
+
+    ``invalid_tool_protocol`` also covers provider protocol errors, mixed control
+    calls, and a non-``final_answer`` tool on a forced turn. Delegated-child
+    classification reads this marker so it does not collapse all of them into
+    "never produced an answer" and discard the child's own diagnostic.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is True
+    assert "final_answer without an answer" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_react_does_not_mark_other_tool_protocol_violations() -> None:
+    """A non-empty-answer violation keeps the generic error and no marker."""
+
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        structured_work_tool=True,
+        invalid_retry=True,
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is False
+    assert "invalid tool protocol response" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_empty_final_answer_survives_a_state_roundtrip() -> None:
+    """The post-rejection state is recoverable through the real mechanism.
+
+    The guard exists for checkpoint resumes, so the rejection it performs has to
+    survive ``get_state``/``load_state`` rather than only an in-process mutation.
+    """
+
+    pattern = ReActPattern(max_iterations=3)
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        }
+    ]
+
+    resumed = ReActPattern(max_iterations=3)
+    resumed.load_state(pattern.get_state())
+    assert resumed.pending_tool_calls == pattern.pending_tool_calls
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    result = await resumed.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=PatternRuntime(execution_id="task-1"),
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+
+    # The forcing the rejection installed is itself serializable, which is what a
+    # crash between the rejection and the next turn would depend on.
+    carried = ReActPattern()
+    carried.load_state(resumed.get_state())
+    assert carried.force_final_answer_next is False  # cleared once answered
+    assert carried.tool_ledger["call_resumed"].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_empty_final_answer_abandons_after_forced_retry() -> None:
+    """resume -> reject -> forced turn -> empty -> in-turn retry -> abandon."""
+
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        }
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is True
+    assert pattern.pending_tool_calls == []
+    # The forced turn plus its one in-turn repair attempt, and no more.
+    assert len(llm.stream_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_reverse_batch_order_cannot_undo_an_executed_tool() -> None:
+    """Pins the documented limit of the resume guard's batch discard.
+
+    In ``[work_tool, final_answer("")]`` restored onto ``pending_tool_calls``,
+    the work tool has already executed by the time the rejection runs, so
+    discarding the rest of the batch cannot reach back and undo it - the
+    resume guard can only cancel calls still queued, never ones already
+    committed.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    tool = FakeTool()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {"id": "call_work", "name": "calculator", "args": {"expression": "2+2"}},
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        },
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    # The work tool ran: the rejection cannot reach back past it.
+    assert tool.calls == [{"expression": "2+2"}]
+    assert pattern.tool_ledger["call_work"].status == "completed"
+    assert pattern.tool_ledger["call_resumed"].status == "failed"
+
+
+def test_rejected_empty_final_answer_is_recorded_as_a_failure() -> None:
+    """The rejection must not read back as a successful tool result."""
+
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    tool_call = {"id": "call_1", "name": "final_answer", "args": {"answer": ""}}
+    pattern.pending_tool_calls = [tool_call]
+
+    pattern._reject_empty_final_answer(tool_call, context)
+
+    recorded = pattern.tool_ledger["call_1"]
+    assert recorded.status == "failed"
+    # The recorded result carries the keys ``tool_result_succeeded`` reads, so a
+    # consumer cannot read this failure back as a success.
+    assert tool_result_succeeded(recorded.result) is False
+    # Same shape as the cancelled siblings, so the ledger is uniform.
+    assert recorded.result["status"] == "error"
+    tool_messages = [m for m in context.messages if getattr(m, "role", None) == "tool"]
+    assert "empty answer" in tool_messages[-1].content
+
+
+def test_reject_empty_final_answer_tolerates_non_string_arg_keys() -> None:
+    """Log formatting must not abort the run it is diagnosing.
+
+    ``sorted`` over mixed-type keys raises ``TypeError``, and ``run()`` re-raises
+    from its ``except``, so an unsortable payload would fail the run at exactly
+    the point this guard exists to recover from.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    tool_call = {
+        "id": "call_1",
+        "name": "final_answer",
+        "args": {"answer": "", 1: "numeric", None: "null"},
+    }
+    pattern.pending_tool_calls = [tool_call]
+
+    pattern._reject_empty_final_answer(tool_call, context)
+
+    assert pattern.force_final_answer_next is True
+
+
+@pytest.mark.asyncio
+async def test_react_discards_the_preamble_with_the_rejected_response() -> None:
+    """Pins the documented cost of whole-response rejection.
+
+    The preamble arrived attached to a protocol violation, so it is not a vetted
+    answer and is dropped with the response rather than replayed into the retry.
+    A model that recovers supersedes it; one that repeats the pattern fails the
+    run and the preamble is never shown.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(preamble="Let me look into that.")
+    pattern, context, runtime, outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert "Let me look into that." not in str(result["response"])
+    assert all(
+        "Let me look into that." not in str(event.get("content") or event.get("delta"))
+        for event in outbound.events
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_names", "unavailable"),
+    [
+        (["generate_image", "list_image_models"], True),
+        (["generate_image", "edit_image"], False),
+        (["list_image_models"], False),
+        (["web_search"], False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_flags_missing_image_editing_and_renders_the_correction(
+    tool_names: list[str], unavailable: bool
+) -> None:
+    from xagent.core.agent.context.enrichment import (
+        IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
+        SKILL_CONTEXT_METADATA_KEY,
+    )
+
+    from .concurrency_harness import FakeTool as NamedFakeTool
+
+    llm = FakeLLM(responses=[{"content": "done", "done": True}])
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.metadata[SKILL_CONTEXT_METADATA_KEY] = "Use `edit_image` to refine."
+    context.add_user_message("make an ad")
+
+    await pattern.run(
+        context=context,
+        tools=[NamedFakeTool(name) for name in tool_names],
+        llm=llm,
+    )
+
+    assert context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] is unavailable
+    rendered = llm.calls[0]["messages"][0]["content"]
+    assert ("image editing is unavailable here" in rendered) is unavailable
+    assert ("attach a reference through images" in rendered) is unavailable
+
+
+class NoArgToolLLM:
+    """Calls a parameterless tool with `arguments: ""`, then finishes.
+
+    Reproduces the provider shape behind xorbitsai/xagent#1501 on the streaming
+    path: a blank argument string must reach the tool as an empty call, not kill
+    the run.
+    """
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("this path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_list_0",
+                        "function": {"name": "list_models", "arguments": ""},
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final_0",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"gpt-4o","outcome":"completed"}'
+                            ),
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class NoArgTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "list_models"
+            description = "List available models."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {"models": ["gpt-4o"]}
+
+
+@pytest.mark.asyncio
+async def test_react_runs_a_parameterless_tool_called_with_blank_arguments() -> None:
+    """#1501 (a): a no-arg tool sent `""` executes instead of failing the run."""
+
+    llm = NoArgToolLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = NoArgTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool, FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "gpt-4o"
+    assert tool.calls == [{}]
+
+
+@pytest.mark.asyncio
+async def test_react_repairs_final_answer_called_with_blank_arguments() -> None:
+    """Guards the `_empty_final_answer_call` repair retry, not `_fallback_arguments`.
+
+    `final_answer` is a control tool, so blank arguments are dropped by the
+    control-tool branch and never reach the blank-string branch this PR adds.
+    What is pinned here is that the resulting empty args still spend the one
+    repair retry instead of finalizing the run.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(broken_arguments="")
+    pattern, context, runtime, outbound, tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+
+    retry_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "empty_final_answer_recovery"
+    ]
+    assert len(retry_starts) == 1
+    assert outbound.events[-1]["content"] == "The result is 4."
+
+
+class BlankThenRecoverLLM:
+    """Calls a required-argument work tool with `""`, then recovers.
+
+    First turn: `calculator` with blank arguments. Second turn: a valid
+    `final_answer`. Pins what actually happens to a required-argument tool
+    handed `{}` — the tool fails internally and the error feeds back as a tool
+    result, not a dead run.
+    """
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("this path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_calc_0",
+                        "function": {"name": "calculator", "arguments": ""},
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final_0",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The result is 4.","outcome":"completed"}'
+                            ),
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+@pytest.mark.asyncio
+async def test_react_survives_required_argument_tool_called_with_blank_arguments() -> (
+    None
+):
+    """#1501 (b): a required-argument work tool sent `""` receives `{}`, fails
+    inside the tool, and the error feeds back to the model instead of killing
+    the run."""
+
+    llm = BlankThenRecoverLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+
+    # Discriminating assertion for react.py's blank-string fallback branch: the
+    # old code delivered {"input": ""} here, which would fail this equality.
+    assert tool.calls == [{}]
+
+    tool_results = [m for m in context.messages if m.role == "tool"]
+    assert len(tool_results) >= 1
+    first = tool_results[0]
+    assert first.tool_call_id == "call_calc_0"
+    assert "'success': False" in first.content
+
+
+@pytest.mark.asyncio
+async def test_blank_streaming_arguments_flow_from_adapter_into_react(mocker) -> None:
+    """The seam: a real `OpenAICompatibleLLM` stream carrying `arguments: ""`
+    drives a real ReAct loop and the parameterless tool executes."""
+
+    def sdk_chunk(tool_calls=None, finish_reason=None):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=tool_calls),
+                    finish_reason=finish_reason,
+                )
+            ]
+        )
+
+    def sdk_tool_call(name, arguments):
+        return SimpleNamespace(
+            index=0,
+            id=f"call_{name}",
+            type="function",
+            function=SimpleNamespace(name=name, arguments=arguments),
+        )
+
+    async def first_stream():
+        yield sdk_chunk([sdk_tool_call("list_models", "")])
+        yield sdk_chunk(finish_reason="tool_calls")
+
+    async def second_stream():
+        yield sdk_chunk(
+            [
+                sdk_tool_call(
+                    "final_answer",
+                    '{"response_language":"English",'
+                    '"answer":"gpt-4o","outcome":"completed"}',
+                )
+            ]
+        )
+        yield sdk_chunk(finish_reason="tool_calls")
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [first_stream(), second_stream()]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    from xagent.core.model.chat.basic.openai import OpenAILLM
+
+    llm = OpenAILLM(model_name="gpt-4o-mini", base_url=None, api_key="test-key")
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = NoArgTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool, FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "gpt-4o"
+    assert tool.calls == [{}]
+
+
+def _react_clock_prompt(timezone_name: str | None) -> str:
+    context = ExecutionContext(
+        created_at=datetime(2026, 8, 24, 22, 3, 37, tzinfo=timezone.utc)
+    )
+    if timezone_name is not None:
+        context.metadata[CLOCK_TIMEZONE_METADATA_KEY] = timezone_name
+    context.add_user_message("how many shifts do we have on tomorrow?")
+
+    messages = ReActPattern()._messages_for_llm(context, has_tools=True)
+    return messages[0]["content"]
+
+
+# Covers the whole fallback instruction through the get_current_time pointer, so
+# reverting any part of it fails rather than only a change to the prefix.
+UTC_DATE_INSTRUCTION = (
+    "Turn-start date (UTC): 2026-08-24. "
+    "For recent, latest, current, or time-sensitive requests, use this "
+    "date when forming search queries and judging source relevance. If the "
+    "exact current time matters or the turn may have crossed midnight, call "
+    "the get_current_time tool if it is available."
+)
+
+
+def _date_instruction(prompt: str) -> str:
+    start = prompt.index("Turn-start date (")
+    end = prompt.index("if it is available.", start) + len("if it is available.")
+    return prompt[start:end]
+
+
+def test_tool_call_date_line_keeps_utc_wording_without_a_timezone() -> None:
+    assert _date_instruction(_react_clock_prompt(None)) == UTC_DATE_INSTRUCTION
+
+
+def test_tool_call_date_line_uses_the_caller_timezone() -> None:
+    prompt = _react_clock_prompt("Australia/Melbourne")
+
+    assert _date_instruction(prompt) == UTC_DATE_INSTRUCTION.replace(
+        "Turn-start date (UTC): 2026-08-24. ",
+        "Turn-start date (Australia/Melbourne): 2026-08-25. ",
+    )
+    # The UTC date is what produced the wrong "tomorrow" in production.
+    assert "Turn-start date (UTC)" not in prompt
+
+
+def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:
+    assert _date_instruction(_react_clock_prompt("Not/AZone")) == UTC_DATE_INSTRUCTION
+
+
+# ---------------------------------------------------------------------------
+# xagent#486: every final_answer stream that gets opened must be closed with
+# exactly one terminal event, regardless of how the batch that opened it
+# resolves. See _close_streamed_answer's docstring in react.py for the R0-R3
+# contract these tests pin down.
+# ---------------------------------------------------------------------------
+
+
+def _fa(answer: str) -> tuple[str, dict[str, Any]]:
+    return ("final_answer", {"answer": answer})
+
+
+def _send_message_call(*, expect_response: bool) -> tuple[str, dict[str, Any]]:
+    return (
+        "send_message",
+        {
+            "message": "Side note",
+            "message_type": "question" if expect_response else "progress",
+            "expect_response": expect_response,
+        },
+    )
+
+
+def _ask_user_question_call() -> tuple[str, dict[str, Any]]:
+    return (
+        "ask_user_question",
+        {
+            "message": "Which one?",
+            "interactions": [
+                {"type": "select_one", "field": "choice", "label": "Choice"}
+            ],
+        },
+    )
+
+
+def _work_tool_call() -> tuple[str, dict[str, Any]]:
+    return ("calculator", {"expression": "2+2"})
+
+
+_FALLBACK_ANSWER = "Fallback answer."
+_FALLBACK_BATCH: list[tuple[str, dict[str, Any]]] = [_fa(_FALLBACK_ANSWER)]
+
+
+def _terminal_events_by_message_id(
+    events: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    """Group final_answer_start/end/error events by message_id.
+
+    Used to check that every started message_id gets exactly one terminal
+    event (end or error), never zero and never two.
+    """
+
+    by_id: dict[str, list[str]] = {}
+    for event in events:
+        event_type = event.get("type")
+        if event_type not in (
+            "final_answer_start",
+            "final_answer_end",
+            "final_answer_error",
+        ):
+            continue
+        by_id.setdefault(event["message_id"], []).append(event_type)
+    return by_id
+
+
+_I1_RUN_CASES: list[dict[str, Any]] = [
+    {
+        "label": "C1_single_final_answer",
+        "batches": [[_fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C2_identical_final_answers",
+        "batches": [[_fa("Same answer."), _fa("Same answer.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C3_distinct_final_answers",
+        "batches": [[_fa("First."), _fa("Second."), _fa("Third.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C4_final_answer_before_send_message",
+        "batches": [[_fa("Answer one."), _send_message_call(expect_response=False)]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C5_final_answer_before_ask_user_question",
+        "batches": [[_fa("Answer one."), _ask_user_question_call()]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C6_send_message_before_final_answer",
+        "batches": [[_send_message_call(expect_response=False), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C7_send_message_expect_response_before_final_answer",
+        "batches": [[_send_message_call(expect_response=True), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C8_ask_user_question_before_final_answer",
+        "batches": [[_ask_user_question_call(), _fa("Answer one.")]],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 1,
+        "expected_sequences": [],
+    },
+    {
+        "label": "C9a_final_answer_before_work_tool",
+        "batches": [[_fa("Candidate."), _work_tool_call()], _FALLBACK_BATCH],
+        "needs_tool": True,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+    {
+        "label": "C9b_work_tool_before_final_answer",
+        "batches": [[_work_tool_call(), _fa("Candidate.")], _FALLBACK_BATCH],
+        "needs_tool": True,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        # The work tool's name arrives before any final_answer bytes, so the
+        # streamer disables itself immediately - only the fallback batch's
+        # stream ever opens.
+        "expected_sequences": [["final_answer_start", "final_answer_end"]],
+    },
+    {
+        "label": "C10_empty_final_answer_in_control_only_batch",
+        "batches": [[_fa("Valid answer."), _fa("")], _FALLBACK_BATCH],
+        "needs_tool": False,
+        "user_interaction_enabled": True,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+    {
+        "label": "C14_disabled_control_tool_cancels_first_final_answer",
+        "batches": [
+            [_fa("Answer one."), _send_message_call(expect_response=False)],
+            _FALLBACK_BATCH,
+        ],
+        "needs_tool": False,
+        "user_interaction_enabled": False,
+        "max_iterations": 3,
+        "expected_sequences": [
+            ["final_answer_start", "final_answer_error"],
+            ["final_answer_start", "final_answer_end"],
+        ],
+    },
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", _I1_RUN_CASES, ids=[case["label"] for case in _I1_RUN_CASES]
+)
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event(
+    case: dict[str, Any],
+) -> None:
+    """I-1: for every batch shape that can occur through a real ReAct run,
+    each final_answer_start's message_id gets exactly one terminal event
+    (final_answer_end or final_answer_error) - never zero, never two. A
+    shape whose stream never opens (R0) produces no started ids at all."""
+
+    llm = ScriptedStreamLLM(case["batches"])
+    pattern = ReActPattern(
+        max_iterations=case["max_iterations"],
+        user_interaction_enabled=case["user_interaction_enabled"],
+    )
+    tools = [FakeTool()] if case["needs_tool"] else []
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    await pattern.run(context=context, tools=tools, llm=llm, runtime=runtime)
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    actual_sequences = list(by_id.values())
+    assert actual_sequences == case["expected_sequences"]
+    for sequence in actual_sequences:
+        assert sequence[0] == "final_answer_start"
+        assert len(sequence) == 2
+        assert sequence[1] in ("final_answer_end", "final_answer_error")
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_without_outbound_handler() -> (
+    None
+):
+    """I-1, front condition (no outbound handler): start_final_answer_stream
+    returns None with no handler to send to, so the answer streamer never
+    accumulates content and never starts - the run still delivers the
+    correct answer through the non-streaming path, and there is nothing to
+    close."""
+
+    llm = ScriptedStreamLLM([[_fa("Answer one.")]])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=None)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_without_native_streaming() -> (
+    None
+):
+    """I-1, front condition (no native streaming): a model without
+    stream_chat falls back to the non-streaming call path, so on_chunk is
+    never invoked and the answer streamer never starts - zero final_answer_*
+    events, even though tool_schemas were offered and a final_answer call
+    was made."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Answer one."}',
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert outbound.events == []
+
+
+@pytest.mark.asyncio
+async def test_react_every_started_answer_stream_gets_exactly_one_terminal_event_c12_manual() -> (
+    None
+):
+    """I-1, C12 (no tool_calls, plain assistant content, stream already
+    open): there is no known way for a real model response to leave the
+    stream open while producing zero tool_calls - reaching R1 or R3 both
+    require at least one tool call, and the only way tool_calls empties out
+    after the stream opens (the bundled-final_answer strip) always keeps a
+    work-tool entry behind. This case drives the stream open through the
+    real streaming primitive directly, then calls the close function with a
+    tool_calls=[] batch, so the R2 branch is exercised the same way I-11
+    exercises R3's otherwise-untriggerable shapes."""
+
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    streamer = ReActFinalAnswerStreamer(runtime)
+    await streamer.handle_chunk(
+        StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": "call_final",
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": '{"answer":"Partial"}',
+                    },
+                }
+            ],
+        )
+    )
+    assert streamer.started
+    pattern = ReActPattern(max_iterations=1)
+
+    await pattern._close_streamed_answer(
+        answer_streamer=streamer,
+        assistant_content="Some plain content.",
+        tool_calls=[],
+    )
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 1
+    (sequence,) = by_id.values()
+    assert sequence == ["final_answer_start", "final_answer_end"]
+    end_event = next(e for e in outbound.events if e["type"] == "final_answer_end")
+    assert end_event["content"] == "Some plain content."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,batch,force_final_answer",
+    [
+        ("identical", [_fa("  Same answer.\n"), _fa("  Same answer.\n")], False),
+        (
+            "distinct_increasing",
+            [_fa("  First.\n"), _fa("  Second, longer.\n"), _fa("  Third, longest.\n")],
+            False,
+        ),
+        (
+            "distinct_decreasing",
+            [_fa("  First, longest.\n"), _fa("  Second.\n"), _fa("  Third.\n")],
+            False,
+        ),
+        (
+            "two_distinct_forced",
+            [_fa("  First.\n"), _fa("  Second, different.\n")],
+            True,
+        ),
+    ],
+)
+async def test_react_multi_final_answer_closes_stream_with_first_payload(
+    label: str,
+    batch: list[tuple[str, dict[str, Any]]],
+    force_final_answer: bool,
+) -> None:
+    """I-2: a batch with more than one final_answer call closes the stream on
+    the batch's first payload, verbatim (no stripping) - matching the text
+    _handle_control_tool actually delivers, whatever the later payloads say.
+
+    Every payload carries leading/trailing whitespace so this is only green
+    if the close path uses the raw text and never adds a ``.strip()``.
+    ``two_distinct_forced`` runs with ``force_final_answer_next`` set: when
+    the model is forced to answer through a single-tool ``final_answer``
+    schema, more than one call in the same batch is the shape that actually
+    reaches production, not an edge case.
+    """
+
+    llm = ScriptedStreamLLM([batch])
+    pattern = ReActPattern(max_iterations=1)
+    if force_final_answer:
+        pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    first_payload = batch[0][1]["answer"]
+    assert result["success"] is True
+    assert result["response"] == first_payload
+    end_events = [e for e in outbound.events if e["type"] == "final_answer_end"]
+    assert len(end_events) == 1
+    assert end_events[0]["content"] == first_payload
+    assert not any(e["type"] == "final_answer_error" for e in outbound.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_call",
+    [
+        _send_message_call(expect_response=False),
+        _ask_user_question_call(),
+    ],
+    ids=["send_message", "ask_user_question"],
+)
+async def test_react_final_answer_before_control_tool_ends_stream(
+    control_call: tuple[str, dict[str, Any]],
+) -> None:
+    """I-3: final_answer first in the batch always ends the stream with its
+    own answer, even when a control tool follows it in the same batch - that
+    trailing call never actually runs (_handle_control_tool's final_answer
+    branch finalizes the run before it is reached)."""
+
+    llm = ScriptedStreamLLM([[_fa("Answer one."), control_call]])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == "Answer one."
+    assert [e["type"] for e in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "Answer one."
+    # The trailing control tool never ran: it would have produced an
+    # agent_message event (send_message) or paused the run.
+    assert not any(e["type"] == "agent_message" for e in outbound.events)
+    assert result.get("status") != "waiting_for_user"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control_call",
+    [
+        _send_message_call(expect_response=False),
+        _send_message_call(expect_response=True),
+        _ask_user_question_call(),
+    ],
+    ids=["send_message", "send_message_expect_response", "ask_user_question"],
+)
+async def test_react_control_tool_before_final_answer_opens_no_answer_stream(
+    control_call: tuple[str, dict[str, Any]],
+) -> None:
+    """I-4: a control tool ahead of final_answer in the same batch disables
+    the answer streamer before any answer bytes are emitted (the streamer
+    self-disables on the first non-final_answer tool name it sees), so no
+    final_answer_* event of any kind is ever produced for that response.
+    The run's delivered outcome is pinned too: the later final_answer is
+    still executed and delivered unless a response-expecting control tool
+    pauses the run before reaching it."""
+
+    llm = ScriptedStreamLLM([[control_call, _fa("Answer one.")], _FALLBACK_BATCH])
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert not any(e["type"].startswith("final_answer_") for e in outbound.events)
+    control_name, control_args = control_call
+    if control_name == "ask_user_question" or control_args.get("expect_response"):
+        assert result["status"] == "waiting_for_user"
+    else:
+        assert result["success"] is True
+        assert result["response"] == "Answer one."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordering", ["final_answer_first", "work_tool_first"])
+async def test_react_work_tool_batch_still_fails_stream_before_close(
+    ordering: str,
+) -> None:
+    """I-5: a final_answer bundled with a work tool keeps going through the
+    existing strip-and-fail path (the batch is stripped of its final_answer
+    call and the open stream is failed there), not through the close
+    function's own R3 fallback, and the stream this closes never ends as
+    though the stripped text were the delivered answer.
+
+    Streaming a work-tool name before any final_answer bytes disables the
+    answer streamer immediately (final_answer_stream.py's guard checks tool
+    names as soon as they appear, before reading any field), so
+    ``work_tool_first`` never opens a stream at all; ``final_answer_first``
+    is the only ordering that can leave a stream open for the strip point to
+    close.
+    """
+
+    if ordering == "final_answer_first":
+        batch = [_fa("Candidate."), _work_tool_call()]
+    else:
+        batch = [_work_tool_call(), _fa("Candidate.")]
+    llm = ScriptedStreamLLM([batch, _FALLBACK_BATCH])
+    pattern = ReActPattern(max_iterations=3)
+    tool = FakeTool()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == _FALLBACK_ANSWER
+    # Deltas may echo the discarded candidate while the model is still
+    # streaming - that is pre-existing emit_prefix behavior, unrelated to
+    # this invariant. What must never happen is the discarded text being
+    # delivered as a completed answer.
+    assert not any(
+        e["type"] == "final_answer_end" and e.get("content") == "Candidate."
+        for e in outbound.events
+    )
+
+    if ordering == "work_tool_first":
+        # The work tool's name arrives before any final_answer bytes, so the
+        # streamer disables itself immediately: no stream is ever opened for
+        # this batch, and only the fallback batch's stream produces events.
+        by_id = _terminal_events_by_message_id(outbound.events)
+        assert len(by_id) == 1
+        (only_sequence,) = by_id.values()
+        assert only_sequence == ["final_answer_start", "final_answer_end"]
+        return
+
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 2
+    first_id, second_id = by_id.keys()
+    assert by_id[first_id] == ["final_answer_start", "final_answer_error"]
+    assert by_id[second_id] == ["final_answer_start", "final_answer_end"]
+    first_stream_error = next(
+        e for e in outbound.events if e["type"] == "final_answer_error"
+    )
+    assert first_stream_error["error"] == (
+        "discarded an answer that arrived together with tool "
+        "calls; answering again once the tools have run"
+    )
+    second_stream_end = next(
+        e
+        for e in outbound.events
+        if e["type"] == "final_answer_end" and e["message_id"] == second_id
+    )
+    assert second_stream_end["content"] == _FALLBACK_ANSWER
+    assert runtime.last_final_answer_stream_message_id == second_id
+
+
+@pytest.mark.asyncio
+async def test_react_disabled_control_tool_fails_cancelled_answer_stream() -> None:
+    """I-6: when a disabled user-interaction control tool shares the batch
+    with the first final_answer, _disabled_control_tool_index means R1 does
+    not fire - the stream is failed, not ended, and the run recovers on the
+    next forced turn. The failed stream's id is never mistaken for the
+    delivered one."""
+
+    llm = ScriptedStreamLLM(
+        [
+            [_fa("Answer one."), _send_message_call(expect_response=False)],
+            _FALLBACK_BATCH,
+        ]
+    )
+    pattern = ReActPattern(max_iterations=3, user_interaction_enabled=False)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["response"] == _FALLBACK_ANSWER
+    by_id = _terminal_events_by_message_id(outbound.events)
+    assert len(by_id) == 2
+    first_id, second_id = by_id.keys()
+    assert by_id[first_id] == ["final_answer_start", "final_answer_error"]
+    assert by_id[second_id] == ["final_answer_start", "final_answer_end"]
+    assert runtime.last_final_answer_stream_message_id == second_id
+    assert runtime.last_final_answer_stream_message_id != first_id
+
+
+@pytest.mark.asyncio
+async def test_react_close_streamed_answer_zero_side_effect_when_discarded_stream_is_last() -> (
+    None
+):
+    """A discarded stream's id must never leave itself behind in
+    runtime.last_final_answer_stream_message_id. max_iterations=1 forces the
+    discarded stream to be the run's only stream, which is the only
+    construction where this assertion has any discriminating power - with a
+    later round, start_final_answer_stream unconditionally clears the field
+    before a new id could be confused with the old one, so the assertion
+    would pass even if the close function wrongly called finish() instead of
+    fail() here."""
+
+    llm = ScriptedStreamLLM(
+        [[_fa("Answer one."), _send_message_call(expect_response=False)]]
+    )
+    pattern = ReActPattern(max_iterations=1, user_interaction_enabled=False)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Question")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_react_disabled_control_tool_index_is_the_single_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-7: _close_streamed_answer and _execute_pending_tool_calls must share
+    one _disabled_control_tool_index implementation. Patching it to always
+    return None flips both call sites' observable behavior together: the
+    execution side stops canceling the first final_answer, and the streaming
+    side switches from failing to ending that same stream. A collusion where
+    the close function reimplemented the check inline would not move under
+    this patch."""
+
+    def make_pattern() -> tuple[
+        ReActPattern,
+        ScriptedStreamLLM,
+        OutboundCollector,
+        PatternRuntime,
+        ExecutionContext,
+    ]:
+        llm = ScriptedStreamLLM(
+            [
+                [_fa("Answer one."), _send_message_call(expect_response=False)],
+                _FALLBACK_BATCH,
+            ]
+        )
+        pattern = ReActPattern(max_iterations=3, user_interaction_enabled=False)
+        context = ExecutionContext(
+            system_prompt="You are helpful.", execution_id="task-1"
+        )
+        context.add_user_message("Question")
+        outbound = OutboundCollector()
+        runtime = PatternRuntime(
+            execution_id="task-1", outbound_message_handler=outbound
+        )
+        return pattern, llm, outbound, runtime, context
+
+    real_pattern, real_llm, real_outbound, real_runtime, real_context = make_pattern()
+    real_result = await real_pattern.run(
+        context=real_context, tools=[], llm=real_llm, runtime=real_runtime
+    )
+
+    assert real_result["response"] == _FALLBACK_ANSWER
+    assert any(e["type"] == "final_answer_error" for e in real_outbound.events)
+
+    (
+        mutant_pattern,
+        mutant_llm,
+        mutant_outbound,
+        mutant_runtime,
+        mutant_context,
+    ) = make_pattern()
+    monkeypatch.setattr(
+        mutant_pattern,
+        "_disabled_control_tool_index",
+        lambda tool_calls, *, user_interaction_enabled: None,
+    )
+    mutant_result = await mutant_pattern.run(
+        context=mutant_context, tools=[], llm=mutant_llm, runtime=mutant_runtime
+    )
+
+    assert mutant_result["response"] == "Answer one."
+    assert not any(e["type"] == "final_answer_error" for e in mutant_outbound.events)
+    assert any(
+        e["type"] == "final_answer_end" and e["content"] == "Answer one."
+        for e in mutant_outbound.events
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,tool_calls,assistant_content",
+    [
+        (
+            "C11_work_tool_only",
+            [{"name": "calculator", "args": {"expression": "2+2"}}],
+            None,
+        ),
+        ("C13_no_calls_no_content", [], None),
+        (
+            "C15_final_answer_not_first",
+            [
+                {"name": "send_message", "args": {"message": "hi"}},
+                {"name": "final_answer", "args": {"answer": "x"}},
+            ],
+            None,
+        ),
+    ],
+)
+async def test_react_close_streamed_answer_fails_open_stream_without_deliverable_final_answer(
+    label: str,
+    tool_calls: list[dict[str, Any]],
+    assistant_content: Any,
+) -> None:
+    """I-11: these three tool_calls shapes have no known way to occur through
+    a real model response, so they are pinned at the function level instead
+    of being forced into an end-to-end fake-model shape that would not occur
+    in production. Whenever the stream is open and neither R1 nor R2 applies,
+    _close_streamed_answer
+    must fail it exactly once and must never call finish."""
+
+    class RecordingStreamer:
+        def __init__(self) -> None:
+            self.started = True
+            self.finish_calls: list[str] = []
+            self.fail_calls: list[str] = []
+
+        async def finish(self, content: str) -> None:
+            self.finish_calls.append(content)
+
+        async def fail(self, error: str) -> None:
+            self.fail_calls.append(error)
+
+    pattern = ReActPattern(max_iterations=1)
+    streamer = RecordingStreamer()
+
+    await pattern._close_streamed_answer(
+        answer_streamer=streamer,
+        assistant_content=assistant_content,
+        tool_calls=tool_calls,
+    )
+
+    assert streamer.finish_calls == []
+    assert streamer.fail_calls == [NO_DELIVERABLE_FINAL_ANSWER_REASON]
+
+
+class RoutedDownstreamLLM:
+    """Downstream selection behind a router.
+
+    It needs both entry points: compaction goes through ``run_llm_call`` ->
+    ``chat``, while the turn's own call streams (``_ResolvedRouterLLM``
+    defines ``stream_chat``, so the runtime takes the native streaming path).
+    Both record into one list so call ordering is assertable.
+    """
+
+    def __init__(self, chat_responses: list[Any], final_text: str) -> None:
+        self.chat_responses = chat_responses
+        self.final_text = final_text
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        return self.chat_responses.pop(0)
+
+    async def stream_chat(self, messages: Any = None, **kwargs: Any) -> Any:
+        self.calls.append({"messages": messages, **kwargs})
+        yield StreamChunk(type=ChunkType.TOKEN, delta=self.final_text)
+        yield StreamChunk(type=ChunkType.END)
+
+
+def _routing_router(
+    downstream: Any, route_prompts: list[str], *, context_window: int = 32_000
+) -> RouterLLM:
+    """A real ``RouterLLM`` whose selection is stubbed to record its prompt.
+
+    ``context_window`` is deliberately set, matching production: ``adapter.py``
+    always stamps it from the model row, and ``prepare_llm_for_context``
+    recomputes the compaction threshold from it. Leaving it unset would put the
+    fixture in a state a real router never reaches. The fixture uses a realistic
+    32k window and enough history below to trigger compaction.
+    """
+    router = RouterLLM(downstream_resolver=lambda _model_id: downstream)
+    router.context_window = context_window
+
+    async def select_model(prompt: str) -> str:
+        route_prompts.append(prompt)
+        return "test/model"
+
+    router._select_model = select_model  # type: ignore[assignment]
+    return router
+
+
+def _react_context_with_tool_history(execution_id: str) -> ExecutionContext:
+    context = ExecutionContext(execution_id=execution_id)
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path":"large.txt"}',
+                },
+            },
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 120_000}, tool_call_id="call-1"
+    )
+    return context
+
+
+@pytest.mark.asyncio
+async def test_react_summarizes_with_the_main_model_when_no_compact_model() -> None:
+    """An unset compact slot must not silently disable summary compaction.
+
+    ``PatternRuntime.compact_context_if_needed`` skips summarization entirely
+    without a compact LLM and drops all but the last few messages instead.
+    Agent preview and delegated sub-agents resolve that slot themselves and
+    validate only the default model, so an empty slot is ordinary -- and made
+    the same agent behave differently depending on how it was launched.
+    """
+    downstream = RoutedDownstreamLLM(
+        [{"content": "summarized tool result"}], final_text="done"
+    )
+    route_prompts: list[str] = []
+    router = _routing_router(downstream, route_prompts)
+    context = _react_context_with_tool_history("compact-inherits-main")
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        llm=router,
+        compact_llm=None,
+        runtime=PatternRuntime(tracer=TraceEventRecorder()),
+    )
+
+    assert result["success"] is True
+    # Two downstream calls: the summary, then the turn's own call -- and the
+    # summary reached that call, which is what proves compaction summarized
+    # rather than truncated.
+    assert len(downstream.calls) == 2
+    assert any(
+        "summarized tool result" in message.get("content", "")
+        for message in downstream.calls[1]["messages"]
+    )
+    # One routing decision for the whole turn, taken on the conversation.
+    assert len(route_prompts) == 1
+    assert "Conversation history to compact" not in route_prompts[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("calculator", {"expression": "2+2"}),
+        ("send_message", {"message": "Working"}),
+        ("ask_user_question", {"message": "Which option?"}),
+        ("final_answer", {"answer": "Done"}),
+    ],
+)
+async def test_react_shared_lifecycle_preserves_tool_observers(
+    name: str, args: dict[str, Any], mocker: Any
+) -> None:
+    pattern = ReActPattern()
+    call = {"id": "call-1", "name": name, "args": args}
+    pattern.pending_tool_calls = [call]
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "step-1"
+    runtime.active_turn_id = "turn-1"
+    context = ExecutionContext()
+    records = mocker.spy(pattern, "_record_tool_call")
+    started = mocker.spy(runtime, "on_tool_start")
+    ended = mocker.spy(runtime, "on_tool_end")
+    billed = mocker.patch("xagent.core.model.chat.token_context.add_tool_call_usage")
+
+    await pattern._execute_pending_tool_calls(
+        context=context, tools=[FakeTool()], llm=FakeLLM([]), runtime=runtime
+    )
+
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        "completed",
+    ]
+    assert pattern.tool_ledger["call-1"].status == "completed"
+    assert len(context.get_messages_by_role("tool")) == 1
+    ordinary_count = int(name == "calculator")
+    assert started.call_count == ended.call_count == billed.call_count == ordinary_count
+    # Preparing execution context must not mutate an existing checkpoint's
+    # pending object or interfere with control handlers' identity comparisons.
+    assert call == {"id": "call-1", "name": name, "args": args}
+    if name in {"send_message", "ask_user_question"}:
+        metadata = runtime.outbound_messages[0]["metadata"]
+        assert metadata["tool_call_id"] == "call-1"
+        assert metadata["tool_name"] == name
+        assert metadata["step_id"] == "step-1"
+        assert metadata["turn_id"] == "turn-1"
+        assert "args" not in metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_type", "status"),
+    [
+        (RuntimeError, "failed"),
+        (ToolCallInterrupted, "interrupted"),
+        (asyncio.CancelledError, "interrupted"),
+    ],
+)
+async def test_react_control_send_failure_settles_lifecycle_and_propagates(
+    failure_type: type[BaseException], status: str, mocker: Any
+) -> None:
+    pattern = ReActPattern()
+    call = {"id": "send-1", "name": "send_message", "args": {"message": "Hi"}}
+    pattern.pending_tool_calls = [call]
+    failure = failure_type("send aborted")
+
+    async def send(payload: dict[str, Any]) -> None:
+        assert pattern.tool_ledger["send-1"].status == "running"
+        assert payload["metadata"]["tool_call_id"] == "send-1"
+        raise failure
+
+    runtime = PatternRuntime(outbound_message_handler=send)
+    context = ExecutionContext()
+    records = mocker.spy(pattern, "_record_tool_call")
+    with pytest.raises(failure_type) as caught:
+        await pattern._execute_pending_tool_calls(
+            context=context, tools=[], llm=None, runtime=runtime
+        )
+    assert caught.value is failure
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        status,
+    ]
+    assert pattern.tool_ledger["send-1"].error == "send aborted"
+    assert pattern.pending_tool_calls == [call]
+    assert context.get_messages_by_role("tool") == []
+
+
+@pytest.mark.asyncio
+async def test_react_aggregated_question_preserves_ordered_call_sources() -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    runtime.active_react_step_id = "parent-step"
+    runtime.active_turn_id = "turn-1"
+    calls = [
+        {"id": "a", "name": "first", "step_id": "child-step"},
+        {"id": "b", "name": "second"},
+    ]
+    await pattern._pause_for_tool_results(
+        waiting_pairs=[(call, {"message": call["name"]}) for call in calls],
+        context=ExecutionContext(),
+        runtime=runtime,
+    )
+    assert runtime.outbound_messages[0]["metadata"]["tool_calls"] == [
+        {
+            "tool_call_id": "a",
+            "tool_name": "first",
+            "step_id": "child-step",
+            "turn_id": "turn-1",
+        },
+        {
+            "tool_call_id": "b",
+            "tool_name": "second",
+            "step_id": "parent-step",
+            "dag_step_id": "parent-step",
+            "turn_id": "turn-1",
+        },
+    ]
+    assert calls == [
+        {"id": "a", "name": "first", "step_id": "child-step"},
+        {"id": "b", "name": "second"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_react_final_checkpoint_failure_preserves_completed_call(
+    mocker: Any,
+) -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_calls = [
+        {"id": "final-1", "name": "final_answer", "args": {"answer": "Done"}}
+    ]
+    runtime = PatternRuntime()
+    failure = RuntimeError("checkpoint unavailable")
+    mocker.patch.object(runtime, "checkpoint", side_effect=failure)
+    records = mocker.spy(pattern, "_record_tool_call")
+    context = ExecutionContext()
+
+    with pytest.raises(RuntimeError) as caught:
+        await pattern._execute_pending_tool_calls(
+            context=context, tools=[], llm=None, runtime=runtime
+        )
+
+    assert caught.value is failure
+    assert [entry.kwargs["status"] for entry in records.call_args_list] == [
+        "running",
+        "completed",
+    ]
+    assert pattern.tool_ledger["final-1"].status == "completed"
+    assert pattern.tool_ledger["final-1"].error is None
+    assert len(context.get_messages_by_role("tool")) == 1

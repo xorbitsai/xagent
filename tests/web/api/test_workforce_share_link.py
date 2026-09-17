@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import io
-from types import SimpleNamespace
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task, TaskStatus
@@ -23,6 +25,7 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.services import task_orchestrator as task_orchestrator_service
 from xagent.web.services import workforce_runs as workforce_runs_service
 
 from .conftest import (
@@ -30,9 +33,17 @@ from .conftest import (
     _direct_db_session,
     _register_second_user,
     client,
+    patch_schedule_bg,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
+
+# Anti-hang bounds, not latency assertions. The WS handler and the detached
+# command it enqueues settle in milliseconds; these budgets exist only so a
+# deadlock or a lost command fails as a test error instead of hanging the run,
+# so they are set far above any plausible runtime on a contended CI runner.
+_DEADLINE_SECONDS = 30.0
+_SETTLE_POLL_SECONDS = 0.01
 
 
 def _user_id(username: str = "admin") -> int:
@@ -113,15 +124,6 @@ def _authenticate_share_guest(share_token: str) -> dict[str, str]:
     response = client.post("/api/share/auth", json={"share_token": share_token})
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
-
-
-def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _stub(**_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(background_task=None)
-
-    monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub
-    )
 
 
 # ===== Share-link management endpoints =====
@@ -422,13 +424,54 @@ def test_disabled_workforce_share_invalidates_existing_guest_tokens() -> None:
 # ===== Guest task creation → create_workforce_run =====
 
 
+def test_share_task_create_forwards_timezone_to_the_opening_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Share opening turns start inside task creation, same as the widget."""
+    workforce_id = _create_workforce("Share Timezone Workforce")
+    token = _enable_share(workforce_id)
+    guest_headers = _authenticate_share_guest(token)
+    scheduled = patch_schedule_bg(monkeypatch)
+
+    response = client.post(
+        "/api/share/chat/task/create",
+        headers=guest_headers,
+        json={
+            "title": "how many shifts do we have on tomorrow?",
+            "description": "how many shifts do we have on tomorrow?",
+            "timezone": "Australia/Melbourne",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+
+
+def test_share_task_create_without_timezone_sends_no_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workforce_id = _create_workforce("Share No Timezone Workforce")
+    token = _enable_share(workforce_id)
+    guest_headers = _authenticate_share_guest(token)
+    scheduled = patch_schedule_bg(monkeypatch)
+
+    response = client.post(
+        "/api/share/chat/task/create",
+        headers=guest_headers,
+        json={"title": "hello", "description": "hello"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert scheduled["context"] is None
+
+
 def test_share_task_create_starts_workforce_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workforce_id = _create_workforce("Guest Run Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     response = client.post(
         "/api/share/chat/task/create",
@@ -444,6 +487,7 @@ def test_share_task_create_starts_workforce_run(
         assert task.source == "shared_link"
         assert bool(task.is_visible) is False
         assert int(task.user_id) == _user_id()
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
 
         run = db.query(WorkforceRun).filter(WorkforceRun.task_id == task_id).one()
         assert int(run.workforce_id) == workforce_id
@@ -479,7 +523,7 @@ def test_share_task_create_rejects_foreign_agent_id(
     workforce_id = _create_workforce("Foreign Agent Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     other_agent_id = _create_published_agent(_user_id(), "Unrelated Agent")
     response = client.post(
@@ -503,7 +547,7 @@ async def test_share_guest_cannot_touch_internal_run_task(
     workforce_id = _create_workforce("Scoping Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     # An owner-initiated (internal) run of the same workforce.
     db = _direct_db_session()
@@ -532,7 +576,7 @@ def test_share_guest_can_upload_to_own_shared_task(
     workforce_id = _create_workforce("Upload Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
@@ -553,13 +597,14 @@ def test_share_guest_can_upload_to_own_shared_task(
 
 def test_workforce_share_first_turn_attachments_reach_run(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     """M1: opening-message files are uploaded task-lessly, then threaded into
     the run's task so the very first turn actually sees them."""
     workforce_id = _create_workforce("First Turn File Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     # 1) Task-less upload is allowed for workforce guests (no task exists yet).
     upload = client.post(
@@ -594,7 +639,26 @@ def test_workforce_share_first_turn_attachments_reach_run(
     db = _direct_db_session()
     try:
         bound = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        task = db.query(Task).filter(Task.id == task_id).one()
         assert bound.task_id == task_id
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
+
+        workspace = TaskWorkspace(
+            id="agent_1_first_turn",
+            base_dir=str(tmp_path / "workspaces"),
+            allowed_external_dirs=[str(Path(bound.storage_path).parent)],
+            db_task_id=task_id,
+        )
+        workspace.owner_user_id = int(task.user_id)
+        workspace.file_operation_access_version = 1
+        # File Operation runs in a worker thread and deliberately ignores
+        # caller-bound ORM sessions. Point its operation-local session factory
+        # at this test's temporary application database instead.
+        monkeypatch.setattr(
+            "xagent.core.storage.manager.create_db_session",
+            _direct_db_session,
+        )
+        assert WorkspaceFileOperations(workspace).read_file(file_id) == "trip brief"
     finally:
         db.close()
 
@@ -685,7 +749,7 @@ def test_agent_share_guest_cannot_access_workforce_task(
     workforce_id = _create_workforce("Cross Guest Workforce")
     token = _enable_share(workforce_id)
     guest_headers = _authenticate_share_guest(token)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     created = client.post(
         "/api/share/chat/task/create",
@@ -738,7 +802,6 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
 
     from xagent.web.api.websocket import handle_chat_message
     from xagent.web.models.workforce import WorkforceAgent
-    from xagent.web.services import task_orchestrator as task_orchestrator_service
     from xagent.web.services.workforce_snapshot import build_workforce_snapshot
 
     workforce_id = _create_workforce("Append Sync Workforce")
@@ -808,10 +871,19 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
                 )
             )
             try:
-                await asyncio.wait_for(turn_started.wait(), timeout=1.0)
-                await asyncio.wait_for(asyncio.shield(handler_task), timeout=1.0)
+                await asyncio.wait_for(turn_started.wait(), timeout=_DEADLINE_SECONDS)
+                await asyncio.wait_for(
+                    asyncio.shield(handler_task), timeout=_DEADLINE_SECONDS
+                )
 
-                for _ in range(100):
+                # The command is applied by a detached background task, so the
+                # only observable signal is the committed row. Poll against a
+                # wall-clock deadline rather than a fixed iteration count: a
+                # loaded runner slows each iteration down, which would shrink a
+                # count-based budget exactly when it needs to be widest.
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + _DEADLINE_SECONDS
+                while True:
                     command_db = _direct_db_session()
                     try:
                         run_status = (
@@ -828,14 +900,15 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
                         command_db.close()
                     if run_status == "running" and command_status == "completed":
                         break
-                    await asyncio.sleep(0.01)
-                else:
-                    raise AssertionError(
-                        "detached APPEND command did not project the WorkforceRun "
-                        "to running"
-                    )
+                    if loop.time() >= deadline:
+                        raise AssertionError(
+                            "detached APPEND command did not project the "
+                            f"WorkforceRun to running (run_status={run_status!r}, "
+                            f"command_status={command_status!r})"
+                        )
+                    await asyncio.sleep(_SETTLE_POLL_SECONDS)
             finally:
                 if not handler_task.done():
-                    await asyncio.wait_for(handler_task, timeout=1.0)
+                    await asyncio.wait_for(handler_task, timeout=_DEADLINE_SECONDS)
     finally:
         db.close()

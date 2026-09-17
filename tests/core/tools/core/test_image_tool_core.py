@@ -123,6 +123,32 @@ class TestImageGenerationToolCore:
         assert "one exact headline" in description
         assert "one concise CTA" in description
         assert "file_id through the images parameter" in description
+        assert "Use only references the user supplied" in description
+        # The curb this description exists for.
+        assert "not go looking" in description
+        # The official source is the third origin static-visual-design sanctions;
+        # dropping it here would forbid what the skill requires.
+        assert "brand's own official source" in description
+        # Without the authenticity guard the carve-out reads as "go fetch a logo"
+        # in every run where the skill is not loaded.
+        assert "plausible-looking search result" in description
+        assert "never take" in description and "other tasks" in description
+
+    def test_edit_description_restricts_reference_sources(self):
+        # generate_image routes reference-based work here, so the restriction has
+        # to hold on both descriptions or the model just switches tools.
+        description = ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION
+
+        assert "Use only images the user supplied" in description
+        assert "not go looking" in description
+        assert "brand's own official source" in description
+        assert "plausible-looking search result" in description
+        assert "never take" in description and "other tasks" in description
+        assert "never present a generative edit as exact" in description
+        # Loaded with or without the skill, so it must not offer the weaker gate
+        # the skill closed: #942 deleted logo_overlay as brittle.
+        assert "composite deterministically" not in description
+        assert "ask the user to arrange" in description
 
     def test_init_with_models(self, mock_image_models, mock_workspace):
         """Test ImageGenerationToolCore initialization with models"""
@@ -223,7 +249,8 @@ class TestImageGenerationToolCore:
         result = await tool.generate_image("A test prompt")
 
         assert result["success"] is False
-        assert result["error"] == "No available image models configured"
+        assert "No available image models with generate capabilities" in result["error"]
+        assert "Configured image models:" in result["error"]
         assert result["image_path"] is None
 
     @pytest.mark.asyncio

@@ -38,7 +38,7 @@ from ..core.schemas import (
 )
 from ..progress import ProgressManager, ProgressTracker
 from ..retrieval.search_dense import search_dense
-from ..retrieval.search_hybrid import _rrf_fusion, search_hybrid
+from ..retrieval.search_hybrid import search_hybrid
 from ..retrieval.search_sparse import search_sparse
 from ..utils.config_utils import coerce_search_config
 from ..utils.embedding_utils import normalize_single_embedding
@@ -171,8 +171,7 @@ def _try_unified_rerank(
         if not ordered_results:
             provider_name = type(rerank_model).__name__
             warnings.append(
-                f"{provider_name} rerank returned no recognizable documents; "
-                "falling back to RRF."
+                f"{provider_name} rerank returned no recognizable documents."
             )
             return None
 
@@ -190,8 +189,8 @@ def _try_unified_rerank(
         TypeError,
     ) as exc:
         provider_name = type(rerank_model).__name__
-        logger.warning("%s rerank failed: %s, falling back to RRF", provider_name, exc)
-        warnings.append(f"{provider_name} rerank failed: {exc}, using RRF fallback")
+        logger.warning("%s rerank failed: %s", provider_name, exc)
+        warnings.append(f"{provider_name} rerank failed: {exc}")
         return None
 
 
@@ -414,9 +413,7 @@ def _try_dashscope_rerank(
         ordered_results = _map_reranked_pairs_to_results(reranked_pairs, results)
 
         if not ordered_results:
-            warnings.append(
-                "DashScope rerank returned no recognizable documents; falling back to RRF."
-            )
+            warnings.append("DashScope rerank returned no recognizable documents.")
             return None
 
         # After rerank we always truncate to the user-requested top_k. The
@@ -432,67 +429,8 @@ def _try_dashscope_rerank(
         ValueError,
         TypeError,
     ) as exc:
-        logger.warning("DashScope rerank failed: %s, falling back to RRF", exc)
-        warnings.append(f"DashScope rerank failed: {exc}, using RRF fallback")
-        return None
-
-
-def _try_lancedb_rrf_fallback(
-    results: List[SearchResult],
-    cfg: SearchConfig,
-    warnings: List[str],
-) -> Optional[Tuple[List[SearchResult], bool, List[str]]]:
-    """Try to rerank results using LanceDB RRF fusion as fallback.
-
-    Args:
-        results: Search results to rerank
-        cfg: Search configuration
-        warnings: List to append warnings to
-
-    Returns:
-        Tuple of (reranked_results, used_rerank, warnings) if successful, None otherwise
-    """
-    # Check if we have original scores/ranks for RRF
-    has_vector_scores = any(r.vector_score is not None for r in results)
-    has_fts_scores = any(r.fts_score is not None for r in results)
-
-    if not (has_vector_scores and has_fts_scores):
-        warnings.append(
-            "Cannot apply RRF fallback: missing original vector/FTS scores. "
-            "Ensure hybrid search is used to populate vector_score, fts_score, vector_rank, fts_rank."
-        )
-        return None
-
-    # Use RRF fusion with original scores/ranks
-    rrf_k = int(os.getenv("DASHSCOPE_RERANK_RRF_K", "60"))
-
-    # Split results into vector and FTS lists based on which score exists
-    vector_results: List[SearchResult] = []
-    fts_results: List[SearchResult] = []
-
-    for result in results:
-        if result.vector_score is not None:
-            vector_results.append(result)
-        if result.fts_score is not None:
-            fts_results.append(result)
-
-    # Sort by original ranks for RRF
-    vector_results.sort(key=lambda r: r.vector_rank or 999999)
-    fts_results.sort(key=lambda r: r.fts_rank or 999999)
-
-    # Apply RRF fusion
-    try:
-        reranked_results = _rrf_fusion([vector_results, fts_results], k=rrf_k)
-
-        # Apply rerank_top_k limit if specified
-        reranked_results = _apply_rerank_top_k_limit(reranked_results, cfg.rerank_top_k)
-
-        logger.info("Applied LanceDB RRF rerank fallback")
-        return reranked_results, True, warnings
-
-    except (AttributeError, TypeError, ValueError, ZeroDivisionError) as exc:
-        logger.warning("LanceDB RRF rerank failed: %s", exc)
-        warnings.append(f"LanceDB RRF rerank failed: {exc}")
+        logger.warning("DashScope rerank failed: %s", exc)
+        warnings.append(f"DashScope rerank failed: {exc}")
         return None
 
 
@@ -501,15 +439,15 @@ def _apply_rerank_if_needed(
     query_text: str,
     cfg: SearchConfig,
 ) -> Tuple[List[SearchResult], bool, List[str]]:
-    """Optionally rerank search results using unified resolver -> LanceDB RRF 2-tier fallback.
+    """Optionally rerank search results using the unified resolver.
 
     Strategy:
     1. Try unified rerank (DashScope / Xinference, from model hub via cfg.rerank_model_id)
     2. If unified rerank fails or is not configured, try legacy DashScope env-based rerank
-    3. If DashScope fails, fallback to LanceDB RRF using original scores/ranks
+    3. Otherwise return the fused results untouched
 
     Args:
-        results: Search results to rerank (should have vector_score, fts_score, vector_rank, fts_rank)
+        results: Search results to rerank
         query_text: Query text for reranking
         cfg: Search configuration
 
@@ -536,37 +474,7 @@ def _apply_rerank_if_needed(
         logger.info("Successfully applied DashScope rerank (legacy env config)")
         return dashscope_result
 
-    # Fallback to LanceDB RRF if DashScope failed or is disabled
-    fallback_to_lancedb = os.getenv(
-        "DASHSCOPE_RERANK_FALLBACK_TO_LANCEDB", "true"
-    ).lower() in ("true", "1", "yes")
-
-    if fallback_to_lancedb:
-        rrf_result = _try_lancedb_rrf_fallback(results, cfg, warnings)
-        if rrf_result:
-            return rrf_result
-        else:
-            logger.debug(
-                "Skipping rerank: LanceDB RRF fallback not applicable or failed"
-            )
-    else:
-        # Only warn if rerank was attempted but fallback is disabled
-        # If rerank is completely disabled (no DashScope and no fallback), no warning needed
-        unified_model = _resolve_unified_rerank(cfg)
-        env_model = _resolve_dashscope_rerank_from_env()
-        if (
-            unified_model is not None
-            or env_model is not None
-            or any(
-                r.vector_score is not None or r.fts_score is not None for r in results
-            )
-        ):
-            warnings.append("Rerank fallback to LanceDB is disabled")
-        logger.debug(
-            "Skipping rerank: Fallback disabled and DashScope rerank unavailable/failed"
-        )
-
-    # If all rerank attempts failed, return original results
+    # No rerank model (or it failed): the fused order is already correct, pass it through.
     return results, False, warnings
 
 

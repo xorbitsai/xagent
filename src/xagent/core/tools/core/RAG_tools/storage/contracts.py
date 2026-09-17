@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
 from typing import (
     Any,
@@ -1332,15 +1333,46 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
-    def trigger_reindex(self, table_name: str) -> bool:
-        """Trigger index rebuild operation.
+    def trigger_reindex(
+        self, table_name: str, cleanup_older_than: Optional[timedelta] = None
+    ) -> bool:
+        """Optimize a table: compact data files, prune old versions, refresh indices.
+
+        Called for any table :meth:`compact_tables` selects, including ones with
+        no index at all, so compaction and version pruning — not the index
+        rebuild — are the parts callers can rely on.
 
         Args:
-            table_name: Embeddings table name.
+            table_name: Table to optimize; need not be an embeddings table.
+            cleanup_older_than: Retention window for old table versions; versions
+                younger than this are always kept so concurrent readers stay
+                valid. ``None`` falls back to
+                ``DEFAULT_INDEX_POLICY.version_retention_days`` -- a value shared
+                with the compaction predicate, not something internal to the
+                backend.
 
         Returns:
-            True if reindex was triggered successfully.
+            True if the table was optimized successfully.
         """
+
+    def should_compact(
+        self, table_name: str, policy: Optional[IndexPolicy] = None
+    ) -> bool:
+        """Whether a table is fragmented enough to be worth compacting.
+
+        Separate from :meth:`should_reindex`: fragmentation is about read
+        latency, not index freshness. Backends without compaction return False.
+        """
+        return False
+
+    def compact_tables(
+        self, table_names: Sequence[str], policy: Optional[IndexPolicy] = None
+    ) -> List[str]:
+        """Compact the fragmented tables among ``table_names``; returns those done.
+
+        Best-effort maintenance; backends without compaction return an empty list.
+        """
+        return []
 
     # --- Async index management variants ---
 
@@ -1369,11 +1401,15 @@ class VectorIndexStore(ABC):
     async def trigger_reindex_async(self, table_name: str) -> bool:
         """Async version of trigger_reindex.
 
+        Same optimization as the sync form -- compaction, version pruning, index
+        refresh -- but always with the backend's default retention window, since
+        there is no ``cleanup_older_than`` parameter here.
+
         Args:
-            table_name: Embeddings table name.
+            table_name: Table to optimize; need not be an embeddings table.
 
         Returns:
-            True if reindex was triggered successfully.
+            True if the table was optimized successfully.
 
         Note: Current implementation uses sync operations under the hood.
         True async I/O will be added in Phase 1B with RDB backend.

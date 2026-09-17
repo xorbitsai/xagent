@@ -8,6 +8,8 @@ Covers two bugs the PR fixed:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -16,15 +18,36 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.utils.encryption import encrypt_value
+from xagent.core.utils.encryption import _is_encrypted, decrypt_value, encrypt_value
 from xagent.web.api.auth import (
+    _is_salesforce_provider,
     _resolve_oauth_secret,
     create_access_token,
     generic_oauth_login,
+    verify_token,
+)
+from xagent.web.builtin_mcp_registry import (
+    get_builtin_oauth_provider_rows,
+    get_builtin_public_mcp_app,
 )
 from xagent.web.models.database import Base
+from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.oauth_provider_quirks import requires_pkce
+
+XERO_APP_SCOPES = [
+    "openid",
+    "profile",
+    "email",
+    "accounting.contacts",
+    "accounting.settings",
+    "accounting.invoices",
+    "accounting.payments",
+    "accounting.banktransactions",
+    "accounting.manualjournals",
+    "offline_access",
+]
 
 # ---------- helpers ---------------------------------------------------------
 
@@ -78,6 +101,91 @@ def _location(response) -> str:
 
 
 # ---------- the actual regression checks ------------------------------------
+
+
+def test_xero_provider_defaults(monkeypatch):
+    monkeypatch.setenv("XERO_CLIENT_ID", "xero-test-client")
+    monkeypatch.setenv("XERO_CLIENT_SECRET", "xero-test-secret")
+    monkeypatch.setenv(
+        "XERO_REDIRECT_URI", "https://app.example/api/auth/xero/callback"
+    )
+
+    provider = next(
+        row
+        for row in get_builtin_oauth_provider_rows()
+        if row["provider_name"] == "xero"
+    )
+
+    assert provider == {
+        "provider_name": "xero",
+        "name": "Xero",
+        "client_id": "xero-test-client",
+        "client_secret": "xero-test-secret",
+        "auth_url": "https://login.xero.com/identity/connect/authorize",
+        "token_url": "https://identity.xero.com/connect/token",
+        "redirect_uri": "https://app.example/api/auth/xero/callback",
+        "userinfo_url": "https://identity.xero.com/connect/userinfo",
+        "user_id_path": "sub",
+        "email_path": "email",
+        "default_scopes": ["openid", "profile", "email"],
+    }
+
+
+def test_xero_catalog_contract():
+    app = get_builtin_public_mcp_app("xero")
+    assert app is not None
+    assert app["transport"] == "oauth"
+    assert app["provider_name"] == "xero"
+    assert app["category"] == "Operations"
+    assert app["is_visible_in_connector"] is True
+    assert app["oauth_scopes"] == XERO_APP_SCOPES
+    assert app["launch_config"] == {
+        "command": "npx",
+        "args": ["-y", "@xeroapi/xero-mcp-server@latest"],
+        "env_mapping": {"XERO_CLIENT_BEARER_TOKEN": "access_token"},
+    }
+
+
+def test_xero_catalog_login_scopes(db_session, monkeypatch):
+    db, user = db_session
+    monkeypatch.setenv("XERO_CLIENT_ID", "xero-test-client")
+    monkeypatch.setenv("XERO_CLIENT_SECRET", "xero-test-secret")
+    monkeypatch.setenv(
+        "XERO_REDIRECT_URI", "https://app.example/api/auth/xero/callback"
+    )
+    app = get_builtin_public_mcp_app("xero")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    provider = OAuthProvider(
+        **next(
+            row
+            for row in get_builtin_oauth_provider_rows()
+            if row["provider_name"] == "xero"
+        )
+    )
+    db.add(provider)
+    db.commit()
+
+    response = generic_oauth_login(
+        provider="xero",
+        token=_token_for(user),
+        app_id="xero",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert response.status_code == 307
+    url = urlparse(_location(response))
+    params = parse_qs(url.query)
+    assert f"{url.scheme}://{url.netloc}{url.path}" == provider.auth_url
+    assert params["client_id"] == ["xero-test-client"]
+    assert params["redirect_uri"] == [provider.redirect_uri]
+    assert params["response_type"] == ["code"]
+    scopes = params["scope"][0].split()
+    assert set(scopes) == set(XERO_APP_SCOPES)
+    assert len(scopes) == len(set(scopes))
+    assert verify_token(params["state"][0])["app_id"] == "xero"
 
 
 def test_auth_url_with_query_uses_ampersand_separator(db_session):
@@ -164,6 +272,240 @@ def test_zoom_provider_sets_prompt_login(db_session):
     assert qs.get("prompt") == ["login"], f"zoom prompt missing: {url}"
 
 
+def test_salesforce_provider_includes_pkce_code_challenge(db_session):
+    """Newer Salesforce orgs enforce PKCE on this grant with no per-app
+    opt-out; the authorize redirect must carry a code_challenge derived from
+    a verifier that (a) round-trips through the signed state token via
+    decrypt_value (not left as plaintext in it) and (b) actually matches the
+    S256 challenge sent to Salesforce."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="salesforce",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+    state_payload = verify_token(qs["state"][0])
+    encrypted_verifier = state_payload["code_verifier"]
+    decrypted_verifier = decrypt_value(encrypted_verifier)
+    # The real regression this guards: encryption actually changed the
+    # value. `encrypted_verifier != qs["code_challenge"][0]` alone proves
+    # nothing -- a verifier trivially differs from its own derived S256
+    # hash regardless of whether encryption ever ran.
+    assert encrypted_verifier != decrypted_verifier
+    assert _is_encrypted(encrypted_verifier)
+
+    expected_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(decrypted_verifier.encode("ascii")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert qs["code_challenge"][0] == expected_challenge
+
+
+@pytest.mark.parametrize(
+    "provider,expected",
+    [
+        ("salesforce", True),
+        ("SALESFORCE", True),
+        ("salesforce-sandbox", True),
+        ("salesforce-govcloud", True),
+        ("salesforcelite", False),
+        ("salesforce2", False),
+        ("hubspot", False),
+        ("", False),
+    ],
+)
+def test_is_salesforce_provider_requires_exact_name_or_hyphenated_suffix(
+    provider, expected
+):
+    """Anchored to a "-" separator, not a bare prefix: oauth_providers.name
+    is admin-settable via POST/PUT /admin/mcp/providers, so a bare
+    startswith("salesforce") would also match an unrelated custom provider
+    an admin happened to name e.g. "salesforcelite" -- silently routing it
+    through PKCE and the instance_url-required guard it has no reason to
+    satisfy."""
+    assert _is_salesforce_provider(provider) is expected
+
+
+def test_salesforce_sandbox_provider_includes_pkce_code_challenge(db_session):
+    """PKCE is gated on a provider-name *prefix* match
+    (_is_salesforce_provider), not exact equality -- specifically so an
+    admin-created "salesforce-sandbox" row (example.env's documented
+    workaround for sandbox orgs, which have no per-user toggle otherwise)
+    also gets it. An exact match here would silently skip PKCE for that row
+    and then fail opaquely against a PKCE-enforcing sandbox org."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://test.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="salesforce-sandbox",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+
+def test_employment_hero_provider_includes_pkce_code_challenge(db_session):
+    """Employment Hero mandates PKCE on this grant for every app from
+    2026-09-14, with no per-app opt-out -- requires_pkce()
+    (oauth_provider_quirks.py) covers this provider the same way it covers
+    salesforce above, so the authorize redirect must carry a code_challenge
+    too."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://oauth.employmenthero.com/oauth2/authorize",
+        default_scopes=[],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="employment-hero",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+    state_payload = verify_token(qs["state"][0])
+    encrypted_verifier = state_payload["code_verifier"]
+    decrypted_verifier = decrypt_value(encrypted_verifier)
+    assert encrypted_verifier != decrypted_verifier
+    assert _is_encrypted(encrypted_verifier)
+
+    expected_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(decrypted_verifier.encode("ascii")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert qs["code_challenge"][0] == expected_challenge
+
+
+@pytest.mark.parametrize(
+    "provider,expected",
+    [
+        ("salesforce", True),
+        ("salesforce-sandbox", True),
+        ("employment-hero", True),
+        ("EMPLOYMENT-HERO", True),
+        ("employment-hero-sandbox", True),
+        ("employment-herolite", False),
+        ("employment-hero2", False),
+        ("hubspot", False),
+        ("", False),
+    ],
+)
+def test_requires_pkce_matches_gated_provider_families(provider, expected):
+    """requires_pkce() is the shared predicate generic_oauth_login's PKCE
+    gate actually calls -- covering it directly (not just indirectly through
+    the redirect-URL assertions above) pins the provider-family membership
+    list itself, the same anchored-prefix reasoning
+    _is_salesforce_provider's own test documents."""
+    assert requires_pkce(provider) is expected
+
+
+def test_salesforce_login_returns_clear_error_when_encryption_key_missing(
+    db_session, monkeypatch
+):
+    """encrypt_value() raises a bare ValueError when ENCRYPTION_KEY is unset
+    outside development. Every other provider's login route never calls
+    encrypt_value at all, so this misconfiguration would otherwise be
+    invisible until the first Salesforce connect attempt -- and uncaught,
+    it would 500 with an opaque traceback instead of a clear cause."""
+    from xagent.core.utils.encryption import get_cipher
+
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    get_cipher.cache_clear()
+    try:
+        resp = generic_oauth_login(
+            provider="salesforce",
+            token=token,
+            app_id=None,
+            redirect=None,
+            db=db,
+            db_provider=provider,
+        )
+    finally:
+        get_cipher.cache_clear()
+
+    assert resp.status_code == 500
+    assert "ENCRYPTION_KEY" in resp.body.decode()
+
+
+def test_non_salesforce_provider_omits_pkce_code_challenge(db_session):
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://example.com/oauth/authorize",
+        default_scopes=["openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="custom",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "code_challenge" not in qs
+    assert "code_challenge_method" not in qs
+    state_payload = verify_token(qs["state"][0])
+    assert "code_verifier" not in state_payload
+
+
 def test_non_zoom_provider_does_not_set_prompt_login(db_session):
     """Sanity: only Zoom gets prompt=login (Google gets prompt=consent, others none)."""
     db, user = db_session
@@ -226,8 +568,348 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     qs = parse_qs(urlparse(_location(resp)).query)
 
     assert qs["scope"] == [
-        "public_profile,pages_manage_posts,pages_read_engagement,pages_show_list"
+        "public_profile,pages_manage_posts,pages_read_engagement,"
+        "pages_read_user_content,pages_show_list"
     ]
+
+
+def test_meta_ads_login_requests_ads_read_scope_without_config_id(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
+    monkeypatch.delenv("META_ADS_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="meta-ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="meta-ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == ["public_profile,ads_read"]
+    assert "config_id" not in qs
+
+
+def test_github_login_requests_exact_canonical_scope(db_session):
+    """The requested scope must be exactly the provider's default_scopes
+    ("read:user") merged with the github app row's canonical oauth_scopes
+    ("repo", "user:email", sorted) -- read:org must NOT reappear even if a
+    stale/incorrect DB row still lists it, since get_app_by_id overlays the
+    canonical registry's oauth_scopes for a builtin app_id regardless of
+    what is persisted."""
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="github",
+            name="GitHub",
+            description="GitHub connector",
+            transport="oauth",
+            provider_name="github",
+            category="Development",
+            # Deliberately stale/wrong to prove the registry, not this
+            # row's oauth_scopes, is what actually gets requested.
+            oauth_scopes=["repo", "read:org", "user:email"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id="github",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == ["read:user repo user:email"]
+
+
+def test_employment_hero_login_requests_exact_canonical_scope(db_session):
+    """Employment Hero has no default_scopes of its own (every scope it
+    needs lives entirely on the app row's oauth_scopes) -- the only test
+    covering its login route before this ran with app_id=None, bypassing
+    this app-level scope-merge path (and the canonical-registry overlay
+    test_github_login_requests_exact_canonical_scope above exercises)
+    entirely. Verified by sabotage: deleting a scope from the registry row
+    produced zero failures anywhere in the oauth + employment-hero suite
+    before this test existed."""
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="employment-hero",
+            name="Employment Hero",
+            description="Employment Hero connector",
+            transport="oauth",
+            provider_name="employment-hero",
+            category="HR",
+            # Deliberately stale/wrong to prove the registry, not this
+            # row's oauth_scopes, is what actually gets requested.
+            oauth_scopes=["organisations:list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://oauth.employmenthero.com/oauth2/authorize",
+        default_scopes=[],
+        redirect_uri="https://app.example.com/api/auth/employment-hero/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="employment-hero",
+        token=token,
+        app_id="employment-hero",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == [
+        "employees:list employees:show organisations:list teams:list "
+        "timesheet_entries:list"
+    ]
+
+
+def test_bare_github_login_config_error_takes_precedence_over_bare_route_guard(
+    db_session,
+):
+    """A bare (app_id-less) login persists to the exact same
+    UserOAuth.provider="github" key an app-scoped login uses, since
+    github's app_id and provider name are the same string. Left unblocked,
+    re-running this route would silently replace a fully-scoped
+    connection's grant with an identity-only one on the next callback --
+    that guard exists and still runs before any state token is minted.
+
+    But the guard is checked AFTER config/auth resolution, not before: a
+    misconfigured provider (missing client_id) must still get the
+    actionable CLIENT_ID config error, not a 404 that would incorrectly
+    read as "this route doesn't support a normal connect attempt" to an
+    operator debugging their setup."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+        client_id="",  # deliberately unconfigured
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 500
+    assert "GITHUB_CLIENT_ID" in resp.body.decode()
+
+
+def test_bare_github_login_unauthenticated_gets_401_not_404(db_session):
+    """Same ordering point as the config-error case above: an
+    unauthenticated bare-route request must get the generic 401, not a 404
+    that implies the route itself is unsupported."""
+    db, _user = db_session
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=None,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 401
+
+
+def test_bare_github_login_is_rejected_once_authenticated_and_configured(db_session):
+    """Once config and auth both resolve cleanly, the bare-route guard for
+    providers requiring an app-scoped grant still fires -- before any
+    state token is minted, which is the property it actually needs to
+    hold."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 404
+
+
+def test_bare_login_for_unrestricted_provider_still_proceeds(db_session):
+    """Sanity: the bare-route guard is scoped to
+    APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT members only -- an ordinary
+    provider's bare login (no collision risk) must be unaffected."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 307
+
+
+def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
+    """business-intelligence, marketing-email, and marketing.campaigns.read
+    are all gated on a Marketing Hub tier above Free/CRM-only - requesting
+    any of them as required scopes would block the whole authorization for
+    portals below that tier. They must arrive via optional_scope, not
+    merged into the required scope param."""
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="hubspot",
+            name="HubSpot",
+            description="HubSpot connector",
+            transport="oauth",
+            provider_name="hubspot",
+            category="CRM",
+            oauth_scopes=["crm.objects.contacts.read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://app.hubspot.com/oauth/authorize",
+        default_scopes=["oauth"],
+        redirect_uri="https://app.example.com/api/auth/hubspot/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="hubspot",
+        token=token,
+        app_id="hubspot",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "business-intelligence" not in qs["scope"][0]
+    assert "marketing-email" not in qs["scope"][0]
+    assert "marketing.campaigns.read" not in qs["scope"][0]
+    assert qs["optional_scope"] == [
+        "business-intelligence marketing-email marketing.campaigns.read"
+    ]
+
+
+def test_non_hubspot_app_sends_no_optional_scope_param(db_session, monkeypatch):
+    """optional_oauth_scopes is a HubSpot-specific registry field today; a
+    builtin app that doesn't set it must not get a stray optional_scope
+    param on a provider whose authorize endpoint doesn't expect one."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
+    monkeypatch.delenv("META_LOGIN_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "optional_scope" not in qs
 
 
 def test_meta_login_uses_config_id_without_scope_when_configured(
@@ -269,6 +951,476 @@ def test_meta_login_uses_config_id_without_scope_when_configured(
 
     assert qs["config_id"] == ["1234567890"]
     assert "scope" not in qs
+    assert "optional_scope" not in qs
+
+
+def test_meta_login_suppresses_optional_scope_under_config_id(db_session, monkeypatch):
+    """config_id mode discards the registry's scope list entirely (the Meta
+    Login Configuration is the sole source of truth) - optional_scope must
+    be suppressed the same way scope already is, even for an app that DOES
+    declare optional_oauth_scopes. No builtin meta-provider app declares
+    optional_oauth_scopes today, so the registry lookup is patched to
+    simulate one rather than asserting a coincidence of current data."""
+    import xagent.web.mcp_apps as mcp_apps_module
+    from xagent.web.builtin_mcp_registry import (
+        get_builtin_execution_fields_and_optional_scopes,
+    )
+
+    def fake_lookup(app_id):
+        execution_fields, _ = get_builtin_execution_fields_and_optional_scopes(app_id)
+        optional_scopes = ["some_tier_gated_scope"] if app_id == "facebook" else []
+        return execution_fields, optional_scopes
+
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "1234567890")
+    monkeypatch.setattr(
+        mcp_apps_module,
+        "get_builtin_execution_fields_and_optional_scopes",
+        fake_lookup,
+    )
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["1234567890"]
+    assert "scope" not in qs
+    assert "optional_scope" not in qs
+
+
+def test_meta_login_uses_config_id_without_scope_for_facebook(db_session, monkeypatch):
+    """Facebook Pages via config_id: pages_read_user_content is NOT requested.
+
+    In this mode the Login Configuration in the Meta App Dashboard is the sole
+    source of truth for granted permissions (see META_CONFIG_ID in example.env)
+    - our builtin registry scopes are not sent at all. This test documents that
+    gap so a future change to the request-scope path doesn't silently mask it.
+    """
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "1234567890")
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=[
+                "pages_show_list",
+                "pages_read_engagement",
+                "pages_manage_posts",
+                "pages_read_user_content",
+            ],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["1234567890"]
+    assert "scope" not in qs
+    assert "optional_scope" not in qs
+
+
+def test_facebook_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """Mirrors the meta-ads override test below for META_FACEBOOK_CONFIG_ID,
+    which had no dedicated coverage of its own."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_FACEBOOK_CONFIG_ID", "facebook-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["facebook-only-config-id"]
+
+
+def test_instagram_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """Mirrors the meta-ads override test below for META_INSTAGRAM_CONFIG_ID,
+    which had no dedicated coverage of its own."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_INSTAGRAM_CONFIG_ID", "instagram-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            description="Instagram connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["instagram_basic"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="instagram",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["instagram-only-config-id"]
+
+
+def test_meta_ads_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """A dedicated META_ADS_CONFIG_ID must take precedence over the shared
+    META_CONFIG_ID for the meta-ads app -- otherwise widening the one shared
+    Login Configuration to include ads_read would also hand that permission
+    to Facebook/Instagram tokens issued from the same configuration."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_ADS_CONFIG_ID", "ads-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="meta-ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="meta-ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["ads-only-config-id"]
+    assert "scope" not in qs
+
+
+def test_meta_ads_login_falls_back_to_shared_config_id_when_unset(
+    db_session, monkeypatch
+):
+    """Without a dedicated META_ADS_CONFIG_ID, Meta Ads still falls back to
+    the shared META_CONFIG_ID -- preserving existing deployments that
+    haven't split their Login Configurations out per app."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.delenv("META_ADS_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="meta-ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="meta-ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["shared-config-id"]
+
+
+def test_meta_ads_login_config_id_override_survives_admin_app_id_casing(
+    db_session, monkeypatch
+):
+    """An admin-created app row's app_id is free-form (e.g. "Meta Ads" with
+    a space/capitals, still normalizing to "meta-ads" for the app-scoped
+    OAuth grant policy in mcp_apps.py). The config_id override lookup must
+    normalize the same way, or a differently-cased app_id would silently
+    miss META_ADS_CONFIG_ID and fall back to the shared META_CONFIG_ID --
+    reintroducing exactly the cross-app capability sharing the per-app
+    override exists to prevent."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_ADS_CONFIG_ID", "ads-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="Meta Ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="Meta Ads",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["ads-only-config-id"]
+
+
+def test_whatsapp_login_uses_its_own_config_id_override(db_session, monkeypatch):
+    """A dedicated META_WHATSAPP_CONFIG_ID must take precedence over the
+    shared META_CONFIG_ID for the whatsapp app -- otherwise widening the one
+    shared Login Configuration to include WhatsApp's business_management /
+    whatsapp_business_management / whatsapp_business_messaging scopes would
+    also hand those permissions to Facebook/Instagram/Meta Ads tokens issued
+    from the same configuration."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_WHATSAPP_CONFIG_ID", "whatsapp-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="whatsapp",
+            name="WhatsApp Business",
+            description="WhatsApp connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["whatsapp_business_messaging"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="whatsapp",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["whatsapp-only-config-id"]
+    assert "scope" not in qs
+
+
+def test_whatsapp_login_falls_back_to_shared_config_id_when_unset(
+    db_session, monkeypatch
+):
+    """Mirrors the meta-ads equivalent above: without a dedicated
+    META_WHATSAPP_CONFIG_ID, whatsapp still falls back to the shared
+    META_CONFIG_ID -- preserving existing deployments that haven't split
+    their Login Configurations out per app."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.delenv("META_WHATSAPP_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="whatsapp",
+            name="WhatsApp Business",
+            description="WhatsApp connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["whatsapp_business_messaging"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="whatsapp",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["shared-config-id"]
+
+
+def test_whatsapp_login_config_id_override_survives_admin_app_id_casing(
+    db_session, monkeypatch
+):
+    """Mirrors the meta-ads equivalent above: an admin-created app row's
+    app_id is free-form (e.g. "WhatsApp" with different casing/spacing,
+    still normalizing to "whatsapp" for the app-scoped OAuth grant policy in
+    mcp_apps.py). The config_id override lookup must normalize the same
+    way, or a differently-cased app_id would silently miss
+    META_WHATSAPP_CONFIG_ID and fall back to the shared META_CONFIG_ID."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "shared-config-id")
+    monkeypatch.setenv("META_WHATSAPP_CONFIG_ID", "whatsapp-only-config-id")
+    db.add(
+        PublicMCPApp(
+            app_id="WhatsApp",
+            name="WhatsApp Business",
+            description="WhatsApp connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["whatsapp_business_messaging"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="WhatsApp",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["whatsapp-only-config-id"]
 
 
 def test_meta_login_ignores_undocumented_legacy_config_id_alias(
@@ -346,6 +1498,20 @@ def test_resolve_oauth_secret_uses_env_without_decrypting_empty_values(
     )
 
 
+def test_resolve_oauth_secret_normalizes_hyphenated_provider_env_name(monkeypatch):
+    """A hyphenated provider_name (e.g. "employment-hero", or an admin-
+    created "-sandbox" variant of any family) must map to the same
+    underscored env var name every deployment already documents -- env vars
+    can't contain "-" at all, so an unnormalized lookup (EMPLOYMENT-HERO_...)
+    would never match anything a real deployment could set, permanently
+    breaking this fallback for every hyphenated provider."""
+    monkeypatch.setenv("EMPLOYMENT_HERO_CLIENT_SECRET", "env-secret")
+
+    assert (
+        _resolve_oauth_secret("employment-hero", None, "CLIENT_SECRET") == "env-secret"
+    )
+
+
 def test_login_fails_locally_when_client_id_is_missing(db_session, monkeypatch):
     db, user = db_session
     token = _token_for(user)
@@ -369,3 +1535,38 @@ def test_login_fails_locally_when_client_id_is_missing(db_session, monkeypatch):
 
     assert resp.status_code == 500
     assert "MICROSOFT_CLIENT_ID" in resp.body.decode()
+
+
+def test_deputy_login_sends_scope_and_omits_pkce(db_session):
+    """generic_oauth_login has no Deputy-specific branch (its
+    longlife_refresh_token scope flows through the existing generic
+    default_scopes -> scope_str path) -- this locks that in, since nothing
+    previously exercised generic_oauth_login with provider="deputy" at
+    all (only the callback side had coverage)."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://once.deputy.com/my/oauth/login",
+        default_scopes=["longlife_refresh_token"],
+        redirect_uri="https://app.example.com/api/auth/deputy/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="deputy",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    location = _location(resp)
+    qs = parse_qs(urlparse(location).query)
+
+    assert location.startswith("https://once.deputy.com/my/oauth/login?")
+    assert qs.get("scope") == ["longlife_refresh_token"]
+    assert qs.get("response_type") == ["code"]
+    assert "code_challenge" not in qs
+    assert "code_challenge_method" not in qs
+    state_payload = verify_token(qs["state"][0])
+    assert "code_verifier" not in state_payload

@@ -19,11 +19,12 @@ This keeps the dependency edges obvious and avoids the "what's
 magically in scope?" question that pure-fixture conftests get.
 """
 
+import asyncio
 import logging
 import os
 import shutil
 import tempfile
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 from fastapi import FastAPI, Request
@@ -36,6 +37,8 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.auth_database import auth_db_override
+from tests.shared.db_teardown import drop_all_tables
 from xagent.web.api.a2a import router as a2a_router
 from xagent.web.api.agent_api_keys import router as agent_api_keys_router
 from xagent.web.api.agents import router as agents_router
@@ -52,7 +55,9 @@ from xagent.web.api.v1.errors import V1ApiError, v1_api_error_handler
 from xagent.web.api.widget import widget_router
 from xagent.web.api.workforces import router as workforces_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
-from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.models.auth_database import get_auth_db
+from xagent.web.models.database import get_db, get_engine
+from xagent.web.services import task_orchestrator as task_orchestrator_service
 from xagent.web.services.a2a_protocol import (
     A2AApiError,
     a2a_api_error_handler,
@@ -168,6 +173,7 @@ async def _v1_validation_error_handler(request: Request, exc: RequestValidationE
 
 
 app_for_tests.dependency_overrides[get_db] = _override_get_db
+app_for_tests.dependency_overrides[get_auth_db] = auth_db_override(_override_get_db)
 client = TestClient(app_for_tests, raise_server_exceptions=False)
 
 
@@ -214,7 +220,7 @@ def _test_db() -> Iterator[None]:
 
     yield
 
-    Base.metadata.drop_all(bind=get_engine())
+    drop_all_tables(get_engine())
     try:
         shutil.rmtree(temp_dir)
     except OSError:
@@ -340,3 +346,34 @@ def _install_one_slot_queue_pool(
         sessionmaker(autocommit=False, autoflush=False, bind=engine),
     )
     return engine
+
+
+def patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Replace the leaf that starts a real background turn with a no-op task.
+
+    The workforce guest create path reaches
+    ``TaskTurnOrchestrator.schedule_claimed_create_turn`` ->
+    ``schedule_claimed_turn`` -> ``_schedule_bg``. Patching only that leaf
+    keeps the claim-to-schedule handoff real -- a raise anywhere in it still
+    fails the test -- while leaving no live background task for
+    ``public_chat_access.py`` to drop un-awaited, which would otherwise race
+    the schema teardown below.
+
+    Lives here rather than in each suite: three api/ suites need it, and while
+    each kept its own copy they drifted -- two stubbed a call the workforce
+    create path never makes, so the stub was inert and the background turn ran
+    anyway.
+    """
+
+    scheduled: dict[str, Any] = {}
+
+    def fake_schedule_bg(**kwargs: Any) -> "asyncio.Task[None]":
+        scheduled.update(kwargs)
+
+        async def noop() -> None:
+            return None
+
+        return asyncio.create_task(noop())
+
+    monkeypatch.setattr(task_orchestrator_service, "_schedule_bg", fake_schedule_bg)
+    return scheduled

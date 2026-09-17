@@ -1,6 +1,9 @@
 """Durable, cross-worker transport for task execution commands.
 
-Ingress commits a command before acknowledging it. Every web worker runs the
+Ingress commits a command before acknowledging it: enqueue_task_command is
+the committing wrapper most callers use, built on stage_task_command, the
+staging primitive that deliberately does not commit so a caller can fold a
+command into a larger transaction of its own. Every web worker runs the
 same dispatcher; a database claim chooses one consumer while per-task ordering
 prevents a later command from overtaking an earlier unfinished command.
 """
@@ -12,26 +15,35 @@ import enum
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, or_, select, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, Session, aliased
 
 from ...config import (
+    get_shared_task_execution_enabled,
     get_task_lease_heartbeat_seconds,
     get_task_lease_ttl_seconds,
 )
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
+from ..models.user import User
 from .db_runtime import (
     await_task_settlement,
     is_database_pool_timeout,
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .task_command_terminal_events import (
+    TerminalTaskEventDraft,
+    stage_terminal_event,
+    terminal_event_draft_for_error,
+)
+from .task_execution_host import consumes_task_commands
 from .task_lease_service import get_runner_id
 
 logger = logging.getLogger(__name__)
@@ -44,20 +56,71 @@ COMMAND_TERMINAL = (COMMAND_COMPLETED, COMMAND_FAILED)
 
 COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MAX_COMMAND_FAILURES = 5
+# Since the budget was coupled to the lease TTL, this constant is the FLOOR
+# of the effective defer budget, not the budget itself — compare against
+# max_command_defers(), never against this constant directly.
 MAX_COMMAND_DEFERS = 60
+
+
+def max_command_defers() -> int:
+    """The defer budget, a TTL-coupled heuristic rather than a guarantee.
+
+    A deferral's shortest canonical wait is a task lease another holder has
+    not released yet: on a non-RUNNING row the lease cannot be refreshed, so
+    it clears within one TTL. The budget (spent roughly once per second —
+    ``defer_task_command`` re-arms the claim one second out) must outlast
+    that with real margin: a fixed 60 was silently smaller than any raised
+    ``XAGENT_TASK_LEASE_TTL_SECONDS``, turning every long park into a
+    terminal failure for an already-accepted command
+    (xorbitsai/xagent-saas#952 B3). Twice the TTL keeps 100% headroom at
+    every setting; the historical constant stays as the floor so short-TTL
+    deployments keep their existing patience. Read per call, not cached:
+    the TTL is env-driven and tests vary it.
+
+    This mitigates rather than closes the exhaustion: a RUNNING row's lease
+    is heartbeat-refreshed for the whole turn, so a command deferring behind
+    a turn longer than the budget still fails terminally. The structural
+    fix — patience as a wall-clock deadline against the command's
+    ``created_at`` instead of a defer count — is #1995.
+    """
+
+    return max(MAX_COMMAND_DEFERS, get_task_lease_ttl_seconds() * 2)
+
+
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
 
 
 class TaskCommandKind(str, enum.Enum):
+    START = "start"
+    RESUME_INPUT = "resume_input"
     MESSAGE = "message"
     PAUSE = "pause"
     RESUME = "resume"
     CANCEL = "cancel"
 
 
+class TaskCommandTaskMissing(ValueError):
+    """The target task no longer exists.
+
+    Raised when the row is absent, including when a concurrent delete lands
+    between the existence check and the insert. Callers that tolerate a missing
+    task treat this as the missing-task sentinel rather than a rejection, so a
+    deleted task can be replaced instead of losing the message.
+    """
+
+
 class TaskCommandDeferred(RuntimeError):
-    """The command is durable but its downstream handoff is still pending."""
+    """The command is durable but its downstream handoff is still pending.
+
+    ``resend_safe`` is true only when the failed handoff proves this command
+    never reached the downstream operation. The terminal-event projection can
+    then tell the sender to retry without risking a duplicate.
+    """
+
+    def __init__(self, message: str, *, resend_safe: bool = False) -> None:
+        super().__init__(message)
+        self.resend_safe = resend_safe
 
 
 class TaskCommandRejected(RuntimeError):
@@ -75,6 +138,71 @@ class EnqueuedTaskCommand:
     created: bool
     payload_matches: bool
     status: str
+
+
+@dataclass(frozen=True)
+class StagedTaskCommand:
+    """A command row added to a caller-owned session, not yet committed.
+
+    ``staged_db_id`` is deliberately not named ``command_id`` -- unlike
+    ``EnqueuedTaskCommand.command_id``, this id is only guaranteed to exist in
+    the database once the caller commits the session it was staged on. Code
+    that dispatches or notifies by id must never accept a StagedTaskCommand.
+    """
+
+    staged_db_id: int
+    client_command_id: str
+    created: bool
+    payload_matches: bool
+    status: str
+
+    def to_enqueued(self) -> EnqueuedTaskCommand:
+        """Project this staged row into the committing wrapper's result shape.
+
+        ``staged_db_id`` becomes ``EnqueuedTaskCommand.command_id`` -- valid
+        only once the caller has committed the transaction this row was
+        staged on.
+        """
+
+        return EnqueuedTaskCommand(
+            command_id=self.staged_db_id,
+            client_command_id=self.client_command_id,
+            created=self.created,
+            payload_matches=self.payload_matches,
+            status=self.status,
+        )
+
+
+class TaskCommandOwnerStateError(RuntimeError):
+    """The caller's own pending writes failed to flush before staging began.
+
+    Deliberately not an IntegrityError subclass: the wrapper's
+    ``except IntegrityError`` classifies conflicts on the command insert
+    itself, and must not also catch a failure that has nothing to do with
+    that insert. After this is raised, the session is unusable -- the caller
+    must roll back before issuing any further statement on it.
+    """
+
+
+class TaskCommandConflictKind(enum.Enum):
+    RACED_DUPLICATE = "raced_duplicate"
+    TASK_MISSING = "task_missing"
+    UNRELATED = "unrelated"
+
+
+@dataclass(frozen=True)
+class RacedTaskCommandProjection:
+    """Immutable snapshot of the row that won a duplicate-insert race."""
+
+    command_db_id: int
+    status: str
+    payload_matches: bool
+
+
+@dataclass(frozen=True)
+class TaskCommandConflictClassification:
+    kind: TaskCommandConflictKind
+    raced: RacedTaskCommandProjection | None = None
 
 
 @dataclass(frozen=True)
@@ -132,10 +260,24 @@ def _canonical_payload(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _normalize_command_id(command_id: str) -> str:
+    """Strip and validate a caller-supplied command_id.
+
+    Shared by every normalization site in this module so the accepted format
+    -- 1-64 URL-safe characters -- cannot drift between them.
+    """
+
+    normalized = command_id.strip()
+    if COMMAND_ID_PATTERN.fullmatch(normalized) is None:
+        raise ValueError("command_id must be 1-64 URL-safe characters")
+    return normalized
+
+
 def _matches_existing(
     command: TaskExecutionCommand,
     *,
     actor_user_id: int | None,
+    actor_subject: str | None,
     kind: TaskCommandKind,
     payload: dict[str, Any],
 ) -> bool:
@@ -143,11 +285,318 @@ def _matches_existing(
         command.payload if isinstance(command.payload, dict) else {}
     )
     stored_actor_user_id = getattr(command, "actor_user_id", None)
+    stored_actor_subject = getattr(command, "actor_subject", None)
+    actors_match = (
+        stored_actor_user_id is None and stored_actor_subject is None
+        if actor_user_id is None
+        else actor_subject is not None and stored_actor_subject == actor_subject
+    )
     return (
-        stored_actor_user_id == actor_user_id
+        actors_match
         and str(command.kind) == kind.value
         and _canonical_payload(stored_payload) == _canonical_payload(payload)
     )
+
+
+def _load_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
+    if actor_user_id is None:
+        return None
+    stored_subject = db.execute(
+        select(User.actor_subject).where(User.id == actor_user_id)
+    ).scalar_one_or_none()
+    return str(stored_subject) if stored_subject is not None else None
+
+
+def _resolve_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
+    stored_subject = _load_actor_subject(db, actor_user_id)
+    if actor_user_id is None or stored_subject is not None:
+        return stored_subject
+    candidate_subject = str(uuid.uuid4())
+    (
+        db.query(User)
+        .filter(
+            User.id == actor_user_id,
+            User.actor_subject.is_(None),
+        )
+        .update(
+            {User.actor_subject: candidate_subject},
+            synchronize_session=False,
+        )
+    )
+    return _load_actor_subject(db, actor_user_id)
+
+
+def command_identity_matches_task(
+    db: Session, task: Task, command: TaskExecutionCommand
+) -> bool:
+    """Revalidate the accepted actor and owner separately at execution time."""
+    from ..models.agent import Agent
+
+    owner = db.get(User, task.user_id)
+    actor = (
+        db.get(User, command.actor_user_id)
+        if command.actor_user_id is not None
+        else None
+    )
+    return bool(
+        owner is not None
+        and owner.actor_subject == command.task_owner_subject
+        and owner.id == command.task_owner_user_id
+        and actor is not None
+        and actor.actor_subject == command.actor_subject
+        and (
+            actor.id == owner.id
+            or actor.is_admin
+            or (
+                task.source == "sdk"
+                and db.execute(
+                    select(Agent.id).where(
+                        Agent.id == task.agent_id, Agent.user_id == actor.id
+                    )
+                ).scalar_one_or_none()
+                is not None
+            )
+        )
+    )
+
+
+def stage_task_command(
+    db: Session,
+    *,
+    task_id: int,
+    actor_user_id: int | None,
+    command_id: str,
+    kind: TaskCommandKind,
+    payload: dict[str, Any],
+    reply_host_id: str | None = None,
+    reply_origin: str | None = None,
+    target_run_id: str | None = None,
+) -> StagedTaskCommand:
+    """Add an idempotent command row to the session without ending its transaction.
+
+    Never calls ``db.commit()``, ``db.rollback()``, or the dispatcher notify --
+    the caller owns the transaction boundary and decides what durability means
+    for its own writes alongside this command. Statement order is load-bearing:
+
+    1. Reject a malformed command_id before touching the database at all.
+    2. Flush the caller's own pending writes first, so a conflict there is
+       reported as TaskCommandOwnerStateError rather than folded into the
+       IntegrityError this function raises for a duplicate command insert.
+    3. Read the task through a single Core select rather than the ORM. This
+       both closes the window a separate existence check and a separate
+       snapshot read would leave between them, and -- unlike an ORM query --
+       is not served from the identity map, so it observes a caller's own
+       uncommitted CAS-style update to the same row instead of a stale cached
+       instance.
+    4. Resolve the actor and task owner's stable internal subjects in this
+       transaction, so idempotency and terminal delivery never treat a reused
+       integer user id as the same identity.
+    5. Check for an existing command with this (task_id, command_id) before
+       adding a new row, so a repeated call is idempotent without relying on
+       the unique constraint to reject it.
+    6. Add and flush the new row last, so any remaining IntegrityError is
+       attributable to the command insert itself.
+
+    Caller obligations:
+
+    a. After the caller's own commit, it should invoke
+       notify_task_command_dispatcher(). Skipping it does not lose the
+       command -- the dispatcher's idle poll still recovers it -- but
+       delivery silently degrades to up to DISPATCHER_IDLE_SECONDS of added
+       latency instead of an immediate wakeup.
+    b. On IntegrityError from the command-insert flush in step 5, the caller
+       must roll back the whole transaction before issuing any further
+       statement on this session -- classify_task_command_conflict below
+       assumes that rollback has already happened.
+    c. On every exit path -- a created row, an idempotent hit, or
+       TaskCommandTaskMissing -- this call must be the last write a caller
+       issues before it commits, with no I/O or other slow work in between.
+       A caller that instead stays in a long transaction after staging holds
+       SQLite's database-wide writer lock for the entire transaction, not
+       the microseconds an immediate commit implies; every concurrent
+       writer, including the dispatcher's claim, blocks for that whole span.
+    """
+
+    normalized_id = _normalize_command_id(command_id)
+    resolved_task_id = int(task_id)
+
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        raise TaskCommandOwnerStateError(
+            "caller's pending writes failed to flush before command staging"
+        ) from exc
+
+    # A task snapshot a caller loaded earlier would widen the concurrent-delete
+    # window across everything it did in between, so existence is re-checked
+    # here, by query, before inserting a command that references the row.
+    snapshot = db.execute(
+        select(
+            Task.status,
+            Task.runner_id,
+            Task.run_id,
+            Task.state_version,
+            Task.user_id,
+            User.id.label("task_owner_row_id"),
+            User.actor_subject.label("task_owner_subject"),
+        )
+        .select_from(Task)
+        .outerjoin(
+            User,
+            and_(
+                User.id == Task.user_id,
+                User.created_at.is_not(None),
+                Task.created_at.is_not(None),
+                User.created_at <= Task.created_at,
+            ),
+        )
+        .where(Task.id == resolved_task_id)
+    ).one_or_none()
+    if snapshot is None:
+        raise TaskCommandTaskMissing(f"Task {task_id} not found")
+
+    actor_subject = _resolve_actor_subject(db, actor_user_id)
+    task_owner_subject = (
+        str(snapshot.task_owner_subject)
+        if snapshot.task_owner_subject is not None
+        else None
+    )
+    if snapshot.task_owner_row_id is not None and task_owner_subject is None:
+        task_owner_subject = (
+            actor_subject
+            if actor_user_id == int(snapshot.user_id)
+            else _resolve_actor_subject(db, int(snapshot.user_id))
+        )
+    existing = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.task_id == resolved_task_id,
+            TaskExecutionCommand.command_id == normalized_id,
+        )
+        .first()
+    )
+    if existing is not None:
+        matches = _matches_existing(
+            existing,
+            actor_user_id=actor_user_id,
+            actor_subject=actor_subject,
+            kind=kind,
+            payload=payload,
+        )
+        return StagedTaskCommand(
+            staged_db_id=int(existing.id),
+            client_command_id=normalized_id,
+            created=False,
+            payload_matches=matches,
+            status=str(existing.status),
+        )
+
+    active_runner_id = (
+        snapshot.runner_id
+        if snapshot.status == TaskStatus.RUNNING and snapshot.runner_id is not None
+        else None
+    )
+    command = TaskExecutionCommand(
+        task_id=resolved_task_id,
+        actor_user_id=actor_user_id,
+        actor_subject=actor_subject,
+        task_owner_user_id=int(snapshot.user_id),
+        task_owner_subject=task_owner_subject,
+        command_id=normalized_id,
+        kind=kind.value,
+        payload=payload,
+        target_run_id=target_run_id if target_run_id is not None else snapshot.run_id,
+        target_state_version=int(snapshot.state_version or 0),
+        target_runner_id=active_runner_id,
+        reply_host_id=reply_host_id,
+        reply_origin=reply_origin,
+        status=COMMAND_PENDING,
+    )
+    db.add(command)
+    db.flush()
+    return StagedTaskCommand(
+        staged_db_id=int(command.id),
+        client_command_id=normalized_id,
+        created=True,
+        payload_matches=True,
+        status=COMMAND_PENDING,
+    )
+
+
+def classify_task_command_conflict(
+    db: Session,
+    *,
+    task_id: int,
+    command_id: str,
+    actor_user_id: int | None,
+    kind: TaskCommandKind,
+    payload: dict[str, Any],
+) -> TaskCommandConflictClassification:
+    """Classify an IntegrityError from staging a command insert.
+
+    Normalizes command_id the same way stage_task_command does -- strip plus
+    full-format validation, not strip alone -- so a lookup here targets the
+    same row a duplicate-command race would have inserted.
+
+    Call only after the caller has rolled back the transaction the failed
+    stage happened on -- this queries post-rollback state to tell apart a
+    duplicate command_id that won the race (RACED_DUPLICATE, carrying a
+    frozen projection of the winning row computed in this same query so the
+    caller does not need a second, possibly inconsistent, read), a task
+    deleted concurrently with the insert (TASK_MISSING), and a conflict on
+    neither -- the row references two foreign keys, so absence of a duplicate
+    does not prove the task caused it: a concurrently deleted actor fails the
+    users FK while the task is still present (UNRELATED). Rolling back to a
+    savepoint opened before the failing insert is equivalent to rolling back
+    the whole transaction for this purpose, as long as that savepoint
+    predates the insert: either way, the post-rollback state this function
+    queries no longer contains the failed statement's own effects.
+
+    RACED_DUPLICATE means the command survived the race, not that the
+    caller's work did: the rollback that had to precede this call also undid
+    whatever else the caller had written. A caller that had such writes must
+    redo them rather than report success. Opening the savepoint after those
+    writes is the way out of redoing them: a rollback to a savepoint that
+    postdates them leaves them pending in the still-open outer transaction,
+    so the caller decides whether to commit or discard them once it knows
+    what this function found. ``task_interaction_service.respond()`` is
+    that shape. A caller with nothing else pending
+    -- enqueue_task_command is one -- has nothing to redo and reports the
+    raced row as created=False.
+    """
+
+    resolved_task_id = int(task_id)
+    normalized_id = _normalize_command_id(command_id)
+    raced = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.task_id == resolved_task_id,
+            TaskExecutionCommand.command_id == normalized_id,
+        )
+        .one_or_none()
+    )
+    if raced is not None:
+        actor_subject = _load_actor_subject(db, actor_user_id)
+        matches = _matches_existing(
+            raced,
+            actor_user_id=actor_user_id,
+            actor_subject=actor_subject,
+            kind=kind,
+            payload=payload,
+        )
+        return TaskCommandConflictClassification(
+            kind=TaskCommandConflictKind.RACED_DUPLICATE,
+            raced=RacedTaskCommandProjection(
+                command_db_id=int(raced.id),
+                status=str(raced.status),
+                payload_matches=matches,
+            ),
+        )
+    if db.query(Task.id).filter(Task.id == resolved_task_id).scalar() is None:
+        return TaskCommandConflictClassification(
+            kind=TaskCommandConflictKind.TASK_MISSING
+        )
+    return TaskCommandConflictClassification(kind=TaskCommandConflictKind.UNRELATED)
 
 
 def enqueue_task_command(
@@ -158,90 +607,69 @@ def enqueue_task_command(
     command_id: str,
     kind: TaskCommandKind,
     payload: dict[str, Any],
+    reply_host_id: str | None = None,
+    reply_origin: str | None = None,
 ) -> EnqueuedTaskCommand:
-    """Commit an idempotent command and return only after it is durable."""
+    """Commit an idempotent command and return only after it is durable.
 
-    normalized_id = command_id.strip()
-    if COMMAND_ID_PATTERN.fullmatch(normalized_id) is None:
-        raise ValueError("command_id must be 1-64 URL-safe characters")
-    task = db.query(Task).filter(Task.id == int(task_id)).first()
-    if task is None:
-        raise ValueError(f"Task {task_id} not found")
+    TaskCommandOwnerStateError from stage_task_command's owner pre-flush
+    propagates uncaught -- it is deliberately not caught alongside
+    IntegrityError below. A caller managing its own session lifetime must
+    treat it as its own write failure, not a command-staging failure, and
+    roll back before issuing any further statement on the session.
+    """
 
-    existing = (
-        db.query(TaskExecutionCommand)
-        .filter(
-            TaskExecutionCommand.task_id == int(task_id),
-            TaskExecutionCommand.command_id == normalized_id,
-        )
-        .first()
-    )
-    if existing is not None:
-        matches = _matches_existing(
-            existing,
+    try:
+        staged = stage_task_command(
+            db,
+            task_id=task_id,
             actor_user_id=actor_user_id,
+            command_id=command_id,
             kind=kind,
             payload=payload,
+            reply_host_id=reply_host_id,
+            reply_origin=reply_origin,
         )
-        return EnqueuedTaskCommand(
-            command_id=int(existing.id),
-            client_command_id=normalized_id,
-            created=False,
-            payload_matches=matches,
-            status=str(existing.status),
-        )
-
-    active_runner_id = (
-        task.runner_id
-        if task.status == TaskStatus.RUNNING and task.runner_id is not None
-        else None
-    )
-    command = TaskExecutionCommand(
-        task_id=int(task_id),
-        actor_user_id=actor_user_id,
-        command_id=normalized_id,
-        kind=kind.value,
-        payload=payload,
-        target_run_id=task.run_id,
-        target_runner_id=active_runner_id,
-        status=COMMAND_PENDING,
-    )
-    db.add(command)
-    try:
-        db.commit()
-        db.refresh(command)
+        # Only a newly created row is worth committing, and the commit stays
+        # inside this try so that a constraint failure surfacing there rather
+        # than at the staging flush is still rolled back and classified.
+        if staged.created:
+            db.commit()
     except IntegrityError:
         db.rollback()
-        raced = (
-            db.query(TaskExecutionCommand)
-            .filter(
-                TaskExecutionCommand.task_id == int(task_id),
-                TaskExecutionCommand.command_id == normalized_id,
-            )
-            .one()
-        )
-        matches = _matches_existing(
-            raced,
+        # A constraint that only fires at commit time on the caller's own row
+        # (rather than on the command insert) would still land here and enter
+        # conflict classification below. No deferrable constraint exists in
+        # the current schema, so this residual conflation cannot yet trigger
+        # in practice; it is left as-is to keep parity with the original
+        # single-function behavior this was extracted from.
+        classification = classify_task_command_conflict(
+            db,
+            task_id=task_id,
+            command_id=command_id,
             actor_user_id=actor_user_id,
             kind=kind,
             payload=payload,
         )
-        return EnqueuedTaskCommand(
-            command_id=int(raced.id),
-            client_command_id=normalized_id,
-            created=False,
-            payload_matches=matches,
-            status=str(raced.status),
-        )
+        if classification.kind is TaskCommandConflictKind.RACED_DUPLICATE:
+            raced = classification.raced
+            assert raced is not None
+            return EnqueuedTaskCommand(
+                command_id=raced.command_db_id,
+                client_command_id=_normalize_command_id(command_id),
+                created=False,
+                payload_matches=raced.payload_matches,
+                status=raced.status,
+            )
+        if classification.kind is TaskCommandConflictKind.TASK_MISSING:
+            raise TaskCommandTaskMissing(f"Task {task_id} not found") from None
+        raise
+
+    if not staged.created:
+        return staged.to_enqueued()
 
     notify_task_command_dispatcher()
-    return EnqueuedTaskCommand(
-        command_id=int(command.id),
-        client_command_id=normalized_id,
-        created=True,
-        payload_matches=True,
-        status=COMMAND_PENDING,
-    )
+    return staged.to_enqueued()
 
 
 def _claim_availability_predicate(now: datetime) -> Any:
@@ -261,6 +689,15 @@ def _claim_availability_predicate(now: datetime) -> Any:
 
 
 def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
+    if get_shared_task_execution_enabled():
+        # An empty immutable target must not let another worker steal live
+        # owner commands and spend the defer budget waiting for that owner.
+        return or_(
+            Task.runner_id == runner_id,
+            Task.runner_id.is_(None),
+            Task.lease_expires_at.is_(None),
+            Task.lease_expires_at < now,
+        )
     return or_(
         TaskExecutionCommand.target_runner_id.is_(None),
         TaskExecutionCommand.target_runner_id == runner_id,
@@ -290,6 +727,14 @@ def _claimable_query(
         db.query(TaskExecutionCommand)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
         .filter(
+            # Keep START dormant until the entire shared host is enabled.
+            (
+                true()
+                if get_shared_task_execution_enabled()
+                else TaskExecutionCommand.kind.notin_(
+                    (TaskCommandKind.START.value, TaskCommandKind.RESUME_INPUT.value)
+                )
+            ),
             _claim_availability_predicate(now),
             ~_unfinished_earlier_command(),
             _command_routing_predicate(runner_id, now),
@@ -308,6 +753,8 @@ def claim_task_command(
 ) -> ClaimedTaskCommand | None:
     """Atomically claim the oldest eligible command for this worker."""
 
+    if not consumes_task_commands():
+        return None
     resolved_runner_id = runner_id or get_runner_id()
     candidate = _claimable_query(
         db,
@@ -461,6 +908,45 @@ async def _claim_heartbeat(
     return TaskCommandClaimHeartbeatOutcome(pool_timeout=pool_timeout)
 
 
+def finish_task_command_no_commit(
+    db: Session,
+    command_db_id: int,
+    runner_id: str,
+    *,
+    result: dict[str, Any] | None = None,
+    expected_attempt_count: int | None = None,
+    require_live_claim: bool = False,
+) -> bool:
+    """Stage completion; START commits this together with its execution lease."""
+    now = _utc_now()
+    query = db.query(TaskExecutionCommand).filter(
+        TaskExecutionCommand.id == command_db_id,
+        TaskExecutionCommand.status == COMMAND_PROCESSING,
+        TaskExecutionCommand.claimed_by == runner_id,
+    )
+    if require_live_claim:
+        query = query.filter(TaskExecutionCommand.claim_expires_at > now)
+    if expected_attempt_count is not None:
+        query = query.filter(
+            TaskExecutionCommand.attempt_count == expected_attempt_count
+        )
+    updated = query.update(
+        {
+            TaskExecutionCommand.status: COMMAND_COMPLETED,
+            TaskExecutionCommand.result: result,
+            TaskExecutionCommand.error: None,
+            TaskExecutionCommand.claimed_by: None,
+            TaskExecutionCommand.claim_expires_at: None,
+            TaskExecutionCommand.completed_at: now,
+            TaskExecutionCommand.updated_at: now,
+        },
+        synchronize_session=False,
+    )
+    if updated == 1:
+        stage_terminal_event(db, command_db_id=command_db_id)
+    return updated == 1
+
+
 def finish_task_command(
     command_db_id: int,
     runner_id: str,
@@ -470,32 +956,16 @@ def finish_task_command(
 ) -> bool:
     from ..models.database import get_session_local
 
-    SessionLocal = get_session_local()
-    now = _utc_now()
-    with SessionLocal() as db:
-        query = db.query(TaskExecutionCommand).filter(
-            TaskExecutionCommand.id == command_db_id,
-            TaskExecutionCommand.status == COMMAND_PROCESSING,
-            TaskExecutionCommand.claimed_by == runner_id,
-        )
-        if expected_attempt_count is not None:
-            query = query.filter(
-                TaskExecutionCommand.attempt_count == expected_attempt_count
-            )
-        updated = query.update(
-            {
-                TaskExecutionCommand.status: COMMAND_COMPLETED,
-                TaskExecutionCommand.result: result,
-                TaskExecutionCommand.error: None,
-                TaskExecutionCommand.claimed_by: None,
-                TaskExecutionCommand.claim_expires_at: None,
-                TaskExecutionCommand.completed_at: now,
-                TaskExecutionCommand.updated_at: now,
-            },
-            synchronize_session=False,
+    with get_session_local()() as db:
+        updated = finish_task_command_no_commit(
+            db,
+            command_db_id,
+            runner_id,
+            result=result,
+            expected_attempt_count=expected_attempt_count,
         )
         db.commit()
-        return updated == 1
+        return updated
 
 
 def fail_task_command(
@@ -506,6 +976,7 @@ def fail_task_command(
     force_terminal: bool = False,
     expected_attempt_count: int | None = None,
     result: dict[str, Any] | None = None,
+    terminal_event: TerminalTaskEventDraft | None = None,
 ) -> bool:
     """Retry a failed claim, or make it terminal after bounded attempts."""
 
@@ -514,6 +985,26 @@ def fail_task_command(
     SessionLocal = get_session_local()
     now = _utc_now()
     with SessionLocal() as db:
+        handoff = None
+        if get_shared_task_execution_enabled():
+            handoff = (
+                db.query(TaskExecutionCommand)
+                .filter(
+                    TaskExecutionCommand.id == command_db_id,
+                    TaskExecutionCommand.kind.in_(
+                        (
+                            TaskCommandKind.START.value,
+                            TaskCommandKind.RESUME_INPUT.value,
+                        )
+                    ),
+                )
+                .first()
+            )
+        if handoff is not None:
+            # Match acceptance/handoff lock order: task, then command.
+            db.execute(
+                select(Task.id).where(Task.id == handoff.task_id).with_for_update()
+            ).first()
         snapshot_query = db.query(
             TaskExecutionCommand.failure_count,
             TaskExecutionCommand.attempt_count,
@@ -522,6 +1013,10 @@ def fail_task_command(
             TaskExecutionCommand.status == COMMAND_PROCESSING,
             TaskExecutionCommand.claimed_by == runner_id,
         )
+        if handoff is not None:
+            snapshot_query = snapshot_query.filter(
+                TaskExecutionCommand.claim_expires_at > now
+            )
         if expected_attempt_count is not None:
             snapshot_query = snapshot_query.filter(
                 TaskExecutionCommand.attempt_count == expected_attempt_count
@@ -541,6 +1036,9 @@ def fail_task_command(
                 TaskExecutionCommand.claimed_by == runner_id,
                 TaskExecutionCommand.failure_count == observed_failure_count,
                 TaskExecutionCommand.attempt_count == observed_attempt_count,
+                (TaskExecutionCommand.claim_expires_at > _utc_now())
+                if handoff is not None
+                else true(),
             )
             .update(
                 {
@@ -562,6 +1060,17 @@ def fail_task_command(
                 synchronize_session=False,
             )
         )
+        if updated == 1 and terminal:
+            if handoff is not None:
+                if handoff.kind == TaskCommandKind.START.value:
+                    from .task_start_consumer import settle_failed_start_no_commit
+
+                    settle_failed_start_no_commit(db, handoff)
+            stage_terminal_event(
+                db,
+                command_db_id=command_db_id,
+                draft=terminal_event,
+            )
         db.commit()
         if updated != 1:
             return False
@@ -576,6 +1085,7 @@ def defer_task_command(
     reason: str,
     *,
     expected_attempt_count: int | None = None,
+    terminal_event: TerminalTaskEventDraft | None = None,
 ) -> bool:
     """Release a claim for retry without consuming the failure budget."""
 
@@ -602,7 +1112,7 @@ def defer_task_command(
         observed_defer_count = int(snapshot.defer_count or 0)
         observed_attempt_count = int(snapshot.attempt_count or 0)
         defer_count = observed_defer_count + 1
-        terminal = defer_count >= MAX_COMMAND_DEFERS
+        terminal = defer_count >= max_command_defers()
         updated = (
             db.query(TaskExecutionCommand)
             .filter(
@@ -635,6 +1145,12 @@ def defer_task_command(
                 synchronize_session=False,
             )
         )
+        if updated == 1 and terminal:
+            stage_terminal_event(
+                db,
+                command_db_id=command_db_id,
+                draft=terminal_event,
+            )
         db.commit()
         if updated != 1:
             return False
@@ -705,7 +1221,46 @@ def task_has_live_foreign_runner(
         )
 
 
-CommandExecutor = Callable[[ClaimedTaskCommand], Awaitable[dict[str, Any] | None]]
+def task_has_live_runner(
+    task_id: int,
+    *,
+    expected_run_id: str | None,
+) -> bool:
+    """Return whether the target run currently has an unexpired task lease.
+
+    ``expected_run_id`` is required and has no wildcard: an omitted default
+    would let a lease belonging to a different run stand in as idempotency
+    evidence for the run actually being asked about. An explicit ``None``
+    means the row's own run id is NULL, matching how ``expected_run_id`` reads
+    on ``BackgroundTaskManager.resume_admission_state``. Callers that really
+    do want "any run" should ask ``task_has_live_foreign_runner`` instead.
+    """
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    now = _utc_now()
+    with SessionLocal() as db:
+        query = db.query(Task.id).filter(
+            Task.id == task_id,
+            Task.status == TaskStatus.RUNNING,
+            Task.runner_id.is_not(None),
+            Task.lease_expires_at.is_not(None),
+            Task.lease_expires_at >= now,
+        )
+        return query.filter(Task.run_id == expected_run_id).first() is not None
+
+
+@dataclass(frozen=True)
+class SettledTaskCommand:
+    """The handler already committed its terminal command disposition."""
+
+    result: dict[str, Any] | None = None
+
+
+CommandExecutor = Callable[
+    [ClaimedTaskCommand], Awaitable[dict[str, Any] | None | SettledTaskCommand]
+]
 CommandDisposition = Callable[[], bool]
 _dispatcher_wakeup: asyncio.Event | None = None
 _dispatcher_task: asyncio.Task[Any] | None = None
@@ -777,6 +1332,7 @@ async def dispatch_one_task_command(
     heartbeat = asyncio.get_running_loop().create_task(
         _claim_heartbeat(command.id, runner_id, command.attempt_count, stop_event)
     )
+    already_completed = False
     disposition_name: str | None = None
     disposition_operation: CommandDisposition | None = None
     heartbeat_outcome = TaskCommandClaimHeartbeatOutcome()
@@ -789,6 +1345,7 @@ async def dispatch_one_task_command(
         raise
     except TaskCommandDeferred as exc:
         reason = str(exc)
+        terminal_event = terminal_event_draft_for_error(exc)
 
         def persist_deferral() -> bool:
             return defer_task_command(
@@ -796,6 +1353,7 @@ async def dispatch_one_task_command(
                 runner_id,
                 reason,
                 expected_attempt_count=command.attempt_count,
+                terminal_event=terminal_event,
             )
 
         disposition_name = "defer_task_command"
@@ -806,6 +1364,16 @@ async def dispatch_one_task_command(
             {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
 
+        # An executor that bound its own presentation draft wins; the neutral
+        # literal is only the fallback. The other two dispositions already
+        # read the bound draft — hardcoding here silently discarded the
+        # external input executor's identity-withholding draft
+        # (xorbitsai/xagent-saas#952 M3).
+        rejection_event = terminal_event_draft_for_error(exc) or TerminalTaskEventDraft(
+            message_code=None,
+            resend_safe=False,
+        )
+
         def persist_rejection() -> bool:
             return fail_task_command(
                 command.id,
@@ -814,6 +1382,7 @@ async def dispatch_one_task_command(
                 force_terminal=True,
                 expected_attempt_count=command.attempt_count,
                 result=rejection_result,
+                terminal_event=rejection_event,
             )
 
         disposition_name = "fail_task_command"
@@ -843,6 +1412,7 @@ async def dispatch_one_task_command(
                 command.attempt_count,
             )
             error = str(exc)
+            terminal_event = terminal_event_draft_for_error(exc)
 
             def persist_failure() -> bool:
                 return fail_task_command(
@@ -850,6 +1420,7 @@ async def dispatch_one_task_command(
                     runner_id,
                     error,
                     expected_attempt_count=command.attempt_count,
+                    terminal_event=terminal_event,
                 )
 
             disposition_name = "fail_task_command"
@@ -857,6 +1428,7 @@ async def dispatch_one_task_command(
     else:
 
         def persist_completion() -> bool:
+            assert not isinstance(result, SettledTaskCommand)
             return finish_task_command(
                 command.id,
                 runner_id,
@@ -864,8 +1436,11 @@ async def dispatch_one_task_command(
                 expected_attempt_count=command.attempt_count,
             )
 
-        disposition_name = "finish_task_command"
-        disposition_operation = persist_completion
+        if isinstance(result, SettledTaskCommand):
+            already_completed = True
+        else:
+            disposition_name = "finish_task_command"
+            disposition_operation = persist_completion
     finally:
         stop_event.set()
         heartbeat_outcome, heartbeat_cancellation = await await_task_settlement(
@@ -873,7 +1448,7 @@ async def dispatch_one_task_command(
         )
 
     with propagate_deferred_cancellation(heartbeat_cancellation):
-        if heartbeat_outcome.requires_ttl_recovery:
+        if heartbeat_outcome.requires_ttl_recovery and not already_completed:
             logger.error(
                 "task_id=%s component=task-command-heartbeat claim is unresolved; "
                 "retaining command claim for expiry (command_id=%s, kind=%s, "
@@ -906,6 +1481,10 @@ async def dispatch_task_command_promptly(
     checkpoint work continues in its own task, allowing the socket receive loop
     to accept the next pause/message command instead of blocking behind it.
     """
+
+    if not consumes_task_commands():
+        notify_task_command_dispatcher()
+        return
 
     task = asyncio.get_running_loop().create_task(
         dispatch_one_task_command(executor, command_db_id=command_db_id)
@@ -985,8 +1564,12 @@ async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
         await asyncio.gather(*workers, return_exceptions=True)
 
 
-def start_task_command_dispatcher(executor: CommandExecutor) -> asyncio.Task[Any]:
+def start_task_command_dispatcher(
+    executor: CommandExecutor,
+) -> asyncio.Task[Any] | None:
     global _dispatcher_task
+    if not consumes_task_commands():
+        return None
     if _dispatcher_task is not None and not _dispatcher_task.done():
         return _dispatcher_task
     _dispatcher_task = asyncio.create_task(run_task_command_dispatcher(executor))

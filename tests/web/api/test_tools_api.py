@@ -5,15 +5,26 @@ This module tests the /api/tools endpoints, including the /available endpoint
 which lists all tools that can be used by agents.
 """
 
+import logging
 import tempfile
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.shared.auth_database import auth_db_override
+from xagent.core.tools.adapters.vibe.config import (
+    ToolFactoryRuntimeSessionBoundaryError,
+)
 from xagent.web.api.auth import auth_router
 from xagent.web.api.tools import _create_tool_info, tools_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.task import Task, TraceEvent
+from xagent.web.models.tool_config import ToolConfig
+from xagent.web.models.user import User
 
 
 def override_get_db():
@@ -31,6 +42,7 @@ test_app = FastAPI()
 test_app.include_router(auth_router)
 test_app.include_router(tools_router)
 test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 # Create test client
 client = TestClient(test_app)
@@ -57,6 +69,27 @@ def test_sound_effect_tool_requires_sound_effect_model() -> None:
     assert available["status"] == "available"
 
 
+def test_withheld_edit_image_keeps_its_admin_row() -> None:
+    from xagent.web.api.tools import _withheld_edit_image_row
+
+    generate_only = {"img": SimpleNamespace(abilities=["generate"])}
+    edit_capable = {"img": SimpleNamespace(abilities=["generate", "edit"])}
+
+    row = _withheld_edit_image_row([], generate_only)
+
+    assert row is not None
+    assert row["name"] == "edit_image"
+    assert row["enabled"] is False
+    assert row["status"] == "missing_capability"
+    assert "editing support" in row["status_reason"]
+
+    # Nothing to explain when the tool is present, or when no model is configured.
+    assert _withheld_edit_image_row([{"name": "edit_image"}], generate_only) is None
+    assert _withheld_edit_image_row([], {}) is None
+    # An edit-capable deployment must never grow a synthetic row.
+    assert _withheld_edit_image_row([], edit_capable) is None
+
+
 def test_music_tool_requires_music_model() -> None:
     class Tool:
         name = "generate_music"
@@ -73,6 +106,289 @@ def test_music_tool_requires_music_model() -> None:
     assert unavailable["status"] == "missing_model"
     assert available["enabled"] is True
     assert available["status"] == "available"
+
+
+@pytest.mark.asyncio
+async def test_available_tools_route_surfaces_the_withheld_edit_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The helper's unit test cannot catch the wiring being dropped, and every
+    # other route test configures zero image models, which short-circuits it.
+    from xagent.web.api.tools import get_available_tools
+
+    class Config:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def get_vision_model(self):
+            return None
+
+        def get_image_models(self):
+            return {"img": SimpleNamespace(abilities=["generate"])}
+
+        def get_video_models(self):
+            return {}
+
+        def get_asr_models(self):
+            return {}
+
+        def get_tts_models(self):
+            return {}
+
+        def get_sound_effect_models(self):
+            return {}
+
+        def get_music_models(self):
+            return {}
+
+        def get_user_tool_overrides(self):
+            return {}
+
+        def close(self) -> None:
+            return None
+
+    async def create_all_tools(_config, apply_user_override_filter: bool = True):
+        # Capability gating already withheld edit_image.
+        return []
+
+    class Query:
+        def all(self) -> list[object]:
+            return []
+
+    class Database:
+        def query(self, _model: object) -> Query:
+            return Query()
+
+    monkeypatch.setattr("xagent.web.api.tools.WebToolConfig", Config)
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    monkeypatch.setattr("xagent.web.sandbox_manager.get_sandbox_manager", lambda: None)
+    monkeypatch.setattr("xagent.web.api.tools.get_default_tool_configs", lambda: [])
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False),
+        db=Database(),
+    )
+
+    rows = {item["name"]: item for item in response["tools"]}
+    assert rows["edit_image"]["enabled"] is False
+    assert rows["edit_image"]["status"] == "missing_capability"
+    assert "editing support" in rows["edit_image"]["status_reason"]
+
+
+class _AvailableToolsRouteHarness:
+    def __init__(
+        self,
+        *,
+        cleanup_error: BaseException,
+        primary_error: BaseException | None = None,
+    ) -> None:
+        self.cleanup_error = cleanup_error
+        self.primary_error = primary_error
+        self.events: list[str] = []
+        self.close_calls = 0
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> object:
+        harness = self
+
+        class Config:
+            def __init__(self, **_kwargs) -> None:
+                pass
+
+            def get_vision_model(self):
+                harness.events.append("vision")
+                return None
+
+            def get_image_models(self):
+                harness.events.append("image")
+                return {}
+
+            def get_video_models(self):
+                harness.events.append("video")
+                return {}
+
+            def get_asr_models(self):
+                harness.events.append("asr")
+                return {}
+
+            def get_tts_models(self):
+                harness.events.append("tts")
+                return {}
+
+            def get_sound_effect_models(self):
+                harness.events.append("sound_effect")
+                return {}
+
+            def get_music_models(self):
+                harness.events.append("music")
+                return {}
+
+            def get_user_tool_overrides(self):
+                harness.events.append("user_overrides")
+                return {}
+
+            def close(self) -> None:
+                harness.events.append("close")
+                harness.close_calls += 1
+                raise harness.cleanup_error
+
+        class Query:
+            def __init__(self, model: object) -> None:
+                self.model = model
+
+            def all(self) -> list[object]:
+                model_name = getattr(self.model, "__name__", str(self.model))
+                harness.events.append(model_name)
+                if self.model is ToolConfig and harness.primary_error is not None:
+                    raise harness.primary_error
+                return []
+
+        class Database:
+            def query(self, model: object) -> Query:
+                return Query(model)
+
+        monkeypatch.setattr(
+            "xagent.web.api.tools._tool_usage_query", lambda _db: Query("tool_usage")
+        )
+
+        class SandboxManager:
+            async def get_or_create_lease_provider(
+                self, _scope: str, _user_id: str
+            ) -> object:
+                harness.events.append("sandbox_get")
+                return object()
+
+            async def attach_provider(
+                self, _scope: str, _user_id: str, _provider: object
+            ) -> bool:
+                # The route holds the provider it just obtained, so it
+                # attaches that object by identity rather than asking whether
+                # some provider exists for the key.
+                harness.events.append("sandbox_attach")
+                return True
+
+            async def release(self, _scope: str, _user_id: str) -> None:
+                harness.events.append("sandbox_release")
+
+        category = SimpleNamespace(value="basic")
+        tool = SimpleNamespace(
+            name="test_tool",
+            description="",
+            metadata=SimpleNamespace(category=category),
+        )
+
+        async def create_all_tools(
+            _config, apply_user_override_filter: bool = True
+        ) -> list[object]:
+            assert apply_user_override_filter is False
+            harness.events.append("factory")
+            return [tool]
+
+        def create_tool_info(*_args, **_kwargs) -> dict[str, object]:
+            harness.events.append("response_shape")
+            return {
+                "name": "test_tool",
+                "category": "basic",
+                "enabled": True,
+                "status": "available",
+            }
+
+        monkeypatch.setattr("xagent.web.api.tools.WebToolConfig", Config)
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            create_all_tools,
+        )
+        monkeypatch.setattr(
+            "xagent.web.sandbox_manager.get_sandbox_manager",
+            lambda: SandboxManager(),
+        )
+        monkeypatch.setattr("xagent.web.api.tools._create_tool_info", create_tool_info)
+        monkeypatch.setattr(
+            "xagent.web.api.tools.get_default_tool_configs",
+            lambda: [],
+        )
+        return Database()
+
+
+@pytest.mark.asyncio
+async def test_available_tools_cleanup_failure_follows_complete_route_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    cleanup_error = RuntimeError("close failed")
+    harness = _AvailableToolsRouteHarness(cleanup_error=cleanup_error)
+    db = harness.install(monkeypatch)
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError) as exc_info:
+        await get_available_tools(
+            current_user=SimpleNamespace(id=7, is_admin=False),
+            db=db,
+        )
+
+    assert exc_info.value.__cause__ is cleanup_error
+    assert str(exc_info.value) == "Tool runtime cleanup could not be completed."
+    assert harness.close_calls == 1
+    assert harness.events == [
+        "sandbox_get",
+        "sandbox_attach",
+        "factory",
+        "sandbox_release",
+        "vision",
+        "image",
+        "video",
+        "asr",
+        "tts",
+        "sound_effect",
+        "music",
+        "response_shape",
+        "tool_usage",
+        ToolConfig.__name__,
+        "user_overrides",
+        "close",
+    ]
+
+
+class _RoutePrimaryFailure(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_available_tools_primary_failure_wins_over_terminal_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    primary_error = _RoutePrimaryFailure("route failed")
+    cleanup_error = RuntimeError("close failed")
+    harness = _AvailableToolsRouteHarness(
+        cleanup_error=cleanup_error,
+        primary_error=primary_error,
+    )
+    db = harness.install(monkeypatch)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="xagent.web.api.tools"),
+        pytest.raises(_RoutePrimaryFailure) as exc_info,
+    ):
+        await get_available_tools(
+            current_user=SimpleNamespace(id=7, is_admin=False),
+            db=db,
+        )
+
+    assert exc_info.value is primary_error
+    assert harness.close_calls == 1
+    cleanup_records = [
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "Failed to close tool listing runtime after route failure"
+    ]
+    assert len(cleanup_records) == 1
+    assert cleanup_records[0].exc_info is not None
 
 
 def ensure_system_initialized() -> None:
@@ -122,12 +438,32 @@ class TestToolsAvailableAPI:
         ensure_system_initialized()
         yield
 
-    def test_get_available_tools_without_workspace(self):
+    def test_get_available_tools_without_workspace(self, monkeypatch):
         """Test that /api/tools/available works without a real workspace.
 
         This endpoint is used to list available tools for the UI.
         It should work even when there's no active task/workspace.
         """
+        from xagent.web.api import tools as tools_api
+
+        real_config_type = tools_api.WebToolConfig
+        created_configs = []
+        closed_configs = []
+
+        def capture_config(*args, **kwargs):
+            config = real_config_type(*args, **kwargs)
+            real_close = config.close
+
+            def close() -> None:
+                closed_configs.append(config)
+                real_close()
+
+            config.close = close
+            created_configs.append(config)
+            return config
+
+        monkeypatch.setattr(tools_api, "WebToolConfig", capture_config)
+
         # Login to get token
         login_response = client.post(
             "/api/auth/login", json={"username": "admin", "password": "admin123"}
@@ -187,6 +523,7 @@ class TestToolsAvailableAPI:
         assert "read_skill_doc" in tool_names, "Should have read_skill_doc tool"
         assert "list_skill_docs" in tool_names, "Should have list_skill_docs tool"
         assert "fetch_skill_file" in tool_names, "Should have fetch_skill_file tool"
+        assert closed_configs == created_configs
 
     def test_skill_category_in_available_tools(self):
         """Test that skill tools appear with correct category."""
@@ -236,6 +573,32 @@ class TestToolsAvailableAPI:
 
         data = response.json()
         tools = data["tools"]
+
+        counted_tool = tools[0]["name"]
+        with next(get_db()) as db:
+            user = db.query(User).filter(User.username == "admin").one()
+            task = Task(user_id=user.id, title="Tool usage")
+            db.add(task)
+            db.flush()
+            db.add(
+                TraceEvent(
+                    task_id=task.id,
+                    event_id="tool-usage-list-event",
+                    event_type="tool_execution_end",
+                    timestamp=datetime.now(timezone.utc),
+                    data={"tool_name": counted_tool, "success": True},
+                )
+            )
+            db.commit()
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200
+        tools = response.json()["tools"]
+        assert (
+            next(tool for tool in tools if tool["name"] == counted_tool)["usage_count"]
+            == 1
+        )
 
         # Each tool should have usage_count field
         for tool in tools:
@@ -846,10 +1209,11 @@ class TestWebToolConfigUserOverride:
             set_user_tool_overrides_hook(None)
 
     @pytest.mark.asyncio
-    async def test_create_all_tools_skips_filter_when_no_user_at_all(self):
-        """When neither explicit user nor request.user is set,
-        get_user_tool_overrides() returns {} and ToolFactory filtering is skipped.
-        This is the safe fallback — no user means no per-user policy can apply."""
+    async def test_create_all_tools_denies_every_tool_when_no_user_at_all(self):
+        """When a policy hook is registered but neither explicit user nor
+        request.user is set, the hook never runs. That is "policy unavailable",
+        not "no policy": the turn must get no tools rather than the full set,
+        which would include the very tool the policy disables."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -868,7 +1232,7 @@ class TestWebToolConfigUserOverride:
                 db=MagicMock(),
                 request=request_without_user,
                 user_id=42,
-                # No explicit user passed — this is the pre-fix bug path
+                # No explicit user passed — the unresolvable-policy path.
                 workspace_config={"base_dir": "/tmp", "task_id": "test"},
             )
 
@@ -884,13 +1248,46 @@ class TestWebToolConfigUserOverride:
                 result = await ToolFactory.create_all_tools(cfg)
 
             tool_names = [t.name for t in result]
-            # Without explicit user, overrides are {} and filtering is skipped
-            assert "browser_navigate" in tool_names, (
-                "No filtering when no user (existing behavior)"
+            assert "browser_navigate" not in tool_names, (
+                "an unresolved policy must not hand back a tool the policy disables"
             )
-            assert "calculator" in tool_names
+            # Fail closed all the way: an unresolved policy cannot be narrowed
+            # to just the disabled names, because the hook never told us any.
+            assert tool_names == []
         finally:
             set_user_tool_overrides_hook(None)
+
+    @pytest.mark.asyncio
+    async def test_create_all_tools_keeps_every_tool_when_no_hook_registered(self):
+        """Standalone xagent registers no policy hook, so a config without a
+        runtime user has no policy to lose and keeps its unrestricted default."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from xagent.core.tools.adapters.vibe.factory import ToolFactory
+        from xagent.web.tools.config import WebToolConfig
+
+        request_without_user = MagicMock()
+        del request_without_user.user
+
+        cfg = WebToolConfig(
+            db=MagicMock(),
+            request=request_without_user,
+            user_id=42,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+
+        tool_browser = MagicMock()
+        tool_browser.name = "browser_navigate"
+        tool_calc = MagicMock()
+        tool_calc.name = "calculator"
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+            AsyncMock(return_value=[tool_browser, tool_calc]),
+        ):
+            result = await ToolFactory.create_all_tools(cfg)
+
+        assert sorted(t.name for t in result) == ["browser_navigate", "calculator"]
 
     @pytest.mark.asyncio
     async def test_create_all_tools_keeps_disabled_when_filter_false(self):
@@ -965,6 +1362,7 @@ class TestWebToolConfigCustomApi:
 
         # Mirror of production custom_apis row (id=5, name=Post_HelloAPI)
         api = MagicMock()
+        api.id = 5
         api.name = "Post_HelloAPI"
         api.description = None
         api.url = "https://helloapi-u6nc.onrender.com/"
@@ -973,11 +1371,10 @@ class TestWebToolConfigCustomApi:
         api.body = '{\n  "message": "example message"\n}'
         api.env = None
 
-        user_api = MagicMock()
-        user_api.custom_api = api
-
         db = MagicMock()
-        db.query.return_value.filter.return_value.all.return_value = [user_api]
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            api
+        ]
 
         cfg = WebToolConfig(
             db=db,
@@ -1003,6 +1400,7 @@ class TestWebToolConfigCustomApi:
         from xagent.web.tools.config import WebToolConfig
 
         api = MagicMock()
+        api.id = 6
         api.name = "Get_HiAPI"
         api.description = None
         api.url = "https://helloapi-u6nc.onrender.com/"
@@ -1011,11 +1409,10 @@ class TestWebToolConfigCustomApi:
         api.body = None
         api.env = None
 
-        user_api = MagicMock()
-        user_api.custom_api = api
-
         db = MagicMock()
-        db.query.return_value.filter.return_value.all.return_value = [user_api]
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            api
+        ]
 
         cfg = WebToolConfig(
             db=db,
@@ -1050,7 +1447,7 @@ class TestWebToolConfigMCPAuth:
         server.concurrent_tools = ["echo", "get_sum"]
 
         db = MagicMock()
-        db.query.return_value.join.return_value.filter.return_value.all.return_value = [
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
             server
         ]
 
@@ -1097,7 +1494,7 @@ class TestWebToolConfigMCPAuth:
         }
 
         db = MagicMock()
-        db.query.return_value.join.return_value.filter.return_value.all.return_value = [
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
             server
         ]
 
@@ -1136,16 +1533,16 @@ class TestAvailableToolsSandboxLifecycle:
     def test_reclaimed_provider_before_attach_lists_without_sandbox(
         self, monkeypatch
     ) -> None:
-        """attach() returning False (provider reclaimed between creation and
-        attach) must drop the stale reference and still serve the listing,
-        without releasing what was never attached."""
+        """attach_provider() returning False (provider reclaimed between
+        creation and attach) must drop the stale reference and still serve
+        the listing, without releasing what was never attached."""
         from unittest.mock import AsyncMock, MagicMock
 
         sandbox_manager = MagicMock()
         sandbox_manager.get_or_create_lease_provider = AsyncMock(
             return_value=MagicMock()
         )
-        sandbox_manager.attach = AsyncMock(return_value=False)
+        sandbox_manager.attach_provider = AsyncMock(return_value=False)
         sandbox_manager.release = AsyncMock()
         monkeypatch.setattr(
             "xagent.web.sandbox_manager.get_sandbox_manager",
@@ -1159,7 +1556,7 @@ class TestAvailableToolsSandboxLifecycle:
 
         assert response.status_code == 200
         assert response.json()["count"] > 0
-        sandbox_manager.attach.assert_awaited_once()
+        sandbox_manager.attach_provider.assert_awaited_once()
         sandbox_manager.release.assert_not_awaited()
 
     def test_attached_sandbox_is_released_after_listing(self, monkeypatch) -> None:
@@ -1171,7 +1568,7 @@ class TestAvailableToolsSandboxLifecycle:
         provider.primary_sandbox.exec = AsyncMock()
         sandbox_manager = MagicMock()
         sandbox_manager.get_or_create_lease_provider = AsyncMock(return_value=provider)
-        sandbox_manager.attach = AsyncMock(return_value=True)
+        sandbox_manager.attach_provider = AsyncMock(return_value=True)
         sandbox_manager.release = AsyncMock()
         monkeypatch.setattr(
             "xagent.web.sandbox_manager.get_sandbox_manager",

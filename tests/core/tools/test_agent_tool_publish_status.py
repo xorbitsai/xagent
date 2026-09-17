@@ -6,6 +6,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
+from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.tools.adapters.vibe.agent_tool import (
     AgentTool,
     create_create_agent_tool,
@@ -21,6 +28,11 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
 from xagent.web.tools.config import WebToolConfig
+
+# Every no-valid-model assertion in this module depends on the fallback
+# resolving to nothing; see the fixture for why that cannot be left to the
+# machine's environment.
+pytestmark = pytest.mark.usefixtures("no_resolvable_default_llm")
 
 
 def _create_session() -> tuple[Session, str, sessionmaker]:
@@ -130,26 +142,30 @@ async def test_published_agent_prefetch_waits_for_pool_off_event_loop(tmp_path) 
             ticks += 1
             await asyncio.sleep(0.01)
 
-    ticker_task = asyncio.create_task(ticker())
-    build_task = asyncio.create_task(ToolFactory.create_all_tools(config))
-    try:
-        await asyncio.sleep(0.08)
-        assert ticks >= 4
-        assert not build_task.done()
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        build_task = asyncio.create_task(ToolFactory.create_all_tools(config))
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not build_task.done()
 
-        held_connection.close()
-        tools = await build_task
-        assert published_tool_name in {tool.name for tool in tools}
-    finally:
-        if not held_connection.closed:
             held_connection.close()
-        if not build_task.done():
-            build_task.cancel()
+            gate.let_through()
+            tools = await asyncio.wait_for(build_task, timeout=GUARD_TIMEOUT)
+            assert published_tool_name in {tool.name for tool in tools}
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            if not build_task.done():
+                build_task.cancel()
             await asyncio.gather(build_task, return_exceptions=True)
-        stop.set()
-        await ticker_task
-        config.close()
-        engine.dispose()
+            stop.set()
+            await ticker_task
+            config.close()
+            engine.dispose()
 
 
 def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:
@@ -399,6 +415,7 @@ async def test_agent_tool_execution_enforces_owner_visibility() -> None:
         result = await tool.run_json_async({"task": "run private worker"})
 
         assert result["response"] == f"Error: Agent {published_agent.id} not found"
+        assert tool_result_succeeded(result) is False
     finally:
         db.close()
         try:
@@ -445,6 +462,7 @@ async def test_agent_tool_execution_enforces_target_allowed_agent_ids() -> None:
         result = await tool.run_json_async({"task": "run blocked worker"})
 
         assert result["response"] == f"Error: Agent {blocked_agent.id} not found"
+        assert tool_result_succeeded(result) is False
     finally:
         db.close()
         try:
@@ -491,6 +509,7 @@ async def test_agent_tool_execution_allows_cross_user_only_with_target_allowlist
         assert (
             blocked_result["response"] == f"Error: Agent {published_agent.id} not found"
         )
+        assert tool_result_succeeded(blocked_result) is False
 
         allowed_tool = AgentTool(
             agent_id=published_agent.id,
@@ -507,6 +526,7 @@ async def test_agent_tool_execution_allows_cross_user_only_with_target_allowlist
         assert allowed_result["response"] == (
             f"Error: No valid model configured for agent {published_agent.name}"
         )
+        assert tool_result_succeeded(allowed_result) is False
     finally:
         db.close()
         try:
@@ -555,6 +575,7 @@ async def test_delegation_allowed_agent_ids_do_not_block_current_worker_executio
         assert result["response"] == (
             f"Error: No valid model configured for agent {worker.name}"
         )
+        assert tool_result_succeeded(result) is False
     finally:
         db.close()
         try:

@@ -17,7 +17,6 @@ drive the mapping.
 import asyncio
 import io
 import threading
-import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -26,7 +25,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 from fastapi.datastructures import UploadFile
+from sqlalchemy.orm import Session
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    gated_pool_checkout,
+)
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.deps import (
@@ -44,6 +48,7 @@ from xagent.web.models.task import (
     TraceEvent,
 )
 from xagent.web.models.user import User
+from xagent.web.services import task_start
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     drop_ephemeral_runtime_values_for_testing,
@@ -261,6 +266,79 @@ def mock_start_task():
 # ===== POST /v1/chat/tasks =====
 
 
+def test_create_task_forwards_timezone_to_the_first_turn(mock_start_task):
+    """SDK callers have no websocket, so the create body is their only chance
+    to declare a zone for the turn that task creation starts."""
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "how many shifts tomorrow?"},
+            "timezone": "Australia/Melbourne",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] == {
+        "timezone": "Australia/Melbourne"
+    }
+
+
+def test_create_task_without_timezone_sends_no_context(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] is None
+
+
+def test_create_task_rejects_an_over_long_timezone(mock_start_task):
+    # Guest-reachable free-text field is bounded to IANA lengths (max_length=64).
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+            "timezone": "A" * 65,
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+def test_create_task_treats_a_blank_timezone_as_absent(mock_start_task):
+    # The shared helper normalizes whitespace-only to None, so the SDK path
+    # matches the workforce path rather than sending {"timezone": "  "}.
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+            "timezone": "   ",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] is None
+
+
 def test_create_task_happy_path(mock_start_task):
     """Returns 202 + task_id, writes hidden SDK Task + input,
     persists first user message, kicks off background, and leaves the
@@ -328,6 +406,37 @@ def test_create_task_happy_path(mock_start_task):
     kwargs = mock_start_task.call_args.kwargs
     assert kwargs["task_id"] == task_id
     assert kwargs["payload"].transcript_message == "first user message"
+
+
+def test_create_task_schedules_after_commit_acknowledgement_loss(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    original_commit = Session.commit
+    acknowledgement_lost = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal acknowledgement_lost
+        original_commit(session)
+        if not acknowledgement_lost:
+            acknowledgement_lost = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    response = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "commit then schedule"},
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    assert acknowledgement_lost is True
+    assert mock_start_task.call_count == 1
 
 
 def test_create_task_uses_one_connection_at_a_time(
@@ -471,6 +580,7 @@ def test_upload_and_attach_files_to_task(mock_start_task):
     assert "UPLOADED FILES" in payload.execution_message
     assert payload.attachments
     assert any(a.get("file_id") == file_id for a in payload.attachments)
+    assert payload.file_ids == (file_id,)
 
     # File is bound to the task after the turn is claimed (not before).
     from xagent.web.models.uploaded_file import UploadedFile
@@ -508,10 +618,15 @@ async def test_upload_durable_phase_releases_pool_and_event_loop(
     engine = _install_one_slot_queue_pool(monkeypatch)
     checked_out_during_durable: list[int] = []
     original_sync = ManagedFileRef.sync_to_durable
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
 
     def delayed_sync(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         checked_out_during_durable.append(engine.pool.checkedout())
-        time.sleep(0.1)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "durable upload was never released"
         return original_sync(self, *args, **kwargs)
 
     monkeypatch.setattr(ManagedFileRef, "sync_to_durable", delayed_sync)
@@ -531,17 +646,18 @@ async def test_upload_durable_phase_releases_pool_and_event_loop(
             user_id=user_id,
         )
 
-    started_at = asyncio.get_running_loop().time()
     upload_task = asyncio.create_task(upload_once())
-    ticker_task = asyncio.create_task(asyncio.sleep(0.02))
     try:
-        await ticker_task
-        assert asyncio.get_running_loop().time() - started_at < 0.08
-        await upload_task
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not upload_task.done()
         assert checked_out_during_durable == [0]
         assert engine.pool.checkedout() == 0
     finally:
-        engine.dispose()
+        release.set()
+        try:
+            await asyncio.wait_for(upload_task, timeout=30)
+        finally:
+            engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -582,7 +698,7 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
         with open(target_path, "xb") as buffer:
             buffer.write(b"partial")
         write_started.set()
-        assert allow_write.wait(timeout=2)
+        assert allow_write.wait(timeout=GUARD_TIMEOUT)
         return target_path
 
     monkeypatch.setattr(files_api, "_reserve_and_copy_upload", delayed_copy)
@@ -601,11 +717,18 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
             user_id=user_id,
         )
     )
-    assert await asyncio.to_thread(write_started.wait, 2)
-    upload_task.cancel()
-    allow_write.set()
-    with pytest.raises(asyncio.CancelledError):
-        await upload_task
+    try:
+        assert await asyncio.to_thread(write_started.wait, GUARD_TIMEOUT)
+        upload_task.cancel()
+        allow_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(upload_task, timeout=GUARD_TIMEOUT)
+    finally:
+        allow_write.set()
+        upload_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(upload_task, return_exceptions=True), timeout=GUARD_TIMEOUT
+        )
 
     assert written_path is not None
     assert not written_path.exists()
@@ -789,6 +912,7 @@ def test_append_message_with_files(mock_start_task):
     assert payload.transcript_message == "look at this too"
     assert file_id in payload.execution_message
     assert any(a.get("file_id") == file_id for a in payload.attachments)
+    assert payload.file_ids == (file_id,)
 
     from xagent.web.models.uploaded_file import UploadedFile
 
@@ -1081,7 +1205,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
     mock_start_task,
 ) -> None:
     agent_id, full_key = _create_agent_with_key()
-    prepare_runtime_plan = v1_tasks.prepare_create_connector_runtime
+    prepare_runtime_plan = task_start.prepare_create_connector_runtime
 
     def prepare_mismatched_identity(**kwargs):
         plan = prepare_runtime_plan(**kwargs)
@@ -1091,7 +1215,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
         )
 
     monkeypatch.setattr(
-        v1_tasks,
+        task_start,
         "prepare_create_connector_runtime",
         prepare_mismatched_identity,
     )
@@ -1374,7 +1498,7 @@ def test_create_task_rolls_back_when_runtime_secret_store_fails(mock_start_task)
     )
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         side_effect=RuntimeError("store failed for Bearer tenant-token"),
     ):
         resp = client.post(
@@ -1432,7 +1556,7 @@ def test_create_task_cleans_runtime_secret_when_schedule_fails(mock_start_task):
 
     with (
         patch(
-            "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+            "xagent.web.services.task_start.store_ephemeral_runtime_values",
             new=recording_store,
         ),
         patch(
@@ -2049,9 +2173,9 @@ def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
     mock_start_task.reset_mock()
 
     with patch.object(
-        v1_tasks.TaskTurnOrchestrator,
+        task_start.TaskTurnOrchestrator,
         "schedule_claimed_turn",
-        wraps=v1_tasks.TaskTurnOrchestrator.schedule_claimed_turn,
+        wraps=task_start.TaskTurnOrchestrator.schedule_claimed_turn,
     ) as schedule_claimed_turn:
         response = client.post(
             f"/v1/chat/tasks/{task_id}/messages",
@@ -2589,7 +2713,7 @@ def test_append_message_keeps_task_state_when_runtime_secret_store_fails(
     mock_start_task.reset_mock()
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         side_effect=RuntimeError("store failed for Bearer append-token"),
     ):
         resp = client.post(
@@ -2664,7 +2788,7 @@ def test_append_message_does_not_store_runtime_secret_when_task_is_busy(
         store_ephemeral_runtime_values(turn_id, values_by_ref)
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         new=recording_store,
     ):
         resp = client.post(
@@ -2719,6 +2843,73 @@ def test_append_message_to_running_task_returns_409(mock_start_task):
     assert mock_start_task.call_count == 0
 
 
+def test_append_message_to_waiting_task_returns_interaction_response_required(
+    mock_start_task,
+):
+    """Appending to a waiting_for_user task is rejected with the
+    dedicated code (not task_busy), points at reply, and leaves the task
+    completely untouched -- no new transcript row, same status, same
+    run_id, no new background kickoff."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+    db = _direct_db_session()
+    try:
+        before = db.query(Task).filter(Task.id == task_id).one()
+        run_id_before = before.run_id
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        message_count_before = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).count()
+        )
+    finally:
+        db.close()
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "interaction_response_required"
+    assert "reply" in resp.json()["error"]["message"]
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        after = db.query(Task).filter(Task.id == task_id).one()
+        assert after.status == TaskStatus.WAITING_FOR_USER
+        assert after.run_id == run_id_before
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        message_count_after = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).count()
+        )
+        assert message_count_after == message_count_before
+    finally:
+        db.close()
+
+
+def test_append_message_to_running_task_still_returns_task_busy(mock_start_task):
+    """The new waiting-specific code must not leak onto the
+    unrelated RUNNING rejection -- RUNNING keeps plain task_busy."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.RUNNING)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "task_busy"
+    assert mock_start_task.call_count == 0
+
+
 def test_append_message_claims_slot_atomically(mock_start_task):
     """Successful append flips task.status to RUNNING in the same
     transaction as the input write, so a concurrent POST can't pass
@@ -2763,6 +2954,40 @@ def test_append_message_claims_slot_atomically(mock_start_task):
     assert r2.status_code == 409
     assert r2.json()["error"]["code"] == "task_busy"
     # Only one bg kickoff total (from the winning first append).
+    assert mock_start_task.call_count == 1
+
+
+def test_append_message_schedules_after_commit_acknowledgement_loss(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first")
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+    original_commit = Session.commit
+    acknowledgement_lost = False
+
+    def acknowledge_then_disconnect(session: Session) -> None:
+        nonlocal acknowledgement_lost
+        original_commit(session)
+        if not acknowledgement_lost:
+            acknowledgement_lost = True
+            raise ConnectionError("commit acknowledgement lost")
+
+    monkeypatch.setattr(Session, "commit", acknowledge_then_disconnect)
+
+    response = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second after disconnect"},
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    assert acknowledgement_lost is True
     assert mock_start_task.call_count == 1
 
 
@@ -2817,7 +3042,7 @@ def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task)
     """
     import asyncio
 
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="first turn")
@@ -3061,6 +3286,208 @@ def test_get_task_cache_io_runs_after_database_session_closes(
         engine.dispose()
 
 
+# ===== GET pending_interaction projection =====
+
+
+def _insert_question_message(
+    task_id: int,
+    *,
+    content: str = "Where are you flying to?",
+    interactions: list[dict] | None = None,
+    turn_id: str | None = None,
+) -> None:
+    """Write one assistant question row directly, bypassing the WS writer.
+
+    Mirrors the shape ``_persist_agent_outbound_event`` in
+    ``api/websocket.py`` writes for ``expect_response`` outbound events:
+    ``role='assistant'``, ``message_type='question'``.
+    """
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        assert task is not None
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=int(task.user_id),
+                role="assistant",
+                content=content,
+                message_type="question",
+                interactions=interactions,
+                turn_id=turn_id or f"question-{content[:8]}-{id(content)}",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_get_task_waiting_returns_pending_interaction_with_structured_controls(
+    mock_start_task,
+):
+    """Waiting task with a structured question returns question +
+    non-empty interactions."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(
+        task_id,
+        content="Where are you flying to?",
+        interactions=[
+            {"type": "text_input", "field": "destination", "label": "Destination"}
+        ],
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "waiting_for_user"
+    assert body["pending_interaction"] is not None
+    assert body["pending_interaction"]["question"] == "Where are you flying to?"
+    assert body["pending_interaction"]["interactions"] == [
+        {"type": "text_input", "field": "destination", "label": "Destination"}
+    ]
+
+
+def test_get_task_waiting_null_interactions_stays_null(mock_start_task):
+    """A plain-text question (interactions stored NULL) must come
+    back as null, not []."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(task_id, content="Should I continue?", interactions=None)
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] is None
+
+
+def test_get_task_waiting_empty_interactions_list_stays_empty_list(mock_start_task):
+    """An empty structured-controls list must come back as [], not
+    null -- the server does not normalize [] and null together."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(task_id, content="Should I continue?", interactions=[])
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] == []
+
+
+def test_get_task_waiting_drops_non_mapping_interaction_elements(mock_start_task):
+    """A dirty row whose stored interactions list mixes dicts with a
+    non-dict element (e.g. a bare string a buggy writer once persisted)
+    must not 500 the GET forever -- the v1 read path filters non-mapping
+    elements out, keeping only the valid dict entries."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(
+        task_id,
+        content="Should I continue?",
+        interactions=[
+            {"type": "text_input", "field": "destination", "label": "Destination"},
+            "not a mapping",
+        ],
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] == [
+        {"type": "text_input", "field": "destination", "label": "Destination"}
+    ]
+
+
+def test_get_task_waiting_with_no_question_row_returns_null(mock_start_task):
+    """A task can reach waiting_for_user with no question message
+    persisted (e.g. an empty outbound message string). pending_interaction
+    must be null, and the response must still be 200, not 500."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["pending_interaction"] is None
+
+
+def test_get_task_non_waiting_never_queries_for_a_question(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A non-waiting task's pending_interaction is null, and the
+    server must not even issue the question lookup query."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+
+    called = False
+
+    def spy_get_pending_interaction_question(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return None, None
+
+    monkeypatch.setattr(
+        v1_tasks,
+        "get_pending_interaction_question",
+        spy_get_pending_interaction_question,
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["pending_interaction"] is None
+    assert called is False
+
+
+def test_get_task_pending_interaction_bypasses_stale_cache_entry(mock_start_task):
+    """Cache isolation. The task is already waiting_for_user (with
+    no question yet) when the first GET populates the snapshot cache. A
+    question row is then inserted directly into ``task_chat_messages`` --
+    which, unlike a ``Task`` column write, never touches ``tasks.updated_at``
+    -- so the cache's freshness token is still valid on the next GET. That
+    next GET must still surface the new question: the cache entry itself
+    must never carry ``pending_interaction``, or this second read would
+    serve the pre-question snapshot forever (until the cache TTL expires).
+
+    Needs a real cache backend (the default test backend is a no-op), or
+    this test would pass vacuously without ever exercising a cache hit.
+    """
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        agent_id, full_key = _create_agent_with_key()
+        task_id = _create_task(full_key, agent_id)
+        _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+        first = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+        assert first.status_code == 200, first.text
+        assert first.json()["status"] == "waiting_for_user"
+        assert first.json()["pending_interaction"] is None
+
+        # This insert does not touch the tasks row at all, so
+        # tasks.updated_at -- the cache's only freshness token -- is
+        # unchanged. The next GET is a genuine cache hit on the base body.
+        _insert_question_message(task_id, content="Should I continue?")
+
+        second = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+        assert second.status_code == 200, second.text
+        body = second.json()
+        assert body["status"] == "waiting_for_user"
+        assert body["pending_interaction"] is not None
+        assert body["pending_interaction"]["question"] == "Should I continue?"
+    finally:
+        set_cache_backend_for_testing(None)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_surface", ["task", "steps"])
 async def test_task_read_pool_wait_does_not_block_event_loop(
@@ -3103,23 +3530,31 @@ async def test_task_read_pool_wait_does_not_block_event_loop(
         return original_helper(*args, **kwargs)
 
     monkeypatch.setattr(v1_tasks, helper_name, recording_helper)
-    operation = asyncio.create_task(
-        v1_tasks.get_chat_task(task_id, principal)
-        if read_surface == "task"
-        else v1_tasks.get_chat_task_steps(task_id, principal)
-    )
+    with gated_pool_checkout(engine) as gate:
+        operation = asyncio.create_task(
+            v1_tasks.get_chat_task(task_id, principal)
+            if read_surface == "task"
+            else v1_tasks.get_chat_task_steps(task_id, principal)
+        )
 
-    try:
-        assert await asyncio.to_thread(worker_entered.wait, 1)
-        await asyncio.wait_for(asyncio.sleep(0.02), timeout=0.1)
-        assert not operation.done()
-    finally:
-        held_connection.close()
+        try:
+            await gate.wait_until_contending()
+            # A checkpoint while the checkout is still parked proves loop progress.
+            await asyncio.sleep(0)
+            assert worker_entered.is_set()
+            assert not operation.done()
+        finally:
+            held_connection.close()
+            gate.let_through()
+            await asyncio.wait_for(
+                asyncio.gather(operation, return_exceptions=True), timeout=GUARD_TIMEOUT
+            )
+            checked_out = engine.pool.checkedout()
+            engine.dispose()
 
-    response = await operation
-    assert response.task_id == task_id
-    assert engine.pool.checkedout() == 0
-    engine.dispose()
+        response = operation.result()
+        assert response.task_id == task_id
+        assert checked_out == 0
 
 
 def test_get_missing_task_returns_404(mock_start_task):

@@ -8,7 +8,9 @@ and configuration management.
 # mypy: ignore-errors
 
 import logging
-from collections.abc import Callable, Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -18,15 +20,19 @@ from typing import (
 from sqlalchemy.orm import Session
 
 from .....config import get_uploads_dir
+from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
-from .base import AbstractBaseTool, Tool
+from ...core.knowledge_base_scope import KnowledgeBaseScopeError
+from .base import BINDING_AUTHORIZED_CATEGORIES, AbstractBaseTool, Tool
 from .config import (
+    ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
     BaseToolConfig,
     MCPFailurePolicy,
     MCPUnavailableSummary,
     RequiredMCPUnavailableError,
     enforce_mcp_failure_policy,
     normalize_tool_allowlist,
+    run_with_tool_runtime_cleanup,
 )
 from .connector_runtime import ConnectorRuntimeError
 from .output_filter_wrapper import OutputFilteredToolWrapper
@@ -34,11 +40,53 @@ from .selection_spec import ToolSelectionSpec
 
 if TYPE_CHECKING:
     from .....sandbox.base import Sandbox
+    from .....web.services.actor_mcp_runtime import ActorMCPStdioSessionIdentity
     from .mcp_adapter import MCPServerLoadFailure
+
+    ActorMCPStdioSessionConsumer = Callable[
+        ...,
+        Any,
+    ]
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["ToolFactory", "ToolRegistry", "register_tool"]
+
+
+def _extension_tool_origin(
+    origins: Mapping[str, str] | None,
+    tool_name: str,
+) -> str:
+    """Attribute one contributed tool name to the provider that sent it.
+
+    Tool policy matches the raw ``tool.name``, while ``tool_origins`` is keyed
+    by the stripped name. Try the raw key first and fall back to the stripped
+    one so a padded name is not reported as coming from an unknown provider.
+    """
+
+    resolved = origins or {}
+    if tool_name in resolved:
+        return resolved[tool_name]
+    return resolved.get(tool_name.strip(), "unknown")
+
+
+def _full_stored_contribution(contribution: Any) -> Any:
+    """Resolve a stored contribution back to its full, pre-policy form.
+
+    Non-contribution values (including ``None``) pass through untouched so a
+    duck-typed config keeps working.
+    """
+
+    # Imported lazily: ``core.task_runtime`` is a leaf module, but the factory
+    # is imported from it indirectly through provider packages.
+    from .....core.task_runtime import (
+        TaskRuntimeContribution,
+        full_task_runtime_contribution,
+    )
+
+    if isinstance(contribution, TaskRuntimeContribution):
+        return full_task_runtime_contribution(contribution)
+    return contribution
 
 
 class ToolRegistry:
@@ -76,7 +124,9 @@ class ToolRegistry:
         Register a tool creator function.
 
         The creator function will be called during create_all_tools()
-        with the current config.
+        with the current config. Creators must not blanket-catch their own
+        failures: ``create_registered_tools`` is the single enforcement point
+        for the exception contract described in its docstring.
 
         Usage (bare decorator, no category metadata):
             @register_tool
@@ -124,6 +174,7 @@ class ToolRegistry:
                 audio_tool,
                 basic_tools,
                 browser_tools,
+                current_time_tool,
                 custom_api_factory,
                 file_ingestion_tool,
                 image_tool,
@@ -153,9 +204,17 @@ class ToolRegistry:
         spec: ToolSelectionSpec | None,
         selection_gate: str | None,
     ) -> bool:
-        if spec is None or declared_cats is None or spec.categories is None:
+        if selection_gate == "intrinsic":
+            # Always-available tool: assemble for every non-NONE spec, but an
+            # explicit zero-tools agent still gets nothing.
+            return spec is None or not spec.is_none()
+
+        if spec is None or declared_cats is None:
             return True
 
+        # Creator-specific gates remain authoritative in ALL mode. Actor-marked
+        # tasks use an ALL spec with published-agent dispatch explicitly
+        # disabled, and the creator must not be reached at all.
         if selection_gate == "published_agent":
             return spec.includes_published_agent()
 
@@ -167,6 +226,14 @@ class ToolRegistry:
             # or a server-only spec would skip the MCP creator entirely.
             return spec.includes_mcp()
 
+        if spec.categories is None:
+            return True
+
+        # After the gates above: a creator carrying both a gate and a
+        # binding-authorized category must honour its gate first.
+        if declared_cats & BINDING_AUTHORIZED_CATEGORIES:
+            return spec.includes_binding_authorized()
+
         return bool(declared_cats & spec.categories)
 
     @classmethod
@@ -176,10 +243,18 @@ class ToolRegistry:
         When ``config.get_tool_selection_spec()`` returns a spec,
         creators whose declared categories don't intersect
         ``spec.categories`` are skipped at the registry level (no
-        creator call, no I/O). Creators with no declared categories
-        (dynamic ones: MCP / Custom API / Image / Audio) are always
+        creator call, no I/O) -- except a creator declaring a
+        ``BINDING_AUTHORIZED_CATEGORIES`` category, dispatched per
+        ``spec.includes_binding_authorized()``. Creators with no declared
+        categories (dynamic ones: MCP / Custom API / Image / Audio) are always
         dispatched and are responsible for
         short-circuiting internally based on the spec.
+
+        Exception contract for creators: ``ConnectorRuntimeError``,
+        ``RequiredMCPUnavailableError`` and ``KnowledgeBaseScopeError``
+        propagate to the caller; any other exception is logged as a warning
+        and that creator contributes no tools. Creators rely on this and must
+        not catch broadly themselves.
         """
         # Import tool modules on first call to trigger decorator registration
         cls._import_tool_modules()
@@ -193,7 +268,8 @@ class ToolRegistry:
         for creator, declared_cats, selection_gate in cls._tool_creators:
             # Registry-level skip: declared categories known and no
             # intersection with the spec's allowed categories. The helper
-            # keeps the published-agent workforce exception in one place.
+            # keeps both exceptions (published-agent, binding-authorized)
+            # in one place.
             if not cls._should_run_creator(declared_cats, spec, selection_gate):
                 continue
             try:
@@ -203,8 +279,18 @@ class ToolRegistry:
                 raise
             except RequiredMCPUnavailableError:
                 raise
+            except KnowledgeBaseScopeError:
+                # Defence in depth only (see knowledge_tools.py's own
+                # narrowing): the team hook is never invoked while tools are
+                # being built, so nothing today raises this here. Kept so a
+                # future change that does resolve the team layer during tool
+                # build cannot have the typed error silently swallowed by
+                # the blanket handler below.
+                raise
             except Exception as e:
-                logger.warning(f"Tool creator {creator.__name__} failed: {e}")
+                logger.warning(
+                    f"Tool creator {creator.__name__} failed: {e}", exc_info=True
+                )
 
         # Sort tools by category priority
         tools = cls._sort_tools_by_category(tools)
@@ -275,43 +361,93 @@ class ToolFactory:
 
     @staticmethod
     async def create_all_tools(
-        config: BaseToolConfig, apply_user_override_filter: bool = True
+        config: BaseToolConfig,
+        apply_user_override_filter: bool = True,
+        additional_tools: Iterable[Tool] | None = None,
+        additional_tool_origins: Mapping[str, str] | None = None,
     ) -> list[Tool]:
         """Create tools within the config's optional prepared-runtime boundary.
 
-        Release runs after partial preparation, while an active prepare/build
-        failure remains primary if ordinary cleanup also fails.
+        Task runtime extensions may supply ``additional_tools``; they enter the
+        pipeline before selection, user policy, sandbox, and output filtering.
         """
         prepare_factory_runtime = getattr(type(config), "prepare_factory_runtime", None)
+        handoff_factory_runtime = getattr(type(config), "handoff_factory_runtime", None)
         release_factory_runtime = getattr(
             type(config), "release_prepared_factory_runtime", None
         )
-        primary_error: BaseException | None = None
-        try:
-            if callable(prepare_factory_runtime):
-                await prepare_factory_runtime(config)
-            return await ToolFactory._create_all_tools_prepared(
-                config,
-                apply_user_override_filter=apply_user_override_filter,
-            )
-        except BaseException as exc:
-            primary_error = exc
-            raise
-        finally:
-            if callable(release_factory_runtime):
-                try:
-                    release_factory_runtime(config)
-                except Exception:
-                    if primary_error is None:
-                        raise
-                    logger.warning(
-                        "Failed to release prepared tool-factory runtime",
-                        exc_info=True,
+        abort_factory_runtime = getattr(type(config), "abort_factory_runtime", None)
+        body_failed = False
+
+        async def build_tools() -> list[Tool]:
+            nonlocal body_failed
+            try:
+                if callable(prepare_factory_runtime):
+                    await prepare_factory_runtime(config)
+                resolved_additional_tools = additional_tools
+                if resolved_additional_tools is None:
+                    contribution = (
+                        config.get_task_runtime_contribution()
+                        if isinstance(config, BaseToolConfig)
+                        else None
                     )
+                    # Start every rebuild from the full, pre-policy
+                    # contribution. The stored value may be a view narrowed by
+                    # an earlier turn's tool policy; re-narrowing it would make
+                    # each filter permanent even after the policy widens again.
+                    contribution = _full_stored_contribution(contribution)
+                    resolved_additional_tools = getattr(contribution, "tools", ())
+                    resolved_additional_tool_origins = (
+                        dict(getattr(contribution, "tool_origins", ()))
+                        if additional_tool_origins is None
+                        else dict(additional_tool_origins)
+                    )
+                else:
+                    resolved_additional_tool_origins = dict(
+                        additional_tool_origins or {}
+                    )
+                resolved_additional_tools = tuple(resolved_additional_tools or ())
+                prepared_kwargs: dict[str, Any] = {
+                    "apply_user_override_filter": apply_user_override_filter
+                }
+                if resolved_additional_tools:
+                    prepared_kwargs["additional_tools"] = resolved_additional_tools
+                    prepared_kwargs["additional_tool_origins"] = (
+                        resolved_additional_tool_origins
+                    )
+                return await ToolFactory._create_all_tools_prepared(
+                    config,
+                    **prepared_kwargs,
+                )
+            except BaseException:
+                body_failed = True
+                raise
+
+        def finalize_runtime() -> None:
+            if body_failed and callable(abort_factory_runtime):
+                abort_factory_runtime(config)
+                return
+            finalizer = (
+                handoff_factory_runtime
+                if callable(handoff_factory_runtime)
+                else release_factory_runtime
+            )
+            if callable(finalizer):
+                finalizer(config)
+
+        return await run_with_tool_runtime_cleanup(
+            build_tools,
+            finalize_runtime,
+            logger=logger,
+            cleanup_error_message="Failed to finalize tool-factory runtime",
+        )
 
     @staticmethod
     async def _create_all_tools_prepared(
-        config: BaseToolConfig, apply_user_override_filter: bool = True
+        config: BaseToolConfig,
+        apply_user_override_filter: bool = True,
+        additional_tools: Iterable[Tool] = (),
+        additional_tool_origins: Mapping[str, str] | None = None,
     ) -> list[Tool]:
         """
         Create all tools based on configuration.
@@ -329,8 +465,104 @@ class ToolFactory:
         Returns:
             List of configured tools
         """
+        from ....task_runtime import (
+            TaskRuntimeContribution,
+            reconcile_task_runtime_contribution_tools,
+        )
+
         # Auto-discover tools from @register_tool decorators
         tools = await ToolRegistry.create_registered_tools(config)
+        core_tool_occurrences = Counter(id(tool) for tool in tools)
+        # Snapshot the core name space BEFORE extension tools are merged into
+        # ``tools`` below, so it can never include a contributed name.
+        core_tool_names = {
+            tool.name for tool in tools if isinstance(getattr(tool, "name", None), str)
+        }
+        candidate_extension_tools = list(additional_tools)
+        # Identity guard baseline for reconciliation below: it must reflect what
+        # the contribution actually handed over, before malformed tools are
+        # dropped, otherwise dropping one tool would disable structured
+        # reconciliation for every other provider.
+        candidate_extension_occurrences = Counter(
+            id(tool) for tool in candidate_extension_tools
+        )
+        runtime_config = config if isinstance(config, BaseToolConfig) else None
+        # Resolved back to the full, pre-policy contribution: the stored value
+        # may be a view narrowed by an earlier build, and reconciliation must
+        # re-derive from the full one so a widened policy restores what a
+        # previous, more restrictive policy removed.
+        contribution = _full_stored_contribution(
+            runtime_config.get_task_runtime_contribution()
+            if runtime_config is not None
+            else None
+        )
+        # The structured, provider-owned view of the very same objects that were
+        # handed to this call. Resolved up front so the malformed-tool filter
+        # below can attribute a rejected tool to the provider that really sent
+        # it, and so reconciliation can match survivors by identity.
+        structured_contribution = (
+            contribution
+            if isinstance(contribution, TaskRuntimeContribution)
+            and contribution.provider_contributions
+            and Counter(id(tool) for tool in contribution.tools)
+            == candidate_extension_occurrences
+            else None
+        )
+        # ``additional_tool_origins`` is keyed by tool NAME, so two providers
+        # contributing the same name collapse into a single entry and every
+        # name-keyed diagnostic is attributed to whichever provider was merged
+        # last. Keep an identity-keyed queue in provider-registry order instead.
+        extension_tool_providers: dict[int, list[str]] = {}
+        if structured_contribution is not None:
+            for (
+                provider_name,
+                provider_contribution,
+            ) in structured_contribution.provider_contributions:
+                for tool in provider_contribution.tools:
+                    extension_tool_providers.setdefault(id(tool), []).append(
+                        provider_name
+                    )
+        extension_tools: list[Tool] = []
+        extension_names: set[str] = set()
+        if candidate_extension_tools:
+            for tool in candidate_extension_tools:
+                name = getattr(tool, "name", None)
+                if not isinstance(name, str) or not name.strip():
+                    raise TypeError(
+                        "Task runtime extension contributed a tool without a "
+                        "non-empty string 'name' attribute"
+                    )
+                # ``TaskRuntimeContribution.tools`` is untyped, so a provider can
+                # hand over a plain LangChain ``@tool`` function whose
+                # ``metadata`` is ``None``. Category sorting and downstream
+                # metadata consumers would then raise and take down the whole
+                # task's tool build, including every core tool. Drop only the
+                # malformed contribution.
+                if getattr(getattr(tool, "metadata", None), "category", None) is None:
+                    owners = extension_tool_providers.get(id(tool))
+                    provider = (
+                        owners.pop(0)
+                        if owners
+                        else _extension_tool_origin(additional_tool_origins, name)
+                    )
+                    logger.warning(
+                        "Dropping task runtime extension tool '%s' from '%s' "
+                        "because it has no usable 'metadata.category'",
+                        name.strip(),
+                        provider,
+                    )
+                    continue
+                # Track the RAW name: every policy stage below matches on
+                # ``tool.name`` as-is, so a stripped bookkeeping name would make
+                # a surviving padded name look like it was filtered out.
+                extension_names.add(name)
+                extension_tools.append(tool)
+        extension_tool_occurrences = Counter(id(tool) for tool in extension_tools)
+        if extension_tools:
+            # Keep colliding candidates through the name-policy stages. A tool
+            # filtered by task/user policy cannot collide at execution time.
+            tools.extend(extension_tools)
+            tools = ToolRegistry._sort_tools_by_category(tools)
 
         # Name-level filter via the spec's ``compute_allowed_names``
         # dispatch. The three return shapes encode the three modes:
@@ -367,7 +599,28 @@ class ToolFactory:
                     type(config).__name__,
                     len(legacy_when_spec),
                 )
-            allowed_names = spec.compute_allowed_names(tools)
+            # Task-runtime contributions are an ID-level scope the spec cannot
+            # see on its own: a contributed tool keeps the default
+            # ``ToolCategory.OTHER``, which is never present in a configured
+            # category set, so a category spec would silently drop all of them.
+            # Pass the contributed names so BY_CATEGORIES can admit them on the
+            # task-scoped opt-in, exactly like an ``mcp:<server>`` scope.
+            #
+            # Names already claimed by a core tool are excluded: the filter
+            # below matches on NAME only, so admitting such a name would also
+            # admit the identically named CORE tool even when the agent's
+            # category policy excludes its real category. The colliding
+            # contribution gains nothing from the bypass anyway — the
+            # reconciliation pass below drops the offending provider for the
+            # name collision regardless.
+            allowed_names = spec.compute_allowed_names(
+                tools,
+                extension_tool_names=frozenset(
+                    tool.name
+                    for tool in extension_tools
+                    if tool.name not in core_tool_names
+                ),
+            )
         else:
             # Legacy contract: ``BaseToolConfig.get_allowed_tools()`` is
             # still a public accessor on non-WebToolConfig subclasses
@@ -420,6 +673,97 @@ class ToolFactory:
                 allowed_by_hook = set(allowlist)
                 tools = [tool for tool in tools if tool.name in allowed_by_hook]
 
+        # Classify surviving occurrences, not just object identities. Two
+        # providers are allowed to return the same tool object; a bare set of
+        # ``id()`` values would collapse those contributions and could retain
+        # the occurrence owned by a provider that reconciliation dropped.
+        remaining_core_occurrences = core_tool_occurrences.copy()
+        policy_surviving_core_tools: list[Tool] = []
+        policy_surviving_extension_tools: list[Tool] = []
+        for tool in tools:
+            tool_id = id(tool)
+            if remaining_core_occurrences[tool_id] > 0:
+                remaining_core_occurrences[tool_id] -= 1
+                policy_surviving_core_tools.append(tool)
+            elif extension_tool_occurrences[tool_id] > 0:
+                policy_surviving_extension_tools.append(tool)
+        policy_surviving_extension_names = {
+            tool.name for tool in policy_surviving_extension_tools
+        }
+        dropped_extension_names = extension_names - policy_surviving_extension_names
+        if dropped_extension_names:
+            dropped_by_provider: dict[str, list[str]] = {}
+            for name in sorted(dropped_extension_names):
+                provider = _extension_tool_origin(additional_tool_origins, name)
+                dropped_by_provider.setdefault(provider, []).append(name.strip())
+            logger.warning(
+                "Task runtime extension tools were filtered by task tool policy: %s",
+                "; ".join(
+                    f"{provider}=[{', '.join(names)}]"
+                    for provider, names in sorted(dropped_by_provider.items())
+                ),
+            )
+
+        # Gate on the UNFILTERED candidate list, not on the names that survived
+        # the malformed-tool filter: when every tool a provider contributed was
+        # rejected there is nothing left in ``extension_names``, yet the stored
+        # contribution still carries that provider's prompt environment and
+        # modality preference and must be reconciled away too.
+        if candidate_extension_tools:
+            contribution_reconciled = False
+            if structured_contribution is not None:
+                # Match survivors by object identity. A tool this factory
+                # rejected above must not be able to claim its name back and
+                # evict a different provider's accepted tool of the same name.
+                reconciled, conflicts = reconcile_task_runtime_contribution_tools(
+                    structured_contribution,
+                    available_tools=policy_surviving_extension_tools,
+                    reserved_tool_names={
+                        tool.name for tool in policy_surviving_core_tools
+                    },
+                )
+                runtime_config.set_task_runtime_contribution(reconciled)
+
+                accepted_extension_occurrences = Counter(
+                    id(tool) for tool in reconciled.tools
+                )
+                remaining_core_occurrences = core_tool_occurrences.copy()
+                retained_tools: list[Tool] = []
+                for tool in tools:
+                    tool_id = id(tool)
+                    if remaining_core_occurrences[tool_id] > 0:
+                        remaining_core_occurrences[tool_id] -= 1
+                        retained_tools.append(tool)
+                    elif accepted_extension_occurrences[tool_id] > 0:
+                        accepted_extension_occurrences[tool_id] -= 1
+                        retained_tools.append(tool)
+                tools = retained_tools
+                contribution_reconciled = True
+                for conflict in conflicts:
+                    logger.warning(
+                        "Dropping task runtime extension '%s' because its "
+                        "post-policy tool names collide: %s",
+                        conflict.provider,
+                        ", ".join(conflict.tool_names),
+                    )
+            # No name-only fallback: an unstructured contribution carries no
+            # per-provider view to reconcile, and matching survivors by name
+            # would let a tool this factory already rejected claim the name of
+            # a different provider's accepted tool. Such a contribution falls
+            # through to the duplicate-name guard below instead.
+
+            if not contribution_reconciled:
+                claimed_names = {tool.name for tool in policy_surviving_core_tools}
+                for tool in policy_surviving_extension_tools:
+                    name = tool.name
+                    if name in claimed_names:
+                        provider = _extension_tool_origin(additional_tool_origins, name)
+                        raise ValueError(
+                            f"Task runtime extension '{provider}' contributed "
+                            f"duplicate tool '{name}'"
+                        )
+                    claimed_names.add(name)
+
         # Wrap sandbox-enabled tools if sandbox is available
         sandbox = config.get_sandbox()
         if sandbox is not None:
@@ -431,14 +775,52 @@ class ToolFactory:
             release = getattr(config, "release_db_connection", None)
             if callable(release):
                 release()
-            workspace = ToolFactory._create_workspace(config.get_workspace_config())
+            workspace = (
+                config.get_task_runtime_workspace()
+                if isinstance(config, BaseToolConfig)
+                else None
+            )
+            if workspace is None:
+                workspace = ToolFactory.create_workspace(config.get_workspace_config())
             if workspace is not None:
-                from .sandboxed_tool.sandboxed_tool_wrapper import (
-                    create_workspace_in_sandbox,
+                directories = workspace.get_allowed_dirs()
+                # Mount coverage is sufficient only when the backend-side
+                # directories already exist. TaskWorkspace creates them in
+                # its constructor; MockWorkspace deliberately does not, so it
+                # must retain the historical in-sandbox mkdir fallback.
+                directories_exist_on_backend_storage = all(
+                    Path(directory).is_dir() for directory in directories
                 )
+                # Resolve on the concrete type: getattr(instance, ...) against
+                # unittest.mock.Mock auto-creates an attribute and would make
+                # an unimplemented capability look present. Instance-only
+                # duck-typed capabilities intentionally keep the safe fallback.
+                host_mount_check = getattr(
+                    type(sandbox), "workspace_dirs_are_host_mounted", None
+                )
+                workspace_is_host_mounted = False
+                if directories_exist_on_backend_storage and callable(host_mount_check):
+                    try:
+                        workspace_is_host_mounted = (
+                            host_mount_check(sandbox, directories) is True
+                        )
+                    except Exception:
+                        # This is an optimization probe. If it cannot prove
+                        # coverage, preserve the pre-optimization behavior
+                        # instead of failing task/tool creation.
+                        logger.warning(
+                            "Workspace host-mount coverage check failed; "
+                            "falling back to sandbox directory setup",
+                            exc_info=True,
+                        )
+                if not workspace_is_host_mounted:
+                    from .sandboxed_tool.sandboxed_tool_wrapper import (
+                        create_workspace_in_sandbox,
+                        resolve_primary_sandbox,
+                    )
 
-                setup_sandbox = getattr(sandbox, "primary_sandbox", sandbox)
-                await create_workspace_in_sandbox(setup_sandbox, workspace)
+                    setup_sandbox = resolve_primary_sandbox(sandbox)
+                    await create_workspace_in_sandbox(setup_sandbox, workspace)
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
 
         # Apply output filtering to all tools
@@ -525,10 +907,10 @@ class ToolFactory:
 
     # New unified tool creation methods
     @staticmethod
-    def _create_workspace(
+    def create_workspace(
         workspace_config: dict[str, Any] | None,
     ) -> TaskWorkspace | None:
-        """Create workspace from configuration.
+        """Create a workspace from a tool configuration.
 
         Uses MockWorkspace for tool listing scenarios to avoid creating
         unnecessary directories on disk.
@@ -564,21 +946,34 @@ class ToolFactory:
                 allowed_external_dirs=workspace_config.get("allowed_external_dirs"),
                 db_task_id=workspace_config.get("db_task_id"),
                 scope_segments=tuple(workspace_config.get("scope_segments") or ()),
+                durable_storage_segments=workspace_config.get(
+                    "durable_storage_segments"
+                ),
             )
             user_id = workspace_config.get("user_id")
             if isinstance(user_id, int):
                 workspace.owner_user_id = user_id
+            workspace.file_operation_access_version = workspace_config.get(
+                FILE_OPERATION_ACCESS_VERSION_KEY
+            )
             return workspace
         except Exception as e:
             logger.warning(f"Failed to create workspace: {e}")
             return None
 
     @staticmethod
+    def _create_workspace(
+        workspace_config: dict[str, Any] | None,
+    ) -> TaskWorkspace | None:
+        """Backward-compatible alias for callers on older core revisions."""
+
+        return ToolFactory.create_workspace(workspace_config)
+
+    @staticmethod
     def _create_unavailable_mcp_tool(
         *,
         server_name: object,
         server_id: object = None,
-        allow_users: object = None,
         reason: object = None,
         message: object = None,
         failure_code: object = None,
@@ -590,7 +985,6 @@ class ToolFactory:
         kwargs: dict[str, Any] = {
             "server_name": server_name if isinstance(server_name, str) else "",
             "server_id": server_id,
-            "allow_users": allow_users if isinstance(allow_users, list) else None,
             "failure_code": normalize_tool_failure_code(failure_code),
         }
         if isinstance(reason, str):
@@ -623,7 +1017,6 @@ class ToolFactory:
                 cls._create_unavailable_mcp_tool(
                     server_name=failure.server_name,
                     server_id=server_id,
-                    allow_users=config.get("allow_users"),
                     reason=failure.phase.value,
                     message=mcp_load_failure_message(failure.phase),
                 )
@@ -650,8 +1043,10 @@ class ToolFactory:
     async def _create_mcp_tools_from_configs(
         mcp_configs: list[dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
+        actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
+        actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
     ) -> list[Tool]:
-        """Create MCP tools from configurations."""
+        """Create MCP tools while keeping actor session identity host-only."""
         try:
             from .mcp_adapter import load_mcp_tools_as_agent_tools
 
@@ -663,12 +1058,10 @@ class ToolFactory:
                 if isinstance(inner_config, dict) and inner_config.get("unavailable"):
                     try:
                         server_name = config.get("name")
-                        allow_users = config.get("allow_users")
                         unavailable_tools.append(
                             ToolFactory._create_unavailable_mcp_tool(
                                 server_name=server_name,
                                 server_id=inner_config.get("server_id"),
-                                allow_users=allow_users,
                                 reason=inner_config.get("reason"),
                                 message=inner_config.get("message"),
                                 failure_code=inner_config.get("failure_code"),
@@ -687,6 +1080,8 @@ class ToolFactory:
             if normal_configs:
                 connections: dict[str, Any] = {}
                 configs_by_name: dict[str, dict[str, Any]] = {}
+                session_requests: list[tuple[str, dict[str, Any], Any]] = []
+                session_identities = actor_stdio_session_identities or {}
                 try:
                     # Convert configs to connection format
                     for config in normal_configs:
@@ -702,7 +1097,6 @@ class ToolFactory:
                                 ToolFactory._create_unavailable_mcp_tool(
                                     server_name=config.get("name"),
                                     server_id=config.get("id"),
-                                    allow_users=config.get("allow_users"),
                                     reason="invalid_config",
                                     message="MCP server configuration is unavailable.",
                                 )
@@ -714,7 +1108,6 @@ class ToolFactory:
                                 ToolFactory._create_unavailable_mcp_tool(
                                     server_name=server_name,
                                     server_id=config.get("id"),
-                                    allow_users=config.get("allow_users"),
                                     reason="invalid_config",
                                     message="MCP server configuration is unavailable.",
                                 )
@@ -726,7 +1119,6 @@ class ToolFactory:
                                 ToolFactory._create_unavailable_mcp_tool(
                                     server_name=server_name,
                                     server_id=config.get("id"),
-                                    allow_users=config.get("allow_users"),
                                     reason="invalid_config",
                                     message="MCP server configuration is unavailable.",
                                 )
@@ -766,8 +1158,55 @@ class ToolFactory:
                                     "args"
                                 ].split()
 
-                        connections[server_name] = connection_config
                         configs_by_name[server_name] = config
+                        session_identity = session_identities.get(server_name)
+                        if session_identity is not None:
+                            if actor_stdio_session_consumer is None:
+                                unavailable_tools.append(
+                                    ToolFactory._create_unavailable_mcp_tool(
+                                        server_name=server_name,
+                                        server_id=config.get("id"),
+                                        reason=ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+                                        message=(
+                                            "MCP server session runtime is unavailable."
+                                        ),
+                                    )
+                                )
+                                continue
+                            session_requests.append(
+                                (server_name, connection_config, session_identity)
+                            )
+                            continue
+                        connections[server_name] = connection_config
+
+                    for server_name, connection, identity in session_requests:
+                        try:
+                            consumed_tools = await actor_stdio_session_consumer(
+                                server_name=server_name,
+                                connection=connection,
+                                session_identity=identity,
+                                sandbox=sandbox,
+                            )
+                            normal_tools.extend(consumed_tools)
+                        except ConnectorRuntimeError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "Actor stdio session consumer failed for server "
+                                "'%s' (%s)",
+                                server_name,
+                                type(exc).__name__,
+                            )
+                            unavailable_tools.append(
+                                ToolFactory._create_unavailable_mcp_tool(
+                                    server_name=server_name,
+                                    server_id=configs_by_name[server_name].get("id"),
+                                    reason=ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+                                    message=(
+                                        "MCP server session runtime is unavailable."
+                                    ),
+                                )
+                            )
 
                     # Load MCP tools
                     if connections:
@@ -775,7 +1214,7 @@ class ToolFactory:
                             connections,
                             sandbox=sandbox,
                         )  # type: ignore[arg-type]
-                        normal_tools = list(load_result.tools)
+                        normal_tools.extend(load_result.tools)
                         unavailable_tools.extend(
                             ToolFactory._unavailable_mcp_tools_from_load_failures(
                                 load_result.failures,
@@ -791,7 +1230,6 @@ class ToolFactory:
                             ToolFactory._create_unavailable_mcp_tool(
                                 server_name=server_name,
                                 server_id=config.get("id"),
-                                allow_users=config.get("allow_users"),
                                 reason="loader_failed",
                                 message="MCP server tools could not be loaded.",
                             )
@@ -838,6 +1276,14 @@ class ToolFactory:
                     UserMCPServer, MCPServer.id == UserMCPServer.mcpserver_id
                 ).filter(UserMCPServer.user_id == user_id, UserMCPServer.is_active)
 
+            # This shared layer is resolved purely on user_id and is
+            # outside team governance: the query above is already
+            # restricted to the user's own active links, so no team-owned
+            # server reaches it today, and this classmethod has no
+            # production caller. Broadening either of those -- a caller in
+            # src/, or a query that admits team-owned servers -- means this
+            # path must first re-key the shared layer onto the governing
+            # team the way the web tool-config loader does.
             user_env_overrides = load_user_env_overrides(db, user_id)
             shared_env_overrides = load_shared_env_overrides(db, user_id)
             env_source_overrides = load_user_env_sources(db, user_id)
@@ -869,7 +1315,6 @@ class ToolFactory:
                         cls._create_unavailable_mcp_tool(
                             server_name=getattr(server, "name", ""),
                             server_id=getattr(server, "id", None),
-                            allow_users=[str(user_id)] if user_id is not None else None,
                             reason="runtime_connection_failed",
                             message="MCP server configuration is unavailable.",
                         )
@@ -881,7 +1326,6 @@ class ToolFactory:
                     configs_by_name[server_name] = {
                         "id": getattr(server, "id", None),
                         "name": server_name,
-                        "allow_users": [str(user_id)] if user_id is not None else None,
                     }
                     continue
                 diagnostic = build.diagnostic or {}
@@ -894,7 +1338,6 @@ class ToolFactory:
                     cls._create_unavailable_mcp_tool(
                         server_name=getattr(server, "name", ""),
                         server_id=getattr(server, "id", None),
-                        allow_users=[str(user_id)] if user_id is not None else None,
                         reason=diagnostic.get("code", "runtime_connection_unavailable"),
                         message="MCP server configuration is unavailable.",
                     )
@@ -920,7 +1363,6 @@ class ToolFactory:
                     cls._create_unavailable_mcp_tool(
                         server_name=server_name,
                         server_id=config.get("id"),
-                        allow_users=config.get("allow_users"),
                         reason="loader_failed",
                         message="MCP server tools could not be loaded.",
                     )

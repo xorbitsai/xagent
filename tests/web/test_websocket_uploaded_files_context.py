@@ -7,26 +7,34 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.trace import get_display_user_message
 from xagent.core.file_storage.factory import get_unscoped_file_storage
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import _build_task_agent_config
 from xagent.web.api.websocket import (
-    _append_uploaded_files_context_to_message,
-    _build_uploaded_files_context,
-    _display_file_refs_from_file_info,
-    _display_message_for_user,
-    _normalize_attachments_for_persistence,
     _normalize_file_outputs,
     _normalize_task_file_outputs,
-    _register_uploaded_files_for_agent,
-    _rewrite_file_links_to_file_id,
-    _selected_file_refs_from_task,
-    execute_task_background,
     handle_file_upload_for_task,
 )
 from xagent.web.models import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services.task_command_execution import (
+    _append_uploaded_files_context_to_message,
+    _build_uploaded_files_context,
+    _display_file_refs_from_file_info,
+    _display_message_for_user,
+    _normalize_attachments_for_persistence,
+    _selected_file_refs_from_task,
+)
+from xagent.web.services.task_execution import (
+    _register_uploaded_files_for_agent,
+    _rewrite_file_links_to_file_id,
+    execute_task_background,
+)
 from xagent.web.services.task_lease_service import TaskLease
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -75,6 +83,7 @@ def _create_task(
         title=f"task-{task_id}",
         description="task",
         status=status,
+        lease_attempt_id="test-attempt" if runner_id is not None else None,
         runner_id=runner_id,
         run_id=run_id,
         agent_config=(
@@ -125,6 +134,7 @@ def _task_setup_snapshot(
 
 def _task_lease(task_id: int) -> TaskLease:
     return TaskLease(
+        attempt_id="test-attempt",
         task_id=task_id,
         runner_id="test-runner",
         run_id=f"run-{task_id}",
@@ -191,7 +201,7 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
             captured["broadcast_task_id"] = task_id
 
     class AgentService:
-        def set_conversation_history(self, history):
+        def set_conversation_history(self, history, *, watermark=None):
             captured["conversation_history"] = history
 
         def set_execution_context_messages(self, messages):
@@ -214,13 +224,15 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
             return {"success": True, "output": "ok", "file_outputs": []}
 
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "background_task_manager",
         BackgroundTaskManager(),
     )
     monkeypatch.setattr(websocket_api, "manager", BroadcastManager())
     test_sessionmaker = sessionmaker(bind=db_session.get_bind())
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
+    monkeypatch.setattr(
+        task_execution_service, "get_session_local", lambda: test_sessionmaker
+    )
 
     await execute_task_background(
         task_id=10,
@@ -246,7 +258,7 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
 
 
 class _NoopAgentService:
-    def set_conversation_history(self, history):
+    def set_conversation_history(self, history, *, watermark=None):
         pass
 
     def set_execution_context_messages(self, messages):
@@ -276,10 +288,14 @@ def _wire_execute_task_background(monkeypatch, db_session, manager):
     test_sessionmaker = sessionmaker(bind=db_session.get_bind())
 
     monkeypatch.setattr(
-        websocket_api, "background_task_manager", _NoopBackgroundTaskManager()
+        task_execution_service,
+        "background_task_manager",
+        _NoopBackgroundTaskManager(),
     )
     monkeypatch.setattr(websocket_api, "manager", manager)
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
+    monkeypatch.setattr(
+        task_execution_service, "get_session_local", lambda: test_sessionmaker
+    )
 
 
 @pytest.mark.asyncio
@@ -330,7 +346,9 @@ async def test_completion_broadcast_failure_keeps_task_completed(
         return {"type": event_type, "task_id": task_id}
 
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", fake_payload
+    )
 
     await execute_task_background(
         task_id=10,
@@ -470,7 +488,9 @@ async def test_execution_failure_is_deferred_to_concrete_lease_owner(
         return {"type": event_type, "task_id": task_id}
 
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", fake_payload
+    )
 
     with pytest.raises(RuntimeError, match="agent boom xyz"):
         await execute_task_background(
@@ -556,7 +576,9 @@ async def test_assistant_persist_failure_surfaces_as_task_failure(
         "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
         boom,
     )
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", fake_payload
+    )
 
     with pytest.raises(RuntimeError, match="durable persist failed"):
         await execute_task_background(
@@ -630,7 +652,9 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
         "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", fake_payload
+    )
 
     await execute_task_background(
         task_id=13,
@@ -1193,10 +1217,8 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
     # production boundary instead of carrying fixture writes into storage I/O.
     db_session.commit()
 
-    import xagent.web.api.chat as chat_api
-
     monkeypatch.setattr(
-        chat_api,
+        agent_runtime_service,
         "get_agent_manager",
         lambda: pytest.fail("file staging must not create an AgentService"),
     )
@@ -1216,6 +1238,58 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
     assert [item["file_id"] for item in result["file_info_list"]] == ["valid-file"]
     db_session.refresh(valid_file)
     assert valid_file.task_id == 10
+
+
+@pytest.mark.asyncio
+async def test_marked_websocket_first_turn_file_remains_readable(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    owner = _create_user(db_session, 1, "owner")
+    task = _create_task(db_session, task_id=10, user_id=owner.id)
+    task.source = "widget"
+    task.agent_config = {
+        "auth_mode": "widget",
+        "__xagent_file_operation_access_version": 1,
+    }
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="first-turn-file",
+        user_id=owner.id,
+        task_id=None,
+        filename="first-turn.txt",
+    )
+    Path(upload.storage_path).write_text("first turn", encoding="utf-8")
+    db_session.commit()
+
+    result = await handle_file_upload_for_task(
+        task.id,
+        [{"file_id": upload.file_id}],
+        db_session,
+        SimpleNamespace(id=owner.id, is_admin=False),
+        task_owner_id=owner.id,
+    )
+    assert [item["file_id"] for item in result["file_info_list"]] == [upload.file_id]
+    db_session.refresh(upload)
+    assert upload.task_id == task.id
+
+    SessionLocal = sessionmaker(bind=db_session.get_bind())
+    monkeypatch.setattr(
+        "xagent.core.storage.manager.create_db_session",
+        SessionLocal,
+    )
+    workspace = TaskWorkspace(
+        id="agent_1_websocket_first_turn",
+        base_dir=str(tmp_path / "workspaces"),
+        allowed_external_dirs=[str(Path(upload.storage_path).parent)],
+        db_task_id=task.id,
+    )
+    workspace.owner_user_id = owner.id
+    workspace.file_operation_access_version = 1
+
+    assert WorkspaceFileOperations(workspace).read_file(upload.file_id) == "first turn"
 
 
 def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(

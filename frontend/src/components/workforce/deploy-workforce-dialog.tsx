@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useState } from "react"
 import { Check, Copy, KeyRound, Loader2 } from "lucide-react"
 
+import { DeploymentConfigErrorAlert } from "@/components/deployment/deployment-config-error-alert"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -15,6 +16,10 @@ import { Input } from "@/components/ui/input"
 import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
 import { copyToClipboard } from "@/lib/clipboard"
+import {
+  DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
+  fetchDeploymentConfig,
+} from "@/lib/deployment-config"
 import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
 import {
   formatWorkforceApiSnippets,
@@ -53,6 +58,7 @@ export function DeployWorkforceDialog({
   const [apiTab, setApiTab] = useState<ApiSnippetTab>("curl")
   const [copiedSnippet, setCopiedSnippet] = useState(false)
   const [apiTarget, setApiTarget] = useState<ApiSnippetTarget>({ baseUrl: "" })
+  const [deploymentConfigFailed, setDeploymentConfigFailed] = useState(false)
 
   const [keys, setKeys] = useState<AgentApiKeyListItem[]>([])
   const [loadingKeys, setLoadingKeys] = useState(false)
@@ -62,8 +68,47 @@ export function DeployWorkforceDialog({
   const [copiedKey, setCopiedKey] = useState(false)
 
   useEffect(() => {
-    if (open) setApiTarget(getApiSnippetTarget())
-  }, [open])
+    if (!open) {
+      setApiTarget({ baseUrl: "" })
+      setDeploymentConfigFailed(false)
+      return
+    }
+
+    let cancelled = false
+    fetchDeploymentConfig()
+      .then((config) => {
+        if (!cancelled) {
+          setApiTarget(getApiSnippetTarget(config.deployment_origin))
+          setDeploymentConfigFailed(false)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setApiTarget({ baseUrl: "" })
+          setDeploymentConfigFailed(true)
+          toast.error(
+            t("deployment_config.messages.load_failed")
+            || DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
+          )
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, t])
+
+  const retryDeploymentConfig = async () => {
+    try {
+      const config = await fetchDeploymentConfig()
+      setApiTarget(getApiSnippetTarget(config.deployment_origin))
+      setDeploymentConfigFailed(false)
+    } catch {
+      toast.error(
+        t("deployment_config.messages.load_failed")
+        || DEPLOYMENT_CONFIG_LOAD_FAILED_FALLBACK,
+      )
+    }
+  }
 
   useEffect(() => {
     if (!open) {
@@ -95,10 +140,15 @@ export function DeployWorkforceDialog({
   )
 
   const handleCopySnippet = async () => {
+    if (!apiTarget.baseUrl) return
     const ok = await copyToClipboard(snippets[apiTab])
     if (ok) {
       setCopiedSnippet(true)
       setTimeout(() => setCopiedSnippet(false), 1500)
+    } else {
+      toast.error(
+        t("deploy_workforce.copy_failed") || "Failed to copy to clipboard",
+      )
     }
   }
 
@@ -108,6 +158,10 @@ export function DeployWorkforceDialog({
     if (ok) {
       setCopiedKey(true)
       setTimeout(() => setCopiedKey(false), 1500)
+    } else {
+      toast.error(
+        t("deploy_workforce.copy_failed") || "Failed to copy to clipboard",
+      )
     }
   }
 
@@ -150,6 +204,10 @@ export function DeployWorkforceDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {deploymentConfigFailed && (
+          <DeploymentConfigErrorAlert onRetry={retryDeploymentConfig} />
+        )}
+
         <div className="space-y-5">
           {/* Snippet tabs */}
           <div>
@@ -171,13 +229,14 @@ export function DeployWorkforceDialog({
             </div>
             <div className="mt-3 bg-muted p-4 rounded-md text-xs font-mono relative group">
               <pre className="whitespace-pre-wrap break-all text-muted-foreground max-h-72 overflow-auto">
-                {snippets[apiTab]}
+                {apiTarget.baseUrl ? snippets[apiTab] : "…"}
               </pre>
               <Button
                 variant="secondary"
                 size="icon"
                 className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
                 onClick={handleCopySnippet}
+                disabled={!apiTarget.baseUrl}
                 title={t("deploy_workforce.copy") || "Copy"}
               >
                 {copiedSnippet ? (

@@ -3,27 +3,28 @@
 Covers the three key contracts callers rely on:
 
   - Generation produces a syntactically correct key (brand + alphabet
-    + lengths) and a bcrypt hash that verifies against it.
+    + lengths) and a versioned SHA-256 verifier that matches it.
   - Parse is strict -- any deviation from the format returns None
     rather than partial / lenient parses, so a bad header never
-    reaches the bcrypt step.
-  - verify_api_key matches bcrypt's contract (true on match, false
-    on miss, false on garbage input rather than raising).
+    reaches secret verification.
+  - verify_api_key accepts current SHA-256 and legacy bcrypt verifiers
+    (true on match, false on miss, false on garbage input rather than raising).
 
 Plus a couple of robustness checks:
 
-  - verify_dummy spends roughly the same time as a real verify_api_key
-    call, so an attacker can't enumerate prefixes by timing.
+  - verify_dummy performs a bcrypt check with the same cost as legacy bcrypt API
+    keys, so missing prefixes do not skip the expensive verification.
   - generate_api_key retries on prefix collision and gives up cleanly
     if a mock keeps colliding.
 """
 
 import re
-import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import bcrypt
 import pytest
 
+from xagent.core.utils import api_key as api_key_module
 from xagent.core.utils.api_key import (
     BCRYPT_COST,
     KEY_ALPHABET,
@@ -31,10 +32,16 @@ from xagent.core.utils.api_key import (
     KEY_PREFIX_LENGTH,
     KEY_SECRET_LENGTH,
     PREFIX_COLLISION_RETRIES,
+    SHA256_HASH_PREFIX,
     ApiKeyKind,
+    ApiKeyVerification,
     generate_api_key,
+    hash_api_key,
+    is_legacy_bcrypt_api_key_hash,
+    is_sha256_api_key_hash,
     parse_api_key,
     verify_api_key,
+    verify_api_key_with_timing,
     verify_dummy,
 )
 
@@ -62,8 +69,8 @@ def test_generate_format() -> None:
     assert alphabet_re.fullmatch(parts[1])
     assert alphabet_re.fullmatch(parts[2])
 
-    # bcrypt hash is the standard $2b$ prefix with our cost factor
-    assert key_hash.startswith(f"$2b${BCRYPT_COST:02d}$")
+    assert key_hash.startswith(SHA256_HASH_PREFIX)
+    assert len(key_hash) == len(SHA256_HASH_PREFIX) + 64
 
 
 def test_generate_persists_only_hash() -> None:
@@ -73,6 +80,24 @@ def test_generate_persists_only_hash() -> None:
     assert verify_api_key(full, key_hash) is True
     # Sanity: hash does NOT verify a different key
     assert verify_api_key(full + "X", key_hash) is False
+
+
+def test_hash_api_key_is_deterministic_and_versioned() -> None:
+    raw = "xag_ABC123_" + "x" * KEY_SECRET_LENGTH
+    first = hash_api_key(raw)
+    second = hash_api_key(raw)
+
+    assert first == second
+    assert first.startswith(SHA256_HASH_PREFIX)
+    assert raw not in first
+    assert is_sha256_api_key_hash(first) is True
+    assert is_legacy_bcrypt_api_key_hash(first) is False
+
+
+@pytest.mark.parametrize("raw", ["", None, 123])
+def test_hash_api_key_rejects_empty_or_non_string(raw: object) -> None:
+    with pytest.raises(ValueError, match="non-empty string"):
+        hash_api_key(raw)  # type: ignore[arg-type]
 
 
 def test_generate_prefix_collision_retry() -> None:
@@ -179,6 +204,37 @@ def test_verify_wrong_secret() -> None:
     assert verify_api_key(flipped, key_hash) is False
 
 
+def test_verify_legacy_bcrypt_hash() -> None:
+    """A deployed bcrypt verifier remains readable for lazy migration."""
+    full = "xag_ABC123_" + "x" * KEY_SECRET_LENGTH
+    legacy_hash = bcrypt.hashpw(full.encode(), bcrypt.gensalt(rounds=4)).decode()
+
+    assert is_legacy_bcrypt_api_key_hash(legacy_hash) is True
+    assert is_sha256_api_key_hash(legacy_hash) is False
+    assert verify_api_key(full, legacy_hash) is True
+    assert verify_api_key(full[:-1] + "y", legacy_hash) is False
+
+
+def test_verification_reports_whether_bcrypt_timing_floor_was_paid() -> None:
+    """Malformed and low-cost bcrypt failures still require dummy padding."""
+    full = "xag_ABC123_" + "x" * KEY_SECRET_LENGTH
+    wrong = full[:-1] + "y"
+    low_cost_hash = bcrypt.hashpw(full.encode(), bcrypt.gensalt(rounds=4)).decode()
+    floor_hash = bcrypt.hashpw(
+        full.encode(), bcrypt.gensalt(rounds=BCRYPT_COST)
+    ).decode()
+
+    assert verify_api_key_with_timing(
+        wrong, "$2b$12$this-is-not-a-valid-bcrypt-hash"
+    ) == ApiKeyVerification(False, False)
+    assert verify_api_key_with_timing(wrong, low_cost_hash) == ApiKeyVerification(
+        False, False
+    )
+    assert verify_api_key_with_timing(wrong, floor_hash) == ApiKeyVerification(
+        False, True
+    )
+
+
 def test_verify_empty_inputs_return_false() -> None:
     """Empty / malformed inputs return False rather than raising."""
     assert verify_api_key("", "") is False
@@ -187,9 +243,31 @@ def test_verify_empty_inputs_return_false() -> None:
 
 
 def test_verify_garbage_hash_returns_false() -> None:
-    """Malformed bcrypt hash strings produce False, not ValueError leaking out."""
+    """Unknown verifier formats produce False rather than leaking errors."""
     full, _prefix, _hash = generate_api_key(db=None)
     assert verify_api_key(full, "not-a-bcrypt-hash") is False
+
+
+@pytest.mark.parametrize(
+    "stored_hash",
+    [
+        SHA256_HASH_PREFIX,
+        SHA256_HASH_PREFIX + "0" * 63,
+        SHA256_HASH_PREFIX + "0" * 63 + "z",
+        SHA256_HASH_PREFIX + "0" * 65,
+        SHA256_HASH_PREFIX + "A" * 64,
+        SHA256_HASH_PREFIX + "é" * 64,
+    ],
+)
+def test_verify_malformed_sha256_hash_returns_false(stored_hash: str) -> None:
+    full, _prefix, _hash = generate_api_key(db=None)
+    assert verify_api_key(full, stored_hash) is False
+
+
+def test_verify_unencodable_raw_key_returns_false() -> None:
+    """A lone surrogate is malformed input, not an internal server error."""
+    _full, _prefix, stored_hash = generate_api_key(db=None)
+    assert verify_api_key(chr(0xD800), stored_hash) is False
 
 
 # ===== verify_dummy =====
@@ -200,32 +278,21 @@ def test_verify_dummy_runs_without_raising() -> None:
     assert verify_dummy() is None
 
 
-def test_verify_dummy_timing_similar_to_verify() -> None:
-    """verify_dummy() runs roughly as long as a real verify_api_key() call.
+def test_verify_dummy_uses_the_same_bcrypt_cost_as_real_verification() -> None:
+    """Both paths execute bcrypt at the configured cost, without timing CI."""
+    full, _prefix, _key_hash = generate_api_key(db=None)
+    key_hash = bcrypt.hashpw(full.encode(), bcrypt.gensalt(rounds=BCRYPT_COST)).decode()
+    with patch.object(
+        api_key_module.bcrypt, "checkpw", wraps=api_key_module.bcrypt.checkpw
+    ) as checkpw:
+        assert verify_api_key(full, key_hash) is True
+        checkpw.assert_called_once_with(full.encode(), key_hash.encode())
+        checkpw.reset_mock()
 
-    We don't need tight bounds; the threat model is "an attacker can tell
-    fast (index miss) from slow (bcrypt run) responses". A ratio inside
-    [0.3, 3.0] is good enough -- bcrypt timing is dominated by the cost
-    factor, not by what's being verified. Generous bounds keep CI happy
-    on overcommitted runners.
-    """
-    full, _prefix, key_hash = generate_api_key(db=None)
-
-    # Warm any lazy bcrypt init so we don't measure first-call overhead
-    verify_api_key(full, key_hash)
-    verify_dummy()
-
-    t0 = time.perf_counter()
-    verify_api_key(full, key_hash)
-    real_elapsed = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    verify_dummy()
-    dummy_elapsed = time.perf_counter() - t0
-
-    ratio = dummy_elapsed / real_elapsed
-    assert 0.3 < ratio < 3.0, (
-        f"verify_dummy timing diverged from verify_api_key: "
-        f"real={real_elapsed * 1000:.1f}ms, dummy={dummy_elapsed * 1000:.1f}ms, "
-        f"ratio={ratio:.2f}"
-    )
+        assert verify_dummy() is None
+        checkpw.assert_called_once()
+        dummy_password, dummy_hash = checkpw.call_args.args
+        assert isinstance(dummy_password, bytes)
+        assert isinstance(dummy_hash, bytes)
+        assert int(dummy_hash.split(b"$")[2]) == BCRYPT_COST
+        assert int(key_hash.split("$")[2]) == BCRYPT_COST

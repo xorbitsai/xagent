@@ -29,6 +29,7 @@ from ..core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
+from .async_utils import maybe_await
 from .models import KBStorageBackend
 from .operation_compatibility import (
     KBOperationOutcome,
@@ -43,12 +44,6 @@ if TYPE_CHECKING:
     from .storage_shim import KBStorageShimCompatibilityFacade
 
 T_Result = TypeVar("T_Result")
-
-
-async def _maybe_await(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return await value
-    return value
 
 
 def _has_store_method(metadata_store: object, name: str) -> bool:
@@ -299,7 +294,7 @@ class KBApiCompatibilityFacade:
         """Execute async failed-ingest rollback and update operation outcome state."""
         try:
             with self._storage_context():
-                await _maybe_await(rollback())
+                await maybe_await(rollback())
         except Exception as exc:
             return KBApiFailedIngestRollbackResult(
                 operation_result=self.with_rollback_complete(
@@ -415,7 +410,7 @@ class KBApiCompatibilityFacade:
 
             store = get_metadata_store()
 
-            await _maybe_await(
+            await maybe_await(
                 store.save_collection_config(
                     collection=collection,
                     config_json=config_json,
@@ -450,7 +445,7 @@ class KBApiCompatibilityFacade:
         if _has_store_method(store, "get_collection"):
             try:
                 loaded = store.get_collection(collection)
-                loaded = await _maybe_await(loaded)
+                loaded = await maybe_await(loaded)
             except ValueError:
                 collection_info = CollectionInfo(name=collection)
             else:
@@ -474,7 +469,7 @@ class KBApiCompatibilityFacade:
         updated_collection = collection_info.model_copy(
             update={"extra_metadata": extra_metadata}
         )
-        await _maybe_await(store.save_collection(updated_collection))
+        await maybe_await(store.save_collection(updated_collection))
         return updated_collection
 
     async def get_collection_config(
@@ -490,7 +485,7 @@ class KBApiCompatibilityFacade:
 
             return cast(
                 str | None,
-                await _maybe_await(
+                await maybe_await(
                     get_metadata_store().get_collection_config(
                         collection=collection,
                         user_id=user_id,
@@ -513,7 +508,7 @@ class KBApiCompatibilityFacade:
 
             return cast(
                 dict[str, int],
-                await _maybe_await(
+                await maybe_await(
                     get_metadata_store().delete_collection_metadata(
                         collection_name=collection_name,
                         user_id=user_id,
@@ -522,17 +517,6 @@ class KBApiCompatibilityFacade:
                     )
                 ),
             )
-
-    async def delete_collection_metadata_entry(self, collection_name: str) -> bool:
-        """Delete the collection metadata row when the store supports it."""
-        with self._storage_context():
-            from ..storage.factory import get_metadata_store
-
-            delete_metadata = getattr(get_metadata_store(), "delete_collection", None)
-            if not callable(delete_metadata):
-                return False
-            await _maybe_await(delete_metadata(collection_name))
-            return True
 
     def list_collection_config_owner_ids(self, collection_name: str) -> set[int]:
         """List tenant config owners through the facade-bound metadata store."""

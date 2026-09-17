@@ -5,7 +5,7 @@ import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
 import { SearchInput } from "@/components/ui/search-input"
-import { useState, useEffect, useCallback, useMemo, useRef } from "react"
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useAuth } from "@/contexts/auth-context"
@@ -13,6 +13,7 @@ import { useApp } from "@/contexts/app-context-chat"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { getChannelTooltip, getCompactChannelName } from "@/lib/channel-display"
+import { userDisplayLabel } from "@/lib/user-display"
 import { toast } from "@/components/ui/sonner"
 import extraNav from "@/lib/extra-nav"
 import {
@@ -43,6 +44,7 @@ import {
   Search,
   Radio,
   Send,
+  Hash,
   ChevronsUpDown,
 } from "lucide-react"
 import {
@@ -98,6 +100,9 @@ function ChannelTypeIcon({ channelType }: { channelType?: string }) {
   if (normalizedType === "telegram") {
     return <Send className="h-3 w-3 flex-shrink-0 text-[#229ED9]" aria-hidden="true" />
   }
+  if (normalizedType === "slack") {
+    return <Hash className="h-3 w-3 flex-shrink-0 text-[#4A154B]" aria-hidden="true" />
+  }
 
   const iconPath = CHANNEL_ICON_PATHS[normalizedType]
   if (iconPath) {
@@ -135,6 +140,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   const branding = getBrandingFromEnv()
   const { t } = useI18n()
   const { state } = useApp()
+  const userLabel = userDisplayLabel(user, t("sidebar.user.defaultName"))
   const githubUrl = process.env.NEXT_PUBLIC_GITHUB_URL || "https://github.com/xorbitsai/xagent"
   const normalizedGithubUrl = githubUrl.replace(/\.git$/, "").replace(/\/$/, "")
   const githubRepoDisplay = normalizedGithubUrl.replace(/^https?:\/\/github\.com\//i, "")
@@ -237,6 +243,17 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
   const [isExpanded, setIsExpanded] = useState(false)
   const [expandedMenus, setExpandedMenus] = useState<string[]>(["/agent"]) // Use href as a stable key
+  const [groupCollapseOverrides, setGroupCollapseOverrides] = useState<Record<string, boolean>>({})
+  // Flip from the collapsed state currently rendered (which may come from the default,
+  // an active-route auto-expand, or a previous toggle) so a click always changes what
+  // the user sees — recomputing from defaultCollapsed here would make the first click
+  // a no-op whenever the group was auto-expanded by the active route.
+  const toggleGroupCollapse = (key: string, currentCollapsed: boolean) => {
+    setGroupCollapseOverrides(prev => ({
+      ...prev,
+      [key]: !currentCollapsed,
+    }))
+  }
   const [showUserMenu, setShowUserMenu] = useState(false)
   const [isAboutOpen, setIsAboutOpen] = useState(false)
   const sidebarRef = useRef<HTMLDivElement | null>(null)
@@ -517,7 +534,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
       }, 100)
       return () => clearTimeout(timer)
     }
-  }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks, isHistoryExpanded])
+    // groupCollapseOverrides and pathname aren't read above — they're re-measure triggers:
+    // toggling a group, or navigating to/from a route that auto-expands/collapses a group,
+    // changes contentScrollRef's scrollHeight, so this effect must re-run to re-check the fill.
+  }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks, isHistoryExpanded, groupCollapseOverrides, pathname])
 
   useEffect(() => {
     if (isHistoryExpanded) {
@@ -670,10 +690,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           <button
             onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
             className="flex items-center justify-center w-full p-2 hover:bg-accent rounded-[7px] transition-colors"
-            title={user?.username || t('sidebar.user.defaultName')}
+            title={userLabel}
           >
             <div className="h-7 w-7 rounded-full bg-primary flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
-              {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
+              {userLabel.charAt(0)}
             </div>
           </button>
         </div>
@@ -719,88 +739,107 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           className="z-10 bg-transparent py-1"
         >
           {/* Groups */}
-          {navigationGroups.map((group, groupIndex) => (
-            <div key={group.title} className={cn("mb-4", groupIndex === 0 && "mt-0")}>
-              <div className="px-2 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em]">
-                {group.titleKey ? t(group.titleKey) : group.title}
-              </div>
-              <div className="space-y-0.5">
-                {group.items.map((item: NavigationItem) => {
-                  const isActive = isItemActive(item)
-                  const hasChildren = item.children && item.children.length > 0
-                  const isExpanded = isMenuExpanded(item.href)
+          {navigationGroups.map((group, groupIndex) => {
+            // Groups without a stable `id` (e.g. extra-nav overlays) fall back to `title` —
+            // matches the pre-`id` behavior for anything that hasn't opted in yet.
+            const groupKey = group.id ?? group.title
+            // An active route overrides only the *default* collapsed state, so the current
+            // page is never hidden inside a collapsed group on first load — but an explicit
+            // user toggle always wins over that, so the group can still be collapsed manually.
+            const isGroupCollapsed = groupKey in groupCollapseOverrides
+              ? groupCollapseOverrides[groupKey]
+              : !!group.defaultCollapsed && !group.items.some(isItemActive)
+            return (
+              <div key={groupKey} className={cn("mb-4", groupIndex === 0 && "mt-0")}>
+                <button
+                  type="button"
+                  aria-expanded={!isGroupCollapsed}
+                  className="w-full px-2 py-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between text-left cursor-pointer select-none rounded transition-colors hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => toggleGroupCollapse(groupKey, isGroupCollapsed)}
+                >
+                  <span>{group.titleKey ? t(group.titleKey) : group.title}</span>
+                  {isGroupCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                </button>
+                {!isGroupCollapsed && (
+                  <div className="space-y-0.5">
+                    {group.items.map((item: NavigationItem) => {
+                      const isActive = isItemActive(item)
+                      const hasChildren = item.children && item.children.length > 0
+                      const isExpanded = isMenuExpanded(item.href)
 
-                  const activeStyle = "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))] font-semibold rounded-[7px]"
-                  const inactiveStyle = "text-muted-foreground hover:bg-accent hover:text-foreground rounded-[7px]"
+                      const activeStyle = "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))] font-semibold rounded-[7px]"
+                      const inactiveStyle = "text-muted-foreground hover:bg-accent hover:text-foreground rounded-[7px]"
 
-                  if (hasChildren) {
-                    return (
-                      <Popover key={item.name} open={isExpanded} onOpenChange={() => toggleMenu(item.href)}>
-                        <PopoverTrigger asChild>
-                          <button
-                            className={cn(
-                              "group flex items-center justify-between px-2.5 py-2 text-[13.5px] transition-colors relative w-full",
-                              isActive ? activeStyle : inactiveStyle
+                      if (hasChildren) {
+                        return (
+                          <Popover key={item.name} open={isExpanded} onOpenChange={() => toggleMenu(item.href)}>
+                            <PopoverTrigger asChild>
+                              <button
+                                className={cn(
+                                  "group flex items-center justify-between px-2.5 py-2 text-[13.5px] transition-colors relative w-full",
+                                  isActive ? activeStyle : inactiveStyle
+                                )}
+                              >
+                                <div className="flex items-center gap-2.5">
+                                  <item.icon className={cn("h-4 w-4", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
+                                  {item.nameKey ? t(item.nameKey) : item.name}
+                                </div>
+                                <ChevronRight className="h-3 w-3 opacity-50" />
+                              </button>
+                            </PopoverTrigger>
+                            {item.children && (
+                              <PopoverContent
+                                side="right"
+                                align="start"
+                                sideOffset={8}
+                                className="w-56 rounded-xl border border-border bg-popover p-2 shadow-lg"
+                              >
+                                <div className="space-y-0.5">
+                                  {item.children.map((child: NavigationItem) => {
+                                    const isChildActive = pathname === child.href
+                                    return (
+                                      <Link
+                                        key={child.href}
+                                        href={child.href}
+                                        onClick={() => toggleMenu(item.href)}
+                                        className={cn(
+                                          "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium transition-colors",
+                                          isChildActive
+                                            ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]"
+                                            : "text-foreground hover:bg-accent"
+                                        )}
+                                      >
+                                        <child.icon className="h-4 w-4 text-muted-foreground" />
+                                        {child.nameKey ? t(child.nameKey) : child.name}
+                                      </Link>
+                                    )
+                                  })}
+                                </div>
+                              </PopoverContent>
                             )}
-                          >
-                            <div className="flex items-center gap-2.5">
-                              <item.icon className={cn("h-4 w-4", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
-                              {item.nameKey ? t(item.nameKey) : item.name}
-                            </div>
-                            <ChevronRight className="h-3 w-3 opacity-50" />
-                          </button>
-                        </PopoverTrigger>
-                        {item.children && (
-                          <PopoverContent
-                            side="right"
-                            align="start"
-                            sideOffset={8}
-                            className="w-56 rounded-xl border border-border bg-popover p-2 shadow-lg"
-                          >
-                            <div className="space-y-0.5">
-                              {item.children.map((child: NavigationItem) => {
-                                const isChildActive = pathname === child.href
-                                return (
-                                  <Link
-                                    key={child.href}
-                                    href={child.href}
-                                    onClick={() => toggleMenu(item.href)}
-                                    className={cn(
-                                      "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium transition-colors",
-                                      isChildActive
-                                        ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]"
-                                        : "text-foreground hover:bg-accent"
-                                    )}
-                                  >
-                                    <child.icon className="h-4 w-4 text-muted-foreground" />
-                                    {child.nameKey ? t(child.nameKey) : child.name}
-                                  </Link>
-                                )
-                              })}
-                            </div>
-                          </PopoverContent>
-                        )}
-                      </Popover>
-                    )
-                  }
+                          </Popover>
+                        )
+                      }
 
-                  return (
-                    <Link
-                      key={item.name}
-                      href={item.href}
-                      className={cn(
-                        "group flex items-center px-2.5 py-2 text-[13.5px] font-medium transition-colors",
-                        isActive ? activeStyle : inactiveStyle
-                      )}
-                    >
-                      <item.icon className={cn("h-4 w-4 mr-2.5", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
-                      {item.nameKey ? t(item.nameKey) : item.name}
-                    </Link>
-                  )
-                })}
+                      return (
+                        <Link
+                          key={item.name}
+                          href={item.href}
+                          className={cn(
+                            "group flex items-center px-2.5 py-2 text-[13.5px] font-medium transition-colors",
+                            isActive ? activeStyle : inactiveStyle
+                          )}
+                        >
+                          <item.icon className={cn("h-4 w-4 mr-2.5", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
+                          {item.nameKey ? t(item.nameKey) : item.name}
+                        </Link>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
-            </div>
-          ))}
+            )
+          })}
         </nav>
 
         {/* History Section */}
@@ -1029,8 +1068,11 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
               <div className="h-px bg-border my-1 mx-2" />
               <button
                 onClick={() => {
-                  logout()
-                  setShowUserMenu(false)
+                  void (async () => {
+                    const loggedOut = await logout()
+                    if (loggedOut) setShowUserMenu(false)
+                    else toast.error(t("sidebar.user.logoutFailed"))
+                  })()
                 }}
                 className="flex w-full items-center px-4 py-2 text-sm hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors text-left"
               >
@@ -1045,10 +1087,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           className="flex w-full items-center gap-2.5 hover:bg-accent px-2 py-2 rounded-[7px] transition-colors text-left"
         >
           <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
-            {(user?.username || t('sidebar.user.defaultName')).charAt(0)}
+            {userLabel.charAt(0)}
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-[13px] font-semibold text-foreground truncate">{user?.username || t('sidebar.user.defaultName')}</p>
+            <p className="text-[13px] font-semibold text-foreground truncate">{userLabel}</p>
           </div>
           <ChevronsUpDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
         </button>

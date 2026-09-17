@@ -14,10 +14,12 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.shared.db_teardown import drop_all_tables
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import get_engine, get_session_local, init_db
 from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.services import agent_service_manager as agent_runtime_service
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,16 @@ class _DisabledTelegramChannel:
 
 
 class _DisabledFeishuChannel:
+    enabled = False
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
+class _DisabledSlackChannel:
     enabled = False
 
     async def start(self) -> None:
@@ -106,9 +118,7 @@ def disable_external_app_services(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def reset_chat_agent_manager(monkeypatch: pytest.MonkeyPatch) -> None:
-    import xagent.web.api.chat as chat_api
-
-    monkeypatch.setattr(chat_api, "_global_agent_manager", None)
+    monkeypatch.setattr(agent_runtime_service, "_global_agent_manager", None)
 
 
 def init_e2e_db() -> Any:
@@ -209,9 +219,7 @@ def run_e2e_app_client(
         reset_chat_agent_manager(monkeypatch)
         clear_connection_cache()
         try:
-            from xagent.web.models.database import Base
-
-            Base.metadata.drop_all(bind=get_engine())
+            drop_all_tables(get_engine())
             get_engine().dispose()
         except RuntimeError:
             pass
@@ -228,3 +236,7 @@ def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     feishu_module = ModuleType("xagent.web.channels.feishu.bot")
     feishu_module.get_feishu_channel = lambda: _DisabledFeishuChannel()
     monkeypatch.setitem(sys.modules, "xagent.web.channels.feishu.bot", feishu_module)
+
+    slack_module = ModuleType("xagent.web.channels.slack.bot")
+    slack_module.get_slack_channel = lambda: _DisabledSlackChannel()
+    monkeypatch.setitem(sys.modules, "xagent.web.channels.slack.bot", slack_module)

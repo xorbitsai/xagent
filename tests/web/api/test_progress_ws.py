@@ -175,6 +175,9 @@ class TestProgressWebSocketAPI:
         mock_task.end_time = None
         mock_task.metadata = {"collection": "docs"}
 
+        mock_user = MagicMock(spec=User)
+        mock_user.id = 1
+
         with (
             patch(
                 "xagent.web.api.progress_ws.get_progress_manager"
@@ -182,20 +185,11 @@ class TestProgressWebSocketAPI:
             patch(
                 "xagent.web.api.progress_ws.progress_broadcaster", spec=True
             ) as mock_broadcaster,
-            patch("xagent.web.api.progress_ws.get_db") as mock_get_db,
             patch(
-                "xagent.web.api.progress_ws.get_user_from_websocket_token"
-            ) as mock_get_user,
+                "xagent.web.api.progress_ws.get_authenticated_user",
+                new=AsyncMock(return_value=mock_user),
+            ),
         ):
-            # Mock DB generator
-            mock_db = MagicMock()
-            mock_get_db.return_value = iter([mock_db])
-
-            # Mock user
-            mock_user = MagicMock(spec=User)
-            mock_user.id = 1
-            mock_get_user.return_value = mock_user
-
             mock_manager = MagicMock()
             mock_manager.get_task_progress.return_value = mock_task
 
@@ -227,20 +221,11 @@ class TestProgressWebSocketAPI:
                 "xagent.web.api.progress_ws.get_progress_manager"
             ) as mock_get_manager,
             patch("xagent.web.api.progress_ws.progress_broadcaster", spec=True),
-            patch("xagent.web.api.progress_ws.get_db") as mock_get_db,
             patch(
-                "xagent.web.api.progress_ws.get_user_from_websocket_token"
-            ) as mock_get_user,
+                "xagent.web.api.progress_ws.get_authenticated_user",
+                new=AsyncMock(return_value=None),
+            ),
         ):
-            # Mock DB generator
-            mock_db = MagicMock()
-            mock_get_db.return_value = iter([mock_db])
-
-            # Mock invalid token
-            mock_get_user.side_effect = Exception("Invalid token")
-
-            # Should still work (anonymous access for progress monitoring)
-            # Actually, my current implementation closes the connection on failure
             mock_manager = MagicMock()
             mock_manager.get_task_progress.return_value = None
             mock_get_manager.return_value = mock_manager

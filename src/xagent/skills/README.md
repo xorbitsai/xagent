@@ -42,6 +42,41 @@ Each skill is a directory containing:
 
 See individual skill directories for examples.
 
+### Routing metadata
+
+`description` and `when_to_use` decide whether a skill gets loaded at all: they
+are the only thing the model sees about a skill it has not loaded yet. Two rules
+govern them, and they apply to every skill — built-in, user, external, or
+provider-backed.
+
+**Frontmatter is authoritative; a body section is only a fallback.** A scalar
+`description:` / `when_to_use:` in the YAML frontmatter wins over a `##
+Description` / `## When to Use` section. A whitespace-only frontmatter value
+counts as absent and falls through to the section.
+
+```markdown
+---
+name: my-skill
+description: |
+  What this produces, plus the words a user would say when they want it.
+when_to_use: |
+  When to reach for this, and which skill to prefer instead when not.
+---
+
+## Description
+
+Longer prose for after the skill is loaded. Ignored for routing when the
+frontmatter above defines the field.
+```
+
+**Each field is capped at 200 characters in the index.** Whitespace is
+collapsed to single spaces first, and anything past the cap is dropped
+silently — trigger vocabulary and "use skill X instead" cross-references are
+what usually get lost, since they tend to sit at the end. Keep both fields
+under the cap and put the detail in the body, which is injected in full once
+the skill is loaded. `tests/skills/test_builtin_index_entries.py` enforces this
+for built-in skills.
+
 ## Adding a New Built-in Skill
 
 1. Create a new directory in `src/xagent/skills/builtin/your_skill/`
@@ -80,6 +115,30 @@ XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS="~/skills,$HOME/custom_skills,./local_skills
 3. External directories from `XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS`
 
 Skills with the same name are loaded in order, with later directories overriding earlier ones.
+
+## Provider extension contract
+
+Applications may register a read provider with `set_skill_library_provider()` or
+a write provider with `set_skill_write_provider()`. Both provider protocols and
+their registration functions are exported from `xagent.skills`.
+
+Read providers receive `SkillScopeContext`; write providers receive
+`SkillWriteContext`. These contexts contain only a `user_id` and copied scalar
+metadata. They never contain an ORM entity, request, database session, or
+session factory, and should not be serialized as a transport contract. Metadata
+is non-authoritative: a provider must resolve current authorization from
+`user_id` inside its own short-lived dependency scope.
+
+A database-backed provider owns its complete operation: open a session,
+authorize, materialize its result, commit on success or roll back on failure,
+and close before returning. It must not commit or roll back the caller's
+request transaction.
+
+Expected public write failures must raise `SkillWriteProviderError` with an
+allowlisted `SkillWriteProviderErrorReason` and a deliberately public-safe
+message. `FORBIDDEN` maps to HTTP 403 and `INVALID_REQUEST` to HTTP 400.
+Unexpected provider exceptions are logged and exposed as a stable sanitized
+HTTP 500 response.
 
 ### Path Expansion Support
 

@@ -16,8 +16,8 @@ import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
 import { useApp } from "@/contexts/app-context-chat"
+import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
-import { apiRequest } from "@/lib/api-wrapper"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
@@ -32,6 +32,10 @@ interface TaskConversationPanelProps {
   showTokenUsage?: boolean
   showDagPreview?: boolean
   showTaskFiles?: boolean
+  // Renders the execution trace (reasoning, tool arguments, tool output) above
+  // each answer. Off for the embedded widget, where a visitor should see the
+  // answer and a status line, not the run; share links keep it on.
+  showProcessView?: boolean
   hideFileUpload?: boolean
   hideConfig?: boolean
   compactInput?: boolean
@@ -52,6 +56,7 @@ type CombinedItem = {
   isStreamingFinalAnswer?: boolean
   traceEvents?: any[]
   interactions?: any[]
+  interactionRequestId?: string
   showEmptyStatus?: boolean
   processStatus?: string
   timelineOrder?: number
@@ -150,6 +155,11 @@ const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
   if (currentTask?.status !== "waiting_for_user") {
     return undefined
   }
+  if (currentTask.waitingRequestId) {
+    return currentTask.waitingInteractions?.length
+      ? currentTask.waitingInteractions
+      : undefined
+  }
   if (currentTask.waitingInteractions?.length) {
     return currentTask.waitingInteractions
   }
@@ -181,6 +191,7 @@ export function TaskConversationPanel({
   showTokenUsage = mode === "page",
   showDagPreview = mode === "page",
   showTaskFiles = mode === "page",
+  showProcessView = true,
   hideFileUpload = false,
   hideConfig = mode === "embedded-preview",
   compactInput = false,
@@ -190,7 +201,24 @@ export function TaskConversationPanel({
   onSend,
   onAgentExecutionClick,
 }: TaskConversationPanelProps) {
-  const { state, sendMessage, pauseTask, resumeTask, openFilePreview, closeFilePreview, requestStatus, dispatch, getFileDownloadUrl } = useApp()
+  const {
+    state,
+    sendMessage,
+    filesDisabled,
+    voiceInputEnabled,
+    taskControlsEnabled,
+    pauseTask,
+    resumeTask,
+    openFilePreview,
+    closeFilePreview,
+    requestStatus,
+    dispatch,
+    getFileDownloadUrl,
+    isConversationResetPending,
+    isMessageDeliveryPending,
+    isSessionInteractionLocked,
+  } = useApp()
+  const fileAccess = useFileAccess()
   const { t } = useI18n()
   const [files, setFiles] = useState<File[]>([])
   const [dagPreviewOpen, setDagPreviewOpen] = useState(false)
@@ -199,7 +227,32 @@ export function TaskConversationPanel({
   const [isDragging, setIsDragging] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
-  const anyPreviewOpen = mode === "page" && (state.filePreview.isOpen || dagPreviewOpen)
+  const userMessageContextBadges = useMemo(() => {
+    const hasBoundLocalBrowser = (
+      (
+        state.currentTask?.id === String(state.taskId)
+        && state.currentTask.runtimeExtensionBindings?.includes("local_browser")
+      )
+      || Object.values(state.taskRuntimeExtensions || {}).some(
+        (metadata) => metadata.kind === "local_browser",
+      )
+    )
+    return hasBoundLocalBrowser
+      ? [{
+          kind: "computer_use" as const,
+          label: t("chatPage.input.localBrowser.chipLabel"),
+          detail: t("chatPage.input.localBrowser.label"),
+        }]
+      : []
+  }, [
+    state.currentTask?.id,
+    state.currentTask?.runtimeExtensionBindings,
+    state.taskId,
+    state.taskRuntimeExtensions,
+    t,
+  ])
+  const isFilePreviewOpen = !filesDisabled && state.filePreview.isOpen
+  const anyPreviewOpen = mode === "page" && (isFilePreviewOpen || dagPreviewOpen)
   const hideDelegatedChildTraces = Boolean(onAgentExecutionClick)
   const shouldHideWorkforceInternalTrace = useCallback(
     (event: unknown) =>
@@ -224,7 +277,8 @@ export function TaskConversationPanel({
   }, [closeFilePreview])
 
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
-    await (onSend ?? sendMessage)(message, config, filesToSend || files)
+    const outboundFiles = filesDisabled ? [] : (filesToSend || files)
+    await (onSend ?? sendMessage)(message, config, outboundFiles)
     setFiles([])
   }
 
@@ -249,6 +303,7 @@ export function TaskConversationPanel({
             (event: unknown) => !shouldHideWorkforceInternalTrace(event),
           ),
           interactions: message.interactions,
+          interactionRequestId: message.interactionRequestId,
           isSystemNotice: message.isSystemNotice,
         }
       })
@@ -456,12 +511,20 @@ export function TaskConversationPanel({
   }, [state.messages, state.steps])
 
   useEffect(() => {
-    if (state.filePreview.isOpen) {
+    if (isFilePreviewOpen) {
       setDagPreviewOpen(false)
     }
-  }, [state.filePreview.isOpen])
+  }, [isFilePreviewOpen])
 
   useEffect(() => {
+    if (filesDisabled) {
+      setFiles([])
+    }
+  }, [filesDisabled])
+
+  useEffect(() => {
+    if (filesDisabled) return
+
     const handleFilePreviewEvent = (event: Event) => {
       const { filePath, fileName, allFiles, currentIndex } = (event as CustomEvent<any>).detail || {}
       if (!filePath) return
@@ -474,12 +537,14 @@ export function TaskConversationPanel({
 
     window.addEventListener("openFilePreview", handleFilePreviewEvent as EventListener)
     return () => window.removeEventListener("openFilePreview", handleFilePreviewEvent as EventListener)
-  }, [openFilePreview])
+  }, [filesDisabled, openFilePreview])
 
   const handleDownload = async () => {
+    if (filesDisabled) return
+
     try {
       if (!state.filePreview.fileId) return
-      const response = await apiRequest(getFileDownloadUrl(state.filePreview.fileId))
+      const response = await fileAccess.request(getFileDownloadUrl(state.filePreview.fileId))
       if (!response.ok) {
         throw new Error(`Download failed: ${response.statusText}`)
       }
@@ -638,7 +703,20 @@ export function TaskConversationPanel({
     })
   }
 
-  const isPlanning = dagNodes.length === 0 && state.dagExecution?.phase === "planning"
+  // "replanning" is a real, live phase the backend emits for a mid-run
+  // replan (dag.py's on_dag_execution) - it's planning-like in exactly the
+  // same way "planning" is (no NEW plan/graph to show yet), so it must show
+  // the same in-progress indicator rather than falling through unrecognized.
+  // Unlike "planning" (the very first plan, where dagNodes is naturally
+  // still empty), a mid-run replan keeps the SAME turn_id as the run it's
+  // revising, so app-context-chat's turn_id-based reset never clears the
+  // prior plan's dagNodes - gating on dagNodes.length === 0 the same way
+  // "planning" does would let the OLD, about-to-be-superseded graph keep
+  // rendering as if it were still current for the whole replan. Show the
+  // loading state unconditionally for "replanning" instead.
+  const isPlanning =
+    (dagNodes.length === 0 && state.dagExecution?.phase === "planning")
+    || state.dagExecution?.phase === "replanning"
   const hasError = dagNodes.length === 0 && (state.dagExecution?.phase === "failed" || state.currentTask?.status === "failed")
   const shouldShowHistoryLoading =
     timelineItems.length === 0 &&
@@ -665,6 +743,11 @@ export function TaskConversationPanel({
         style={{ width: anyPreviewOpen ? `${leftWidth}%` : "100%" }}
         className={cn(anyPreviewOpen ? "" : "flex-1", "min-w-0 flex flex-col min-h-0 transition-[width] duration-0 relative")}
       >
+        {state.streamRecoveryTaskId === state.taskId && state.taskId !== null && (
+          <div role="status" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            {t("sharedStream.interrupted")}
+          </div>
+        )}
         <div className="flex-1 overflow-y-auto">
           <main className={cn("mx-auto px-4 relative z-0 transition-all", mode === "page" ? "container max-w-4xl py-8" : "max-w-3xl py-4")}>
             <div className={cn(mode === "page" ? "space-y-6 pb-4" : "space-y-4 pb-4")}>
@@ -685,8 +768,13 @@ export function TaskConversationPanel({
                     if (item.isSystemNotice) {
                       return <CompactionNotice key={item.id} text={item.content as string} />
                     }
-                    const isFailedFinalAnswerStream =
-                      item.isStreamingFinalAnswer && item.status === "failed"
+                    // A failed final-answer stream always renders as failed; a
+                    // verbatim terminal reason (#893) only needs the flag when
+                    // the trace is hidden, so its raw text gets the generic
+                    // replacement in ChatMessage.
+                    const isFailedResultMessage =
+                      item.status === "failed" &&
+                      (item.isStreamingFinalAnswer || !showProcessView)
                     return (
                       <ChatMessage
                         key={item.id}
@@ -694,10 +782,10 @@ export function TaskConversationPanel({
                         content={item.content}
                         rawContent={item.rawContent}
                         traceEvents={item.traceEvents as any || []}
-                        showProcessView={true}
+                        showProcessView={showProcessView}
                         processStatus={item.processStatus}
                         taskStatus={
-                          isFailedFinalAnswerStream
+                          isFailedResultMessage
                             ? "failed"
                             : item.showEmptyStatus
                               ? item.status
@@ -705,8 +793,17 @@ export function TaskConversationPanel({
                         }
                         timestamp={item.timestamp}
                         interactions={item.interactions}
+                        interactionRequestId={item.interactionRequestId}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
+                        contextBadges={item.role === "user" ? userMessageContextBadges : undefined}
+                        taskRuntimeExtensionMetadata={item.role === "user" ? {
+                          bindings:
+                            state.currentTask?.id === String(state.taskId)
+                              ? state.currentTask.runtimeExtensionBindings || []
+                              : [],
+                          publicMetadata: state.taskRuntimeExtensions || {},
+                        } : undefined}
                         onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                         onAgentExecutionClick={onAgentExecutionClick}
                       />
@@ -718,11 +815,12 @@ export function TaskConversationPanel({
                       role="assistant"
                       content={state.currentTask?.status === "waiting_for_user" ? waitingPrompt : null}
                       traceEvents={currentTurnTraceEvents as any || []}
-                      showProcessView={true}
+                      showProcessView={showProcessView}
                       isVirtual
                       processStatus={state.currentTask?.status}
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
+                      interactionRequestId={state.currentTask?.status === "waiting_for_user" ? state.currentTask.waitingRequestId : undefined}
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
@@ -740,7 +838,7 @@ export function TaskConversationPanel({
             {showTaskActions && (
               <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  {showTaskFiles && (
+                  {showTaskFiles && !filesDisabled && (
                     <TaskFileManager taskId={state.taskId} onPreview={(fileId, fileName) => openFilePreview(fileId, fileName)}>
                       <Button type="button" variant="outline" className="h-auto rounded-xl bg-card/80 px-3 py-2 text-sm" title={t("files.header.title")}>
                         <FolderOpen className="w-3.5 h-3.5 mr-1" />
@@ -768,14 +866,25 @@ export function TaskConversationPanel({
 
             <ChatInput
               onSend={handleSend}
-              isLoading={state.isProcessing}
-              files={files}
-              onFilesChange={setFiles}
+              currentInteractionRequestId={
+                state.currentTask?.status === "waiting_for_user" &&
+                state.currentTask.id === String(state.taskId)
+                  ? state.currentTask.waitingRequestId
+                  : undefined
+              }
+              isLoading={
+                state.isProcessing
+                || isConversationResetPending
+                || isMessageDeliveryPending
+                || isSessionInteractionLocked
+              }
+              files={filesDisabled ? [] : files}
+              onFilesChange={filesDisabled ? undefined : setFiles}
               showModeToggle={false}
               hideConfig={hideConfig}
               taskStatus={state.currentTask?.status}
-              onPause={pauseTask}
-              onResume={resumeTask}
+              onPause={taskControlsEnabled ? pauseTask : undefined}
+              onResume={taskControlsEnabled ? resumeTask : undefined}
               taskConfig={state.currentTask ? {
                 model: state.currentTask.modelId || state.currentTask.modelName,
                 smallFastModel: state.currentTask.smallFastModelId,
@@ -784,7 +893,9 @@ export function TaskConversationPanel({
                 executionMode: state.currentTask.executionMode,
               } : undefined}
               readOnlyConfig={true}
-              hideFileUpload={hideFileUpload}
+              filesDisabled={filesDisabled}
+              voiceInputEnabled={voiceInputEnabled}
+              hideFileUpload={hideFileUpload || filesDisabled}
               compact={compactInput}
               minHeightClass={compactInput ? "min-h-[44px]" : undefined}
               autoFocus={autoFocusInput}
@@ -811,15 +922,15 @@ export function TaskConversationPanel({
           className="flex-shrink-0 px-2 py-6 overflow-hidden relative"
         >
           <PreviewSheet
-            open={state.filePreview.isOpen || dagPreviewOpen}
+            open={isFilePreviewOpen || dagPreviewOpen}
             onOpenChange={(open) => {
               if (!open) {
                 closeFilePreview()
                 setDagPreviewOpen(false)
               }
             }}
-            title={state.filePreview.isOpen ? <>{state.filePreview.fileName}</> : t("chatPage.executionPlan.title")}
-            actions={state.filePreview.isOpen ? (
+            title={isFilePreviewOpen ? <>{state.filePreview.fileName}</> : t("chatPage.executionPlan.title")}
+            actions={isFilePreviewOpen ? (
               <FilePreviewActionButtons
                 viewMode={state.filePreview.viewMode}
                 onViewModeChange={(mode) => dispatch({ type: "SET_FILE_PREVIEW_MODE", payload: mode })}
@@ -830,8 +941,8 @@ export function TaskConversationPanel({
             ) : null}
           >
             <div className="w-full h-full">
-              {state.filePreview.isOpen ? (
-                <FilePreviewContent open={state.filePreview.isOpen} />
+              {isFilePreviewOpen ? (
+                <FilePreviewContent open={isFilePreviewOpen} />
               ) : (
                 <CenterPanel
                   dagExecution={state.dagExecution}
@@ -843,7 +954,7 @@ export function TaskConversationPanel({
                   hasError={hasError}
                   currentTaskStatus={state.currentTask?.status}
                   onRefresh={() => requestStatus()}
-                  onFileClick={openFilePreview}
+                  onFileClick={filesDisabled ? undefined : openFilePreview}
                 />
               )}
             </div>

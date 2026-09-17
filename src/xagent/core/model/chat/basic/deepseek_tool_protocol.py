@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -12,9 +13,22 @@ from ..tool_protocol import (
     ToolProtocolViolation,
     tool_protocol_error_response,
 )
-from ..types import ChunkType, StreamChunk
+from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
+
+logger = logging.getLogger(__name__)
 
 _PROVIDER = "deepseek"
+
+# DeepSeek's mandatory reasoning-replay contract, shared by any client that
+# talks the DeepSeek tool protocol (``DeepSeekLLM`` directly, and
+# ``OpenRouterLLM`` for OpenRouter's deepseek-authored slugs): a response that
+# carries reasoning content on a tool-call message must have that exact
+# content replayed on the assistant message the next time it is sent back.
+# The namespace/key below are this client's own internal vocabulary for that
+# state, not necessarily the wire field name a given provider used to send it
+# (see ``deepseek_reasoning_provider_state``'s ``fields`` argument).
+DEEPSEEK_PROVIDER_STATE_NAMESPACE = "deepseek"
+DEEPSEEK_REASONING_CONTENT_STATE_KEY = "reasoning_content"
 _SERIALIZED_TOOL_CALL_RE = re.compile(
     r"<[^>\n]*dsml[^>\n]*tool_calls",
     re.IGNORECASE,
@@ -141,6 +155,154 @@ async def adapt_deepseek_stream(
         yield chunk
 
 
+def deepseek_reasoning_provider_state_payload(reasoning_content: Any) -> dict[str, Any]:
+    """Wrap already-extracted reasoning text in the shared provider-state shape."""
+    return {
+        DEEPSEEK_PROVIDER_STATE_NAMESPACE: {
+            DEEPSEEK_REASONING_CONTENT_STATE_KEY: reasoning_content,
+        },
+    }
+
+
+def deepseek_reasoning_provider_state(
+    result: dict[str, Any],
+    *,
+    fields: tuple[str, ...],
+) -> dict[str, Any]:
+    """Capture DeepSeek-protocol reasoning content into a provider-state payload.
+
+    ``fields`` lists the wire field spellings to look for, in precedence
+    order. Checks ``result`` itself first (the shape the transport layer
+    already normalizes onto), then falls back to the raw response's message
+    payload (``result["raw"]["choices"][0]["message"]``) for a provider whose
+    SDK preserves a field spelling the transport layer does not normalize.
+    A field counts as present only when its value is not ``None`` -- an
+    explicit empty string is a valid, must-preserve value; only genuine
+    absence should return ``{}``.
+
+    Direct DeepSeek only ever sends ``reasoning_content``, so it passes a
+    single-element ``fields`` tuple and the raw fallback is never reached in
+    practice; OpenRouter's deepseek-authored slugs may use either
+    ``reasoning_content`` or the ``reasoning`` alias, so it passes both.
+    """
+    value, found = _first_reasoning_value(result, fields)
+    if not found:
+        message = _raw_response_message(
+            result.get("raw") if isinstance(result, dict) else None
+        )
+        if message is not None:
+            value, found = _first_reasoning_value(message, fields)
+    if not found:
+        return {}
+    return deepseek_reasoning_provider_state_payload(value)
+
+
+def restore_deepseek_reasoning_content(
+    messages: list[dict[str, Any]],
+    *,
+    model_name: str,
+) -> list[dict[str, Any]]:
+    """Replay captured DeepSeek reasoning content onto assistant history.
+
+    An assistant message that previously captured ``reasoning_content`` under
+    the shared provider-state marker gets it translated back to the
+    ``reasoning_content`` field DeepSeek's API expects. An assistant message
+    with tool calls but no captured state gets an empty-string fallback
+    instead, so the history stays structurally valid for a DeepSeek request
+    (older context may predate capture, or come from a rebuilt session).
+
+    This is unconditional: it does not look at whether thinking is enabled
+    for the *current* request, because the replay requirement is about the
+    history's own shape, not this call's configuration.
+
+    Logs one INFO summary per call (only when at least one assistant
+    tool-call message actually needed replay) counting how many messages
+    replayed real captured content versus how many hit the empty-string
+    fallback. A rising fallback count is the signal that something upstream
+    is losing captured state (a rebuilt task history, a synthesized
+    tool-call message) before it reaches here -- that loss does not raise on
+    its own, since the fallback keeps the request valid. The log carries
+    only the counts and ``model_name``, never the reasoning text itself.
+    """
+    prepared: list[dict[str, Any]] = []
+    replayed_count = 0
+    fallback_count = 0
+    for message in messages:
+        prepared_message = dict(message)
+        provider_state = prepared_message.get(PROVIDER_STATE_METADATA_KEY)
+        replayed_captured_content = False
+        if isinstance(provider_state, dict):
+            deepseek_metadata = provider_state.get(DEEPSEEK_PROVIDER_STATE_NAMESPACE)
+            if (
+                isinstance(deepseek_metadata, dict)
+                and DEEPSEEK_REASONING_CONTENT_STATE_KEY in deepseek_metadata
+            ):
+                prepared_message[DEEPSEEK_REASONING_CONTENT_STATE_KEY] = (
+                    deepseek_metadata[DEEPSEEK_REASONING_CONTENT_STATE_KEY]
+                )
+                replayed_captured_content = True
+        if prepared_message.get("role") == "assistant" and prepared_message.get(
+            "tool_calls"
+        ):
+            if replayed_captured_content:
+                replayed_count += 1
+            elif DEEPSEEK_REASONING_CONTENT_STATE_KEY not in prepared_message:
+                prepared_message[DEEPSEEK_REASONING_CONTENT_STATE_KEY] = ""
+                fallback_count += 1
+        prepared.append(prepared_message)
+    if replayed_count or fallback_count:
+        logger.info(
+            "DeepSeek reasoning replay for model %s: %d assistant message(s) "
+            "replayed captured reasoning content, %d used the empty-string "
+            "fallback",
+            model_name,
+            replayed_count,
+            fallback_count,
+        )
+    return prepared
+
+
+def reasoning_field_names(result: Any) -> tuple[str, ...]:
+    """Return every reasoning-related key name observed on a captured result.
+
+    Checks the same two places ``deepseek_reasoning_provider_state`` does --
+    the ``result`` dict itself, then its raw response message -- and returns
+    the union of keys starting with ``"reasoning"`` found there. For
+    observability only: the caller logs these key *names*, never their
+    values, so a provider that renamed its reasoning field can be diagnosed
+    without ever putting reasoning content itself into a log line.
+    """
+    names: list[str] = []
+    if isinstance(result, dict):
+        names.extend(key for key in result if key.startswith("reasoning"))
+        message = _raw_response_message(result.get("raw"))
+        if message is not None:
+            names.extend(key for key in message if key.startswith("reasoning"))
+    return tuple(dict.fromkeys(names))
+
+
+def _first_reasoning_value(source: Any, fields: tuple[str, ...]) -> tuple[Any, bool]:
+    if not isinstance(source, dict):
+        return None, False
+    for field_name in fields:
+        if field_name in source and source[field_name] is not None:
+            return source[field_name], True
+    return None, False
+
+
+def _raw_response_message(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    choices = raw.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None
+    message = first_choice.get("message")
+    return message if isinstance(message, dict) else None
+
+
 def _response_violation(
     response: Any,
     *,
@@ -242,6 +404,11 @@ def _tool_call_violation(
         )
 
     arguments = function.get("arguments", {})
+    if isinstance(arguments, str) and not arguments.strip():
+        # Rebind the local for validation only. `function["arguments"]` keeps the
+        # raw blank string: normalizing it to `"{}"` would defeat pass-through
+        # and crash the auto/DAG paths on a syntactically valid empty plan.
+        arguments = {}
     argument_details: dict[str, Any] | None = None
     if isinstance(arguments, str):
         original_arguments = arguments

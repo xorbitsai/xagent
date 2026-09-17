@@ -28,11 +28,12 @@
     identity_mismatch: true,
     rate_limited: true
   };
-  var TRANSIENT_SESSION_CODES = {
-    network_unavailable: true,
-    rate_limited: true
+  // Only diagnostic reasons registered for their session error code may be logged.
+  var SESSION_ERROR_REASONS = {
+    agent_not_granted: {
+      origin_not_allowed: true
+    }
   };
-
   function sessionAbortError() {
     return new DOMException('session request superseded', 'AbortError');
   }
@@ -56,9 +57,37 @@
     });
   }
 
-  function sessionErrorCode(result) {
-    var code = result && result.data && result.data.error && result.data.error.code;
-    return typeof code === 'string' ? code : null;
+  function isPlainSessionErrorObject(value) {
+    if (!value || typeof value !== 'object') return false;
+    // Prototype identity is not affected by host-page Symbol.toStringTag pollution.
+    var prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype;
+  }
+
+  function ownSessionErrorString(value, key) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) return null;
+    var candidate = value[key];
+    return typeof candidate === 'string' ? candidate : null;
+  }
+
+  function sessionErrorEnvelope(result) {
+    if (!isPlainSessionErrorObject(result.data) ||
+        !Object.prototype.hasOwnProperty.call(result.data, 'error') ||
+        !isPlainSessionErrorObject(result.data.error)) {
+      return { code: null, reason: null };
+    }
+    var error = result.data.error;
+    var code = ownSessionErrorString(error, 'code');
+    var reason = ownSessionErrorString(error, 'reason');
+    var allowedReasons = code && Object.prototype.hasOwnProperty.call(SESSION_ERROR_REASONS, code)
+      ? SESSION_ERROR_REASONS[code]
+      : null;
+    return {
+      code: code,
+      reason: allowedReasons && reason && Object.prototype.hasOwnProperty.call(allowedReasons, reason)
+        ? reason
+        : null
+    };
   }
 
   function isKnownSessionErrorCode(code) {
@@ -81,54 +110,75 @@
       : Math.max(0, retryAt - Date.now());
   }
 
-  // Every request counts against the shared total-attempt and absolute-deadline
-  // budget. Transport failures and coded rate limits also have narrower
-  // per-class retry caps inside it.
-  function withRetry(makeRequest, policy, signal) {
-    var attempts = 0;
-    var transportRetries = 0;
-    var rateLimited = 0;
-    var startedAt = Date.now();
+  function createRetryLineage() {
+    return {
+      startedAt: Date.now(),
+      attempts: 0,
+      transportRetries: 0,
+      rateLimited: 0,
+      lastRetryCode: 'network_unavailable'
+    };
+  }
+
+  function exhaustedRetryResult(code) {
+    return {
+      ok: false,
+      status: 0,
+      data: null,
+      syntheticCode: code || 'network_unavailable'
+    };
+  }
+
+  // Every request counts against the supplied total-attempt and absolute-deadline
+  // lineage. Exchange owns its lineage at controller scope so bfcache can
+  // replace a network operation without minting a new grant budget.
+  function withRetry(makeRequest, policy, signal, onRetry, lineage) {
+    var retry = lineage || createRetryLineage();
 
     function remainingMs() {
-      return Math.max(0, policy.deadlineMs - (Date.now() - startedAt));
+      return Math.max(0, policy.deadlineMs - (Date.now() - retry.startedAt));
     }
 
-    function giveUp(result, error) {
+    function giveUp(result, error, code) {
       if (error) throw error;
-      return result;
+      return result || exhaustedRetryResult(code || retry.lastRetryCode);
     }
 
-    function retryAfter(wait, result, error) {
-      if (attempts >= policy.maxAttempts || wait >= remainingMs()) {
-        return giveUp(result, error);
+    function retryAfter(wait, result, error, code) {
+      retry.lastRetryCode = code;
+      if (retry.attempts >= policy.maxAttempts || wait >= remainingMs()) {
+        return giveUp(result, error, code);
       }
+      if (onRetry) onRetry(code);
       return sessionDelay(wait, signal).then(run);
     }
 
     function retryTransportOrGiveUp(result, error) {
-      if (transportRetries >= policy.retryDelays.length) {
-        return giveUp(result, error);
+      if (retry.transportRetries >= policy.retryDelays.length) {
+        return giveUp(result, error, 'network_unavailable');
       }
-      var wait = policy.retryDelays[transportRetries];
-      transportRetries += 1;
-      return retryAfter(wait, result, error);
+      var wait = policy.retryDelays[retry.transportRetries];
+      retry.transportRetries += 1;
+      return retryAfter(wait, result, error, 'network_unavailable');
     }
 
     function run() {
       if (signal.aborted) return Promise.reject(sessionAbortError());
+      if (retry.attempts >= policy.maxAttempts) {
+        return Promise.resolve(exhaustedRetryResult(retry.lastRetryCode));
+      }
       var requestTimeoutMs = Math.min(SESSION_TIMEOUT_MS, remainingMs());
       if (requestTimeoutMs <= 0) {
-        return Promise.reject(new DOMException('session request deadline exceeded', 'AbortError'));
+        return Promise.resolve(exhaustedRetryResult(retry.lastRetryCode));
       }
-      attempts += 1;
+      retry.attempts += 1;
       return makeRequest(requestTimeoutMs).then(function (result) {
         if (signal.aborted) throw sessionAbortError();
-        var code = sessionErrorCode(result);
+        var code = sessionErrorEnvelope(result).code;
         if (code === 'rate_limited') {
-          if (rateLimited >= policy.maxRateLimitRetries) return result;
-          rateLimited += 1;
-          return retryAfter(retryAfterMs(result), result, null);
+          if (retry.rateLimited >= policy.maxRateLimitRetries) return result;
+          retry.rateLimited += 1;
+          return retryAfter(retryAfterMs(result), result, null, 'rate_limited');
         }
         if (!isKnownSessionErrorCode(code) && result.status >= 500) {
           return retryTransportOrGiveUp(result, null);
@@ -158,6 +208,93 @@
   var buttonColor = scriptTag.getAttribute('data-button-color') || '#000';
   var iconColor = scriptTag.getAttribute('data-icon-color') || '#fff';
   var panelBgColor = scriptTag.getAttribute('data-panel-bg-color') || '#fff';
+
+  // Read by use-websocket.ts off the iframe URL, where it outranks the browser
+  // zone. Optional: absent means the iframe URL is unchanged.
+  var embedTimezone = (scriptTag.getAttribute('data-timezone') || '').trim();
+
+  function withTimezone(url) {
+    if (!embedTimezone) return url;
+    var encoded;
+    try {
+      // A lone UTF-16 surrogate survives trim() and makes encodeURIComponent
+      // throw; the override must degrade to the browser/UTC path, never abort
+      // iframe setup.
+      encoded = encodeURIComponent(embedTimezone);
+    } catch {
+      return url;
+    }
+    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'timezone=' + encoded;
+  }
+
+  // Panel width: resizable via the left-edge drag handle, persisted across
+  // reloads. Inline width is only ever applied above MOBILE_BREAKPOINT --
+  // below it the CSS media query owns sizing, and inline width would win
+  // over that media query by specificity if left in place.
+  var WIDTH_STORAGE_KEY = 'xagent_widget_width';
+  var DEFAULT_PANEL_WIDTH = 380;
+  var MIN_PANEL_WIDTH = 320;
+  var MAX_PANEL_WIDTH = 720;
+  var MOBILE_BREAKPOINT = 480;
+  var HORIZONTAL_VIEWPORT_MARGIN = 40;
+
+  // window.innerWidth includes a classic (non-overlay) scrollbar's own
+  // width, but the CSS media query below measures the viewport itself -- on
+  // a desktop browser with a visible scrollbar those two can disagree by a
+  // few pixels right at the boundary. matchMedia asks the CSS engine the
+  // same question directly, so it can never drift from it; fall back to the
+  // innerWidth comparison only where matchMedia itself is unavailable (this
+  // project's own jsdom test environment has no matchMedia at all).
+  var mobileMediaQuery = typeof window.matchMedia === 'function'
+    ? window.matchMedia('(max-width: ' + MOBILE_BREAKPOINT + 'px)')
+    : null;
+
+  function isMobileViewport() {
+    return mobileMediaQuery ? mobileMediaQuery.matches : window.innerWidth <= MOBILE_BREAKPOINT;
+  }
+
+  function clampPanelWidth(width) {
+    var viewportMax = window.innerWidth - HORIZONTAL_VIEWPORT_MARGIN;
+    return Math.min(Math.max(width, MIN_PANEL_WIDTH), Math.min(MAX_PANEL_WIDTH, viewportMax));
+  }
+
+  function readStoredWidth() {
+    var raw;
+    try {
+      raw = localStorage.getItem(WIDTH_STORAGE_KEY);
+    } catch (e) {
+      return DEFAULT_PANEL_WIDTH;
+    }
+    var parsed = raw ? parseInt(raw, 10) : NaN;
+    // Bounds-check against the static MIN/MAX only (never the viewport --
+    // that's applyPanelWidth's job) so a corrupted or stale-schema stored
+    // value self-heals on the next load instead of being echoed back forever.
+    if (isNaN(parsed) || parsed < MIN_PANEL_WIDTH || parsed > MAX_PANEL_WIDTH) {
+      return DEFAULT_PANEL_WIDTH;
+    }
+    return parsed;
+  }
+
+  function persistWidth(width) {
+    try {
+      localStorage.setItem(WIDTH_STORAGE_KEY, String(width));
+    } catch (e) {
+      // Storage can be unavailable (private browsing, quota); resizing still
+      // works for the session, it just won't survive a reload.
+    }
+  }
+
+  // Raw preferred width, deliberately NOT clamped here: applyPanelWidth below
+  // clamps only for rendering, without writing the clamped value back here,
+  // so a viewport narrower than the stored preference at load never
+  // overwrites it (e.g. via a later, otherwise-unmoved drag release).
+  var panelWidth = readStoredWidth();
+  // Declared here, next to the other panel-sizing state, even though it's
+  // first read (via var hoisting) much later in applyPanelWidth() below --
+  // that read only works today because the value is `undefined` (falsy)
+  // until this line runs; keep it here so a future var -> let/const
+  // conversion can't turn it into a load-time ReferenceError.
+  var isExpanded = false;
 
   // Styles
   var style = document.createElement('style');
@@ -199,12 +336,20 @@
     }
 
     .xagent-widget-panel {
+      /* Pin the box model so the resize drag's width math (which reads
+         computed CSS width) can't drift from the host page's own
+         box-sizing default. */
+      box-sizing: border-box;
       position: absolute;
       bottom: calc(${buttonSize} + 20px);
       right: 0;
-      width: 380px;
+      width: ${DEFAULT_PANEL_WIDTH}px;
       height: 600px;
-      max-height: calc(100vh - 100px);
+      /* The panel's bottom edge sits buttonSize + 40px above the viewport
+         bottom (container's own 20px, plus the panel's own bottom offset
+         above -- both referenced from the rule right above), so that's the
+         most height can grow to before the top edge goes off-screen. */
+      max-height: calc(100vh - ${buttonSize} - 40px);
       background: ${panelBgColor};
       border-radius: 12px;
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
@@ -229,10 +374,143 @@
       background: transparent;
     }
 
-    @media (max-width: 480px) {
+    .xagent-widget-resize-handle {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 6px;
+      cursor: ew-resize;
+      z-index: 2;
+      touch-action: none;
+    }
+
+    .xagent-widget-resize-handle:hover,
+    .xagent-widget-resize-handle:active {
+      background: rgba(0, 0, 0, 0.15);
+    }
+
+    /* visibility transitions keep an element hit-testable for the whole
+       transition (per spec, as long as either end is 'visible') -- without
+       this, a closed-but-still-fading panel stays clickable/touchable for
+       the ~300ms fade, silently swallowing input meant for whatever's
+       underneath it on the host page. On mobile this covers the entire
+       viewport, not just the small desktop popup's footprint. */
+    .xagent-widget-panel:not(.open) {
+      pointer-events: none;
+    }
+
+    /* Same transition-visibility gap as above, applied to the resize handle
+       specifically: without this it stays draggable and cursor-hinting
+       during that window even though the panel is already fading out. */
+    .xagent-widget-panel:not(.open) .xagent-widget-resize-handle {
+      display: none;
+    }
+
+    /* Toggled by acquireScrollLock/releaseScrollLock below, on whichever
+       element document.scrollingElement says actually scrolls the document
+       (see scrollLockTarget's own comment), while the mobile full-screen
+       panel is open. !important so it reliably wins over a host page's own
+       inline overflow write on that element -- this lock deliberately never
+       reads or writes that shared value itself, so it can neither be fooled
+       by, nor interfere with, a host page's own separate scroll-lock
+       mechanism. */
+    .xagent-widget-scroll-locked {
+      overflow: hidden !important;
+    }
+
+    /* Expand mode jumps straight to the same max width the drag-resize
+       handle already clamps to, rather than a separate arbitrary size. The
+       exact logical complement of the max-width block below (not a
+       min-width one pixel above it, which would leave a sub-pixel gap
+       neither query matches), so its two-class selector can never outrank
+       the mobile layout by specificity alone -- structurally impossible to
+       apply under the mobile breakpoint at all. */
+    @media not all and (max-width: ${MOBILE_BREAKPOINT}px) {
+      .xagent-widget-panel.expanded {
+        /* Same viewport clamp the drag-resize handle already enforces via
+           clampPanelWidth() -- a flat 720px would push the right-anchored
+           panel (and its left-edge resize handle) off the left of the
+           screen on any supported desktop width narrower than 760px. */
+        width: min(${MAX_PANEL_WIDTH}px, 100vw - ${HORIZONTAL_VIEWPORT_MARGIN}px);
+        height: calc(100vh - ${buttonSize} - 40px);
+      }
+
+      /* Dragging the handle sets an inline width that would win over (and
+         desync from) the expanded class's own width by specificity. */
+      .xagent-widget-panel.expanded .xagent-widget-resize-handle {
+        display: none;
+      }
+    }
+
+    @media (max-width: ${MOBILE_BREAKPOINT}px) {
       .xagent-widget-panel {
-        width: calc(100vw - 40px);
-        height: calc(100vh - 120px);
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        max-height: 100%;
+        /* Dynamic viewport units track a mobile browser's address-bar
+           show/hide (under the default interactive-widget=resizes-visual
+           behavior this widget doesn't override, an on-screen keyboard
+           opening does NOT change dvh on either iOS Safari or Android
+           Chrome); browsers that don't parse dvh at all ignore these two
+           lines entirely and keep the 100% fallback above. */
+        height: 100dvh;
+        max-height: 100dvh;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        /* The safe-area padding strips below have no scrollable content of
+           their own -- without this, a touch-drag starting on one of them
+           can chain into scrolling the host page hidden behind this "modal"
+           instead of doing nothing, even with body scroll separately locked
+           in JS (a known gap in body-only overflow:hidden on iOS Safari). */
+        overscroll-behavior: none;
+        /* Full-screen means edge-to-edge, including under a notch/home
+           indicator or, in landscape, a side notch -- the fallback keeps
+           unsupporting browsers at 0. */
+        padding-top: env(safe-area-inset-top, 0px);
+        padding-bottom: env(safe-area-inset-bottom, 0px);
+        padding-left: env(safe-area-inset-left, 0px);
+        padding-right: env(safe-area-inset-right, 0px);
+      }
+
+      .xagent-widget-resize-handle {
+        display: none;
+      }
+
+      /* The container (not the FAB itself) is what anchors the fallback
+         FAB's on-screen position -- the panel's own safe-area padding above
+         has no effect on it, so without this a notch/home-indicator inset
+         wider than the base 20px can leave part of the touch target inside
+         that unsafe area while the child hasn't confirmed readiness. */
+      .xagent-widget-container {
+        bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+        right: calc(20px + env(safe-area-inset-right, 0px));
+      }
+
+      /* The panel and the FAB are stacking siblings inside the same
+         z-index:999999 container -- a position:fixed panel always paints
+         above a plain in-flow (position:static, the FAB's default) sibling
+         regardless of DOM order, so without this the fixed full-screen panel
+         would visually cover, and fail hit-testing against, the FAB in every
+         state below that intentionally keeps it as the fallback close
+         control. */
+      .xagent-widget-fab {
+        position: relative;
+        z-index: 1;
+      }
+
+      /* Hide the FAB only once the iframe has confirmed (via
+         widget_chrome_ready in onChromeMessage) that its own in-header
+         close control is actually mounted -- loading, auth-failure, and
+         degraded/terminal Session states render no header at all, and
+         without this guard the FAB would disappear as soon as the panel
+         opens regardless, leaving a full-screen overlay with no dismiss
+         action at all in those states. */
+      .xagent-widget-panel.open.xagent-widget-chrome-ready ~ .xagent-widget-fab {
+        display: none;
       }
     }
   `;
@@ -251,6 +529,266 @@
   iframe.className = 'xagent-widget-iframe';
   panel.appendChild(iframe);
 
+  // Left-edge resize handle
+  var resizeHandle = document.createElement('div');
+  resizeHandle.className = 'xagent-widget-resize-handle';
+  panel.appendChild(resizeHandle);
+
+  // Clamp on render rather than mutating panelWidth here: a temporary narrow
+  // viewport (a shrunk window, a rotated device) must not permanently shrink
+  // the user's stored preference once the viewport widens again.
+  function applyPanelWidth() {
+    // Expand mode's own CSS rule owns width while active; setting an inline
+    // width here would outrank it by specificity regardless of viewport,
+    // desyncing the panel's width from its still-expanded height -- a plain
+    // window resize that stays well above the mobile breakpoint still calls
+    // this via onWindowResize below. collapsePanel() calls this itself,
+    // after already flipping isExpanded false, specifically to restore the
+    // width this skips while expanded.
+    if (isExpanded) return;
+    panel.style.width = isMobileViewport() ? '' : clampPanelWidth(panelWidth) + 'px';
+  }
+  applyPanelWidth();
+
+  var dragState = null;
+  // Set once this instance is torn down (panelRemovalObserver below) so a
+  // stray pointerdown can never start a new, permanently uncleanable drag --
+  // e.g. if a host SPA re-inserts this same panel node into the DOM after
+  // removing it, which flips panel.isConnected back to true but does not
+  // re-arm the (already-disconnected) observer or any removed listener.
+  var torndown = false;
+
+  resizeHandle.addEventListener('pointerdown', function (event) {
+    // event.button is 0 for touch/pen contact and the primary mouse button;
+    // a nonzero value here is a right-click, middle-click, or pen barrel
+    // button, none of which should start a resize. Guard against a
+    // non-numeric value (a synthetic event with no button field) the same
+    // way: only a real, explicit non-primary button should block the drag.
+    // Ignore a second simultaneous pointer (e.g. a touchscreen device) so it
+    // can't hijack dragState mid-drag and strand the first pointer's cleanup.
+    // The injected stylesheet already hides the handle while the panel is
+    // closed (see .xagent-widget-panel:not(.open) above), but a host page
+    // whose CSP blocks that inline <style> would leave it visually
+    // draggable with no CSS backing it up -- check the open class directly
+    // too, as defense in depth that doesn't depend on the stylesheet loading.
+    if (torndown || isMobileViewport() || isExpanded || dragState || (event.button || 0) !== 0 || !panel.classList.contains('open')) return;
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      // getBoundingClientRect().width is always border-box regardless of
+      // box-sizing, but panel.style.width sets content-box width unless
+      // box-sizing: border-box is in effect -- computed style avoids that
+      // mismatch (a jump by the border width on every drag start) even if
+      // something on the host page ends up overriding our own box-sizing rule.
+      startWidth: parseInt(window.getComputedStyle(panel).width, 10) || DEFAULT_PANEL_WIDTH,
+      // The drag's live candidate. panelWidth itself is never written until
+      // a real release commits it (see finishDrag) -- cancelling a drag
+      // (blur, a mid-drag viewport change, pointercancel, DOM removal) then
+      // needs no rollback of anything, since the committed preference was
+      // never touched in the first place.
+      lastWidth: null,
+      // Whether this drag ever visibly rendered a width other than
+      // startWidth -- a release with this still false is a no-op (a plain
+      // click, or a drag fully absorbed by the viewport ceiling) and must
+      // leave the existing preference alone rather than re-commit whatever
+      // startWidth happened to be.
+      moved: false,
+      originalCursor: document.body.style.cursor,
+      originalUserSelect: document.body.style.userSelect
+    };
+    // Optimization, not the drag's only path: pointermove/pointerup/
+    // pointercancel are bound to `document` below specifically so the drag
+    // still works if this capture silently fails.
+    try {
+      resizeHandle.setPointerCapture(event.pointerId);
+    } catch (e) {}
+    document.body.style.cursor = 'ew-resize';
+    document.body.style.userSelect = 'none';
+    // Without this, the iframe (a sibling of the handle, not an ancestor)
+    // would intercept pointer events once the cursor moves over it mid-drag;
+    // disabling its pointer-events lets those events fall through to panel
+    // and bubble to the document-level listeners below instead of stalling
+    // on the iframe.
+    iframe.style.pointerEvents = 'none';
+    event.preventDefault();
+  });
+
+  function onPointerMove(event) {
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
+    // Panel is right-anchored, so dragging the left edge left (clientX
+    // decreasing) should grow the panel.
+    var delta = dragState.startX - event.clientX;
+    var candidate = clampPanelWidth(dragState.startWidth + delta);
+    panel.style.width = candidate + 'px';
+    dragState.lastWidth = candidate;
+    // A drag that started already pinned to the viewport ceiling (the raw
+    // preference is wider than what currently fits) and never visibly moves
+    // the render away from that ceiling hasn't expressed a new choice --
+    // leave the existing preference alone rather than re-committing the
+    // ceiling value on release. Always tracking the *latest* candidate here
+    // (not a running min/max across the drag) is what makes an overshoot
+    // that gets corrected back commit the corrected value, not the peak.
+    if (candidate !== dragState.startWidth) dragState.moved = true;
+  }
+
+  function restoreDragSideEffects() {
+    // Only restore if nothing else changed it in the meantime -- a host page
+    // that set its own userSelect/cursor after this drag started (e.g. while
+    // rebuilding its own UI mid-drag) must not have that value clobbered by
+    // a stale snapshot from before it ran.
+    if (document.body.style.userSelect === 'none') {
+      document.body.style.userSelect = dragState.originalUserSelect;
+    }
+    if (document.body.style.cursor === 'ew-resize') {
+      document.body.style.cursor = dragState.originalCursor;
+    }
+    iframe.style.pointerEvents = '';
+    // The browser normally releases capture implicitly on pointerup/
+    // pointercancel, but not on blur or a plain resize event -- release
+    // explicitly so a drag ended that way can't keep this pointer's future
+    // events (and thus other elements on the host page) captured to the
+    // handle until an eventual real pointerup arrives.
+    try {
+      resizeHandle.releasePointerCapture(dragState.pointerId);
+    } catch (e) {}
+  }
+
+  // A real release (pointerup/pointercancel... see below) commits whatever
+  // was last rendered; any other way a drag ends only cancels. Both share
+  // this one path so the guard, cleanup, and re-render can't drift apart
+  // between the two the way they did across earlier rounds.
+  function finishDrag(commit, event) {
+    if (!dragState || (event && event.pointerId !== dragState.pointerId)) return;
+    restoreDragSideEffects();
+    // dragState.moved false means this release never actually rendered a
+    // different width (a plain click, or a drag fully absorbed by the
+    // viewport ceiling) -- leave the existing preference untouched rather
+    // than re-committing startWidth as if it were a real choice. Skip
+    // committing entirely once the panel has left the DOM: any width here
+    // reflects a stale, no-longer-visible instance rather than a choice the
+    // user can still see or reconsider.
+    if (commit && dragState.moved && panel.isConnected) {
+      panelWidth = dragState.lastWidth;
+      persistWidth(panelWidth);
+    }
+    dragState = null;
+    applyPanelWidth();
+  }
+  function endDrag(event) {
+    finishDrag(true, event);
+  }
+  // Cancels rather than commits: window blur, a viewport change invalidating
+  // this drag's frozen geometry, DOM removal, and pointercancel (an
+  // involuntary interruption -- a touch gesture reinterpreted as a scroll,
+  // an OS-level interrupt, capture lost to another element -- rather than
+  // the user confirming a release) are none of them the user releasing the
+  // handle, so none of them persist a width.
+  function cancelDrag(event) {
+    finishDrag(false, event);
+  }
+  document.addEventListener('pointermove', onPointerMove);
+  document.addEventListener('pointerup', endDrag);
+  document.addEventListener('pointercancel', cancelDrag);
+
+  function onWindowBlur() {
+    // Focus moving into this widget's own iframe (e.g. the chat composer
+    // autofocusing) also fires a parent-window blur; the window itself
+    // hasn't actually lost focus, so this isn't the interruption below
+    // exists for.
+    if (document.hasFocus()) return;
+    // A drag released off-window (e.g. Alt+Tab away mid-drag) never delivers
+    // pointerup/pointercancel, which would otherwise strand userSelect:
+    // 'none' on the host page indefinitely. A no-op when no drag is active.
+    cancelDrag();
+  }
+  window.addEventListener('blur', onWindowBlur);
+
+  var lastViewportWidth = window.innerWidth;
+  function onWindowResize() {
+    var currentViewportWidth = window.innerWidth;
+    var widthChanged = currentViewportWidth !== lastViewportWidth;
+    lastViewportWidth = currentViewportWidth;
+    // Only a horizontal change affects anything here -- isMobileViewport()/
+    // clampPanelWidth() and a drag's frozen startX/startWidth anchors all
+    // depend solely on innerWidth. A resize event with an unchanged
+    // innerWidth (e.g. a mobile on-screen keyboard opening, which only moves
+    // innerHeight) must be a complete no-op: applyPanelWidth() would just
+    // re-render the same value when idle, but during an active drag it would
+    // clobber the live preview (it always renders from the last *committed*
+    // width, not dragState's in-progress one) without actually cancelling
+    // the drag -- worse than doing nothing.
+    if (!widthChanged) return;
+    applyPanelWidth();
+    // Crossing the breakpoint while open -- realistically a device rotation,
+    // since virtually every phone's landscape width already exceeds it --
+    // must re-evaluate the lock either way, not just apply it once at open.
+    applyScrollLock();
+    // A genuine width change mid-drag invalidates this drag's frozen startX/
+    // startWidth anchors -- rather than let a later pointermove misread the
+    // viewport's own movement as the user shrinking the panel (and persist
+    // that on release), end the drag cleanly here. The user can just grab
+    // the handle again if they still want to resize.
+    cancelDrag();
+    // A resize can carry an already-expanded panel across the mobile
+    // breakpoint just as easily as a click can arrive there in the first
+    // place. The .expanded CSS rule stops applying (it's scoped above the
+    // breakpoint), so the panel would render as a plain mobile-sized panel
+    // while isExpanded stays true on both sides -- then widening back past
+    // the breakpoint with no further click reactivates the CSS rule and
+    // silently snaps the panel back to full size, the exact thing
+    // expandPanel()'s own mobile guard exists to prevent for a fresh
+    // request. Force the same correction path a click-time rejection uses.
+    if (isExpanded && isMobileViewport()) {
+      collapsePanel();
+      if (iframe.contentWindow) {
+        iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_rejected' }, host);
+      }
+    }
+  }
+  window.addEventListener('resize', onWindowResize);
+
+  // Teardown the instant the panel leaves the DOM (a microtask later, per
+  // MutationObserver) -- covers both leak prevention (the listeners above
+  // are otherwise GC roots keeping this whole closure, panel included, alive
+  // indefinitely) and the drag-interrupted-by-removal case (blur alone
+  // doesn't fire just because a host SPA removes the widget, so waiting for
+  // it would leave userSelect stranded on the host page until an unrelated
+  // future blur happens to occur, if ever). Matches the isConnected-driven
+  // detection this file already uses for the session controller's own
+  // listeners.
+  var panelRemovalObserver = new MutationObserver(function () {
+    if (panel.isConnected) return;
+    torndown = true;
+    panelRemovalObserver.disconnect();
+    window.removeEventListener('resize', onWindowResize);
+    window.removeEventListener('blur', onWindowBlur);
+    window.removeEventListener('message', onChromeMessage);
+    document.removeEventListener('pointermove', onPointerMove);
+    document.removeEventListener('pointerup', endDrag);
+    document.removeEventListener('pointercancel', cancelDrag);
+    cancelDrag();
+    // A host SPA removing the widget while open must not leave the host
+    // page's own scroll stranded locked -- there'd be nothing left to
+    // reopen and unlock it.
+    isOpen = false;
+    applyScrollLock();
+    // Belt-and-suspenders for a host SPA that re-inserts this same node
+    // later (torndown permanently blocks a new drag regardless, but without
+    // this the handle would still show its ew-resize cursor and hover
+    // highlight, looking interactive while doing nothing).
+    resizeHandle.style.display = 'none';
+    // Same belt-and-suspenders, but for a much worse failure mode on
+    // reinsertion: fab.onclick and the iframe's own postMessage close
+    // channel are BOTH permanently guarded by torndown now, so a reinserted
+    // node that still carried a stale 'open'/'xagent-widget-chrome-ready'
+    // class from before teardown would render a full-screen mobile overlay
+    // with no way left to dismiss it. Clearing them here means a reinserted
+    // node always starts fully closed; hiding the FAB keeps a now-
+    // permanently-inert control from looking like it still does something.
+    panel.classList.remove('open', 'xagent-widget-chrome-ready');
+    fab.style.display = 'none';
+  });
+
   // FAB
   var fab = document.createElement('button');
   fab.className = 'xagent-widget-fab';
@@ -260,22 +798,200 @@
   var closeIcon = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
 
   fab.innerHTML = chatIcon;
+  // In the no-ready mobile states, this is the only dismiss control the
+  // panel has at all -- an unlabeled icon-only button leaves a screen
+  // reader user with no way to know what it does. Kept in sync with the
+  // icon swap in openPanel/closePanel below.
+  fab.setAttribute('aria-label', 'Open chat');
 
   var isOpen = false;
-  fab.onclick = function () {
-    isOpen = !isOpen;
-    if (isOpen) {
-      panel.classList.add('open');
-      fab.innerHTML = closeIcon;
+
+  // Non-null exactly while THIS instance owns a reference on the shared lock
+  // below, and which element that reference is against -- a second widget
+  // script on the same host page (or this one reloaded into an SPA route)
+  // runs its own independent copy of this whole closure, so per-instance
+  // state alone can't tell whether some other instance still needs the lock
+  // this one is about to release.
+  var scrollLockedEl = null;
+
+  // document.scrollingElement is whichever element actually scrolls the
+  // document (the same thing scrollTop/scrollLeft on it would move) --
+  // <html> in standards mode almost always, but <body> in quirks mode, and
+  // <html> again (rather than <body>) even when a host page's own CSS
+  // leaves <body> as the one with propagation-eligible overflow. Locking
+  // document.body directly, as this used to, does nothing on a host page
+  // that sets its own overflow on <html> (e.g. html{overflow-y:scroll}, a
+  // common technique to avoid scrollbar-width layout shift) -- overflow
+  // propagation from body to the viewport only happens when html's own
+  // overflow is left at its default 'visible', so an explicit host value on
+  // html defeats a body-only lock entirely while the fixed full-screen panel
+  // stays pinned over a background that's still freely scrollable.
+  function scrollLockTarget() {
+    return document.scrollingElement || document.documentElement;
+  }
+
+  // The lock is a namespaced CSS class, ref-counted on the element it was
+  // applied to (not a module-level variable) -- deliberately NOT the shared
+  // overflow value a host page might independently set on that same element
+  // for its own scroll-locking. Reading/writing that shared value has no way
+  // to tell "the host set this same value independently" apart from "we set
+  // it ourselves", which can either unlock a host modal still open behind us
+  // or leave our own lock silently defeated by the host releasing its own
+  // value. A class only WE add/remove has no such ambiguity, and !important
+  // in the rule above means it wins regardless of what the host does to its
+  // own style while it's present. Ref-counting still covers multiple widget
+  // instances on one page; a body/documentElement swap mid-lock naturally
+  // starts a fresh count on the new element.
+  function acquireScrollLock() {
+    if (scrollLockedEl) return;
+    var target = scrollLockTarget();
+    if (!target) return;
+    var state = target.__xagentScrollLockV2 || (target.__xagentScrollLockV2 = { count: 0 });
+    state.count += 1;
+    target.classList.add('xagent-widget-scroll-locked');
+    scrollLockedEl = target;
+  }
+
+  function releaseScrollLock() {
+    var target = scrollLockedEl;
+    if (!target) return;
+    scrollLockedEl = null;
+    var state = target.__xagentScrollLockV2;
+    if (!state) return;
+    state.count -= 1;
+    if (state.count > 0) return;
+    delete target.__xagentScrollLockV2;
+    target.classList.remove('xagent-widget-scroll-locked');
+  }
+
+  // The full-screen mobile panel has no scrollable ancestor of its own
+  // outside the iframe (the safe-area padding strips are plain background),
+  // so a touch-scroll gesture starting there would otherwise fall through to
+  // the host page and scroll it invisibly behind the "modal" overlay.
+  // Re-evaluated on resize too (see onWindowResize) so rotating a device
+  // across the breakpoint while open doesn't strand the lock.
+  function applyScrollLock() {
+    if (isOpen && isMobileViewport()) {
+      acquireScrollLock();
     } else {
-      panel.classList.remove('open');
-      fab.innerHTML = chatIcon;
+      releaseScrollLock();
+    }
+  }
+
+  function openPanel() {
+    isOpen = true;
+    panel.classList.add('open');
+    fab.innerHTML = closeIcon;
+    fab.setAttribute('aria-label', 'Close chat');
+    applyScrollLock();
+  }
+
+  function closePanel() {
+    isOpen = false;
+    panel.classList.remove('open');
+    fab.innerHTML = chatIcon;
+    fab.setAttribute('aria-label', 'Open chat');
+    applyScrollLock();
+  }
+
+  // Returns whether it actually expanded -- onChromeMessage uses this to
+  // tell the iframe when its optimistic isExpanded guess needs correcting.
+  function expandPanel() {
+    // The .expanded CSS rule is itself scoped above the mobile breakpoint,
+    // so this would already be a visual no-op there -- but isExpanded would
+    // still latch true, and nothing rechecks it on a later resize/rotation
+    // (see onWindowResize below), so growing past the breakpoint afterward
+    // would silently expand the panel with no further click from the user.
+    if (isMobileViewport()) return false;
+    // Expanding invalidates a drag's frozen startX/startWidth anchors the
+    // same way a viewport-width change does (see onWindowResize's own
+    // cancelDrag() call) -- a drag can only still be active here via a
+    // second, independent pointer (e.g. one finger holding the handle while
+    // another taps this menu item on a touch-capable desktop-width device),
+    // since isMobileViewport()/isExpanded already block a *new* drag from
+    // starting once expanded. Without this, that drag's very next
+    // pointermove would go on setting an inline width, desyncing the
+    // panel's rendered width from the .expanded class it now also carries.
+    cancelDrag();
+    isExpanded = true;
+    panel.classList.add('expanded');
+    // Let the .expanded rule's own width win -- an inline width from a
+    // prior drag would otherwise outrank it by specificity regardless.
+    panel.style.width = '';
+    return true;
+  }
+
+  function collapsePanel() {
+    isExpanded = false;
+    panel.classList.remove('expanded');
+    applyPanelWidth();
+  }
+
+  fab.onclick = function () {
+    // A host SPA can remove just the panel (leaving container/FAB in place;
+    // panelRemovalObserver already covers that -- see its own comment
+    // above), which disconnects the observer with no future chance to
+    // release a lock a stray later click would otherwise reacquire on a
+    // detached panel that nothing will ever clean back up.
+    if (torndown) return;
+    if (isOpen) {
+      closePanel();
+    } else {
+      openPanel();
     }
   };
 
   container.appendChild(panel);
   container.appendChild(fab);
   document.body.appendChild(container);
+
+  // Armed only after container is actually in the tree: subtree: true is
+  // needed because "direct child of body" alone only catches container's
+  // own removal -- a host page reaching further in (removing panel from
+  // container directly, or wiping a wrapper it added around container)
+  // would otherwise mutate a node this observer never inspects, and the
+  // callback would simply never fire.
+  // documentElement, not body: a host framework that replaces <body> wholesale
+  // on navigation (e.g. Turbo Drive, htmx boosted navigation) never mutates
+  // the childList of the *old* body node that still holds container -- only
+  // <html>'s own childList changes when body itself is swapped out.
+  panelRemovalObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+  // The header's close control lives inside the iframe's React app and has
+  // no direct handle to panel/fab, so it signals intent back here over
+  // postMessage instead. Named (not inline) so panelRemovalObserver can
+  // remove it below, matching every other listener's teardown in this file
+  // -- otherwise a host SPA that removes the widget without a full page
+  // reload leaves this listener retaining the closure indefinitely.
+  function onChromeMessage(event) {
+    if (torndown || event.origin !== host || !iframe.contentWindow || event.source !== iframe.contentWindow) return;
+    var data = event.data;
+    if (!data || data.xagent !== true || data.v !== 1) return;
+    if (data.type === 'widget_close') {
+      closePanel();
+    } else if (data.type === 'widget_chrome_ready') {
+      // The child's own close control only exists once its "active" header
+      // has actually mounted -- loading/error/expired states render none.
+      // Until this arrives (or after it's revoked below), the FAB stays the
+      // parent-owned fallback so a stuck child state can never fully trap
+      // the visitor behind a full-screen mobile panel with no dismiss action.
+      panel.classList.add('xagent-widget-chrome-ready');
+    } else if (data.type === 'widget_chrome_not_ready') {
+      panel.classList.remove('xagent-widget-chrome-ready');
+    } else if (data.type === 'widget_expand') {
+      // Correct the iframe's optimistic isExpanded guess when the mobile
+      // guard above rejects it -- otherwise the menu keeps reading "Collapse
+      // window" with nothing actually expanded, and the visitor's next click
+      // (a no-op collapse from the iframe's perspective) needs a second
+      // click on an eventual desktop-width resize to actually expand.
+      if (!expandPanel()) {
+        iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_rejected' }, host);
+      }
+    } else if (data.type === 'widget_collapse') {
+      collapsePanel();
+    }
+  }
+  window.addEventListener('message', onChromeMessage);
 
   mode.attach(iframe);
 
@@ -308,7 +1024,7 @@
           if (ticket) {
             url += '&embed_ticket=' + encodeURIComponent(ticket);
           }
-          iframe.src = url;
+          iframe.src = withTimezone(url);
         }
 
         // Request a short-lived embed ticket from the top-level page. This fetch
@@ -326,8 +1042,14 @@
               if (!res.ok) {
                 // Fail closed: no ticket means auth would fail, and loading the
                 // iframe anyway would let a non-allowlisted embed slip through the
-                // direct-visit path. Surface an actionable error instead.
-                console.error('Xagent Widget: embed authorization failed (HTTP ' + res.status + '). Check that this page is in the agent\'s allowed domains and that the embed snippet is current.');
+                // direct-visit path. Surface an actionable error instead — 429 is
+                // rate limiting (transient, high traffic), distinct from the
+                // domain-allowlist / stale-snippet causes behind a 403.
+                if (res.status === 429) {
+                  console.error('Xagent Widget: embed authorization rate-limited (HTTP 429), usually transient under high traffic. Reload the page to try again.');
+                } else {
+                  console.error('Xagent Widget: embed authorization failed (HTTP ' + res.status + '). Check that this page is in the agent\'s allowed domains and that the embed snippet is current.');
+                }
                 return null;
               }
               return res.json();
@@ -370,9 +1092,10 @@
     return 'g' + hash.toString(16);
   }
 
-  function logSession(level, text, code, status) {
+  function logSession(level, text, code, status, reason) {
     var suffix = status ? ' (HTTP ' + status + ')' : '';
-    console[level]('Xagent Widget: ' + text + ' [' + code + ']' + suffix + '.');
+    var diagnostic = reason ? code + '/' + reason : code;
+    console[level]('Xagent Widget: ' + text + ' [' + diagnostic + ']' + suffix + '.');
   }
 
   function createSessionMode(scriptTag, host) {
@@ -413,21 +1136,34 @@
       reconnectToken: null,
       terminalCode: null,
       recoverableCode: null,
+      exchangeRetry: createRetryLineage(),
+      reconnectRetry: null,
       detached: false,
       observer: null,
       inflight: { exchange: null, reconnect: null },
+      recoveryFlight: null,
       restorePending: false,
-      frozenInflight: { exchange: null, reconnect: null }
+      frozenInflight: { exchange: null, reconnect: null },
+      frozenRecoveryFlight: null,
+      rapidRecoveries: 0,
+      deliverySequence: 0,
+      awaitedDeliveryId: null,
+      invalidatedDeliveryId: null,
+      stableDeliveryId: null,
+      stabilityTimer: null
     };
 
     function attach(iframe) {
       state.iframe = iframe;
-      iframe.src = host + '/widget/chat/session';
+      iframe.src = withTimezone(host + '/widget/chat/session');
       window.addEventListener('message', onMessage);
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);
       state.observer = new MutationObserver(onDomMutation);
-      state.observer.observe(document.body, { childList: true });
+      // documentElement, not body: see panelRemovalObserver's identical
+      // reasoning above -- a full <body> replacement never mutates the old
+      // body's own childList.
+      state.observer.observe(document.documentElement, { childList: true, subtree: true });
       runLoadFlow();
     }
 
@@ -435,8 +1171,33 @@
       return exchange();
     }
 
-    function runRecoveryFlow() {
-      return state.reconnectToken ? reconnect() : exchange();
+    function runRecoveryFlow(isResume) {
+      if (state.terminalCode) {
+        flush();
+        return Promise.resolve();
+      }
+      // Join the existing parent owner before touching the rapid-recovery
+      // circuit: iframe close/error bursts do not consume logical attempts.
+      if (state.recoveryFlight) return state.recoveryFlight;
+      var initialExchange = !state.session && inflightPromise('exchange');
+      if (initialExchange) return initialExchange;
+      if (!isResume) {
+        invalidateStability();
+        if (state.rapidRecoveries >= 3) {
+          recordFailure('network_unavailable');
+          return Promise.resolve();
+        }
+        state.rapidRecoveries += 1;
+      }
+      var recovery = isNonBlankString(state.reconnectToken) ? reconnect() : exchange();
+      var recoveryFlight;
+      recoveryFlight = Promise.resolve(recovery).then(function () {
+        if (state.recoveryFlight === recoveryFlight) state.recoveryFlight = null;
+      }, function () {
+        if (state.recoveryFlight === recoveryFlight) state.recoveryFlight = null;
+      });
+      state.recoveryFlight = recoveryFlight;
+      return recoveryFlight;
     }
 
     function onDomMutation() {
@@ -446,6 +1207,7 @@
     function detach() {
       if (state.detached) return;
       state.detached = true;
+      invalidateStability();
       cancelInflight('exchange');
       cancelInflight('reconnect');
       window.removeEventListener('message', onMessage);
@@ -462,9 +1224,11 @@
     // earlier pageshow for the same navigation.
     function onPageHide(event) {
       if (!event.persisted || state.detached) return;
+      invalidateStability();
       state.restorePending = true;
       state.frozenInflight.exchange = state.inflight.exchange;
       state.frozenInflight.reconnect = state.inflight.reconnect;
+      state.frozenRecoveryFlight = state.recoveryFlight;
     }
 
     // Scripts do not re-run on a bfcache restore. Consume each persisted
@@ -478,18 +1242,24 @@
       state.restorePending = false;
       var frozenExchange = state.frozenInflight.exchange;
       var frozenReconnect = state.frozenInflight.reconnect;
+      var frozenRecoveryFlight = state.frozenRecoveryFlight;
       state.frozenInflight.exchange = null;
       state.frozenInflight.reconnect = null;
+      state.frozenRecoveryFlight = null;
       if (state.terminalCode) return;
       cancelInflightIfCurrent('exchange', frozenExchange);
       cancelInflightIfCurrent('reconnect', frozenReconnect);
+      if (state.recoveryFlight === frozenRecoveryFlight) state.recoveryFlight = null;
       state.recoverableCode = null;
       if (state.session && !isStale(state.session.session_token_expires_at)) {
+        // A persisted restore reuses the token lineage but starts a new
+        // parent/iframe delivery epoch; the pagehide-invalidated ID cannot
+        // establish post-restore stability.
+        state.session.session_delivery_id = mintDeliveryId();
         flush();
         return;
       }
-      runRecoveryFlow();
-      flush();
+      runRecoveryFlow(Boolean(frozenRecoveryFlight));
     }
 
     function onMessage(event) {
@@ -502,7 +1272,10 @@
         state.ready = true;
         flush();
       } else if (data.type === 'reconnect_request') {
-        reconnect();
+        runRecoveryFlow();
+      } else if (data.type === 'session_connection_open') {
+        if (!isNonBlankString(data.session_delivery_id)) return;
+        beginStability(data.session_delivery_id);
       }
     }
 
@@ -532,19 +1305,23 @@
         send({ type: 'session_terminal', code: state.terminalCode });
         return;
       }
-      if (state.recoverableCode &&
-          (!state.session || isStale(state.session.session_token_expires_at))) {
+      if (state.recoverableCode) {
         send({ type: 'session_degraded', code: state.recoverableCode });
         return;
       }
       if (!state.session) return;
       // Rule 3: refresh before any use of the token, including handing it over.
       if (isStale(state.session.session_token_expires_at)) {
-        reconnect();
+        runRecoveryFlow();
         return;
+      }
+      var deliveryId = state.session.session_delivery_id;
+      if (deliveryId !== state.stableDeliveryId && deliveryId !== state.invalidatedDeliveryId) {
+        state.awaitedDeliveryId = deliveryId;
       }
       send({
         type: 'session_update',
+        session_delivery_id: deliveryId,
         session_token: state.session.session_token,
         session_token_expires_at: state.session.session_token_expires_at,
         absolute_expires_at: state.session.absolute_expires_at,
@@ -586,28 +1363,78 @@
     }
 
     function applySession(payload) {
+      var reconnectTokenChanged = payload.reconnectToken !== state.reconnectToken;
       state.session = payload.session;
+      state.session.session_delivery_id = mintDeliveryId();
+      state.awaitedDeliveryId = null;
       state.reconnectToken = payload.reconnectToken;
+      if (reconnectTokenChanged) state.reconnectRetry = null;
       state.recoverableCode = null;
     }
 
-    function recordFailure(code, status) {
-      if (state.terminalCode) return;
-      if (Object.prototype.hasOwnProperty.call(TRANSIENT_SESSION_CODES, code)) {
-        state.recoverableCode = code;
-      } else {
-        state.terminalCode = code;
-        state.recoverableCode = null;
+    function mintDeliveryId() {
+      state.deliverySequence += 1;
+      return 'widget-delivery-' + Date.now().toString(36) + '-' + state.deliverySequence;
+    }
+
+    function invalidateStability() {
+      if (state.stabilityTimer) {
+        clearTimeout(state.stabilityTimer);
+        state.stabilityTimer = null;
       }
-      logSession('error', 'chat unavailable', code, status);
+      if (state.awaitedDeliveryId) {
+        state.invalidatedDeliveryId = state.awaitedDeliveryId;
+        state.awaitedDeliveryId = null;
+      }
+    }
+
+    function beginStability(deliveryId) {
+      if (deliveryId !== state.awaitedDeliveryId || deliveryId === state.invalidatedDeliveryId) return;
+      if (state.stabilityTimer || state.stableDeliveryId === deliveryId) return;
+      var timer = setTimeout(function () {
+        if (state.stabilityTimer !== timer || state.awaitedDeliveryId !== deliveryId) return;
+        state.stabilityTimer = null;
+        state.awaitedDeliveryId = null;
+        state.stableDeliveryId = deliveryId;
+        state.rapidRecoveries = 0;
+      }, 15000);
+      state.stabilityTimer = timer;
+    }
+
+    function reconnectRetryLineage(reconnectToken) {
+      var current = state.reconnectRetry;
+      if (!current || current.reconnectToken !== reconnectToken) {
+        current = {
+          reconnectToken: reconnectToken,
+          lineage: createRetryLineage()
+        };
+        state.reconnectRetry = current;
+      }
+      return current.lineage;
+    }
+
+    function recordRetry(code) {
+      if (state.terminalCode) return;
+      state.recoverableCode = code;
+      logSession('warn', 'session recovery is retrying', code);
+      flush();
+    }
+
+    function recordFailure(code, status, reason) {
+      if (state.terminalCode) return;
+      state.terminalCode = code;
+      state.recoverableCode = null;
+      logSession('error', 'chat unavailable', code, status, reason);
       flush();
     }
 
     function classifySessionFailure(result) {
-      var code = sessionErrorCode(result);
-      if (isKnownSessionErrorCode(code)) return code;
-      if (result.status >= 500) return 'network_unavailable';
-      return 'unexpected_error';
+      var syntheticCode = ownSessionErrorString(result, 'syntheticCode');
+      if (syntheticCode) return { code: syntheticCode, reason: null };
+      var envelope = sessionErrorEnvelope(result);
+      if (isKnownSessionErrorCode(envelope.code)) return envelope;
+      if (result.status >= 500) return { code: 'network_unavailable', reason: null };
+      return { code: 'unexpected_error', reason: null };
     }
 
     function handleResult(result, phase) {
@@ -619,16 +1446,12 @@
           return;
         }
         applySession(payload);
-        // A reconnect already in flight supersedes this response: it was
-        // queued while this exchange was still pending and will carry the
-        // freshest reconnect_token, so let it be the one that flushes.
-        if (phase === 'exchange' && state.inflight.reconnect) return;
         flush();
         return;
       }
 
-      var code = classifySessionFailure(result);
-      recordFailure(code, result.status);
+      var failure = classifySessionFailure(result);
+      recordFailure(failure.code, result.status, failure.reason);
     }
 
     function postJson(url, body, timeoutMs, operationSignal) {
@@ -730,16 +1553,24 @@
       cancelInflight(key);
     }
 
+    // Exchange and reconnect differ only in endpoint/body/lineage; both keep
+    // retry publication fenced by the operation signal.
+    function requestSessionWithRetry(url, body, retryLineage, signal) {
+      return withRetry(function (timeoutMs) {
+        return postJson(url, body, timeoutMs, signal);
+      }, SESSION_RETRY_POLICY, signal, function (code) {
+        if (!signal.aborted) recordRetry(code);
+      }, retryLineage);
+    }
+
     function exchange() {
       return singleFlight('exchange', function (signal) {
-        return withRetry(function (timeoutMs) {
-          return postJson(
-            host + '/v1/external/chat/sessions',
-            { encrypted_context: state.grant },
-            timeoutMs,
-            signal
-          );
-        }, SESSION_RETRY_POLICY, signal).then(function (result) {
+        return requestSessionWithRetry(
+          host + '/v1/external/chat/sessions',
+          { encrypted_context: state.grant },
+          state.exchangeRetry,
+          signal
+        ).then(function (result) {
           handleResult(result, 'exchange');
         }, function () {
           if (!signal.aborted) recordFailure('network_unavailable');
@@ -748,36 +1579,33 @@
     }
 
     function reconnect() {
-      if (state.terminalCode || state.recoverableCode) {
+      if (state.terminalCode) {
         flush();
         return Promise.resolve();
       }
+      if (state.recoverableCode) {
+        return inflightPromise('reconnect') || inflightPromise('exchange') || Promise.resolve();
+      }
+      var reconnectToken = state.reconnectToken;
+      // Defense in depth: every internal reconnect caller must revalidate the
+      // rotate-on-use credential immediately before constructing the request.
+      if (!isNonBlankString(reconnectToken)) {
+        recordFailure('reconnect_invalid');
+        return Promise.resolve();
+      }
       return singleFlight('reconnect', function (signal) {
-        // If an exchange is still in flight, wait for it: it will land the
-        // authoritative reconnect_token this reconnect needs to send, and
-        // its own flush is held back (see handleResult) so this call wins.
-        var wait = inflightPromise('exchange') || Promise.resolve();
-        return wait.then(function () {
-          if (signal.aborted) return;
-          // Re-check: the exchange we waited on may have just published a
-          // failure. Its transition already flushed the authoritative state;
-          // this parked continuation must neither issue a request nor flush a
-          // duplicate terminal message.
-          if (state.terminalCode || state.recoverableCode) return;
-          var body = { reconnect_token: state.reconnectToken };
-          body.encrypted_context = state.grant;
-          return withRetry(function (timeoutMs) {
-            return postJson(
-              host + '/v1/external/chat/sessions/reconnect',
-              body,
-              timeoutMs,
-              signal
-            );
-          }, SESSION_RETRY_POLICY, signal).then(function (result) {
-            handleResult(result, 'reconnect');
-          }, function () {
-            if (!signal.aborted) recordFailure('network_unavailable');
-          });
+        var body = { reconnect_token: reconnectToken };
+        body.encrypted_context = state.grant;
+        var retryLineage = reconnectRetryLineage(reconnectToken);
+        return requestSessionWithRetry(
+          host + '/v1/external/chat/sessions/reconnect',
+          body,
+          retryLineage,
+          signal
+        ).then(function (result) {
+          handleResult(result, 'reconnect');
+        }, function () {
+          if (!signal.aborted) recordFailure('network_unavailable');
         });
       });
     }

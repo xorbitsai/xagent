@@ -1,11 +1,15 @@
 """Unit tests for core/config.py configuration functions."""
 
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from tempfile import gettempdir
 
 import pytest
 
+import xagent.config as config
 from xagent.config import (
     AGENT_RUNTIME,
     APP_BASE_URL,
@@ -14,6 +18,10 @@ from xagent.config import (
     BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
     BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
     BOXLITE_HOME_DIR,
+    BROWSER_CUA_DRIVER_COMMAND,
+    BROWSER_CUA_DRIVER_MAX_ELEMENTS,
+    BROWSER_CUA_DRIVER_SOCKET,
+    BROWSER_CUA_DRIVER_TIMEOUT_SECONDS,
     CELERY_BROKER_URL,
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
@@ -21,6 +29,12 @@ from xagent.config import (
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
     DB_POOL_TIMEOUT_SECONDS,
+    DEEPDOC_XINFERENCE_API_KEY,
+    DEEPDOC_XINFERENCE_MODEL_UID,
+    DEEPDOC_XINFERENCE_PASSWORD,
+    DEEPDOC_XINFERENCE_TIMEOUT_SECONDS,
+    DEEPDOC_XINFERENCE_URL,
+    DEEPDOC_XINFERENCE_USERNAME,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
     FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
@@ -31,6 +45,7 @@ from xagent.config import (
     FILE_STORAGE_OPTIONS,
     FILE_STORAGE_STARTUP_SYNC_ENABLED,
     FILE_STORAGE_URI,
+    FILE_STREAM_TICKET_TTL_SECONDS,
     FRONTEND_DIST_DIR,
     GMAIL_PUBSUB_PROJECT_ID,
     GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT,
@@ -41,17 +56,21 @@ from xagent.config import (
     HOT_PATH_CACHE_TTL_SECONDS,
     HOT_PATH_TASK_CACHE_TTL_SECONDS,
     KB_COLLECTIONS_TIMEOUT_SECONDS,
+    KB_SEARCH_TIMEOUT_SECONDS,
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
     MCP_OAUTH_ALLOW_PRIVATE_HOSTS,
     MCP_OAUTH_PROXY_URL,
     MCP_TOOL_INIT_TIMEOUT_SECONDS,
+    NATIVE_BROWSER_APP_NAME,
+    NATIVE_BROWSER_ENABLED,
     OPENROUTER_OFFICIAL_PROVIDERS_ONLY,
     PASSWORD_RESET_EXPIRE_MINUTES,
     PREVIEW_TMP_DIR,
     PUBLIC_API_BASE_URL,
     REDIS_URL,
+    S2S_API_BASE_URL,
     SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY,
     SANDBOX_CPUS,
     SANDBOX_ENV,
@@ -61,8 +80,14 @@ from xagent.config import (
     SANDBOX_IMAGE,
     SANDBOX_MAX_CONTAINERS,
     SANDBOX_MEMORY,
+    SANDBOX_NAMESPACE,
     SANDBOX_SWEEP_INTERVAL,
+    SANDBOX_TOOL_RUNNER,
     SANDBOX_VOLUMES,
+    SLACK_APP_TOKEN,
+    SLACK_CLIENT_ID,
+    SLACK_CLIENT_SECRET,
+    SLACK_REDIRECT_URI,
     SMTP_FROM_EMAIL,
     SMTP_FROM_NAME,
     SMTP_HOST,
@@ -75,10 +100,13 @@ from xagent.config import (
     TASK_LEASE_RECOVERY_BATCH_SIZE,
     TASK_LEASE_RECOVERY_INTERVAL_SECONDS,
     TASK_LEASE_TTL_SECONDS,
-    TRIGGER_CALLBACK_BASE_URL,
+    TASK_RUNTIME_HOOK_MAX_WORKERS,
+    TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS,
+    TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
+    TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS,
     TRUSTED_EGRESS_PROXY,
     UPLOADED_FILE_RECOVERY_BATCH_SIZE,
     UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS,
@@ -87,6 +115,8 @@ from xagent.config import (
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
+    XROUTER_EXCLUDED_MODELS,
+    ExternalUploadsDirConfigurationError,
     format_file_size,
     get_agent_pattern_for_execution_mode,
     get_agent_runtime,
@@ -96,6 +126,10 @@ from xagent.config import (
     get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
     get_boxlite_home_dir,
+    get_browser_cua_driver_command,
+    get_browser_cua_driver_max_elements,
+    get_browser_cua_driver_socket,
+    get_browser_cua_driver_timeout_seconds,
     get_celery_broker_url,
     get_celery_enabled,
     get_celery_result_backend,
@@ -103,6 +137,12 @@ from xagent.config import (
     get_db_max_overflow,
     get_db_pool_size,
     get_db_pool_timeout_seconds,
+    get_deepdoc_xinference_api_key,
+    get_deepdoc_xinference_model_uid,
+    get_deepdoc_xinference_password,
+    get_deepdoc_xinference_timeout_seconds,
+    get_deepdoc_xinference_url,
+    get_deepdoc_xinference_username,
     get_default_sqlite_db_path,
     get_default_task_execution_mode,
     get_external_skills_dirs,
@@ -115,6 +155,7 @@ from xagent.config import (
     get_file_storage_options,
     get_file_storage_startup_sync_enabled,
     get_file_storage_uri,
+    get_file_stream_ticket_ttl_seconds,
     get_frontend_dist_dir,
     get_gmail_pubsub_project_id,
     get_gmail_pubsub_push_service_account,
@@ -125,17 +166,21 @@ from xagent.config import (
     get_hot_path_cache_ttl_seconds,
     get_hot_path_task_cache_ttl_seconds,
     get_kb_collections_timeout_seconds,
+    get_kb_search_timeout_seconds,
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
     get_mcp_oauth_allow_private_hosts,
     get_mcp_oauth_proxy_url,
     get_mcp_tool_init_timeout_seconds,
+    get_native_browser_app_name,
+    get_native_browser_enabled,
     get_openrouter_official_providers_only,
     get_password_reset_expire_minutes,
     get_preview_tmp_dir,
     get_public_api_base_url,
     get_redis_url,
+    get_s2s_api_base_url,
     get_sandbox_allow_local_fallback_on_capacity,
     get_sandbox_cpus,
     get_sandbox_env,
@@ -145,8 +190,13 @@ from xagent.config import (
     get_sandbox_image,
     get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_namespace,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
+    get_slack_app_token,
+    get_slack_client_id,
+    get_slack_client_secret,
+    get_slack_oauth_redirect_uri,
     get_smtp_from_email,
     get_smtp_from_name,
     get_smtp_host,
@@ -158,10 +208,13 @@ from xagent.config import (
     get_storage_root,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
-    get_trigger_callback_base_url,
+    get_task_runtime_hook_max_workers,
+    get_task_runtime_hook_queue_timeout_seconds,
+    get_temp_file_cleanup_shutdown_timeout_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_trigger_dispatcher_startup_jitter_seconds,
     get_trusted_egress_proxy_enabled,
     get_uploaded_file_recovery_batch_size,
     get_uploaded_file_recovery_interval_seconds,
@@ -170,7 +223,57 @@ from xagent.config import (
     get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
+    get_xrouter_excluded_models,
+    in_sandbox_tool_runner,
+    validate_sandbox_namespace,
 )
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "garbage"])
+def test_artifact_validation_byte_budget_invalid(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", value)
+    with pytest.raises(ValueError):
+        config.get_artifact_validation_max_bytes()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "garbage"])
+def test_artifact_validation_timeout_invalid(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValueError):
+        config.get_artifact_validation_timeout_seconds()
+
+
+def test_artifact_validation_defaults_and_overrides(monkeypatch):
+    monkeypatch.delenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", raising=False)
+    monkeypatch.delenv("XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS", raising=False)
+    assert config.get_artifact_validation_max_bytes() == 32 * 1024 * 1024
+    assert config.get_artifact_validation_timeout_seconds() == 8
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", "")
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS", "")
+    assert config.get_artifact_validation_max_bytes() == 32 * 1024 * 1024
+    assert config.get_artifact_validation_timeout_seconds() == 8
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", "1024")
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS", "0.5")
+    assert config.get_artifact_validation_max_bytes() == 1024
+    assert config.get_artifact_validation_timeout_seconds() == 0.5
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("32M", 32 * 1024**2), ("1.5MB", 1572864), ("512K", 524288), ("1024", 1024)],
+)
+def test_artifact_validation_and_upload_share_size_parser(monkeypatch, value, expected):
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", value)
+    monkeypatch.setenv("XAGENT_MAX_UPLOAD_SIZE", value)
+    assert config.get_artifact_validation_max_bytes() == expected
+    assert config.get_max_upload_size_bytes() == expected
+
+
+@pytest.mark.parametrize("value", ["inf", "infM", "nan", "nanM", "-1M"])
+def test_artifact_validation_size_rejects_invalid_and_nonfinite(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", value)
+    with pytest.raises(ValueError):
+        config.get_artifact_validation_max_bytes()
 
 
 class TestEnvironmentVariableConstants:
@@ -197,14 +300,69 @@ class TestEnvironmentVariableConstants:
     def test_storage_root_constant(self):
         assert STORAGE_ROOT == "XAGENT_STORAGE_ROOT"
 
+    def test_local_browser_constants(self):
+        assert NATIVE_BROWSER_ENABLED == "XAGENT_NATIVE_BROWSER_ENABLED"
+        assert NATIVE_BROWSER_APP_NAME == "XAGENT_NATIVE_BROWSER_APP_NAME"
+        assert BROWSER_CUA_DRIVER_COMMAND == "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
+        assert BROWSER_CUA_DRIVER_SOCKET == "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
+        assert (
+            BROWSER_CUA_DRIVER_TIMEOUT_SECONDS
+            == "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
+        )
+        assert (
+            BROWSER_CUA_DRIVER_MAX_ELEMENTS == "XAGENT_BROWSER_CUA_DRIVER_MAX_ELEMENTS"
+        )
+
     def test_sandbox_image_constant(self):
         assert SANDBOX_IMAGE == "SANDBOX_IMAGE"
 
     def test_sandbox_host_project_root_constant(self):
         assert SANDBOX_HOST_PROJECT_ROOT == "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
 
+    def test_sandbox_namespace_constant(self):
+        assert SANDBOX_NAMESPACE == "XAGENT_SANDBOX_NAMESPACE"
+
     def test_sandbox_host_storage_root_constant(self):
         assert SANDBOX_HOST_STORAGE_ROOT == "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
+
+    def test_sandbox_tool_runner_constant(self):
+        assert SANDBOX_TOOL_RUNNER == "XAGENT_SANDBOX_TOOL_RUNNER"
+
+    def test_in_sandbox_tool_runner_defaults_to_false(self):
+        assert in_sandbox_tool_runner() is False
+
+    def test_in_sandbox_tool_runner_reads_the_env_at_process_start(self, monkeypatch):
+        for value, expected in (
+            ("1", True),
+            ("true", True),
+            ("yes", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("no", False),
+            ("off", False),
+            ("", False),
+        ):
+            monkeypatch.setenv(SANDBOX_TOOL_RUNNER, value)
+            assert config._get_bool_env(SANDBOX_TOOL_RUNNER, False) is expected
+
+    def test_in_sandbox_tool_runner_ignores_later_env_mutation(self, monkeypatch):
+        """Agent-authored code runs late; it must not flip the whole process."""
+        monkeypatch.setenv(SANDBOX_TOOL_RUNNER, "1")
+        assert in_sandbox_tool_runner() is False
+
+    def test_in_sandbox_tool_runner_does_read_the_env_at_import(self):
+        """The other tests patch the snapshot, so pin that it is populated."""
+        probe = "import xagent.config as c; print(c.in_sandbox_tool_runner())"
+        env = {**os.environ, SANDBOX_TOOL_RUNNER: "1"}
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        assert proc.stdout.strip() == "True"
 
     def test_lancedb_path_constant(self):
         assert LANCEDB_PATH == "LANCEDB_PATH"
@@ -247,6 +405,9 @@ class TestEnvironmentVariableConstants:
             OPENROUTER_OFFICIAL_PROVIDERS_ONLY
             == "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
         )
+
+    def test_xrouter_excluded_models_constant(self):
+        assert XROUTER_EXCLUDED_MODELS == "XAGENT_XROUTER_EXCLUDED_MODELS"
 
     def test_mcp_oauth_allow_private_hosts_constant(self):
         assert MCP_OAUTH_ALLOW_PRIVATE_HOSTS == "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
@@ -325,6 +486,12 @@ class TestEnvironmentVariableConstants:
         assert SMTP_FROM_EMAIL == "XAGENT_SMTP_FROM_EMAIL"
         assert SMTP_FROM_NAME == "XAGENT_SMTP_FROM_NAME"
 
+    def test_slack_oauth_config_constants(self):
+        assert SLACK_CLIENT_ID == "XAGENT_SLACK_CLIENT_ID"
+        assert SLACK_CLIENT_SECRET == "XAGENT_SLACK_CLIENT_SECRET"
+        assert SLACK_APP_TOKEN == "XAGENT_SLACK_APP_TOKEN"
+        assert SLACK_REDIRECT_URI == "XAGENT_SLACK_REDIRECT_URI"
+
 
 class TestAuthEmailConfig:
     def test_password_reset_expire_minutes_defaults_to_30(self, monkeypatch):
@@ -348,6 +515,47 @@ class TestAuthEmailConfig:
     def test_app_base_url_strips_and_removes_trailing_slash(self, monkeypatch):
         monkeypatch.setenv(APP_BASE_URL, " https://app.example.com/base/ ")
         assert get_app_base_url() == "https://app.example.com/base"
+
+    def test_slack_oauth_config_defaults_to_unconfigured(self, monkeypatch):
+        for env_name in (
+            SLACK_CLIENT_ID,
+            SLACK_CLIENT_SECRET,
+            SLACK_APP_TOKEN,
+            SLACK_REDIRECT_URI,
+            PUBLIC_API_BASE_URL,
+        ):
+            monkeypatch.delenv(env_name, raising=False)
+
+        assert get_slack_client_id() is None
+        assert get_slack_client_secret() is None
+        assert get_slack_app_token() is None
+        assert get_slack_oauth_redirect_uri() is None
+
+    def test_slack_oauth_config_uses_explicit_values(self, monkeypatch):
+        monkeypatch.setenv(SLACK_CLIENT_ID, " client-id ")
+        monkeypatch.setenv(SLACK_CLIENT_SECRET, " client-secret ")
+        monkeypatch.setenv(SLACK_APP_TOKEN, " xapp-test ")
+        monkeypatch.setenv(
+            SLACK_REDIRECT_URI,
+            " https://api.example.com/api/channels/slack/oauth/callback/ ",
+        )
+
+        assert get_slack_client_id() == "client-id"
+        assert get_slack_client_secret() == "client-secret"
+        assert get_slack_app_token() == "xapp-test"
+        assert (
+            get_slack_oauth_redirect_uri()
+            == "https://api.example.com/api/channels/slack/oauth/callback"
+        )
+
+    def test_slack_redirect_uri_falls_back_to_public_api_base(self, monkeypatch):
+        monkeypatch.delenv(SLACK_REDIRECT_URI, raising=False)
+        monkeypatch.setenv(PUBLIC_API_BASE_URL, " https://api.example.com/ ")
+
+        assert (
+            get_slack_oauth_redirect_uri()
+            == "https://api.example.com/api/channels/slack/oauth/callback"
+        )
 
     def test_smtp_host_and_credentials_strip_expected_values(self, monkeypatch):
         monkeypatch.setenv(SMTP_HOST, " smtp.example.com ")
@@ -411,6 +619,21 @@ class TestOpenRouterConfig:
     def test_official_providers_only_false_values(self, monkeypatch, value):
         monkeypatch.setenv(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, value)
         assert get_openrouter_official_providers_only() is False
+
+    def test_xrouter_excluded_models_defaults_empty(self, monkeypatch):
+        monkeypatch.delenv(XROUTER_EXCLUDED_MODELS, raising=False)
+        assert get_xrouter_excluded_models() == ()
+
+    def test_xrouter_excluded_models_parses_and_deduplicates(self, monkeypatch):
+        monkeypatch.setenv(
+            XROUTER_EXCLUDED_MODELS,
+            " z-ai/glm-5.3-flash, openai/gpt-5.6-luna, z-ai/glm-5.3-flash,, ",
+        )
+
+        assert get_xrouter_excluded_models() == (
+            "z-ai/glm-5.3-flash",
+            "openai/gpt-5.6-luna",
+        )
 
 
 class TestMCPOAuthConfig:
@@ -540,16 +763,20 @@ class TestCeleryBackgroundJobConfig:
         monkeypatch.delenv(TRIGGER_DISPATCHER_ENABLED, raising=False)
         monkeypatch.delenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, raising=False)
         monkeypatch.delenv(TRIGGER_DISPATCHER_BATCH_SIZE, raising=False)
+        monkeypatch.delenv(TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS, raising=False)
         assert get_trigger_dispatcher_enabled() is True
         assert get_trigger_dispatcher_interval_seconds() == 5
         assert get_trigger_dispatcher_batch_size() == 20
+        assert get_trigger_dispatcher_startup_jitter_seconds() == 30
 
         monkeypatch.setenv(TRIGGER_DISPATCHER_ENABLED, "false")
         monkeypatch.setenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, "9")
         monkeypatch.setenv(TRIGGER_DISPATCHER_BATCH_SIZE, "3")
+        monkeypatch.setenv(TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS, "0")
         assert get_trigger_dispatcher_enabled() is False
         assert get_trigger_dispatcher_interval_seconds() == 9
         assert get_trigger_dispatcher_batch_size() == 3
+        assert get_trigger_dispatcher_startup_jitter_seconds() == 0
 
     def test_task_lease_recovery_tuning(self, monkeypatch):
         monkeypatch.setenv(TASK_LEASE_TTL_SECONDS, "60")
@@ -589,6 +816,28 @@ class TestCeleryBackgroundJobConfig:
         assert get_uploaded_file_recovery_interval_seconds() == 60
         assert get_uploaded_file_recovery_stale_seconds() == 300
         assert get_uploaded_file_recovery_batch_size() == 100
+
+    def test_temp_file_cleanup_shutdown_timeout_tuning(self, monkeypatch):
+        assert (
+            TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS
+            == "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+        )
+
+        monkeypatch.delenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, raising=False)
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "45")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 45
+
+        # Invalid / non-positive values fall back to the default.
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "0")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "abc")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "-5")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
 
 
 class TestGetWebSearchProvider:
@@ -819,6 +1068,23 @@ class TestFileStorageConfig:
         ):
             get_file_delivery_signed_url_ttl_seconds()
 
+    def test_file_stream_ticket_ttl_defaults_to_600(self, monkeypatch):
+        monkeypatch.delenv(FILE_STREAM_TICKET_TTL_SECONDS, raising=False)
+
+        assert get_file_stream_ticket_ttl_seconds() == 600
+
+    def test_file_stream_ticket_ttl_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(FILE_STREAM_TICKET_TTL_SECONDS, "120")
+
+        assert get_file_stream_ticket_ttl_seconds() == 120
+
+    @pytest.mark.parametrize("value", ["0", "-1", "abc"])
+    def test_file_stream_ticket_ttl_rejects_invalid(self, monkeypatch, value):
+        monkeypatch.setenv(FILE_STREAM_TICKET_TTL_SECONDS, value)
+
+        with pytest.raises(ValueError, match="XAGENT_FILE_STREAM_TICKET_TTL_SECONDS"):
+            get_file_stream_ticket_ttl_seconds()
+
     def test_file_delivery_accel_redirect_enabled_defaults_false(self, monkeypatch):
         monkeypatch.delenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, raising=False)
 
@@ -1041,6 +1307,47 @@ class TestGetExternalUploadDirs:
             assert dir1 in result
             assert dir2 in result
 
+    def test_expands_environment_tilde_and_preserves_symlink_spelling(
+        self, tmp_path, monkeypatch
+    ):
+        physical = tmp_path / "physical" / "uploads"
+        physical.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("EXTERNAL_NAME", "alias")
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, "~/$EXTERNAL_NAME")
+
+        assert get_external_upload_dirs() == [alias]
+
+    def test_rejects_symlink_followed_by_dotdot(self, tmp_path, monkeypatch):
+        base = tmp_path / "base"
+        outside = tmp_path / "outside" / "nested"
+        base.mkdir()
+        outside.mkdir(parents=True)
+        (base / "link").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, str(base / "link" / ".."))
+
+        with pytest.raises(ExternalUploadsDirConfigurationError, match="two different"):
+            get_external_upload_dirs()
+
+    def test_relative_dir_is_pinned_to_first_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        first_cwd = tmp_path / "first"
+        second_cwd = tmp_path / "second"
+        external = first_cwd / "relative-external"
+        external.mkdir(parents=True)
+        second_cwd.mkdir()
+        relative_spelling = "relative-external"
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, relative_spelling)
+
+        monkeypatch.chdir(first_cwd)
+        assert get_external_upload_dirs() == [external]
+
+        monkeypatch.chdir(second_cwd)
+        assert get_external_upload_dirs() == [external]
+
 
 class TestGetExternalSkillsDirs:
     """Test get_external_skills_dirs() function."""
@@ -1129,6 +1436,31 @@ class TestGetLancedbPath:
         assert result == Path("/custom/lancedb")
 
 
+class TestGoogleDriveDownloadTimeout:
+    """Test the Google Drive LRO timeout configuration."""
+
+    def test_constant_name(self):
+        assert (
+            config.GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS
+            == "XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS"
+        )
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(
+            "XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS", raising=False
+        )
+        assert config.get_google_drive_download_timeout_seconds() == 600
+
+    def test_environment_override(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS", "120")
+        assert config.get_google_drive_download_timeout_seconds() == 120
+
+    @pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+    def test_invalid_value_uses_default(self, monkeypatch, value):
+        monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS", value)
+        assert config.get_google_drive_download_timeout_seconds() == 600
+
+
 class TestGetKbCollectionsTimeoutSeconds:
     """Test get_kb_collections_timeout_seconds() function."""
 
@@ -1150,6 +1482,145 @@ class TestGetKbCollectionsTimeoutSeconds:
     def test_non_positive_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv(KB_COLLECTIONS_TIMEOUT_SECONDS, "0")
         assert get_kb_collections_timeout_seconds() == 30
+
+
+class TestGetKbSearchTimeoutSeconds:
+    """Test get_kb_search_timeout_seconds() function."""
+
+    def test_env_var_constant(self):
+        assert KB_SEARCH_TIMEOUT_SECONDS == "XAGENT_KB_SEARCH_TIMEOUT_SECONDS"
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(KB_SEARCH_TIMEOUT_SECONDS, raising=False)
+        assert get_kb_search_timeout_seconds() == 60
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(KB_SEARCH_TIMEOUT_SECONDS, "5")
+        assert get_kb_search_timeout_seconds() == 5
+
+    def test_invalid_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(KB_SEARCH_TIMEOUT_SECONDS, "not-a-number")
+        assert get_kb_search_timeout_seconds() == 60
+
+    def test_non_positive_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(KB_SEARCH_TIMEOUT_SECONDS, "0")
+        assert get_kb_search_timeout_seconds() == 60
+
+
+class TestDeepDocRemoteParsingConfig:
+    """Test the remote DeepDoc parsing (Xinference) configuration getters."""
+
+    def test_env_var_constants(self):
+        assert DEEPDOC_XINFERENCE_URL == "XAGENT_DEEPDOC_XINFERENCE_URL"
+        assert DEEPDOC_XINFERENCE_API_KEY == "XAGENT_DEEPDOC_XINFERENCE_API_KEY"
+        assert (
+            DEEPDOC_XINFERENCE_TIMEOUT_SECONDS
+            == "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
+        )
+        assert DEEPDOC_XINFERENCE_MODEL_UID == "XAGENT_DEEPDOC_XINFERENCE_MODEL_UID"
+        assert DEEPDOC_XINFERENCE_USERNAME == "XAGENT_DEEPDOC_XINFERENCE_USERNAME"
+        assert DEEPDOC_XINFERENCE_PASSWORD == "XAGENT_DEEPDOC_XINFERENCE_PASSWORD"
+
+    def test_url_unset_defaults_to_local_mode(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_URL, raising=False)
+        assert get_deepdoc_xinference_url() is None
+
+    def test_url_blank_defaults_to_local_mode(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, "   ")
+        assert get_deepdoc_xinference_url() is None
+
+    def test_url_strips_whitespace_and_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, " http://gpu-host:9997/ ")
+        assert get_deepdoc_xinference_url() == "http://gpu-host:9997"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "gpu-host:9997",
+            "ftp://gpu-host:9997",
+            "https:///missing-host",
+            "http://gpu-host:9997?model=deepdoc",
+            "http://gpu-host:9997#deepdoc",
+            "http://gpu-host:9997/v1/deepdoc?model=deepdoc",
+        ],
+    )
+    def test_url_rejects_invalid_values(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, value)
+
+        with pytest.raises(ValueError, match="XAGENT_DEEPDOC_XINFERENCE_URL"):
+            get_deepdoc_xinference_url()
+
+    def test_api_key_dedicated_var_wins(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_API_KEY, " deepdoc-key ")
+        monkeypatch.setenv("XINFERENCE_API_KEY", "shared-key")
+        assert get_deepdoc_xinference_api_key() == "deepdoc-key"
+
+    def test_api_key_falls_back_to_shared_xinference_key(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_API_KEY, raising=False)
+        monkeypatch.setenv("XINFERENCE_API_KEY", " shared-key ")
+        assert get_deepdoc_xinference_api_key() == "shared-key"
+
+    def test_api_key_blank_dedicated_var_falls_back(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_API_KEY, "  ")
+        monkeypatch.setenv("XINFERENCE_API_KEY", "shared-key")
+        assert get_deepdoc_xinference_api_key() == "shared-key"
+
+    def test_api_key_unset_means_no_auth(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_API_KEY, raising=False)
+        monkeypatch.delenv("XINFERENCE_API_KEY", raising=False)
+        assert get_deepdoc_xinference_api_key() is None
+
+    def test_timeout_default(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, raising=False)
+        assert get_deepdoc_xinference_timeout_seconds() == 1800
+
+    def test_timeout_env_override(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, "600")
+        assert get_deepdoc_xinference_timeout_seconds() == 600
+
+    @pytest.mark.parametrize("value", ["not-a-number", "", "0", "-1"])
+    def test_timeout_invalid_or_non_positive_falls_back(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, value)
+        assert get_deepdoc_xinference_timeout_seconds() == 1800
+
+    def test_model_uid_defaults_to_the_family_name(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_MODEL_UID, raising=False)
+        assert get_deepdoc_xinference_model_uid() == "DeepDoc"
+
+    def test_model_uid_env_override_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_MODEL_UID, "  deepdoc-gpu-1  ")
+        assert get_deepdoc_xinference_model_uid() == "deepdoc-gpu-1"
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_model_uid_blank_falls_back_to_the_default(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_MODEL_UID, value)
+        assert get_deepdoc_xinference_model_uid() == "DeepDoc"
+
+    def test_username_unset_means_no_token_exchange(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_USERNAME, raising=False)
+        assert get_deepdoc_xinference_username() is None
+
+    def test_username_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_USERNAME, "  admin  ")
+        assert get_deepdoc_xinference_username() == "admin"
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_username_blank_means_no_token_exchange(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_USERNAME, value)
+        assert get_deepdoc_xinference_username() is None
+
+    def test_password_unset_means_no_token_exchange(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_PASSWORD, raising=False)
+        assert get_deepdoc_xinference_password() is None
+
+    def test_password_blank_means_no_token_exchange(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_PASSWORD, "")
+        assert get_deepdoc_xinference_password() is None
+
+    def test_password_preserves_surrounding_whitespace(self, monkeypatch):
+        """Whitespace can be significant in a secret, so it is not stripped."""
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_PASSWORD, "  pa ss  ")
+        assert get_deepdoc_xinference_password() == "  pa ss  "
 
 
 class TestGetDefaultSqliteDbPath:
@@ -1427,6 +1898,62 @@ class TestGetSandboxHostStorageRoot:
         assert result == Path("/host/.xagent/../.xagent")
 
 
+class TestGetSandboxNamespace:
+    """Test get_sandbox_namespace() function."""
+
+    def test_no_env_var_returns_none(self, monkeypatch):
+        """Test that a missing namespace returns None."""
+        monkeypatch.delenv(SANDBOX_NAMESPACE, raising=False)
+        result = get_sandbox_namespace()
+        assert result is None
+
+    def test_blank_env_var_returns_none(self, monkeypatch):
+        """Test that a blank namespace returns None."""
+        monkeypatch.setenv(SANDBOX_NAMESPACE, "   ")
+        result = get_sandbox_namespace()
+        assert result is None
+
+    def test_valid_namespace(self, monkeypatch):
+        """Test that a Compose-project-name-shaped namespace is accepted."""
+        monkeypatch.setenv(SANDBOX_NAMESPACE, "my-project-1")
+        result = get_sandbox_namespace()
+        assert result == "my-project-1"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Upper-Case",
+            "-leading-dash",
+            "has space",
+            ":",
+            "a::b",
+            "a/b",
+            "a.b",
+            "café",
+        ],
+    )
+    def test_invalid_namespace_raises(self, monkeypatch, value):
+        """Test that malformed namespaces raise instead of silently degrading."""
+        monkeypatch.setenv(SANDBOX_NAMESPACE, value)
+        with pytest.raises(ValueError, match="Invalid sandbox namespace"):
+            get_sandbox_namespace()
+
+    def test_validation_helper_rejects_empty_namespace(self):
+        """Direct callers must not bypass the getter's blank-to-None policy."""
+        with pytest.raises(ValueError, match="Invalid sandbox namespace"):
+            validate_sandbox_namespace("")
+
+    def test_long_namespace_accepted_like_compose(self, monkeypatch):
+        """Compose accepts arbitrary-length project names; so must we.
+
+        Container identities hash the full namespace, label values preserve
+        it, and snapshot repository names use a bounded sanitized token plus
+        a digest, so backend identifiers do not impose a namespace length cap.
+        """
+        monkeypatch.setenv(SANDBOX_NAMESPACE, "a" * 100)
+        assert get_sandbox_namespace() == "a" * 100
+
+
 class TestGetBoxliteHomeDir:
     """Test get_boxlite_home_dir() function."""
 
@@ -1530,6 +2057,102 @@ class TestGetToolMaxStructuredTruncateInputChars:
             "XAGENT_TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS", "not-a-number"
         )
         assert get_tool_max_structured_truncate_input_chars() == 10_000_000
+
+
+class TestTaskRuntimeHookConfig:
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv(TASK_RUNTIME_HOOK_MAX_WORKERS, raising=False)
+        monkeypatch.delenv(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, raising=False)
+
+        assert get_task_runtime_hook_max_workers() == 8
+        assert get_task_runtime_hook_queue_timeout_seconds() == 30
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv(TASK_RUNTIME_HOOK_MAX_WORKERS, "12")
+        monkeypatch.setenv(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, "45")
+
+        assert get_task_runtime_hook_max_workers() == 12
+        assert get_task_runtime_hook_queue_timeout_seconds() == 45
+
+    def test_invalid_values_fall_back(self, monkeypatch):
+        monkeypatch.setenv(TASK_RUNTIME_HOOK_MAX_WORKERS, "0")
+        monkeypatch.setenv(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, "invalid")
+
+        assert get_task_runtime_hook_max_workers() == 8
+        assert get_task_runtime_hook_queue_timeout_seconds() == 30
+
+
+class TestLocalBrowserConfig:
+    def test_defaults(self, monkeypatch):
+        for name in (
+            NATIVE_BROWSER_ENABLED,
+            NATIVE_BROWSER_APP_NAME,
+            BROWSER_CUA_DRIVER_COMMAND,
+            BROWSER_CUA_DRIVER_SOCKET,
+            BROWSER_CUA_DRIVER_TIMEOUT_SECONDS,
+            BROWSER_CUA_DRIVER_MAX_ELEMENTS,
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        assert get_native_browser_enabled() is False
+        assert get_native_browser_app_name() == "Google Chrome"
+        assert get_browser_cua_driver_command() == "cua-driver"
+        assert get_browser_cua_driver_socket() is None
+        assert get_browser_cua_driver_timeout_seconds() == 30
+        assert get_browser_cua_driver_max_elements() == 2_000
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv(NATIVE_BROWSER_ENABLED, "true")
+        monkeypatch.setenv(NATIVE_BROWSER_APP_NAME, "Chromium")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_COMMAND, "/opt/bin/cua-driver")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_SOCKET, "/tmp/cua.sock")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_TIMEOUT_SECONDS, "12.5")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_MAX_ELEMENTS, "250")
+
+        assert get_native_browser_enabled() is True
+        assert get_native_browser_app_name() == "Chromium"
+        assert get_browser_cua_driver_command() == "/opt/bin/cua-driver"
+        assert get_browser_cua_driver_socket() == "/tmp/cua.sock"
+        assert get_browser_cua_driver_timeout_seconds() == 12.5
+        assert get_browser_cua_driver_max_elements() == 250
+
+    def test_invalid_values_fall_back(self, monkeypatch):
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_TIMEOUT_SECONDS, "0")
+        monkeypatch.setenv(BROWSER_CUA_DRIVER_MAX_ELEMENTS, "invalid")
+
+        assert get_browser_cua_driver_timeout_seconds() == 30
+        assert get_browser_cua_driver_max_elements() == 2_000
+
+    def test_rejects_non_browser_native_application(self, monkeypatch):
+        monkeypatch.setenv(NATIVE_BROWSER_APP_NAME, "Terminal")
+
+        with pytest.raises(ValueError, match="must name a supported browser"):
+            get_native_browser_app_name()
+
+
+class TestBrowserToolDefaultLocaleConfig:
+    """Fallback locale/timezone for browser_use (Playwright) sessions."""
+
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv(config.BROWSER_TOOL_DEFAULT_LOCALE, raising=False)
+        monkeypatch.delenv(config.BROWSER_TOOL_DEFAULT_TIMEZONE, raising=False)
+
+        assert config.get_browser_tool_default_locale() == "en-US"
+        assert config.get_browser_tool_default_timezone() is None
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_LOCALE, "ja-JP")
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_TIMEZONE, "Asia/Tokyo")
+
+        assert config.get_browser_tool_default_locale() == "ja-JP"
+        assert config.get_browser_tool_default_timezone() == "Asia/Tokyo"
+
+    def test_blank_values_fall_back(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_LOCALE, "   ")
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_TIMEZONE, "")
+
+        assert config.get_browser_tool_default_locale() == "en-US"
+        assert config.get_browser_tool_default_timezone() is None
 
 
 class TestCheckpointStorageConfig:
@@ -1655,8 +2278,55 @@ class TestShareRateLimitConfig:
             "120/minute",
         ),
         ("get_share_upload_rate_limit", "XAGENT_SHARE_UPLOAD_RATE_LIMIT", "60/minute"),
+        (
+            "get_widget_upload_rate_limit",
+            "XAGENT_WIDGET_UPLOAD_RATE_LIMIT",
+            "240/minute",
+        ),
+        (
+            "get_widget_upload_ip_rate_limit",
+            "XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT",
+            "60/minute",
+        ),
         ("get_share_run_quota", "XAGENT_SHARE_RUN_QUOTA", "500/day"),
         ("get_share_run_guest_quota", "XAGENT_SHARE_RUN_GUEST_QUOTA", "60/hour"),
+        (
+            "get_widget_ws_connect_ip_rate_limit",
+            "XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT",
+            "120/minute",
+        ),
+        (
+            "get_widget_ws_turn_ip_rate_limit",
+            "XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT",
+            "60/minute",
+        ),
+        (
+            "get_widget_ws_turn_rate_limit",
+            "XAGENT_WIDGET_WS_TURN_RATE_LIMIT",
+            "240/minute",
+        ),
+        (
+            "get_widget_auth_rate_limit",
+            "XAGENT_WIDGET_AUTH_RATE_LIMIT",
+            "1200/minute",
+        ),
+        (
+            "get_widget_auth_ip_rate_limit",
+            "XAGENT_WIDGET_AUTH_IP_RATE_LIMIT",
+            "300/minute",
+        ),
+        (
+            "get_widget_task_create_rate_limit",
+            "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT",
+            "240/minute",
+        ),
+        (
+            "get_widget_task_create_ip_rate_limit",
+            "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT",
+            "60/minute",
+        ),
+        ("get_widget_run_quota", "XAGENT_WIDGET_RUN_QUOTA", "500/day"),
+        ("get_widget_run_ip_quota", "XAGENT_WIDGET_RUN_IP_QUOTA", "120/hour"),
     ]
 
     @pytest.mark.parametrize("func_name,env_var,default", _CASES)
@@ -1683,6 +2353,72 @@ class TestShareRateLimitConfig:
         assert getattr(config, func_name)() == default
 
 
+class TestOrphanUploadGcConfig:
+    """Config for task-less public-upload orphan GC (#973)."""
+
+    def test_ttl_default(self, monkeypatch):
+        from xagent.config import get_taskless_upload_ttl_seconds
+
+        monkeypatch.delenv("XAGENT_TASKLESS_UPLOAD_TTL_SECONDS", raising=False)
+        assert get_taskless_upload_ttl_seconds() == 48 * 60 * 60
+
+    def test_ttl_env_override(self, monkeypatch):
+        from xagent.config import get_taskless_upload_ttl_seconds
+
+        monkeypatch.setenv("XAGENT_TASKLESS_UPLOAD_TTL_SECONDS", "86400")
+        assert get_taskless_upload_ttl_seconds() == 86400
+
+    def test_ttl_below_minimum_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_taskless_upload_ttl_seconds
+
+        # Below the 1h floor -> default (guards against reaping mid-first-turn).
+        monkeypatch.setenv("XAGENT_TASKLESS_UPLOAD_TTL_SECONDS", "5")
+        assert get_taskless_upload_ttl_seconds() == 48 * 60 * 60
+
+    def test_sweep_interval_default(self, monkeypatch):
+        from xagent.config import get_orphan_upload_sweep_interval_seconds
+
+        monkeypatch.delenv("XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS", raising=False)
+        assert get_orphan_upload_sweep_interval_seconds() == 3600
+
+    def test_sweep_interval_env_override(self, monkeypatch):
+        from xagent.config import get_orphan_upload_sweep_interval_seconds
+
+        monkeypatch.setenv("XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS", "900")
+        assert get_orphan_upload_sweep_interval_seconds() == 900
+
+
+class TestWorkforcePreviewRunReapConfig:
+    """PR #1060 review: get_workforce_preview_run_stale_seconds() had no
+    test, unlike its sibling TTL config functions above."""
+
+    def test_default(self, monkeypatch):
+        from xagent.config import get_workforce_preview_run_stale_seconds
+
+        monkeypatch.delenv("XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS", raising=False)
+        assert get_workforce_preview_run_stale_seconds() == 7200
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import get_workforce_preview_run_stale_seconds
+
+        monkeypatch.setenv("XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS", "3600")
+        assert get_workforce_preview_run_stale_seconds() == 3600
+
+    def test_below_minimum_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_workforce_preview_run_stale_seconds
+
+        # Below the 300s floor -> default (guards against reaping a preview
+        # run that is still genuinely in progress).
+        monkeypatch.setenv("XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS", "5")
+        assert get_workforce_preview_run_stale_seconds() == 7200
+
+    def test_invalid_value_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_workforce_preview_run_stale_seconds
+
+        monkeypatch.setenv("XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS", "not-a-number")
+        assert get_workforce_preview_run_stale_seconds() == 7200
+
+
 class TestGmailPubSubProvisioningConfig:
     """Config for per-mailbox Gmail Pub/Sub provisioning."""
 
@@ -1702,6 +2438,7 @@ class TestGmailPubSubProvisioningConfig:
             == "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
         )
         assert PUBLIC_API_BASE_URL == "XAGENT_PUBLIC_API_BASE_URL"
+        assert S2S_API_BASE_URL == "XAGENT_S2S_API_BASE_URL"
 
     def test_defaults(self, monkeypatch):
         monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_PROJECT_ID", raising=False)
@@ -1710,6 +2447,7 @@ class TestGmailPubSubProvisioningConfig:
         monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT", raising=False)
         monkeypatch.delenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", raising=False)
         monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
 
         assert get_gmail_pubsub_project_id() is None
         assert get_gmail_pubsub_topic_prefix() == "xagent-gmail"
@@ -1717,6 +2455,7 @@ class TestGmailPubSubProvisioningConfig:
         assert get_gmail_pubsub_push_service_account() is None
         assert get_gmail_registration_timeout_seconds() == 10
         assert get_public_api_base_url() is None
+        assert get_s2s_api_base_url() is None
 
     def test_env_overrides(self, monkeypatch):
         monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_PROJECT_ID", " demo ")
@@ -1728,6 +2467,9 @@ class TestGmailPubSubProvisioningConfig:
         )
         monkeypatch.setenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", "3")
         monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", " https://api.example.com/ ")
+        monkeypatch.setenv(
+            "XAGENT_S2S_API_BASE_URL", " https://sg-origin.example.com/ "
+        )
 
         assert get_gmail_pubsub_project_id() == "demo"
         assert get_gmail_pubsub_topic_prefix() == "mail-topic"
@@ -1738,6 +2480,79 @@ class TestGmailPubSubProvisioningConfig:
         )
         assert get_gmail_registration_timeout_seconds() == 3
         assert get_public_api_base_url() == "https://api.example.com"
+        assert get_s2s_api_base_url() == "https://sg-origin.example.com"
+
+    def test_s2s_base_falls_back_to_public_api_base(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+        monkeypatch.setenv(
+            "XAGENT_PUBLIC_API_BASE_URL", " https://api.example.com/base/ "
+        )
+
+        assert get_s2s_api_base_url() == "https://api.example.com/base"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "api.example.com",
+            "ftp://api.example.com",
+            "https:///missing-host",
+        ],
+    )
+    def test_s2s_base_rejects_invalid_http_urls(self, monkeypatch, value) -> None:
+        monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", value)
+
+        with pytest.raises(ValueError, match="XAGENT_S2S_API_BASE_URL"):
+            get_s2s_api_base_url()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "https://api.example.com/base?region=sg",
+            "https://api.example.com/base#callbacks",
+        ],
+    )
+    def test_s2s_base_rejects_query_and_fragment(self, monkeypatch, value) -> None:
+        monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", value)
+
+        with pytest.raises(ValueError, match="XAGENT_S2S_API_BASE_URL"):
+            get_s2s_api_base_url()
+
+    def test_s2s_base_validates_public_api_fallback(self, monkeypatch) -> None:
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+        monkeypatch.setenv(
+            "XAGENT_PUBLIC_API_BASE_URL",
+            "https://api.example.com?region=sg",
+        )
+
+        with pytest.raises(ValueError, match="XAGENT_PUBLIC_API_BASE_URL"):
+            get_s2s_api_base_url()
+
+    def test_gmail_callback_validates_legacy_fallback(self, monkeypatch) -> None:
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+        monkeypatch.setenv(
+            "XAGENT_TRIGGER_CALLBACK_BASE_URL",
+            "https://legacy-callback.example.com#gmail",
+        )
+
+        resolver = getattr(config, "get_gmail_callback_base_url", lambda: None)
+        with pytest.raises(ValueError, match="XAGENT_TRIGGER_CALLBACK_BASE_URL"):
+            resolver()
+
+    def test_gmail_callback_preserves_legacy_base_url_fallback(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_S2S_API_BASE_URL", raising=False)
+        monkeypatch.setenv(
+            "XAGENT_TRIGGER_CALLBACK_BASE_URL",
+            " https://legacy-callback.example.com/ ",
+        )
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+
+        assert (
+            getattr(config, "TRIGGER_CALLBACK_BASE_URL", None)
+            == "XAGENT_TRIGGER_CALLBACK_BASE_URL"
+        )
+        resolver = getattr(config, "get_gmail_callback_base_url", lambda: None)
+        assert resolver() == "https://legacy-callback.example.com"
+        assert get_s2s_api_base_url() == "https://api.example.com"
 
     def test_invalid_timeout_uses_default(self, monkeypatch):
         monkeypatch.setenv("XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS", "0")
@@ -1754,49 +2569,6 @@ class TestGmailPubSubProvisioningConfig:
         assert get_gmail_pubsub_transport() == "rest"
         monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TRANSPORT", "carrier-pigeon")
         assert get_gmail_pubsub_transport() == "grpc"
-
-
-class TestTriggerCallbackBaseUrlConfig:
-    """Dedicated base URL for inbound trigger callbacks (issue #1009)."""
-
-    def test_env_var_name(self):
-        assert TRIGGER_CALLBACK_BASE_URL == "XAGENT_TRIGGER_CALLBACK_BASE_URL"
-
-    def test_env_set_strips_whitespace_and_trailing_slash(self, monkeypatch):
-        monkeypatch.setenv(
-            "XAGENT_TRIGGER_CALLBACK_BASE_URL", " https://callbacks.example.com/ "
-        )
-        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
-        assert get_trigger_callback_base_url() == "https://callbacks.example.com"
-
-    def test_unset_falls_back_to_public_api_base_url(self, monkeypatch):
-        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
-        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com/")
-        assert get_trigger_callback_base_url() == "https://api.example.com"
-
-    @pytest.mark.parametrize("raw_value", ["   ", " /// "])
-    def test_empty_after_cleaning_falls_back_to_public_api_base_url(
-        self, monkeypatch, raw_value
-    ):
-        # "   " exercises .strip(); " /// " exercises .rstrip("/"). Either way
-        # the cleaned value is empty and must fall back rather than return "".
-        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raw_value)
-        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
-        assert get_trigger_callback_base_url() == "https://api.example.com"
-
-    def test_both_unset_returns_none(self, monkeypatch):
-        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
-        monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
-        assert get_trigger_callback_base_url() is None
-
-    def test_override_does_not_affect_public_api_base_url(self, monkeypatch):
-        # The isolation between the two getters is the whole reason MCP and A2A
-        # (which read get_public_api_base_url) are unaffected by the override.
-        monkeypatch.setenv(
-            "XAGENT_TRIGGER_CALLBACK_BASE_URL", "https://callbacks.example.com"
-        )
-        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
-        assert get_public_api_base_url() == "https://api.example.com"
 
 
 class TestTrustedProxyHopsConfig:
@@ -1988,3 +2760,291 @@ class TestCompactThresholdConfig:
 
         monkeypatch.setenv(COMPACT_THRESHOLD_DEFAULT, value)
         assert get_compact_threshold_default() == 32000
+
+
+class TestUrlUserinfoRejectionIsScopedToDeepDoc:
+    """Only the DeepDoc URL rejects embedded credentials.
+
+    The rejection guards a specific hazard: the remote client interpolates
+    ``httpx.HTTPStatusError`` — which renders the URL unredacted — into an
+    exception the caller logs. Putting the check inside the shared
+    ``_normalized_http_env_url`` would also apply it to
+    ``PUBLIC_API_BASE_URL``/``S2S_API_BASE_URL``, whose call sites do not catch
+    ``ValueError`` and depend on ``or``-chained fallbacks, so a pre-existing
+    (if ill-advised) config would start failing at runtime.
+    """
+
+    def test_deepdoc_url_rejects_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, "http://user:pw@gpu-host:9997")
+        with pytest.raises(ValueError, match="credentials embedded"):
+            get_deepdoc_xinference_url()
+
+    def test_deepdoc_url_without_credentials_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, "http://gpu-host:9997/base")
+        assert get_deepdoc_xinference_url() == "http://gpu-host:9997/base"
+
+    def test_shared_helper_consumers_keep_working(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other consumers of the shared helper must be unaffected."""
+        monkeypatch.setenv(PUBLIC_API_BASE_URL, "http://user:pw@api.example.com")
+        monkeypatch.delenv(S2S_API_BASE_URL, raising=False)
+
+        assert get_public_api_base_url() == "http://user:pw@api.example.com"
+        assert get_s2s_api_base_url() == "http://user:pw@api.example.com"
+
+
+def test_inline_file_delivery_budget(monkeypatch, caplog):
+    monkeypatch.delenv(config.INLINE_FILE_DELIVERY_MAX_BYTES, raising=False)
+    assert config.get_inline_file_delivery_max_bytes() == 8 * 1024 * 1024
+    for value in ("0", "1024"):
+        monkeypatch.setenv(config.INLINE_FILE_DELIVERY_MAX_BYTES, value)
+        assert config.get_inline_file_delivery_max_bytes() == int(value)
+    for value in ("-1", "invalid", ""):
+        monkeypatch.setenv(config.INLINE_FILE_DELIVERY_MAX_BYTES, value)
+        caplog.clear()
+        assert config.get_inline_file_delivery_max_bytes() == 0
+        assert "Invalid XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES" in caplog.text
+
+
+_OTEL_ENV_VARS = (
+    "XAGENT_RUNTIME_TELEMETRY_ENABLED",
+    "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS",
+    "XAGENT_OTEL_SERVICE_NAME",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_SERVICE_NAME",
+)
+
+
+def _clear_otel_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for env_var in _OTEL_ENV_VARS:
+        monkeypatch.delenv(env_var, raising=False)
+
+
+def test_runtime_telemetry_defaults_to_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_otel_env(monkeypatch)
+
+    assert config.get_otel_metrics_endpoint() is None
+    assert config.get_runtime_telemetry_enabled() is False
+    assert config.get_otel_export_interval_milliseconds() == 10_000
+    assert config.get_otel_service_name() == "xagent"
+
+
+def test_xagent_otel_endpoint_enables_export_and_explicit_false_disables_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_otel_env(monkeypatch)
+    monkeypatch.setenv(
+        "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        " http://collector:4318/v1/metrics/ ",
+    )
+
+    assert config.get_otel_metrics_endpoint() == "http://collector:4318/v1/metrics"
+    assert config.get_runtime_telemetry_enabled() is True
+
+    monkeypatch.setenv("XAGENT_RUNTIME_TELEMETRY_ENABLED", "false")
+    assert config.get_runtime_telemetry_enabled() is False
+
+
+def test_standard_otel_fallbacks_and_xagent_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_otel_env(monkeypatch)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://standard:4318/")
+    monkeypatch.setenv("OTEL_METRIC_EXPORT_INTERVAL", "30000")
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "standard-xagent")
+
+    assert config.get_otel_metrics_endpoint() == "http://standard:4318/v1/metrics"
+    assert config.get_otel_export_interval_milliseconds() == 30_000
+    assert config.get_otel_service_name() == "standard-xagent"
+
+    monkeypatch.setenv(
+        "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "http://xagent:4318/v1/metrics",
+    )
+    monkeypatch.setenv("XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS", "5000")
+    monkeypatch.setenv("XAGENT_OTEL_SERVICE_NAME", "xagent-override")
+    assert config.get_otel_metrics_endpoint() == "http://xagent:4318/v1/metrics"
+    assert config.get_otel_export_interval_milliseconds() == 5_000
+    assert config.get_otel_service_name() == "xagent-override"
+
+
+def test_toby_personal_stdio_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv(config.TOBY_PERSONAL_STDIO_ENABLED, raising=False)
+
+    assert config.get_toby_personal_stdio_enabled() is False
+
+
+def test_trace_database_defaults_and_opt_in(monkeypatch):
+    monkeypatch.delenv(config.ASYNC_TRACE_DB_ENABLED, raising=False)
+    monkeypatch.delenv(config.TRACE_DB_MAX_INFLIGHT, raising=False)
+    assert config.get_async_trace_db_enabled() is True
+    assert config.get_trace_db_max_inflight() == 4
+    monkeypatch.setenv(config.ASYNC_TRACE_DB_ENABLED, "true")
+    monkeypatch.setenv(config.TRACE_DB_MAX_INFLIGHT, "8")
+    assert config.get_async_trace_db_enabled() is True
+    assert config.get_trace_db_max_inflight() == 8
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_trace_database_invalid_admission_limit_falls_back(monkeypatch, value):
+    monkeypatch.setenv(config.TRACE_DB_MAX_INFLIGHT, value)
+    assert config.get_trace_db_max_inflight() == 4
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
+    monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
+
+    assert config.get_toby_personal_stdio_enabled() is True
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, True), ("true", True), ("false", False)]
+)
+def test_shared_task_execution_is_enabled_by_default(monkeypatch, value, expected):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
+    assert config.get_shared_task_execution_enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["", " ", "deployment/channel"])
+def test_task_event_channel_prefix_rejects_invalid_namespace(monkeypatch, value):
+    monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, value)
+    with pytest.raises(ValueError, match="channel prefix"):
+        config.get_task_event_channel_prefix()
+
+
+def test_task_event_channel_prefix_default_and_override(monkeypatch):
+    monkeypatch.delenv(config.TASK_EVENT_CHANNEL_PREFIX, raising=False)
+    assert config.get_task_event_channel_prefix() == "xagent:task-events:v1"
+    monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, "xagent:staging:v1")
+    assert config.get_task_event_channel_prefix() == "xagent:staging:v1"
+
+
+@pytest.mark.parametrize("key", [None, ""])
+def test_task_runtime_secrets_reject_unconfigured_key(monkeypatch, key):
+    monkeypatch.delenv(config.ENCRYPTION_KEY, raising=False)
+    if key is not None:
+        monkeypatch.setenv(config.ENCRYPTION_KEY, key)
+    assert config.get_task_runtime_secrets_encryption_key() is None
+
+
+def test_task_runtime_secrets_use_explicit_fallback_key(monkeypatch):
+    monkeypatch.setenv(config.ENCRYPTION_KEY, config.DEV_FALLBACK_ENCRYPTION_KEY)
+
+    assert (
+        config.get_task_runtime_secrets_encryption_key()
+        == config.DEV_FALLBACK_ENCRYPTION_KEY
+    )
+
+
+def test_task_runtime_secrets_use_explicit_key(monkeypatch):
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv(config.ENCRYPTION_KEY, key)
+    assert config.get_task_runtime_secrets_encryption_key() == key
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 30), ("12", 12), ("0", 30), ("-1", 30), ("bad", 30)]
+)
+def test_task_reply_wait_timeout(value, expected, monkeypatch):
+    from xagent.config import get_task_reply_wait_timeout_seconds
+
+    monkeypatch.delenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", value)
+    assert get_task_reply_wait_timeout_seconds() == expected
+
+
+@pytest.mark.parametrize(
+    "shared,role,override,expected",
+    [
+        (False, "combined", None, True),
+        (True, "combined", None, False),
+        (True, "web", "true", True),
+        (True, "web", "false", False),
+        (True, "worker", "true", False),
+    ],
+)
+def test_designated_channel_ingress(monkeypatch, shared, role, override, expected):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, str(shared).lower())
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.CHANNEL_INGRESS_ENABLED, raising=False)
+    if override is not None:
+        monkeypatch.setenv(config.CHANNEL_INGRESS_ENABLED, override)
+    assert config.get_channel_ingress_enabled() is expected
+
+
+@pytest.mark.parametrize("role", ["combined", "web", "worker"])
+def test_shared_host_configuration(monkeypatch, role):
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "true")
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.setenv(config.REDIS_URL, "redis://localhost:6379/0")
+    monkeypatch.setenv(config.ENCRYPTION_KEY, Fernet.generate_key().decode())
+    config.validate_task_execution_host_config()
+    monkeypatch.setenv(config.ENCRYPTION_KEY, config.DEV_FALLBACK_ENCRYPTION_KEY)
+    config.validate_task_execution_host_config()
+    monkeypatch.delenv(config.ENCRYPTION_KEY)
+    with pytest.raises(ValueError, match="private common ENCRYPTION_KEY"):
+        config.validate_task_execution_host_config()
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "false")
+    if role == "combined":
+        config.validate_task_execution_host_config()
+    else:
+        with pytest.raises(ValueError, match="requires"):
+            config.validate_task_execution_host_config()
+
+
+def test_unknown_task_execution_role_rejected(monkeypatch):
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, "other")
+    with pytest.raises(ValueError, match="combined, web or worker"):
+        config.validate_task_execution_host_config()
+
+
+@pytest.mark.parametrize("configured_home", [None, "/custom/boxlite"])
+def test_shared_boxlite_home_is_scoped_to_worker(
+    monkeypatch, tmp_path, configured_home
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_SANDBOX_WORKER_ID", "worker-1")
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path))
+    if configured_home is None:
+        monkeypatch.delenv(BOXLITE_HOME_DIR, raising=False)
+    else:
+        monkeypatch.setenv(BOXLITE_HOME_DIR, configured_home)
+    expected_root = Path(configured_home) if configured_home else tmp_path / "boxlite"
+    assert get_boxlite_home_dir() == expected_root / "worker-1"
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, None), ("", None), ("1", 1), ("4", 4)]
+)
+def test_worker_count_optional_positive_integer(monkeypatch, value, expected):
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, value)
+    assert config.get_worker_count() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "invalid"])
+def test_worker_count_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv(config.WORKER_COUNT, value)
+    with pytest.raises(
+        ValueError, match="XAGENT_WORKER_COUNT must be a positive integer"
+    ):
+        config.get_worker_count()

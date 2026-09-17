@@ -121,8 +121,10 @@ async def _create_knowledge_base_from_file_impl(
         from .....web.models.database import get_db
         from .....web.models.uploaded_file import UploadedFile
         from .....web.services.managed_file_ref import (
+            DurableObjectIntegrityError,
             DurableStorageOperationError,
             ensure_uploaded_file_local_path,
+            log_durable_storage_fault,
         )
         from ...core.RAG_tools.core.schemas import (
             DEFAULT_EMBEDDING_MODEL_ID,
@@ -131,7 +133,10 @@ async def _create_knowledge_base_from_file_impl(
         from ...core.RAG_tools.pipelines.document_ingestion import (
             run_document_ingestion,
         )
-        from .agent_kb_service import AgentKnowledgeBaseService
+        from .agent_kb_service import (
+            AgentKnowledgeBaseError,
+            AgentKnowledgeBaseService,
+        )
 
         tool_args = CreateKnowledgeBaseFromFileArgs.model_validate(args)
 
@@ -173,10 +178,10 @@ async def _create_knowledge_base_from_file_impl(
             user_id=user_id,
             is_admin=is_admin,
         )
-        collection_name = await kb_service.prepare_collection(
-            collection_name=collection_name,
-            ingestion_config=config,
-        )
+        collection_name = await kb_service.prepare_collection(collection_name)
+        # The ingest pipeline writes a metadata row of its own; remember whether
+        # the collection is ours to clean up if every file fails.
+        collection_existed_before = await kb_service.collection_exists(collection_name)
 
         ingested_count = 0
         errors = []
@@ -184,9 +189,35 @@ async def _create_knowledge_base_from_file_impl(
         for record in file_records:
             try:
                 source_path = ensure_uploaded_file_local_path(record)
-            except DurableStorageOperationError as exc:
+            except DurableObjectIntegrityError:
+                # Must precede the parent arm below, which this subclasses. A
+                # checksum mismatch is permanent corruption, already recorded
+                # at ERROR with both checksums by ``_raise_integrity_error``.
+                # Routing it through the durable-fault logger would add a
+                # "Durable storage unavailable" WARNING on top, which reads as
+                # a transient outage and can trip the alerts that watch for one
+                # -- burying the corruption diagnosis under a wrong one.
                 errors.append(
-                    f"Failed to restore {record.filename} from durable storage: {exc}"
+                    f"Stored copy of {record.filename} failed its integrity "
+                    "check and must be re-uploaded"
+                )
+                continue
+            except DurableStorageOperationError as exc:
+                log_durable_storage_fault(
+                    logger,
+                    "knowledge-base file restore",
+                    exc,
+                    file_id=record.file_id,
+                )
+                # Deliberately does NOT interpolate ``exc``. This string is
+                # joined into the tool result, so it reaches the model and the
+                # conversation transcript, and the provider detail belongs in
+                # the log line above, which is server-side only. (Since #1643
+                # the storage key is on ``storage_key`` rather than in the
+                # message, so it is the provider text -- not the key -- that
+                # interpolating would expose here.)
+                errors.append(
+                    f"Failed to restore {record.filename} from durable storage"
                 )
                 continue
             if not source_path.exists():
@@ -208,17 +239,25 @@ async def _create_knowledge_base_from_file_impl(
             try:
                 request_context = copy_context()
                 result = await loop.run_in_executor(None, request_context.run, func)
-            except Exception as exc:
-                errors.append(
-                    f"Failed to ingest {record.filename} due to unexpected error: {exc}"
-                )
+            except Exception:
+                # Deliberately does NOT interpolate the exception, for the same
+                # reason as the durable arm above: this string is joined into the
+                # tool result, so it reaches the model and the conversation
+                # transcript. ``HashComputationError`` wraps an OSError whose
+                # message embeds the absolute upload path, and
+                # ``DocumentValidationError`` renders "Source path does not
+                # exist: <path>" -- both under users/<user_id>/uploads/..., so
+                # both carry the owning user's id. The filename is the only part
+                # the model needs; the traceback below keeps everything else,
+                # server-side.
+                errors.append(f"Failed to ingest {record.filename}")
                 logger.exception(
                     "Unexpected error ingesting file %s",
                     record.filename,
                 )
                 continue
 
-            if result.status == "error":
+            if not result.produced_documents:
                 errors.append(f"Failed to ingest {record.filename}: {result.message}")
             else:
                 ingested_count += 1
@@ -229,6 +268,8 @@ async def _create_knowledge_base_from_file_impl(
                 )
 
         if ingested_count == 0:
+            if not collection_existed_before:
+                await kb_service.cleanup_failed_collection(collection_name)
             return CreateKnowledgeBaseFromFileResult(
                 success=False,
                 collection_name=collection_name,
@@ -243,6 +284,26 @@ async def _create_knowledge_base_from_file_impl(
         if errors:
             message += f" Warnings: {'; '.join(errors)}"
 
+        try:
+            await kb_service.publish_collection(
+                collection_name,
+                config,
+                collection_existed_before=collection_existed_before,
+            )
+        except AgentKnowledgeBaseError as exc:
+            # The files landed; retrying would duplicate them. Report the
+            # collection name so the caller can act on what exists.
+            logger.error("Could not publish agent knowledge base: %s", exc)
+            return CreateKnowledgeBaseFromFileResult(
+                success=False,
+                collection_name=collection_name,
+                message=(
+                    f"Ingested {ingested_count} file(s) into '{collection_name}' but "
+                    f"could not publish it, so it is not listed yet. Do not re-import; "
+                    f"retry publishing: {exc}"
+                ),
+                files_ingested=ingested_count,
+            ).model_dump()
         await kb_service.refresh_collection_metadata(collection_name)
 
         return CreateKnowledgeBaseFromFileResult(

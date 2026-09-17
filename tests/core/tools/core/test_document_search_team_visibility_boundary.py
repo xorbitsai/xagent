@@ -26,12 +26,20 @@ from xagent.web.services.knowledge_base_team_scope import (
 
 
 @pytest.fixture(autouse=True)
-def _isolate_team_knowledge_base_visibility_hook(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep this suite from changing unrelated application hooks."""
+def _isolate_team_knowledge_base_visibility_hook():
+    """Keep this suite from changing unrelated application hooks.
 
-    monkeypatch.setattr(kb_scope, "_visibility_hook", None)
+    Goes through the module's own snapshot/restore primitive rather than
+    monkeypatching ``_visibility_hook`` alone: a direct monkeypatch of that
+    one attribute does not save or restore the team-keyed slot, so a test
+    in this suite that installs a team-keyed hook (or a future test that
+    does) would leak it into whatever runs next. The primitive saves every
+    slot the module has, known or not yet added.
+    """
+
+    with kb_scope.snapshot_knowledge_base_team_hooks():
+        kb_scope.set_knowledge_base_team_hooks()
+        yield
 
 
 @pytest.fixture()
@@ -39,6 +47,11 @@ def install_visibility_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[[KnowledgeBaseVisibilityHook], None]:
     def install(hook: KnowledgeBaseVisibilityHook) -> None:
+        # A direct attribute monkeypatch, not the reset-all setter: this
+        # fixture must not disturb an access/lifecycle hook another part of
+        # the same test installed. The autouse fixture above is what keeps
+        # this suite isolated from the rest of the module's state, including
+        # the team-keyed slot this fixture never touches.
         monkeypatch.setattr(kb_scope, "_visibility_hook", hook)
 
     return install

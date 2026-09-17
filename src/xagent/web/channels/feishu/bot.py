@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 from uuid import uuid4
 
 import lark_oapi as lark
@@ -13,13 +13,17 @@ from lark_oapi.api.im.v1 import (
     PatchMessageRequestBody,
 )
 
+from ....config import get_channel_ingress_enabled, get_shared_task_execution_enabled
 from ....core.file_ref import build_file_id_ref
-from ...api.chat import get_agent_manager
 from ...models.task import TaskStatus
+from ...services.agent_service_manager import get_agent_manager
+from ...services.channel_delivery import ChannelDelivery, recover_channel_results
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
+    ClaimedChannelTask,
     DownloadedChannelFile,
+    SelectedChannelTask,
     authorize_channel_sender,
     load_active_channel_configs,
     persist_channel_user_message,
@@ -27,6 +31,7 @@ from ...services.channel_runtime import (
     register_channel_uploaded_files,
     update_channel_task_fields,
 )
+from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ...services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
@@ -34,11 +39,17 @@ from ...services.db_runtime import (
 )
 from ...services.execution_result_projection import project_execution_result_for_channel
 from ...services.file_turn import normalize_attachments_for_persistence
+from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
+from ...services.shared_channel_execution import (
+    SharedChannelTurn,
+    prepare_shared_channel_turn,
+)
 from ...services.task_execution_context_service import (
     materialize_task_execution_recovery_state,
 )
 from ...services.task_lease_service import TaskLeaseLostError
+from ...services.task_orchestrator import TaskTurnPayload
 from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
 from .trace_handler import FeishuTraceHandler
 
@@ -148,6 +159,8 @@ class FeishuBotInstance:
         chat_id = messages_data[0].event.message.chat_id
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
+        shared_turn: SharedChannelTurn | None = None
+        agent_service = None
         try:
             combined_text = ""
             files_info = []
@@ -213,7 +226,7 @@ class FeishuBotInstance:
                 except ChannelConfigurationError:
                     await self._send_text(
                         chat_id,
-                        "Configuration error: Cannot find the owner of this bot.",
+                        "This bot is inactive or not correctly configured.",
                     )
                     return
 
@@ -233,7 +246,12 @@ class FeishuBotInstance:
 
             active_task_id = self.active_tasks.get(open_id)
             try:
-                prepared_task = await prepare_channel_task(
+                prepare = (
+                    prepare_shared_channel_turn
+                    if get_shared_task_execution_enabled()
+                    else prepare_channel_task
+                )
+                prepared_task = await prepare(
                     channel_id=self.channel_id,
                     external_user_id=str(open_id),
                     active_task_id=(
@@ -251,7 +269,7 @@ class FeishuBotInstance:
             except ChannelConfigurationError:
                 await self._send_text(
                     chat_id,
-                    "Configuration error: Cannot find the owner of this bot.",
+                    "This bot is inactive or not correctly configured.",
                 )
                 return
 
@@ -265,39 +283,47 @@ class FeishuBotInstance:
 
             # Take ownership synchronously after the atomic DB claim so any
             # later transport failure settles or TTL-recovers this exact run.
-            managed_lease = prepared_task.managed_lease
-            task_id = prepared_task.task_id
+            selected_task: SelectedChannelTask | ClaimedChannelTask
+            if isinstance(prepared_task, SharedChannelTurn):
+                shared_turn = prepared_task
+                selected_task = shared_turn.selection
+            else:
+                selected_task = prepared_task
+                managed_lease = prepared_task.managed_lease
+            task_id = selected_task.task_id
             claimed_task_id = task_id
-            owner_user_id = prepared_task.user_id
-            is_new_task = prepared_task.is_new_task
+            owner_user_id = selected_task.user_id
+            is_new_task = selected_task.is_new_task
             if is_new_task:
                 self.active_tasks[open_id] = str(task_id)
                 self._save_active_tasks()
 
-            setup_snapshot = await run_db_io_cancellation_safe(
-                lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
-            )
-            if setup_snapshot is None:
-                raise RuntimeError(f"Task {task_id} disappeared before execution")
-            agent_manager = get_agent_manager()
-            agent_service = await agent_manager.get_agent_for_task(
-                task_id,
-                user=setup_snapshot.runtime_user,
-                task_setup_snapshot=setup_snapshot,
-                task_owner_user_id=owner_user_id,
-            )
-            agent_service.set_conversation_history(
-                [dict(message) for message in setup_snapshot.conversation_history]
-            )
-            recovery_state = await materialize_task_execution_recovery_state(
-                setup_snapshot.execution_recovery
-            )
-            agent_service.set_execution_context_messages(
-                recovery_state.get("messages", [])
-            )
-            agent_service.set_recovered_skill_context(
-                recovery_state.get("skill_context")
-            )
+            if shared_turn is None:
+                setup_snapshot = await run_db_io_cancellation_safe(
+                    lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
+                )
+                if setup_snapshot is None:
+                    raise RuntimeError(f"Task {task_id} disappeared before execution")
+                agent_manager = get_agent_manager()
+                agent_service = await agent_manager.get_agent_for_task(
+                    task_id,
+                    user=setup_snapshot.runtime_user,
+                    task_setup_snapshot=setup_snapshot,
+                    task_owner_user_id=owner_user_id,
+                )
+                agent_service.set_conversation_history(
+                    [dict(message) for message in setup_snapshot.conversation_history],
+                    watermark=setup_snapshot.conversation_watermark,
+                )
+                recovery_state = await materialize_task_execution_recovery_state(
+                    setup_snapshot.execution_recovery
+                )
+                agent_service.set_execution_context_messages(
+                    recovery_state.get("messages", [])
+                )
+                agent_service.set_recovered_skill_context(
+                    recovery_state.get("skill_context")
+                )
 
             message_turn_id = str(uuid4())
             context: dict = {"turn_id": message_turn_id}
@@ -309,6 +335,7 @@ class FeishuBotInstance:
                     agent_service=agent_service,
                     task_id=task_id,
                     user_id=owner_user_id,
+                    **({"workspace": shared_turn.workspace} if shared_turn else {}),
                 )
                 if uploaded_info:
                     persisted_attachments = normalize_attachments_for_persistence(
@@ -332,13 +359,14 @@ class FeishuBotInstance:
                     context["state"] = context.get("state", {})
                     context["state"]["file_info"] = uploaded_info
 
-            await persist_channel_user_message(
-                task_id=task_id,
-                user_id=owner_user_id,
-                content=text,
-                attachments=persisted_attachments or None,
-                turn_id=message_turn_id,
-            )
+            if shared_turn is None:
+                await persist_channel_user_message(
+                    task_id=task_id,
+                    user_id=owner_user_id,
+                    content=text,
+                    attachments=persisted_attachments or None,
+                    turn_id=message_turn_id,
+                )
 
             loading_msg_id = await self._send_text(
                 chat_id,
@@ -350,37 +378,61 @@ class FeishuBotInstance:
                 fs_handler = FeishuTraceHandler(
                     task_id, self.api_client, chat_id, loading_msg_id
                 )
-                agent_service.tracer.add_handler(fs_handler)
+                if agent_service is not None:
+                    agent_service.tracer.add_handler(fs_handler)
 
-            from ...user_isolated_memory import UserContext
+            if shared_turn is not None:
+                shared_turn.delivery_destination = {
+                    "chat_id": chat_id,
+                    "loading_message_id": loading_msg_id,
+                }
+                result = await shared_turn.execute(
+                    TaskTurnPayload(
+                        transcript_message=text,
+                        execution_message=text,
+                        attachments=persisted_attachments or None,
+                        file_ids=tuple(
+                            item["file_id"] for item in persisted_attachments
+                        ),
+                    ),
+                    fs_handler,
+                )
+                await shared_turn.deliver(
+                    self._deliver_shared_result,
+                    pending_notice=result.get("status") == "accepted",
+                )
+                return
+            else:
+                local_service: Any = agent_service
+                local_lease = cast(ManagedTaskLease, managed_lease)
+                from ...user_isolated_memory import UserContext
 
-            actual_task_id = str(task_id)
-            try:
-                with UserContext(owner_user_id):
-                    result = await agent_manager.execute_task(
-                        agent_service=agent_service,
-                        task=text,
-                        context=context,
-                        task_id=actual_task_id,
-                        tracking_task_id=actual_task_id,
-                        db_session=None,
-                        manage_task_lease=False,
-                        task_lease=managed_lease.lease,
-                        task_lease_heartbeat_task=managed_lease.heartbeat_task,
-                    )
-            finally:
-                if (
-                    fs_handler is not None
-                    and fs_handler in agent_service.tracer.handlers
-                ):
-                    agent_service.tracer.handlers.remove(fs_handler)
+                actual_task_id = str(task_id)
+                try:
+                    with UserContext(owner_user_id):
+                        result = await agent_manager.execute_task(
+                            agent_service=local_service,
+                            task=text,
+                            context=context,
+                            task_id=actual_task_id,
+                            tracking_task_id=actual_task_id,
+                            db_session=None,
+                            manage_task_lease=False,
+                            task_lease=local_lease.lease,
+                            task_lease_heartbeat_task=local_lease.heartbeat_task,
+                        )
+                finally:
+                    if fs_handler is not None:
+                        local_service.tracer.remove_handler(fs_handler)
 
             projection = project_execution_result_for_channel(result)
-            if not await managed_lease.finalize_result(
+            if managed_lease is not None and not await managed_lease.finalize_result(
                 status=projection.task_status,
                 assistant_content=projection.transcript_content,
                 interactions=projection.interactions,
                 message_type=projection.message_type,
+                error_message=projection.diagnostic_error,
+                execution_result=result,
             ):
                 raise TaskLeaseLostError(
                     f"task {task_id} ownership changed before Feishu result"
@@ -412,6 +464,7 @@ class FeishuBotInstance:
                 try:
                     finalized = await managed_lease.finalize_result(
                         status=TaskStatus.FAILED,
+                        error_message=str(e),
                     )
                 except Exception:
                     logger.warning(
@@ -428,11 +481,36 @@ class FeishuBotInstance:
                     )
                     return
             await self._send_text(
-                chat_id, "Sorry, an error occurred while processing your request."
+                chat_id,
+                CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+                if isinstance(e, AutoModelUnavailableError)
+                else "Sorry, an error occurred while processing your request.",
             )
         finally:
+            if shared_turn is not None:
+                await shared_turn.close()
             if managed_lease is not None:
                 await managed_lease.close()
+
+    async def _deliver_shared_result(
+        self, delivery: ChannelDelivery, result: dict[str, Any]
+    ) -> None:
+        projection = project_execution_result_for_channel(result)
+        chat_id = delivery.destination["chat_id"]
+        loading_id = delivery.destination["loading_message_id"]
+        chunks = [
+            projection.visible_text[i : i + 4000]
+            for i in range(0, len(projection.visible_text), 4000)
+        ]
+        if loading_id:
+            await self._update_text(
+                chat_id, loading_id, chunks[0], require_delivery=True
+            )
+        elif not await self._send_text(chat_id, chunks[0]):
+            raise ConnectionError("Feishu final message was not accepted")
+        for chunk in chunks[1:]:
+            if not await self._send_text(chat_id, chunk):
+                raise ConnectionError("Feishu final message was not accepted")
 
     async def _download_and_register_files(
         self,
@@ -440,15 +518,17 @@ class FeishuBotInstance:
         agent_service: "Any",
         task_id: int,
         user_id: int,
+        workspace: Any = None,
     ) -> list:
-        if not agent_service.workspace:
+        workspace = workspace if workspace is not None else agent_service.workspace
+        if not workspace:
             logger.warning("Agent service workspace is not available for file upload")
             return []
 
         target_dir = getattr(
-            agent_service.workspace,
+            workspace,
             "input_dir",
-            agent_service.workspace.workspace_dir / "input",
+            workspace.workspace_dir / "input",
         )
         downloaded_files: list[DownloadedChannelFile] = []
         for file_info in files_info:
@@ -471,7 +551,7 @@ class FeishuBotInstance:
                 downloaded_files.append(downloaded)
 
         registered = await register_channel_uploaded_files(
-            workspace=agent_service.workspace,
+            workspace=workspace,
             task_id=task_id,
             user_id=user_id,
             files=tuple(downloaded_files),
@@ -520,7 +600,8 @@ class FeishuBotInstance:
             ext = ".jpg" if msg_type == "image" else ".bin"
             file_name = f"{file_key}{ext}"
 
-        from ...api.websocket import build_unique_target_path, normalize_filename
+        from ...api.websocket import build_unique_target_path
+        from ...services.task_execution import normalize_filename
 
         normalized_file_name = normalize_filename(file_name)
         target_path = build_unique_target_path(target_dir, normalized_file_name)
@@ -576,7 +657,14 @@ class FeishuBotInstance:
             logger.error(f"Error sending Feishu message: {e}")
             return None
 
-    async def _update_text(self, chat_id: str, message_id: str, text: str) -> None:
+    async def _update_text(
+        self,
+        chat_id: str,
+        message_id: str,
+        text: str,
+        *,
+        require_delivery: bool = False,
+    ) -> None:
         try:
             card_content = {
                 "config": {"wide_screen_mode": True},
@@ -602,8 +690,16 @@ class FeishuBotInstance:
                 )
                 if resp.code == 230001:  # "This message is NOT a card." error
                     logger.info("Falling back to send_text instead of update_text")
-                    await self._send_text(chat_id, text)
+                    sent = await self._send_text(chat_id, text)
+                    if sent:
+                        return
+                if require_delivery:
+                    raise ConnectionError(
+                        "Feishu final message update was not accepted"
+                    )
         except Exception as e:
+            if require_delivery:
+                raise
             logger.error(f"Error updating Feishu message: {e}")
 
     async def start(self) -> None:
@@ -735,47 +831,72 @@ class FeishuChannelManager:
     def __init__(self) -> None:
         self.bots: Dict[str, FeishuBotInstance] = {}
         self._bot_stop_tasks: Dict[str, asyncio.Task[None]] = {}
+        # Channel CRUD endpoints fire sync as a background task, so two syncs
+        # can interleave. _stop_bot_for_appid awaits the shutdown drain and
+        # only removes the bot from self.bots afterwards, so a second sync
+        # entering that window sees an app_id that is still present but
+        # already being torn down: it skips starting it, the first sync
+        # completes the removal, and a re-enabled channel ends up neither
+        # running nor tracked until some later sync happens to run.
+        self._sync_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        await self._sync_bots_async()
+        if not get_channel_ingress_enabled():
+            logger.info("Feishu channel ingress disabled on this host")
+            return
+        while get_channel_ingress_enabled():
+            await self._sync_bots_async()
+            if not get_shared_task_execution_enabled():
+                return
+            for bot in tuple(self.bots.values()):
+                if bot.channel_id is not None:
+                    await recover_channel_results(
+                        bot.channel_id, bot._deliver_shared_result
+                    )
+            # CRUD may reach another web replica. The designated ingress
+            # observes its committed configuration without opening extra bots.
+            await asyncio.sleep(30)
 
     async def stop(self) -> None:
         for app_id in list(self.bots.keys()):
             await self._stop_bot_for_appid(app_id)
 
     async def _sync_bots_async(self) -> None:
-        active_app_ids = set()
-        channel_info_by_appid: Dict[str, Dict] = {}
-
-        try:
-            channels = await load_active_channel_configs(
-                channel_type="feishu",
-                required_config_keys=("app_id", "app_secret"),
-            )
-            for ch in channels:
-                app_id = ch.config_value("app_id")
-                app_secret = ch.config_value("app_secret")
-                if app_id and app_secret:
-                    active_app_ids.add(app_id)
-                    channel_info_by_appid[app_id] = {
-                        "app_secret": app_secret,
-                        "id": ch.channel_id,
-                        "name": ch.channel_name,
-                    }
-        except Exception as e:
-            logger.error(f"Failed to load feishu channels for sync: {e}")
+        if not get_channel_ingress_enabled():
             return
+        async with self._sync_lock:
+            active_app_ids = set()
+            channel_info_by_appid: Dict[str, Dict] = {}
 
-        current_app_ids = set(self.bots.keys())
+            try:
+                channels = await load_active_channel_configs(
+                    channel_type="feishu",
+                    required_config_keys=("app_id", "app_secret"),
+                )
+                for ch in channels:
+                    app_id = ch.config_value("app_id")
+                    app_secret = ch.config_value("app_secret")
+                    if app_id and app_secret:
+                        active_app_ids.add(app_id)
+                        channel_info_by_appid[app_id] = {
+                            "app_secret": app_secret,
+                            "id": ch.channel_id,
+                            "name": ch.channel_name,
+                        }
+            except Exception as e:
+                logger.error(f"Failed to load feishu channels for sync: {e}")
+                return
 
-        for app_id in current_app_ids - active_app_ids:
-            await self._stop_bot_for_appid(app_id)
+            current_app_ids = set(self.bots.keys())
 
-        for app_id in active_app_ids - current_app_ids:
-            info = channel_info_by_appid[app_id]
-            await self._start_bot_for_appid(
-                app_id, info["app_secret"], info["id"], info["name"]
-            )
+            for app_id in current_app_ids - active_app_ids:
+                await self._stop_bot_for_appid(app_id)
+
+            for app_id in active_app_ids - current_app_ids:
+                info = channel_info_by_appid[app_id]
+                await self._start_bot_for_appid(
+                    app_id, info["app_secret"], info["id"], info["name"]
+                )
 
     async def _start_bot_for_appid(
         self, app_id: str, app_secret: str, channel_id: int, channel_name: str

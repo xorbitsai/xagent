@@ -2,7 +2,8 @@
 
 `classify_app_auth` is the one place backend + both frontend dialogs read from,
 so its edge cases matter: oauth wins over any launch_config, key-based needs
-BOTH required_env and command, everything else is unconnectable.
+BOTH required_env and command, a stdio command with no required_env is keyless,
+everything else is unconnectable.
 """
 
 import pytest
@@ -31,11 +32,131 @@ def test_key_based_needs_command_and_required_env():
     )
 
 
+def test_key_based_is_not_transport_gated_unlike_keyless():
+    # Round-4 MAJOR-1 (deferred to #1203): unlike keyless, api_key has no
+    # transport constraint -- a command+required_env shape on a remote
+    # transport still classifies api_key, and the downstream provisioner
+    # then hardcodes transport="stdio" regardless. Pinning today's actual
+    # behavior as a deliberate, visible contract (not an accident) so it
+    # fails loudly whenever #1203 changes it, instead of silently drifting.
+    assert (
+        classify_app_auth(
+            "streamable_http", {"command": "npx", "required_env": ["KEY"]}
+        )
+        == "api_key"
+    )
+
+
+def test_remote_mcp_oauth_shape_is_mcp_oauth():
+    for transport in ("sse", "websocket", "streamable_http"):
+        assert (
+            classify_app_auth(
+                transport,
+                {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+            )
+            == "mcp_oauth"
+        )
+
+
+def test_mcp_oauth_requires_both_url_and_auth_type():
+    # url without auth.type=mcp_oauth -> not launchable via OAuth
+    assert (
+        classify_app_auth("streamable_http", {"url": "https://mcp.example.com/mcp"})
+        == "unconnectable"
+    )
+    # auth.type=mcp_oauth without url -> nothing to connect to
+    assert (
+        classify_app_auth("streamable_http", {"auth": {"type": "mcp_oauth"}})
+        == "unconnectable"
+    )
+    # wrong auth.type is not mcp_oauth
+    assert (
+        classify_app_auth(
+            "streamable_http",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "bearer"}},
+        )
+        == "unconnectable"
+    )
+
+
+def test_remote_mcp_oauth_transport_check_is_case_insensitive():
+    # N1: the builtin_oauth check above lowercases ("OAuth" -> "oauth"); the
+    # remote-transport check must be equally forgiving, or an admin PATCH that
+    # stores a mixed-case transport puts the two halves of this feature in
+    # disagreement about the same row.
+    assert (
+        classify_app_auth(
+            "Streamable_HTTP",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "mcp_oauth"
+    )
+    assert (
+        classify_app_auth(
+            "SSE",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "mcp_oauth"
+    )
+
+
+def test_mcp_oauth_shape_requires_a_remote_transport():
+    # Same launch_config shape on a stdio transport must not be misrouted —
+    # only sse/websocket/streamable_http describe a genuine remote MCP server.
+    assert (
+        classify_app_auth(
+            "stdio",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "unconnectable"
+    )
+
+
+def test_keyless_is_a_stdio_command_with_no_required_env():
+    # e.g. the Chrome connector: a launchable local module with no secrets.
+    assert classify_app_auth("stdio", {"command": "npx"}) == "keyless"
+    assert (
+        classify_app_auth(
+            "stdio", {"command": "npx", "args": ["-y", "chrome-devtools-mcp@latest"]}
+        )
+        == "keyless"
+    )
+    # empty required_env is the same as absent, not a key-based app
+    assert (
+        classify_app_auth("stdio", {"command": "npx", "required_env": []}) == "keyless"
+    )
+    # transport check is case-insensitive, like the other classifications
+    assert classify_app_auth("STDIO", {"command": "npx"}) == "keyless"
+    # keyless is stdio-only: a command on a remote transport is mis-authored,
+    # not connectable
+    assert classify_app_auth("streamable_http", {"command": "npx"}) == "unconnectable"
+    assert classify_app_auth("sse", {"command": "npx"}) == "unconnectable"
+    assert classify_app_auth(None, {"command": "npx"}) == "unconnectable"
+
+
+def test_keyless_excludes_env_mapping_shapes():
+    # env_mapping means the launcher expects an injected token (the builtin
+    # OAuth apps' pattern, e.g. env_mapping={"SLACK_ACCESS_TOKEN":
+    # "access_token"}) -- not required_env, but not secret-free either. A
+    # custom app authored with this shape and no required_env must not
+    # classify keyless: that would offer a no-secrets Connect button for a
+    # server that fails at tool-call time for a missing token.
+    assert (
+        classify_app_auth(
+            "stdio",
+            {"command": "uv", "env_mapping": {"TOKEN": "access_token"}},
+        )
+        == "unconnectable"
+    )
+    # Still keyless with an empty env_mapping -- same as absent.
+    assert (
+        classify_app_auth("stdio", {"command": "npx", "env_mapping": {}}) == "keyless"
+    )
+
+
 def test_inconsistent_entries_are_unconnectable_not_misrouted():
     # required_env but no command -> not launchable
     assert classify_app_auth("stdio", {"required_env": ["KEY"]}) == "unconnectable"
-    # command but no required_env -> nothing to prompt for
-    assert classify_app_auth("stdio", {"command": "npx"}) == "unconnectable"
     assert classify_app_auth("stdio", None) == "unconnectable"
     assert classify_app_auth(None, None) == "unconnectable"
     # malformed launch_config (non-dict) must not raise AttributeError
@@ -53,7 +174,7 @@ def test_oauth_landing_rejects_non_oauth_app():
     with pytest.raises(AppNotOAuthError, match="not an OAuth app"):
         _ensure_user_mcp_server(
             None,
-            "1",
+            1,
             {"id": "google-maps", "name": "Google Maps", "auth_type": "api_key"},
         )
 

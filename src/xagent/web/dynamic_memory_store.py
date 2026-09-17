@@ -149,46 +149,34 @@ class DynamicMemoryStoreManager:
         self, embedding_model: DBModel
     ) -> UserIsolatedMemoryStore:
         """Create LanceDB store with the given embedding model."""
-        try:
-            # Check legacy location (project root) first for backward compatibility
-            legacy_dir = os.path.join(
-                os.path.dirname(
-                    os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-                ),
-                "memory_store",
-            )
-            if os.path.exists(legacy_dir) and os.listdir(legacy_dir):
-                logger.info(f"Using legacy memory store location: {legacy_dir}")
-                db_dir = legacy_dir
-            else:
-                # Use new default location
-                new_dir = get_storage_root() / "memory_store"
-                os.makedirs(new_dir, exist_ok=True)
-                db_dir = str(new_dir)
+        legacy_dir = os.path.join(
+            os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            ),
+            "memory_store",
+        )
+        if os.path.exists(legacy_dir) and os.listdir(legacy_dir):
+            logger.info(f"Using legacy memory store location: {legacy_dir}")
+            db_dir = legacy_dir
+        else:
+            new_dir = get_storage_root() / "memory_store"
+            os.makedirs(new_dir, exist_ok=True)
+            db_dir = str(new_dir)
 
-            if embedding_model.model_provider == "dashscope":
-                lancedb_store = LanceDBMemoryStore(
-                    db_dir=db_dir,
-                    embedding_model=DashScopeEmbedding(
-                        api_key=str(embedding_model.api_key),
-                        dimension=int(embedding_model.dimension or 1024),
-                    ),
-                    similarity_threshold=self._similarity_threshold or 1.5,
-                )
-                logger.info("Created LanceDB store with DashScope embedding model")
-                return UserIsolatedMemoryStore(lancedb_store)
-            else:
-                # Fallback to in-memory if embedding type not supported
-                logger.warning(
-                    f"Unsupported embedding model type: {embedding_model.model_provider}"
-                )
-                self._initialize_in_memory_store()
-                return self._memory_store  # type: ignore[return-value]
-        except Exception as e:
-            logger.error(f"Error creating LanceDB store: {e}")
-            # Fallback to in-memory store
-            self._initialize_in_memory_store()
-            return self._memory_store  # type: ignore[return-value]
+        if embedding_model.model_provider != "dashscope":
+            raise ValueError(
+                f"Unsupported embedding model type: {embedding_model.model_provider}"
+            )
+        lancedb_store = LanceDBMemoryStore(
+            db_dir=db_dir,
+            embedding_model=DashScopeEmbedding(
+                api_key=str(embedding_model.api_key),
+                dimension=int(embedding_model.dimension or 1024),
+            ),
+            similarity_threshold=self._similarity_threshold or 1.5,
+        )
+        logger.info("Created LanceDB store with DashScope embedding model")
+        return UserIsolatedMemoryStore(lancedb_store)
 
     def _check_and_update_store(self) -> None:
         """Check if embedding model configuration has changed and update store accordingly."""
@@ -224,7 +212,12 @@ class DynamicMemoryStoreManager:
 
             if should_update:
                 if embedding_model:
-                    self._memory_store = self._create_lancedb_store(embedding_model)
+                    try:
+                        new_store = self._create_lancedb_store(embedding_model)
+                    except Exception as error:
+                        logger.error("Error creating LanceDB store: %s", error)
+                        return
+                    self._memory_store = new_store
                     self._is_lancedb = True
                     self._last_embedding_model_id = current_model_id  # type: ignore[assignment]
                     self._last_embedding_model_fingerprint = current_fingerprint

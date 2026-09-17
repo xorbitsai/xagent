@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 
 from sqlalchemy.orm import Session
 
+from ...core.agent.voice_policy import voice_from_preferences
 from ...core.model.chat.basic.base import BaseLLM
 from ..models.database import get_session_local
 from ..models.task import DAGExecution, Task, TraceEvent
@@ -77,6 +78,30 @@ class RuntimeUserFields:
 
     id: int
     is_admin: bool
+    # Onboarding "Launch" step voice choice, verbatim from the raw
+    # preferences JSON (not validated against VALID_VOICES here - an
+    # unrecognized value is stored as-is and only becomes an inert no-op
+    # later, inside apply_output_voice's own isinstance/lookup guard in
+    # api/agents.py), or None if the key is unset.
+    voice: Optional[str] = None
+
+
+def detach_runtime_user_fields(user: User) -> RuntimeUserFields:
+    """Reduce a live ORM ``User`` row to the primitives ``RuntimeUserFields``
+    needs, read now while the row is still attached and unexpired.
+
+    A caller holding a live ``User`` past the point its Session's
+    connection gets released (``release_db_connection_if_clean``'s
+    rollback unconditionally expires every object that Session loaded)
+    would otherwise force an implicit reload on the next attribute
+    access - synchronously, on the event loop, in the same window this
+    whole snapshot mechanism exists to keep query-free. Call this as
+    soon as a live ``User`` is in hand instead of holding onto it."""
+    return RuntimeUserFields(
+        id=int(user.id),
+        is_admin=bool(user.is_admin),
+        voice=voice_from_preferences(user.preferences),
+    )
 
 
 @dataclass(frozen=True)
@@ -118,7 +143,12 @@ class TaskSetupSnapshot:
     agent: Optional[AgentRuntimeFields]
     agent_config: Optional[dict]
     excluded_agent_id: Optional[int]
-    conversation_history: tuple[dict[str, str], ...] = ()
+    conversation_history: tuple[dict[str, Any], ...] = ()
+    # Largest stored transcript row id ``conversation_history`` covers. Handed
+    # to the agent so a compaction during this turn can record what its summary
+    # absorbed. ``None`` means there was nothing to cover, and a compaction
+    # will emit an unpositionable summary that the next turn ignores.
+    conversation_watermark: Optional[int] = None
     execution_recovery: TaskExecutionRecoverySnapshot = TaskExecutionRecoverySnapshot()
     reconstruction: TaskReconstructionSnapshot = TaskReconstructionSnapshot()
     # Resolved by ``resolve_task_runtime_config_core`` using this same Session.
@@ -215,20 +245,14 @@ def _resolve_inline_preview_excluded_agent_id(
     if not agent_config or not agent_config.get("preview_agent_id"):
         return None
 
-    from ..models.agent import Agent, AgentStatus
-    from .agent_team_scope import get_agent_team_scope, owned_agent_clause
+    from ..models.agent import AgentStatus
+    from .agent_team_scope import resolve_authorized_agent
 
     owner_user_id = int(task_row.user_id)
-    preview_agent = (
-        session.query(Agent)
-        .filter(
-            Agent.id == agent_config["preview_agent_id"],
-            owned_agent_clause(
-                owner_user_id,
-                get_agent_team_scope(session, owner_user_id),
-            ),
-        )
-        .first()
+    preview_agent = resolve_authorized_agent(
+        session,
+        owner_user_id,
+        agent_config.get("preview_agent_id"),
     )
     if preview_agent is None or preview_agent.status != AgentStatus.PUBLISHED:
         return None
@@ -278,7 +302,7 @@ def load_task_setup_snapshot_sync(
             raise TaskOwnerMismatchError(task_id, task_owner_user_id, owner_user_id)
 
         runtime_user_row = (
-            session.query(User.id, User.is_admin)
+            session.query(User.id, User.is_admin, User.preferences)
             .filter(User.id == owner_user_id)
             .first()
         )
@@ -286,6 +310,7 @@ def load_task_setup_snapshot_sync(
             RuntimeUserFields(
                 id=int(runtime_user_row[0]),
                 is_admin=bool(runtime_user_row[1]),
+                voice=voice_from_preferences(runtime_user_row[2]),
             )
             if runtime_user_row is not None
             else None
@@ -337,15 +362,14 @@ def load_task_setup_snapshot_sync(
                 core.agent_config,
             )
 
-        from .chat_history_service import load_task_transcript
+        from .chat_history_service import load_task_transcript_window
 
-        conversation_history = tuple(
-            load_task_transcript(
-                session,
-                task_id,
-                before_message_id=before_message_id,
-            )
+        transcript_window = load_task_transcript_window(
+            session,
+            task_id,
+            before_message_id=before_message_id,
         )
+        conversation_history = tuple(transcript_window.messages)
         execution_recovery = load_task_execution_recovery_snapshot_sync(
             session,
             task_id,
@@ -367,6 +391,7 @@ def load_task_setup_snapshot_sync(
             agent_config=core.agent_config,
             excluded_agent_id=excluded_agent_id,
             conversation_history=conversation_history,
+            conversation_watermark=transcript_window.watermark,
             execution_recovery=execution_recovery,
             reconstruction=reconstruction,
             workforce_runtime=deepcopy(core.workforce),

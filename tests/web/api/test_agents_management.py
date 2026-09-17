@@ -14,6 +14,10 @@ from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
 from xagent.config import get_uploads_dir
+from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    execution_scope_from_agent_config,
+)
 from xagent.web.api import agents as agents_api
 from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.api.widget import (
@@ -25,14 +29,23 @@ from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.template_stats import TemplateStats
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent, WorkforceRun
+from xagent.web.services import agent_prompt as _agent_prompt_services
 from xagent.web.services.agent_management import (
     AgentManagementService,
     AgentWorkforceConflictError,
     AgentWorkforceReference,
+    TemplateQuickAccessRaceError,
 )
+from xagent.web.services.task_runtime import (
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+    TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
+    task_extension_bindings_from_agent_config,
+)
+from xagent.web.services.task_setup_snapshot import RuntimeUserFields
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_lifecycle import discard_draft_workforce
 
@@ -161,6 +174,671 @@ def test_create_from_template_fails_closed_when_request_session_is_not_clean(
     assert template_calls == []
 
 
+def test_create_from_template_persists_template_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The created (and later listed) agent must carry its source template id."""
+
+    headers = _admin_headers()
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            return {
+                "id": template_id,
+                "name": "Template-Linked Agent",
+                "descriptions": {"en": "Created from a template"},
+                "agent_config": {
+                    "instructions": "Follow the template.",
+                    "execution_mode": "balanced",
+                },
+            }
+
+    monkeypatch.setattr(
+        client.app.state, "template_manager", TemplateManagerStub(), raising=False
+    )
+
+    response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "linked-template-id"},
+    )
+    assert response.status_code == 200, response.text
+    agent_id = response.json()["id"]
+    assert response.json()["template_id"] == "linked-template-id"
+
+    list_response = client.get("/api/agents", headers=headers)
+    assert list_response.status_code == 200, list_response.text
+    listed = next(a for a in list_response.json() if a["id"] == agent_id)
+    assert listed["template_id"] == "linked-template-id"
+
+    detail_response = client.get(f"/api/agents/{agent_id}", headers=headers)
+    assert detail_response.status_code == 200, detail_response.text
+    assert detail_response.json()["template_id"] == "linked-template-id"
+
+
+def test_create_from_template_duplicate_name_returns_400_with_stable_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins the exact 400 detail string POST /api/agents/from-template
+    returns on a name collision - a different endpoint's exception handling
+    from the plain POST /api/agents duplicate-name test above. See PR review
+    finding F2: without this test, a refactor could change this endpoint's
+    exception mapping while every other test (DB-pool release, the
+    clean-transaction 500 guard, template_id persistence) stayed green.
+
+    Note: template-agent-resolution.ts (the frontend's create-or-reuse
+    flow) does not itself branch on this string - it only checks
+    response.ok and surfaces the HTTP status. This test's value is the
+    stable API contract, not a cross-stack string dependency.
+    """
+
+    headers = _admin_headers()
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            return {
+                "id": template_id,
+                "name": "Duplicate Name Agent",
+                "descriptions": {"en": "Created from a template"},
+                "agent_config": {
+                    "instructions": "Follow the template.",
+                    "execution_mode": "balanced",
+                },
+            }
+
+    monkeypatch.setattr(
+        client.app.state, "template_manager", TemplateManagerStub(), raising=False
+    )
+
+    first_response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "dup-name-template"},
+    )
+    assert first_response.status_code == 200, first_response.text
+
+    second_response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "dup-name-template-2"},
+    )
+    assert second_response.status_code == 400
+    assert second_response.json()["detail"] == "Agent with this name already exists"
+
+
+class _ResolveTemplateManagerStub:
+    """Minimal template manager for the resolve-flow tests."""
+
+    def __init__(self, name: str = "Resolve Flow Agent") -> None:
+        self.name = name
+
+    async def get_template(self, template_id: str) -> dict[str, Any]:
+        return {
+            "id": template_id,
+            "name": self.name,
+            "descriptions": {"en": "Created by the resolve flow"},
+            "agent_config": {
+                "instructions": "Follow the template.",
+                "execution_mode": "balanced",
+            },
+        }
+
+
+def _install_resolve_template_stub(
+    monkeypatch: pytest.MonkeyPatch, name: str = "Resolve Flow Agent"
+) -> None:
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        _ResolveTemplateManagerStub(name),
+        raising=False,
+    )
+
+
+class _MalformedCapabilitiesTemplateManagerStub(_ResolveTemplateManagerStub):
+    """A template whose authored tool_categories/skills contain a
+    non-string element (e.g. an authoring typo) - agent_management.py's
+    _spec_from_template must filter these out rather than let them reach
+    AgentResponse's strict list[str] fields as an unhandled Pydantic
+    ValidationError."""
+
+    async def get_template(self, template_id: str) -> dict[str, Any]:
+        template = await super().get_template(template_id)
+        template["agent_config"]["tool_categories"] = [123, "web_search", None]
+        template["agent_config"]["skills"] = ["real_skill", {"bad": "shape"}]
+        return template
+
+
+def test_resolve_from_template_creates_and_publishes_on_first_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    response = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created"] is True
+    assert body["agent"]["template_id"] == "resolve-template"
+    assert body["agent"]["status"] == "published"
+    assert body["agent"]["name"] == "Resolve Flow Agent"
+
+
+def test_resolve_from_template_reuses_the_same_agent_on_repeat_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point of the resolve endpoint (PR review D1): repeat sends
+    must converge on one agent per (user, template), enforced server-side
+    rather than by client-side reconciliation."""
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    first = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] is False
+    assert second.json()["agent"]["id"] == first.json()["agent"]["id"]
+
+    listed = client.get("/api/agents", headers=headers).json()
+    matching = [a for a in listed if a.get("template_id") == "resolve-template"]
+    assert len(matching) == 1
+
+
+def test_resolve_from_template_drops_non_string_capability_elements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed tool_categories/skills entry in the template's authored
+    agent_config must not 500 the resolve endpoint - it must be filtered
+    out, the same way get_agent_capability_lists filters it for the
+    marketplace list/detail endpoints."""
+    headers = _admin_headers()
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        _MalformedCapabilitiesTemplateManagerStub(),
+        raising=False,
+    )
+
+    response = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "malformed-capabilities-template"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()["agent"]
+    assert body["tool_categories"] == ["web_search"]
+    assert body["skills"] == ["real_skill"]
+
+
+def test_resolve_from_template_increments_used_count_only_on_the_fresh_mint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hire is the primary adoption path for every currently-featured
+    template, and the Featured section's hero ranking sorts by used_count -
+    a resolve call that mints a fresh agent must record a use, exactly once,
+    not on every repeat/idempotent call."""
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    def used_count() -> int:
+        db = _direct_db_session()
+        try:
+            stats = (
+                db.query(TemplateStats)
+                .filter(TemplateStats.template_id == "resolve-template")
+                .first()
+            )
+            return stats.used_count if stats else 0
+        finally:
+            db.close()
+
+    first = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["created"] is True
+    assert used_count() == 1
+
+    second = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] is False
+    assert used_count() == 1
+
+
+def test_resolve_from_template_does_not_adopt_a_workforce_builder_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding B4: the plain POST
+    /from-template (workforce-builder UI, one-off named creates) writes
+    template_id but not the quick-access origin marker. The resolve flow's
+    reuse query must not adopt (and publish) that unrelated draft - it has
+    to mint its own separate quick-access agent instead."""
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    created = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["status"] == "draft"
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is True
+    assert resolved.json()["agent"]["id"] != created.json()["id"]
+    assert resolved.json()["agent"]["status"] == "published"
+
+    # The workforce-builder draft is untouched - still its own draft.
+    workforce_draft = client.get(f"/api/agents/{created.json()['id']}", headers=headers)
+    assert workforce_draft.status_code == 200, workforce_draft.text
+    assert workforce_draft.json()["status"] == "draft"
+
+
+def test_resolve_from_template_does_not_republish_a_deliberate_unpublish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding B3: status/published_at alone
+    can't distinguish "never published yet" from "the user explicitly
+    unpublished it" - both are status=draft, published_at=None. Resolve must
+    not silently flip a deliberate unpublish back to published on a later,
+    unrelated call."""
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    first = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["agent"]["status"] == "published"
+    agent_id = first.json()["agent"]["id"]
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+    assert unpublished.json()["agent"]["status"] == "draft"
+
+    second = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] is False
+    assert second.json()["agent"]["id"] == agent_id
+    assert second.json()["agent"]["status"] == "draft"
+
+
+def test_resolve_from_template_never_touches_another_users_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding F1: resolving a template must
+    only ever consider the caller's own agents - another user's draft from
+    the same template stays untouched (not reused, not published)."""
+
+    _install_resolve_template_stub(monkeypatch)
+
+    # Bootstrap the admin (first user) before the public register endpoint
+    # will accept a second account.
+    headers = _admin_headers()
+
+    other_headers = _register_second_user(username="resolveother")
+    other_draft = client.post(
+        "/api/agents/from-template",
+        headers=other_headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert other_draft.status_code == 200, other_draft.text
+    other_agent_id = other_draft.json()["id"]
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is True
+    assert resolved.json()["agent"]["id"] != other_agent_id
+    assert resolved.json()["agent"]["status"] == "published"
+
+    other_view = client.get(f"/api/agents/{other_agent_id}", headers=other_headers)
+    assert other_view.status_code == 200, other_view.text
+    assert other_view.json()["status"] == "draft"
+
+
+def test_resolve_from_template_disambiguates_a_colliding_default_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated agent already holding the template's default name must
+    not fail the resolve - the server picks a free name itself instead of
+    surfacing the duplicate-name 400 the plain create path returns."""
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+    _create_agent(headers, name="Resolve Flow Agent")
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    body = resolved.json()
+    assert body["created"] is True
+    assert body["agent"]["name"] != "Resolve Flow Agent"
+    assert body["agent"]["name"].startswith("Resolve Flow Agent")
+    assert body["agent"]["status"] == "published"
+
+
+def test_resolve_from_template_converges_when_a_racing_insert_wins_the_same_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding F3: if a concurrent request
+    creates this template's agent between our select and our insert, the
+    retry loop must re-select and reuse that row instead of erroring or
+    minting a duplicate. Here the racing insert collides on name too, which
+    is caught by the (user_id, name) unique index alone - see the sibling
+    test below for the interleaving where names do *not* collide (B1/B2)."""
+
+    from xagent.web.services import agent_management as management_module
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    real_resolve_name = management_module.resolve_unique_agent_name
+    racing_agent_id: dict[str, int] = {}
+
+    def race_then_delegate(db: Any, *, user_id: int, name: str) -> str:
+        # Simulate a concurrent request winning the race: insert this
+        # template's agent (as the same user) after resolve's select missed
+        # but before its own insert, then hand back the template's default
+        # name so the insert collides on the unique index.
+        if not racing_agent_id:
+            store = AgentStore(db)
+            racing = store.create_agent(
+                user_id=user_id,
+                name=name,
+                description="raced in first",
+                instructions="Follow the template.",
+                execution_mode="balanced",
+                template_id="resolve-template",
+                origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+            )
+            db.commit()
+            racing_agent_id["id"] = int(racing.id)
+            return name
+        return real_resolve_name(db, user_id=user_id, name=name)
+
+    monkeypatch.setattr(
+        management_module, "resolve_unique_agent_name", race_then_delegate
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is False
+    assert resolved.json()["agent"]["id"] == racing_agent_id["id"]
+
+
+def test_resolve_from_template_converges_when_a_racing_insert_wins_a_different_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding B2: the realistic interleaving
+    is a racing insert that takes its *own* disambiguated name - no
+    (user_id, name) collision at all - which the plain name-collision retry
+    from the sibling test above can't catch (it never fires, so the old
+    code's retry loop never re-selected, and two rows ended up sharing one
+    template_id with different names, both reporting created=True).
+    Convergence here depends entirely on
+    AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX - the (user_id, template_id)
+    partial unique index scoped to the quick-access origin (B1/D2/D3)."""
+
+    from xagent.web.services import agent_management as management_module
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    real_resolve_name = management_module.resolve_unique_agent_name
+    racing_agent_id: dict[str, int] = {}
+
+    def race_then_delegate(db: Any, *, user_id: int, name: str) -> str:
+        # Simulate a concurrent request winning the race between our SELECT
+        # and our INSERT - but, unlike the sibling test above, under a
+        # disambiguated name that never collides with our own. Only the
+        # first call (the "our own" resolve's own resolve_unique_agent_name
+        # lookup) triggers the race; the racing insert's own internal
+        # resolve_unique_agent_name call must not recurse into this hook.
+        if not racing_agent_id:
+            store = AgentStore(db)
+            racing = store.create_agent(
+                user_id=user_id,
+                name="Totally Unrelated Name",
+                description="raced in first, under a name that never collides",
+                instructions="Follow the template.",
+                execution_mode="balanced",
+                template_id="resolve-template",
+                origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+                status=AgentStatus.PUBLISHED,
+            )
+            db.commit()
+            racing_agent_id["id"] = int(racing.id)
+            # Our own insert proceeds under its natural, undisambiguated
+            # name - no name collision occurs at all.
+            return name
+        return real_resolve_name(db, user_id=user_id, name=name)
+
+    monkeypatch.setattr(
+        management_module, "resolve_unique_agent_name", race_then_delegate
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is False
+    assert resolved.json()["agent"]["id"] == racing_agent_id["id"]
+    assert resolved.json()["agent"]["name"] == "Totally Unrelated Name"
+
+
+def test_resolve_from_template_reports_409_when_retries_are_exhausted_by_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When every TEMPLATE_RESOLVE_RACE_RETRIES attempt loses the
+    (user_id, template_id) quick-access race, the error must say so
+    honestly - not the name-collision 400, since no name collision is
+    involved at all in this failure mode."""
+    from xagent.web.services import agent_management as management_module
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    def always_races(*args: Any, **kwargs: Any) -> Any:
+        raise TemplateQuickAccessRaceError("resolve-template")
+
+    monkeypatch.setattr(
+        management_module.AgentManagementService,
+        "create_agent_with_optional_key",
+        always_races,
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 409, resolved.text
+    assert "name" not in resolved.json()["detail"].lower()
+
+
+def test_resolve_from_template_reports_409_when_a_race_hit_precedes_final_name_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding m6: retry exhaustion must
+    report the quick-access race (409) whenever *any* attempt hit it, even
+    if the *last* attempt's collision happened to be a plain name collision
+    instead. Before this fix, only the last error's type was tracked, so
+    this exact interleaving (race, then name-collision, then name-collision)
+    surfaced a misleading 400 "Agent with this name already exists" - which
+    is wrong, since the caller never even chose a colliding name."""
+    from xagent.web.services import agent_management as management_module
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    attempts = {"n": 0}
+
+    def race_then_name_collisions(*args: Any, **kwargs: Any) -> Any:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise TemplateQuickAccessRaceError("resolve-template")
+        raise management_module.DuplicateAgentNameError("Resolve Flow Agent")
+
+    monkeypatch.setattr(
+        management_module.AgentManagementService,
+        "create_agent_with_optional_key",
+        race_then_name_collisions,
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 409, resolved.text
+    assert "name" not in resolved.json()["detail"].lower()
+
+
+def test_manually_created_agent_has_no_template_id() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Hand-built agent")
+
+    response = client.get(f"/api/agents/{agent_id}", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["template_id"] is None
+
+
+def test_duplicate_agent_name_returns_400_with_stable_detail() -> None:
+    """Pins the exact 400 detail string POST /api/agents returns on a name
+    collision, so a refactor of this endpoint's exception mapping doesn't
+    silently change the API contract."""
+
+    headers = _admin_headers()
+    _create_agent(headers, name="Duplicate Name Agent")
+
+    response = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Duplicate Name Agent",
+            "description": "test",
+            "instructions": "You are a test agent.",
+            "execution_mode": "balanced",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Agent with this name already exists"
+
+
+def test_db_constraint_catches_name_race_the_app_precheck_missed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Simulates two concurrent requests both passing the app-level
+    pre-check before either commits: the DB partial unique index must still
+    reject the second insert with a clean DuplicateAgentNameError (400), not
+    a raw IntegrityError (500).
+    """
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    monkeypatch.setattr(AgentStore, "agent_name_exists", lambda self, *a, **k: False)
+
+    first = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Raced Agent Name",
+            "description": "test",
+            "instructions": "You are a test agent.",
+            "execution_mode": "balanced",
+        },
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Raced Agent Name",
+            "description": "test",
+            "instructions": "You are a test agent.",
+            "execution_mode": "balanced",
+        },
+    )
+    assert second.status_code == 400, second.text
+    assert second.json()["detail"] == "Agent with this name already exists"
+
+
+def test_update_agent_translates_a_raced_rename_collision_to_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding R1-1: update_agent's
+    agent_name_exists precheck is a fast path, not the source of truth,
+    exactly like create_agent's - so a rename that races past it must still
+    surface the DB's uq_agents_user_id_name_active violation as a clean 400,
+    not an uncaught IntegrityError leaking as a 500 (update_agent had no
+    equivalent to create_agent's `except IntegrityError` handler)."""
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    _create_agent(headers, name="Rename Race Target")
+    renamed_id = _create_agent(headers, name="Rename Race Source")
+
+    monkeypatch.setattr(AgentStore, "agent_name_exists", lambda self, *a, **k: False)
+
+    response = client.put(
+        f"/api/agents/{renamed_id}",
+        headers=headers,
+        json={"name": "Rename Race Target"},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "Agent with this name already exists"
+
+
 def _create_agent_row(
     *,
     user_id: int,
@@ -173,6 +851,7 @@ def _create_agent_row(
     share_token: str | None = None,
     widget_key: str | None = None,
     generate_widget_key: bool = True,
+    suggested_prompts: list[str] | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
@@ -191,6 +870,7 @@ def _create_agent_row(
             share_enabled=share_enabled,
             share_token=share_token,
             widget_key=widget_key,
+            suggested_prompts=suggested_prompts or [],
         )
         db.add(agent)
         db.commit()
@@ -206,6 +886,22 @@ def _widget_key_for(agent_id: int) -> str:
         agent = db.query(Agent).filter(Agent.id == agent_id).first()
         assert agent is not None and agent.widget_key
         return str(agent.widget_key)
+    finally:
+        db.close()
+
+
+def _set_agent_status(agent_id: int, status: AgentStatus) -> None:
+    """Write a status straight to the row.
+
+    Only needed for ``ARCHIVED``: no web API route assigns it, so the
+    ``!= PUBLISHED`` shape of the widget gates cannot be exercised through the
+    real ``/unpublish`` endpoint, which hardcodes ``DRAFT``.
+    """
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.status = status
+        db.commit()
     finally:
         db.close()
 
@@ -365,6 +1061,52 @@ def test_list_agents_includes_owned_agents_and_policy_visible_agents() -> None:
     assert items_by_id[shared_draft_id]["access"] == "policy"
     assert items_by_id[shared_draft_id]["status"] == "draft"
     assert items_by_id[shared_draft_id]["readonly"] is True
+
+
+def test_list_agents_response_carries_suggested_prompts_through_owner_and_policy_rows() -> (
+    None
+):
+    # tests/web/test_agent_visibility.py only exercises
+    # AgentStore.agent_to_list_item_dict directly - this drives the real
+    # GET /api/agents route so a future regression in AgentListItem's
+    # response-model validation or the permission-merge step in
+    # _serialize_agent_list_item would actually be caught here, not just
+    # at the store layer the /task "My Team" picker's auto-fill depends on.
+    _admin_headers()
+    bob_headers = _register_second_user()
+    admin_id = _user_id("admin")
+    bob_id = _user_id("bob")
+
+    bob_with_prompts_id = _create_agent_row(
+        user_id=bob_id,
+        name="Bob With Prompts",
+        status=AgentStatus.PUBLISHED,
+        suggested_prompts=["Draft a status update"],
+    )
+    bob_without_prompts_id = _create_agent_row(
+        user_id=bob_id,
+        name="Bob Without Prompts",
+        status=AgentStatus.PUBLISHED,
+    )
+    shared_with_prompts_id = _create_agent_row(
+        user_id=admin_id,
+        name="Shared With Prompts",
+        status=AgentStatus.PUBLISHED,
+        suggested_prompts=["Summarize today's meetings"],
+    )
+    set_workforce_policy(_VisibleAgentPolicy({shared_with_prompts_id}))
+
+    response = client.get("/api/agents", headers=bob_headers)
+    assert response.status_code == 200, response.text
+    items_by_id = {item["id"]: item for item in response.json()}
+
+    assert items_by_id[bob_with_prompts_id]["suggested_prompts"] == [
+        "Draft a status update"
+    ]
+    assert items_by_id[bob_without_prompts_id]["suggested_prompts"] == []
+    assert items_by_id[shared_with_prompts_id]["suggested_prompts"] == [
+        "Summarize today's meetings"
+    ]
 
 
 def test_agent_lists_keep_reusable_managers_and_hide_generated_managers() -> None:
@@ -1136,6 +1878,110 @@ def test_widget_task_create_persists_connector_runtime_selection_snapshot() -> N
             .one()
         )
         assert task.connector_runtime_selected_refs == []
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
+    finally:
+        db.close()
+
+
+def test_widget_task_create_drops_forged_runtime_extension_bindings() -> None:
+    """Widget guests are explicitly denied ``runtime_extensions`` (400), yet the
+    client ``agent_config`` copy would still let a guest write the server-owned
+    per-task binding record directly. Task deletion dispatches provider cleanup
+    by that record, so a forged entry naming a broken provider can wedge the
+    owner's task."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Widget Binding Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["example.com"],
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    create_task_response = client.post(
+        "/api/widget/chat/task/create",
+        json={
+            "title": "forged binding",
+            "description": "forged binding",
+            "agent_id": agent_id,
+            "agent_config": {
+                TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY: ["victim_ext"],
+                "keep_me": "client value",
+            },
+        },
+        headers=guest_headers,
+    )
+    assert create_task_response.status_code == 200, create_task_response.text
+
+    db = _direct_db_session()
+    try:
+        task = (
+            db.query(Task)
+            .filter(Task.id == create_task_response.json()["task_id"])
+            .one()
+        )
+        assert task_extension_bindings_from_agent_config(task.agent_config) == ()
+        # Only the reserved key goes; ordinary client config and the
+        # server-owned keys layered on top both survive.
+        assert task.agent_config.get("keep_me") == "client value"
+        assert task.agent_config.get("auth_mode") == "widget"
+        assert task.agent_config.get("guest_id") == "guest-1"
+    finally:
+        db.close()
+
+
+def test_widget_task_create_drops_forged_execution_scope() -> None:
+    """A widget guest cannot pre-seed the scope snapshot that governs where a
+    task's bytes land -- sandbox mount, storage prefix, workspace directory,
+    memory dimensions -- or the bound file list, by naming either in the
+    request body's ``agent_config``.
+    """
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Widget Scope Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["example.com"],
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    create_task_response = client.post(
+        "/api/widget/chat/task/create",
+        json={
+            "title": "forged scope",
+            "description": "forged scope",
+            "agent_id": agent_id,
+            "agent_config": {
+                EXECUTION_SCOPE_AGENT_CONFIG_KEY: {
+                    "sandbox_key_suffix": "victim",
+                    "workspace_segments": ["victim"],
+                    "memory_dimensions": {"tenant": "victim"},
+                },
+                SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
+                "keep_me": "client value",
+            },
+        },
+        headers=guest_headers,
+    )
+    assert create_task_response.status_code == 200, create_task_response.text
+
+    db = _direct_db_session()
+    try:
+        task = (
+            db.query(Task)
+            .filter(Task.id == create_task_response.json()["task_id"])
+            .one()
+        )
+        assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
+        assert execution_scope_from_agent_config(task.agent_config) is None
+        assert SELECTED_FILE_IDS_AGENT_CONFIG_KEY not in task.agent_config
+        assert task.agent_config.get("keep_me") == "client value"
+        assert task.agent_config.get("auth_mode") == "widget"
+        assert task.agent_config.get("guest_id") == "guest-1"
     finally:
         db.close()
 
@@ -1201,6 +2047,316 @@ def test_rotated_widget_key_invalidates_existing_guest_tokens() -> None:
     response = _create_widget_task(guest_headers, agent_id)
     assert response.status_code == 403, response.text
     assert response.json()["detail"] == "Widget is unavailable"
+
+
+def test_unpublishing_agent_invalidates_existing_widget_guest_tokens() -> None:
+    """Unpublishing an agent must invalidate already-issued guest JWTs on their
+    next request — the third revocation lever alongside disable and rotate.
+
+    ``unpublish_agent`` only flips ``status``; it leaves ``widget_enabled`` and
+    ``widget_key`` intact on purpose, so that re-publishing restores the same
+    embed snippet. That makes the per-request check in
+    ``ensure_widget_agent_available`` the thing that has to enforce this (#1055).
+    """
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Invalidate Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    # Sanity: the guest token works while the agent is published.
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def test_republishing_agent_restores_widget_access_for_existing_tokens() -> None:
+    """Unpublish is a reversible lever: re-publishing revives the same guest
+    token, because the widget key it pins was never rotated. Locks in why the
+    status check lives in the availability helper rather than in
+    ``unpublish_agent`` clearing ``widget_enabled`` (#1055)."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Republish Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+    key_before = _widget_key_for(agent_id)
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+    assert _create_widget_task(guest_headers, agent_id).status_code == 403
+
+    republished = client.post(f"/api/agents/{agent_id}/publish", headers=headers)
+    assert republished.status_code == 200, republished.text
+
+    assert _widget_key_for(agent_id) == key_before
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+
+def test_widget_auth_rejects_unpublished_agent_key() -> None:
+    """An unpublished agent's widget key must stop minting guest tokens at all,
+    rather than handing out a token that dies on its first real request. Mirrors
+    the workforce branch, which resolves keys only for ``status == 'active'``."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Auth Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    widget_key = _widget_key_for(agent_id)
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"widget_key": widget_key, "guest_id": "guest-1"},
+    )
+    assert response.status_code == 403, response.text
+    # Same detail as an unknown key: publication state must not be probeable.
+    assert response.json()["detail"] == "Invalid widget key"
+
+
+@pytest.mark.parametrize("status", [AgentStatus.DRAFT, AgentStatus.ARCHIVED])
+def test_widget_auth_rejects_agent_that_is_not_published(status: AgentStatus) -> None:
+    """Agents are created ``widget_enabled=True`` with a key already minted, so
+    a never-published draft carries a live widget credential. External access
+    requires publication, so that key must not authenticate either (#1055).
+
+    Parametrized over both non-published states to pin the gate as
+    ``!= PUBLISHED`` rather than ``== DRAFT``; ``ARCHIVED`` is not reachable
+    through the web API today, so nothing else would catch a narrowing."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name=f"Unpublished Widget Agent ({status.value})",
+        status=status,
+        widget_enabled=True,
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"widget_key": _widget_key_for(agent_id), "guest_id": "guest-1"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Invalid widget key"
+
+
+def test_embed_ticket_rejects_unpublished_agent_like_an_unknown_key() -> None:
+    """The embedding page cannot obtain a fresh ticket for an unpublished agent;
+    unpublished and unknown-key collapse to the same 403."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Embed Ticket Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    widget_key = _widget_key_for(agent_id)
+    assert _issue_embed_ticket(agent_id, "https://trusted-site.com").status_code == 200
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    response = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": widget_key},
+        headers={"origin": "https://trusted-site.com"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Invalid widget key"
+
+
+def test_embed_ticket_stops_authenticating_once_agent_is_unpublished() -> None:
+    """A ticket minted while the agent was published must not survive an
+    unpublish inside its 60s TTL: redemption re-derives the agent from live
+    state, mirroring ``_workforce_owner_from_ticket``'s ``active`` check.
+
+    The denial reuses the disabled-widget detail so a caller holding a valid
+    ticket cannot tell the two revocation levers apart."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Ticket Redemption Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    ticket_response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+    assert ticket_response.status_code == 200, ticket_response.text
+    ticket = ticket_response.json()["ticket"]
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+        headers={"origin": "https://xagent-host.example"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is disabled for this agent"
+
+
+def test_widget_guest_token_rejected_when_agent_is_archived() -> None:
+    """``ensure_widget_agent_available`` gates on ``!= PUBLISHED``, not
+    ``== DRAFT``.
+
+    ``test_unpublishing_agent_invalidates_existing_widget_guest_tokens`` covers
+    the DRAFT half, but only through the real ``/unpublish`` endpoint, which
+    hardcodes ``AgentStatus.DRAFT`` and can never produce ``ARCHIVED`` — so a
+    narrowed gate would still pass it. Hence the direct status write."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Archived Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    _set_agent_status(agent_id, AgentStatus.ARCHIVED)
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def test_embed_ticket_rejects_widget_enabled_agent_with_no_widget_key() -> None:
+    """``_get_live_widget_agent`` also requires a live ``widget_key``, matching
+    its three sibling gates.
+
+    Nothing produces ``widget_enabled=True, widget_key=None`` today — creation
+    always mints a key, the update path re-mints one if the flag is toggled on
+    without it, and rotation never nulls it — but no schema constraint forbids
+    the row either. Written directly so the check is pinned: such an agent must
+    fail here rather than redeem the ticket into a guest token that 403s on its
+    first real request."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Keyless Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    ticket_response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+    assert ticket_response.status_code == 200, ticket_response.text
+    ticket = ticket_response.json()["ticket"]
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.widget_key = None
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+        headers={"origin": "https://xagent-host.example"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is disabled for this agent"
+
+
+def test_embed_ticket_stops_authenticating_once_agent_is_archived() -> None:
+    """``_get_live_widget_agent`` gates on ``!= PUBLISHED``, not ``== DRAFT``.
+
+    Same reasoning as ``test_widget_guest_token_rejected_when_agent_is_archived``
+    one gate over: the sibling unpublish test can only reach DRAFT."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Archived Ticket Redemption Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    ticket_response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+    assert ticket_response.status_code == 200, ticket_response.text
+    ticket = ticket_response.json()["ticket"]
+
+    _set_agent_status(agent_id, AgentStatus.ARCHIVED)
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+        headers={"origin": "https://xagent-host.example"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is disabled for this agent"
+
+
+def test_unpublishing_agent_revokes_widget_guest_access_to_task_files() -> None:
+    """The publication gate reaches further than the chat/WS routes: the public
+    file endpoints resolve a guest token through ``get_public_chat_user``
+    (``_validate_public_task_file_access``), which calls the same
+    ``ensure_widget_agent_available``. So unpublishing also cuts a widget guest
+    off from its own task's attachments — part of the shipped blast radius of
+    #1055, and the only widget/guest file-access assertion in the suite."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Unpublish Widget File Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+    access_token = guest_headers["Authorization"].removeprefix("Bearer ")
+
+    created = _create_widget_task(guest_headers, agent_id)
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task_id"]
+
+    uploaded = client.post(
+        "/api/widget/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task", "task_id": str(task_id)},
+        files={"file": ("widget-note.txt", io.BytesIO(b"hello"), "text/plain")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    file_id = uploaded.json()["file_id"]
+
+    allowed = client.get(
+        f"/api/files/public/download/{file_id}", params={"token": access_token}
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.content == b"hello"
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+
+    denied = client.get(
+        f"/api/files/public/download/{file_id}", params={"token": access_token}
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["detail"] == "Widget is unavailable"
 
 
 def test_widget_guest_token_rejected_when_agent_becomes_generated_manager() -> None:
@@ -2575,3 +3731,120 @@ def test_policy_shared_non_admin_reads_agent_detail_read_only():
     body = resp.json()
     assert body["readonly"] is True
     assert body["can_edit"] is False
+
+
+def _set_preferences(user_id: int, preferences: dict[str, Any]) -> None:
+    db = _direct_db_session()
+    try:
+        user = db.get(User, user_id)
+        assert user is not None
+        user.preferences = preferences
+        db.commit()
+    finally:
+        db.close()
+
+
+class TestApplyUserVoice:
+    """Unit tests for apply_user_voice - the onboarding Launch-step voice
+    preference's system-prompt injection, alongside enhance_system_prompt_with_kb."""
+
+    def test_no_voice_returns_prompt_unchanged(self):
+        assert (
+            _agent_prompt_services.apply_user_voice("Be helpful.", None)
+            == "Be helpful."
+        )
+
+    def test_unrecognized_voice_value_returns_prompt_unchanged(self):
+        assert (
+            _agent_prompt_services.apply_user_voice("Be helpful.", "sarcastic")
+            == "Be helpful."
+        )
+
+    def test_list_voice_value_does_not_raise_and_returns_prompt_unchanged(self):
+        # The JSON `preferences` column has no nested-type constraint, so a
+        # corrupted/hand-edited row could hold a list here. A list is truthy
+        # but unhashable - `dict.get` on it would raise TypeError instead of
+        # degrading to plain output.
+        assert (
+            _agent_prompt_services.apply_user_voice("Be helpful.", ["concise"])
+            == "Be helpful."
+        )
+
+    def test_dict_voice_value_does_not_raise_and_returns_prompt_unchanged(self):
+        assert (
+            _agent_prompt_services.apply_user_voice("Be helpful.", {"voice": "concise"})
+            == "Be helpful."
+        )
+
+    def test_known_voice_appends_output_voice_section(self):
+        result = _agent_prompt_services.apply_user_voice("Be helpful.", "concise")
+
+        assert result.startswith("Be helpful.\n\n## OUTPUT VOICE\n")
+        assert "As short as possible" in result
+
+    def test_none_system_prompt_with_voice_omits_leading_blank_lines(self):
+        result = _agent_prompt_services.apply_user_voice(None, "warm")
+
+        assert result.startswith("## OUTPUT VOICE\n")
+
+    def test_every_valid_voice_has_a_matching_instruction(self):
+        # Guards the module-level consistency assertion in agents.py itself
+        # (VALID_USER_VOICES vs _VOICE_INSTRUCTIONS) with an explicit test,
+        # so a future divergence fails a test, not just an import-time assert.
+        assert set(agents_api._VOICE_INSTRUCTIONS) == agents_api.VALID_USER_VOICES
+
+
+class TestVoiceFromRuntimeUser:
+    """Unit tests for voice_from_runtime_user - extracts the voice
+    preference without issuing a new query, from whichever runtime-user
+    shape a caller already has in hand (see apply_user_voice's docstring
+    for why a fresh query is deliberately avoided here)."""
+
+    def test_none_runtime_user_returns_none(self):
+        assert _agent_prompt_services.voice_from_runtime_user(None) is None
+
+    def test_runtime_user_fields_with_voice_set(self):
+        runtime_user = RuntimeUserFields(id=1, is_admin=False, voice="friendly")
+        assert (
+            _agent_prompt_services.voice_from_runtime_user(runtime_user) == "friendly"
+        )
+
+    def test_runtime_user_fields_with_no_voice(self):
+        runtime_user = RuntimeUserFields(id=1, is_admin=False)
+        assert _agent_prompt_services.voice_from_runtime_user(runtime_user) is None
+
+    def test_full_user_orm_row_reads_from_preferences(self):
+        _admin_headers()
+        user_id = _user_id("admin")
+        _set_preferences(user_id, {"voice": "playful"})
+
+        db = _direct_db_session()
+        try:
+            user = db.get(User, user_id)
+            assert _agent_prompt_services.voice_from_runtime_user(user) == "playful"
+        finally:
+            db.close()
+
+    def test_full_user_orm_row_with_no_preferences(self):
+        _admin_headers()
+        user_id = _user_id("admin")
+        _set_preferences(user_id, {})
+
+        db = _direct_db_session()
+        try:
+            user = db.get(User, user_id)
+            assert _agent_prompt_services.voice_from_runtime_user(user) is None
+        finally:
+            db.close()
+
+    def test_unexpected_shape_does_not_raise(self):
+        # A caller passing something that's neither RuntimeUserFields nor a
+        # real User row (e.g. a mismatched test double) must degrade to "no
+        # voice" rather than crash agent construction over a cosmetic
+        # preference - see test_agent_manager_reconstruction.py's
+        # test_admin_task_uses_task_owner_workspace_dirs, which broke this
+        # way when apply_user_voice used to query on its own.
+        class _NotAUser:
+            pass
+
+        assert _agent_prompt_services.voice_from_runtime_user(_NotAUser()) is None

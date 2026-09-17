@@ -115,6 +115,7 @@ class TestPythonExecutorTool:
                 "filename": "report.docx",
                 "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 "display": "inline",
+                "validation": result["file_refs"][0]["validation"],
             }
         ]
 
@@ -125,7 +126,7 @@ class TestPythonExecutorTool:
 
         result = executor.run_json_sync(
             {
-                "code": "from pathlib import Path\nPath('data.xlsx').write_bytes(b'xlsx')",
+                "code": "from openpyxl import Workbook\nWorkbook().save('data.xlsx')",
                 "capture_output": True,
             }
         )
@@ -136,6 +137,25 @@ class TestPythonExecutorTool:
         assert result["artifacts"][0]["type"] == "spreadsheet"
         assert result["artifacts"][0]["file_id"] == result["file_refs"][0]["file_id"]
         assert result["artifacts"][0]["display"] == "inline"
+        assert result["artifacts"][0]["validation"]["status"] == "valid"
+
+    def test_invalid_xlsx_keeps_execution_success_and_repair_handle(self, tmp_path):
+        workspace = TaskWorkspace("test_python_invalid_xlsx", str(tmp_path))
+        executor = PythonExecutorTool(workspace=workspace)
+        result = executor.run_json_sync(
+            {"code": "from pathlib import Path\nPath('data.xlsx').write_bytes(b'xlsx')"}
+        )
+        assert result["success"] is True
+        assert result["file_refs"][0]["file_id"]
+        assert result["file_refs"][0]["validation"]["status"] == "invalid"
+        repaired = executor.run_json_sync(
+            {"code": "from openpyxl import Workbook\nWorkbook().save('data.xlsx')"}
+        )
+        assert repaired["file_refs"][0]["validation"]["status"] == "valid"
+        assert (
+            repaired["file_refs"][0]["validation"]["sha256"]
+            != result["file_refs"][0]["validation"]["sha256"]
+        )
 
     def test_overwritten_generated_file_returns_inline_artifact(self, tmp_path):
         """Test overwritten generated files are exposed as inline artifacts."""
@@ -167,6 +187,7 @@ class TestPythonExecutorTool:
                 "filename": "report.docx",
                 "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 "display": "inline",
+                "validation": second_result["file_refs"][0]["validation"],
             }
         ]
 

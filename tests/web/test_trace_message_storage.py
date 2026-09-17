@@ -25,7 +25,6 @@ from xagent.core.agent.trace import (
 )
 from xagent.core.tools.adapters.vibe.connector_runtime import REDACTED_RUNTIME_SECRET
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
-from xagent.web.api.trace_handlers import DatabaseTraceHandler
 from xagent.web.models.database import Base
 from xagent.web.models.task import (
     Task,
@@ -37,6 +36,7 @@ from xagent.web.models.task import (
     TraceMessageBlob,
 )
 from xagent.web.models.user import User
+from xagent.web.services.trace_handlers import DatabaseTraceHandler
 from xagent.web.services.trace_message_storage import (
     CHECKPOINT_BLOB_REF_ENCODING,
     LEDGER_REFS_ENCODING,
@@ -684,7 +684,7 @@ def test_database_trace_handler_stores_checkpoint_messages_as_refs(
         assert db.query(TraceCheckpointBlob).count() == 2
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         loaded = handler._sync_load_latest_checkpoint("exec-handler")
@@ -876,7 +876,7 @@ def test_database_trace_handler_reads_old_inline_checkpoint(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
@@ -928,7 +928,7 @@ def test_database_trace_handler_falls_back_when_latest_refs_are_unreadable(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
@@ -1203,12 +1203,12 @@ def test_database_trace_handler_prunes_checkpoint_history(
         task_id = int(task.id)
         handler = DatabaseTraceHandler(task_id)
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+            "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
             lambda: 3,
         )
         # Force the batched-delete loop to run multiple chunks.
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.SQL_IN_CLAUSE_CHUNK_SIZE",
+            "xagent.web.services.trace_handlers.SQL_IN_CLAUSE_CHUNK_SIZE",
             1,
         )
 
@@ -1314,7 +1314,7 @@ def test_loader_falls_back_to_older_row_when_prefetch_raises(
         db.commit()
 
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_db",
+            "xagent.web.services.trace_handlers.get_db",
             lambda: _get_db_factory(SessionLocal),
         )
         # The newest row needs the prefetch (it has refs) and fails; the
@@ -1346,7 +1346,7 @@ def test_prune_matches_legacy_execution_id_shapes(
         task_id = int(task.id)
         handler = DatabaseTraceHandler(task_id)
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+            "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
             lambda: 2,
         )
         now = datetime.now(timezone.utc)
@@ -1412,6 +1412,85 @@ def test_prune_matches_legacy_execution_id_shapes(
         db.close()
 
 
+def test_checkpoint_execution_id_predicate_matches_the_python_helper() -> None:
+    """The read query and history pruning share one SQL predicate; it must
+    agree with ``checkpoint_execution_id()`` (the Python SSOT the storage
+    encoder also follows) on every shape a stored row can take, not just the
+    common one. A row with no execution-id information anywhere never
+    matches a real, non-empty id -- absence and the empty string are the
+    same SQL fact."""
+    from xagent.core.agent.checkpoint import checkpoint_execution_id
+    from xagent.web.services.trace_handlers import _checkpoint_execution_id_predicate
+
+    real_execution_id = "exec-parity-real"
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        rows = {
+            "absent-fields": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"context": {"messages": []}},
+            },
+            "present-but-empty": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "root_execution_id": "",
+                "execution_id": "",
+                "snapshot": {"context": {"messages": []}},
+            },
+            "snapshot-only": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {
+                    "execution_id": real_execution_id,
+                    "context": {"messages": []},
+                },
+            },
+            "tagged-only": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "root_execution_id": real_execution_id,
+                "snapshot": {"context": {"messages": []}},
+            },
+        }
+        for event_id, data in rows.items():
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=event_id,
+                    event_type="system_update_general",
+                    timestamp=datetime.now(timezone.utc),
+                    data=data,
+                )
+            )
+        db.commit()
+
+        # The Python SSOT: only the two id-bearing shapes resolve to the
+        # real execution id, regardless of whether it came from the root
+        # tag or the nested snapshot.
+        expected_matches = {"snapshot-only", "tagged-only"}
+        for event_id, data in rows.items():
+            resolved = checkpoint_execution_id(data)
+            if event_id in expected_matches:
+                assert resolved == real_execution_id, event_id
+            else:
+                assert resolved == "", event_id
+
+        # The SQL predicate must select exactly the same matching set.
+        matched_ids = {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent)
+            .filter(
+                DatabaseTraceEvent.task_id == task_id,
+                _checkpoint_execution_id_predicate(real_execution_id),
+            )
+            .all()
+        }
+        assert matched_ids == expected_matches
+    finally:
+        db.close()
+
+
 def test_database_trace_handler_prune_disabled_keeps_all_checkpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1422,7 +1501,7 @@ def test_database_trace_handler_prune_disabled_keeps_all_checkpoints(
         task_id = int(task.id)
         handler = DatabaseTraceHandler(task_id)
         monkeypatch.setattr(
-            "xagent.web.api.trace_handlers.get_checkpoint_history_limit",
+            "xagent.web.services.trace_handlers.get_checkpoint_history_limit",
             lambda: 0,
         )
 
@@ -1599,4 +1678,755 @@ def test_convert_trace_checkpoint_messages_continues_after_row_error(
             == MESSAGE_REFS_ENCODING
         )
     finally:
+        db.close()
+
+
+def test_load_checkpoint_query_failure_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    def broken_get_db() -> Iterator[Session]:
+        raise RuntimeError("pool checkout failed")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", broken_get_db)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError):
+            handler._sync_load_latest_checkpoint("exec-query-failure")
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+@pytest.mark.asyncio
+async def test_load_checkpoint_async_wrapper_propagates_query_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async wrapper must not collapse a read failure back to ``None``."""
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    def broken_get_db() -> Iterator[Session]:
+        raise RuntimeError("pool checkout failed")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", broken_get_db)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError):
+            await handler.load_latest_checkpoint("exec-query-failure-async")
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+def test_load_checkpoint_zero_rows_returns_none_and_clears_stale_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+        register_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        # A prior transient failure left the signal active; a query that
+        # completes successfully -- even with zero matching rows -- must
+        # clear it, not just a query that finds a checkpoint.
+        register_degradation(CHECKPOINT_LOAD_UNAVAILABLE, "stale from a prior failure")
+        try:
+            loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-empty"
+            )
+            assert loaded is None
+            assert CHECKPOINT_LOAD_UNAVAILABLE not in active_degradations()
+        finally:
+            clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_all_rows_undecodable_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every matching row permanently undecodable, set exhausted -> corrupt."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        for offset, event_id in enumerate(["corrupt-old", "corrupt-new"]):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=event_id,
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=offset),
+                    data=_checkpoint_data(
+                        "exec-corrupt",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{event_id}"]),
+                            "refs": [f"sha256:missing-{event_id}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint("exec-corrupt")
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_generic_decode_failure_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient failure on every row must not be reported as corrupt."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        encoded = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data(
+                "exec-transient", [{"role": "user", "content": "needs prefetch"}]
+            ),
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="needs-prefetch",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data=encoded,
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with patch.object(
+            tms,
+            "_load_trace_blob_lookup",
+            side_effect=RuntimeError("transient db error"),
+        ):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "exec-transient"
+                )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_undecodable_full_batch_is_exhausted_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first batch exactly at the page size is not ambiguous: the scan
+    pages past it, finds nothing more, and that proves the matching set was
+    exhausted -- exclusively permanent decode failures is corrupt, not a
+    conservative unavailable."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+    from xagent.web.services.trace_handlers import CHECKPOINT_ROW_SCAN_LIMIT
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        for i in range(CHECKPOINT_ROW_SCAN_LIMIT):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"full-batch-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-full-batch",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-full-batch"
+            )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_scan_continues_past_a_batch_of_undecodable_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A readable row in a later batch is still found -- the scan does not
+    give up after the first page, it pages until the set is exhausted or a
+    readable row turns up."""
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        # Newest four rows (scanned first, in two pages of two) are
+        # undecodable; the oldest row (third page) is readable.
+        for i in range(4):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"multi-batch-bad-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=10 - i),
+                    data=_checkpoint_data(
+                        "exec-multi-batch",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="multi-batch-readable",
+                event_type="system_update_general",
+                timestamp=now,
+                data=_checkpoint_data(
+                    "exec-multi-batch", [{"role": "user", "content": "hello"}]
+                ),
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+            "exec-multi-batch"
+        )
+        assert loaded is not None
+        assert loaded["context"]["messages"] == [{"role": "user", "content": "hello"}]
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_scan_exhausts_multiple_batches_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every row across every batch is permanently undecodable, and the
+    scan proves the set exhausted (a page shorter than the batch size) --
+    corrupt, not unavailable."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        for i in range(4):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"multi-batch-corrupt-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-multi-batch-corrupt",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-multi-batch-corrupt"
+            )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_scan_stops_at_max_page_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With history pruning disabled, a backlog large enough to keep paging
+    past the cap must stop and fail unavailable instead of scanning the
+    matching set to exhaustion query by query."""
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        # 4 undecodable rows with a page size of 2 and a page cap of 2 means
+        # both pages come back full (no short page to prove exhaustion), so
+        # the loop must hit the cap on the 3rd iteration instead of issuing
+        # a 3rd query.
+        for i in range(4):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"max-page-cap-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-max-page-cap",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_SCAN_MAX_PAGES", 2
+        )
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        with pytest.raises(CheckpointUnavailableError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-max-page-cap"
+            )
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_load_checkpoint_generic_failure_mid_scan_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generic (transient) failure on one row anywhere in a multi-batch
+    scan is conservatively unavailable, even if every other row in the scan
+    is a confirmed permanent decode failure. The final raise must also
+    register the degradation signal -- the intervening successful page
+    fetches clear it, so nothing else re-raises it before this raise site
+    does."""
+    from unittest.mock import patch
+
+    import xagent.web.services.trace_message_storage as tms
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        # Newest row is marked to fail the blob prefetch generically; it is
+        # otherwise perfectly readable (encoded so decode actually needs the
+        # blob lookup this test makes fail).
+        flaky_data = encode_checkpoint_data_for_storage(
+            db,
+            task_id=task_id,
+            data=_checkpoint_data(
+                "exec-mid-scan-failure",
+                [{"role": "user", "content": "needs prefetch"}],
+            ),
+        )
+        flaky_data["__test_trigger_generic_failure"] = True
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="mid-scan-flaky",
+                event_type="system_update_general",
+                timestamp=now + timedelta(seconds=10),
+                data=flaky_data,
+            )
+        )
+        # Older rows are permanently undecodable, spanning a second batch.
+        for i in range(3):
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=f"mid-scan-corrupt-{i}",
+                    event_type="system_update_general",
+                    timestamp=now + timedelta(seconds=i),
+                    data=_checkpoint_data(
+                        "exec-mid-scan-failure",
+                        {
+                            "__encoding": MESSAGE_REFS_ENCODING,
+                            "count": 1,
+                            "hash": canonical_json_hash([f"sha256:missing-{i}"]),
+                            "refs": [f"sha256:missing-{i}"],
+                        },
+                    ),
+                )
+            )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.CHECKPOINT_ROW_SCAN_LIMIT", 2
+        )
+        original_lookup = tms._load_trace_blob_lookup
+
+        def _flaky_lookup(db: Session, *, task_id: int, data_items: list[Any]) -> Any:
+            if any(
+                isinstance(item, dict) and item.get("__test_trigger_generic_failure")
+                for item in data_items
+            ):
+                raise RuntimeError("transient db error")
+            return original_lookup(db, task_id=task_id, data_items=data_items)
+
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        with patch.object(tms, "_load_trace_blob_lookup", side_effect=_flaky_lookup):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "exec-mid-scan-failure"
+                )
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_load_checkpoint_readable_type_without_snapshot_raises_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that claims to be a checkpoint but carries no payload is corrupt,
+    not absent -- it must not be silently treated as "no checkpoint"."""
+    from xagent.core.agent.checkpoint import CheckpointCorruptError
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="no-snapshot",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "execution_id": "exec-no-snapshot",
+                },
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        with pytest.raises(CheckpointCorruptError):
+            DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                "exec-no-snapshot"
+            )
+    finally:
+        db.close()
+
+
+def test_load_checkpoint_snapshotless_newest_row_does_not_shadow_older_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newest row with a readable checkpoint_type but no snapshot is a
+    per-row permanent failure, not a verdict on the matching set: the scan
+    falls through to the older valid row and returns its snapshot."""
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        now = datetime.now(timezone.utc)
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="shadowing-no-snapshot",
+                event_type="system_update_general",
+                timestamp=now + timedelta(seconds=10),
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "execution_id": "exec-shadowed",
+                },
+            )
+        )
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="shadowing-valid-older",
+                event_type="system_update_general",
+                timestamp=now,
+                data=_checkpoint_data(
+                    "exec-shadowed", [{"role": "user", "content": "hello"}]
+                ),
+            )
+        )
+        db.commit()
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        loaded = DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+            "exec-shadowed"
+        )
+        assert loaded is not None
+        assert loaded["context"]["messages"] == [{"role": "user", "content": "hello"}]
+    finally:
+        db.close()
+
+
+def test_checkpoint_read_failure_preserves_pool_timeout_cause_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Translating a read failure must chain the original exception.
+
+    Resume consumers discriminate pool exhaustion before they act on an
+    unavailable checkpoint, and ``is_database_pool_timeout`` finds that
+    fact by walking ``__cause__``/``__context__``. A translation that drops
+    the chain would make an exhausted-pool read look like an ordinary
+    unavailable one, and the recovery path would answer it by issuing more
+    database writes against the same exhausted pool.
+    """
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.db_runtime import is_database_pool_timeout
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    def timing_out_get_db() -> Iterator[Session]:
+        raise SQLAlchemyTimeoutError("QueuePool limit reached")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr("xagent.web.services.trace_handlers.get_db", timing_out_get_db)
+    clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+    try:
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError) as checkout_failure:
+            handler._sync_load_latest_checkpoint("exec-checkout-timeout")
+        assert is_database_pool_timeout(checkout_failure.value)
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+
+
+def test_checkpoint_query_failure_preserves_pool_timeout_cause_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The row-scan translation carries the same obligation as checkout."""
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+    from sqlalchemy.orm import Query
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.db_runtime import is_database_pool_timeout
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+
+        def failing_all(self: Query) -> Any:
+            del self
+            raise SQLAlchemyTimeoutError("QueuePool limit reached")
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        # Only the row scan uses ``.all()``; partition resolution reads
+        # through ``one_or_none``/``first`` and still completes, so this
+        # lands on the row-scan translation rather than the partition one.
+        monkeypatch.setattr(Query, "all", failing_all)
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        handler = DatabaseTraceHandler(task_id)
+        with pytest.raises(CheckpointUnavailableError) as query_failure:
+            handler._sync_load_latest_checkpoint("exec-query-timeout")
+        assert "checkpoint query failed" in str(query_failure.value)
+        assert is_database_pool_timeout(query_failure.value)
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_checkpoint_partition_read_failure_is_translated_and_chained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partition resolution is part of the read, not a step outside it.
+
+    A database failure while resolving which run partition this reader may
+    observe leaves the partition unknown, so the read could not be
+    completed. It must surface as ``CheckpointUnavailableError`` like any
+    other query failure -- a raw driver exception here would bypass every
+    consumer that catches the checkpoint read contract.
+    """
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    from xagent.core.agent.checkpoint import CheckpointUnavailableError
+    from xagent.web.services.db_runtime import is_database_pool_timeout
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+
+        def failing_partition(self: DatabaseTraceHandler, _db: Session) -> Any:
+            del self
+            raise SQLAlchemyTimeoutError("QueuePool limit reached")
+
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        monkeypatch.setattr(
+            DatabaseTraceHandler,
+            "_root_checkpoint_read_partition",
+            failing_partition,
+        )
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        handler = DatabaseTraceHandler(task_id)
+        with pytest.raises(CheckpointUnavailableError) as partition_failure:
+            handler._sync_load_latest_checkpoint("exec-partition-failure")
+        assert is_database_pool_timeout(partition_failure.value)
+        assert CHECKPOINT_LOAD_UNAVAILABLE in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_checkpoint_read_for_missing_task_row_is_unavailable_not_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanished task row is an exceptional condition, not a policy one.
+
+    Refusal means "a checkpoint may exist but this reader is not the one
+    allowed to observe it", which callers answer by leaving the task
+    alone. A task row that is simply gone tells the reader nothing about
+    the partition, so it belongs with the read failures instead -- the two
+    verdicts are decided on adjacent branches and must not collapse.
+    """
+    from xagent.core.agent.checkpoint import (
+        CheckpointAccessRefusedError,
+        CheckpointUnavailableError,
+    )
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        active_degradations,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        monkeypatch.setattr(
+            "xagent.web.services.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError) as missing_row:
+            handler._sync_load_latest_checkpoint("exec-missing-task")
+        assert not isinstance(missing_row.value, CheckpointAccessRefusedError)
+        assert CHECKPOINT_LOAD_UNAVAILABLE not in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         db.close()

@@ -6,16 +6,16 @@ from datetime import datetime
 from typing import Any, cast
 
 from fastapi import HTTPException
-from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from xagent.web.models.agent import Agent
 from xagent.web.models.database import (
     get_session_local,
     release_db_connection_if_clean,
 )
 from xagent.web.models.task import ExecutionMode, Task, TaskStatus
-from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 
@@ -27,16 +27,19 @@ from .db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from .file_turn import bind_turn_files_no_commit
 from .task_orchestrator import (
     TaskTurnOrchestrator,
     TaskTurnPayload,
-    _ClaimedTurn,
+    _PreparedTurn,
+    timezone_schedule_context,
 )
 from .workforce_access import ensure_workforce_access, get_workforce_policy
 from .workforce_errors import WorkforceRunError, WorkforceRunErrorCode
 from .workforce_lifecycle import acquire_workforce_lifecycle_fence
 from .workforce_runtime import sync_workforce_run_status
 from .workforce_snapshot import (
+    build_preview_workforce_snapshot,
     build_workforce_snapshot,
     build_workforce_task_config,
     normalize_text,
@@ -87,7 +90,7 @@ class _PreparedWorkforceRunStart:
     workforce_run: WorkforceRunStartSnapshot
     task: WorkforceTaskStartSnapshot
     payload: TaskTurnPayload | None
-    claimed_turn: _ClaimedTurn | None
+    claimed_turn: _PreparedTurn | None
     created: bool
 
 
@@ -101,6 +104,7 @@ class _NormalizedWorkforceRunRequest:
     source: str
     idempotency_key: str | None
     extra_agent_config: dict[str, Any] | None
+    timezone: str | None
 
 
 def normalize_execution_mode(value: str | None) -> str:
@@ -129,9 +133,13 @@ def _normalize_selected_file_ids(values: list[str] | None) -> list[str]:
     return normalized
 
 
-def _build_task_title(workforce: Workforce, message: str) -> str:
-    title = f"{workforce.name}: {message}"
+def _build_run_task_title(name: str, message: str) -> str:
+    title = f"{name}: {message}"
     return title[:50] + "..." if len(title) > 50 else title
+
+
+def _build_task_title(workforce: Workforce, message: str) -> str:
+    return _build_run_task_title(str(workforce.name), message)
 
 
 def _merge_agent_config(
@@ -176,6 +184,7 @@ def _normalize_workforce_run_request(
     source: str | None,
     idempotency_key: str | None,
     extra_agent_config: dict[str, Any] | None,
+    timezone: str | None = None,
 ) -> _NormalizedWorkforceRunRequest:
     """Normalize caller input once before either transaction owner runs."""
 
@@ -190,6 +199,7 @@ def _normalize_workforce_run_request(
         extra_agent_config=(
             dict(extra_agent_config) if extra_agent_config is not None else None
         ),
+        timezone=(timezone.strip() or None) if isinstance(timezone, str) else None,
     )
 
 
@@ -235,20 +245,18 @@ def _bind_selected_files_to_task(
     if not selected_file_ids:
         return
 
-    uploaded_files = (
-        db.query(UploadedFile)
-        .filter(
-            UploadedFile.file_id.in_(selected_file_ids),
-            UploadedFile.user_id == int(user.id),
-            UploadedFile.storage_status != "compensating",
-            or_(UploadedFile.task_id.is_(None), UploadedFile.task_id == int(task.id)),
-        )
-        .all()
+    # Bind through the shared conditional-update binder, NOT a
+    # read-then-assign: a stale ORM assignment would overwrite a
+    # compensation/GC claim that committed between the SELECT and the flush,
+    # binding a row whose bytes are already being deleted (#973). Rows bound
+    # elsewhere, claimed (``compensating``), or nonexistent come back as
+    # missing; rows already bound to THIS task pass idempotently.
+    missing_file_ids = bind_turn_files_no_commit(
+        file_ids=selected_file_ids,
+        task_id=int(task.id),
+        owner_user_id=int(user.id),
+        db=db,
     )
-    found_file_ids = {str(uploaded_file.file_id) for uploaded_file in uploaded_files}
-    missing_file_ids = [
-        file_id for file_id in selected_file_ids if file_id not in found_file_ids
-    ]
     if missing_file_ids:
         raise WorkforceRunError(
             status_code=404,
@@ -256,58 +264,36 @@ def _bind_selected_files_to_task(
             code=WorkforceRunErrorCode.FILE_NOT_FOUND,
         )
 
-    for uploaded_file in uploaded_files:
-        if uploaded_file.task_id is None:
-            uploaded_file.task_id = int(task.id)
 
-
-def _create_workforce_run_record_no_commit(
+def _create_run_and_task_no_commit(
     db: Session,
     user: User,
-    workforce: Workforce | None,
     *,
+    workforce_id: int | None,
+    manager_agent: Agent,
+    snapshot: dict[str, Any],
+    task_title: str,
     request: _NormalizedWorkforceRunRequest,
 ) -> WorkforceRunRecordResult:
-    """Stage a PENDING WorkforceRun and Task without ending the transaction."""
+    """Stage a PENDING WorkforceRun and Task without ending the transaction.
 
-    workforce = ensure_workforce_access(db, user, workforce, action="run")
-    workforce_id = int(workforce.id)
-    if request.idempotency_key is not None:
-        replayed = _replay_existing_run_by_idempotency_key(
-            db,
-            workforce_id,
-            request.idempotency_key,
-        )
-        if replayed is not None:
-            return replayed
+    ``workforce_id`` is ``None`` for ephemeral preview runs (test-before-save
+    in the builder): there is no persisted Workforce row to point at, so the
+    manager Agent and the already-built snapshot are passed in directly
+    instead of being derived from a Workforce relationship.
+    """
 
     selected_files = list(request.selected_file_ids)
-    # Revalidate archived/active under the lifecycle fence so archive and run
-    # creation cannot pass each other between validation and insert.
-    workforce = ensure_workforce_access(
-        db,
-        user,
-        acquire_workforce_lifecycle_fence(db, workforce_id),
-        action="run",
-    )
-    snapshot = build_workforce_snapshot(
-        db,
-        user,
-        workforce,
-        is_preview=request.is_preview,
-    )
-    policy = get_workforce_policy()
-    policy.before_workforce_run(db, user, workforce)
     manager_execution_mode = normalize_execution_mode(
-        request.execution_mode or cast(Any, workforce.manager_agent).execution_mode
+        request.execution_mode or cast(str, manager_agent.execution_mode)
     )
 
     task = Task(
         user_id=int(user.id),
-        title=_build_task_title(workforce, request.message),
+        title=task_title,
         description=request.message,
         status=TaskStatus.PENDING,
-        agent_id=int(workforce.manager_agent_id),
+        agent_id=int(manager_agent.id),
         agent_config=_merge_agent_config(
             build_workforce_task_config(
                 snapshot,
@@ -321,7 +307,7 @@ def _create_workforce_run_record_no_commit(
     )
     selected_refs = prepare_connector_runtime_selection_snapshot(
         db=db,
-        agent=cast(Any, workforce.manager_agent),
+        agent=manager_agent,
         connector_user_id=int(user.id),
     )
     bind_connector_runtime_selection_snapshot(task=task, selected_refs=selected_refs)
@@ -331,7 +317,7 @@ def _create_workforce_run_record_no_commit(
     _bind_selected_files_to_task(db, user, task, selected_files)
 
     workforce_run = WorkforceRun(
-        workforce_id=int(workforce.id),
+        workforce_id=workforce_id,
         task_id=int(task.id),
         user_id=int(user.id),
         status="pending",
@@ -354,8 +340,99 @@ def _create_workforce_run_record_no_commit(
             request.extra_agent_config,
         ),
     )
-    policy.after_workforce_run_created(db, user, workforce, workforce_run, task)
     return WorkforceRunRecordResult(workforce_run=workforce_run, task=task)
+
+
+def _create_workforce_run_record_no_commit(
+    db: Session,
+    user: User,
+    workforce: Workforce | None,
+    *,
+    request: _NormalizedWorkforceRunRequest,
+) -> WorkforceRunRecordResult:
+    """Stage a PENDING WorkforceRun and Task for a saved Workforce."""
+
+    workforce = ensure_workforce_access(db, user, workforce, action="run")
+    workforce_id = int(workforce.id)
+    if request.idempotency_key is not None:
+        replayed = _replay_existing_run_by_idempotency_key(
+            db,
+            workforce_id,
+            request.idempotency_key,
+        )
+        if replayed is not None:
+            return replayed
+
+    # Revalidate archived/active under the lifecycle fence so archive and run
+    # creation cannot pass each other between validation and insert.
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        acquire_workforce_lifecycle_fence(db, workforce_id),
+        action="run",
+    )
+    snapshot = build_workforce_snapshot(
+        db,
+        user,
+        workforce,
+        is_preview=request.is_preview,
+    )
+    policy = get_workforce_policy()
+    policy.before_workforce_run(db, user, workforce)
+
+    record = _create_run_and_task_no_commit(
+        db,
+        user,
+        workforce_id=workforce_id,
+        manager_agent=cast(Agent, workforce.manager_agent),
+        snapshot=snapshot,
+        task_title=_build_task_title(workforce, request.message),
+        request=request,
+    )
+    policy.after_workforce_run_created(
+        db, user, workforce, record.workforce_run, record.task
+    )
+    return record
+
+
+def _create_preview_run_record_no_commit(
+    db: Session,
+    user: User,
+    *,
+    name: str | None,
+    description: str | None,
+    manager_agent_id: int,
+    workers: list[dict[str, Any]],
+    request: _NormalizedWorkforceRunRequest,
+) -> WorkforceRunRecordResult:
+    """Stage a PENDING WorkforceRun and Task for an unsaved workforce draft."""
+
+    snapshot, manager_agent = build_preview_workforce_snapshot(
+        db,
+        user,
+        name=name,
+        description=description,
+        manager_agent_id=manager_agent_id,
+        workers=workers,
+    )
+    policy = get_workforce_policy()
+    policy.before_workforce_run(db, user, None)
+
+    record = _create_run_and_task_no_commit(
+        db,
+        user,
+        workforce_id=None,
+        manager_agent=manager_agent,
+        snapshot=snapshot,
+        task_title=_build_run_task_title(
+            str(snapshot["workforce"]["name"]), request.message
+        ),
+        request=request,
+    )
+    policy.after_workforce_run_created(
+        db, user, None, record.workforce_run, record.task
+    )
+    return record
 
 
 def create_workforce_run_record(
@@ -448,6 +525,17 @@ def _build_start_snapshots(
         .one()
     )
 
+    run_id = task_row.run_id
+    if task_row.status == TaskStatus.PENDING and run_id is None:
+        run_id = (
+            db.query(TaskExecutionCommand.target_run_id)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.kind == "start",
+                TaskExecutionCommand.status.in_(("pending", "processing")),
+            )
+            .scalar()
+        )
     return (
         WorkforceTaskStartSnapshot(
             id=int(task_row.id),
@@ -455,7 +543,7 @@ def _build_start_snapshots(
             title=str(task_row.title),
             status=cast(TaskStatus, task_row.status),
             created_at=cast(datetime | None, task_row.created_at),
-            run_id=(str(task_row.run_id) if task_row.run_id is not None else None),
+            run_id=(str(run_id) if run_id is not None else None),
             state_version=int(task_row.state_version or 0),
             control_state=str(task_row.control_state or "idle"),
             channel_id=(
@@ -509,14 +597,18 @@ def _create_claimed_workforce_run_isolated(
                 created=False,
             )
 
-        payload = TaskTurnPayload(transcript_message=request.message)
+        payload = TaskTurnPayload(
+            transcript_message=request.message, file_ids=request.selected_file_ids
+        )
         claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
             db,
             task_id=int(record.task.id),
             task_owner_user_id=user_id,
+            actor_user_id=user_id,
             payload=payload,
+            context=timezone_schedule_context(request.timezone),
         )
-        sync_workforce_run_status(db, record.task, TaskStatus.RUNNING)
+        sync_workforce_run_status(db, record.task, claimed_turn.status)
         db.flush()
         task_snapshot, run_snapshot = _build_start_snapshots(
             db,
@@ -546,6 +638,72 @@ def _create_claimed_workforce_run_isolated(
                     created=False,
                 )
         raise
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    return _PreparedWorkforceRunStart(
+        workforce_run=run_snapshot,
+        task=task_snapshot,
+        payload=payload,
+        claimed_turn=claimed_turn,
+        created=True,
+    )
+
+
+def _create_claimed_preview_run_isolated(
+    *,
+    user_id: int,
+    name: str | None,
+    description: str | None,
+    manager_agent_id: int,
+    workers: list[dict[str, Any]],
+    request: _NormalizedWorkforceRunRequest,
+) -> _PreparedWorkforceRunStart:
+    """Create and claim an ephemeral preview run in one worker-owned transaction.
+
+    Unlike ``_create_claimed_workforce_run_isolated``, there is no persisted
+    Workforce identity to detach across the Session boundary and no
+    idempotency-key replay path (previews never pass one).
+    """
+
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        record = _create_preview_run_record_no_commit(
+            db,
+            user,
+            name=name,
+            description=description,
+            manager_agent_id=manager_agent_id,
+            workers=workers,
+            request=request,
+        )
+
+        payload = TaskTurnPayload(
+            transcript_message=request.message, file_ids=request.selected_file_ids
+        )
+        claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
+            db,
+            task_id=int(record.task.id),
+            task_owner_user_id=user_id,
+            actor_user_id=user_id,
+            payload=payload,
+            context=timezone_schedule_context(request.timezone),
+        )
+        sync_workforce_run_status(db, record.task, claimed_turn.status)
+        db.flush()
+        task_snapshot, run_snapshot = _build_start_snapshots(
+            db,
+            task_id=int(record.task.id),
+            workforce_run_id=int(record.workforce_run.id),
+        )
+        db.commit()
     except Exception:
         db.rollback()
         raise
@@ -593,6 +751,7 @@ async def _start_normalized_workforce_run(
             actor_user_id=user_id,
             payload=prepared.payload,
             claimed=prepared.claimed_turn,
+            context=timezone_schedule_context(request.timezone),
         )
         return WorkforceRunStartResult(
             workforce_run=prepared.workforce_run,
@@ -619,6 +778,7 @@ async def create_workforce_run_by_id(
     source: str | None = None,
     idempotency_key: str | None = None,
     extra_agent_config: dict[str, Any] | None = None,
+    timezone: str | None = None,
 ) -> WorkforceRunStartResult:
     """Create a run from detached identities.
 
@@ -636,6 +796,7 @@ async def create_workforce_run_by_id(
         source=source,
         idempotency_key=idempotency_key,
         extra_agent_config=extra_agent_config,
+        timezone=timezone,
     )
     return await _start_normalized_workforce_run(
         user_id=int(user_id),
@@ -657,6 +818,7 @@ async def create_workforce_run(
     source: str | None = None,
     idempotency_key: str | None = None,
     extra_agent_config: dict[str, Any] | None = None,
+    timezone: str | None = None,
 ) -> WorkforceRunStartResult:
     """Compatibility entry point for callers that still own ORM identities."""
 
@@ -673,6 +835,7 @@ async def create_workforce_run(
         source=source,
         idempotency_key=idempotency_key,
         extra_agent_config=extra_agent_config,
+        timezone=timezone,
     )
     if not release_db_connection_if_clean(db):
         raise RuntimeError("request DB transaction is not clean at turn boundary")
@@ -681,3 +844,74 @@ async def create_workforce_run(
         workforce_id=workforce_id,
         request=request,
     )
+
+
+async def create_preview_workforce_run(
+    db: Session,
+    *,
+    user_id: int,
+    name: str | None,
+    description: str | None,
+    manager_agent_id: int,
+    workers: list[dict[str, Any]],
+    message: str,
+    selected_file_ids: list[str] | None = None,
+    execution_mode: str | None = None,
+    source: str | None = None,
+    timezone: str | None = None,
+) -> WorkforceRunStartResult:
+    """Test-run an unsaved workforce draft: a manager + inline worker configs
+    that were never persisted as a Workforce row.
+
+    Always ``is_preview`` and never visible in task lists, mirroring the
+    single-agent builder's preview task. No idempotency key: previews are
+    interactive, one-shot builder actions, not externally retried calls.
+
+    ``db`` is the request-scoped Session from the endpoint's ``get_current_user``
+    dependency; it is unused past this point but must have its pooled
+    connection released before the isolated worker transaction below, or it
+    pins a pool slot idle-in-transaction for the whole request (issue #889),
+    mirroring ``create_workforce_run``'s ``release_db_connection_if_clean`` call.
+    """
+    if not release_db_connection_if_clean(db):
+        raise RuntimeError("request DB transaction is not clean at turn boundary")
+
+    request = _normalize_workforce_run_request(
+        message=message,
+        selected_file_ids=selected_file_ids,
+        execution_mode=execution_mode,
+        is_preview=True,
+        is_visible=False,
+        source=source,
+        idempotency_key=None,
+        extra_agent_config=None,
+        timezone=timezone,
+    )
+
+    async def _create_and_schedule() -> WorkforceRunStartResult:
+        prepared = await run_db_io_cancellation_safe(
+            lambda: _create_claimed_preview_run_isolated(
+                user_id=user_id,
+                name=name,
+                description=description,
+                manager_agent_id=manager_agent_id,
+                workers=workers,
+                request=request,
+            )
+        )
+        started = await TaskTurnOrchestrator.schedule_claimed_create_turn(
+            task_id=prepared.task.id,
+            task_owner_user_id=user_id,
+            actor_user_id=user_id,
+            payload=cast(TaskTurnPayload, prepared.payload),
+            claimed=cast(_PreparedTurn, prepared.claimed_turn),
+            context=timezone_schedule_context(request.timezone),
+        )
+        return WorkforceRunStartResult(
+            workforce_run=prepared.workforce_run,
+            task=prepared.task,
+            background_task=started.background_task,
+        )
+
+    start_task = asyncio.create_task(_create_and_schedule())
+    return await drain_async_task_cancellation_safe(start_task)

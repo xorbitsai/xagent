@@ -45,6 +45,7 @@ def _template_summary(template: dict[str, Any]) -> V1TemplateSummary:
         tags=_localized(template.get("tags")) or [],
         author=template.get("author", ""),
         version=template.get("version", ""),
+        type=template.get("type", "agent"),
     )
 
 
@@ -73,7 +74,10 @@ async def get_template(
     if template is None:
         raise V1ApiError(V1ErrorCode.TEMPLATE_NOT_FOUND, 404)
     summary = _template_summary(template)
+    is_agent_template = summary.type == "agent"
     return V1TemplateDetail(
         **summary.model_dump(),
-        agent_config=template.get("agent_config") or {},
+        agent_config=(template.get("agent_config") or {})
+        if is_agent_template
+        else None,
     )

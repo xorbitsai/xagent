@@ -509,6 +509,7 @@ class TestJavaScriptExecutorToolArtifacts:
                 "filename": "slides.pptx",
                 "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 "display": "inline",
+                "validation": result["file_refs"][0]["validation"],
             }
         ]
 

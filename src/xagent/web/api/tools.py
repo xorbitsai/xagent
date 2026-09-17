@@ -3,17 +3,21 @@
 import asyncio
 import logging
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy import case, func
+from sqlalchemy.orm import Query, Session
 
 from ...config import get_uploads_dir
+from ...core.tools.adapters.vibe.config import run_with_tool_runtime_cleanup
 from ..auth_dependencies import get_current_user
 from ..init_tool_configs import get_default_tool_configs
 from ..models.database import get_db
-from ..models.tool_config import ToolConfig, ToolUsage
+from ..models.task import TraceEvent
+from ..models.tool_config import ToolConfig
 from ..models.user import User
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
@@ -28,6 +32,24 @@ from ..services.tool_credentials import (
 from ..tools.config import WebToolConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_usage_query(db: Session) -> Query[Any]:
+    """Count persisted completion events, shared by the list and usage endpoints."""
+    tool_name = TraceEvent.data["tool_name"].as_string()
+    query: Query[Any] = (
+        db.query(
+            tool_name.label("tool_name"),
+            func.count(TraceEvent.id).label("usage_count"),
+        )
+        .filter(
+            TraceEvent.event_type == "tool_execution_end",
+            tool_name.isnot(None),
+            tool_name != "",
+        )
+        .group_by(tool_name)
+    )
+    return query
 
 
 def _require_user_id(current_user: User) -> int:
@@ -52,6 +74,8 @@ CATEGORY_DISPLAY_NAMES = {
     "agent": "Agent",
     "mcp": "MCP",
     "skill": "Skill",
+    "ssh": "SSH",
+    "database": "Database",
     "other": "Other",
 }
 
@@ -119,7 +143,8 @@ def _create_tool_info(
         elif tool_name == "edit_image":
             # Special check for image editing capability
             has_edit_capability = any(
-                "edit" in model.abilities for model in image_models.values()
+                "edit" in (getattr(model, "abilities", None) or ())
+                for model in image_models.values()
             )
             if not has_edit_capability:
                 status = "missing_capability"
@@ -223,6 +248,33 @@ def _create_tool_info(
     }
 
 
+def _withheld_edit_image_row(
+    tools: list[dict[str, Any]], image_models: Any
+) -> dict[str, Any] | None:
+    """Row explaining an edit_image that capability gating kept out of the toolset.
+
+    Without it the admin listing just drops the tool, losing the only prompt to
+    register an edit-capable model.
+    """
+    # Not dead code despite the status check below also rejecting this case: with
+    # no image model there is nothing to explain, and the route asserts it does no
+    # extra work here.
+    if not image_models:
+        return None
+    if any(item.get("name") == "edit_image" for item in tools):
+        return None
+    row = _create_tool_info(
+        SimpleNamespace(
+            name="edit_image",
+            description="Edit an existing image with a text prompt",
+        ),
+        "image",
+        image_models=image_models,
+    )
+    # Only ever surface the disabled explanation, never invent an available tool.
+    return row if row["status"] == "missing_capability" else None
+
+
 @tools_router.get("/available")
 async def get_available_tools(
     current_user: User = Depends(get_current_user),
@@ -256,7 +308,15 @@ async def get_available_tools(
             sandbox = await sandbox_manager.get_or_create_lease_provider(
                 "tools", sandbox_user_id
             )
-            sandbox_attached = await sandbox_manager.attach("tools", sandbox_user_id)
+            # attach_provider (identity-checked), not the existence-only
+            # attach(): this call already holds the specific provider object
+            # returned above, so it must catch the case where that object was
+            # already replaced by a rebuild/sweep/eviction between creation
+            # and attach (ABA) — the same pattern chat.py's
+            # ``_acquire_sandbox_task`` uses when it holds a provider handle.
+            sandbox_attached = await sandbox_manager.attach_provider(
+                "tools", sandbox_user_id, sandbox
+            )
             if not sandbox_attached:
                 # The provider was reclaimed by a concurrent sweep/eviction
                 # between creation and attach. Drop the stale reference and
@@ -293,135 +353,135 @@ async def get_available_tools(
         sandbox=sandbox,
     )
 
-    # Use ToolFactory.create_all_tools() to get all tools
-    # Pass apply_user_override_filter=False so that disabled tools remain in
-    # the list and can be shown as ``enabled=False`` in the UI.
-    from ...core.tools.adapters.vibe.factory import ToolFactory
+    async def build_tool_listing_response() -> dict[str, Any]:
+        # Tool construction is the last operation that owns the sandbox lease.
+        from ...core.tools.adapters.vibe.factory import ToolFactory
 
-    try:
-        all_tools = await ToolFactory.create_all_tools(
-            tool_config, apply_user_override_filter=False
-        )
-    finally:
-        # The sandbox is only needed while tools are constructed; the rest
-        # of the handler inspects metadata only.
-        if sandbox_manager is not None and sandbox_attached:
-            await sandbox_manager.release("tools", sandbox_user_id)
-
-    # Helper function to get category from tool's metadata
-    def get_tool_category(tool: Any) -> str:
-        """Get category from tool's self-describing metadata.
-
-        Tools declare their category via the category class attribute.
-        """
         try:
-            metadata = getattr(tool, "metadata", None)
-            category = getattr(metadata, "category", None)
-            value = getattr(category, "value", None)
-            if isinstance(value, str) and value:
-                return value
-        except Exception:
-            logger.warning(
-                "Failed to read tool category from metadata for %s",
-                getattr(tool, "name", tool.__class__.__name__),
-                exc_info=True,
+            all_tools = await ToolFactory.create_all_tools(
+                tool_config, apply_user_override_filter=False
             )
-        return "other"
+        finally:
+            if sandbox_manager is not None and sandbox_attached:
+                await sandbox_manager.release("tools", sandbox_user_id)
 
-    # Get models for tool status checking
-    vision_model = tool_config.get_vision_model()
-    image_models = tool_config.get_image_models()
-    video_models = tool_config.get_video_models()
-    asr_models = tool_config.get_asr_models()
-    tts_models = tool_config.get_tts_models()
-    sound_effect_models = tool_config.get_sound_effect_models()
-    music_models = tool_config.get_music_models()
+        def get_tool_category(tool: Any) -> str:
+            """Get category from the tool's self-describing metadata."""
+            try:
+                metadata = getattr(tool, "metadata", None)
+                category = getattr(metadata, "category", None)
+                value = getattr(category, "value", None)
+                if isinstance(value, str) and value:
+                    return value
+            except Exception:
+                logger.warning(
+                    "Failed to read tool category from metadata for %s",
+                    getattr(tool, "name", tool.__class__.__name__),
+                    exc_info=True,
+                )
+            return "other"
 
-    # Convert tools to API format with category information
-    tools: list[dict[str, Any]] = []
-    for tool in all_tools:
-        category = get_tool_category(tool)
-        tools.append(
-            _create_tool_info(
-                tool,
-                category,
-                vision_model,
-                image_models,
-                video_models,
-                asr_models,
-                tts_models,
-                sound_effect_models,
-                music_models,
+        vision_model = tool_config.get_vision_model()
+        image_models = tool_config.get_image_models()
+        video_models = tool_config.get_video_models()
+        asr_models = tool_config.get_asr_models()
+        tts_models = tool_config.get_tts_models()
+        sound_effect_models = tool_config.get_sound_effect_models()
+        music_models = tool_config.get_music_models()
+
+        tools: list[dict[str, Any]] = []
+        for tool in all_tools:
+            category = get_tool_category(tool)
+            tools.append(
+                _create_tool_info(
+                    tool,
+                    category,
+                    vision_model,
+                    image_models,
+                    video_models,
+                    asr_models,
+                    tts_models,
+                    sound_effect_models,
+                    music_models,
+                )
             )
-        )
 
-    # Calculate tool usage count from ToolUsage table (execution stats)
-    from collections import defaultdict
+        withheld = _withheld_edit_image_row(tools, image_models)
+        if withheld is not None:
+            tools.append(withheld)
 
-    usage_map: defaultdict[str, int] = defaultdict(int)
-    try:
-        usage_stats: list[Any] = db.query(ToolUsage).all()
-        for stat in usage_stats:
-            usage_map[stat.tool_name] = stat.usage_count
-    except Exception as e:
-        logger.error(f"Failed to fetch tool usage stats: {e}")
+        from collections import defaultdict
 
-    # Add usage_count to tools
-    for tool_item in tools:
-        tool_name = tool_item.get("name", "")
-        tool_item["usage_count"] = usage_map[tool_name]
+        usage_map: defaultdict[str, int] = defaultdict(int)
+        try:
+            usage_stats = await asyncio.to_thread(lambda: _tool_usage_query(db).all())
+            for stat in usage_stats:
+                usage_map[stat.tool_name] = stat.usage_count
+        except Exception as e:
+            logger.error(f"Failed to fetch tool usage stats: {e}")
 
-    default_configs = {item["tool_name"]: item for item in get_default_tool_configs()}
-    config_rows = db.query(ToolConfig).all()
-    enabled_map: dict[str, bool] = {}
-    requires_configuration_map: dict[str, bool] = {
-        tool_name: bool(config.get("requires_configuration", False))
-        for tool_name, config in default_configs.items()
-    }
-    for row in config_rows:
-        row_tool_name = cast(Any, row.tool_name)
-        if isinstance(row_tool_name, str):
-            enabled_map[row_tool_name] = bool(cast(Any, row.enabled))
-            requires_configuration_map[row_tool_name] = bool(
-                cast(Any, getattr(row, "requires_configuration", False))
-            )
-    for tool_item in tools:
-        tool_name = str(tool_item.get("name") or "")
-        if tool_name in enabled_map:
-            tool_item["enabled"] = enabled_map[tool_name]
-            if not enabled_map[tool_name]:
-                tool_item["status"] = "disabled"
-                tool_item["status_reason"] = "Disabled by tool policy"
-        requires_configuration = requires_configuration_map.get(tool_name, False)
-        if not requires_configuration and tool_item.get("category") == "database":
-            requires_configuration = requires_configuration_map.get("sql_query", False)
-        tool_item["requires_configuration"] = requires_configuration
+        for tool_item in tools:
+            tool_name = tool_item.get("name", "")
+            tool_item["usage_count"] = usage_map[tool_name]
 
-    # Apply per-user tool overrides (e.g. per-user enable/disable).
-    # Only affects policy-based states; resource-missing states cannot be
-    # overridden to "available".
-    # Refresh through the live request session and user: the factory's
-    # prefetch snapshot re-fetches the user by id in a worker session, which
-    # drops request-scoped policy attributes callers may have set on the
-    # user object (e.g. a route-selected team id).
-    user_overrides = tool_config.refresh_user_tool_overrides()
-    for tool_item in tools:
-        tool_name = str(tool_item.get("name") or "")
-        override = user_overrides.get(tool_name)
-        if override and override.get("enabled") is not None:
-            if not override["enabled"]:
-                tool_item["enabled"] = False
-                tool_item["status"] = "disabled"
-                tool_item["status_reason"] = "Disabled by admin"
-            elif tool_item["status"] in ("disabled", "available"):
-                tool_item["enabled"] = True
-                tool_item["status"] = "available"
-                tool_item["status_reason"] = None
+        default_configs = {
+            item["tool_name"]: item for item in get_default_tool_configs()
+        }
+        config_rows = db.query(ToolConfig).all()
+        enabled_map: dict[str, bool] = {}
+        requires_configuration_map: dict[str, bool] = {
+            tool_name: bool(config.get("requires_configuration", False))
+            for tool_name, config in default_configs.items()
+        }
+        for row in config_rows:
+            row_tool_name = cast(Any, row.tool_name)
+            if isinstance(row_tool_name, str):
+                enabled_map[row_tool_name] = bool(cast(Any, row.enabled))
+                requires_configuration_map[row_tool_name] = bool(
+                    cast(Any, getattr(row, "requires_configuration", False))
+                )
+        for tool_item in tools:
+            tool_name = str(tool_item.get("name") or "")
+            if tool_name in enabled_map:
+                tool_item["enabled"] = enabled_map[tool_name]
+                if not enabled_map[tool_name]:
+                    tool_item["status"] = "disabled"
+                    tool_item["status_reason"] = "Disabled by tool policy"
+            requires_configuration = requires_configuration_map.get(tool_name, False)
+            if not requires_configuration and tool_item.get("category") == "database":
+                requires_configuration = requires_configuration_map.get(
+                    "sql_query", False
+                )
+            tool_item["requires_configuration"] = requires_configuration
 
-    return {
-        "tools": tools,
-        "count": len(tools),
-    }
+        # Factory handoff makes policy reads detached from the request Session.
+        user_overrides = tool_config.get_user_tool_overrides()
+        for tool_item in tools:
+            tool_name = str(tool_item.get("name") or "")
+            override = user_overrides.get(tool_name)
+            if override and override.get("enabled") is not None:
+                if not override["enabled"]:
+                    tool_item["enabled"] = False
+                    tool_item["status"] = "disabled"
+                    tool_item["status_reason"] = "Disabled by admin"
+                elif tool_item["status"] in ("disabled", "available"):
+                    tool_item["enabled"] = True
+                    tool_item["status"] = "available"
+                    tool_item["status_reason"] = None
+
+        return {
+            "tools": tools,
+            "count": len(tools),
+        }
+
+    return await run_with_tool_runtime_cleanup(
+        build_tool_listing_response,
+        tool_config.close,
+        logger=logger,
+        cleanup_error_message=(
+            "Failed to close tool listing runtime after route failure"
+        ),
+    )
 
 
 @tools_router.get("/configurable")
@@ -607,7 +667,17 @@ async def get_tool_usage(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
         def _get_tool_usage_sync() -> list[dict[str, Any]]:
-            usage_stats = db.query(ToolUsage).all()
+            # Completion payloads carry a boolean; older events omit it on success.
+            success = func.coalesce(TraceEvent.data["success"].as_boolean(), True)
+            usage_stats = (
+                _tool_usage_query(db)
+                .add_columns(
+                    func.sum(case((success, 1), else_=0)).label("success_count"),
+                    func.sum(case((success, 0), else_=1)).label("error_count"),
+                    func.max(TraceEvent.timestamp).label("last_used_at"),
+                )
+                .all()
+            )
 
             result = []
             for stat in usage_stats:

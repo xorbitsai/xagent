@@ -45,6 +45,20 @@ AGENT_CONFIG_UNASSIGNABLE_CATEGORIES: frozenset[str] = frozenset(
     {ToolCategory.OTHER.value, ToolCategory.AGENT.value}
 )
 
+# Categories granted by a per-agent binding the creator enforces itself. Not
+# selectable in the builder's picker, so never gate them on a selection.
+BINDING_AUTHORIZED_CATEGORIES: frozenset[str] = frozenset({ToolCategory.SSH.value})
+
+# Tools available regardless of category selection for spec-driven
+# (``ToolSelectionSpec``) configs: their creator registers with
+# ``selection_gate="intrinsic"`` and ``compute_allowed_names`` admits their
+# names outside the category match. An explicit NONE (zero-tools) spec still
+# excludes them. Legacy allow-list / per-user override paths do a plain name
+# intersection and are not aware of this set, so they can still drop these.
+INTRINSIC_TOOL_NAMES: frozenset[str] = frozenset(
+    {"get_current_time", "validate_local_time"}
+)
+
 
 class ToolMetadata(BaseModel):
     name: str
@@ -73,6 +87,59 @@ class ToolMetadata(BaseModel):
     # metadata is constructed).
     read_only: bool = False
     concurrency_safe: bool = False
+    # What a *remote* MCP server's own annotations claimed about this tool's
+    # writes, or None for any tool that is not an MCP tool. Deliberately not
+    # folded into ``read_only`` above: that field is a local guarantee the
+    # scheduler acts on (it implies ``concurrency_safe``), while this one is
+    # an untrusted third-party hint that must never widen what the scheduler
+    # is allowed to do. Kept as the declaration's three states rather than a
+    # boolean so "the server said read-only" stays distinguishable from "the
+    # server said nothing" -- see ``MCPWriteHint``. A consumer gating an
+    # action must treat everything except an explicit read-only claim as a
+    # write, and must not treat even that claim as a security fact.
+    mcp_write_hint: Optional[str] = None
+    # Whether a *remote* MCP server's annotations explicitly declare this
+    # tool a non-idempotent write (see ``classify_non_idempotent_write`` in
+    # the MCP adapter), or None for any tool that is not an MCP tool.
+    # Consumed by the same-turn duplicate-write guard, which reads metadata
+    # rather than the concrete adapter so wrappers that forward only
+    # ``.metadata`` (e.g. the sandbox wrapper) keep the declaration.
+    mcp_non_idempotent_write: Optional[bool] = None
+    # A local tool author's own declaration that repeating this tool with
+    # identical arguments produces an additional external effect (a create,
+    # a send, a submission). Opt-in via a ``non_idempotent = True`` attribute
+    # on the tool; consumed by the same-turn duplicate-write guard. Distinct
+    # from ``mcp_non_idempotent_write``: this is a first-party guarantee,
+    # that is an untrusted remote hint.
+    non_idempotent: bool = False
+
+
+def _write_hint_value(tool: Any) -> Optional[str]:
+    """Read a tool's MCP write hint as a plain string, if it has one.
+
+    ``getattr`` rather than an isinstance check against the MCP adapter:
+    this module is the common tool contract and must not import a concrete
+    adapter, and a wrapper that delegates the attribute has to work exactly
+    like the adapter itself. A tool without the attribute reports ``None``,
+    meaning "not an MCP declaration" -- distinct from an MCP tool whose
+    server declared nothing, which reports ``"undeclared"``.
+    """
+    hint = getattr(tool, "write_hint", None)
+    if hint is None:
+        return None
+    value = getattr(hint, "value", None)
+    return value if isinstance(value, str) else None
+
+
+def _non_idempotent_write_value(tool: Any) -> Optional[bool]:
+    """Read a tool's MCP non-idempotent-write declaration, if it has one.
+
+    Same duck-typing contract as ``_write_hint_value``: ``None`` means "not
+    an MCP declaration", distinct from an MCP tool whose annotations do not
+    declare a non-idempotent write, which reports ``False``.
+    """
+    declared = getattr(tool, "non_idempotent_write", None)
+    return declared if isinstance(declared, bool) else None
 
 
 @runtime_checkable
@@ -126,6 +193,16 @@ class AbstractBaseTool(ABC, Tool):
                 getattr(self, "concurrency_safe", False)
                 or getattr(self, "read_only", False)
             ),
+            # Populated from whatever the concrete tool exposes, so an MCP
+            # adapter's declaration reaches the common contract without every
+            # other tool having to know the field exists. Stored as the
+            # enum's value (a plain string) to keep this module free of a
+            # dependency on the MCP adapter.
+            mcp_write_hint=_write_hint_value(self),
+            mcp_non_idempotent_write=_non_idempotent_write_value(self),
+            # ``is True`` so a truthy non-boolean never enrolls a tool in the
+            # duplicate-write guard by accident.
+            non_idempotent=getattr(self, "non_idempotent", None) is True,
         )
 
     @abstractmethod

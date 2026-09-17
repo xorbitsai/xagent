@@ -10,15 +10,19 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from tests.shared.auth_database import auth_db_override
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.task_runtime import TaskRuntimeClientError
 from xagent.web.api.auth import auth_router
-from xagent.web.api.chat import (
+from xagent.web.api.chat import chat_router
+from xagent.web.api.model import model_router
+from xagent.web.models.auth_database import get_auth_db
+from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.schemas.chat import MAX_SEED_INTERACTIONS
+from xagent.web.services.agent_service_manager import (
     AgentServiceManager,
     _load_agent_for_task_runtime,
-    chat_router,
 )
-from xagent.web.api.model import model_router
-from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 
@@ -37,6 +41,7 @@ test_app.include_router(auth_router)
 test_app.include_router(model_router)
 test_app.include_router(chat_router)
 test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 client = TestClient(test_app)
 
@@ -144,6 +149,22 @@ def sample_model_data():
         "description": "User2 private model",
         "share_with_users": False,
     }
+
+
+def create_test_models(headers, template, specs, *, shared=False):
+    for model_id, model_name in specs:
+        payload = dict(template)
+        payload.update(
+            {
+                "model_id": model_id,
+                "model_name": model_name,
+                "share_with_users": shared,
+            }
+        )
+        assert (
+            client.post("/api/models/", json=payload, headers=headers).status_code
+            == 200
+        )
 
 
 class DummyLLM(BaseLLM):
@@ -504,6 +525,247 @@ def test_task_create_allows_shared_model_ids(
     assert data["model_id"] == shared_model_id
 
 
+def test_task_create_does_not_persist_inactive_owned_or_shared_model_ids(
+    test_db, user1_headers, sample_model_data
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+
+    # An owner link must not make a deactivated model runtime-available.
+    owned_data = dict(sample_model_data)
+    owned_data["model_id"] = "inactive-owned-model"
+    created_owned = client.post("/api/models/", json=owned_data, headers=user1_headers)
+    assert created_owned.status_code == 200
+
+    # A shared link must not bypass the same active gate for another user.
+    admin_login = client.post(
+        "/api/auth/login", json={"username": "admin", "password": "admin123"}
+    )
+    assert admin_login.status_code == 200
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+    shared_data = dict(sample_model_data)
+    shared_data.update({"model_id": "inactive-shared-model", "share_with_users": True})
+    created_shared = client.post(
+        "/api/models/", json=shared_data, headers=admin_headers
+    )
+    assert created_shared.status_code == 200
+
+    db = next(get_db())
+    try:
+        inactive_ids = ("inactive-owned-model", "inactive-shared-model")
+        db.query(Model).filter(Model.model_id.in_(inactive_ids)).update(
+            {Model.is_active: False}, synchronize_session=False
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    for model_id in inactive_ids:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": f"task-{model_id}",
+                "description": "desc",
+                "llm_ids": [model_id, None, None, None],
+            },
+            headers=user1_headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["model_id"] != model_id
+
+
+def test_task_create_falls_back_general_without_replacing_active_explicit_slots(
+    test_db, user1_headers, sample_model_data
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+    from xagent.web.models.user import User, UserDefaultModel
+
+    model_specs = [
+        ("fallback-general-id", "fallback-general"),
+        ("inactive-general-id", "inactive-general"),
+        ("active-fast-id", "active-fast"),
+        ("active-vision-id", "active-vision"),
+        ("active-compact-id", "active-compact"),
+    ]
+    create_test_models(user1_headers, sample_model_data, model_specs)
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        fallback = db.query(Model).filter(Model.model_id == "fallback-general-id").one()
+        inactive = db.query(Model).filter(Model.model_id == "inactive-general-id").one()
+        inactive.is_active = False
+        db.add(
+            UserDefaultModel(
+                user_id=user.id,
+                model_id=fallback.id,
+                config_type="general",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "slot-wise-create",
+            "description": "desc",
+            "llm_ids": [
+                "inactive-general-id",
+                "active-fast-id",
+                "active-vision-id",
+                "active-compact-id",
+            ],
+        },
+        headers=user1_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert [
+        data["model_id"],
+        data["small_fast_model_id"],
+        data["visual_model_id"],
+        data["compact_model_id"],
+    ] == [
+        "fallback-general-id",
+        "active-fast-id",
+        "active-vision-id",
+        "active-compact-id",
+    ]
+    assert [
+        data["model_name"],
+        data["small_fast_model_name"],
+        data["visual_model_name"],
+        data["compact_model_name"],
+    ] == ["fallback-general", "active-fast", "active-vision", "active-compact"]
+
+
+def test_persisted_task_falls_back_general_without_replacing_active_slots(
+    test_db, user1_headers, sample_model_data
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User, UserDefaultModel
+    from xagent.web.services.llm_utils import resolve_task_runtime_config_core
+
+    model_specs = [
+        ("resume-fallback-id", "resume-fallback"),
+        ("resume-general-id", "resume-general"),
+        ("resume-fast-id", "resume-fast"),
+        ("resume-vision-id", "resume-vision"),
+        ("resume-compact-id", "resume-compact"),
+    ]
+    create_test_models(user1_headers, sample_model_data, model_specs)
+
+    created = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "slot-wise-resume",
+            "description": "desc",
+            "llm_ids": [
+                "resume-general-id",
+                "resume-fast-id",
+                "resume-vision-id",
+                "resume-compact-id",
+            ],
+        },
+        headers=user1_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        fallback = db.query(Model).filter(Model.model_id == "resume-fallback-id").one()
+        general = db.query(Model).filter(Model.model_id == "resume-general-id").one()
+        general.is_active = False
+        db.add(
+            UserDefaultModel(
+                user_id=user.id,
+                model_id=fallback.id,
+                config_type="general",
+            )
+        )
+        db.commit()
+
+        task = db.get(Task, created.json()["task_id"])
+        runtime = resolve_task_runtime_config_core(task, db, user_id=user.id)
+
+        assert [llm.model_name if llm else None for llm in runtime.llms] == [
+            "resume-fallback",
+            "resume-fast",
+            "resume-vision",
+            "resume-compact",
+        ]
+    finally:
+        db.close()
+
+
+def test_task_create_shared_default_skips_inactive_and_accepts_active(
+    test_db, user1_headers, sample_model_data
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+    from xagent.web.models.user import User, UserDefaultModel
+
+    admin_login = client.post(
+        "/api/auth/login", json={"username": "admin", "password": "admin123"}
+    )
+    assert admin_login.status_code == 200
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+    create_test_models(
+        admin_headers,
+        sample_model_data,
+        [("shared-default-id", "shared-default")],
+        shared=True,
+    )
+
+    db = next(get_db())
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        model = db.query(Model).filter(Model.model_id == "shared-default-id").one()
+        model.is_active = False
+        db.add(
+            UserDefaultModel(
+                user_id=admin.id,
+                model_id=model.id,
+                config_type="general",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    inactive_response = client.post(
+        "/api/chat/task/create",
+        json={"title": "inactive-shared-default", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert inactive_response.status_code == 200, inactive_response.text
+    assert inactive_response.json()["model_id"] != "shared-default-id"
+
+    db = next(get_db())
+    try:
+        model = db.query(Model).filter(Model.model_id == "shared-default-id").one()
+        model.is_active = True
+        db.commit()
+    finally:
+        db.close()
+
+    active_response = client.post(
+        "/api/chat/task/create",
+        json={"title": "active-shared-default", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert active_response.status_code == 200, active_response.text
+    assert active_response.json()["model_id"] == "shared-default-id"
+    assert active_response.json()["model_name"] == "shared-default"
+
+
 def test_standalone_task_create_defaults_to_auto(test_db, user1_headers):
     resp = client.post(
         "/api/chat/task/create",
@@ -637,6 +899,170 @@ def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_hea
     assert payload["cache_write_input_tokens"] == 15
 
 
+def test_get_task_returns_media_usage_grouped_by_model_and_unit(test_db, user1_headers):
+    """Pin ``media_usage`` at the real route, not just at the aggregator.
+
+    The aggregator has its own unit tests and the frontend tests mock this
+    response, so both sides can stay green while the handler omits, renames or
+    fails to serialise the field. This asserts the exact payload the client
+    actually receives.
+    """
+    from xagent.web.models.task import Task
+
+    create_resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "media-usage-test", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert create_resp.status_code == 200
+    task_id = create_resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.token_usage_details = [
+            # Two calls on the same (model, unit, call_type, resolution) key
+            # must collapse into one row with summed quantity and calls.
+            {
+                "type": "media",
+                "model": "stable-diffusion-xl",
+                "model_id": "sd",
+                "unit": "images",
+                "call_type": "generate_image",
+                "resolution": "1K",
+                "quantity": 2,
+                "provider_tokens": 30,
+            },
+            {
+                "type": "media",
+                "model": "stable-diffusion-xl",
+                "model_id": "sd",
+                "unit": "images",
+                "call_type": "generate_image",
+                "resolution": "1K",
+                "quantity": 1,
+                "provider_tokens": 12,
+                "tokens_estimated": True,
+            },
+            # Zero quantity is meaningful and must survive: the call happened,
+            # its size is not known yet.
+            {
+                "type": "media",
+                "model": "veo-3",
+                "model_id": "veo",
+                "unit": "seconds",
+                "call_type": "video",
+                "quantity": 0,
+            },
+            # An LLM entry must not leak into media_usage.
+            {
+                "type": "input",
+                "tokens": 100,
+                "model": "gpt-4.1",
+                "model_id": "main",
+            },
+        ]
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["media_usage"] == [
+        {
+            "model_id": "sd",
+            "model_name": "stable-diffusion-xl",
+            "unit": "images",
+            "call_type": "generate_image",
+            "resolution": "1K",
+            "quantity": 3.0,
+            "calls": 2,
+            "provider_tokens": 42,
+            # True because one of the two merged entries was estimated: a mixed
+            # group must never be priced as if it were fully measured.
+            "tokens_estimated": True,
+        },
+        {
+            "model_id": "veo",
+            "model_name": "veo-3",
+            "unit": "seconds",
+            "call_type": "video",
+            "resolution": "",
+            "quantity": 0.0,
+            "calls": 1,
+            "provider_tokens": 0,
+            "tokens_estimated": False,
+        },
+    ]
+    # The LLM entry stayed on its own side of the split.
+    assert [row["model_id"] for row in payload["model_usage"]] == ["main"]
+
+
+def test_web_task_detail_cache_serves_media_usage_on_cache_hit(test_db, user1_headers):
+    """A cache hit must carry ``media_usage``, not drop it on the second read.
+
+    The detail response is cached wholesale, so a field added to the miss path
+    only is invisible on every subsequent poll -- which is the path the usage
+    popover actually hits while a task runs.
+    """
+    from xagent.web.models.task import Task
+    from xagent.web.services.hot_path_cache import (
+        InMemoryTTLCache,
+        set_cache_backend_for_testing,
+    )
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        create_resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "media-cache-test", "description": "desc"},
+            headers=user1_headers,
+        )
+        assert create_resp.status_code == 200
+        task_id = create_resp.json()["task_id"]
+
+        db = next(get_db())
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            task.token_usage_details = [
+                {
+                    "type": "media",
+                    "model": "elevenlabs-tts",
+                    "model_id": "tts-1",
+                    "unit": "characters",
+                    "call_type": "tts",
+                    "quantity": 480,
+                }
+            ]
+            db.commit()
+        finally:
+            db.close()
+
+        first = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert first.status_code == 200
+        expected = [
+            {
+                "model_id": "tts-1",
+                "model_name": "elevenlabs-tts",
+                "unit": "characters",
+                "call_type": "tts",
+                "resolution": "",
+                "quantity": 480.0,
+                "calls": 1,
+                "provider_tokens": 0,
+                "tokens_estimated": False,
+            }
+        ]
+        assert first.json()["media_usage"] == expected
+
+        cached = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert cached.status_code == 200
+        assert cached.json()["media_usage"] == expected
+    finally:
+        set_cache_backend_for_testing(None)
+
+
 def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
     ensure_system_initialized()
     from xagent.web.models.task import Task, TaskStatus
@@ -667,6 +1093,45 @@ def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
         assert ids[1] == "deleted-fast-id"
         assert ids[2] == "deleted-visual-id"
         assert ids[3] == "deleted-compact-id"
+    finally:
+        db.close()
+
+
+def test_get_task_llm_ids_drops_stored_id_when_model_is_inactive(test_db):
+    ensure_system_initialized()
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        inactive = Model(
+            model_id="inactive-persisted-model",
+            category="llm",
+            model_provider="openai",
+            model_name="gpt-4.1",
+            api_key="test-key",
+            abilities=["chat"],
+            is_active=False,
+        )
+        db.add(inactive)
+        db.flush()
+        task = Task(
+            user_id=admin.id,
+            title="inactive persisted model",
+            description="d",
+            status=TaskStatus.PENDING,
+            model_id=inactive.model_id,
+            model_name=inactive.model_name,
+        )
+        db.add(task)
+        db.commit()
+
+        ids = AgentServiceManager()._get_task_llm_ids(task, db)
+
+        assert ids[0] is None
     finally:
         db.close()
 
@@ -1214,3 +1679,795 @@ def test_delete_task_keeps_cross_user_access_denied(
         assert db.query(Task).filter(Task.id == task_id).count() == 1
     finally:
         db.close()
+
+
+def test_filtered_runtime_provider_environment_is_not_added_to_system_prompt():
+    from xagent.core.agent.service import AgentService
+    from xagent.core.task_runtime import (
+        TaskRuntimeContribution,
+        merge_task_runtime_contributions,
+        reconcile_task_runtime_contribution_tools,
+    )
+    from xagent.core.tools.adapters.vibe.config import ToolConfig
+
+    runtime_tool = MagicMock()
+    runtime_tool.name = "leased_browser"
+    contribution = merge_task_runtime_contributions(
+        {
+            "browser_runtime": TaskRuntimeContribution(
+                tools=(runtime_tool,),
+                environment="Use the leased browser.",
+            )
+        }
+    )
+
+    filtered, _conflicts = reconcile_task_runtime_contribution_tools(
+        contribution,
+        available_tools=(),
+    )
+    tool_config = ToolConfig({})
+    tool_config.get_task_runtime_contribution = lambda: filtered
+
+    service = AgentService(
+        name="filtered-runtime-prompt",
+        id="filtered-runtime-prompt",
+        tools=[],
+        tool_config=tool_config,
+        enable_workspace=False,
+        system_prompt="Base prompt.",
+    )
+
+    assert service.system_prompt == "Base prompt."
+
+
+class _TaskRuntimeProvider:
+    def __init__(
+        self,
+        *,
+        fail_create: bool = False,
+        metadata_error: Exception | None = None,
+    ):
+        self.fail_create = fail_create
+        self.metadata_error = metadata_error
+        self.events: list[tuple[str, int]] = []
+        self.configuration: dict | None = None
+        self.task_existed_on_delete: list[bool] = []
+
+    async def on_task_created(self, context, configuration):
+        self.events.append(("created", context.task_id))
+        self.configuration = dict(configuration)
+        if self.fail_create:
+            raise TaskRuntimeClientError("invalid target")
+
+    async def build_runtime(self, context):
+        from xagent.core.task_runtime import TaskRuntimeContribution
+
+        return TaskRuntimeContribution()
+
+    async def public_metadata(self, context):
+        if self.metadata_error is not None:
+            raise self.metadata_error
+        return {"target": self.configuration["target"]} if self.configuration else {}
+
+    async def on_task_deleted(self, context):
+        from xagent.web.models.task import Task
+
+        db = context.session_factory()
+        try:
+            self.task_existed_on_delete.append(
+                db.query(Task).filter(Task.id == context.task_id).count() == 1
+            )
+        finally:
+            db.close()
+        self.events.append(("deleted", context.task_id))
+
+
+def test_task_runtime_unknown_extension_error_does_not_disclose_registry(
+    test_db,
+    user1_headers,
+):
+    response = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "unknown runtime",
+            "runtime_extensions": {"private-provider-name": {}},
+        },
+        headers=user1_headers,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid task runtime extension request"
+    assert "private-provider-name" not in response.text
+
+
+def test_task_runtime_extension_create_metadata_and_delete_lifecycle(
+    test_db,
+    user1_headers,
+    user2_headers,
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    release_count = 0
+    original_release = chat_module.release_db_connection_if_clean
+
+    def record_release(db):
+        nonlocal release_count
+        release_count += 1
+        return original_release(db)
+
+    monkeypatch.setattr(
+        chat_module,
+        "release_db_connection_if_clean",
+        record_release,
+    )
+
+    class _ReleaseAwareProvider(_TaskRuntimeProvider):
+        minimum_release_count = 1
+
+        async def on_task_created(self, context, configuration):
+            assert release_count >= self.minimum_release_count
+            await super().on_task_created(context, configuration)
+
+        async def public_metadata(self, context):
+            assert release_count >= self.minimum_release_count
+            return await super().public_metadata(context)
+
+    provider = _ReleaseAwareProvider()
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "runtime task",
+                "description": "inspect the selected target",
+                "runtime_extensions": {"test_runtime": {"target": "approved_browser"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 200, response.text
+        task_id = response.json()["task_id"]
+        assert response.json()["runtime_extensions"] == {
+            "test_runtime": {"target": "approved_browser"}
+        }
+        assert response.json()["runtime_extensions_status"] == "complete"
+        assert response.json()["runtime_extensions_omitted"] == []
+        provider.minimum_release_count = release_count + 1
+        metadata = client.get(
+            f"/api/chat/task/{task_id}/runtime-extensions",
+            headers=user1_headers,
+        )
+        assert metadata.status_code == 200
+        assert metadata.json()["runtime_extensions"] == {
+            "test_runtime": {"target": "approved_browser"}
+        }
+        assert metadata.json()["runtime_extensions_status"] == "complete"
+        assert metadata.json()["runtime_extensions_omitted"] == []
+        denied = client.get(
+            f"/api/chat/task/{task_id}/runtime-extensions",
+            headers=user2_headers,
+        )
+        assert denied.status_code == 404
+
+        deleted = client.delete(
+            f"/api/chat/task/{task_id}",
+            headers=user1_headers,
+        )
+        assert deleted.status_code == 200
+        assert provider.events == [
+            ("created", task_id),
+            ("deleted", task_id),
+        ]
+        assert provider.task_existed_on_delete == [True]
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+@pytest.mark.parametrize(
+    ("metadata_error", "expected_status", "expected_detail"),
+    [
+        (
+            TaskRuntimeClientError("target denied", status_code=403),
+            403,
+            "target denied",
+        ),
+        (TaskRuntimeClientError("invalid metadata"), 400, "invalid metadata"),
+        (TypeError("provider implementation detail"), 500, "Internal server error"),
+        (RuntimeError("database unavailable"), 500, "Internal server error"),
+    ],
+)
+def test_task_runtime_metadata_maps_provider_error_status(
+    test_db,
+    user1_headers,
+    metadata_error,
+    expected_status,
+    expected_detail,
+):
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider(metadata_error=metadata_error)
+    register_task_extension("test_runtime", provider)
+    task_id = None
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "runtime metadata error",
+                "runtime_extensions": {"test_runtime": {"target": "approved_browser"}},
+            },
+            headers=user1_headers,
+        )
+        assert response.status_code == 200, response.text
+        task_id = response.json()["task_id"]
+        assert response.json()["runtime_extensions_status"] == "failed"
+        assert response.json()["runtime_extensions_omitted"] == []
+
+        metadata = client.get(
+            f"/api/chat/task/{task_id}/runtime-extensions",
+            headers=user1_headers,
+        )
+
+        assert metadata.status_code == expected_status
+        assert metadata.json()["detail"] == expected_detail
+    finally:
+        if task_id is not None:
+            client.delete(
+                f"/api/chat/task/{task_id}",
+                headers=user1_headers,
+            )
+        unregister_task_extension("test_runtime")
+
+
+def test_task_runtime_extension_create_failure_compensates_task(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider(fail_create=True)
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "invalid runtime task",
+                "description": "must be compensated",
+                "runtime_extensions": {"test_runtime": {"target": "missing"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 400
+        db = next(get_db())
+        try:
+            assert (
+                db.query(Task).filter(Task.title == "invalid runtime task").count() == 0
+            )
+        finally:
+            db.close()
+        assert [event for event, _task_id in provider.events] == [
+            "created",
+            "deleted",
+        ]
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_task_runtime_extension_create_server_error_is_sanitized(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider()
+
+    async def fail_create(context, configuration):
+        provider.events.append(("created", context.task_id))
+        raise RuntimeError("database password leaked")
+
+    provider.on_task_created = fail_create
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "unavailable runtime task",
+                "runtime_extensions": {"test_runtime": {"target": "missing"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Service unavailable"
+        assert "database password leaked" not in response.text
+        db = next(get_db())
+        try:
+            assert (
+                db.query(Task).filter(Task.title == "unavailable runtime task").count()
+                == 0
+            )
+        finally:
+            db.close()
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_task_runtime_extension_compensation_failure_preserves_client_error(
+    test_db,
+    user1_headers,
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+
+    provider = _TaskRuntimeProvider(fail_create=True)
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    def fail_compensation(db, *, task_id):
+        raise RuntimeError("compensation database unavailable")
+
+    monkeypatch.setattr(
+        chat_module,
+        "_compensate_failed_task_extension_create",
+        fail_compensation,
+    )
+    register_task_extension("test_runtime", provider)
+    try:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "failed compensation task",
+                "runtime_extensions": {"test_runtime": {"target": "missing"}},
+            },
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "invalid target"
+        assert "compensation database unavailable" not in response.text
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_create_task_records_runtime_extension_bindings_for_deletion(
+    test_db,
+    user1_headers,
+):
+    """End-to-end: create records the binding, delete dispatches on it.
+
+    Without a persisted binding record the delete path has no way to tell which
+    providers own state for this task, and would have to fall back to the whole
+    process-wide registry.
+    """
+
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.services.task_runtime import (
+        register_task_extension,
+        task_extension_bindings_from_agent_config,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider()
+    register_task_extension("test_runtime", provider)
+    try:
+        created = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "bound task",
+                "runtime_extensions": {"test_runtime": {"target": "one"}},
+            },
+            headers=user1_headers,
+        )
+        assert created.status_code == 200, created.text
+        task_id = int(created.json()["task_id"])
+
+        db = next(get_db())
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            assert task_extension_bindings_from_agent_config(task.agent_config) == (
+                "test_runtime",
+            )
+        finally:
+            db.close()
+
+        deleted = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert deleted.status_code == 200, deleted.text
+        assert ("deleted", task_id) in provider.events
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_delete_task_reports_concurrent_disappearance(
+    test_db,
+    user1_headers,
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        task = Task(user_id=user.id, title="concurrent delete", description="")
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    monkeypatch.setattr(chat_module, "_delete_task_sync", lambda **_kwargs: False)
+
+    response = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Task no longer exists"
+
+
+def test_delete_task_core_failure_is_retry_safe_for_idempotent_provider(
+    test_db,
+    user1_headers,
+    monkeypatch,
+):
+    import xagent.web.api.chat as chat_module
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+    from xagent.web.services.task_runtime import (
+        agent_config_with_task_extension_bindings,
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    provider = _TaskRuntimeProvider()
+    register_task_extension("test_runtime", provider)
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        # Cleanup dispatch is filtered by the task's binding record, so the
+        # task has to actually claim the provider for this retry to exercise it.
+        task = Task(
+            user_id=user.id,
+            title="retry delete",
+            description="",
+            agent_config=agent_config_with_task_extension_bindings(
+                {}, ["test_runtime"]
+            ),
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    original_delete = chat_module._delete_task_sync
+
+    def fail_delete(*, task_id):
+        raise RuntimeError("core delete unavailable")
+
+    try:
+        monkeypatch.setattr(chat_module, "_delete_task_sync", fail_delete)
+        first = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert first.status_code == 500
+        assert first.json()["detail"] == "Internal server error"
+
+        db = next(get_db())
+        try:
+            assert db.query(Task).filter(Task.id == task_id).count() == 1
+        finally:
+            db.close()
+
+        monkeypatch.setattr(chat_module, "_delete_task_sync", original_delete)
+        second = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert second.status_code == 200
+        assert [event for event, _task_id in provider.events] == [
+            "deleted",
+            "deleted",
+        ]
+    finally:
+        unregister_task_extension("test_runtime")
+
+
+def test_delete_task_runtime_cleanup_failure_preserves_task_for_retry(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+    from xagent.web.services.task_runtime import (
+        agent_config_with_task_extension_bindings,
+        register_task_extension,
+        unregister_task_extension,
+    )
+
+    class _FailingDeleteProvider(_TaskRuntimeProvider):
+        async def on_task_deleted(self, context):
+            await super().on_task_deleted(context)
+            raise RuntimeError("provider cleanup failed")
+
+    provider = _FailingDeleteProvider()
+    register_task_extension("failing_runtime", provider)
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        task = Task(
+            user_id=user.id,
+            title="preserve for retry",
+            description="",
+            agent_config=agent_config_with_task_extension_bindings(
+                {}, ["failing_runtime"]
+            ),
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    try:
+        response = client.delete(
+            f"/api/chat/task/{task_id}",
+            headers=user1_headers,
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "Runtime extension cleanup failed; the task was not deleted"
+        )
+        db = next(get_db())
+        try:
+            assert db.query(Task).filter(Task.id == task_id).count() == 1
+        finally:
+            db.close()
+    finally:
+        unregister_task_extension("failing_runtime")
+
+
+def test_task_create_seeds_assistant_message(test_db, user1_headers):
+    """`seed_assistant_message` should land as the task's first (and only)
+    chat history row, committed in the same request as task creation - the
+    AI Team Marketplace's "Hire" flow relies on this to let a persona speak
+    first without ever running the LLM."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "Hire Leo",
+            "seed_assistant_message": "Hi — I'm Leo, your Email Lead Response Agent.",
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        messages = (
+            db.query(TaskChatMessage)
+            .filter_by(task_id=task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+        assert len(messages) == 1
+        assert messages[0].role == "assistant"
+        assert messages[0].message_type == "assistant_response"
+        assert messages[0].content == "Hi — I'm Leo, your Email Lead Response Agent."
+    finally:
+        db.close()
+
+
+def test_task_create_seeds_interactions_alongside_the_assistant_message(
+    test_db, user1_headers
+):
+    """`seed_interactions` should ride along on the seeded assistant message's
+    row - the AI Team Marketplace's "connect your apps" card is delivered
+    this way, attached to the same seeded intro message."""
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.user import User
+
+    connect_apps_interaction = {
+        "type": "connect_apps",
+        "field": "connect_apps",
+        "label": "Connect your apps",
+        "apps": ["Gmail", "Google Calendar"],
+    }
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "Hire Leo",
+            "seed_assistant_message": "Hi — I'm Leo.",
+            "seed_interactions": [connect_apps_interaction],
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        message = db.query(TaskChatMessage).filter_by(task_id=task_id).one()
+        assert message.interactions == [connect_apps_interaction]
+        user1_id = db.query(User).filter_by(username="user1").one().id
+    finally:
+        db.close()
+
+    # The DB row alone doesn't prove a client ever actually sees the card
+    # again - assert what historical websocket replay (websocket.py) emits
+    # for it too, so a regression there (e.g. dropping metadata.interactions,
+    # or flipping expect_response back to True and re-opening a stale
+    # question) can't silently remove the card on reload without any test
+    # noticing.
+    from xagent.web.api import websocket as websocket_api
+
+    snapshot = websocket_api._load_historical_stream_snapshot_sync(
+        task_id, actor_user_id=user1_id, actor_is_admin=False
+    )
+    assert snapshot is not None
+    agent_events = [
+        event["data"]
+        for event in snapshot.events
+        if event.get("event_type") == "agent_message"
+    ]
+    assert len(agent_events) == 1
+    replayed = agent_events[0]
+    assert replayed["source"] == "chat_history"
+    assert replayed["expect_response"] is False
+    assert replayed["metadata"] == {"interactions": [connect_apps_interaction]}
+
+
+def test_task_create_ignores_seed_interactions_without_a_seed_message(
+    test_db, user1_headers
+):
+    """`seed_interactions` has no row to attach to without
+    `seed_assistant_message` - documented as a no-op, not a 400, since a
+    client omitting the message by mistake shouldn't fail task creation."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "No seed message",
+            "seed_interactions": [{"type": "connect_apps", "apps": ["Gmail"]}],
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_task_create_rejects_more_than_five_seed_interactions(test_db, user1_headers):
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "Too many interactions",
+            "seed_assistant_message": "Hi.",
+            "seed_interactions": [{"type": "connect_apps"}]
+            * (MAX_SEED_INTERACTIONS + 1),
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_task_create_without_seed_message_creates_no_chat_messages(
+    test_db, user1_headers
+):
+    """Omitting `seed_assistant_message` (the existing behavior for every
+    other task-creation caller) must not start writing empty history rows."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "No seed"},
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_task_create_rejects_overlong_seed_assistant_message(test_db, user1_headers):
+    """`seed_assistant_message` is bounded (max_length=8000) since it is a
+    public request field, not just internal marketplace-authored content."""
+    resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "Too long", "seed_assistant_message": "x" * 8001},
+        headers=user1_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_task_create_warns_when_seed_assistant_message_normalizes_to_empty(
+    test_db, user1_headers, caplog
+):
+    """A non-empty `seed_assistant_message` that `persist_assistant_message_no_commit`
+    drops (normalizes to whitespace-only) must leave a log trail - otherwise a
+    'speak first' flow silently produces zero chat history with no way to
+    tell why."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    with caplog.at_level(logging.WARNING):
+        resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "Blank seed", "seed_assistant_message": "   "},
+            headers=user1_headers,
+        )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+    assert any(
+        "normalized to" in record.message and str(task_id) in record.message
+        for record in caplog.records
+    )
+
+
+def test_task_create_warns_for_a_plain_empty_seed_assistant_message_too(
+    test_db, user1_headers, caplog
+):
+    """A truthy check (`if request.seed_assistant_message:`) would drop a
+    literal "" with zero log output - only the whitespace-only case above
+    would reach the warning. Checking `is not None` instead covers both,
+    since both are the same "seeder passed a value that normalizes to
+    nothing" situation worth a log trail."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    with caplog.at_level(logging.WARNING):
+        resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "Empty seed", "seed_assistant_message": ""},
+            headers=user1_headers,
+        )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+    assert any(
+        "normalized to" in record.message and str(task_id) in record.message
+        for record in caplog.records
+    )

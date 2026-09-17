@@ -4,14 +4,13 @@ import asyncio
 import functools
 import hashlib
 import inspect
+import io
 import json
 import logging
 import mimetypes
-import os
 import re
 import shutil
 import threading
-import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
@@ -26,6 +25,7 @@ from typing import (
     Optional,
     TypedDict,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -45,7 +45,10 @@ from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
-from ...config import get_kb_collections_timeout_seconds
+from ...config import (
+    get_google_drive_download_timeout_seconds,
+    get_kb_collections_timeout_seconds,
+)
 from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
 from ...core.tools.core.RAG_tools.core.parser_registry import (
@@ -72,6 +75,9 @@ from ...core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
     KBApiOperationResult,
     get_kb_coordinator,
+)
+from ...core.tools.core.RAG_tools.kb.config_merge import (
+    merge_collection_config_json,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
@@ -109,6 +115,7 @@ from ..services.background_jobs import (
     is_background_job_enqueue_available,
     mark_job_failed,
 )
+from ..services.google_drive_download import download_google_workspace_file
 from ..services.kb_collection_service import (
     delete_collection_physical_dir,
     delete_collection_uploaded_files,
@@ -170,6 +177,12 @@ from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
+
+_GOOGLE_SLIDES_MIME_TYPE = "application/vnd.google-apps.presentation"
+_GOOGLE_DRIVE_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
+_POWERPOINT_EXPORT_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+)
 
 
 def _create_file_compensation_delete(
@@ -647,6 +660,24 @@ class UploadCopyResult:
     sha256: str
 
 
+class _LimitedWriter(io.BufferedWriter):
+    """Reject a write before a cloud download can exceed its byte limit."""
+
+    def __init__(self, raw: io.FileIO, *, max_bytes: int) -> None:
+        super().__init__(raw)
+        self._max_bytes = max_bytes
+        self._written = 0
+
+    def write(self, data: Any) -> int:
+        if self._written + len(data) > self._max_bytes:
+            raise ValueError(
+                f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
+            )
+        written = super().write(data)
+        self._written += written
+        return written
+
+
 def _like_contains_pattern(value: str) -> str:
     escaped = (
         value.replace(_SQL_LIKE_ESCAPE, _SQL_LIKE_ESCAPE * 2)
@@ -1029,11 +1060,33 @@ async def _cleanup_failed_new_collection_metadata(
     collection_name: str,
     user: User,
 ) -> None:
-    """Remove config rows left behind when a brand-new collection ingest fails."""
+    """Remove config rows left behind when a brand-new collection ingest fails.
+
+    Every caller reaches here from a stale `collection_existed_before`, so the
+    documents check is the last guard before a row a sibling ingest owns is
+    deleted by name.
+    """
+    # Read as the owner, and delete as the owner too: an admin-scoped delete
+    # bypasses owner scoping entirely and would wipe a metadata row another
+    # tenant owns under the same name, which the owner-scoped read never saw.
+    if _collection_holds_documents(
+        collection_name=collection_name,
+        user_id=int(user.id),
+        context="failed-ingest metadata cleanup",
+        on_error=True,
+    ):
+        logger.info(
+            "Skipping failed-ingest collection metadata cleanup for %s/user_%s "
+            "because the collection holds documents",
+            collection_name,
+            int(user.id),
+        )
+        return
+
     cleanup_result = await _get_api_compatibility_facade().delete_collection_metadata(
         collection_name=collection_name,
         user_id=int(user.id),
-        is_admin=bool(user.is_admin),
+        is_admin=False,
         delete_orphaned_metadata=True,
     )
     logger.info(
@@ -1043,19 +1096,120 @@ async def _cleanup_failed_new_collection_metadata(
     )
 
 
-def _collection_or_config_existed_before(
-    collection_existed_before: bool,
-    snapshot: Optional["_CollectionConfigSnapshot"],
+async def _collection_config_exists(
+    *,
+    collection_name: str,
+    user_id: int,
+    context: str,
 ) -> bool:
-    """Treat config-only collections as pre-existing for rollback decisions."""
-    return collection_existed_before or (
-        snapshot is not None and snapshot.previous_config_json is not None
+    """Whether a config row is already published for this collection."""
+    try:
+        config = await _get_api_compatibility_facade().get_collection_config(
+            collection=collection_name,
+            user_id=user_id,
+            is_admin=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Unreadable state must not authorize a destructive rollback.
+        logger.warning(
+            "Failed to read the collection config of %s/user_%s during %s: %s",
+            collection_name,
+            user_id,
+            context,
+            exc,
+        )
+        return True
+    return config is not None
+
+
+async def _rollback_may_delete_collection(
+    *,
+    collection_name: str,
+    user_id: int,
+    collection_existed_before: bool,
+    other_document_present: bool,
+    context: str,
+) -> bool:
+    """Whether a failed ingest may delete the whole collection.
+
+    `collection_existed_before` is stamped when the request or job is submitted,
+    so a sibling ingest into the same new collection may have landed a document
+    or published the config since. Either one makes the delete destructive, and
+    both are re-read here rather than inferred from the stamp.
+
+    The stamp itself cannot be re-read: `initialize_collection` creates the
+    collection metadata row at step 0 of the ingest (collection_manager.py:598),
+    so by rollback time the row exists for every run and says nothing about
+    whether the collection predated this one.
+
+    Caveat: these reads are not atomic with the delete that follows, so a
+    sibling that commits inside the window is still exposed. Closing it needs a
+    per-collection lock, which the codebase does not have anywhere yet — tracked
+    in https://github.com/xorbitsai/xagent/issues/1242 rather than invented here.
+
+    Caveat: when the config read itself fails, this fails safe and a brand-new
+    zero-document collection keeps its metadata row with no config — invisible
+    to its owner and still answering 409 for the name. That row is deliberately
+    not cleaned up on this branch: the cleanup deletes this owner's config row
+    first, so on the other reading of an unreadable state — a sibling published
+    it — it would drop settings that sibling just saved.
+    """
+    if collection_existed_before or other_document_present:
+        return False
+    return not await _collection_config_exists(
+        collection_name=collection_name,
+        user_id=user_id,
+        context=context,
     )
 
 
-async def _restore_or_cleanup_collection_config_after_failed_ingest(
+def _collection_holds_documents(
     *,
-    snapshot: Optional["_CollectionConfigSnapshot"],
+    collection_name: str,
+    user_id: int,
+    context: str,
+    on_error: bool,
+) -> bool:
+    """Whether the collection currently holds any document.
+
+    This is the single question behind both halves of the ingest lifecycle:
+    a collection with documents must be published and must never be cleaned up,
+    an empty one must be neither. Asking the store at decision time avoids
+    trusting `collection_existed_before`, which is stamped when the request or
+    job is submitted and goes stale while a sibling ingest runs.
+
+    The two halves need opposite behaviour when the store cannot be read, so
+    `on_error` is explicit: a cleanup passes `True` (unknown state must not
+    authorize a delete), a publish passes `False` (unknown state must not make
+    a possibly empty knowledge base visible).
+
+    Reads are owner-scoped: every decision it gates acts on the caller's own
+    rows, and an admin-wide read would match rows another tenant owns.
+
+    Callers that roll back their own document must do so before asking.
+    """
+    try:
+        records = list_document_records(
+            collection_name=collection_name,
+            user_id=user_id,
+            is_admin=False,
+            max_results=1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to list documents of %s/user_%s during %s, assuming %s: %s",
+            collection_name,
+            user_id,
+            context,
+            "documents exist" if on_error else "no documents",
+            exc,
+        )
+        return on_error
+    return bool(records)
+
+
+async def _cleanup_collection_metadata_after_failed_ingest(
+    *,
     collection_existed_before: bool,
     collection_name: str,
     user: User,
@@ -1063,60 +1217,18 @@ async def _restore_or_cleanup_collection_config_after_failed_ingest(
     successful_documents: int = 0,
     side_effects_may_remain: bool = False,
 ) -> None:
-    """Restore previous config or clean up only truly empty new collections."""
-    if (
-        snapshot is not None
-        and not snapshot.saved
-        and not snapshot.previous_config_known
-    ):
-        logger.warning(
-            "Skipping failed-ingest collection metadata cleanup because previous "
-            "config state is unknown: %s/user_%s",
-            collection_name,
-            int(user.id),
-        )
-        return
-
-    effective_collection_existed_before = _collection_or_config_existed_before(
-        collection_existed_before,
-        snapshot,
-    )
-    config_only_existed_before = (
-        not collection_existed_before
-        and snapshot is not None
-        and snapshot.previous_config_json is not None
-    )
-    if effective_collection_existed_before:
-        await _restore_collection_config_after_failed_ingest(
-            snapshot=snapshot,
-            collection_existed_before=effective_collection_existed_before,
-            context=context,
-        )
-        if (
-            config_only_existed_before
-            and successful_documents == 0
-            and not side_effects_may_remain
-            and snapshot is not None
-        ):
-            if await _get_api_compatibility_facade().delete_collection_metadata_entry(
-                collection_name
-            ):
-                logger.info(
-                    "Removed collection metadata created by failed %s while "
-                    "preserving previous config: %s/user_%s",
-                    context,
-                    collection_name,
-                    int(user.id),
-                )
+    """Clean up only truly empty new collections; config is saved after ingest."""
+    if collection_existed_before:
         return
 
     if successful_documents > 0 or side_effects_may_remain:
         if side_effects_may_remain:
             logger.warning(
                 "Skipping failed-ingest collection metadata cleanup for %s/user_%s "
-                "because rollback side effects may remain",
+                "during %s because rollback side effects may remain",
                 collection_name,
                 int(user.id),
+                context,
             )
         return
 
@@ -1126,17 +1238,16 @@ async def _restore_or_cleanup_collection_config_after_failed_ingest(
     )
 
 
-async def _restore_or_cleanup_collection_config_after_failed_api_ingest(
+async def _cleanup_collection_metadata_after_failed_api_ingest(
     *,
     api_result: KBApiOperationResult[Any],
-    snapshot: Optional["_CollectionConfigSnapshot"],
     collection_existed_before: bool,
     collection_name: str,
     user: User,
     context: str,
     successful_documents: int | None = None,
     rollback_complete: bool | None = None,
-) -> KBApiOperationResult[Any]:
+) -> None:
     """Apply failed-ingest config cleanup using API rollback outcome semantics."""
     if rollback_complete is not None:
         api_result = _get_api_compatibility_facade().with_rollback_complete(
@@ -1147,8 +1258,7 @@ async def _restore_or_cleanup_collection_config_after_failed_api_ingest(
         api_result,
         successful_documents=successful_documents,
     )
-    await _restore_or_cleanup_collection_config_after_failed_ingest(
-        snapshot=snapshot,
+    await _cleanup_collection_metadata_after_failed_ingest(
         collection_existed_before=collection_existed_before,
         collection_name=collection_name,
         user=user,
@@ -1156,13 +1266,11 @@ async def _restore_or_cleanup_collection_config_after_failed_api_ingest(
         successful_documents=cleanup_decision.successful_documents,
         side_effects_may_remain=cleanup_decision.side_effects_may_remain,
     )
-    return api_result
 
 
-async def _restore_or_cleanup_collection_config_after_failed_batch_api_ingest(
+async def _cleanup_collection_metadata_after_failed_batch_api_ingest(
     *,
     api_results: list[KBApiOperationResult[Any]],
-    snapshot: Optional["_CollectionConfigSnapshot"],
     collection_existed_before: bool,
     collection_name: str,
     user: User,
@@ -1176,8 +1284,7 @@ async def _restore_or_cleanup_collection_config_after_failed_batch_api_ingest(
             successful_documents=successful_documents,
         )
     )
-    await _restore_or_cleanup_collection_config_after_failed_ingest(
-        snapshot=snapshot,
+    await _cleanup_collection_metadata_after_failed_ingest(
         collection_existed_before=collection_existed_before,
         collection_name=collection_name,
         user=user,
@@ -1209,21 +1316,39 @@ async def _rollback_failed_ingestion(
     doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
 
     try:
-        if not collection_existed_before:
-            collection_records = vector_store.list_document_records(
+        collection_records = (
+            vector_store.list_document_records(
                 collection_name=collection_name,
                 user_id=user_id,
                 is_admin=bool(user.is_admin),
             )
-            collection_file_ids = {
-                file_id
-                for file_id in (
-                    _get_document_record_file_id(record)
-                    for record in collection_records
+            if not collection_existed_before
+            else []
+        )
+        collection_file_ids = {
+            file_id
+            for file_id in (
+                _get_document_record_file_id(record) for record in collection_records
+            )
+            if file_id
+        }
+        # Comparing doc_ids, not file_ids: two ingests of the same path share a
+        # file_id, so a file_id match cannot tell a sibling's work from ours.
+        if await _rollback_may_delete_collection(
+            collection_name=collection_name,
+            user_id=user_id,
+            collection_existed_before=collection_existed_before,
+            other_document_present=any(
+                (
+                    record.get("doc_id")
+                    if isinstance(record, dict)
+                    else getattr(record, "doc_id", None)
                 )
-                if file_id
-            }
-
+                != doc_id
+                for record in collection_records
+            ),
+            context="failed-ingest rollback",
+        ):
             collection_delete_result = delete_collection(
                 collection_name,
                 user_id,
@@ -1289,15 +1414,14 @@ async def _rollback_failed_ingestion(
             return
 
         if register_created and doc_id:
-            document_delete_result = delete_document(
-                collection_name,
-                doc_id,
-                user_id,
-                bool(user.is_admin),
-            )
             _ensure_cleanup_succeeded(
                 f"delete document '{doc_id}' during rollback",
-                document_delete_result,
+                delete_document(
+                    collection_name,
+                    doc_id,
+                    user_id,
+                    bool(user.is_admin),
+                ),
             )
             remaining_records = vector_store.list_document_records(
                 collection_name=None,
@@ -1433,7 +1557,13 @@ async def _rollback_failed_cloud_ingestion(
             max_results=1,
         )
         removed_new_collection = False
-        if not collection_existed_before and not collection_records:
+        if await _rollback_may_delete_collection(
+            collection_name=collection_name,
+            user_id=user_id,
+            collection_existed_before=collection_existed_before,
+            other_document_present=bool(collection_records),
+            context="failed-cloud-ingest rollback",
+        ):
             collection_delete_result = delete_collection(
                 collection_name,
                 user_id,
@@ -1484,72 +1614,6 @@ async def _rollback_failed_cloud_ingestion(
         if restore_error is not None:
             message = f"{message}; backup restore also failed: {restore_error}"
         raise RollbackFailureError(message) from exc
-
-
-def cleanup_orphaned_temp_files(upload_dir: Optional[Path] = None) -> int:
-    """Clean up orphaned temporary files from interrupted atomic replacements.
-
-    Removes files matching patterns like:
-    - *.tmp-replace (old pattern)
-    - .*.tmp (new NamedTemporaryFile pattern)
-
-    Args:
-        upload_dir: Base uploads directory to clean. If None, uses default uploads dir.
-
-    Returns:
-        Number of files cleaned up.
-    """
-    from ..config import get_uploads_dir
-
-    base_dir = upload_dir or get_uploads_dir()
-    if not base_dir.exists():
-        return 0
-
-    cleaned_count = 0
-    now = time.time()
-
-    # Walk through uploads directory and clean up temp files older than 1 hour
-    # to avoid deleting files that might still be in use
-    for root, dirs, files in os.walk(base_dir):
-        for filename in files:
-            file_path = Path(root) / filename
-
-            # Check for old temp file pattern (*.tmp-replace)
-            if filename.endswith(".tmp-replace"):
-                file_age = now - file_path.stat().st_mtime
-                if file_age > 3600:  # 1 hour
-                    try:
-                        file_path.unlink()
-                        cleaned_count += 1
-                        logger.debug("Cleaned up orphaned temp file: %s", file_path)
-                    except OSError as e:
-                        logger.warning(
-                            "Failed to clean up orphaned temp file %s: %s", file_path, e
-                        )
-
-            # Check for new temp file pattern (.*.tmp from NamedTemporaryFile)
-            # Pattern: filename.XXXXXX.tmp where X is random hex
-            if filename.endswith(".tmp") and "." in filename[:-4]:
-                # Verify it looks like our temp pattern (has multiple extensions)
-                parts = filename.split(".")
-                if len(parts) >= 3 and parts[-1] == "tmp":
-                    file_age = now - file_path.stat().st_mtime
-                    if file_age > 3600:  # 1 hour
-                        try:
-                            file_path.unlink()
-                            cleaned_count += 1
-                            logger.debug("Cleaned up orphaned temp file: %s", file_path)
-                        except OSError as e:
-                            logger.warning(
-                                "Failed to clean up orphaned temp file %s: %s",
-                                file_path,
-                                e,
-                            )
-
-    if cleaned_count > 0:
-        logger.info("Cleaned up %d orphaned temporary file(s)", cleaned_count)
-
-    return cleaned_count
 
 
 def _get_file_sha256(file_path: Path) -> str:
@@ -2627,6 +2691,9 @@ def _refresh_existing_file_if_changed(
         except DurableObjectMissingError:
             return None
         except Exception as exc:  # noqa: BLE001
+            # ``exc_info`` because this fault is swallowed -- the caller only
+            # sees ``None`` -- so this line is its only record, and ``error=%s``
+            # alone drops the exception class and the cause chain (#1467).
             logger.warning(
                 "Failed to restore durable web-ingestion file before refresh: "
                 "url=%s, file_id=%s, context=%s, error=%s",
@@ -2634,6 +2701,7 @@ def _refresh_existing_file_if_changed(
                 existing_record.file_id,
                 context,
                 exc,
+                exc_info=exc,
             )
             return None
 
@@ -3157,6 +3225,9 @@ def handle_kb_exceptions(func: T) -> T:
         except RollbackFailureError as e:
             logger.error("KB rollback failure in %s: %s", func.__name__, e)
             raise HTTPException(status_code=500, detail=str(e))
+        except CollectionConfigSaveError as e:
+            logger.error("KB config publish failure in %s: %s", func.__name__, e)
+            raise HTTPException(status_code=500, detail=str(e))
         except (ValueError, KeyError, TypeError) as e:
             logger.error("Data format error in %s: %s", func.__name__, e)
             raise HTTPException(status_code=400, detail=f"Data format error: {str(e)}")
@@ -3243,12 +3314,15 @@ def _effective_knowledge_base_user(
 
 class CloudFile(BaseModel):
     provider: str
-    fileId: str
+    fileId: str = Field(pattern=r"^[^\r\n]*$")
     fileName: str
+    resourceKey: Optional[str] = Field(default=None, pattern=r"^[^\r\n]*$")
 
 
 class CloudIngestRequest(BaseModel):
-    files: List[CloudFile]
+    # Reject empty work and keep each request within one five-file concurrency
+    # wave so Drive polling cannot add a second full timeout interval.
+    files: List[CloudFile] = Field(..., min_length=1, max_length=5)
     collection: str
     parse_method: Optional[ParseMethod] = None
     chunk_strategy: Optional[ChunkStrategy] = None
@@ -3265,13 +3339,20 @@ class RollbackFailureError(RuntimeError):
     """Raised when best-effort ingest rollback cannot complete cleanly."""
 
 
-@dataclass
-class _CollectionConfigSnapshot:
-    collection: str
-    user_id: int
-    previous_config_json: Optional[str]
-    previous_config_known: bool
-    saved: bool
+class CollectionConfigSaveError(RuntimeError):
+    """Raised when a successful ingest cannot be published as a visible collection.
+
+    Carries the ingested `file_id` when there is one: the caller is told not to
+    re-import, so it needs a handle on the document that did land.
+    """
+
+    def __init__(self, message: str, *, file_id: Optional[str] = None) -> None:
+        super().__init__(message if not file_id else f"{message} (file_id: {file_id})")
+        self.file_id = file_id
+
+
+class GoogleDriveMetadataValidationError(ValueError):
+    """Report a client-safe validation failure in trusted Drive metadata fields."""
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -3280,142 +3361,183 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-async def _save_collection_config_with_snapshot(
+def _demote_empty_crawl_to_error(
+    api_result: KBApiOperationResult[WebIngestionResult],
+    *,
+    collection_existed_before: bool,
+) -> KBApiOperationResult[WebIngestionResult]:
+    """A crawl that produced no documents publishes nothing, so it is not a success.
+
+    A crawl can finish without recording a single failure (robots.txt, an empty
+    site) and still create zero documents. Typed to the crawl result on purpose:
+    ``documents_created`` is a WebIngestionResult field, and the document paths
+    report their own count instead.
+    """
+    result = api_result.result
+    if result.status == "error" or int(result.documents_created or 0) > 0:
+        return api_result
+
+    outcome = (
+        "nothing was added"
+        if collection_existed_before
+        else "the knowledge base was not created"
+    )
+    return _get_api_compatibility_facade().with_result(
+        api_result,
+        result.model_copy(
+            update={
+                "status": "error",
+                "message": f"{result.message}. No pages were ingested, so {outcome}.",
+            }
+        ),
+    )
+
+
+async def _config_json_preserving_extras(
+    *,
+    collection: str,
+    config_json: str,
+    user_id: int,
+    context: str,
+    collection_existed_before: bool,
+) -> Optional[str]:
+    """Read the current config row and apply the shared merge rule to it.
+
+    Returns ``None`` when a pre-existing collection's settings cannot be read:
+    this write replaces the row wholesale, so writing blind would drop whatever
+    the user had. A brand-new collection has nothing to lose and still writes.
+    """
+    try:
+        existing = await _get_api_compatibility_facade().get_collection_config(
+            collection=collection,
+            user_id=user_id,
+            is_admin=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if collection_existed_before:
+            logger.error(
+                "Could not read the existing collection config of %s/user_%s "
+                "during %s; keeping its settings rather than overwriting: %s",
+                collection,
+                user_id,
+                context,
+                exc,
+            )
+            return None
+        logger.warning(
+            "Could not read the collection config of new %s/user_%s during %s, "
+            "saving this ingest's settings alone: %s",
+            collection,
+            user_id,
+            context,
+            exc,
+        )
+        return config_json
+
+    return merge_collection_config_json(
+        existing if isinstance(existing, str) else None,
+        config_json,
+    )
+
+
+async def _save_collection_config_after_ingest(
     *,
     collection: str,
     config_json: str,
     user: User,
     context: str,
-) -> _CollectionConfigSnapshot:
-    """Save collection config while retaining the caller's previous config."""
-    previous_config_json: Optional[str] = None
-    previous_config_known = False
+    documents_created: int,
+    collection_existed_before: bool = True,
+    run_succeeded: bool = False,
+    file_id: Optional[str] = None,
+) -> None:
+    """Publish the collection config only once ingest actually produced documents.
 
-    try:
-        loaded = await _get_api_compatibility_facade().get_collection_config(
-            collection=collection,
-            user_id=int(user.id),
-            is_admin=False,
-        )
-        if isinstance(loaded, str):
-            previous_config_json = loaded
-            previous_config_known = True
-        elif loaded is None:
-            previous_config_known = True
-        else:
-            logger.warning(
-                "Unexpected collection config snapshot type during %s: %s",
-                context,
-                type(loaded).__name__,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Failed to snapshot collection config during %s: %s",
-            context,
-            exc,
-        )
+    Saving it up front made a failed ingest leave a visible, empty collection.
+    A brand-new collection that produced nothing but could not roll back cleanly
+    still publishes: documents without a config row are invisible to their owner
+    and permanently block the name, which is worse than a visible collection.
+    A pre-existing collection takes this run's settings when the run produced
+    documents (a partial crawl counts) or when it succeeded while adding none;
+    a run that failed and produced nothing leaves the previous settings alone.
 
-    if not previous_config_known:
-        logger.warning(
-            "Skipping collection config save during %s because previous config "
-            "state could not be read for %s/user_%s",
-            context,
-            collection,
-            int(user.id),
-        )
-        return _CollectionConfigSnapshot(
-            collection=collection,
+    Caveat: a collection deleted while its ingest runs is republished here.
+    Cancelling in-flight jobs on delete is the real fix and is out of scope.
+    """
+    publishes_new_collection = not collection_existed_before and (
+        documents_created > 0
+        or _collection_holds_documents(
+            collection_name=collection,
             user_id=int(user.id),
-            previous_config_json=previous_config_json,
-            previous_config_known=previous_config_known,
-            saved=False,
+            context=context,
+            on_error=False,
         )
+    )
+    # A pre-existing collection takes this run's settings when the run produced
+    # something, and also when it succeeded while adding nothing (a file that
+    # parsed to no chunks) — the user still submitted those settings with it.
+    updates_existing_settings = collection_existed_before and (
+        documents_created > 0 or run_succeeded
+    )
+    if not publishes_new_collection and not updates_existing_settings:
+        return
+
+    merged_config_json = await _config_json_preserving_extras(
+        collection=collection,
+        config_json=config_json,
+        user_id=int(user.id),
+        context=context,
+        collection_existed_before=collection_existed_before,
+    )
+    if merged_config_json is None:
+        return
 
     try:
         await _get_api_compatibility_facade().save_collection_config(
             collection=collection,
-            config_json=config_json,
+            config_json=merged_config_json,
             user_id=int(user.id),
-        )
-        return _CollectionConfigSnapshot(
-            collection=collection,
-            user_id=int(user.id),
-            previous_config_json=previous_config_json,
-            previous_config_known=previous_config_known,
-            saved=True,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to save collection config during %s: %s", context, exc)
-        return _CollectionConfigSnapshot(
-            collection=collection,
-            user_id=int(user.id),
-            previous_config_json=previous_config_json,
-            previous_config_known=previous_config_known,
-            saved=False,
-        )
-
-
-async def _restore_collection_config_after_failed_ingest(
-    *,
-    snapshot: Optional[_CollectionConfigSnapshot],
-    collection_existed_before: bool,
-    context: str,
-) -> None:
-    """Undo the config save made before an ingest that ultimately failed."""
-    if snapshot is None or not snapshot.saved:
-        return
-
-    try:
-        if snapshot.previous_config_json is not None:
-            await _get_api_compatibility_facade().save_collection_config(
-                collection=snapshot.collection,
-                config_json=snapshot.previous_config_json,
-                user_id=snapshot.user_id,
-            )
-            logger.info(
-                "Restored previous collection config after failed %s: %s/user_%s",
-                context,
-                snapshot.collection,
-                snapshot.user_id,
-            )
-            return
-
-        if not snapshot.previous_config_known:
-            logger.warning(
-                "Skipping collection config deletion after failed %s because "
-                "previous config state is unknown: %s/user_%s",
-                context,
-                snapshot.collection,
-                snapshot.user_id,
-            )
-            return
-
-        await _get_api_compatibility_facade().delete_collection_metadata(
-            collection_name=snapshot.collection,
-            user_id=snapshot.user_id,
-            is_admin=False,
-            delete_orphaned_metadata=not collection_existed_before,
-        )
-        logger.info(
-            "Removed collection config created by failed %s: %s/user_%s",
+        # The documents are committed and the collection lists them, so re-importing
+        # would only duplicate them. Report the lost settings, not a failed ingest.
+        logger.error(
+            "Ingested into '%s' but saving the collection config during %s failed; "
+            "the documents are listed, the chunking settings were not saved: %s",
+            collection,
             context,
-            snapshot.collection,
-            snapshot.user_id,
+            exc,
         )
-    except Exception as exc:  # noqa: BLE001
-        raise RollbackFailureError(
-            "Failed to restore collection config after failed "
-            f"{context} for {snapshot.collection}/user_{snapshot.user_id}: {exc}"
+        if collection_existed_before:
+            advice = (
+                "the settings fall back to the defaults. Do not re-import; set "
+                "them again in the knowledge base settings"
+            )
+        else:
+            # Nothing published it, so there is no settings page to visit yet.
+            advice = (
+                "'%s' is not listed yet. Re-run the import to publish it; the "
+                "documents already there will not be duplicated" % collection
+            )
+        raise CollectionConfigSaveError(
+            f"The documents were imported into '{collection}', but saving its "
+            f"chunking settings failed, so {advice}: {exc}",
+            file_id=file_id,
         ) from exc
 
 
 def _build_cloud_storage_filename(original_filename: str, file_id: str) -> str:
-    """Generate a collision-resistant local filename for cloud ingests."""
+    """Generate a collision-resistant filename within filesystem byte limits."""
     original_path = Path(original_filename)
     suffix = original_path.suffix
-    stem = original_path.stem or "cloud-file"
     digest = hashlib.sha256(file_id.encode("utf-8")).hexdigest()[:12]
-    return f"{stem}__{digest}{suffix}"
+    trailer = f"__{digest}{suffix}"
+    max_stem_bytes = _MAX_FILESYSTEM_FILENAME_BYTES - len(trailer.encode("utf-8"))
+    stem = _truncate_utf8_bytes(
+        original_path.stem or "cloud-file",
+        max_stem_bytes,
+    )
+    return f"{stem}{trailer}"
 
 
 def _raise_if_list_collections_failed(
@@ -3467,23 +3589,62 @@ async def _list_collections_with_retry(
     )
 
 
+def _collection_name_unavailable_detail(
+    collection_name: str, *, advise_rename: bool = False
+) -> str:
+    """Name-conflict wording that does not confirm another tenant owns the name.
+
+    States the fact, and only adds "pick another name" when the caller knows the
+    user just supplied one. `_ensure_collection_access` cannot know: it raises
+    this both while a name is being chosen and while an existing collection is
+    being written to, from requests the server cannot tell apart, and the advice
+    is useless on a screen with no name field. Rename can know -- the new name is
+    in the request -- so it passes ``advise_rename=True``.
+    """
+    detail = f"Knowledge base name unavailable: {collection_name}."
+    return f"{detail} Please choose a different name." if advise_rename else detail
+
+
+def _rename_target_has_files_detail(collection_name: str) -> str:
+    """Storage-collision wording, for the rename dialog only.
+
+    The owning user id belongs in the log, not here: the caller who sees this may
+    not be that owner. Rename always has a name field, so this says what to do --
+    same reason the name-conflict wording above takes ``advise_rename=True`` here.
+    """
+    return (
+        f"Cannot rename to '{collection_name}': that name already has stored "
+        "files. Please choose a different name."
+    )
+
+
 async def _ensure_collection_access(
     collection_name: str,
     user: User,
     *,
     hide_missing: bool = False,
     allow_create: bool = False,
+    taken_name_is_conflict: Optional[bool] = None,
 ) -> None:
     """Enforce collection-level access semantics for KB APIs.
 
     Rules:
     - Admin users always pass.
-    - If collection exists but is not visible to current user: raise 403.
+    - If collection exists but is not visible to current user: raise 403, or 409
+      when the caller is naming a new collection (the name is merely taken -- it is
+      not an access violation). ``taken_name_is_conflict`` decides; it defaults to
+      ``allow_create`` because most creating callers do carry a user-typed name.
+      Pass it explicitly for a caller that accepts unknown names without asking
+      for one -- there a foreign name really is an access attempt, and "pick a
+      different name" is nonsense on a form with no name field.
     - If collection does not exist globally: when ``allow_create`` is True, allow
       (first ingest / config for a new collection name); otherwise raise 404, or
       403 when ``hide_missing`` is True.
     - If ``list_collections`` returns ``status != "success"``, raise 503 (do not
       infer access from an empty list after a storage read failure).
+    - ``hide_missing`` wins over ``allow_create``: it short-circuits to 403 before
+      the global lookup, so a caller passing both never reaches the 409 branch.
+      No caller passes both today.
     """
     if bool(user.is_admin):
         return
@@ -3515,6 +3676,23 @@ async def _ensure_collection_access(
             return
         raise HTTPException(
             status_code=404, detail=f"Collection not found: {collection_name}"
+        )
+
+    name_is_being_picked = (
+        allow_create if taken_name_is_conflict is None else taken_name_is_conflict
+    )
+    if name_is_being_picked:
+        # The caller wants to create this name, not reach someone else's collection:
+        # that is a naming conflict (409), not an access violation (403).
+        # NOTE: the existence check above is an unlocked read-then-branch, and it
+        # compares names case-sensitively. Two concurrent creates of the same name
+        # can therefore both pass it and collide in the storage layer instead of
+        # getting a clean 409, and "Test" and "test" count as different names. Both
+        # predate this branch: it makes the message friendlier, it is not an
+        # authoritative uniqueness check.
+        raise HTTPException(
+            status_code=409,
+            detail=_collection_name_unavailable_detail(collection_name),
         )
 
     raise HTTPException(
@@ -3604,7 +3782,12 @@ async def save_collection_config(
 
     _user, _ = _effective_knowledge_base_user(db, _user, safe_collection, action="edit")
 
-    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    # Accepts a name with no collection yet (settings are seeded before any
+    # ingest), but the body is an ``IngestionConfig`` -- no name field, so a
+    # foreign name here is an access attempt, not someone picking a name.
+    await _ensure_collection_access(
+        safe_collection, _user, allow_create=True, taken_name_is_conflict=False
+    )
 
     config_json = config.model_dump_json(exclude_unset=True)
 
@@ -3965,17 +4148,6 @@ async def ingest(
 
     progress_manager = get_progress_manager()
 
-    config_snapshot = await _save_collection_config_with_snapshot(
-        collection=safe_collection,
-        config_json=config.model_dump_json(exclude_unset=True),
-        user=_user,
-        context="ingest",
-    )
-    effective_collection_existed_before = _collection_or_config_existed_before(
-        collection_existed_before,
-        config_snapshot,
-    )
-
     try:
         file_record = _upsert_uploaded_file_record(
             db,
@@ -4017,7 +4189,7 @@ async def ingest(
                         result=result,
                         file_path=file_path,
                         file_record=file_record,
-                        collection_existed_before=effective_collection_existed_before,
+                        collection_existed_before=collection_existed_before,
                         uploaded_file_existed_before=uploaded_file_existed_before,
                         file_backup_path=file_backup_path,
                         had_existing_file=had_existing_file,
@@ -4028,17 +4200,6 @@ async def ingest(
             api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:
                 raise rollback_execution.error
-            if effective_collection_existed_before:
-                api_result = (
-                    await _restore_or_cleanup_collection_config_after_failed_api_ingest(
-                        api_result=api_result,
-                        snapshot=config_snapshot,
-                        collection_existed_before=collection_existed_before,
-                        collection_name=collection,
-                        user=_user,
-                        context="ingest",
-                    )
-                )
 
         if result.status == "error":
             return JSONResponse(
@@ -4058,17 +4219,31 @@ async def ingest(
                 content={**result.model_dump(), "status": "error"},
             )
 
+        # The ingest is committed; the backup has nothing left to restore.
         if file_backup_path is not None and file_backup_path.exists():
             try:
                 file_backup_path.unlink()
             except OSError:
                 logger.warning("Failed to remove ingest backup %s", file_backup_path)
 
+        await _save_collection_config_after_ingest(
+            collection=safe_collection,
+            config_json=config.model_dump_json(exclude_unset=True),
+            user=_user,
+            context="ingest",
+            documents_created=result.produced_documents,
+            collection_existed_before=collection_existed_before,
+            run_succeeded=True,
+            file_id=str(file_record.file_id),
+        )
+
         return JSONResponse(
             status_code=200,
             content={**result.model_dump(), "file_id": file_record.file_id},
         )
-    except RollbackFailureError:
+    except (RollbackFailureError, CollectionConfigSaveError):
+        # The documents are committed; only the config write failed. Let the
+        # decorator map it instead of rolling a successful ingest back.
         raise
     except Exception:
         if file_record is not None:
@@ -4088,7 +4263,7 @@ async def ingest(
                         result=rollback_result,
                         file_path=file_path,
                         file_record=file_record,
-                        collection_existed_before=effective_collection_existed_before,
+                        collection_existed_before=collection_existed_before,
                         uploaded_file_existed_before=uploaded_file_existed_before,
                         file_backup_path=file_backup_path,
                         had_existing_file=had_existing_file,
@@ -4099,17 +4274,6 @@ async def ingest(
             rollback_api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:
                 raise rollback_execution.error
-            if effective_collection_existed_before:
-                rollback_api_result = (
-                    await _restore_or_cleanup_collection_config_after_failed_api_ingest(
-                        api_result=rollback_api_result,
-                        snapshot=config_snapshot,
-                        collection_existed_before=collection_existed_before,
-                        collection_name=collection,
-                        user=_user,
-                        context="ingest",
-                    )
-                )
         else:
             rollback_api_result = KBApiOperationResult(
                 result=IngestionResult(
@@ -4131,9 +4295,8 @@ async def ingest(
             rollback_api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:
                 raise rollback_execution.error
-            await _restore_or_cleanup_collection_config_after_failed_api_ingest(
+            await _cleanup_collection_metadata_after_failed_api_ingest(
                 api_result=rollback_api_result,
-                snapshot=config_snapshot,
                 collection_existed_before=collection_existed_before,
                 collection_name=collection,
                 user=_user,
@@ -4315,7 +4478,10 @@ async def create_ingest_job(
     try:
         job = create_background_job(
             db,
-            user_id=int(_user.id),
+            # Owner is the real member who polls /api/jobs/{id}, not the team
+            # storage tenant _user was swapped to; the worker keeps reading the
+            # tenant from payload["user_id"].
+            user_id=int(actor_user.id),
             job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
             payload=job_payload,
             idempotency_key=idempotency_key,
@@ -4358,7 +4524,7 @@ async def ingest_cloud(
     request: CloudIngestRequest,
     db: Session = Depends(get_db),
     _user: User = Depends(get_current_user),
-) -> List[IngestionResult]:
+) -> Union[List[IngestionResult], JSONResponse]:
     """Ingest files from cloud storage."""
     _enforce_storage_gate(db, _user)
 
@@ -4410,17 +4576,6 @@ async def ingest_cloud(
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
 
-    config_snapshot = await _save_collection_config_with_snapshot(
-        collection=safe_collection,
-        config_json=config.model_dump_json(exclude_unset=True),
-        user=_user,
-        context="ingest_cloud",
-    )
-    effective_collection_existed_before = _collection_or_config_existed_before(
-        collection_existed_before,
-        config_snapshot,
-    )
-
     # Concurrency limit for cloud ingestion to avoid overloading
     semaphore = asyncio.Semaphore(5)
 
@@ -4432,7 +4587,137 @@ async def ingest_cloud(
             file_backup_path: Optional[Path] = None
             had_existing_file = False
             uploaded_file_existed_before = False
-            safe_filename = Path(file_info.fileName).name
+            source_filename = Path(file_info.fileName).name
+            safe_filename = source_filename
+            stored_mime_type = (
+                mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+            )
+            is_native_google_slides = False
+            service: Any = None
+            creds: Any = None
+            drive_request_headers: dict[str, str] = {}
+
+            if file_info.provider == "google-drive":
+                if file_info.resourceKey:
+                    drive_request_headers["X-Goog-Drive-Resource-Keys"] = (
+                        f"{file_info.fileId}/{file_info.resourceKey}"
+                    )
+                try:
+                    creds = await asyncio.to_thread(
+                        get_google_credentials, int(actor_user.id), db
+                    )
+                except HTTPException as e:
+                    return KBApiOperationResult(
+                        result=IngestionResult(
+                            status="error",
+                            message=f"Authentication error: {e.detail}",
+                            doc_id=source_filename,
+                        )
+                    )
+
+                try:
+                    service = await asyncio.to_thread(
+                        build,
+                        "drive",
+                        "v3",
+                        credentials=creds,
+                        cache_discovery=False,
+                    )
+
+                    def _get_file_metadata() -> dict[str, Any]:
+                        """Read current metadata before deriving the local file format."""
+                        metadata_request = service.files().get(
+                            fileId=file_info.fileId,
+                            fields="id,name,mimeType,size",
+                            supportsAllDrives=True,
+                        )
+                        if drive_request_headers:
+                            metadata_request.headers.update(drive_request_headers)
+                        return cast(
+                            dict[str, Any], metadata_request.execute(num_retries=3)
+                        )
+
+                    metadata = await asyncio.to_thread(_get_file_metadata)
+                    metadata_name = metadata.get("name")
+                    metadata_mime_type = metadata.get("mimeType")
+                    metadata_size = metadata.get("size")
+                    if metadata_name:
+                        source_filename = Path(str(metadata_name)).name
+                    if metadata_mime_type == _GOOGLE_DRIVE_SHORTCUT_MIME_TYPE:
+                        raise GoogleDriveMetadataValidationError(
+                            "Google Drive shortcuts are not supported"
+                        )
+                    if (
+                        not metadata_name
+                        or not metadata_mime_type
+                        or metadata_size is None
+                    ):
+                        raise GoogleDriveMetadataValidationError(
+                            "Google Drive returned incomplete file metadata"
+                        )
+
+                    if not source_filename:
+                        raise GoogleDriveMetadataValidationError(
+                            "Google Drive returned an invalid file name"
+                        )
+                    try:
+                        file_size = int(str(metadata_size))
+                    except (TypeError, ValueError) as exc:
+                        raise GoogleDriveMetadataValidationError(
+                            "Google Drive returned an invalid file size"
+                        ) from exc
+                    drive_mime_type = str(metadata_mime_type)
+                    is_native_google_slides = (
+                        drive_mime_type == _GOOGLE_SLIDES_MIME_TYPE
+                    )
+                    # Drive reports the native editor-file size here, not the
+                    # generated PPTX size. The export stream enforces its own
+                    # byte limit while it is written.
+                    if not is_native_google_slides and file_size > MAX_FILE_SIZE:
+                        return KBApiOperationResult(
+                            result=IngestionResult(
+                                status="error",
+                                message=(
+                                    "File size exceeds maximum limit of "
+                                    f"{MAX_FILE_SIZE_LABEL}"
+                                ),
+                                doc_id=source_filename,
+                            )
+                        )
+
+                    safe_filename = source_filename
+                    if is_native_google_slides and not safe_filename.lower().endswith(
+                        ".pptx"
+                    ):
+                        safe_filename = f"{safe_filename}.pptx"
+                    stored_mime_type = (
+                        _POWERPOINT_EXPORT_MIME_TYPE
+                        if is_native_google_slides
+                        else drive_mime_type
+                    )
+                except GoogleDriveMetadataValidationError as e:
+                    return KBApiOperationResult(
+                        result=IngestionResult(
+                            status="error",
+                            message=f"Metadata lookup failed: {e}",
+                            doc_id=source_filename or file_info.fileId,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Google Drive metadata lookup failed for file_id=%s user_id=%s",
+                        file_info.fileId,
+                        int(actor_user.id),
+                        exc_info=True,
+                    )
+                    return KBApiOperationResult(
+                        result=IngestionResult(
+                            status="error",
+                            message="Google Drive metadata lookup failed",
+                            doc_id=source_filename or file_info.fileId,
+                        )
+                    )
+
             storage_filename = _build_cloud_storage_filename(
                 safe_filename,
                 file_info.fileId,
@@ -4449,30 +4734,11 @@ async def ingest_cloud(
                     result=IngestionResult(
                         status="error",
                         message=ve.detail,
-                        doc_id=file_info.fileName,
+                        doc_id=source_filename,
                     )
                 )
             try:
                 if file_info.provider == "google-drive":
-                    # Get credentials (run in thread to avoid blocking)
-                    try:
-                        creds = await asyncio.to_thread(
-                            get_google_credentials, int(actor_user.id), db
-                        )
-                    except HTTPException as e:
-                        return KBApiOperationResult(
-                            result=IngestionResult(
-                                status="error",
-                                message=f"Authentication error: {e.detail}",
-                                doc_id=file_info.fileName,
-                            )
-                        )
-
-                    # Build service (blocking)
-                    service = await asyncio.to_thread(
-                        build, "drive", "v3", credentials=creds, cache_discovery=False
-                    )
-
                     # Save to local path
                     had_existing_file = file_path.exists()
                     if had_existing_file:
@@ -4485,23 +4751,60 @@ async def ingest_cloud(
                     try:
 
                         def _download_file() -> None:
-                            request_file = service.files().get_media(
-                                fileId=file_info.fileId
-                            )
-                            with open(file_path, "wb") as fh:
-                                downloader = MediaIoBaseDownload(fh, request_file)
-                                done = False
-                                while done is False:
-                                    status, done = downloader.next_chunk()
+                            if is_native_google_slides:
+                                download_google_workspace_file(
+                                    service=service,
+                                    credentials=creds,
+                                    file_id=file_info.fileId,
+                                    mime_type=_POWERPOINT_EXPORT_MIME_TYPE,
+                                    destination=file_path,
+                                    timeout_seconds=get_google_drive_download_timeout_seconds(),
+                                    resource_key=file_info.resourceKey,
+                                    max_bytes=MAX_FILE_SIZE,
+                                )
+                                return
 
+                            request_file = service.files().get_media(
+                                fileId=file_info.fileId,
+                                supportsAllDrives=True,
+                            )
+                            if drive_request_headers:
+                                request_file.headers.update(drive_request_headers)
+                            with open(file_path, "wb", buffering=0) as raw_file:
+                                with _LimitedWriter(
+                                    raw_file,
+                                    max_bytes=MAX_FILE_SIZE,
+                                ) as output_file:
+                                    downloader = MediaIoBaseDownload(
+                                        output_file,
+                                        request_file,
+                                    )
+                                    done = False
+                                    while done is False:
+                                        _status, done = downloader.next_chunk()
+
+                        if is_native_google_slides:
+                            logger.info(
+                                "Downloading native Google Slides file_id=%s user_id=%s mime_type=%s",
+                                file_info.fileId,
+                                int(actor_user.id),
+                                _POWERPOINT_EXPORT_MIME_TYPE,
+                            )
                         await asyncio.to_thread(_download_file)
 
                     except Exception as e:
+                        logger.warning(
+                            "Google Drive download failed for file_id=%s user_id=%s: %s",
+                            file_info.fileId,
+                            int(actor_user.id),
+                            e,
+                            exc_info=True,
+                        )
                         rollback_api_result = KBApiOperationResult(
                             result=IngestionResult(
                                 status="error",
                                 message=f"Download failed: {str(e)}",
-                                doc_id=file_info.fileName,
+                                doc_id=source_filename,
                             )
                         )
                         rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
@@ -4519,10 +4822,10 @@ async def ingest_cloud(
                                     status="error",
                                     message=(
                                         "Failed to fully roll back cloud ingest for "
-                                        f"{safe_collection}/{file_info.fileName}: "
+                                        f"{safe_collection}/{source_filename}: "
                                         f"{rollback_execution.error}"
                                     ),
-                                    doc_id=file_info.fileName,
+                                    doc_id=source_filename,
                                 ),
                             )
                         return rollback_execution.operation_result
@@ -4539,10 +4842,7 @@ async def ingest_cloud(
                         user_id=int(_user.id),
                         filename=safe_filename,
                         storage_path=file_path,
-                        mime_type=(
-                            mimetypes.guess_type(safe_filename)[0]
-                            or "application/octet-stream"
-                        ),
+                        mime_type=stored_mime_type,
                         file_size=int(file_path.stat().st_size),
                     )
 
@@ -4584,7 +4884,7 @@ async def ingest_cloud(
                                     result=result,
                                     file_path=file_path,
                                     file_record=file_record,
-                                    collection_existed_before=effective_collection_existed_before,
+                                    collection_existed_before=collection_existed_before,
                                     uploaded_file_existed_before=uploaded_file_existed_before,
                                     file_backup_path=file_backup_path,
                                     had_existing_file=had_existing_file,
@@ -4598,7 +4898,7 @@ async def ingest_cloud(
                                     IngestionResult(
                                         status="error",
                                         message=str(rollback_execution.error),
-                                        doc_id=file_info.fileName,
+                                        doc_id=source_filename,
                                     ),
                                 )
                         elif file_backup_path is not None:
@@ -4612,7 +4912,7 @@ async def ingest_cloud(
                             result=IngestionResult(
                                 status="error",
                                 message=str(rollback_exc),
-                                doc_id=file_info.fileName,
+                                doc_id=source_filename,
                             ),
                             operation_outcome=api_result.operation_outcome
                             if "api_result" in locals()
@@ -4622,7 +4922,7 @@ async def ingest_cloud(
                     except Exception as e:
                         rollback_result = IngestionResult(
                             status="error",
-                            doc_id=file_info.fileName,
+                            doc_id=source_filename,
                             message=f"Ingestion failed: {str(e)}",
                         )
                         rollback_api_result = KBApiOperationResult(
@@ -4640,7 +4940,7 @@ async def ingest_cloud(
                                 result=rollback_result,
                                 file_path=file_path,
                                 file_record=file_record,
-                                collection_existed_before=effective_collection_existed_before,
+                                collection_existed_before=collection_existed_before,
                                 uploaded_file_existed_before=uploaded_file_existed_before,
                                 file_backup_path=file_backup_path,
                                 had_existing_file=had_existing_file,
@@ -4653,7 +4953,7 @@ async def ingest_cloud(
                                 IngestionResult(
                                     status="error",
                                     message=str(rollback_execution.error),
-                                    doc_id=file_info.fileName,
+                                    doc_id=source_filename,
                                 ),
                             )
                         return rollback_execution.operation_result
@@ -4663,7 +4963,7 @@ async def ingest_cloud(
                         result=IngestionResult(
                             status="error",
                             message=f"Unsupported provider: {file_info.provider}",
-                            doc_id=file_info.fileName,
+                            doc_id=source_filename,
                         )
                     )
 
@@ -4673,7 +4973,7 @@ async def ingest_cloud(
                     result=IngestionResult(
                         status="error",
                         message=str(e),
-                        doc_id=file_info.fileName,
+                        doc_id=source_filename,
                     ),
                     rollback_complete=False,
                 )
@@ -4682,7 +4982,7 @@ async def ingest_cloud(
                     result=IngestionResult(
                         status="error",
                         message=f"Unexpected error: {str(e)}",
-                        doc_id=file_info.fileName,
+                        doc_id=source_filename,
                     )
                 )
                 rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
@@ -4705,10 +5005,10 @@ async def ingest_cloud(
                             status="error",
                             message=(
                                 "Failed to fully roll back cloud ingest for "
-                                f"{safe_collection}/{file_info.fileName}: "
+                                f"{safe_collection}/{source_filename}: "
                                 f"{rollback_execution.error}"
                             ),
-                            doc_id=file_info.fileName,
+                            doc_id=source_filename,
                         ),
                     )
                 logger.exception(
@@ -4720,19 +5020,48 @@ async def ingest_cloud(
     api_results = await asyncio.gather(*[process_file(f) for f in request.files])
     results = [api_result.result for api_result in api_results]
 
+    # `partial` and `error` files were rolled back inside `process_file` above,
+    # so only the clean successes still have documents in the collection.
+    successful_documents = sum(
+        result.produced_documents for result in results if result.status == "success"
+    )
     has_failure = any(result.status in {"error", "partial"} for result in results)
 
     if has_failure:
-        await _restore_or_cleanup_collection_config_after_failed_batch_api_ingest(
+        await _cleanup_collection_metadata_after_failed_batch_api_ingest(
             api_results=list(api_results),
-            snapshot=config_snapshot,
             collection_existed_before=collection_existed_before,
             collection_name=safe_collection,
             user=_user,
             context="ingest_cloud",
-            successful_documents=sum(
-                1 for result in results if result.status == "success"
-            ),
+            successful_documents=successful_documents,
+        )
+
+    landed_file_ids = [
+        result.file_id
+        for result in results
+        if result.status == "success" and result.file_id
+    ]
+    try:
+        await _save_collection_config_after_ingest(
+            collection=safe_collection,
+            config_json=config.model_dump_json(exclude_unset=True),
+            user=_user,
+            context="ingest_cloud",
+            documents_created=successful_documents,
+            collection_existed_before=collection_existed_before,
+            file_id=", ".join(landed_file_ids) or None,
+        )
+    except CollectionConfigSaveError as exc:
+        # Returning the batch keeps per-file outcomes visible; a bare 500 would
+        # hide which of the files actually landed.
+        logger.error("Cloud ingest could not publish the collection config: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": str(exc),
+                "results": [result.model_dump() for result in results],
+            },
         )
 
     return results
@@ -4783,6 +5112,11 @@ async def list_collections_api(
         collections_by_name = {
             collection.name: collection for collection in personal_collections
         }
+        # Runner-keyed on purpose: this endpoint answers "what can the
+        # requesting user see", the same question for every user regardless
+        # of which agent (if any) they are about to run, so it stays on the
+        # user-keyed overlay hook and never resolves against a governing
+        # agent's team.
         team_refs = visible_team_knowledge_bases(db, int(_user.id))
         refs_by_owner: dict[int, list[KnowledgeBaseAccess]] = {}
         for ref in team_refs:
@@ -5445,12 +5779,6 @@ async def ingest_web(
         except ValueError:
             collection_existed_before = False
 
-        config_snapshot = await _save_collection_config_with_snapshot(
-            collection=safe_collection,
-            config_json=ingestion_config.model_dump_json(exclude_unset=True),
-            user=_user,
-            context="ingest_web",
-        )
         # Track processed URLs to prevent duplicate UploadedFile records
         # Key: URL hash, Value: file_id
         # Note: For large-scale web ingestion (>10000 pages), consider using
@@ -5646,10 +5974,25 @@ async def ingest_web(
                 result,
             )
 
+        api_result = _demote_empty_crawl_to_error(
+            api_result,
+            collection_existed_before=collection_existed_before,
+        )
+        result = api_result.result
+
+        # Partial crawls still leave real documents behind, so publish on any of them.
+        await _save_collection_config_after_ingest(
+            collection=safe_collection,
+            config_json=ingestion_config.model_dump_json(exclude_unset=True),
+            user=_user,
+            context="ingest_web",
+            documents_created=int(result.documents_created or 0),
+            collection_existed_before=collection_existed_before,
+        )
+
         if result.status == "error":
-            await _restore_or_cleanup_collection_config_after_failed_api_ingest(
+            await _cleanup_collection_metadata_after_failed_api_ingest(
                 api_result=api_result,
-                snapshot=config_snapshot,
                 collection_existed_before=collection_existed_before,
                 collection_name=safe_collection,
                 user=_user,
@@ -5665,9 +6008,8 @@ async def ingest_web(
                 _user.id,
                 result.message,
             )
-            await _restore_or_cleanup_collection_config_after_failed_api_ingest(
+            await _cleanup_collection_metadata_after_failed_api_ingest(
                 api_result=api_result,
-                snapshot=config_snapshot,
                 collection_existed_before=collection_existed_before,
                 collection_name=safe_collection,
                 user=_user,
@@ -5679,16 +6021,10 @@ async def ingest_web(
 
     except HTTPException:
         raise
+    except CollectionConfigSaveError:
+        raise
     except (ValueError, KeyError, TypeError) as e:
-        if "config_snapshot" in locals():
-            await _restore_or_cleanup_collection_config_after_failed_ingest(
-                snapshot=config_snapshot,
-                collection_existed_before=collection_existed_before,
-                collection_name=safe_collection,
-                user=_user,
-                context="ingest_web",
-            )
-        elif "collection_existed_before" in locals() and not collection_existed_before:
+        if "collection_existed_before" in locals() and not collection_existed_before:
             await _cleanup_failed_new_collection_metadata(
                 collection_name=safe_collection,
                 user=_user,
@@ -5698,15 +6034,7 @@ async def ingest_web(
             status_code=400, detail=f"Data format error: {str(e)}"
         ) from e
     except Exception as e:
-        if "config_snapshot" in locals():
-            await _restore_or_cleanup_collection_config_after_failed_ingest(
-                snapshot=config_snapshot,
-                collection_existed_before=collection_existed_before,
-                collection_name=safe_collection,
-                user=_user,
-                context="ingest_web",
-            )
-        elif "collection_existed_before" in locals() and not collection_existed_before:
+        if "collection_existed_before" in locals() and not collection_existed_before:
             await _cleanup_failed_new_collection_metadata(
                 collection_name=safe_collection,
                 user=_user,
@@ -5853,7 +6181,10 @@ async def create_ingest_web_job(
     try:
         job = create_background_job(
             db,
-            user_id=int(_user.id),
+            # Owner is the real member who polls /api/jobs/{id}, not the team
+            # storage tenant _user was swapped to; the worker keeps reading the
+            # tenant from payload["user_id"].
+            user_id=int(actor_user.id),
             job_type=BackgroundJobType.KB_INGEST_WEB,
             payload={
                 "collection": safe_collection,
@@ -6629,7 +6960,14 @@ async def check_documents_exist_api(
         if not requested:
             return {"existing_filenames": []}
 
-        await _ensure_collection_access(safe_collection, _user, allow_create=True)
+        # Read-only duplicate check: it names nothing, so it must not report a
+        # naming conflict. Only an existing collection's detail page calls it.
+        # Trade-off: ``allow_create=True`` used to wave through any lag between
+        # ``list_collections`` and the vector store, so a collection missing from
+        # the listing now answers 403 (present globally) or 404 (absent) instead
+        # of being allowed. The caller is fail-open -- it warns and uploads
+        # anyway -- so a missed duplicate warning is the whole cost.
+        await _ensure_collection_access(safe_collection, _user)
 
         # Fetch document records through the API compatibility boundary.
         records = list_document_records(
@@ -7414,21 +7752,24 @@ async def rename_collection_api(
         stage="rename_list_visible_collections",
     )
     if any(c.name == safe_new_collection for c in visible_for_user.collections):
+        # Deliberately not the vague cross-tenant wording: this collection is the
+        # caller's own, so naming it is useful -- they can go rename or delete it.
         raise HTTPException(
             status_code=409,
             detail=f"Target collection already exists: {safe_new_collection}",
         )
-    if not any(c.name == safe_new_collection for c in visible_for_user.collections):
-        all_named = await _list_collections_with_retry(
-            user_id=None,
-            is_admin=True,
-            stage="rename_list_all_collections",
+    all_named = await _list_collections_with_retry(
+        user_id=None,
+        is_admin=True,
+        stage="rename_list_all_collections",
+    )
+    if any(c.name == safe_new_collection for c in all_named.collections):
+        raise HTTPException(
+            status_code=409,
+            detail=_collection_name_unavailable_detail(
+                safe_new_collection, advise_rename=True
+            ),
         )
-        if any(c.name == safe_new_collection for c in all_named.collections):
-            raise HTTPException(
-                status_code=403,
-                detail=f"Access denied for collection: {safe_new_collection}",
-            )
 
     mutation_scope = _resolve_collection_mutation_scope(
         collection_name=safe_old_collection,
@@ -7453,13 +7794,16 @@ async def rename_collection_api(
             collection_is_sanitized=True,
         )
         if old_dir.exists() and old_dir.is_dir() and new_dir.exists():
+            # The owning user id and the storage layout stay in the log: this
+            # detail is shown to the caller, who may not be that owner.
+            logger.warning(
+                "Rename blocked: %s already has files for user_%s",
+                safe_new_collection,
+                owner_id,
+            )
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "Failed to rename collection: target physical directory already "
-                    f"exists for user_{owner_id}. A collection named "
-                    f"'{safe_new_collection}' already has physical files."
-                ),
+                detail=_rename_target_has_files_detail(safe_new_collection),
             )
 
     physical_rename_results = {}

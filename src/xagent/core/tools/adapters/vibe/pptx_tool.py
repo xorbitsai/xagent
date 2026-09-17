@@ -169,6 +169,6 @@ async def create_pptx_tool(config: "BaseToolConfig") -> list:
     Returns:
         List of tool instances
     """
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
     tool_instance = PPTXGenerationTool(workspace)
     return tool_instance.get_tools()

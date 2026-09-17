@@ -23,6 +23,14 @@ search_sparse_module = importlib.import_module(
 )
 
 
+def _searched_terms(mock_table) -> List[str]:
+    """Terms of the BooleanQuery the FTS path built from the query text."""
+    assert mock_table.search.call_count == 1
+    (built,), kwargs = mock_table.search.call_args
+    assert kwargs == {"query_type": "fts"}
+    return [match.query for _, match in built.queries]
+
+
 class TestSearchSparse:
     """Test search_sparse main function."""
 
@@ -100,7 +108,7 @@ class TestSearchSparse:
         # Verify calls: collection filter must be applied for KB isolation
         mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
         mock_vector_store.build_filter_expression.assert_called_once()
-        mock_table.search.assert_called_once_with("content", query_type="fts")
+        assert _searched_terms(mock_table) == ["content"]
         mock_search.limit.assert_called_once_with(1)
         mock_limit.where.assert_called_once()
         where_arg = mock_limit.where.call_args[0][0]
@@ -165,7 +173,7 @@ class TestSearchSparse:
         mock_fallback.assert_called_once()
         mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
         mock_vector_store.build_filter_expression.assert_called()
-        mock_table.search.assert_called_once_with("filtered content", query_type="fts")
+        assert _searched_terms(mock_table) == ["filtered", "content"]
         mock_search.limit.assert_called_once_with(5)
         mock_limit.where.assert_called_once()
         mock_where.to_pandas.assert_called_once()
@@ -270,7 +278,7 @@ class TestSearchSparse:
         assert any(w.code == "FTS_INDEX_MISSING" for w in response.warnings)
 
         mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
-        mock_table.search.assert_called_once_with("query", query_type="fts")
+        assert _searched_terms(mock_table) == ["query"]
         mock_search.limit.assert_called_once_with(1)
 
     def test_search_sparse_readonly_mode(self, make_handle, routed_facade) -> None:
@@ -326,7 +334,7 @@ class TestSearchSparse:
         assert any(w.code == "READONLY_MODE" for w in response.warnings)
 
         mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
-        mock_table.search.assert_called_once_with("query", query_type="fts")
+        assert _searched_terms(mock_table) == ["query"]
         mock_search.limit.assert_called_once_with(1)
 
     @patch(
@@ -409,7 +417,7 @@ class TestSearchSparse:
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
-                    query_text="no matches",
+                    query_text="zero matches",
                     top_k=5,
                     user_id=None,
                     is_admin=True,
@@ -421,7 +429,7 @@ class TestSearchSparse:
         assert response.warnings == []
 
         mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
-        mock_table.search.assert_called_once_with("no matches", query_type="fts")
+        assert _searched_terms(mock_table) == ["zero", "matches"]
         mock_search.limit.assert_called_once_with(5)
 
     def test_search_sparse_triggers_fallback_with_results(

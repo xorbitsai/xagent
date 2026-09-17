@@ -12,6 +12,10 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { MCPServerFormData } from "./custom-api-form"
 import {
+  parseMcpOAuthErrorMessage,
+  type McpOAuthConnectResponse,
+} from "@/lib/mcp-utils"
+import {
   RuntimeInputsForm,
   type RuntimeConfigErrorKey,
 } from "./runtime-inputs-form"
@@ -56,27 +60,11 @@ interface McpOAuthDiscoveryResponse {
   scopes: string[]
 }
 
-interface McpOAuthConnectResponse {
-  authorization_url: string
-}
-
 const MASKED_SECRET_VALUE = "********"
 const HTTP_MCP_OAUTH_TRANSPORTS = new Set(["streamable_http", "sse", "websocket"])
 
 export function isHttpMcpOAuthTransport(transport: string): boolean {
   return HTTP_MCP_OAUTH_TRANSPORTS.has(transport)
-}
-
-async function parseMcpOAuthErrorMessage(response: Response, fallback: string): Promise<string> {
-  try {
-    const payload = await response.json()
-    if (typeof payload?.detail === "string") return payload.detail
-    if (payload?.detail?.message) return payload.detail.message
-    if (payload?.detail?.code) return payload.detail.code
-  } catch {
-    // Keep the provided fallback.
-  }
-  return fallback
 }
 
 export function CustomMcpForm({
@@ -92,6 +80,42 @@ export function CustomMcpForm({
   const [oauthStatusLoading, setOauthStatusLoading] = useState(false)
   const [oauthAction, setOauthAction] = useState<string | null>(null)
   const isMountedRef = useRef(false)
+  // #1330: synchronous shadow of oauthAction. Every action button is guarded
+  // only by `disabled={oauthAction === "..."}`, which is React state and so
+  // lags a commit cycle behind two clicks landing in the same tick. This
+  // matters most for Connect, which drives the same per-server
+  // /api/mcp/{id}/oauth/connect endpoint the connector dialog does: with no
+  // configured client_id, two concurrent POSTs each run Dynamic Client
+  // Registration, leaving a second, orphaned client registered at the
+  // third-party authorization server.
+  const oauthActionRef = useRef<string | null>(null)
+  // Returns false when the same action is already in flight. Deliberately
+  // compares against the action identity rather than "any action in flight",
+  // so this exactly mirrors what each button's disabled prop already claims to
+  // do — a Connect fired while a discover is running behaves as it does today.
+  // Note the residual limitation of a scalar slot: a *different* action
+  // starting still takes the slot from an in-flight one. Tracking overlaps
+  // properly needs a set, not a slot — but the slot is what the disabled props
+  // read, so widening it is a UI change, not a guard change, and is left out
+  // of #1330's scope.
+  const beginOauthAction = (action: string) => {
+    if (oauthActionRef.current === action) return false
+    oauthActionRef.current = action
+    setOauthAction(action)
+    return true
+  }
+  // Only the action that currently owns the slot may release it. The three
+  // buttons are gated on their own identity, so a discover and a connect are
+  // allowed to overlap; an unconditional clear would let whichever finished
+  // first reopen the other's guard mid-flight. (main cleared oauthAction
+  // unconditionally and had the same clobber, so this is a gap the shadow
+  // inherited rather than introduced — but the ref is what the guard now
+  // reads, so it has to be tighter than the state ever was.)
+  const endOauthAction = (action: string) => {
+    if (oauthActionRef.current !== action) return
+    oauthActionRef.current = null
+    if (isMountedRef.current) setOauthAction(null)
+  }
   const pollingTimeoutRef = useRef<number | null>(null)
   const editedSecretFieldsRef = useRef<Set<string>>(new Set())
   const previousServerIdRef = useRef<number | null | undefined>(serverId)
@@ -229,7 +253,7 @@ export function CustomMcpForm({
       toast.error(t('tools.mcp.dialog.oauthSaveBeforeConnect'))
       return
     }
-    setOauthAction("discover")
+    if (!beginOauthAction("discover")) return
     try {
       const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/discover`, {
         method: "POST",
@@ -255,7 +279,7 @@ export function CustomMcpForm({
       console.error("Failed to discover MCP OAuth metadata:", error)
       if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthDiscoveryFailed'))
     } finally {
-      if (isMountedRef.current) setOauthAction(null)
+      endOauthAction("discover")
     }
   }
 
@@ -264,7 +288,7 @@ export function CustomMcpForm({
       toast.error(t('tools.mcp.dialog.oauthSaveBeforeConnect'))
       return
     }
-    setOauthAction("connect")
+    if (!beginOauthAction("connect")) return
     let popup: Window | null = null
     try {
       clearOAuthPolling()
@@ -334,13 +358,13 @@ export function CustomMcpForm({
       console.error("Failed to start MCP OAuth authorization:", error)
       if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
     } finally {
-      if (isMountedRef.current) setOauthAction(null)
+      endOauthAction("connect")
     }
   }
 
   const handleDeleteGrant = async (grantId: number) => {
     if (!serverId) return
-    setOauthAction(`delete-${grantId}`)
+    if (!beginOauthAction(`delete-${grantId}`)) return
     try {
       const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/grants/${grantId}`, {
         method: "DELETE"
@@ -360,7 +384,7 @@ export function CustomMcpForm({
       console.error("Failed to delete MCP OAuth grant:", error)
       if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthDisconnectFailed'))
     } finally {
-      if (isMountedRef.current) setOauthAction(null)
+      endOauthAction(`delete-${grantId}`)
     }
   }
 

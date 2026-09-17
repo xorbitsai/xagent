@@ -12,14 +12,24 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Optional, Type, cast
+from typing import (
+    Any,
+    Mapping,
+    Optional,
+    Protocol,
+    Type,
+    TypeGuard,
+    cast,
+    runtime_checkable,
+)
 
 import cloudpickle  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
-from ......config import get_sandbox_host_project_root
+from ......config import SANDBOX_TOOL_RUNNER, get_sandbox_host_project_root
 from ......sandbox.base import Sandbox
 from .....workspace import TaskWorkspace
+from ....artifacts import build_generated_file_metadata, build_inline_artifact
 from ..base import AbstractBaseTool, ToolMetadata
 from ..function import FunctionTool
 from .sandbox_config import (
@@ -60,9 +70,89 @@ class _StaticSandboxLease:
         return None
 
 
-def _is_sandbox_lease_provider(value: Any) -> bool:
-    """Return whether an object is a real sandbox lease provider."""
+@runtime_checkable
+class _SandboxLeaseProviderLike(Protocol):
+    """Structural shape of a SandboxLeaseProvider (src/xagent/web/sandbox_manager.py).
+
+    A Protocol rather than an import of that class: this module lives under
+    core/ and must not depend on web/. Declaring the shape here lets
+    resolve_primary_sandbox's signature express what it actually accepts
+    instead of ``Any``.
+    """
+
+    primary_sandbox: Sandbox
+
+    def lease(self, *, concurrency_safe: bool) -> Any: ...
+
+
+def _is_sandbox_lease_provider(
+    value: Any,
+) -> TypeGuard[_SandboxLeaseProviderLike]:
+    """Return whether an object is a real sandbox lease provider.
+
+    Checks only for a callable ``lease`` -- the one thing _lease_sandbox()
+    actually needs to decide whether to call `.lease(...)` or wrap a plain
+    Sandbox. This makes the TypeGuard not fully sound (a `.lease`-only
+    object narrows to _SandboxLeaseProviderLike here even without
+    `.primary_sandbox`): tightening it to also require `.primary_sandbox`
+    was tried and reverted -- it broke
+    tests/core/tools/adapters/sandboxed_tool/test_sandboxed_tool_lease_provider.py's
+    FakeLeaseProvider, a legitimate lease-provider double that only
+    implements `.lease()` and names its own bookkeeping attribute
+    ``primary``, not ``primary_sandbox``. resolve_primary_sandbox is the
+    only caller that needs `.primary_sandbox` to actually exist, and in
+    production it's only ever given the real SandboxLeaseProvider (which
+    always has it) or a plain Sandbox (which this check correctly rejects
+    -- no callable `.lease` on the class).
+    """
     return callable(getattr(type(value), "lease", None))
+
+
+def _has_primary_sandbox(value: Any) -> TypeGuard[_SandboxLeaseProviderLike]:
+    """Return whether an object exposes ``.primary_sandbox``.
+
+    A separate, narrower check from _is_sandbox_lease_provider: this is
+    the one attribute resolve_primary_sandbox actually dereferences, and
+    checking for it directly (rather than reusing the lease-only check)
+    keeps this sound for resolve_primary_sandbox's own contract without
+    touching _is_sandbox_lease_provider's existing, battle-tested
+    definition that _lease_sandbox()/FakeLeaseProvider-style test doubles
+    depend on (see that function's docstring for why it can't require
+    ``.primary_sandbox`` too).
+
+    Sound for the two real production shapes (a concrete Sandbox subclass
+    never has this attribute; SandboxLeaseProvider always does), but an
+    unspecced ``MagicMock()`` auto-vivifies *any* attribute access,
+    including this one -- a mock meant to stand in for a plain Sandbox
+    must be built with ``spec=Sandbox`` or it will misclassify as a lease
+    provider here.
+    """
+    return hasattr(value, "primary_sandbox")
+
+
+def resolve_primary_sandbox(sandbox: "Sandbox | _SandboxLeaseProviderLike") -> Sandbox:
+    """Unwrap a SandboxLeaseProvider to its primary Sandbox, if given one.
+
+    For one-shot/setup-style operations (dependency install, MCP tool
+    listing) that don't need per-call worker-slot leasing, callers should
+    use this instead of re-deriving the same ``.primary_sandbox`` check --
+    a SandboxLeaseProvider has no ``.exec``/``.read_file``/``.name`` of its
+    own, so operating on it directly raises AttributeError.
+
+    Checks ``isinstance(sandbox, Sandbox)`` first, before the ``.primary_sandbox``
+    duck-type check: a concrete Sandbox is never misclassified this way
+    regardless of what attributes it happens to expose, which matters
+    because SandboxLeaseProvider is not a Sandbox subclass and vice versa
+    -- the two shapes don't otherwise overlap in production, but nothing
+    stops an untyped test double from claiming to be either.
+    """
+    if sandbox is None:
+        raise ValueError("sandbox cannot be None")
+    if isinstance(sandbox, Sandbox):
+        return sandbox
+    if _has_primary_sandbox(sandbox):
+        return sandbox.primary_sandbox
+    return cast(Sandbox, sandbox)
 
 
 class SandboxDependencyManager:
@@ -263,6 +353,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
         self._allow_users = getattr(target_tool, "_allow_users", None)
 
         self._execution_spec, reconstruction_target = self._resolve_execution_spec()
+        self._reconstruction_target = reconstruction_target
 
         # Extract and serialize init params for sandbox reconstruction
         init_params = _extract_init_params(reconstruction_target)
@@ -304,7 +395,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
 
     def _build_execution_env(self) -> dict[str, str]:
         """Build per-exec environment variables (scoped to this process, not the sandbox)."""
-        env = {"PYTHONPATH": SANDBOX_SRC_ROOT}
+        env: dict[str, str] = {}
 
         for env_var in self._env_vars:
             value = os.getenv(env_var)
@@ -313,6 +404,10 @@ class SandboxedToolWrapper(AbstractBaseTool):
             else:
                 logger.warning(f"Environment variable {env_var} not found in host")
 
+        # Seeded last: a tool-declared env_var must not be able to override
+        # these. A host PYTHONPATH would point the runner outside the sandbox.
+        env["PYTHONPATH"] = SANDBOX_SRC_ROOT
+        env[SANDBOX_TOOL_RUNNER] = "1"
         return env
 
     def _lease_sandbox(self) -> Any:
@@ -324,11 +419,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
     async def _ensure_dependencies(self, sandbox: Sandbox | None = None) -> None:
         """Ensure dependencies are installed in the sandbox."""
         if sandbox is None:
-            sandbox = (
-                self._sandbox.primary_sandbox
-                if _is_sandbox_lease_provider(self._sandbox)
-                else self._sandbox
-            )
+            sandbox = resolve_primary_sandbox(self._sandbox)
         await SandboxDependencyManager.ensure_requirements(sandbox, self._requirements)
 
     def _resolve_execution_spec(self) -> tuple[dict[str, str], Any]:
@@ -400,6 +491,154 @@ class SandboxedToolWrapper(AbstractBaseTool):
         return asyncio.run(self.run_json_async(args))
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        """Execute the tool in the sandbox, then register its files here."""
+        result = await self._run_json_in_sandbox(args)
+        # Guest metadata is not evidence about persisted host bytes. Only the
+        # host rebuild below can attach an authoritative validation report.
+        pending = [result]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                value.pop("validation", None)
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+        try:
+            return await self._register_sandbox_outputs(result)
+        except Exception:
+            # A successful sandbox run must survive a registration failure.
+            logger.warning(
+                "Host-side registration failed for %s; returning sandbox metadata",
+                self._target.name,
+                exc_info=True,
+            )
+            return result
+
+    @staticmethod
+    def _resolved_ref_key(ref: Mapping[str, Any]) -> str | None:
+        """Merge key for every ref, registrable or not.
+
+        Deliberately not _host_output_key: that one decides what the host may
+        persist, so it rejects symlinks and paths outside the output tree.
+        Applying those checks here would drop guest-only refs from the merge.
+        """
+        raw = ref.get("file_path")
+        if not raw:
+            return None
+        try:
+            return str(Path(str(raw)).resolve())
+        except OSError:
+            return None
+
+    @staticmethod
+    def _host_output_key(workspace: Any, ref: Mapping[str, Any]) -> str | None:
+        """Resolved key for a ref the host is willing to register.
+
+        A guest-supplied path is not authorization to persist whatever it
+        points at: sandboxed code can drop a symlink into the output tree.
+        Only a regular, non-symlink file whose resolved path stays under this
+        workspace's output directory is accepted.
+        """
+        raw = ref.get("file_path")
+        if not raw:
+            return None
+        candidate = Path(str(raw))
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                return None
+            resolved = candidate.resolve()
+            output_root = Path(workspace.output_dir).resolve()
+        except OSError:
+            return None
+        if not resolved.is_relative_to(output_root):
+            logger.warning(
+                "Refusing to register sandbox output %s outside %s",
+                resolved,
+                output_root,
+            )
+            return None
+        return str(resolved)
+
+    @staticmethod
+    def _reregister_on_host(workspace: Any, paths: list[str]) -> dict[str, Any]:
+        """Re-stage sandbox outputs on the host, then describe what persisted.
+
+        ``register_file`` is called explicitly: a regenerated file already
+        carries an id, and ``build_workspace_file_ref`` would short-circuit on
+        it and leave the previous generation's bytes as the served version.
+        Only paths that registered are described, because that same
+        short-circuit would otherwise hand a failed path its stale id back.
+        """
+        registered: list[str] = []
+        for path in paths:
+            try:
+                workspace.register_file(path)
+            except Exception:
+                logger.warning(
+                    "Host-side re-registration failed for %s", path, exc_info=True
+                )
+                continue
+            registered.append(path)
+        if not registered:
+            return {"generated_files": [], "file_refs": [], "artifacts": []}
+        return build_generated_file_metadata(workspace=workspace, file_paths=registered)
+
+    async def _register_sandbox_outputs(self, result: Any) -> Any:
+        """Mint usable file_ids for sandbox-produced files.
+
+        The sandbox has no database credentials, so a file_id minted in there
+        names no real record. Refs the host cannot re-register keep the sandbox
+        entry: a dropped artifact reads as "nothing was generated", which is
+        what makes an agent overwrite a real file to obtain a usable id.
+        """
+        workspace = getattr(self._reconstruction_target, "_workspace", None)
+        if workspace is None:
+            logger.debug(
+                "%s exposes no _workspace; sandbox outputs stay unregistered",
+                self._target.name,
+            )
+            return result
+        if not isinstance(result, dict):
+            return result
+        original_refs = [
+            ref for ref in result.get("file_refs") or [] if isinstance(ref, dict)
+        ]
+        if not original_refs:
+            return result
+
+        # Merge on resolved paths: a guest mount point deliberately keeps the
+        # unresolved spelling, while FileRefs carry the resolved one.
+        keys = [self._host_output_key(workspace, ref) for ref in original_refs]
+        paths = [key for key in keys if key]
+        if not paths:
+            return result
+
+        rebuilt = await asyncio.to_thread(
+            self._reregister_on_host,
+            workspace,
+            paths,
+        )
+        rebuilt_by_path = {
+            key: ref
+            for ref in rebuilt["file_refs"]
+            if (key := self._resolved_ref_key(ref))
+        }
+        if not rebuilt_by_path:
+            return result
+
+        # Both sandboxed executors keep artifacts 1:1 with file_refs, so the
+        # rebuild below is lossless for them and only for them.
+        merged = [
+            rebuilt_by_path.get(key or "", ref) for key, ref in zip(keys, original_refs)
+        ]
+        result["file_refs"] = merged
+        result["artifacts"] = [build_inline_artifact(ref) for ref in merged]
+        result["generated_files"] = [
+            str(ref["filename"]) for ref in merged if ref.get("filename")
+        ]
+        return result
+
+    async def _run_json_in_sandbox(self, args: Mapping[str, Any]) -> Any:
         """Execute tool asynchronously in sandbox"""
 
         # Generate unique result file name
@@ -461,14 +700,16 @@ class SandboxedToolWrapper(AbstractBaseTool):
 
 async def create_sandboxed_tool(
     tool: AbstractBaseTool,
-    sandbox: Sandbox,
+    sandbox: "Sandbox | _SandboxLeaseProviderLike",
 ) -> SandboxedToolWrapper:
     """
     Create sandboxed tool instance
 
     Args:
         tool: Tool to wrap
-        sandbox: Created sandbox instance
+        sandbox: Created sandbox instance, or a lease provider -- retained
+            as-is (never resolved to its primary here) so each per-call
+            invocation can still take its own worker-slot lease
 
     Returns:
         Sandboxed tool wrapper
@@ -487,7 +728,11 @@ async def create_workspace_in_sandbox(
     sandbox: Sandbox,
     workspace: TaskWorkspace,
 ) -> None:
-    """Create workspace directories inside the sandbox.
+    """Create workspace directories inside an independently-backed sandbox.
+
+    This is the fallback for raw/standalone sandbox integrations. Web sandbox
+    lease providers expose their host-mount coverage to ``ToolFactory`` and
+    skip this exec when the host-created workspace is already visible.
 
     Args:
         sandbox: Sandbox instance

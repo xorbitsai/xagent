@@ -10,19 +10,93 @@ from __future__ import annotations
 
 import mimetypes
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol
+
+SkillScopeMetadataValue = str | int | float | bool | None
+_DETACHED_SKILL_METADATA_VALUE_TYPES = {str, int, float, bool, type(None)}
+
+
+def _freeze_detached_skill_metadata(
+    metadata: Mapping[str, SkillScopeMetadataValue], *, context_name: str
+) -> Mapping[str, SkillScopeMetadataValue]:
+    """Copy and freeze scalar extension metadata at the public boundary."""
+    copied_metadata = dict(metadata)
+    if any(
+        type(key) is not str or type(value) not in _DETACHED_SKILL_METADATA_VALUE_TYPES
+        for key, value in copied_metadata.items()
+    ):
+        raise TypeError(f"{context_name} metadata must contain detached scalar values")
+    return MappingProxyType(copied_metadata)
+
+
+def _validate_detached_skill_user_id(user_id: int | None) -> None:
+    """Reject identity values that could retain request-owned state."""
+    if user_id is not None and type(user_id) is not int:
+        raise TypeError("skill user_id must be an exact detached integer or None")
 
 
 @dataclass(frozen=True)
 class SkillScopeContext:
-    """Request/runtime context passed to skill providers."""
+    """Detached runtime identity passed to read-only skill providers.
 
-    user: Any | None = None
+    Request objects, ORM entities, and database sessions must never enter this
+    context because agent services may retain it across long-running waits.
+    """
+
     user_id: int | None = None
-    db: Any | None = None
-    request: Any | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, SkillScopeMetadataValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _validate_detached_skill_user_id(self.user_id)
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_detached_skill_metadata(self.metadata, context_name="skill scope"),
+        )
+
+
+@dataclass(frozen=True)
+class SkillWriteContext:
+    """Detached scalar identity passed to a scoped Skill write provider.
+
+    Providers resolve authorization from ``user_id`` and own their database
+    dependency, transaction, and result materialization.  Callers must not
+    place request, Session, or ORM state in this context.
+    """
+
+    user_id: int | None = None
+    metadata: Mapping[str, SkillScopeMetadataValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _validate_detached_skill_user_id(self.user_id)
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_detached_skill_metadata(self.metadata, context_name="skill write"),
+        )
+
+
+class SkillWriteProviderErrorReason(str, Enum):
+    """Allowlisted public failure categories for Skill write providers."""
+
+    FORBIDDEN = "forbidden"
+    INVALID_REQUEST = "invalid_request"
+
+
+class SkillWriteProviderError(Exception):
+    """A provider failure with an explicitly public-safe message."""
+
+    def __init__(
+        self,
+        reason: SkillWriteProviderErrorReason,
+        public_detail: str,
+    ) -> None:
+        self.reason = reason
+        self.public_detail = public_detail
+        super().__init__(public_detail)
 
 
 @dataclass(frozen=True)
@@ -49,7 +123,11 @@ class SkillRecord:
 
 
 class SkillLibraryProvider(Protocol):
-    """Read interface implemented by filesystem and database providers."""
+    """Read interface implemented by filesystem and database providers.
+
+    Metadata is non-authoritative: database providers re-resolve access from
+    ``context.user_id`` in their own short-lived database session.
+    """
 
     async def list_records(self, context: SkillScopeContext) -> list[SkillRecord]:
         """Return records in provider precedence order."""
@@ -61,11 +139,17 @@ class SkillLibraryProvider(Protocol):
 
 
 class SkillWriteProvider(Protocol):
-    """Optional write interface for scoped skill management APIs."""
+    """Optional scoped write interface with provider-owned transactions.
+
+    A database provider opens, commits or rolls back, materializes, and closes
+    its own session before returning. Expected public failures use
+    :class:`SkillWriteProviderError`; unknown failures are sanitized at the
+    invocation boundary.
+    """
 
     async def create_skill(
         self,
-        context: SkillScopeContext,
+        context: SkillWriteContext,
         *,
         scope: str,
         name: str,
@@ -77,7 +161,7 @@ class SkillWriteProvider(Protocol):
 
     async def update_skill_file(
         self,
-        context: SkillScopeContext,
+        context: SkillWriteContext,
         *,
         scope: str,
         name: str,
@@ -88,7 +172,7 @@ class SkillWriteProvider(Protocol):
 
     async def delete_skill(
         self,
-        context: SkillScopeContext,
+        context: SkillWriteContext,
         *,
         scope: str,
         name: str,

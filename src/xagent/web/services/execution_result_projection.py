@@ -7,6 +7,8 @@ from typing import Any
 
 from ...core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from ..models.task import TaskStatus
+from .assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
+from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 
 EMPTY_CHANNEL_OUTPUT_FALLBACK = "Task completed, but no output was generated."
 
@@ -18,6 +20,7 @@ class ChannelExecutionProjection:
     transcript_content: str
     message_type: str
     interactions: list[dict[str, Any]]
+    diagnostic_error: str | None
 
 
 def project_execution_result_for_channel(
@@ -38,12 +41,22 @@ def project_execution_result_for_channel(
     output = str(result.get("output") or "")
     base_text = chat_message or output
     transcript_content = base_text
+    task_status = _project_task_status(result, status)
+    diagnostic_error = None
+    if task_status == TaskStatus.FAILED:
+        diagnostic_error = (
+            str(result.get("error") or "").strip() or base_text.strip() or None
+        )
     if status == "interrupted":
         # An interruption is control state, not an assistant answer. Show a
         # friendly status in every chat channel without adding it to the
         # conversation transcript used by later model turns.
         base_text = INTERRUPTED_USER_MESSAGE
         transcript_content = ""
+        interactions = []
+    elif task_status == TaskStatus.FAILED:
+        base_text = CLIENT_SAFE_TASK_FAILURE
+        transcript_content = base_text
         interactions = []
     elif not base_text.strip() and not interactions:
         base_text = EMPTY_CHANNEL_OUTPUT_FALLBACK
@@ -52,13 +65,14 @@ def project_execution_result_for_channel(
     visible_text = _append_interactions(base_text, interactions)
 
     return ChannelExecutionProjection(
-        task_status=_project_task_status(result, status),
+        task_status=task_status,
         visible_text=visible_text,
         transcript_content=transcript_content,
         message_type="question"
         if status == "waiting_for_user" or interactions
-        else "assistant_message",
+        else ASSISTANT_RESPONSE_MESSAGE_TYPE,
         interactions=interactions,
+        diagnostic_error=diagnostic_error,
     )
 
 

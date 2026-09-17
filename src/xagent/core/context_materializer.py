@@ -5,8 +5,11 @@ import base64
 import logging
 import time
 from collections import OrderedDict
+from io import BytesIO
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
+
+from PIL import Image
 
 from .context_ref import (
     CONTEXT_REFS_KEY,
@@ -17,10 +20,17 @@ from .context_ref import (
 logger = logging.getLogger(__name__)
 
 _IMAGE_CONTEXT_PLACEHOLDER = "Image context for the preceding message."
+_DEFAULT_CACHE_ENTRIES = 32
 _DEFAULT_CACHE_BYTES = 32 * 1024 * 1024
 _DEFAULT_CONTEXT_REF_TOKEN_BUDGET = 8_192
 _MAX_CONTEXT_IMAGE_BYTES_PER_REQUEST = 32 * 1024 * 1024
 _CONTEXT_REF_TOKEN_BUDGET_RATIO = 0.25
+_SUPPORTED_IMAGE_MIME_TYPES = {
+    "GIF": "image/gif",
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "WEBP": "image/webp",
+}
 
 
 class ContextReferenceResolutionError(RuntimeError):
@@ -45,6 +55,12 @@ class _CacheEntry(NamedTuple):
     encoded_bytes: int
 
 
+class _ReferencePosition(NamedTuple):
+    message_index: int
+    reference_index: int
+    reference: ContextReference
+
+
 class ContextReferenceResolver(Protocol):
     async def resolve_image(self, reference: ContextReference) -> str: ...
 
@@ -56,7 +72,7 @@ class WorkspaceContextReferenceResolver:
         self,
         workspace: Any,
         *,
-        cache_size: int = 8,
+        cache_size: int = _DEFAULT_CACHE_ENTRIES,
         cache_ttl_seconds: float = 300,
         max_image_bytes: int = 20 * 1024 * 1024,
         max_cache_bytes: int = _DEFAULT_CACHE_BYTES,
@@ -70,10 +86,15 @@ class WorkspaceContextReferenceResolver:
         self._cache_bytes = 0
 
     async def resolve_image(self, reference: ContextReference) -> str:
-        mime_type = str(reference.safe_file_ref.get("mime_type") or "image/png")
-        if not mime_type.startswith("image/"):
+        declared_mime_type = str(reference.safe_file_ref.get("mime_type") or "").lower()
+        declared_mime_type = declared_mime_type.split(";", 1)[0].strip()
+        if declared_mime_type == "image/jpg":
+            declared_mime_type = "image/jpeg"
+        if declared_mime_type and declared_mime_type not in (
+            _SUPPORTED_IMAGE_MIME_TYPES.values()
+        ):
             raise ContextReferenceResolutionError(
-                f"unsupported context image MIME type: {mime_type}"
+                f"unsupported context image MIME type: {declared_mime_type}"
             )
 
         for attempt in range(2):
@@ -86,7 +107,11 @@ class WorkspaceContextReferenceResolver:
                     f"context image exceeds {self.max_image_bytes} bytes"
                 )
 
-            cache_key = self._cache_key(reference, generation)
+            cache_key = self._cache_key(
+                reference,
+                generation,
+                declared_mime_type,
+            )
             now = time.monotonic()
             cached = self._cache.get(cache_key)
             if cached is not None:
@@ -113,6 +138,11 @@ class WorkspaceContextReferenceResolver:
                 raise ContextReferenceResolutionError(
                     f"context image exceeds {self.max_image_bytes} bytes"
                 )
+            mime_type = await asyncio.to_thread(
+                self._validated_image_mime_type,
+                image_bytes,
+                declared_mime_type,
+            )
             encoded = base64.b64encode(image_bytes).decode("ascii")
             data_url = f"data:{mime_type};base64,{encoded}"
             encoded_bytes = len(data_url)
@@ -178,12 +208,43 @@ class WorkspaceContextReferenceResolver:
         return image_bytes
 
     @staticmethod
+    def _validated_image_mime_type(
+        image_bytes: bytes,
+        declared_mime_type: str,
+    ) -> str:
+        try:
+            with Image.open(BytesIO(image_bytes)) as image:
+                image_format = str(image.format or "").upper()
+                image.verify()
+        except (
+            Image.DecompressionBombError,
+            OSError,
+            SyntaxError,
+            ValueError,
+        ) as exc:
+            raise ContextReferenceResolutionError(
+                "context FileRef does not contain a valid supported image"
+            ) from exc
+
+        mime_type = _SUPPORTED_IMAGE_MIME_TYPES.get(image_format)
+        if mime_type is None:
+            raise ContextReferenceResolutionError(
+                f"unsupported context image format: {image_format or 'unknown'}"
+            )
+        if declared_mime_type and declared_mime_type != mime_type:
+            raise ContextReferenceResolutionError(
+                "context image MIME type does not match its encoded format"
+            )
+        return mime_type
+
+    @staticmethod
     def _cache_key(
         reference: ContextReference,
         generation: _FileGeneration,
+        declared_mime_type: str,
     ) -> str:
         generation_key = ":".join(str(part) for part in generation)
-        return f"{reference.file_id}:{generation_key}"
+        return f"{reference.file_id}:{declared_mime_type}:{generation_key}"
 
 
 def llm_supports_vision(llm: Any) -> bool:
@@ -208,6 +269,15 @@ def _append_text(content: Any, text: str) -> Any:
     return f"{current}\n{text}".strip()
 
 
+def _context_ref_fallback(
+    reference: ContextReference,
+    *,
+    reason: str | None = None,
+) -> str:
+    compact = reference.compact_text()
+    return f"{compact} {reason}" if reason else compact
+
+
 def _context_ref_token_budget(llm: Any) -> int:
     context_window = getattr(llm, "context_window", None)
     if isinstance(context_window, int) and context_window > 0:
@@ -215,22 +285,44 @@ def _context_ref_token_budget(llm: Any) -> int:
     return _DEFAULT_CONTEXT_REF_TOKEN_BUDGET
 
 
-def _enforce_context_ref_request_budget(
-    llm: Any,
+def _prioritized_reference_positions(
     messages: list[dict[str, Any]],
-) -> None:
-    references = [
-        reference
-        for message in messages
-        for reference in normalize_context_references(message.get(CONTEXT_REFS_KEY))
-    ]
-    estimated_tokens = sum(reference.estimated_tokens() for reference in references)
-    token_budget = _context_ref_token_budget(llm)
-    if estimated_tokens > token_budget:
-        raise ContextReferenceResolutionError(
-            "context image request exceeds the materialization token budget "
-            f"({estimated_tokens} estimated tokens > {token_budget})"
-        )
+    references_by_message: list[tuple[ContextReference, ...]],
+) -> tuple[
+    list[_ReferencePosition],
+    list[_ReferencePosition],
+    set[tuple[int, int]],
+]:
+    """Return unique current-turn refs first and older refs newest-first."""
+
+    current_turn_start: int | None = None
+    for message_index in range(len(messages) - 1, -1, -1):
+        if messages[message_index].get("role") == "user":
+            current_turn_start = message_index
+            break
+
+    current: list[_ReferencePosition] = []
+    historical: list[_ReferencePosition] = []
+    duplicates: set[tuple[int, int]] = set()
+    seen_file_ids: set[str] = set()
+    for message_index in range(len(messages) - 1, -1, -1):
+        references = references_by_message[message_index]
+        for reference_index in range(len(references) - 1, -1, -1):
+            reference = references[reference_index]
+            if reference.file_id in seen_file_ids:
+                duplicates.add((message_index, reference_index))
+                continue
+            seen_file_ids.add(reference.file_id)
+            position = _ReferencePosition(
+                message_index,
+                reference_index,
+                reference,
+            )
+            if current_turn_start is not None and message_index >= current_turn_start:
+                current.append(position)
+            else:
+                historical.append(position)
+    return current, historical, duplicates
 
 
 async def materialize_messages(
@@ -242,11 +334,72 @@ async def materialize_messages(
     """Materialize durable context refs without mutating persisted messages."""
 
     supports_vision = llm_supports_vision(llm)
+    references_by_message = [
+        normalize_context_references(message.get(CONTEXT_REFS_KEY))
+        for message in messages
+    ]
+    resolved_images: dict[tuple[int, int], str] = {}
+    fallback_reasons: dict[tuple[int, int], str] = {}
+    duplicate_positions: set[tuple[int, int]] = set()
     if supports_vision and resolver is not None:
-        _enforce_context_ref_request_budget(llm, messages)
+        (
+            current_positions,
+            historical_positions,
+            duplicate_positions,
+        ) = _prioritized_reference_positions(messages, references_by_message)
+        for message_index, reference_index in duplicate_positions:
+            fallback_reasons[(message_index, reference_index)] = (
+                "The same image is included with a more recent message."
+            )
+        token_budget = _context_ref_token_budget(llm)
+        materialized_tokens = 0
+        materialized_image_bytes = 0
+
+        async def resolve(position: _ReferencePosition) -> str | None:
+            try:
+                return await resolver.resolve_image(position.reference)
+            except (
+                ContextReferenceResolutionError,
+                FileNotFoundError,
+                OSError,
+            ):
+                fallback_reasons[(position.message_index, position.reference_index)] = (
+                    "The image could not be loaded."
+                )
+                logger.debug(
+                    "Falling back to text for unresolved context ref %s",
+                    position.reference.file_id,
+                    exc_info=True,
+                )
+                return None
+
+        for position in (*current_positions, *historical_positions):
+            estimated_tokens = position.reference.estimated_tokens()
+            if materialized_tokens + estimated_tokens > token_budget:
+                fallback_reasons[(position.message_index, position.reference_index)] = (
+                    "The image was omitted because this request contains more "
+                    "images than the model can accept."
+                )
+                continue
+            url = await resolve(position)
+            if url is None:
+                continue
+            image_bytes = len(url.encode("utf-8"))
+            if (
+                materialized_image_bytes + image_bytes
+                > _MAX_CONTEXT_IMAGE_BYTES_PER_REQUEST
+            ):
+                fallback_reasons[(position.message_index, position.reference_index)] = (
+                    "The image was omitted because this request contains more "
+                    "image data than the model can accept."
+                )
+                continue
+            materialized_tokens += estimated_tokens
+            materialized_image_bytes += image_bytes
+            resolved_images[(position.message_index, position.reference_index)] = url
+
     result: list[dict[str, Any]] = []
     deferred_user_messages: list[dict[str, Any]] = []
-    materialized_image_bytes = 0
 
     def flush_deferred() -> None:
         if deferred_user_messages:
@@ -255,12 +408,21 @@ async def materialize_messages(
 
     for index, message in enumerate(messages):
         copied = dict(message)
-        refs = normalize_context_references(copied.pop(CONTEXT_REFS_KEY, None))
+        copied.pop(CONTEXT_REFS_KEY, None)
+        refs = references_by_message[index]
         role = copied.get("role")
 
         if not refs or not supports_vision or resolver is None:
             if refs:
-                fallback = "\n".join(ref.compact_text() for ref in refs)
+                if not supports_vision:
+                    reason = "This model cannot view the image directly."
+                elif resolver is None:
+                    reason = "The image is not available for direct viewing."
+                else:
+                    reason = None
+                fallback = "\n".join(
+                    _context_ref_fallback(ref, reason=reason) for ref in refs
+                )
                 copied["content"] = _append_text(copied.get("content"), fallback)
             if role != "tool":
                 flush_deferred()
@@ -286,34 +448,17 @@ async def materialize_messages(
         else:
             content_parts.append({"type": "text", "text": _IMAGE_CONTEXT_PLACEHOLDER})
 
-        unresolved: list[ContextReference] = []
-        for reference in refs:
-            try:
-                url = await resolver.resolve_image(reference)
-            except (
-                ContextReferenceResolutionError,
-                FileNotFoundError,
-                OSError,
-            ):
-                logger.debug(
-                    "Falling back to text for unresolved context ref %s",
-                    reference.file_id,
-                    exc_info=True,
+        unresolved: list[tuple[ContextReference, str | None]] = []
+        for reference_index, reference in enumerate(refs):
+            url = resolved_images.get((index, reference_index))
+            if url is None:
+                unresolved.append(
+                    (
+                        reference,
+                        fallback_reasons.get((index, reference_index)),
+                    )
                 )
-                unresolved.append(reference)
                 continue
-
-            image_bytes = len(url.encode("utf-8"))
-            if (
-                materialized_image_bytes + image_bytes
-                > _MAX_CONTEXT_IMAGE_BYTES_PER_REQUEST
-            ):
-                raise ContextReferenceResolutionError(
-                    "context image request exceeds the materialized byte budget "
-                    f"({materialized_image_bytes + image_bytes} bytes > "
-                    f"{_MAX_CONTEXT_IMAGE_BYTES_PER_REQUEST})"
-                )
-            materialized_image_bytes += image_bytes
             image_url: dict[str, Any] = {"url": url}
             detail = (
                 "high"
@@ -330,13 +475,18 @@ async def materialize_messages(
             )
 
         if unresolved:
-            fallback = "\n".join(ref.compact_text() for ref in unresolved)
+            fallback = "\n".join(
+                _context_ref_fallback(ref, reason=reason) for ref, reason in unresolved
+            )
             content_parts.append({"type": "text", "text": fallback})
 
         if not any(part.get("type") == "image_url" for part in content_parts):
             copied["content"] = _append_text(
                 copied.get("content"),
-                "\n".join(ref.compact_text() for ref in unresolved),
+                "\n".join(
+                    _context_ref_fallback(ref, reason=reason)
+                    for ref, reason in unresolved
+                ),
             )
             if role != "tool":
                 flush_deferred()

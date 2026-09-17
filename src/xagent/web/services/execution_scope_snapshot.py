@@ -3,11 +3,12 @@
 Workforce runs create fresh Task rows whose ids the embedding application's
 scope resolver cannot map. The creating context's scope is persisted into
 the task's ``agent_config`` JSON (``EXECUTION_SCOPE_AGENT_CONFIG_KEY``, no
-schema migration) at creation; this module's loader reads it back, and the
-core per-task resolution (:func:`xagent.core.execution_scope.
-resolve_execution_scope`) prefers the snapshot over the resolver — so a
-sub-task of a scoped parent executes fully scoped even after a process
-restart.
+schema migration) at creation; this module's loader reads it back. The core
+per-task resolution (:func:`xagent.core.execution_scope.
+resolve_execution_scope`) treats it as the sole answer when no resolver is
+registered — this is what keeps a sub-task of a scoped parent executing
+fully scoped even after a process restart — and as a corroborating
+candidate for the resolver's authoritative answer when one is registered.
 """
 
 from __future__ import annotations

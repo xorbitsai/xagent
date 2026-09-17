@@ -181,6 +181,43 @@ describe("AgentBuilder preview", () => {
       if (url.endsWith("/api/mcp/servers")) {
         return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
       }
+      if (url.endsWith("/api/agents/42/triggers")) {
+        return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      }
+      if (url.endsWith("/api/agents/42")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: 42,
+              user_id: 1,
+              name: "Existing SSH agent",
+              description: "Saved description",
+              instructions: "Saved instructions",
+              execution_mode: "balanced",
+              suggested_prompts: [],
+              visibility: "team",
+              team_id: null,
+              knowledge_bases: [],
+              skills: [],
+              tool_categories: ["ssh"],
+              logo_url: null,
+              models: {
+                general: 7,
+                small_fast: null,
+                visual: null,
+                compact: null,
+              },
+              can_edit: true,
+              status: "draft",
+              origin: "user",
+              widget_enabled: false,
+              allowed_domains: [],
+              share_enabled: false,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
       if (url.endsWith("/api/chat/task/create")) {
         return Promise.resolve(
           new Response(
@@ -239,6 +276,31 @@ describe("AgentBuilder preview", () => {
       expect(sendMessageMock).toHaveBeenCalledWith("Preview this", expect.objectContaining({ force: true }), undefined)
     })
     expect(globalThis.WebSocket).not.toHaveBeenCalled()
+  })
+
+  it("keeps an edit-mode agent identity inside preview config only", async () => {
+    render(<AgentBuilder agentId="42" />)
+
+    await screen.findByDisplayValue("Existing SSH agent")
+    fireEvent.click(screen.getByText("send-preview-message"))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/chat/task/create",
+        expect.objectContaining({ method: "POST", body: expect.any(String) }),
+      )
+    })
+
+    const createCall = apiRequestMock.mock.calls.find(([url]) =>
+      String(url).endsWith("/api/chat/task/create"),
+    )
+    const payload = JSON.parse(createCall?.[1]?.body as string)
+    expect(payload.agent_id).toBeUndefined()
+    expect(payload.agent_config).toMatchObject({
+      preview_agent_id: 42,
+      is_preview: true,
+      tool_categories: ["ssh"],
+    })
   })
 
   it("shows task file management in the embedded preview panel", async () => {

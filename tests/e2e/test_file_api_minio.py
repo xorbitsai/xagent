@@ -24,7 +24,10 @@ from tests.e2e.minio_harness import MinioStorage, run_minio_storage
 from xagent.core.tools.adapters.vibe.file_ingestion_tool import (
     CreateKnowledgeBaseFromFileTool,
 )
-from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    IngestionResult,
+    IngestionStepResult,
+)
 from xagent.core.workspace import TaskWorkspace
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
@@ -421,7 +424,7 @@ async def test_create_kb_from_file_tool_restores_durable_only_upload_from_minio(
         chunk_count=1,
         embedding_count=1,
         vector_count=1,
-        completed_steps=[],
+        completed_steps=[IngestionStepResult(name="register_document")],
         failed_step=None,
         message="ok",
         warnings=[],

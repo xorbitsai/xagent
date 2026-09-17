@@ -11,6 +11,12 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.model.chat.token_context import (
     TokenUsage,
     add_token_usage,
@@ -191,7 +197,6 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
     verify,
     *,
     operation_scheduled=None,
-    timer_created=None,
 ):
     """Exercise one tracker DB operation while its QueuePool is exhausted."""
     from xagent.web.models import database
@@ -203,23 +208,15 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
     operation_task = None
     ticker_task = None
     held_connection = None
-    window_timer = None
     ticker_stop = threading.Event()
-    window_elapsed = threading.Event()
     ticker_ticks = 0
-    worker_entered = threading.Event()
     event_loop_thread_id = threading.get_ident()
     worker_thread_id: int | None = None
     original_helper = getattr(tracker_module, sync_helper_name)
 
     def traced_helper(*args, **kwargs):
-        nonlocal window_timer, worker_thread_id
+        nonlocal worker_thread_id
         worker_thread_id = threading.get_ident()
-        window_timer = threading.Timer(0.1, end_window)
-        if timer_created is not None:
-            timer_created(window_timer)
-        window_timer.start()
-        worker_entered.set()
         return original_helper(*args, **kwargs)
 
     async def ticker():
@@ -228,62 +225,43 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
             await asyncio.sleep(0.01)
             ticker_ticks += 1
 
-    def end_window():
-        ticker_stop.set()
-        window_elapsed.set()
-
     try:
         await prepare(tracker)
         monkeypatch.setattr(tracker_module, sync_helper_name, traced_helper)
         held_connection = engine.connect()
-        ticker_task = asyncio.create_task(ticker())
-        await asyncio.sleep(0)
-        operation_task = asyncio.create_task(operation(tracker))
-        if operation_scheduled is not None:
-            operation_scheduled.set()
-        assert await asyncio.wait_for(
-            asyncio.to_thread(worker_entered.wait, 2), timeout=2
-        )
-
-        assert await asyncio.wait_for(
-            asyncio.to_thread(window_elapsed.wait, 0.2), timeout=0.3
-        )
-        assert ticker_ticks >= 3
-        assert not operation_task.done()
-        assert worker_thread_id is not None
-        assert worker_thread_id != event_loop_thread_id
-
-        held_connection.close()
-        held_connection = None
-        result = await asyncio.wait_for(operation_task, timeout=1)
-        verify(tracker, session_factory, result)
+        with gated_pool_checkout(engine) as gate:
+            ticker_task = asyncio.create_task(ticker())
+            operation_task = asyncio.create_task(operation(tracker))
+            if operation_scheduled is not None:
+                operation_scheduled.set()
+            try:
+                await gate.wait_until_contending()
+                observed = await wait_for_ticks(lambda: ticker_ticks)
+                assert observed >= LOOP_LIVENESS_TICKS
+                assert not operation_task.done()
+                assert worker_thread_id is not None
+                assert worker_thread_id != event_loop_thread_id
+            finally:
+                held_connection.close()
+                held_connection = None
+                gate.let_through()
+                # Drain even when cancelled before the worker reaches checkout.
+                await drain_async_task_cancellation_safe(operation_task)
+            result = operation_task.result()
+            verify(tracker, session_factory, result)
     finally:
-        window_elapsed.set()
         ticker_stop.set()
         try:
             if held_connection is not None:
                 held_connection.close()
+            if ticker_task is not None:
+                await drain_async_task_cancellation_safe(ticker_task)
         finally:
             try:
-                if operation_task is not None:
-                    await drain_async_task_cancellation_safe(operation_task)
+                if tracker.is_tracking:
+                    await tracker.stop_periodic_updates()
             finally:
-                try:
-                    if window_timer is not None:
-                        try:
-                            window_timer.cancel()
-                        finally:
-                            window_timer.join()
-                finally:
-                    try:
-                        if ticker_task is not None:
-                            await drain_async_task_cancellation_safe(ticker_task)
-                    finally:
-                        try:
-                            if tracker.is_tracking:
-                                await tracker.stop_periodic_updates()
-                        finally:
-                            engine.dispose()
+                engine.dispose()
 
 
 class TestTaskTracker:
@@ -433,21 +411,32 @@ class TestTaskTracker:
         ids=["normal-cleanup", "cleanup-error"],
     )
     @pytest.mark.asyncio
-    async def test_tracker_pool_helper_joins_timer_created_by_delayed_worker(
+    async def test_tracker_pool_helper_drains_delayed_worker(
         self, monkeypatch, tmp_path, inject_cleanup_error
     ):
-        """Cancellation must not leave a delayed worker's timer alive."""
+        """Cancellation must drain a worker queued before it reaches checkout."""
         loop = asyncio.get_running_loop()
         executor = ThreadPoolExecutor(max_workers=1)
         original_executor = getattr(loop, "_default_executor")
         blocker_started = asyncio.Event()
         release_worker = threading.Event()
         operation_scheduled = asyncio.Event()
-        recorded_timers = []
+        worker_finished = threading.Event()
+        from xagent.web.tracking import task_tracker as tracker_module
+
+        original_seed = tracker_module._load_task_seed_sync
+
+        def observed_seed(*args, **kwargs):
+            try:
+                return original_seed(*args, **kwargs)
+            finally:
+                worker_finished.set()
+
+        monkeypatch.setattr(tracker_module, "_load_task_seed_sync", observed_seed)
 
         def occupy_default_executor():
             loop.call_soon_threadsafe(blocker_started.set)
-            assert release_worker.wait(timeout=2)
+            assert release_worker.wait(timeout=GUARD_TIMEOUT)
 
         async def prepare(_tracker):
             return None
@@ -459,7 +448,7 @@ class TestTaskTracker:
             blocker = loop.run_in_executor(None, occupy_default_executor)
             helper_task = None
             try:
-                await asyncio.wait_for(blocker_started.wait(), timeout=1)
+                await asyncio.wait_for(blocker_started.wait(), timeout=GUARD_TIMEOUT)
                 helper_task = asyncio.create_task(
                     _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
                         monkeypatch,
@@ -470,10 +459,11 @@ class TestTaskTracker:
                         lambda tracker: tracker.start_tracking(),
                         verify,
                         operation_scheduled=operation_scheduled,
-                        timer_created=recorded_timers.append,
                     )
                 )
-                await asyncio.wait_for(operation_scheduled.wait(), timeout=1)
+                await asyncio.wait_for(
+                    operation_scheduled.wait(), timeout=GUARD_TIMEOUT
+                )
                 helper_task.cancel()
                 release_worker.set()
                 await blocker
@@ -481,8 +471,7 @@ class TestTaskTracker:
                     await helper_task
 
                 assert helper_task.cancelled()
-                assert len(recorded_timers) == 1
-                assert not recorded_timers[0].is_alive()
+                assert worker_finished.is_set()
             finally:
                 try:
                     release_worker.set()
@@ -577,8 +566,9 @@ class TestTaskTracker:
         engine.dispose()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("takeover", ["runner", "attempt"])
     async def test_runner_fence_rejects_same_run_takeover_at_every_db_boundary(
-        self, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path, takeover
     ):
         """A stale tracker must not seed or write after runner ownership changes."""
         from xagent.web.models import database
@@ -604,6 +594,7 @@ class TestTaskTracker:
                         status=TaskStatus.RUNNING,
                         run_id="run-a",
                         runner_id="runner-a",
+                        lease_attempt_id="attempt-a",
                         input_tokens=4,
                         output_tokens=2,
                         total_tokens=6,
@@ -624,12 +615,14 @@ class TestTaskTracker:
                 update_interval_seconds=60,
                 expected_run_id="run-a",
                 expected_runner_id="runner-a",
+                expected_attempt_id="attempt-a",
             )
             final_tracker = TaskTracker(
                 task_id=124,
                 update_interval_seconds=60,
                 expected_run_id="run-a",
                 expected_runner_id="runner-a",
+                expected_attempt_id="attempt-a",
             )
             await periodic_tracker.start_tracking()
             await final_tracker.start_tracking()
@@ -638,7 +631,10 @@ class TestTaskTracker:
                 for task_id in (123, 124, 125):
                     replacement = takeover_db.get(Task, task_id)
                     assert replacement is not None
-                    replacement.runner_id = "runner-b"
+                    if takeover == "runner":
+                        replacement.runner_id = "runner-b"
+                    else:
+                        replacement.lease_attempt_id = "attempt-b"
                     replacement.input_tokens = 100
                     replacement.output_tokens = 50
                     replacement.total_tokens = 150
@@ -652,6 +648,7 @@ class TestTaskTracker:
                 task_id=125,
                 expected_run_id="run-a",
                 expected_runner_id="runner-a",
+                expected_attempt_id="attempt-a",
             )
             with pytest.raises(ValueError, match="Task 125.*not found"):
                 await seed_tracker.start_tracking()
@@ -665,7 +662,9 @@ class TestTaskTracker:
                 replacement = verify_db.get(Task, task_id)
                 assert replacement is not None
                 assert replacement.run_id == "run-a"
-                assert replacement.runner_id == "runner-b"
+                assert replacement.runner_id == (
+                    "runner-b" if takeover == "runner" else "runner-a"
+                )
                 assert replacement.input_tokens == 100
                 assert replacement.output_tokens == 50
                 assert replacement.total_tokens == 150
@@ -745,6 +744,7 @@ class TestTaskTracker:
                     status=TaskStatus.RUNNING,
                     run_id="run-a",
                     runner_id="runner-a",
+                    lease_attempt_id="attempt-a",
                     input_tokens=4,
                     output_tokens=2,
                     total_tokens=6,
@@ -772,6 +772,7 @@ class TestTaskTracker:
                 update_interval_seconds=60,
                 expected_run_id="run-a",
                 expected_runner_id="runner-a",
+                expected_attempt_id="attempt-a",
             )
             await tracker.start_tracking()
             add_token_usage(input_tokens=16, output_tokens=8)

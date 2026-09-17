@@ -7,7 +7,8 @@ import base64
 import json
 import logging
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, cast
 
 from google.auth.exceptions import TransportError as GoogleTransportError
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -17,19 +18,35 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from ....config import (
+    get_gmail_callback_base_url,
     get_gmail_pubsub_project_id,
     get_gmail_pubsub_push_service_account,
+    get_gmail_watch_enabled,
 )
 from ...models.gmail_watch import GmailWatchState
 from ...models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
+from ...models.user_oauth import UserOAuth
 from ..gmail_provisioning import (
+    GMAIL_WATCH_DISABLED_ERROR,
+    gmail_callback_url,
     provision_gmail_trigger,
     release_gmail_mailbox_if_unused,
 )
+from ..gmail_triggers import (
+    gmail_binding_id,
+    is_legacy_gmail_binding,
+    ordinary_gmail_triggers,
+)
 from ..ops_signals import (
     GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED,
+    GMAIL_WATCH_REGISTRATION_DISABLED,
     clear_degradation,
     register_degradation,
+)
+from ..user_oauth import (
+    get_scoped_user_oauth_account,
+    is_ordinary_gmail,
+    ordinary_gmail_clause,
 )
 from .base import (
     CallbackRequestContext,
@@ -80,20 +97,81 @@ def warn_if_gmail_oidc_verification_degraded() -> None:
     )
 
 
-def _binding_oauth_account_id(config: Any) -> int | None:
-    """Read the bound OAuth account from a binding config.
+def warn_if_gmail_watch_registration_degraded() -> None:
+    """Startup config-drift check for Gmail watch registration.
 
-    CRUD dispatch always passes the previous config as a plain dict
-    (AgentTrigger.config is a JSON column).
+    A configured Pub/Sub project without the watch feature enabled means
+    Gmail watch registration and renewal are disabled: Gmail triggers report
+    failed provisioning and existing watches expire unrenewed. Registering
+    the degradation at startup surfaces the drift on /health.
     """
-    value = (config or {}).get("oauth_account_id")
-    return int(value) if value is not None else None
+    if not get_gmail_pubsub_project_id() or get_gmail_watch_enabled():
+        return
+    message = (
+        "XAGENT_GMAIL_PUBSUB_PROJECT_ID is set but XAGENT_GMAIL_WATCH_ENABLED "
+        "is not; Gmail watch registration and renewal are disabled, so Gmail "
+        "triggers report failed provisioning and existing watches expire "
+        "unrenewed"
+    )
+    register_degradation(GMAIL_WATCH_REGISTRATION_DISABLED, message)
+    logger.warning(message)
+
+
+def _accepted_callback_audiences(
+    state: GmailWatchState, callback_id: str
+) -> tuple[str, ...]:
+    """Return the audiences valid during a callback endpoint transition.
+
+    Reconciliation must update Pub/Sub before it can persist the corresponding
+    audience locally. During that short interval, the stored old audience and
+    the configured new audience cover both sides of the cloud-before-database
+    transition. After the commit, those values collapse to the new URL while
+    the durable previous audience remains accepted until its bounded grace
+    period expires.
+    """
+    stored_audience = str(state.push_audience or "").strip()
+    callback_base_url = get_gmail_callback_base_url()
+    configured_audience = (
+        gmail_callback_url(callback_base_url, callback_id) if callback_base_url else ""
+    )
+    previous_audience = str(state.previous_push_audience or "").strip()
+    previous_audience_expires_at = cast(
+        datetime | None, state.previous_push_audience_expires_at
+    )
+    if previous_audience_expires_at is None or _as_utc(
+        previous_audience_expires_at
+    ) <= datetime.now(timezone.utc):
+        previous_audience = ""
+    return tuple(
+        dict.fromkeys(
+            audience
+            for audience in (
+                stored_audience,
+                configured_audience,
+                previous_audience,
+            )
+            if audience
+        )
+    )
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalize SQLite's timezone-naive datetime round trips to UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _watch_state_for_callback(db: Session, callback_id: str) -> GmailWatchState | None:
+    """Resolve a callback only through a same-user ordinary Gmail account."""
     return (
         db.query(GmailWatchState)
-        .filter(GmailWatchState.callback_id == callback_id)
+        .join(UserOAuth, UserOAuth.id == GmailWatchState.oauth_account_id)
+        .filter(
+            GmailWatchState.callback_id == callback_id,
+            UserOAuth.user_id == GmailWatchState.user_id,
+            ordinary_gmail_clause(),
+        )
         .first()
     )
 
@@ -242,10 +320,8 @@ class GmailProvider:
         state = _watch_state_for_callback(db, callback_id)
         if state is None:
             return None
-        # Prefer triggers bound to this callback's mailbox so the disabled
-        # check applies to the right binding; fall back to the user's other
-        # Gmail triggers so cross-mailbox events still surface as audited
-        # rejected_resource outcomes instead of unknown callbacks.
+        # Prefer this mailbox. Explicit bindings to another account fail
+        # closed; only unbound legacy triggers use mailbox matching.
         mailbox_matches = case(
             (
                 func.lower(AgentTrigger.resource_id) == _normalized_email(state.email),
@@ -253,7 +329,7 @@ class GmailProvider:
             ),
             else_=1,
         )
-        return (
+        candidates = (
             db.query(AgentTrigger)
             .filter(
                 AgentTrigger.user_id == int(state.user_id),
@@ -261,12 +337,20 @@ class GmailProvider:
                 AgentTrigger.provider == self.name,
             )
             .order_by(
-                mailbox_matches,
                 AgentTrigger.enabled.desc(),
+                mailbox_matches,
                 AgentTrigger.id.asc(),
             )
-            .first()
+            .all()
         )
+        ordinary = ordinary_gmail_triggers(
+            triggers=candidates,
+            oauth_account_id=int(state.oauth_account_id),
+            mailbox=_normalized_email(state.email),
+        )
+        # An invalid binding is acknowledged as unknown before parsing. The
+        # cursor stays unchanged until an ordinary trigger can consume it.
+        return ordinary[0] if ordinary else None
 
     def handle_challenge(
         self, context: CallbackRequestContext, raw_body: bytes
@@ -298,8 +382,8 @@ class GmailProvider:
         if state is None:
             return VerificationResult.reject("Unknown Gmail callback")
 
-        audience = str(state.push_audience or "").strip()
-        if not audience:
+        audiences = _accepted_callback_audiences(state, context.callback_id)
+        if not audiences:
             return VerificationResult.reject(
                 "Gmail callback audience is not configured"
             )
@@ -308,25 +392,38 @@ class GmailProvider:
         if token is None:
             return VerificationResult.reject("Missing Gmail OIDC bearer token")
 
-        try:
-            claims = await asyncio.to_thread(self.oidc_verifier, token, audience)
-        except GoogleTransportError:
-            # Fetching Google's JWKS certs failed; nothing about the token was
-            # proven invalid. Propagate so the pipeline answers with
-            # failure_status and Pub/Sub redelivers, instead of rejecting -
-            # Gmail's rejected_status=200 would drop the event permanently.
-            raise
-        except Exception as exc:
-            return VerificationResult.reject(
-                f"Gmail OIDC token verification failed: {type(exc).__name__}"
-            )
+        claims: Mapping[str, Any] | None = None
+        verification_error: Exception | None = None
+        for audience in audiences:
+            try:
+                candidate_claims = await asyncio.to_thread(
+                    self.oidc_verifier, token, audience
+                )
+            except GoogleTransportError:
+                # Fetching Google's JWKS certs failed; nothing about the token
+                # was proven invalid. Propagate so the pipeline answers with
+                # failure_status and Pub/Sub redelivers, instead of rejecting -
+                # Gmail's rejected_status=200 would drop the event permanently.
+                raise
+            except Exception as exc:
+                verification_error = exc
+                continue
+
+            if _claim_audience_matches(candidate_claims.get("aud"), audience):
+                claims = candidate_claims
+                break
+
+        if claims is None:
+            if verification_error is not None:
+                return VerificationResult.reject(
+                    "Gmail OIDC token verification failed: "
+                    f"{type(verification_error).__name__}"
+                )
+            return VerificationResult.reject("Gmail OIDC audience does not match")
 
         issuer = str(claims.get("iss") or "")
         if issuer not in GOOGLE_OIDC_ISSUERS:
             return VerificationResult.reject("Gmail OIDC issuer is not trusted")
-
-        if not _claim_audience_matches(claims.get("aud"), audience):
-            return VerificationResult.reject("Gmail OIDC audience does not match")
 
         expected_service_account = get_gmail_pubsub_push_service_account()
         if expected_service_account:
@@ -374,14 +471,46 @@ class GmailProvider:
             error=trigger.provisioning_error,
         )
 
-    async def unregister(self, db: Session, trigger: AgentTrigger, config: Any) -> None:
-        # The binding must come from config: CRUD passes the trigger's
-        # previous config, and on delete the trigger row no longer exists.
-        oauth_account_id = _binding_oauth_account_id(config)
-        if oauth_account_id is not None:
-            await asyncio.to_thread(
-                release_gmail_mailbox_if_unused, db, oauth_account_id
+    async def unregister(
+        self,
+        db: Session,
+        trigger: AgentTrigger,
+        config: Any,
+        *,
+        resource_id: str | None = None,
+    ) -> None:
+        oauth_account_id = gmail_binding_id(config)
+        if oauth_account_id is None:
+            if not is_legacy_gmail_binding(config):
+                return
+            mailbox = _normalized_email(resource_id)
+            if not mailbox:
+                return
+            matches = (
+                db.query(UserOAuth)
+                .filter(
+                    UserOAuth.user_id == int(trigger.user_id),
+                    ordinary_gmail_clause(),
+                    func.lower(UserOAuth.email) == mailbox,
+                )
+                .order_by(UserOAuth.id)
+                .limit(2)
+                .all()
             )
+            if len(matches) != 1:
+                return
+            oauth_account_id = int(matches[0].id)
+        else:
+            oauth_account = get_scoped_user_oauth_account(
+                db,
+                user_id=int(trigger.user_id),
+                account_id=oauth_account_id,
+                resource_owner_key=None,
+            )
+            if oauth_account is None or not is_ordinary_gmail(oauth_account):
+                return
+
+        await asyncio.to_thread(release_gmail_mailbox_if_unused, db, oauth_account_id)
 
     async def parse_events(
         self,
@@ -432,15 +561,59 @@ class GmailProvider:
         state = _watch_state_for_callback(db, context.callback_id)
         if state is None:
             return
+        if (
+            str(state.status) == TriggerProvisioningStatus.FAILED.value
+            and not get_gmail_watch_enabled()
+            and str(state.last_error or "") == GMAIL_WATCH_DISABLED_ERROR
+        ):
+            # While registration is disabled, parse_events already acked this
+            # callback (skipped, no history advance) instead of raising; the
+            # pipeline still calls finalize_callback for the acked event. Do
+            # not let a successful-looking finalize clear the FAILED/disabled
+            # marking that collect_gmail_pubsub_events just recorded.
+            #
+            # The guard keys on the exact disabled marking, not just
+            # status+flag: a row failed for a transient reason (e.g. a prior
+            # message batch error) while the flag happens to be off must keep
+            # advancing its cursor when a valid push later arrives, since the
+            # only writers of this precise last_error string are the
+            # choke-point gate (_ensure_gmail_mailbox_provisioned_locked) and
+            # the webhook disabled-ack site (collect_gmail_pubsub_events).
+            return
         notification = _decode_pubsub_notification(
             raw_body,
             attested_email=_normalized_email(state.email),
         )
         if not _history_cursor_advances(state.history_id, notification.history_id):
             return
-        setattr(state, "history_id", notification.history_id)
-        setattr(state, "last_error", None)
-        db.add(state)
+        ordinary_account_exists = (
+            db.query(UserOAuth.id)
+            .filter(
+                UserOAuth.id == GmailWatchState.oauth_account_id,
+                UserOAuth.user_id == GmailWatchState.user_id,
+                ordinary_gmail_clause(),
+            )
+            .exists()
+        )
+        updated = (
+            db.query(GmailWatchState)
+            .filter(
+                GmailWatchState.id == int(state.id),
+                GmailWatchState.oauth_account_id == int(state.oauth_account_id),
+                GmailWatchState.user_id == int(state.user_id),
+                ordinary_account_exists,
+            )
+            .update(
+                {
+                    GmailWatchState.history_id: notification.history_id,
+                    GmailWatchState.last_error: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated == 0:
+            db.rollback()
+            return
         db.commit()
 
 

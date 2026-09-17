@@ -36,6 +36,7 @@ import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-crea
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "@/components/ui/sonner"
+import { userDisplayLabel } from "@/lib/user-display"
 
 interface Collection {
   name: string
@@ -53,6 +54,7 @@ interface Collection {
 interface AdminUser {
   id: number
   username: string
+  email: string | null
 }
 
 interface AdminUserListResponse {
@@ -111,7 +113,7 @@ export function KnowledgeBasePage() {
           const data: AdminUserListResponse = await response.json()
           const users: AdminUser[] = data.users || []
           for (const u of users) {
-            map[u.id] = u.username
+            map[u.id] = userDisplayLabel(u, `#${u.id}`)
           }
 
           if (typeof data.pages === "number" && data.pages > 0) {

@@ -41,7 +41,9 @@ class _FakeDockerClient:
 
 
 def _make_service() -> DockerSandboxService:
-    return DockerSandboxService(MemDockerStore(), client=_FakeDockerClient())
+    return DockerSandboxService(
+        MemDockerStore(), namespace="test", client=_FakeDockerClient()
+    )
 
 
 class _StoppableContainer:
@@ -131,7 +133,9 @@ class TestHandleStopSharesTheServiceLifecycleLock:
     async def test_handles_are_built_with_the_services_lock_registry(self):
         container = _StoppableContainer("wired")
         service = DockerSandboxService(
-            MemDockerStore(), client=_FakeClientWithContainer(container)
+            MemDockerStore(),
+            namespace="test",
+            client=_FakeClientWithContainer(container),
         )
 
         from_start_existing = await service.start_existing("wired")
@@ -147,7 +151,9 @@ class TestHandleStopSharesTheServiceLifecycleLock:
         name = "contended"
         container = _StoppableContainer(name)
         service = DockerSandboxService(
-            MemDockerStore(), client=_FakeClientWithContainer(container)
+            MemDockerStore(),
+            namespace="test",
+            client=_FakeClientWithContainer(container),
         )
         handle = await service.start_existing(name)
 
@@ -193,7 +199,9 @@ class TestHandleStopSharesTheServiceLifecycleLock:
         container = _StoppableContainer(name)
         container.release_stop.set()
         service = DockerSandboxService(
-            MemDockerStore(), client=_FakeClientWithContainer(container)
+            MemDockerStore(),
+            namespace="test",
+            client=_FakeClientWithContainer(container),
         )
 
         handle = await service.start_existing(name)

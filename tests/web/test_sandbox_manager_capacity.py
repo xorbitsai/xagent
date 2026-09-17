@@ -5,44 +5,24 @@ creations and deletions — no Docker-only assumptions.
 """
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import xagent.web.sandbox_manager as sandbox_manager_module
+from tests.web.sandbox_fakes import FakeSandboxService
 from xagent.web.sandbox_manager import SandboxCapacityError, SandboxManager
 
 
-class _FakeService:
-    """In-memory sandbox service tracking existing container names."""
+class _FakeService(FakeSandboxService):
+    """In-memory sandbox service tracking existing container names.
 
-    def __init__(self, initial: tuple[str, ...] = ()) -> None:
-        self.containers: set[str] = set(initial)
-        self.peak = len(self.containers)
-        self.deleted: list[str] = []
-
-    async def list_sandboxes(self) -> list[SimpleNamespace]:
-        return [
-            SimpleNamespace(
-                name=name,
-                state="stopped",
-                template=SimpleNamespace(type="image", image="img:v1"),
-                config=SimpleNamespace(),
-            )
-            for name in sorted(self.containers)
-        ]
-
-    async def get_or_create(self, name, template=None, config=None):
-        self.containers.add(name)
-        self.peak = max(self.peak, len(self.containers))
-        sandbox = MagicMock()
-        sandbox.name = name
-        return sandbox
-
-    async def delete(self, name: str) -> None:
-        self.containers.discard(name)
-        self.deleted.append(name)
+    Inherits its container registry (containers/peak/deleted) and its
+    get_or_create/list_sandboxes/delete bodies from FakeSandboxService
+    unchanged; kept as a local subclass (rather than using
+    FakeSandboxService directly) only so the rest of this file's type hints
+    stay put.
+    """
 
 
 class _FakeClock:
@@ -292,6 +272,31 @@ async def test_worker_lease_at_cap_degrades_to_primary(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_route_lru_eviction_and_recreate(
+    _env, clock, monkeypatch
+) -> None:
+    """Capacity eviction and later recreation also work end to end on the
+    spec-reconciliation route (``FakeSandboxService(runtime_spec_supported=
+    True)``), not only the legacy ``get_or_create()`` route the rest of this
+    module drives."""
+    monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONTAINERS", "1")
+    service = FakeSandboxService(runtime_spec_supported=True)
+    manager = SandboxManager(service)
+
+    first = await manager.get_or_create_sandbox("task", "1")
+    assert "task::1" in service._containers
+    clock.advance(10)
+    second = await manager.get_or_create_sandbox("task", "2")  # evicts task::1
+
+    assert first.name == "task::1"
+    assert second.name == "task::2"
+    assert "task::1" in service.deleted
+    assert "task::1" not in service._containers
+    assert "task::2" in service._containers
+    assert service.create.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_victim_turning_active_between_pick_and_claim_is_spared(
     _env, clock, monkeypatch
 ) -> None:
@@ -323,3 +328,80 @@ async def test_victim_turning_active_between_pick_and_claim_is_spared(
     assert "task::a" in service.containers  # spared: became active
     assert "task::b" in service.deleted  # next victim evicted instead
     assert "task::c" in service.containers
+
+
+@pytest.mark.asyncio
+async def test_reuse_racing_capacity_eviction_of_its_own_container_converges(
+    _env, clock, monkeypatch
+) -> None:
+    """B1 regression: reusing a container that a *concurrent, unrelated*
+    capacity eviction has just picked as its LRU victim must never race
+    ``start_existing`` against that eviction's ``delete`` on the sandbox
+    service -- it must queue behind the same capacity gate the eviction
+    holds, then (since the container is now gone) converge to a fresh
+    create instead of surfacing ``SandboxNotFoundError`` to the caller.
+
+    Uses the reconciliation route (``FakeSandboxService(
+    runtime_spec_supported=True)``), cap=1, with the evictor's delete
+    blocked mid-flight -- the exact race timing from the review finding.
+    """
+    monkeypatch.setenv("XAGENT_SANDBOX_MAX_CONTAINERS", "1")
+    service = FakeSandboxService(runtime_spec_supported=True)
+    manager = SandboxManager(service)
+
+    # Seed the victim as an idle, already-reconciled container (MATCH on
+    # next inspect) — the ordinary path a "reuse" request takes.
+    await manager.get_or_create_sandbox("task", "victim")
+    assert "task::victim" in service._containers
+    clock.advance(50)
+
+    delete_started = asyncio.Event()
+    delete_release = asyncio.Event()
+    original_delete = service.delete
+    start_existing_calls_after_delete: list[bool] = []
+    original_start_existing = service.start_existing
+
+    async def slow_delete(name: str) -> None:
+        delete_started.set()
+        await delete_release.wait()
+        await original_delete(name)
+
+    async def tracking_start_existing(name: str):
+        # Recorded before the call resolves, so a True here proves the
+        # gate fully serialized this call behind the evictor's delete
+        # rather than letting the two race on the sandbox service.
+        start_existing_calls_after_delete.append(delete_started.is_set())
+        return await original_start_existing(name)
+
+    service.delete = slow_delete  # type: ignore[method-assign]
+    service.start_existing = tracking_start_existing  # type: ignore[method-assign]
+
+    # Evictor: an unrelated new key that must evict the idle "victim" to
+    # fit under cap=1. Picks "victim" (only idle candidate) and blocks mid
+    # claim+delete, still holding the capacity gate.
+    evictor = asyncio.create_task(manager.get_or_create_sandbox("task", "new"))
+    await delete_started.wait()
+
+    # Racer: a reuse request for the same "victim" key. Its own inspect()
+    # still sees the (not-yet-deleted) container and takes the MATCH/reuse
+    # path, but publishing must queue behind the capacity gate the evictor
+    # holds rather than calling start_existing concurrently with delete.
+    racer = asyncio.create_task(manager.get_or_create_sandbox("task", "victim"))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not racer.done()
+    assert start_existing_calls_after_delete == []
+
+    delete_release.set()
+    await evictor
+    recreated = await racer
+
+    assert recreated.name == "task::victim"
+    assert start_existing_calls_after_delete == [True], (
+        "start_existing must only be attempted after the evictor's delete "
+        "fully finished, never concurrently with it"
+    )
+    assert "task::victim" in service._containers, (
+        "the reuse must converge to a fresh create once start_existing "
+        "reports the container gone, not surface SandboxNotFoundError"
+    )

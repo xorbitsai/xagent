@@ -3,6 +3,12 @@
 from typing import Any
 
 
+class LLMContextLengthError(RuntimeError):
+    """The provider rejected an input because it exceeded the model window."""
+
+    pass
+
+
 class LLMRetryableError(RuntimeError):
     """Base exception for LLM errors that should trigger retry.
 

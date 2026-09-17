@@ -21,7 +21,12 @@ from ...core.utils.api_key import (
     generate_api_key,
 )
 from ...templates.manager import TemplateManager
-from ..models.agent import Agent
+from ..models.agent import (
+    AGENT_NAME_UNIQUE_INDEX,
+    AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX,
+    Agent,
+    AgentOrigin,
+)
 from ..models.agent_api_key import AgentApiKey
 from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.model import Model as DBModel
@@ -44,7 +49,8 @@ from .db_runtime import (
     run_db_io_cancellation_safe,
 )
 from .workforce_access import can_edit_workforce, filter_visible_workforces
-from .workforce_lifecycle import is_workforce_manager_discard_safe
+from .workforce_lifecycle import is_workforce_manager_removal_safe
+from .workforce_names import resolve_unique_agent_name
 
 logger = logging.getLogger(__name__)
 _RuntimeKeyResultT = TypeVar("_RuntimeKeyResultT")
@@ -53,13 +59,35 @@ _RuntimeKeyResultT = TypeVar("_RuntimeKeyResultT")
 # selection is only valid when this category is also enabled.
 KNOWLEDGE_TOOL_CATEGORY = "knowledge"
 
+# Select-then-insert retries for resolve_agent_from_template: each retry
+# re-selects, so a concurrent insert of this same template's agent converges
+# to reuse and an unrelated name race picks a fresh candidate name.
+TEMPLATE_RESOLVE_RACE_RETRIES = 3
+
 
 class DuplicateAgentNameError(ValueError):
     """Raised when a user already owns an agent with the requested name."""
 
 
+class TemplateQuickAccessRaceError(ValueError):
+    """Raised when a concurrent insert wins the (user_id, template_id)
+    quick-access race - see AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX and
+    _resolve_agent_from_template_sync's retry loop."""
+
+
 class TemplateNotFoundError(LookupError):
     """Raised when a template id cannot be resolved."""
+
+
+class WorkforceTemplateNotSupportedError(ValueError):
+    """Raised when a template's `type` is "workforce" but the caller only
+    knows how to create a single Agent from it.
+
+    A workforce template's `agent_config` carries no real instructions (see
+    `TemplateManager._enrich_template`), so without this gate every one of
+    these single-agent creation paths would silently publish an agent with
+    empty instructions instead of failing.
+    """
 
 
 class InvalidAgentModelConfigError(ValueError):
@@ -68,6 +96,21 @@ class InvalidAgentModelConfigError(ValueError):
 
 class InvalidKnowledgeBaseError(ValueError):
     """Raised when KB selection fails the knowledge-tool or visibility rule."""
+
+
+def _string_list_elements(value: Any) -> list[str]:
+    """Filters a possibly-malformed list down to its string elements. A
+    template's agent_config.skills/tool_categories is author-provided YAML
+    data with no element-type validation upstream (see
+    TemplateManager._enrich_template) - a single non-string entry (e.g. an
+    authoring typo like `[123, "web_search"]`) would otherwise reach
+    AgentCreateSpec untouched (a plain dataclass, no runtime type
+    enforcement) and only fail later as an unhandled Pydantic
+    ValidationError when AgentResponse serializes the created agent back
+    out, 500ing an otherwise-successful creation."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 @dataclass(frozen=True)
@@ -84,6 +127,7 @@ class AgentCreateSpec:
     tool_categories: tuple[str, ...]
     suggested_prompts: tuple[str, ...]
     generate_runtime_key: bool
+    template_id: str | None = None
 
     @classmethod
     def from_values(
@@ -99,6 +143,7 @@ class AgentCreateSpec:
         tool_categories: list[str] | tuple[str, ...] | None,
         suggested_prompts: list[str] | tuple[str, ...] | None,
         generate_runtime_key: bool,
+        template_id: str | None = None,
     ) -> AgentCreateSpec:
         frozen_models: tuple[tuple[str, int | None], ...] | None = None
         if models is not None:
@@ -116,6 +161,7 @@ class AgentCreateSpec:
             skills=tuple(skills or ()),
             tool_categories=tuple(tool_categories or ()),
             suggested_prompts=tuple(suggested_prompts or ()),
+            template_id=template_id,
             generate_runtime_key=generate_runtime_key,
         )
 
@@ -166,6 +212,7 @@ class AgentResponseSnapshot:
     allowed_domains: tuple[str, ...]
     share_enabled: bool
     share_updated_at: str | None
+    template_id: str | None = None
 
     def model_mapping(self) -> dict[str, Any] | None:
         return dict(self.models) if self.models is not None else None
@@ -196,6 +243,7 @@ class AgentResponseSnapshot:
             "allowed_domains": list(self.allowed_domains),
             "share_enabled": self.share_enabled,
             "share_updated_at": self.share_updated_at,
+            "template_id": self.template_id,
         }
 
 
@@ -409,7 +457,7 @@ class AgentManagementService:
                 status != "archived" and can_edit_workforce(self.db, actor, workforce)
             )
             manager_id = int(workforce.manager_agent_id)
-            manager_discard_safe = is_workforce_manager_discard_safe(
+            manager_removal_safe = is_workforce_manager_removal_safe(
                 workforce,
                 managers_by_id.get(manager_id),
                 used_as_other_manager=manager_reference_counts.get(manager_id, 0) > 1,
@@ -426,7 +474,7 @@ class AgentManagementService:
                         can_edit
                         and status == "draft"
                         and run_counts.get(workforce_id, 0) == 0
-                        and manager_discard_safe
+                        and manager_removal_safe
                     ),
                 )
             )
@@ -538,6 +586,7 @@ class AgentManagementService:
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
         generate_runtime_key: bool = True,
+        template_id: str | None = None,
     ) -> tuple[Agent, APIKeyGenerateResponse | None]:
         """Sole external create entry point: validate KBs (async) then
         run the transactional create. Every public create path
@@ -562,6 +611,7 @@ class AgentManagementService:
             tool_categories=tool_categories,
             suggested_prompts=suggested_prompts,
             generate_runtime_key=generate_runtime_key,
+            template_id=template_id,
         )
 
     def create_agent_with_optional_key(
@@ -579,6 +629,8 @@ class AgentManagementService:
         suggested_prompts: list[str] | None = None,
         generate_runtime_key: bool = True,
         runtime_key_candidate: ApiKeyCandidate | None = None,
+        template_id: str | None = None,
+        origin: str = AgentOrigin.USER.value,
     ) -> tuple[Agent, APIKeyGenerateResponse | None]:
         """Create an agent and (optionally) its first runtime key in a
         single transaction. Internal transaction executor: assumes
@@ -593,15 +645,29 @@ class AgentManagementService:
         commits once at the boundary, rolling back atomically on any
         failure.
 
-        Conflict contract: the only IntegrityError this path can raise
-        comes from the runtime key's ``key_prefix`` unique constraint
-        (the ``uq_agent_api_keys_agent_active`` partial index that used
-        to also live here was dropped for multi-key support -- an agent
-        may hold more than one active key now); the agent table has no
-        unique constraint and therefore does not contribute one. If a
-        ``(user_id, name)`` unique constraint is ever added to agents,
-        the conflict translation here must be split by source (agent ->
-        duplicate-name 400, key -> 409).
+        Conflict contract: ``agent_name_exists`` is a fast-path pre-check,
+        not the source of truth -- the ``uq_agents_user_id_name_active``
+        partial unique index (excludes workforce-generated-manager agents)
+        is what actually prevents a same-user concurrent-request race, so
+        the agent insert's flush can itself raise IntegrityError and is
+        translated to ``DuplicateAgentNameError`` below. The index is keyed
+        on ``(user_id, name)`` only, so it matches ``agent_name_exists``
+        exactly in standalone xagent (no team-scope hook, where the check is
+        also purely per-user). When a team-scope hook is installed,
+        ``agent_name_exists`` widens to a team-wide check (any teammate's
+        ``visibility="team"`` agent, or all of them for an admin) that this
+        per-user index does not mirror -- two different users on the same
+        team can still race past it with identical names; only a single
+        user's own double-submit is guaranteed to be caught here. A second
+        partial unique index, ``uq_agents_user_id_template_id_quick_access``
+        (scoped to ``origin=template_quick_access``), similarly turns an
+        insert into ``TemplateQuickAccessRaceError`` below -- see
+        ``AgentManagementService._resolve_agent_from_template_sync``. The
+        only remaining IntegrityError source is the runtime key's
+        ``key_prefix`` unique constraint (the ``uq_agent_api_keys_agent_active``
+        partial index that used to also live here was dropped for multi-key
+        support -- an agent may hold more than one active key now), handled
+        separately inside ``complete_runtime_key_delivery``.
 
         Delivery contract: once a runtime-key receipt exists, an ambiguous
         commit result or post-commit response failure is wrapped in
@@ -614,23 +680,34 @@ class AgentManagementService:
 
         models = self._validate_models(models, user_id=user_id)
 
-        agent = self.store.add_agent(  # flush, no commit
-            user_id=user_id,
-            name=name,
-            description=description,
-            instructions=instructions,
-            execution_mode=execution_mode or "balanced",
-            models=models,
-            knowledge_bases=knowledge_bases or [],
-            skills=skills or [],
-            tool_categories=tool_categories or [],
-            suggested_prompts=suggested_prompts or [],
-        )
+        try:
+            agent = self.store.add_agent(  # flush, no commit
+                user_id=user_id,
+                name=name,
+                description=description,
+                instructions=instructions,
+                execution_mode=execution_mode or "balanced",
+                models=models,
+                knowledge_bases=knowledge_bases or [],
+                skills=skills or [],
+                tool_categories=tool_categories or [],
+                suggested_prompts=suggested_prompts or [],
+                template_id=template_id,
+                origin=origin,
+            )
+        except IntegrityError as exc:
+            self.db.rollback()
+            if is_agent_name_unique_violation(exc):
+                raise DuplicateAgentNameError(name) from exc
+            if is_agent_template_quick_access_unique_violation(exc):
+                raise TemplateQuickAccessRaceError(template_id) from exc
+            raise
 
-        # The runtime key is the only write that can raise IntegrityError
-        # here (agent has no unique constraint), so the conflict-to-409
-        # translation wraps key staging + commit together. See the
-        # contract note in the docstring above.
+        # The agent-name race is handled above via the add_agent flush; the
+        # runtime key is the only remaining write that can raise
+        # IntegrityError here, so its conflict-to-409 translation happens
+        # inside complete_runtime_key_delivery. See the contract note in the
+        # docstring above.
         def stage_runtime_key() -> tuple[AgentApiKey, str] | None:
             if generate_runtime_key:
                 staged_key = self.key_service.stage_rotated_key(
@@ -708,6 +785,8 @@ class AgentManagementService:
         template = await self.template_manager.get_template(template_id)
         if template is None:
             raise TemplateNotFoundError(template_id)
+        if template.get("type", "agent") != "agent":
+            raise WorkforceTemplateNotSupportedError(template_id)
 
         agent_config = template.get("agent_config") or {}
         final_name = name or template.get("name") or template_id
@@ -725,6 +804,7 @@ class AgentManagementService:
             generate_runtime_key=generate_runtime_key,
             name=final_name,
             description=final_description,
+            template_id=template_id,
             instructions=(
                 instructions
                 if instructions is not None
@@ -737,11 +817,15 @@ class AgentManagementService:
                 if knowledge_bases is not None
                 else agent_config.get("knowledge_bases") or []
             ),
-            skills=skills if skills is not None else agent_config.get("skills") or [],
+            skills=(
+                skills
+                if skills is not None
+                else _string_list_elements(agent_config.get("skills"))
+            ),
             tool_categories=(
                 tool_categories
                 if tool_categories is not None
-                else agent_config.get("tool_categories") or []
+                else _string_list_elements(agent_config.get("tool_categories"))
             ),
             suggested_prompts=(
                 suggested_prompts
@@ -848,6 +932,7 @@ def _agent_response_snapshot(payload: dict[str, Any]) -> AgentResponseSnapshot:
         allowed_domains=tuple(payload.get("allowed_domains") or ()),
         share_enabled=bool(payload["share_enabled"]),
         share_updated_at=cast("str | None", payload.get("share_updated_at")),
+        template_id=cast("str | None", payload.get("template_id")),
     )
 
 
@@ -873,6 +958,60 @@ def _is_runtime_key_prefix_collision(error: BaseException) -> bool:
         message = str(current).lower()
         if "key_prefix" in message and (
             "agent_api_keys" in message or "unique" in message or "duplicate" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def is_agent_name_unique_violation(error: BaseException) -> bool:
+    """Recognize the authoritative (user_id, name) unique index failure.
+
+    Postgres includes the index name (``uq_agents_user_id_name_active``) in
+    its error message; sqlite instead names the columns
+    (``agents.user_id, agents.name``). Matching either keeps this from
+    misclassifying an unrelated IntegrityError (e.g. a ``widget_key``
+    collision or a foreign-key violation) as a duplicate-name conflict.
+    """
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if AGENT_NAME_UNIQUE_INDEX.lower() in message:
+            return True
+        if (
+            "agents.user_id" in message
+            and "agents.name" in message
+            and ("unique" in message or "duplicate" in message)
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def is_agent_template_quick_access_unique_violation(error: BaseException) -> bool:
+    """Recognize the authoritative (user_id, template_id) quick-access
+    unique index failure - the counterpart to is_agent_name_unique_violation
+    above, for AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX. Fires when a
+    concurrent request wins the resolve flow's create race even when the two
+    inserts picked different (disambiguated) names, so
+    is_agent_name_unique_violation alone would miss it (PR review findings
+    B1/B2).
+    """
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX.lower() in message:
+            return True
+        if (
+            "agents.user_id" in message
+            and "agents.template_id" in message
+            and ("unique" in message or "duplicate" in message)
         ):
             return True
         current = current.__cause__ or current.__context__
@@ -1051,8 +1190,8 @@ class AgentManagementRuntime:
     ) -> _RuntimeKeyDeliveryOutcome[AgentCreateSnapshot]:
         attempts = PREFIX_COLLISION_RETRIES if spec.generate_runtime_key else 1
         for attempt in range(attempts):
-            # Candidate generation includes bcrypt. It deliberately precedes
-            # Session creation so CPU work never pins a pool checkout.
+            # Generate key material and its verifier before Session creation
+            # so this work never pins a pool checkout.
             candidate = (
                 generate_api_key(None, kind=ApiKeyKind.AGENT)
                 if spec.generate_runtime_key
@@ -1076,6 +1215,7 @@ class AgentManagementRuntime:
                     suggested_prompts=list(spec.suggested_prompts),
                     generate_runtime_key=spec.generate_runtime_key,
                     runtime_key_candidate=candidate,
+                    template_id=spec.template_id,
                 )
                 agent_snapshot = _agent_response_snapshot(
                     service.store.agent_to_response_dict(agent)
@@ -1106,6 +1246,73 @@ class AgentManagementRuntime:
             traceback=error.__traceback__,
         )
 
+    async def _spec_from_template(
+        self,
+        *,
+        template_id: str,
+        name: str | None,
+        description: str | None,
+        instructions: str | None,
+        execution_mode: str | None,
+        models: dict[str, Any] | None,
+        knowledge_bases: list[str] | None,
+        skills: list[str] | None,
+        tool_categories: list[str] | None,
+        suggested_prompts: list[str] | None,
+        generate_runtime_key: bool,
+    ) -> AgentCreateSpec:
+        """Resolve a template (async I/O) into a detached create spec."""
+        if self.template_manager is None:
+            raise TemplateNotFoundError(template_id)
+        template = await self.template_manager.get_template(template_id)
+        if template is None:
+            raise TemplateNotFoundError(template_id)
+        if template.get("type", "agent") != "agent":
+            raise WorkforceTemplateNotSupportedError(template_id)
+
+        agent_config = template.get("agent_config") or {}
+        final_description = description
+        if final_description is None:
+            descriptions = template.get("descriptions") or {}
+            if isinstance(descriptions, dict):
+                final_description = descriptions.get("en") or ""
+            elif isinstance(descriptions, str):
+                final_description = descriptions
+
+        return AgentCreateSpec.from_values(
+            name=name or template.get("name") or template_id,
+            description=final_description,
+            template_id=template_id,
+            instructions=(
+                instructions
+                if instructions is not None
+                else agent_config.get("instructions")
+            ),
+            execution_mode=execution_mode or agent_config.get("execution_mode"),
+            models=models if models is not None else agent_config.get("models"),
+            knowledge_bases=(
+                knowledge_bases
+                if knowledge_bases is not None
+                else agent_config.get("knowledge_bases") or []
+            ),
+            skills=(
+                skills
+                if skills is not None
+                else _string_list_elements(agent_config.get("skills"))
+            ),
+            tool_categories=(
+                tool_categories
+                if tool_categories is not None
+                else _string_list_elements(agent_config.get("tool_categories"))
+            ),
+            suggested_prompts=(
+                suggested_prompts
+                if suggested_prompts is not None
+                else agent_config.get("suggested_prompts") or []
+            ),
+            generate_runtime_key=generate_runtime_key,
+        )
+
     async def create_agent_from_template(
         self,
         *,
@@ -1123,47 +1330,17 @@ class AgentManagementRuntime:
         suggested_prompts: list[str] | None,
         generate_runtime_key: bool,
     ) -> AgentCreateSnapshot:
-        if self.template_manager is None:
-            raise TemplateNotFoundError(template_id)
-        template = await self.template_manager.get_template(template_id)
-        if template is None:
-            raise TemplateNotFoundError(template_id)
-
-        agent_config = template.get("agent_config") or {}
-        final_description = description
-        if final_description is None:
-            descriptions = template.get("descriptions") or {}
-            if isinstance(descriptions, dict):
-                final_description = descriptions.get("en") or ""
-            elif isinstance(descriptions, str):
-                final_description = descriptions
-
-        spec = AgentCreateSpec.from_values(
-            name=name or template.get("name") or template_id,
-            description=final_description,
-            instructions=(
-                instructions
-                if instructions is not None
-                else agent_config.get("instructions")
-            ),
-            execution_mode=execution_mode or agent_config.get("execution_mode"),
-            models=models if models is not None else agent_config.get("models"),
-            knowledge_bases=(
-                knowledge_bases
-                if knowledge_bases is not None
-                else agent_config.get("knowledge_bases") or []
-            ),
-            skills=skills if skills is not None else agent_config.get("skills") or [],
-            tool_categories=(
-                tool_categories
-                if tool_categories is not None
-                else agent_config.get("tool_categories") or []
-            ),
-            suggested_prompts=(
-                suggested_prompts
-                if suggested_prompts is not None
-                else agent_config.get("suggested_prompts") or []
-            ),
+        spec = await self._spec_from_template(
+            template_id=template_id,
+            name=name,
+            description=description,
+            instructions=instructions,
+            execution_mode=execution_mode,
+            models=models,
+            knowledge_bases=knowledge_bases,
+            skills=skills,
+            tool_categories=tool_categories,
+            suggested_prompts=suggested_prompts,
             generate_runtime_key=generate_runtime_key,
         )
         return await self.create_agent(
@@ -1171,6 +1348,179 @@ class AgentManagementRuntime:
             is_admin=is_admin,
             spec=spec,
         )
+
+    async def resolve_agent_from_template(
+        self,
+        *,
+        user_id: int,
+        is_admin: bool,
+        template_id: str,
+        name: str | None = None,
+    ) -> tuple[AgentResponseSnapshot, bool]:
+        """Atomic server-side get-or-create keyed on (user_id, template_id,
+        origin=template_quick_access).
+
+        Backs flows with reuse semantics (the /task template quick-access):
+        return the caller's own existing quick-access agent for this
+        template as-is, or create and publish a fresh one. Unlike the plain
+        create path this never raises on a duplicate default name; it
+        disambiguates server-side instead. Reuse never republishes a found
+        agent that isn't currently published - see
+        :meth:`_resolve_agent_from_template_sync` for why.
+
+        Contrast with :meth:`create_agent_from_template`, which is a pure
+        create used by flows that deliberately mint multiple instances of one
+        template under user-chosen names (workforce workers, via the plain
+        ``origin=user`` ``POST /from-template``); those agents are invisible
+        to this method's reuse query (origin-scoped, see
+        AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX) and a DB-level uniqueness
+        constraint on plain (user_id, template_id) would have broken them, so
+        the constraint backing this method's idempotency is scoped to the
+        quick-access origin specifically.
+
+        ``name`` is create-only: it seeds the name for a freshly minted
+        agent (disambiguated server-side on collision) but is not consulted
+        on the reuse path. A caller passing a different ``name`` on a repeat
+        call for a template it already has a quick-access agent for gets
+        that existing agent back under its original name, silently -- the
+        response's ``agent.name`` is the source of truth for what a caller
+        should reconcile against.
+
+        Returns the detached agent snapshot and whether it was newly created.
+        """
+        spec = await self._spec_from_template(
+            template_id=template_id,
+            name=name,
+            description=None,
+            instructions=None,
+            execution_mode=None,
+            models=None,
+            knowledge_bases=None,
+            skills=None,
+            tool_categories=None,
+            suggested_prompts=None,
+            # The quick-access flow talks to the agent through the normal
+            # chat session, never through a runtime API key.
+            generate_runtime_key=False,
+        )
+        await _validate_agent_knowledge_bases(
+            knowledge_bases=spec.knowledge_bases,
+            tool_categories=spec.tool_categories,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        return await run_db_io_cancellation_safe(
+            lambda: self._resolve_agent_from_template_sync(
+                user_id=user_id,
+                template_id=template_id,
+                spec=spec,
+            )
+        )
+
+    @staticmethod
+    def _resolve_agent_from_template_sync(
+        *,
+        user_id: int,
+        template_id: str,
+        spec: AgentCreateSpec,
+    ) -> tuple[AgentResponseSnapshot, bool]:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            service = AgentManagementService(db)
+            # Sticky: once a TemplateQuickAccessRaceError is seen, it is never
+            # overwritten by a later DuplicateAgentNameError - retry
+            # exhaustion must surface 409 even when a later attempt's
+            # collision happened to be a plain name collision instead,
+            # otherwise the two are indistinguishable to the caller (PR
+            # review finding m6).
+            last_error: (
+                DuplicateAgentNameError | TemplateQuickAccessRaceError | None
+            ) = None
+            for _ in range(TEMPLATE_RESOLVE_RACE_RETRIES):
+                # Strictly the caller's own rows (user_id filter, not the
+                # team-wide owned_agent_clause): this path may publish what it
+                # finds, and publishing a teammate's in-progress draft on this
+                # user's behalf is exactly the bug this server-side resolve
+                # exists to prevent (PR review finding F1). Also strictly
+                # scoped to the quick-access origin (PR review finding B4):
+                # without it, this query could adopt (and publish) an
+                # unrelated agent the workforce-builder UI built from the
+                # same template under a user-chosen name, since that flow
+                # writes template_id too. Lowest id wins so concurrent
+                # duplicates resolve deterministically (F3).
+                existing = (
+                    db.query(Agent)
+                    .filter(
+                        Agent.user_id == user_id,
+                        Agent.template_id == template_id,
+                        Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+                    )
+                    .order_by(Agent.id)
+                    .first()
+                )
+                if existing is not None:
+                    # Deliberately does not auto-publish a found draft (PR
+                    # review finding B3): status/published_at alone can't
+                    # distinguish "never published yet" (the create-then-
+                    # publish below failed) from "the user explicitly
+                    # unpublished it" - both look identical. Silently
+                    # republishing on an unrelated later call would revert
+                    # that choice with zero visible signal. Returning it
+                    # as-is is honest either way; the response's own
+                    # status/published_at fields tell the caller the truth.
+                    return (
+                        _agent_response_snapshot(
+                            service.store.agent_to_response_dict(existing)
+                        ),
+                        False,
+                    )
+
+                candidate_name = resolve_unique_agent_name(
+                    db, user_id=user_id, name=spec.name
+                )
+                try:
+                    agent, _ = service.create_agent_with_optional_key(
+                        user_id=user_id,
+                        name=candidate_name,
+                        description=spec.description,
+                        instructions=spec.instructions,
+                        execution_mode=spec.execution_mode,
+                        models=spec.model_mapping(),
+                        knowledge_bases=list(spec.knowledge_bases),
+                        skills=list(spec.skills),
+                        tool_categories=list(spec.tool_categories),
+                        suggested_prompts=list(spec.suggested_prompts),
+                        generate_runtime_key=False,
+                        template_id=template_id,
+                        origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+                    )
+                except (DuplicateAgentNameError, TemplateQuickAccessRaceError) as exc:
+                    # A concurrent request inserted between our select and our
+                    # insert. DuplicateAgentNameError means it took the exact
+                    # name we picked; TemplateQuickAccessRaceError means it
+                    # won this same (user, template)'s quick-access row even
+                    # under a *different*, disambiguated name - the case the
+                    # name-collision-only retry used to miss entirely (PR
+                    # review findings B1/B2). Either way, re-select: if it was
+                    # this template's quick-access agent we reuse it, else
+                    # resolve_unique_agent_name picks a fresh name next pass.
+                    if not isinstance(last_error, TemplateQuickAccessRaceError):
+                        last_error = exc
+                    db.rollback()
+                    continue
+
+                # Publish in a second commit. If this fails the create still
+                # stands as an unpublished draft; per the note on the reuse
+                # branch above, a later resolve call now returns it as-is
+                # rather than silently republishing it.
+                agent = service.store.publish_agent(user_id, int(agent.id)) or agent
+                return (
+                    _agent_response_snapshot(
+                        service.store.agent_to_response_dict(agent)
+                    ),
+                    True,
+                )
+            raise last_error or DuplicateAgentNameError(spec.name)
 
     async def rotate_agent_runtime_key(
         self,

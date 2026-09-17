@@ -19,7 +19,7 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
         return []
 
     tools: List[Any] = []
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
 
     # Web search tool preference in auto mode: Zhipu -> Tavily -> Exa -> Google -> none
     zhipu_api_key = config.get_tool_credential("zhipu_web_search", "api_key")

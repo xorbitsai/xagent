@@ -37,6 +37,22 @@ class StaleTaskRunError(RuntimeError):
     """Raised when a late transition targets an execution that is no longer current."""
 
 
+class StaleTaskStateVersionError(StaleTaskRunError):
+    """The run still matches, but the row moved since the caller read it.
+
+    Separated from its parent because the two mean opposite things to a
+    caller. A rotated run is terminal: the execution being targeted no longer
+    exists and no retry can make it exist. A moved version is not: the row is
+    still this run's, someone simply wrote to it first, so re-reading and
+    re-deciding is the correct response.
+
+    Raised for an ambiguous rowcount miss too. There the UPDATE carried both
+    fences and cannot say which one rejected it, and deferring is the safe
+    half of that ambiguity: the retry reads a fresh row, and a genuinely
+    rotated run is then caught precisely by the run check above.
+    """
+
+
 @dataclass(frozen=True)
 class TaskControlSnapshot:
     task_id: int
@@ -111,7 +127,7 @@ def apply_task_control_transition(
         expected_state_version is not None
         and current_state_version != expected_state_version
     ):
-        raise StaleTaskRunError(
+        raise StaleTaskStateVersionError(
             f"task {task.id} state changed from version "
             f"{expected_state_version} to {current_state_version}"
         )
@@ -155,8 +171,20 @@ def apply_task_control_transition(
                 statement.values(values).execution_options(synchronize_session=False)
             )
             if int(getattr(result, "rowcount", 0) or 0) != 1:
-                raise StaleTaskRunError(
-                    f"task {task_id} no longer belongs to run {expected_run_id}"
+                # The Python pre-check above reads the row before this
+                # UPDATE, so a commit landing in between arrives here
+                # instead. Name both fences rather than only the run id:
+                # this is the line an operator reads while diagnosing a
+                # rejected transition, and blaming the run id when only the
+                # version moved sends them the wrong way.
+                error_type = (
+                    StaleTaskStateVersionError
+                    if expected_state_version is not None
+                    else StaleTaskRunError
+                )
+                raise error_type(
+                    f"task {task_id} no longer matches run {expected_run_id} "
+                    f"at state version {expected_state_version}"
                 )
             session.refresh(task)
         return task_control_snapshot(task)
@@ -310,7 +338,21 @@ class TaskExecutionController:
         status: TaskStatus | None = None,
         new_run: bool = False,
         expected_run_id: str | None = None,
+        expected_state_version: int | None = None,
     ) -> TaskControlSnapshot:
+        """Apply one control transition, optionally fenced on an exact row.
+
+        ``expected_run_id`` alone cannot detect a writer that moved the row
+        while preserving its run id, and several do: the a2a and v1 reply
+        preleases bump ``state_version`` while
+        ``acquire_task_lease_no_commit`` keeps the existing run, and an A2A
+        cancel finalizes to FAILED with ``run_id`` untouched. Callers that
+        read the row before deciding must therefore fence on
+        ``expected_state_version`` too, or their write lands on a row that
+        has since moved underneath them. The underlying sync path has always
+        supported it; this wrapper simply did not pass it through.
+        """
+
         return await asyncio.to_thread(
             transition_task_control_state_sync,
             int(task_id),
@@ -318,6 +360,7 @@ class TaskExecutionController:
             status=status,
             new_run=new_run,
             expected_run_id=expected_run_id,
+            expected_state_version=expected_state_version,
         )
 
     async def snapshot(self, task_id: int) -> TaskControlSnapshot | None:

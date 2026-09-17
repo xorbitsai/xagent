@@ -26,6 +26,9 @@ Background:
 Mode completeness:
     Each abstract method (``is_*`` / ``includes_*`` /
     ``compute_allowed_names``) must be implemented by every subclass.
+    ``includes_binding_authorized`` is one of them: it decides whether
+    ``BINDING_AUTHORIZED_CATEGORIES`` (granted by a per-agent binding
+    rather than by selection) ride along this spec.
     Missing an implementation is both a mypy error and a runtime
     ``TypeError`` at instantiation time. Adding a new ``includes_*``
     creator-dispatch method on the base forces every subclass to
@@ -50,12 +53,57 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional, Set
 
-from .base import AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
+from .base import (
+    AGENT_CONFIG_UNASSIGNABLE_CATEGORIES,
+    BINDING_AUTHORIZED_CATEGORIES,
+    INTRINSIC_TOOL_NAMES,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def with_mcp_tools(spec: "ToolSelectionSpec") -> "ToolSelectionSpec":
+    """Return the same selection with MCP tools enabled.
+
+    Actor-marked tasks must load their owner-scoped builtin tools even when a
+    long-lived agent was created before it had an ordinary ``mcp`` category.
+    The caller still supplies the actor policy that authorizes each server.
+    """
+    if isinstance(spec, _SpecAll):
+        return spec
+    if isinstance(spec, _SpecNone):
+        return _SpecByCategories(categories=frozenset({"mcp"}))
+    assert isinstance(spec, _SpecByCategories)
+    return replace(spec, categories=spec.categories | frozenset({"mcp"}))
+
+
+def without_published_agent_tools(spec: "ToolSelectionSpec") -> "ToolSelectionSpec":
+    """Return the same selection with published-agent delegation disabled.
+
+    Actor-marked direct tasks call this before tool construction, so the
+    published-agent creator is skipped by the registry rather than invoked and
+    asked to return an empty list.
+    """
+
+    if isinstance(spec, _SpecNone):
+        return spec
+    if isinstance(spec, _SpecAll):
+        return replace(spec, published_agent_ids=frozenset())
+    assert isinstance(spec, _SpecByCategories)
+
+    categories = frozenset(
+        category for category in spec.categories if category != "agent"
+    )
+    if not categories and not spec.mcp_servers:
+        return _SpecNone()
+    return replace(
+        spec,
+        categories=categories,
+        published_agent_ids=frozenset(),
+    )
 
 
 def normalize_mcp_server_name(name: str) -> str:
@@ -166,6 +214,16 @@ class ToolSelectionSpec(ABC):
         """Whether the Published Agent delegation creators should run."""
 
     @abstractmethod
+    def includes_binding_authorized(self) -> bool:
+        """Whether ``BINDING_AUTHORIZED_CATEGORIES`` ride along this spec.
+
+        Such a category is never selectable, so its per-agent binding is the
+        opt-in. False for an explicit zero-tools spec and for one whose only
+        selection is an internal injection (the unconfigured workforce
+        manager's worker tools), which stays scoped to that injection.
+        """
+
+    @abstractmethod
     def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
         """Pre-build MCP server restriction for the MCP creator.
 
@@ -186,8 +244,24 @@ class ToolSelectionSpec(ABC):
     # ── Final name-level filter ───────────────────────────────────
 
     @abstractmethod
-    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+    def compute_allowed_names(
+        self,
+        all_tools: List[Any],
+        extension_tool_names: frozenset[str] = frozenset(),
+    ) -> Optional[frozenset[str]]:
         """Resolve the final allowed-tool-names set for this spec.
+
+        Args:
+            all_tools: the built tool objects to filter.
+            extension_tool_names: names of tools contributed by task-runtime
+                extensions for THIS task (``TaskRuntimeContribution.tools``).
+                Such a tool is requested explicitly at task-creation time and
+                validated against the extension registry, so it carries a
+                task-scoped opt-in that is stronger than the agent-level
+                category policy; BY_CATEGORIES therefore admits it regardless
+                of its category. Defaults to empty, i.e. "no contributed
+                tools", so every existing caller keeps pure category /
+                server-scoped semantics.
 
         Returns:
             ``None``       — caller keeps every tool in ``all_tools``
@@ -358,7 +432,9 @@ class ToolSelectionSpec(ABC):
         """Whether the given category passes the spec.
 
         ``ALL`` admits every category; ``NONE`` admits none; and
-        ``BY_CATEGORIES`` admits only members of :attr:`categories`.
+        ``BY_CATEGORIES`` admits members of :attr:`categories`, plus any
+        ``BINDING_AUTHORIZED_CATEGORIES`` member per
+        :meth:`includes_binding_authorized`.
         Existing callers in ``factory.py`` registry-skip and
         creator-internal short-circuits keep using this.
         """
@@ -370,6 +446,8 @@ class ToolSelectionSpec(ABC):
         # through ``is_by_categories()`` narrowing in modern setups,
         # but the duck-typed attribute access is also safe here.
         categories: frozenset[str] = getattr(self, "categories", frozenset())
+        if cat in BINDING_AUTHORIZED_CATEGORIES:
+            return self.includes_binding_authorized()
         return cat in categories
 
 
@@ -447,15 +525,23 @@ class _SpecAll(ToolSelectionSpec):
             return False
         return True
 
+    def includes_binding_authorized(self) -> bool:
+        return True
+
     def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
         # ALL mode: MCP selected without restriction -> initialize every
         # server. (``includes_mcp()`` already honors the legacy
         # explicit-empty ``mcp_servers`` exclude before the creator runs.)
         return None
 
-    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+    def compute_allowed_names(
+        self,
+        all_tools: List[Any],
+        extension_tool_names: frozenset[str] = frozenset(),
+    ) -> Optional[frozenset[str]]:
         # None signals "no name-level filter" -- factory keeps
-        # every tool returned by the registry.
+        # every tool returned by the registry, contributed tools included, so
+        # ``extension_tool_names`` needs no special handling here.
         return None
 
 
@@ -493,14 +579,27 @@ class _SpecNone(ToolSelectionSpec):
     def includes_published_agent(self) -> bool:
         return False
 
+    def includes_binding_authorized(self) -> bool:
+        return False
+
     def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
         # NONE mode: MCP not selected -> initialize no servers.
         return frozenset()
 
-    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+    def compute_allowed_names(
+        self,
+        all_tools: List[Any],
+        extension_tool_names: frozenset[str] = frozenset(),
+    ) -> Optional[frozenset[str]]:
         # Empty frozenset signals "filter to []" -- factory drops
         # every tool returned by the registry. Distinct from
         # ``None`` (ALL mode, keep everything).
+        # ``extension_tool_names`` is deliberately NOT admitted: NONE is an
+        # explicit "this agent runs with zero tools" decision, so it outranks
+        # a task-level contribution. Only BY_CATEGORIES needs the bypass,
+        # because there "unknown category" is an accident of the category
+        # taxonomy (contributed tools carry the internal ``other`` fallback)
+        # rather than a deliberate exclusion.
         return frozenset()
 
 
@@ -592,6 +691,15 @@ class _SpecByCategories(ToolSelectionSpec):
             return False
         return "agent" in self.categories or bool(self.published_agent_ids)
 
+    def includes_binding_authorized(self) -> bool:
+        # Denied only for the injection-only shape: worker tool names with no
+        # dimension a user could have selected. A connector-only selection
+        # (``mcp:<server>`` -> mcp_servers, empty categories) is an opt-in.
+        injection_only = bool(self.name_allowlist) and not (
+            self.categories or self.mcp_servers
+        )
+        return not injection_only
+
     def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
         # Parent/child rule, identical to what compute_allowed_names applies
         # post-build: the plain "mcp" parent admits every server, so it means
@@ -602,9 +710,13 @@ class _SpecByCategories(ToolSelectionSpec):
             return None
         return self.mcp_servers or frozenset()
 
-    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
-        """Filter ``all_tools`` by ``categories`` + ``mcp_servers``,
-        then union ``name_allowlist``.
+    def compute_allowed_names(
+        self,
+        all_tools: List[Any],
+        extension_tool_names: frozenset[str] = frozenset(),
+    ) -> Optional[frozenset[str]]:
+        """Filter ``all_tools`` by ``categories`` + ``mcp_servers``
+        (+ task-runtime contribution), then union ``name_allowlist``.
 
         Reads the orthogonal policy fields directly (no ``_user_picked``
         reconstruction):
@@ -612,6 +724,9 @@ class _SpecByCategories(ToolSelectionSpec):
           - a tool whose category ∈ ``categories`` is admitted (plain
             ``"mcp"`` admits all MCP tools, etc.; DB-backed Custom API
             tools are loaded only for scoped ``mcp:<server>`` connectors);
+          - a tool in a ``BINDING_AUTHORIZED_CATEGORIES`` category is
+            admitted per :meth:`includes_binding_authorized` -- its per-agent
+            binding is the opt-in, since the category is never selectable;
           - otherwise a tool whose ``metadata.source_server`` matches a
             scoped server in ``mcp_servers`` is admitted. ``source_server``
             is the normalized originating-server identity set once at
@@ -621,6 +736,19 @@ class _SpecByCategories(ToolSelectionSpec):
             ``mcp:<server>`` therefore admits both the server's MCP tools
             and its ``api_<server>_call`` wrapper, since both carry the same
             ``source_server``;
+          - otherwise a tool whose name is in ``extension_tool_names`` -- the
+            tools this task's runtime extensions contributed -- is admitted
+            regardless of category. Same shape as the server-scoped admit
+            above (an ID-level scope supplied by the caller rather than a
+            category match), and necessary because a contributed tool keeps
+            ``ToolMetadata``'s default ``ToolCategory.OTHER`` while ``"other"``
+            is stripped from every configured category set
+            (``AGENT_CONFIG_UNASSIGNABLE_CATEGORIES``): a pure default-deny
+            filter would silently drop every contributed tool for any agent
+            with a configured ``tool_categories``. The contribution is already
+            access-controlled at task creation (validated against the
+            extension registry), which is a stronger, task-scoped opt-in than
+            the agent-level category policy;
           - finally ``name_allowlist`` names are unioned in.
 
         Duck-typed access to ``tool.metadata`` keeps this module free of any
@@ -631,15 +759,36 @@ class _SpecByCategories(ToolSelectionSpec):
         }
         names: Set[str] = set()
         for tool in all_tools:
-            if not (hasattr(tool, "metadata") and hasattr(tool.metadata, "category")):
-                continue
             tool_name = getattr(tool, "name", None)
             if not isinstance(tool_name, str):
+                continue
+
+            # Task-runtime admit, checked before the metadata shape guard so a
+            # contributed tool is admitted on the task-scoped signal alone and
+            # never depends on its (default ``other``) category metadata.
+            if tool_name in extension_tool_names:
+                names.add(tool_name)
+                continue
+
+            # Intrinsic admit: an always-available tool rides along any non-NONE
+            # selection regardless of the category picker (NONE never reaches
+            # this subclass). Same ID-level shape as the task-runtime admit.
+            # This runs ahead of any injection-only scoping too, so an
+            # unconfigured workforce-manager spec also gets it; harmless, as the
+            # tool is read-only and grants no new capability.
+            if tool_name in INTRINSIC_TOOL_NAMES:
+                names.add(tool_name)
+                continue
+
+            if not (hasattr(tool, "metadata") and hasattr(tool.metadata, "category")):
                 continue
             category = str(tool.metadata.category.value)
 
             # Plain category admit (categories holds only plain names).
-            if category in self.categories:
+            if category in self.categories or (
+                category in BINDING_AUTHORIZED_CATEGORIES
+                and self.includes_binding_authorized()
+            ):
                 names.add(tool_name)
                 continue
 

@@ -1,0 +1,15 @@
+# Vulnerabilities excluded from the weekly image scan
+# (.github/workflows/image-security-scan.yml).
+#
+# One CVE id per line. Add an entry only for a risk that has been reviewed and
+# accepted -- not to quiet an alert nobody has looked at yet. Each entry needs a
+# comment saying why, plus the PR that decided it:
+#
+#   # Not reachable: the vulnerable codec is never fed untrusted input. xorbitsai/xagent#0000
+#   CVE-0000-00000
+#
+# Note that unfixed vulnerabilities never become code scanning alerts in the
+# first place (the workflow's ignore-unfixed), so they need no entry here.
+#
+# An entry here also removes the finding from the run's full JSON artifact, not
+# just from the alerts -- Trivy reads this file by default on both scans.

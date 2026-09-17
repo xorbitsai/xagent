@@ -6,18 +6,17 @@ import asyncio
 import builtins
 import io
 import threading
-import time
 from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
 from fastapi.datastructures import UploadFile
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.workspace import TaskWorkspace
 from xagent.web.api import files as files_api
-from xagent.web.api import websocket as websocket_api
 from xagent.web.api.public_chat_access import (
     PublicChatAccessContext,
     ShareChatAccessContext,
@@ -26,7 +25,9 @@ from xagent.web.api.public_chat_access import (
 )
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.managed_file_ref import (
+    DURABLE_FAULT_LOG_PREFIX,
     DurableStorageOperationError,
     ManagedFileRef,
 )
@@ -94,14 +95,18 @@ def _stage_path_in(root: Path, user_id: int):
 class _SlowTrackingSource(io.BytesIO):
     """A synchronous source that reveals an accidental event-loop read."""
 
-    def __init__(self, payload: bytes, delay_seconds: float) -> None:
+    def __init__(self, payload: bytes) -> None:
         super().__init__(payload)
-        self.delay_seconds = delay_seconds
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.loop_thread = threading.get_ident()
         self.read_threads: list[int] = []
 
     def read(self, size: int = -1) -> bytes:
         self.read_threads.append(threading.get_ident())
-        time.sleep(self.delay_seconds)
+        self.started.set()
+        assert threading.get_ident() != self.loop_thread
+        assert self.release.wait(timeout=30), "upload read was never released"
         return super().read(size)
 
 
@@ -211,14 +216,13 @@ async def test_staging_copy_reads_off_loop_with_no_database_checkout(
         files_api, "get_upload_path", _stage_path_in(upload_root, user_id)
     )
     engine = _install_one_slot_queue_pool(monkeypatch)
-    source = _SlowTrackingSource(b"bounded-copy", delay_seconds=0.2)
+    source = _SlowTrackingSource(b"bounded-copy")
     upload = UploadFile(
         filename="off-loop.txt",
         file=source,
         headers={"content-type": "text/plain"},
     )
     loop_thread = threading.get_ident()
-    started_at = asyncio.get_running_loop().time()
     task = asyncio.create_task(
         files_api.store_uploaded_files(
             upload_items=[upload],
@@ -230,15 +234,20 @@ async def test_staging_copy_reads_off_loop_with_no_database_checkout(
         )
     )
     try:
-        await asyncio.sleep(0.01)
-        assert asyncio.get_running_loop().time() - started_at < 0.1
+        assert await asyncio.to_thread(source.started.wait, 30)
+        assert not task.done()
         assert engine.pool.checkedout() == 0
-        await task
+        source.release.set()
+        await asyncio.wait_for(task, timeout=30)
         assert source.read_threads
         assert all(thread_id != loop_thread for thread_id in source.read_threads)
         assert engine.pool.checkedout() == 0
     finally:
-        engine.dispose()
+        source.release.set()
+        try:
+            await asyncio.wait_for(task, timeout=30)
+        finally:
+            engine.dispose()
 
 
 def test_reserve_and_copy_enforces_max_size_and_cleans_partial_file(
@@ -810,6 +819,7 @@ async def test_cancel_after_upload_registration_compensates_metadata_and_bytes(
 async def test_failed_compensation_does_not_skip_request_local_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     isolated_upload_storage,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     _upload_root, _object_root = isolated_upload_storage
     _admin_headers()
@@ -826,7 +836,9 @@ async def test_failed_compensation_does_not_skip_request_local_cleanup(
         raise RuntimeError("registration failed")
 
     def fail_compensation(_claims) -> None:  # type: ignore[no-untyped-def]
-        raise DurableStorageOperationError("storage cleanup unavailable")
+        raise DurableStorageOperationError(
+            "storage cleanup unavailable", storage_key=None
+        )
 
     monkeypatch.setattr(
         files_api,
@@ -857,6 +869,89 @@ async def test_failed_compensation_does_not_skip_request_local_cleanup(
 
     assert local_paths
     assert all(not path.exists() for path in local_paths)
+
+    # The double fault -- the upload failed against durable storage and
+    # compensating against it failed too -- is the incident this reporting
+    # exists for, so it must not be recorded as an unlabelled traceback. The
+    # AST sweep pins that the site declares these fields; this pins that the
+    # record actually carries them, with the values from this request.
+    fault_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "xagent.web.api.files"
+        and DURABLE_FAULT_LOG_PREFIX in record.getMessage()
+    ]
+    assert len(fault_lines) == 1, caplog.records
+    assert "upload compensation" in fault_lines[0]
+    assert f"user_id={user_id}" in fault_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_store_uploaded_files_fails_closed_on_scope_authority_mismatch(
+    isolated_upload_storage,
+) -> None:
+    """``store_uploaded_files`` selects the write namespace (workspace
+    segments / storage key) for the bytes it writes, unlike the off-turn
+    *read* paths (``resolve_execution_scope_off_turn``) that downgrade an
+    authority mismatch to a warning and keep going. A registered
+    resolver/persisted-snapshot disagreement here must propagate and fail
+    the request instead of silently choosing a namespace."""
+    from xagent.core.execution_scope import (
+        ExecutionScope,
+        ExecutionScopeAuthorityError,
+        set_execution_scope_snapshot_loader,
+    )
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.services.execution_scope_snapshot import (
+        load_task_execution_scope_snapshot,
+    )
+
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = int(db.query(User.id).filter(User.username == "admin").scalar())
+        task = Task(
+            user_id=user_id,
+            title="scope mismatch",
+            description="scope mismatch",
+            status=TaskStatus.COMPLETED,
+            source="sdk",
+            agent_config={
+                "execution_scope": ExecutionScope(
+                    workspace_segments=("snapshot-tenant",),
+                ).to_dict()
+            },
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    set_execution_scope_snapshot_loader(load_task_execution_scope_snapshot)
+    register_scope_resolver(
+        lambda _task_id: ExecutionScope(workspace_segments=("resolver-tenant",)),
+    )
+    try:
+        with pytest.raises(ExecutionScopeAuthorityError):
+            await files_api.store_uploaded_files(
+                upload_items=[
+                    UploadFile(
+                        filename="mismatch.txt",
+                        file=io.BytesIO(b"payload"),
+                        headers={"content-type": "text/plain"},
+                    )
+                ],
+                task_type="general",
+                task_id=str(task_id),
+                folder=None,
+                user_id=user_id,
+                single_file_mode=True,
+            )
+    finally:
+        register_scope_resolver(None)
+        set_execution_scope_snapshot_loader(None)
 
 
 def test_http_durable_upload_is_bound_to_agent_workspace_without_second_put(
@@ -906,7 +1001,7 @@ def test_http_durable_upload_is_bound_to_agent_workspace_without_second_put(
         base_dir=str(tmp_path := upload_root / "agent-workspaces"),
         allowed_external_dirs=[str(Path(storage_path).parent)],
     )
-    websocket_api._register_uploaded_files_for_agent(
+    task_execution_service._register_uploaded_files_for_agent(
         type("AgentService", (), {"workspace": workspace})(),
         [file_info],
     )

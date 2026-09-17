@@ -20,6 +20,49 @@ features:
   - 生成完整文档的清晰、结构化摘要
   - 提取文本中隐藏的每一项行动项、截止日期和负责人
   - 在同一对话线程中回答关于文档的后续问题
+sample_prompts:
+  en:
+  - title: Summarise a document
+    prompt: 'Summarise the attached PDF / Word / PowerPoint and pull out the key points and decisions.'
+    highlights:
+    - PDF / Word / PowerPoint
+  - title: Extract action items
+    prompt: 'Extract every action item from document / meeting notes, grouped by owner with deadlines.'
+    highlights:
+    - document / meeting notes
+  zh:
+  - title: 总结文档
+    prompt: 总结附加的 PDF / Word / PowerPoint 文档，并提炼要点和结论。
+    highlights:
+    - PDF / Word / PowerPoint
+  - title: 提取行动项
+    prompt: 从 文档 / 会议纪要 中提取每一项行动项，按负责人和截止日期归类。
+    highlights:
+    - 文档 / 会议纪要
+persona:
+  name: Iris
+  role:
+    en: Doc Summarizer & Action Extractor
+    zh: 文档摘要与行动项提取
+  avatar: /marketplace/avatars/iris.png
+  intro:
+    en: |-
+      Hi there — I'm Iris, your Doc Summarizer & Action Extractor.
+
+      I read the documents you drop in and hand back a summary plus every action item, owner and deadline.
+    zh: |-
+      你好，我是 Iris，你的文档摘要与行动项提取助手。
+
+      把文档丢给我，我会返回一份摘要，外加其中的每一项行动项、负责人和截止日期。
+  kickoff_questions:
+    en:
+    - What am I reading first — contracts, board packs, meeting decks, something else?
+    - Do you want the summary first with actions underneath, or just the action table?
+    - Should I flag items with no stated owner or due date, or leave those blank?
+    zh:
+    - 我先看哪类文档——合同、董事会材料、会议演示，还是别的？
+    - 你希望先看摘要、下面再列行动项，还是只要行动项表格？
+    - 遇到没写明负责人或截止日期的条目，要标出来，还是留空就好？
 connections: []
 setup_time:
   en: 2 min setup

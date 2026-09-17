@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         dimension = Column(Integer, nullable=True)
         abilities = Column(JSON, nullable=True)
         description = Column(Text, nullable=True)
+        managed_by = Column(String(50), nullable=True)
         created_at = Column(DateTime(timezone=True), server_default=func.now())
         updated_at = Column(DateTime(timezone=True), onupdate=func.now())
         is_active = Column(Boolean, default=True)

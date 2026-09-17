@@ -6,23 +6,40 @@ enabling MCP tools to be used in DAG plan-execute patterns and other agent workf
 
 import asyncio
 import inspect
+import json
 import logging
+import math
 import os
 import re
 import weakref
 from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Type, TypeVar, Union, cast
+from typing import (
+    Annotated,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from mcp.types import CallToolResult
 from mcp.types import Tool as MCPTool
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, ValidationError, create_model
 
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
+from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import Connection, create_session
-from ...core.mcp.tools import load_mcp_tools
+from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -35,10 +52,20 @@ from .connector_runtime import (
     connector_runtime_from_config,
     runtime_bindings_from_config,
 )
+from .sandboxed_tool.chrome_session import (
+    ChromeDaemonLaunchSpec,
+    ChromeExecutionScope,
+    ChromeExecutionSessionPool,
+    ChromeSessionContractError,
+    chrome_metadata_connection,
+)
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
+    SandboxedMCPLoadResult,
+    list_tools_in_sandbox,
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
 )
+from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 
 class MCPFailurePhase(str, Enum):
@@ -72,6 +99,120 @@ def mcp_load_failure_message(phase: MCPFailurePhase) -> str:
     return _MCP_LOAD_FAILURE_MESSAGES[phase]
 
 
+class MCPWriteHint(Enum):
+    """What a server's tool annotations claim about a tool's side effects.
+
+    Three states rather than a boolean, because "the server told us this is
+    read-only" and "the server told us nothing" are different facts and only
+    the first one is a claim. Collapsing them into ``is_read_only: bool``
+    would make silence indistinguishable from a promise -- and silence is
+    the common case, since annotations are optional and most connectors
+    omit them.
+
+    A consumer deciding whether an action needs a human in front of it
+    should treat everything except :data:`READ_ONLY` as a write. See
+    ``MCPToolAdapter.write_hint`` for why none of this is a trust boundary.
+    """
+
+    READ_ONLY = "read_only"
+    DESTRUCTIVE = "destructive"
+    UNDECLARED = "undeclared"
+
+
+# The annotation keys this classifier reads, spelled as the MCP wire schema
+# spells them (camelCase is the protocol's, not this codebase's).
+_READ_ONLY_HINT = "readOnlyHint"
+_DESTRUCTIVE_HINT = "destructiveHint"
+_IDEMPOTENT_HINT = "idempotentHint"
+
+
+def classify_write_hint(raw_annotations: object) -> MCPWriteHint:
+    """Classify a tool's *raw* wire annotations into a write hint.
+
+    Takes the annotation mapping as it arrived on the wire, before the mcp
+    SDK's models see it. That is deliberate and it is the whole reason this
+    function exists: ``ToolAnnotations`` declares ``bool | None`` under
+    non-strict Pydantic validation, so by the time a parsed object is in
+    hand, ``1`` and ``"true"`` have already become an indistinguishable
+    Python ``True``. Classifying after that boundary cannot tell a server
+    that promised ``true`` from one that sent a coercible non-boolean, which
+    would turn "only an exact boolean counts" into a promise this code does
+    not keep.
+
+    Fail-closed in both directions that matter:
+
+    * A declared ``destructiveHint`` outranks a simultaneous ``readOnlyHint``.
+      The schema marks the two independent with no mutual exclusion, so a peer
+      can send both, and the safe reading of a contradiction is the one that
+      keeps a human in front of the action.
+    * Everything else -- absent, ``None``, ``false``, a non-boolean, or an
+      annotations value that is not even a mapping -- is ``UNDECLARED``,
+      which a consumer must treat as a write.
+
+    None of this makes the result trustworthy: annotations come from a server
+    the client does not control, and the spec says outright that a client
+    "should never make tool use decisions based on ToolAnnotations received
+    from untrusted servers". What this buys is that a *malformed* or
+    *contradictory* claim can never read as the permissive one.
+    """
+    if not isinstance(raw_annotations, Mapping):
+        return MCPWriteHint.UNDECLARED
+    # ``is True`` against the raw value, which is the only place it means what
+    # it says. Checked destructive-first so a both-true peer lands on the
+    # safe side.
+    if raw_annotations.get(_DESTRUCTIVE_HINT) is True:
+        return MCPWriteHint.DESTRUCTIVE
+    if raw_annotations.get(_READ_ONLY_HINT) is True:
+        return MCPWriteHint.READ_ONLY
+    return MCPWriteHint.UNDECLARED
+
+
+def classify_non_idempotent_write(raw_annotations: object) -> bool:
+    """Whether a tool's *raw* wire annotations declare a non-idempotent write.
+
+    The consumer is the same-turn duplicate-write guard, whose enrollment
+    question is not "may this destroy data" but "does repeating this call
+    with identical arguments produce an additional effect". Per the MCP
+    schema that is ``idempotentHint`` (``false`` = repeats have additional
+    effect), not ``destructiveHint`` (``false`` = only additive updates) — a
+    well-annotated create tool is additive and non-idempotent, i.e.
+    ``destructiveHint: false, idempotentHint: false``.
+
+    Reads the wire mapping for the same reason ``classify_write_hint`` does:
+    only an exact boolean is a declaration. True exactly when
+    ``readOnlyHint`` is not exactly ``true`` and either
+
+    * ``idempotentHint`` is exactly ``false`` — the explicit declaration
+      that identical repeats compound, or
+    * ``destructiveHint`` is exactly ``true`` without an exact
+      ``idempotentHint: true`` — an explicit write whose idempotency the
+      server left unstated.
+
+    Everything else is False. An absent hint is never read through its
+    spec default: ``idempotentHint``'s default of false does not enroll an
+    unannotated tool, and ``destructiveHint``'s default of true does not
+    either, so enrollment always needs at least one exact boolean from the
+    server and legitimate identical-args poll loops stay unguarded. Within
+    an explicit ``destructiveHint: true``, though, a *missing*
+    ``idempotentHint`` does enroll: the server declared a write and said
+    nothing about repeats, which is the same reading the previous
+    destructive-only enrollment used. Unlike confirmation-style
+    consumers, deduplication fails OPEN: a contradictory or malformed claim
+    (e.g. read-only plus non-idempotent) reads as "do not enroll", because
+    the harmless failure mode here is executing, not suppressing.
+    """
+    if not isinstance(raw_annotations, Mapping):
+        return False
+    if raw_annotations.get(_READ_ONLY_HINT) is True:
+        return False
+    if raw_annotations.get(_IDEMPOTENT_HINT) is False:
+        return True
+    return (
+        raw_annotations.get(_DESTRUCTIVE_HINT) is True
+        and raw_annotations.get(_IDEMPOTENT_HINT) is not True
+    )
+
+
 @dataclass(frozen=True)
 class MCPServerLoadFailure:
     """Safe MCP load failure data that excludes raw exception details."""
@@ -98,12 +239,421 @@ class EmptyArgsModel(BaseModel):
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
-_RESOLVER_HTTP_401_NODE_LIMIT = 64
+# Hard ceiling on how many exception nodes either walk over a failed call
+# visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
+# Two consumers read it: _bounded_exception_nodes (the 401 resolver's
+# challenge lookup) and _level_order_exception_nodes (failure logging).
+_EXCEPTION_WALK_NODE_LIMIT = 64
+# Caps each exception message logged when an MCP tool call fails, so a server
+# that echoes a large payload back in its error (or an SDK that dumps a full
+# request) can't blow up log volume. The cap is per line, not per failure: a
+# plain failure logs one capped line, and an exception-group failure logs one
+# for the group plus up to _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS more, each
+# capped on its own. No traceback is attached to any of them. The message
+# returned to the caller ("Error executing MCP tool.") never carries it.
+_MCP_TOOL_ERROR_LOG_MAX_CHARS = 500
+# Caps str(exc) before either redaction pass in _truncated_error_message runs.
+# str(exc) comes from a remote MCP server (or an SDK relaying its response)
+# and has no length limit of its own, while both redaction passes cost time
+# proportional to their input, so an unbounded message is a CPU-cost lever a
+# hostile or compromised server can pull regardless of how cheap either pass
+# is made per character. This bound only needs to keep the redaction passes
+# themselves cheap -- _MCP_TOOL_ERROR_LOG_MAX_CHARS is still what bounds the
+# final logged size.
+_MCP_TOOL_ERROR_RAW_MAX_CHARS = 4096
+# Caps how many related exceptions of a failed call get their own log line:
+# the leaves of a (possibly nested) BaseExceptionGroup and the exceptions on
+# their __cause__/__context__ chains. A fan-out call (e.g. concurrent
+# sub-requests) can otherwise raise a group with dozens of members.
+# Members at the same nesting depth are visited before any of their own
+# chains, so a fan-out failure logs one line per leg before spending
+# budget on a leg's causes.
+_MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS = 5
 _HTTP_401_TEXT_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
     r"\b401\s+unauthorized\b",
     re.IGNORECASE,
 )
+
+# Caps one field's `description` and one field's `pattern`, both of which reach
+# the model on every LLM call. 200 mirrors the cap the repo already uses for
+# a model-facing one-line summary (`INDEX_ENTRY_MAX_CHARS`). `description` and
+# `pattern` share this number, so lowering it also drops mid-length patterns
+# entirely: a pattern is emitted whole or not at all and is never truncated.
+_FIELD_TEXT_MAX_CHARS = 200
+# The `format` tokens carried through: the JSON Schema Draft 2020-12 format
+# vocabulary, plus the OpenAPI 3.0 hints (`byte`, `binary`, `password`,
+# `int32`, `int64`, `float`, `double`) connector authors write in practice.
+# `description` and `pattern` are free text no allowlist could enumerate, but
+# `format` is a closed set of defined tokens, so a token outside it names no
+# rule to pass on and is dropped rather than forwarded to the model as
+# authoritative text. The match is exact, and every defined token is
+# lower-case, so `Date-Time` is not one of them. This set is also what bounds
+# the length of an accepted `format`, so the key carries no length cap of its
+# own.
+_KNOWN_FIELD_FORMATS = frozenset(
+    {
+        "date-time",
+        "date",
+        "time",
+        "duration",
+        "email",
+        "idn-email",
+        "hostname",
+        "idn-hostname",
+        "ipv4",
+        "ipv6",
+        "uri",
+        "uri-reference",
+        "iri",
+        "iri-reference",
+        "uuid",
+        "uri-template",
+        "json-pointer",
+        "relative-json-pointer",
+        "regex",
+        "byte",
+        "binary",
+        "password",
+        "int32",
+        "int64",
+        "float",
+        "double",
+    }
+)
+
+
+def _json_equal(a: Any, b: Any) -> bool:
+    """Compare two JSON values using JSON's own type distinctions.
+
+    JSON Schema treats booleans and numbers as different types, while Python
+    holds ``True == 1``. Enum membership follows JSON, not Python, and the
+    distinction has to hold at every level: the JSON arrays ``[true]`` and
+    ``[1]`` are not the same array, so the comparison recurses instead of
+    handing nested values back to Python's ``==``.
+
+    Recursion is bounded by the shallower of the two values, and an enum only
+    reaches here after ``_is_json_serializable`` has already serialized it,
+    so its nesting is within the interpreter's recursion limit.
+    """
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _json_equal(item_a, item_b) for item_a, item_b in zip(a, b)
+        )
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, dict)) or isinstance(b, (list, dict)):
+        return False
+    return bool(a == b)
+
+
+def _compact_json(value: Any) -> str:
+    """Serialize a value the way the emitted tool schema will carry it.
+
+    ``allow_nan=False`` matches the provider clients, which reject non-finite
+    numbers, so a value that cannot be serialized here would fail the LLM call.
+    """
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _is_json_serializable(value: Any) -> bool:
+    """Whether a value survives the serialization the emitted schema applies.
+
+    ``RecursionError`` is refused alongside the type and value errors, because
+    a value nested deeper than the interpreter's recursion limit cannot be
+    emitted either: ``json.dumps`` gives up at roughly 1200 levels. Refusing
+    it here drops the one key it arrived on, whereas letting it escape would
+    reach the caller's fallback and cost the whole tool its arguments.
+    """
+    try:
+        _compact_json(value)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    return True
+
+
+def _is_finite_number(value: Any) -> bool:
+    """Whether a value is a JSON number, excluding booleans and non-finite floats.
+
+    Python integers are unbounded, so for an integer too large to convert to a
+    float ``math.isfinite`` raises ``OverflowError`` rather than answering.
+    Such a number is no more emittable than an infinity, so it is refused the
+    same way: the key it arrived on is dropped and nothing else is affected.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _is_non_negative_integer(value: Any) -> bool:
+    """Whether a value is a JSON integer of zero or more.
+
+    ``minLength`` and ``maxLength`` count characters, so JSON Schema defines
+    them as non-negative integers. A negative or fractional bound is not a
+    stricter rule the model should honour, it is a malformed one.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+# Every field-schema key this adapter reads: the eight it carries into the
+# emitted schema, the four `_json_schema_to_python_type` resolves a type from,
+# and `default`. A key outside this set reaches neither the emitted schema nor
+# the field's type, so it is dropped -- `items`, `const`, `multipleOf`,
+# `exclusiveMinimum` and `title` among them -- and is counted as such.
+_READ_FIELD_SCHEMA_KEYS = frozenset(
+    {
+        "description",
+        "enum",
+        "pattern",
+        "format",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "default",
+        "type",
+        "anyOf",
+        "oneOf",
+        "allOf",
+    }
+)
+# Numeric field-schema keys carried through, in the order they are emitted,
+# each with the check its own JSON Schema definition calls for. Every key is
+# accepted or dropped on its own value; one key never affects another.
+_FIELD_NUMERIC_METADATA_KEYS = (
+    ("minLength", _is_non_negative_integer),
+    ("maxLength", _is_non_negative_integer),
+    ("minimum", _is_finite_number),
+    ("maximum", _is_finite_number),
+)
+
+
+def _bounded_field_text(value: str) -> str:
+    """Collapse a field description to a bounded single line."""
+    text = " ".join(value.split())
+    if len(text) <= _FIELD_TEXT_MAX_CHARS:
+        return text
+    return text[: _FIELD_TEXT_MAX_CHARS - 1].rstrip() + "…"
+
+
+def _emitted_default(field_schema: Mapping[str, Any]) -> tuple[Any, bool]:
+    """Return the default an optional field emits, and whether the server chose it.
+
+    An optional field the server gave no default still emits ``None``, because
+    that is what makes it optional. That ``None`` is this adapter's doing, not
+    something the connector author asserted, and the second element says so.
+
+    A non-finite default survives ``json.loads`` and would be emitted into the
+    tool schema, where the provider client refuses to serialize it and every
+    LLM call for the agent fails -- not only calls to this tool. Only a bare
+    float needs this guard: a non-finite float nested inside a list or object
+    default is already rendered as null by the schema serializer. Replacing it
+    also makes the emitted default this adapter's own, so it is reported the
+    same way as an absent one.
+    """
+    if "default" not in field_schema:
+        return None, False
+    declared = field_schema["default"]
+    if isinstance(declared, float) and not math.isfinite(declared):
+        return None, False
+    return declared, True
+
+
+def _field_metadata_candidates(
+    field_schema: Mapping[str, Any],
+    *,
+    emitted_default: Any,
+    default_is_authored: bool,
+) -> tuple[list[tuple[str, Any]], int]:
+    """Return the metadata one field may emit, in fixed key order.
+
+    ``field_schema`` comes from an MCP server and is untrusted, so every key is
+    judged on its own: a rejected key never removes another key, the field, or
+    the tool. The order is fixed here rather than taken from the incoming
+    mapping, so a server reordering its JSON cannot change what is emitted.
+    The input is not modified. The second element counts the present keys that
+    were rejected.
+    """
+    candidates: list[tuple[str, Any]] = []
+    rejected = 0
+
+    if "description" in field_schema:
+        raw_description = field_schema["description"]
+        if isinstance(raw_description, str) and raw_description.split():
+            candidates.append(("description", _bounded_field_text(raw_description)))
+        else:
+            rejected += 1
+
+    if "enum" in field_schema:
+        raw_enum = field_schema["enum"]
+        # An over-long enum is dropped whole rather than shortened: a clipped
+        # list still reads as the complete set of legal values, so it would
+        # tell the model that a value the server accepts is illegal.
+        # A default the author wrote that sits outside their own enum
+        # contradicts itself, and the enum is the half this code chose to add,
+        # so the enum gives way. A default this adapter invented carries no
+        # such claim: dropping the author's enum over a `null` they never wrote
+        # would silence the enum on exactly the shape it helps most, an
+        # optional field with no default. Membership is tested member by member
+        # because enum members may be objects, which no hash-based container
+        # would accept.
+        # Only an authored default is capable of the contradiction. An
+        # optional field whose author wrote an enum and no default emits that
+        # enum inside the non-null branch of its `anyOf` and `default: null`
+        # beside the wrapper, and the null validates against the null branch,
+        # so those two say nothing conflicting about each other.
+        if (
+            isinstance(raw_enum, list)
+            and raw_enum
+            and _is_json_serializable(raw_enum)
+            and len(_compact_json(raw_enum)) <= _FIELD_TEXT_MAX_CHARS
+            and (
+                not default_is_authored
+                or any(_json_equal(emitted_default, member) for member in raw_enum)
+            )
+        ):
+            candidates.append(("enum", list(raw_enum)))
+        else:
+            rejected += 1
+
+    if "pattern" in field_schema:
+        raw_pattern = field_schema["pattern"]
+        # A pattern is passed through character for character. The whitespace
+        # collapsing `description` gets would change which strings the regex
+        # matches -- `^a  b$` and `^a b$` accept disjoint sets -- and a regex
+        # is read by a matcher, not by a reader. A truncated regex is
+        # syntactically invalid yet still reads to the model as an
+        # authoritative rule, so an over-long pattern is dropped whole. A
+        # blank pattern states nothing and is dropped as malformed.
+        if (
+            isinstance(raw_pattern, str)
+            and raw_pattern.strip()
+            and len(raw_pattern) <= _FIELD_TEXT_MAX_CHARS
+        ):
+            candidates.append(("pattern", raw_pattern))
+        else:
+            rejected += 1
+
+    if "format" in field_schema:
+        raw_format = field_schema["format"]
+        # The allowlist is the whole gate: `format` is emitted verbatim, so
+        # only a defined token passes, and that set also bounds how long an
+        # accepted token can be.
+        if isinstance(raw_format, str) and raw_format in _KNOWN_FIELD_FORMATS:
+            candidates.append(("format", raw_format))
+        else:
+            rejected += 1
+
+    for key, is_acceptable in _FIELD_NUMERIC_METADATA_KEYS:
+        if key not in field_schema:
+            continue
+        value = field_schema[key]
+        if is_acceptable(value):
+            candidates.append((key, value))
+        else:
+            rejected += 1
+
+    # A key this adapter never reads is dropped just as surely as one that
+    # failed its check, and the author has no way to tell the two apart from
+    # the outside. Counting it keeps the reported number the number of things
+    # the connector declared that did not survive.
+    rejected += sum(1 for key in field_schema if key not in _READ_FIELD_SCHEMA_KEYS)
+
+    return candidates, rejected
+
+
+class _FieldMetadata(NamedTuple):
+    """What one field of one tool emits, named so the read site cannot slip.
+
+    The three parts travel together from the one place that decides them to
+    the one place that builds the field, and a caller that mixed two of them
+    up would put a description where a default belongs.
+    """
+
+    emitted_default: Any
+    description: Optional[str]
+    extra: dict[str, Any]
+
+
+class _ToolFieldMetadata(NamedTuple):
+    """Every field's record for one tool, with what was dropped reaching it.
+
+    The two counts are kept apart because they count different things. A
+    field schema that is not a mapping has no keys to enumerate, so folding
+    it into the key count would report a number nothing measured.
+    """
+
+    fields: dict[str, _FieldMetadata]
+    rejected_keys: int
+    unreadable_fields: int
+
+
+def _tool_field_metadata(
+    properties: Mapping[str, Any],
+    required: Any,
+    excluded_names: set[str],
+) -> _ToolFieldMetadata:
+    """Decide what every field of one tool emits.
+
+    Fields are independent: each key is judged on its own, so nothing one
+    field declares can change what another field emits.
+
+    Returns one record per field the args model will carry -- the default it
+    emits, its description, and its other schema keys -- alongside how much
+    was dropped on the way: the present keys that did not survive, and the
+    fields whose schema could not be read at all. The default is decided here
+    rather than by the caller so that it is derived exactly once per field:
+    the enum rules already need to know it.
+    """
+    metadata: dict[str, _FieldMetadata] = {}
+    rejected_keys = 0
+    unreadable_fields = 0
+
+    for field_name, field_schema in properties.items():
+        if field_name in excluded_names:
+            continue
+
+        if not isinstance(field_schema, Mapping):
+            # A field schema that is not a mapping declares nothing readable,
+            # a default included, so it is recorded empty and left to the
+            # type conversion the caller runs. Reading a default off it first
+            # would raise past the caller instead and cost the tool every one
+            # of its arguments over one malformed field.
+            metadata[field_name] = _FieldMetadata(None, None, {})
+            unreadable_fields += 1
+            continue
+
+        if field_name in required:
+            # A required field has no default to emit, and the enum rules that
+            # consult one do not apply to it.
+            emitted_default: Any = None
+            default_is_authored = False
+        else:
+            emitted_default, default_is_authored = _emitted_default(field_schema)
+
+        candidates, rejected = _field_metadata_candidates(
+            field_schema,
+            emitted_default=emitted_default,
+            default_is_authored=default_is_authored,
+        )
+        rejected_keys += rejected
+
+        description: Optional[str] = None
+        extra: dict[str, Any] = {}
+        for key, value in candidates:
+            if key == "description":
+                description = value
+            else:
+                extra[key] = value
+
+        metadata[field_name] = _FieldMetadata(emitted_default, description, extra)
+
+    return _ToolFieldMetadata(metadata, rejected_keys, unreadable_fields)
 
 
 def _bounded_exception_nodes(
@@ -112,7 +662,7 @@ def _bounded_exception_nodes(
     pending = [(exc, True)]
     visited: set[int] = set()
     visited_count = 0
-    while pending and visited_count < _RESOLVER_HTTP_401_NODE_LIMIT:
+    while pending and visited_count < _EXCEPTION_WALK_NODE_LIMIT:
         current, is_root = pending.pop()
         current_id = id(current)
         if current_id in visited or (
@@ -133,6 +683,254 @@ def _bounded_exception_nodes(
         if isinstance(current.__context__, BaseException):
             linked.append(current.__context__)
         pending.extend((node, False) for node in reversed(linked))
+
+
+def _level_order_exception_nodes(exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc`` and the exceptions linked to it in level order: the
+    members of an exception group at one nesting depth are reached before
+    any of those members' own ``__cause__``/``__context__`` chains.
+
+    ``_bounded_exception_nodes`` walks the same edges depth-first, which is
+    what the 401 resolver wants -- it only needs one matching response from
+    anywhere in the graph. A capped log wants the opposite: a fan-out call
+    fails as a group with one member per failed leg, and depth-first order
+    lets the first leg's own cause chain spend the whole per-call budget,
+    so the other legs never get a line at all.
+    """
+    pending: list[BaseException] = [exc]
+    visited: set[int] = set()
+    index = 0
+    while index < len(pending) and len(visited) < _EXCEPTION_WALK_NODE_LIMIT:
+        current = pending[index]
+        index += 1
+        current_id = id(current)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+        yield current
+
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        if isinstance(current.__cause__, BaseException):
+            pending.append(current.__cause__)
+        if isinstance(current.__context__, BaseException):
+            pending.append(current.__context__)
+
+
+# A URL token ends only at whitespace or an angle bracket. A quote is NOT a
+# boundary: quotes are legal query-string content, and HTTPX puts the request
+# URL inside single quotes in its own error messages, so stopping at the first
+# quote would end the token in the middle of a query value -- dropping the
+# ``key=`` half with the query while the value stayed outside the token, where
+# the assignment-shaped pass that masks by key name can no longer see it. The
+# cost of consuming the quote instead is one trailing quote missing from the
+# logged sentence. Whitespace and the two angle brackets stay boundaries
+# because they are structural, not typographic: RFC 3986 excludes all three
+# from the URI character set, and HTTPX -- the only producer this has been
+# measured against -- percent-encodes a literal space, ``<``, or ``>`` in a
+# query value before it ever reaches a token here. A producer that does not
+# percent-encode them (this also consumes the ``str()`` of arbitrary
+# non-HTTPX exceptions, e.g. a JSON-RPC error or an echoed server message)
+# can still end a token at a raw ``<``/``>`` the same way a quote used to,
+# splitting a ``key=`` off with the query while its value stays outside the
+# token; ``_MCP_TOOL_ERROR_LOG_MAX_CHARS`` is what bounds that residual.
+_URL_TOKEN_RE = re.compile(r"(?:https?|wss?)://[^\s<>]+", re.IGNORECASE)
+# Punctuation that ends the sentence rather than the URL. Closing brackets
+# are only dropped when the token holds no matching opener, so an IPv6
+# authority ("https://[::1]") and a parenthesised path segment survive.
+_URL_TRAILING_PUNCTUATION = ",.;:"
+_URL_TRAILING_BRACKETS = {")": "(", "]": "[", "}": "{"}
+# Appended by a caller that truncates the text it hands to
+# ``redact_urls_in_text`` (``_truncated_error_message`` is the only producer).
+# A URL token carrying it was cut at an unknown offset, so its remaining
+# authority may be the front half of a ``user:pass`` whose ``@`` was cut away.
+# U+FFFE is a Unicode noncharacter, permanently reserved and never assigned a
+# meaning in interchange text, so in practice its presence comes from that
+# append; nothing stops a remote message from carrying one on its own; if
+# that happens, the only effect is that the token carrying it is redacted
+# too. ``_truncated_error_message``, the only caller that appends it, also
+# strips it unconditionally before anything is logged -- a guarantee scoped
+# to that call site, not to every consumer of ``redact_urls_in_text``.
+_TEXT_TRUNCATION_MARK = "\ufffe"
+
+
+def _split_url_token(token: str) -> tuple[str, str]:
+    """Split a matched URL token into ``(clean, trailing)``.
+
+    ``trailing`` is sentence punctuation immediately following the URL (a
+    closing paren, a period, ...) that should survive redaction even
+    though the URL itself does not; ``clean`` is the token with that
+    punctuation removed, ready to hand to ``urlsplit``.
+
+    The boundary between the two is found by scanning backward from the
+    end of the *scheme+authority+path* portion of the token only -- never
+    past the first ``?`` or ``#`` -- dropping characters that are either
+    in ``_URL_TRAILING_PUNCTUATION`` or a closing bracket with no
+    matching opener earlier in that same portion, until neither applies.
+    Stopping at the query/fragment boundary is deliberate: those parts are
+    dropped wholesale by the caller, so a credential value ending in one
+    of these characters (``...api_key=S)))``) must not have that tail
+    split off, survive the drop, and be reattached to the redacted URL as
+    if it were sentence punctuation -- nothing at or after the boundary is
+    ever part of either return value. Bracket counts for the scanned
+    portion are computed once up front and decremented as brackets are
+    consumed, rather than re-scanned on every character, so the scan is
+    linear in the token length instead of quadratic.
+    """
+    boundary = len(token)
+    for sep in ("?", "#"):
+        idx = token.find(sep)
+        if idx != -1 and idx < boundary:
+            boundary = idx
+    scanned = token[:boundary]
+    remaining = {c: scanned.count(c) for c in _URL_TRAILING_BRACKETS}
+    openers = {c: scanned.count(o) for c, o in _URL_TRAILING_BRACKETS.items()}
+    end = boundary
+    while end > 0:
+        last = token[end - 1]
+        if last in _URL_TRAILING_PUNCTUATION:
+            end -= 1
+            continue
+        if last in _URL_TRAILING_BRACKETS and openers[last] < remaining[last]:
+            remaining[last] -= 1
+            end -= 1
+            continue
+        break
+    return token[:end], token[end:boundary]
+
+
+def redact_urls_in_text(text: str) -> str:
+    """Return ``text`` with every ``scheme://...`` URL replaced by a copy
+    that has its query string and userinfo stripped.
+
+    Exception messages that legitimately need to name the server sometimes
+    embed the full request URL -- e.g. ``httpx.HTTPStatusError``'s message
+    is "... for url '<url>'" and an unfollowed redirect's message names the
+    ``Location`` response header. Connector URLs commonly carry secrets
+    (API keys, tokens) in the query string or in ``user:pass@host``
+    userinfo, so those parts are dropped before the message is logged, and
+    so is the fragment (it never reaches a server and carries no diagnostic
+    value). The scheme, host, port, and path are kept so the log line still
+    says which server failed. A token that fails to parse as a URL, or
+    whose authority does not parse as ``host[:port]``, is replaced
+    wholesale with ``<url redacted>`` rather than risking a partial leak.
+    Two further rules cover userinfo that lost its ``@``, which no
+    authority parse can recognise on its own because ``user:pass`` is
+    byte-for-byte a legal ``host:port``. First, a token that still carries
+    an ``@`` the parsed authority does not -- a password containing ``?``
+    or ``#`` pushes the separator into the query string -- is replaced
+    wholesale: the stray ``@`` is the only evidence left that the
+    authority is a remnant. Second, a caller that truncates the text it
+    passes here must append ``_TEXT_TRUNCATION_MARK``, because a cut can
+    remove the ``@`` outright and leave no evidence at all inside the
+    token; a token carrying the mark was cut at an unknown offset and is
+    likewise replaced wholesale. What is still kept is an authority with
+    no such evidence against it: ``https://alice:12345`` standing alone in
+    an untruncated message is indistinguishable from a host named
+    ``alice`` on port 12345, and rejecting it would reject every legal
+    ``host:port``. ``ws://``/``wss://`` tokens are covered the same way as
+    ``http``/``https``, because a websocket transport cannot send headers,
+    so a websocket connector has nowhere but the URL to put its credential.
+    Sentence punctuation that trails the token (a closing paren, a period,
+    ...) is split off before parsing and re-appended to the result
+    afterwards, so redaction does not eat the punctuation that follows a
+    URL -- but only punctuation trailing the scheme/authority/path:
+    nothing at or after the first ``?``/``#`` is ever treated as trailing,
+    since that is where the query string / fragment begins and both are
+    dropped wholesale (see ``_split_url_token``). Text separated from the
+    URL only by a character that is legal inside a query string (a comma,
+    say) is still part of the token and is dropped with the query; see
+    the ``comma-inside-query`` test case.
+    """
+
+    def _redact(match: "re.Match[str]") -> str:
+        token = match.group(0)
+        clean, trailing = _split_url_token(token)
+        try:
+            if _TEXT_TRUNCATION_MARK in token:
+                # The text was cut inside this token, so its real extent is
+                # unknown: what is left of the authority can be the front half
+                # of a ``user:pass`` whose ``@`` was cut away, which is
+                # byte-for-byte a legal ``host:port``. Only the caller that
+                # cut the text knows that happened, which is what the mark
+                # carries.
+                raise ValueError("truncated URL token")
+            parts = urlsplit(clean)
+            # Fail closed unless the authority parses as ``host[:port]``.
+            # ``SplitResult.port`` is the standard library's own reading of
+            # that field and raises ``ValueError`` on anything that is not a
+            # port number, so the ``except`` below turns the whole URL into
+            # ``<url redacted>``. Reading it IS the check: deleting this line
+            # as an unused assignment removes the guard. It covers userinfo
+            # left where an authority belongs with no ``@`` in the token at
+            # all -- ``https://alice:PASSWORDabcd`` -- which the ``@`` check
+            # below cannot see.
+            _port = parts.port
+            authority = parts.netloc
+            if "@" in token and "@" not in authority:
+                # The token carries a userinfo separator that the parsed
+                # authority does not: ``urlsplit`` ends the authority at the
+                # first ``?``/``#``, so a password holding one of those pushes
+                # the ``@`` into the query string and leaves ``user:pass``
+                # sitting where ``host:port`` belongs -- and that remnant can
+                # itself be a legal authority (``https://alice:123``,
+                # ``https://SECRET_API_KEY``), which no parse can reject. The
+                # original ``@`` is the only evidence that it is a remnant, so
+                # the whole token goes.
+                raise ValueError("userinfo separator outside the authority")
+            # Keep the authority verbatim minus userinfo: re-assembling it
+            # from ``hostname``/``port`` would drop IPv6 brackets and lower
+            # the case.
+            netloc = authority.rsplit("@", 1)[-1]
+            return urlunsplit((parts.scheme, netloc, parts.path, "", "")) + trailing
+        except ValueError:
+            # UnicodeError is a ValueError subclass, so this also covers a
+            # token that fails to decode as IDNA.
+            return "<url redacted>" + trailing
+
+    return _URL_TOKEN_RE.sub(_redact, text)
+
+
+def _truncated_error_message(exc: BaseException) -> str:
+    """Return ``str(exc)`` made safe to log: URLs lose their query string,
+    userinfo and fragment (``redact_urls_in_text``), header- and
+    assignment-shaped secrets are masked (``redact_sensitive_text``), and
+    the result is bounded to ``_MCP_TOOL_ERROR_LOG_MAX_CHARS``. It is
+    otherwise just the exception's own message (e.g. a JSON-RPC error
+    string or an HTTP status line) -- it must never be additionally handed
+    tool_args, tool_meta, or connection headers, none of which are
+    exception messages to begin with. Some shapes are recognised by neither
+    helper -- a secret in a URL path segment (#2272), some of the shapes
+    listed in #2356, and a query value containing a raw ``<`` or ``>`` from
+    a non-HTTPX producer (HTTPX itself percent-encodes both) -- and for
+    those the cap is what bounds the exposure.
+    ``str(exc)`` is also bounded to ``_MCP_TOOL_ERROR_RAW_MAX_CHARS`` before
+    either redaction pass runs, since it is remote-controlled and unbounded
+    while both passes cost time proportional to their input. Cutting the
+    raw text can land between a URL's password and its ``@``, leaving a
+    remnant that is byte-for-byte a legal ``host:port``. The cut therefore
+    appends ``_TEXT_TRUNCATION_MARK`` so ``redact_urls_in_text`` can
+    replace that whole token instead of keeping its visible half; the mark
+    is removed again from the redacted text, so it never reaches a log
+    line.
+    """
+    try:
+        raw = str(exc)
+        if len(raw) > _MCP_TOOL_ERROR_RAW_MAX_CHARS:
+            raw = raw[:_MCP_TOOL_ERROR_RAW_MAX_CHARS] + _TEXT_TRUNCATION_MARK
+        text = redact_sensitive_text(redact_urls_in_text(raw)).replace(
+            _TEXT_TRUNCATION_MARK, ""
+        )
+    except BaseException:
+        # Every caller is an ``except`` handler whose contract is to return
+        # a result dict, so a custom ``__str__`` that raises must not escape
+        # here. ``BaseException`` is deliberate: nothing in the guarded block
+        # awaits, so no cancellation can originate in it, and a ``__str__``
+        # is free to raise a BaseException subclass.
+        return type(exc).__name__
+    if len(text) <= _MCP_TOOL_ERROR_LOG_MAX_CHARS:
+        return text
+    return text[: _MCP_TOOL_ERROR_LOG_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _strict_http_401_responses(
@@ -156,14 +954,24 @@ def _strict_http_401_responses(
 
 
 def _resolver_401_evidence(exc: BaseException) -> tuple[Any | None, frozenset[int]]:
-    # Lazy import keeps the core adapter independent from the web layer at import time.
-    from .....web.services.mcp_oauth import parse_www_authenticate_bearer
+    try:
+        # Lazy import keeps the core adapter independent from the web layer
+        # at import time -- and, since this runs inside MCPToolAdapter.
+        # run_json_async, which tool_runner.py reconstructs and calls for
+        # every sandboxed npx/uvx MCP tool call, from crashing with
+        # ModuleNotFoundError on a 401 (mcp_oauth.py needs sqlalchemy,
+        # which the sandbox never installs) instead of just skipping the
+        # refresh attempt the same way an unparsable challenge already
+        # does below.
+        from .....web.services.mcp_oauth import parse_www_authenticate_bearer
+    except ImportError:
+        parse_www_authenticate_bearer = None  # type: ignore[assignment]
 
     challenge = None
     response_ids: set[int] = set()
     for response in _strict_http_401_responses(exc):
         response_ids.add(id(response))
-        if challenge is not None:
+        if challenge is not None or parse_www_authenticate_bearer is None:
             continue
         candidate = parse_www_authenticate_bearer(
             response.headers.get_list("WWW-Authenticate")
@@ -304,24 +1112,79 @@ def _mcp_access_denied_result(user_id: Optional[str], tool_name: str) -> dict[st
 
 
 def _mcp_return_value_as_string(value: Any) -> str:
+    """Renders an MCP result dict for the ``AbstractBaseTool.return_value_as_string``
+    interface, used only by the tool wrappers (e.g. output-filter/sandboxed
+    wrappers). This is NOT the path the LLM's observation text is built from
+    for MCP tool calls in ReAct -- that is
+    ``ExecutionContext._format_tool_result`` (execution.py), which
+    stringifies the whole result dict returned by ``_execute_mcp_call``
+    directly. Keep this renderer lossless anyway, since any future caller
+    of ``return_value_as_string`` should see the same fields.
+    """
     try:
         if isinstance(value, dict):
+            texts = []
             content = value.get("content", [])
             if isinstance(content, list) and content:
-                texts = []
                 for item in content:
                     if isinstance(item, dict) and "text" in item:
                         texts.append(item["text"])
                     else:
                         texts.append(str(item))
-                return "\n".join(texts)
-            if content:
-                return str(content)
-            return "No content returned"
+            elif content:
+                texts.append(str(content))
+
+            structured_content = value.get("structured_content")
+            if structured_content is not None:
+                texts.append(
+                    "Structured result: " + json.dumps(structured_content, default=str)
+                )
+
+            if not texts:
+                texts.append("No content returned")
+
+            return "\n".join(texts)
         return str(value)
     except Exception as e:
         logger.warning(f"Failed to convert return value to string: {e}")
         return str(value)
+
+
+def _normalized_mcp_call_result(
+    value: Any, *, validate_wire: bool = False
+) -> dict[str, Any]:
+    """Validate a wire result and render the stable agent-facing shape."""
+
+    if validate_wire:
+        if (
+            not isinstance(value, Mapping)
+            or type(value.get("isError", False)) is not bool
+        ):
+            raise ChromeSessionContractError("Chrome daemon returned invalid result")
+        try:
+            result = CallToolResult.model_validate(value)
+        except ValidationError as exc:
+            raise ChromeSessionContractError(
+                "Chrome daemon returned invalid result"
+            ) from exc
+    else:
+        result = value
+    content = []
+    if result.content:
+        for content_item in result.content:
+            if hasattr(content_item, "model_dump"):
+                content.append(content_item.model_dump())
+            else:
+                content.append({"text": str(content_item)})
+    # MCP SDK 1.x and 2.x expose different Python attribute spellings, while
+    # the wire aliases remain stable. Keep aliases here and handle content
+    # separately so nested content metadata is not renamed unexpectedly.
+    other_fields = result.model_dump(by_alias=True, exclude={"content"})
+    return {
+        "content": content,
+        "structured_content": other_fields.get("structuredContent"),
+        "is_error": bool(other_fields.get("isError")),
+    }
 
 
 def _format_unavailable_mcp_tool_name(server_name: str, server_id: Any | None) -> str:
@@ -365,6 +1228,7 @@ class MCPToolAdapter(AbstractBaseTool):
         source_server: Optional[str] = None,
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
+        raw_annotations: Optional[Mapping[str, Any]] = None,
     ):
         """Initialize MCP tool adapter.
 
@@ -383,8 +1247,16 @@ class MCPToolAdapter(AbstractBaseTool):
                 after interruption.
             concurrent_tools: Optional allowlist of raw MCP tool names. Empty
                 means every tool from an opted-in server is safe.
+            raw_annotations: The tool's ``annotations`` object exactly as it
+                arrived on the wire, before the mcp SDK's non-strict models
+                coerced it. Required for an honest ``write_hint``: once
+                parsed, ``1`` and ``"true"`` are indistinguishable from a
+                real ``true``. Omitted means no wire evidence reached this
+                adapter, which classifies as ``UNDECLARED`` -- never as a
+                read-only promise.
         """
         self.mcp_tool = mcp_tool
+        self._raw_annotations = raw_annotations
         self.connection = connection
         self._name_prefix = name_prefix or ""
         self._visibility = visibility or ToolVisibility.PRIVATE
@@ -409,15 +1281,76 @@ class MCPToolAdapter(AbstractBaseTool):
     @property
     def name(self) -> str:
         """Get tool name with optional prefix, formatted for LLM requirements."""
-        raw_name = f"{self._name_prefix}{self.mcp_tool.name}"
-        # Replace spaces and dashes with underscores to match LLM tool naming constraints
-        # This matches the frontend/chat.py filtering logic
-        return raw_name.replace(" ", "_").replace("-", "_")
+
+        def _sanitize(value: str) -> str:
+            # Replace spaces and dashes with underscores to match LLM tool
+            # naming constraints, then catch anything else disallowed --
+            # some MCP servers namespace tool names with characters (e.g.
+            # the `.` in `coding.start`) that OpenAI-compatible APIs reject
+            # outright (`^[a-zA-Z0-9_-]+$` is the pattern OpenAI/DeepSeek
+            # enforce on `tools[].function.name`), and a name that fails it
+            # 400s the whole LLM call, not just this one tool.
+            return re.sub(
+                r"[^A-Za-z0-9_-]", "_", value.replace(" ", "_").replace("-", "_")
+            )
+
+        sanitized_prefix = _sanitize(self._name_prefix)
+        sanitized_tool = _sanitize(self.mcp_tool.name)
+        # Same failure mode as the character check above -- an over-long
+        # name is rejected by the same providers, just on length instead of
+        # charset. `MAX_AGENT_TOOL_NAME_LENGTH` is this repo's own record of
+        # that provider limit (tool_naming_limits.py), shared here rather
+        # than redeclared so the two adapters can't drift apart on the number.
+        #
+        # The tool name -- not the prefix -- is the only part that tells
+        # two tools on the *same* server apart, so truncating from the end
+        # (i.e. cutting the tool name) can make two distinct tools collide
+        # into one identical name once `prefix + tool_name` exceeds the
+        # limit. `_find_tool` has no duplicate-name detection, so a
+        # collision isn't a loud error like an illegal character is -- it's
+        # a silent wrong-tool dispatch. Squeeze the prefix instead and keep
+        # the tool name whole; `max(0, ...)` covers a tool name alone at or
+        # past the limit, where a negative slice would otherwise wrap
+        # around from the end instead of emptying.
+        budget_for_prefix = max(0, MAX_AGENT_TOOL_NAME_LENGTH - len(sanitized_tool))
+        combined = f"{sanitized_prefix[:budget_for_prefix]}{sanitized_tool}"
+        return combined[:MAX_AGENT_TOOL_NAME_LENGTH]
 
     @property
     def description(self) -> str:
         """Get tool description from MCP tool."""
         return self.mcp_tool.description or f"Execute MCP tool: {self.mcp_tool.name}"
+
+    @property
+    def write_hint(self) -> "MCPWriteHint":
+        """What the server's own annotations claim about this tool's writes.
+
+        Classified from the raw wire annotations captured at load time, not
+        from the parsed ``ToolAnnotations`` object -- see
+        ``classify_write_hint`` for why the distinction is the point rather
+        than a detail. An adapter built without that evidence reports
+        ``UNDECLARED``, which a consumer must treat as a write.
+
+        Not a trust boundary. The spec says annotations are hints and a
+        client "should never make tool use decisions based on
+        ToolAnnotations received from untrusted servers". A server that lies
+        in the permissive direction is upstream of anything this can check;
+        what is guaranteed here is only that malformed or self-contradictory
+        input never reads as the permissive answer.
+        """
+        return classify_write_hint(self._raw_annotations)
+
+    @property
+    def non_idempotent_write(self) -> bool:
+        """Whether the server's annotations declare a non-idempotent write.
+
+        Consumed (via ``ToolMetadata.mcp_non_idempotent_write``) by the
+        same-turn duplicate-write guard. Same wire-evidence discipline and
+        trust caveats as ``write_hint``; see
+        ``classify_non_idempotent_write`` for the enrollment predicate and
+        why it fails open.
+        """
+        return classify_non_idempotent_write(self._raw_annotations)
 
     @property
     def tags(self) -> List[str]:
@@ -446,7 +1379,31 @@ class MCPToolAdapter(AbstractBaseTool):
         return True
 
     def _build_args_model(self) -> Type[BaseModel]:
-        """Build Pydantic model from MCP tool input schema."""
+        """Build Pydantic model from MCP tool input schema.
+
+        Field-level metadata the connector author wrote (description, enum,
+        pattern, format and the length/range bounds) is carried through to the
+        emitted schema as presentation only: it goes in as
+        ``json_schema_extra``, which never becomes a Pydantic validator, so
+        argument validation behaves exactly as it would without it.
+
+        Only the tool's own top-level fields are read. A nested ``object`` or
+        an ``array`` item schema is already flattened to a bare Python type
+        here, so metadata a connector wrote on a nested sub-field or on an
+        array's items is not extracted and does not reach the model.
+
+        The metadata is attached to the field's annotation rather than placed
+        beside the field. For an optional field Pydantic emits an ``anyOf``
+        wrapper, and a consumer that resolves that wrapper down to its
+        non-null branch keeps only what that branch holds; metadata placed
+        beside the wrapper would be dropped there, which is exactly the shape
+        the fix is for.
+
+        A field's default is the one exception, and it is not presentation: a
+        non-finite default is replaced by ``None``, so such a field is omitted
+        from the arguments sent to the server instead of carrying a value no
+        provider client can serialize.
+        """
         try:
             if not self.mcp_tool.inputSchema:
                 # No input parameters
@@ -472,19 +1429,53 @@ class MCPToolAdapter(AbstractBaseTool):
             # Build field definitions for create_model
             fields: Dict[str, Any] = {}
             runtime_bound_args = self._runtime_bound_tool_argument_names(properties)
+            tool_metadata = _tool_field_metadata(
+                properties, required, runtime_bound_args
+            )
+            metadata = tool_metadata.fields
 
             for field_name, field_schema in properties.items():
                 if field_name in runtime_bound_args:
                     continue
-                field_type = self._json_schema_to_python_type(field_schema)
+                # Both loops walk `properties` skipping the same names, so
+                # every field reaching here has a record.
+                field_metadata = metadata[field_name]
+                annotation: Any = self._json_schema_to_python_type(field_schema)
+
+                if field_metadata.description is not None or field_metadata.extra:
+                    # Carried on the annotation so it lands inside the
+                    # non-null branch of the `anyOf` an optional field gets.
+                    # A field with nothing to say is left alone, so its
+                    # emitted schema is unchanged.
+                    annotation = Annotated[
+                        annotation,
+                        Field(
+                            description=field_metadata.description,
+                            json_schema_extra=field_metadata.extra or None,
+                        ),
+                    ]
 
                 # Check if field is required
                 if field_name in required:
-                    fields[field_name] = (field_type, ...)
+                    fields[field_name] = (annotation, ...)
                 else:
                     # Optional field with default
-                    default_value = field_schema.get("default", None)
-                    fields[field_name] = (Optional[field_type], default_value)
+                    fields[field_name] = (
+                        Optional[annotation],
+                        field_metadata.emitted_default,
+                    )
+
+            if tool_metadata.rejected_keys or tool_metadata.unreadable_fields:
+                # One line per tool, whatever the connector declared. A
+                # malformed schema can drop keys on many fields at once, and
+                # a line per key would turn one bad connector into a flood.
+                logger.debug(
+                    "MCP tool %s dropped %d field schema metadata keys "
+                    "and %d unreadable field schemas",
+                    self.mcp_tool.name,
+                    tool_metadata.rejected_keys,
+                    tool_metadata.unreadable_fields,
+                )
 
             # Create the model
             model_name = f"{self.mcp_tool.name.title().replace('_', '')}Args"
@@ -504,6 +1495,13 @@ class MCPToolAdapter(AbstractBaseTool):
         class MCPToolResult(BaseModel):
             content: List[Dict[str, Any]] = Field(
                 default_factory=list, description="Tool execution result content"
+            )
+            structured_content: Any = Field(
+                default=None,
+                description=(
+                    "Structured JSON result of the tool call, if the server "
+                    "returned one."
+                ),
             )
             is_error: bool = Field(
                 default=False,
@@ -587,6 +1585,13 @@ class MCPToolAdapter(AbstractBaseTool):
             return all(item == "null" for item in schema_type)
         return False
 
+    # Caps the string this method will attempt to recover as a double-encoded
+    # array/scalar (see below). A real LLM double-encoding mistake is small —
+    # '["date"]', not a multi-KB blob — so anything past this length is out of
+    # scope for the recovery and just takes the raw-wrap fallback instead of
+    # being handed to json.loads at all.
+    _ARRAY_ARG_JSON_RECOVERY_MAX_CHARS = 4096
+
     def _normalize_args_by_schema(self, args: Mapping[str, Any]) -> Dict[str, Any]:
         """Normalize common LLM argument shape mistakes using the MCP input schema."""
         normalized_args = dict(args)
@@ -605,6 +1610,31 @@ class MCPToolAdapter(AbstractBaseTool):
             if value is None:
                 continue
             if self._schema_is_array_only(field_schema) and not isinstance(value, list):
+                if (
+                    isinstance(value, str)
+                    and len(value) <= self._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS
+                ):
+                    # Tool-calling models sometimes double-encode an
+                    # array-only argument as a JSON string instead of a real
+                    # array — e.g. '["date"]', or even a lone item as
+                    # '"date"'. Recover the intended value before falling
+                    # back to the raw wrap below, which would otherwise
+                    # leak the string's own brackets/quotes into a garbled
+                    # single item. Both ValueError (json.JSONDecodeError,
+                    # and CPython's int-string-conversion digit-limit guard
+                    # for a long run of digits) and RecursionError (a
+                    # pathologically deep bracket string) mean the same
+                    # thing here: not recoverable, fall back below.
+                    try:
+                        parsed_value = json.loads(value)
+                    except (ValueError, RecursionError):
+                        parsed_value = None
+                    if isinstance(parsed_value, list):
+                        normalized_args[field_name] = parsed_value
+                        continue
+                    if isinstance(parsed_value, str):
+                        normalized_args[field_name] = [parsed_value]
+                        continue
                 normalized_args[field_name] = [value]
 
         return normalized_args
@@ -710,12 +1740,34 @@ class MCPToolAdapter(AbstractBaseTool):
                         return retry_result
                     raise
 
+        # The tool-loading handlers (_load_direct_mcp_tools,
+        # load_mcp_tools_as_agent_tools) log only the class name above DEBUG
+        # and keep the raw traceback (exc_info) for DEBUG, because a traceback
+        # is unredacted and unbounded. These two handlers log at ERROR, but
+        # only _truncated_error_message() output -- passed through
+        # redact_urls_in_text and redact_sensitive_text and capped per line --
+        # and never a traceback, so do not add exc_info here. Shapes neither
+        # helper recognises: #2272 and some of those listed in #2356.
         except BaseExceptionGroup as e:
             logger.error(
-                "MCP tool %s execution failed with exception group %s",
+                "MCP tool %s execution failed with exception group %s: %s",
                 self.mcp_tool.name,
                 type(e).__name__,
+                _truncated_error_message(e),
             )
+            leaf_count = 0
+            for node in _level_order_exception_nodes(e):
+                if node is e or isinstance(node, BaseExceptionGroup):
+                    continue
+                if leaf_count >= _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS:
+                    break
+                leaf_count += 1
+                logger.error(
+                    "MCP tool %s execution failed with related exception %s: %s",
+                    self.mcp_tool.name,
+                    type(node).__name__,
+                    _truncated_error_message(node),
+                )
             return {
                 "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
@@ -723,9 +1775,10 @@ class MCPToolAdapter(AbstractBaseTool):
 
         except Exception as e:
             logger.error(
-                "MCP tool %s execution failed with %s",
+                "MCP tool %s execution failed with %s: %s",
                 self.mcp_tool.name,
                 type(e).__name__,
+                _truncated_error_message(e),
             )
             return {
                 "content": [{"text": "Error executing MCP tool."}],
@@ -746,18 +1799,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            content = []
-            if result.content:
-                for content_item in result.content:
-                    if hasattr(content_item, "model_dump"):
-                        content.append(content_item.model_dump())
-                    else:
-                        content.append({"text": str(content_item)})
-
-            return {
-                "content": content,
-                "is_error": result.isError if hasattr(result, "isError") else False,
-            }
+            return _normalized_mcp_call_result(result)
 
     async def _retry_after_authorization_failure(
         self,
@@ -782,9 +1824,17 @@ class MCPToolAdapter(AbstractBaseTool):
             "Retrying MCP tool %s after delegated authorization failure",
             self.mcp_tool.name,
         )
-        refreshed = refresh()
-        if inspect.isawaitable(refreshed):
-            refreshed = await refreshed
+        try:
+            refreshed = refresh()
+            if inspect.isawaitable(refreshed):
+                refreshed = await refreshed
+        except (BaseExceptionGroup, Exception) as refresh_exc:
+            logger.error(
+                "MCP tool %s delegated authorization refresh failed with %s",
+                self.mcp_tool.name,
+                type(refresh_exc).__name__,
+            )
+            return _delegated_authorization_failed_result()
         if not isinstance(refreshed, dict):
             return _delegated_authorization_failed_result()
         try:
@@ -900,7 +1950,16 @@ class MCPToolAdapter(AbstractBaseTool):
             if target.get("target_type") != TARGET_TOOL_ARGUMENTS:
                 continue
             target_key = target.get("key")
-            if not isinstance(target_key, str) or target_key not in properties:
+            if not isinstance(target_key, str):
+                continue
+            if target_key not in properties:
+                logger.warning(
+                    "Skipping runtime MCP tool argument binding for %s on "
+                    "tool %s: the tool's input schema does not declare "
+                    "this argument",
+                    target_key,
+                    self.mcp_tool.name,
+                )
                 continue
             value = binding_source_value(
                 binding,
@@ -959,6 +2018,53 @@ class MCPToolAdapter(AbstractBaseTool):
         return _mcp_return_value_as_string(value)
 
 
+class ChromeExecutionMCPToolAdapter(MCPToolAdapter):
+    """MCP adapter whose calls share one sandbox-owned Chrome daemon."""
+
+    def __init__(
+        self,
+        *args: Any,
+        chrome_pool: ChromeExecutionSessionPool,
+        chrome_scope: ChromeExecutionScope,
+        chrome_launch: ChromeDaemonLaunchSpec,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._chrome_pool = chrome_pool
+        self._chrome_scope = chrome_scope
+        self._chrome_launch = chrome_launch
+
+    async def _execute_mcp_call(
+        self,
+        connection: Connection,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if connection is not self.connection or tool_meta:
+            raise ChromeSessionContractError(
+                "Chrome execution connection changed after identity binding"
+            )
+        result = await self._chrome_pool.invoke_tool(
+            self._chrome_scope,
+            self._chrome_launch,
+            self.mcp_tool.name,
+            tool_args,
+        )
+        try:
+            return _normalized_mcp_call_result(result, validate_wire=True)
+        except ChromeSessionContractError:
+            await self._chrome_pool.close_shielded(self._chrome_scope)
+            raise
+
+    async def teardown(self, task_id: Optional[str] = None) -> None:
+        try:
+            await self._chrome_pool.close_shielded(self._chrome_scope)
+        except asyncio.CancelledError:
+            # The pool-owned cleanup task remains alive. Do not abort Runner's
+            # reverse teardown pass before the remaining tools are visited.
+            return
+
+
 class _UnavailableMCPToolResult(BaseModel):
     success: bool = Field(default=False, description="Whether execution succeeded")
     status: str = Field(default="error", description="Tool execution status")
@@ -981,7 +2087,18 @@ class _UnavailableMCPToolResult(BaseModel):
 
 
 class UnavailableMCPTool(AbstractBaseTool):
-    """Server-level MCP tool returned when a selected server is unavailable."""
+    """Server-level MCP tool returned when a selected server is unavailable.
+
+    The tool exists to explain an outage, so it always reports that outage to
+    whoever invokes it: it carries no allow-list and performs no caller check.
+    Its result holds only a constant message plus a ``reason`` and a
+    ``failure_code``. ``failure_code`` is normalized against the public failure
+    allowlist here and dropped when it is not on it; ``reason`` is stored as
+    given, so an allowlisted value is a guarantee callers make, enforced where
+    the unavailable config is built. The server name it is built from is
+    already exposed in the tool listing, so there is nothing here to withhold
+    from a caller.
+    """
 
     read_only = True
     concurrency_safe = True
@@ -991,7 +2108,6 @@ class UnavailableMCPTool(AbstractBaseTool):
         *,
         server_name: str,
         server_id: Any | None,
-        allow_users: Optional[List[str]] = None,
         failure_code: str | None = None,
         reason: str | None = None,
         message: str = _DEFAULT_UNAVAILABLE_MCP_MESSAGE,
@@ -1002,7 +2118,6 @@ class UnavailableMCPTool(AbstractBaseTool):
 
         self._server_name = server_name
         self._server_id = server_id
-        self._allow_users = allow_users
         self._failure_code = normalize_tool_failure_code(failure_code)
         self._reason = reason
         self._message = message
@@ -1042,9 +2157,6 @@ class UnavailableMCPTool(AbstractBaseTool):
         return None
 
     def _run_unavailable(self) -> Dict[str, Any]:
-        current_user_id = _get_current_mcp_user_id()
-        if not _is_mcp_user_allowed(current_user_id, self._allow_users):
-            return _mcp_access_denied_result(current_user_id, self.name)
         content_message = self._message
         if self._message == _DEFAULT_UNAVAILABLE_MCP_MESSAGE:
             content_message = (
@@ -1109,6 +2221,100 @@ def _build_mcp_tool_adapter(
         source_server=normalize_mcp_server_name(server_name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,
+        # Read off the tool the loader produced -- both the direct and the
+        # sandboxed loader attach it, so one builder serves both paths and
+        # neither can quietly lose the evidence the other keeps.
+        raw_annotations=raw_annotations_for(mcp_tool),
+    )
+
+
+def _build_execution_scoped_chrome_tool_adapter(
+    server_name: str,
+    connection: Connection,
+    mcp_tool: MCPTool,
+    *,
+    pool: ChromeExecutionSessionPool,
+    scope: ChromeExecutionScope,
+    launch: ChromeDaemonLaunchSpec,
+    name_prefix: str,
+    visibility: Optional[ToolVisibility],
+    allow_users: Optional[List[str]],
+    concurrency_safe: bool,
+    concurrent_tools: list[str],
+) -> ChromeExecutionMCPToolAdapter:
+    tool_prefix = f"{name_prefix}{server_name}_" if name_prefix else f"{server_name}_"
+    from .selection_spec import normalize_mcp_server_name
+
+    return ChromeExecutionMCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection=connection,
+        name_prefix=tool_prefix,
+        visibility=visibility,
+        allow_users=allow_users,
+        source_server=normalize_mcp_server_name(server_name),
+        concurrency_safe=concurrency_safe,
+        concurrent_tools=concurrent_tools,
+        raw_annotations=raw_annotations_for(mcp_tool),
+        chrome_pool=pool,
+        chrome_scope=scope,
+        chrome_launch=launch,
+    )
+
+
+async def load_execution_scoped_chrome_tools(
+    server_name: str,
+    connection: Connection,
+    *,
+    scope: ChromeExecutionScope,
+    name_prefix: str = "mcp_",
+    visibility: Optional[ToolVisibility] = None,
+    allow_users: Optional[List[str]] = None,
+) -> SandboxedMCPLoadResult:
+    # Lazy web import preserves the existing core-only MCP adapter import path.
+    from .....web.services.chrome_mcp_runtime import (
+        get_chrome_execution_session_pool,
+    )
+
+    launch = ChromeDaemonLaunchSpec.from_connection(connection)
+    pool = get_chrome_execution_session_pool()
+    session = await pool.get_or_create(scope, launch)
+    try:
+        mcp_tools = await list_tools_in_sandbox(
+            session.sandbox,
+            chrome_metadata_connection(connection),
+        )
+    except BaseException:
+        await pool.close_shielded(scope)
+        raise
+
+    concurrency_safe, concurrent_tools = _connection_concurrency_config(connection)
+    tools: list[AbstractBaseTool] = []
+    adapter_errors: list[str] = []
+    for mcp_tool in mcp_tools:
+        try:
+            tools.append(
+                _build_execution_scoped_chrome_tool_adapter(
+                    server_name,
+                    connection,
+                    mcp_tool,
+                    pool=pool,
+                    scope=scope,
+                    launch=launch,
+                    name_prefix=name_prefix,
+                    visibility=visibility,
+                    allow_users=allow_users,
+                    concurrency_safe=concurrency_safe,
+                    concurrent_tools=concurrent_tools,
+                )
+            )
+        except Exception as exc:
+            adapter_errors.append(type(exc).__name__)
+    if not tools:
+        await pool.close_shielded(scope)
+    return SandboxedMCPLoadResult(
+        tools=tuple(tools),
+        adapter_error_types=tuple(adapter_errors),
+        wrap_error_types=(),
     )
 
 
@@ -1153,6 +2359,20 @@ async def _load_direct_mcp_tools(
                     error_type,
                 )
                 await asyncio.sleep(1)
+            else:
+                # DEBUG, not WARNING: same secret-leak concern as the
+                # sandboxed-load handler below -- a session-start/initialize
+                # /list-tools failure can carry secrets from the connection
+                # (e.g. an oauth-authenticated request's URL or headers
+                # surfacing in the exception message). Opt-in: set
+                # XAGENT_LOG_LEVEL=DEBUG (or run with --debug) to capture it
+                # when reproducing a failure.
+                logger.debug(
+                    "Exhausted retries loading tools from MCP server %s during %s",
+                    server_name,
+                    current_phase.value,
+                    exc_info=True,
+                )
     else:
         return MCPLoadResult(
             tools=(),
@@ -1446,6 +2666,19 @@ async def load_mcp_tools_as_agent_tools(
                         server_name,
                         error_type,
                     )
+                    # DEBUG, not ERROR: the sandboxed process's raw error
+                    # (e.g. its stderr) can carry secrets that flowed into
+                    # the MCP connection, so the always-on ERROR log above
+                    # deliberately keeps only the exception's class name
+                    # (see test_sandbox_list_failure_is_preserved_without_secret).
+                    # This traceback is opt-in -- set XAGENT_LOG_LEVEL=DEBUG
+                    # (or run with --debug) to capture it when reproducing a
+                    # failure.
+                    logger.debug(
+                        "Sandboxed MCP tool listing failure detail for server %s",
+                        server_name,
+                        exc_info=True,
+                    )
                     failures.append(
                         MCPServerLoadFailure(
                             server_name=server_name,
@@ -1515,6 +2748,19 @@ async def load_mcp_tools_as_agent_tools(
                 "Unexpected failure loading tools from MCP server %s (%s)",
                 server_name,
                 error_type,
+            )
+            # DEBUG, not ERROR, for the same secret-leak reason as the
+            # handlers above. This outer handler mostly catches
+            # _load_server_tools_bounded's wall-clock TimeoutError (a
+            # fixed-format message with no secret) or a genuine bug escaping
+            # the loop -- per-server session/initialize/list-tools failures
+            # for direct transports are handled, and logged, inside
+            # _load_direct_mcp_tools's retry loop instead. Opt-in: set
+            # XAGENT_LOG_LEVEL=DEBUG (or run with --debug) to capture it.
+            logger.debug(
+                "MCP server load failure detail for server %s",
+                server_name,
+                exc_info=True,
             )
             failures.append(
                 MCPServerLoadFailure(

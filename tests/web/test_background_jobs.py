@@ -29,6 +29,7 @@ from xagent.web.services.background_jobs import (
     enqueue_background_job,
     is_background_job_enqueue_available,
     requeue_stale_background_jobs,
+    update_job_progress,
 )
 from xagent.web.services.triggers import enqueue_trigger_event_job
 
@@ -36,6 +37,25 @@ from xagent.web.services.triggers import enqueue_trigger_event_job
 def _init_test_db(path: Path):
     init_db(f"sqlite:///{path}")
     return get_session_local()
+
+
+def _age_job(db, job, *, updated_at=None, started_at=None) -> None:
+    """Backdate a job row. A plain ORM write cannot: ``updated_at`` carries
+    ``onupdate=func.now()``, which any flush would overwrite."""
+    values = {}
+    if updated_at is not None:
+        values["updated_at"] = updated_at
+    if started_at is not None:
+        values["started_at"] = started_at
+    if not values:
+        # An empty SET still carries onupdate=func.now(), so this would push
+        # updated_at forward -- the opposite of backdating.
+        raise ValueError("_age_job needs updated_at or started_at")
+    db.query(BackgroundJob).filter(BackgroundJob.id == job.id).update(
+        values, synchronize_session=False
+    )
+    db.commit()
+    db.expire_all()
 
 
 def _create_user(db, username: str = "background-job-test") -> User:
@@ -314,9 +334,10 @@ def test_kb_document_job_reads_staged_file_and_publishes_canonical(
 
     from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
 
+    published_config: list[dict] = []
     monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks._save_job_collection_config_with_snapshot",
-        lambda *args, **kwargs: None,
+        "xagent.web.jobs.kb_tasks._save_job_collection_config_after_ingest",
+        lambda *args, **kwargs: published_config.append(kwargs),
     )
 
     SessionLocal = _init_test_db(tmp_path / "kb-staged-ingest.db")
@@ -355,6 +376,7 @@ def test_kb_document_job_reads_staged_file_and_publishes_canonical(
             return IngestionResult(
                 status="success",
                 doc_id="doc-1",
+                chunk_count=1,
                 message="ok",
                 completed_steps=[
                     {"name": "register_document", "metadata": {"created": True}}
@@ -380,6 +402,7 @@ def test_kb_document_job_reads_staged_file_and_publishes_canonical(
         )
         assert file_record is not None
         assert str(file_record.file_id) == file_id
+        assert [call["documents_created"] for call in published_config] == [1]
     finally:
         db.close()
 
@@ -426,7 +449,7 @@ def test_kb_document_job_full_worker_path_new_target_end_to_end(tmp_path, monkey
     initialize_storage_manager(str(storage_root), str(uploads_dir))
 
     monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks._save_job_collection_config_with_snapshot",
+        "xagent.web.jobs.kb_tasks._save_job_collection_config_after_ingest",
         lambda *args, **kwargs: None,
     )
     stub_config = EmbeddingModelConfig(
@@ -513,7 +536,7 @@ def test_kb_document_job_supersedes_older_generation_for_same_target(
     from xagent.web.services.kb_ingest_targets import admit_kb_ingest_target
 
     monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks._save_job_collection_config_with_snapshot",
+        "xagent.web.jobs.kb_tasks._save_job_collection_config_after_ingest",
         lambda *args, **kwargs: None,
     )
 
@@ -590,6 +613,7 @@ def test_kb_document_job_supersedes_older_generation_for_same_target(
             return IngestionResult(
                 status="success",
                 doc_id="doc-1",
+                chunk_count=1,
                 message="ok",
                 completed_steps=[
                     {"name": "register_document", "metadata": {"created": True}}
@@ -733,13 +757,13 @@ def test_kb_document_job_skips_canonical_rollback_when_generation_turns_stale(
         assert result["status"] == "superseded"
         assert result["published"] is False
         assert not staged_file.exists()
-        assert metadata_store.save_collection_config.await_count == 1
+        metadata_store.save_collection_config.assert_not_awaited()
         metadata_store.delete_collection_metadata.assert_not_awaited()
     finally:
         db.close()
 
 
-def test_kb_document_job_existing_collection_failure_restores_previous_config(
+def test_kb_document_job_existing_collection_failure_keeps_previous_config(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv(CELERY_ENABLED, "false")
@@ -806,19 +830,13 @@ def test_kb_document_job_existing_collection_failure_restores_previous_config(
         with pytest.raises(BackgroundJobHandlerError):
             handle_kb_ingest_document(db, job)
 
-        assert metadata_store.save_collection_config.await_count == 2
-        restore_call = metadata_store.save_collection_config.await_args_list[-1]
-        assert restore_call.kwargs == {
-            "collection": "existing-kb",
-            "config_json": '{"chunk_size":111}',
-            "user_id": int(user.id),
-        }
+        metadata_store.save_collection_config.assert_not_awaited()
         metadata_store.delete_collection_metadata.assert_not_awaited()
     finally:
         db.close()
 
 
-def test_kb_document_job_exception_restores_previous_config_before_retry(
+def test_kb_document_job_exception_keeps_previous_config_before_retry(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv(CELERY_ENABLED, "false")
@@ -879,13 +897,7 @@ def test_kb_document_job_exception_restores_previous_config_before_retry(
             handle_kb_ingest_document(db, job)
 
         assert staged_file.exists()
-        assert metadata_store.save_collection_config.await_count == 2
-        restore_call = metadata_store.save_collection_config.await_args_list[-1]
-        assert restore_call.kwargs == {
-            "collection": "existing-kb",
-            "config_json": '{"chunk_size":111}',
-            "user_id": int(user.id),
-        }
+        metadata_store.save_collection_config.assert_not_awaited()
         metadata_store.delete_collection_metadata.assert_not_awaited()
     finally:
         db.close()
@@ -967,7 +979,7 @@ def test_kb_web_job_cleans_new_collection_metadata_on_ingest_error(
     from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
 
     monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks._save_job_collection_config_with_snapshot",
+        "xagent.web.jobs.kb_tasks._save_job_collection_config_after_ingest",
         lambda *args, **kwargs: None,
     )
 
@@ -1040,7 +1052,7 @@ def test_kb_web_job_keeps_new_collection_metadata_when_error_has_successful_docs
     from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
 
     monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks._save_job_collection_config_with_snapshot",
+        "xagent.web.jobs.kb_tasks._save_job_collection_config_after_ingest",
         lambda *args, **kwargs: None,
     )
 
@@ -1113,7 +1125,7 @@ def test_kb_web_job_keeps_new_collection_metadata_when_side_effects_may_remain(
     from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
 
     monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks._save_job_collection_config_with_snapshot",
+        "xagent.web.jobs.kb_tasks._save_job_collection_config_after_ingest",
         lambda *args, **kwargs: None,
     )
 
@@ -1177,7 +1189,7 @@ def test_kb_web_job_keeps_new_collection_metadata_when_side_effects_may_remain(
         db.close()
 
 
-def test_kb_web_job_existing_collection_failure_restores_previous_config(
+def test_kb_web_job_existing_collection_failure_keeps_previous_config(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv(CELERY_ENABLED, "false")
@@ -1243,21 +1255,13 @@ def test_kb_web_job_existing_collection_failure_restores_previous_config(
         with pytest.raises(BackgroundJobHandlerError):
             handle_kb_ingest_web(db, job)
 
-        assert metadata_store.save_collection_config.await_count == 2
-        restore_call = metadata_store.save_collection_config.await_args_list[-1]
-        assert restore_call.kwargs == {
-            "collection": "existing-web-kb",
-            "config_json": '{"chunk_size":111}',
-            "user_id": int(user.id),
-        }
+        metadata_store.save_collection_config.assert_not_awaited()
         metadata_store.delete_collection_metadata.assert_not_awaited()
     finally:
         db.close()
 
 
-def test_kb_web_job_existing_collection_partial_restores_previous_config(
-    tmp_path, monkeypatch
-):
+def test_kb_web_job_partial_publishes_new_config(tmp_path, monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
 
@@ -1320,14 +1324,84 @@ def test_kb_web_job_existing_collection_partial_restores_previous_config(
         result = handle_kb_ingest_web(db, job)
 
         assert result["status"] == "partial"
-        assert metadata_store.save_collection_config.await_count == 2
-        restore_call = metadata_store.save_collection_config.await_args_list[-1]
-        assert restore_call.kwargs == {
-            "collection": "existing-web-kb",
-            "config_json": '{"chunk_size":111}',
-            "user_id": int(user.id),
-        }
+        saved = metadata_store.save_collection_config.await_args_list
+        assert len(saved) == 1
+        assert saved[0].kwargs["collection"] == "existing-web-kb"
+        assert '"chunk_size":2048' in saved[0].kwargs["config_json"]
         metadata_store.delete_collection_metadata.assert_not_awaited()
+    finally:
+        db.close()
+
+
+def test_kb_web_job_zero_pages_without_failures_fails(tmp_path, monkeypatch):
+    """A crawl that ingested nothing publishes no KB, so the job must not succeed."""
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+
+    SessionLocal = _init_test_db(tmp_path / "web-ingest-zero-pages.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="web-ingest-zero-pages-test")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": "robots-blocked-kb",
+                "crawl_config": WebCrawlConfig(
+                    start_url="https://example.com"
+                ).model_dump(mode="json"),
+                "ingestion_config": IngestionConfig(chunk_size=2048).model_dump(
+                    mode="json"
+                ),
+                "user_id": int(user.id),
+                "is_admin": False,
+                "collection_existed_before": False,
+            },
+        )
+
+        metadata_store = MagicMock()
+        metadata_store.get_collection_config = AsyncMock(return_value=None)
+        metadata_store.save_collection_config = AsyncMock()
+        metadata_store.delete_collection_metadata = AsyncMock()
+
+        async def fake_run_web_ingestion(**kwargs):
+            return WebIngestionResult(
+                status="success",
+                collection="robots-blocked-kb",
+                total_urls_found=0,
+                pages_crawled=0,
+                pages_failed=0,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[],
+                failed_urls={},
+                message="crawl completed",
+                warnings=[],
+                elapsed_time_ms=1,
+            )
+
+        monkeypatch.setattr(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            lambda: metadata_store,
+        )
+        monkeypatch.setattr(
+            "xagent.web.jobs.kb_tasks.run_web_ingestion",
+            fake_run_web_ingestion,
+        )
+
+        with pytest.raises(
+            BackgroundJobHandlerError, match="No pages were ingested"
+        ) as excinfo:
+            handle_kb_ingest_web(db, job)
+
+        # Retrying re-crawls the whole site to reach the same empty result.
+        assert excinfo.value.retryable is False
+        metadata_store.save_collection_config.assert_not_awaited()
     finally:
         db.close()
 
@@ -1416,9 +1490,9 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         )
         old = datetime.now(timezone.utc) - timedelta(hours=3)
         setattr(job, "status", BackgroundJobStatus.RUNNING.value)
-        setattr(job, "started_at", old)
         db.add(job)
         db.commit()
+        _age_job(db, job, updated_at=old, started_at=old)
         db.refresh(job)
 
         requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
@@ -1429,6 +1503,83 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         assert job.celery_task_id is None
         assert job.started_at is None
         assert job.progress["message"] == "Requeued stale background job"
+    finally:
+        db.close()
+
+
+def test_requeue_spares_running_job_that_is_still_reporting_progress(
+    tmp_path, monkeypatch
+):
+    """A long job that keeps working must not be requeued.
+
+    ``started_at`` never advances, so judging a RUNNING job by it means any job
+    outliving the cutoff gets a second copy started alongside it.
+    """
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-live.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="live-test")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        db.add(job)
+        db.commit()
+        old = datetime.now(timezone.utc) - timedelta(hours=4)
+        _age_job(db, job, updated_at=old, started_at=old)
+        db.refresh(job)
+        stale_updated_at = job.updated_at
+
+        # Go through the real reporting path, not a hand-set timestamp: that
+        # progress advances updated_at is the premise the whole predicate rests
+        # on, so the test has to fail if it ever stops holding.
+        update_job_progress(db, job, message="Still working", completed=536, total=699)
+        db.refresh(job)
+        assert job.updated_at > stale_updated_at
+
+        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert requeued == []
+        db.refresh(job)
+        assert job.status == BackgroundJobStatus.RUNNING.value
+        assert job.started_at is not None
+    finally:
+        db.close()
+
+
+def test_requeue_reclaims_running_job_that_stopped_reporting(tmp_path, monkeypatch):
+    """A RUNNING job whose heartbeat went stale is still reclaimed."""
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-dead.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="dead-test")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        db.add(job)
+        db.commit()
+        # Started recently, but has not touched the row since.
+        _age_job(db, job, updated_at=datetime.now(timezone.utc) - timedelta(hours=3))
+        db.refresh(job)
+
+        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert [item.id for item in requeued] == [job.id]
+        db.refresh(job)
+        assert job.status == BackgroundJobStatus.PENDING.value
     finally:
         db.close()
 
@@ -1715,3 +1866,193 @@ def test_registered_handler_retryable_error_flows_through_execute_background_job
         assert "transient downstream failure" in str(refreshed.error_message)
     finally:
         verify_db.close()
+
+
+class _ExplodingEmbeddingAdapter(_StubEmbeddingAdapter):
+    """Fails where the real pipeline embeds, after the collection row exists."""
+
+    def encode(self, text, dimension=None, instruct=None):
+        raise RuntimeError("embedding backend down")
+
+
+def test_kb_document_job_failed_new_collection_publishes_nothing_end_to_end(
+    tmp_path, monkeypatch
+):
+    """A failed new collection ends up with no config row and a reusable name.
+
+    The end state is what is pinned here, not which cleanup produced it: the
+    rollback of a run that fails this early removes the collection outright.
+    ``test_kb_document_job_publishes_the_config_end_to_end`` is the one that runs
+    the real ``_save_job_collection_config_after_ingest``.
+    """
+    import asyncio
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    monkeypatch.setenv("LANCEDB_DIR", str((tmp_path / "lancedb").resolve()))
+
+    from xagent.core.model.model import EmbeddingModelConfig
+    from xagent.core.storage.manager import initialize_storage_manager
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+    from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+
+    storage_root = tmp_path / "storage"
+    uploads_dir = storage_root / "uploads"
+    uploads_dir.mkdir(parents=True)
+    initialize_storage_manager(str(storage_root), str(uploads_dir))
+
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="stub",
+        model_provider="stub",
+        dimension=2,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, _ExplodingEmbeddingAdapter()),
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.resolve_embedding_adapter",
+        lambda *args, **kwargs: (stub_config, _StubEmbeddingAdapter()),
+    )
+
+    SessionLocal = _init_test_db(tmp_path / "kb-failed-publish.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-failed-publish-test")
+        staged_file = tmp_path / "stage" / "doc.txt"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("staged content", encoding="utf-8")
+        ingestion_config = IngestionConfig(embedding_model_id="embedding-default")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "failed_kb",
+                "source_path": str(staged_file),
+                "target_path": str(target_file),
+                "file_id": "66666666-6666-4666-8666-666666666666",
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": staged_file.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": ingestion_config.model_dump(mode="json"),
+                "collection_existed_before": False,
+            },
+        )
+
+        with pytest.raises(BackgroundJobHandlerError):
+            handle_kb_ingest_document(db, job)
+
+        store = get_metadata_store()
+        assert (
+            asyncio.run(
+                store.get_collection_config(
+                    collection="failed_kb",
+                    user_id=int(user.id),
+                    is_admin=False,
+                )
+            )
+            is None
+        )
+        # The name has to stay reusable: a leftover metadata row is invisible to
+        # its owner and still answers 409 from every route. The store raises
+        # rather than returning None when the row is gone.
+        with pytest.raises(ValueError):
+            asyncio.run(store.get_collection("failed_kb"))
+    finally:
+        db.close()
+
+
+def test_kb_document_job_publishes_the_config_end_to_end(tmp_path, monkeypatch):
+    """The real ``_save_job_collection_config_after_ingest``, not a stub.
+
+    Every other job test patches that function out, so the job path's own config
+    write — the write this PR moved to after the ingest — is never exercised.
+    """
+    import asyncio
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    monkeypatch.setenv("LANCEDB_DIR", str((tmp_path / "lancedb").resolve()))
+
+    from xagent.core.model.model import EmbeddingModelConfig
+    from xagent.core.storage.manager import initialize_storage_manager
+    from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion
+    from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+
+    storage_root = tmp_path / "storage"
+    uploads_dir = storage_root / "uploads"
+    uploads_dir.mkdir(parents=True)
+    initialize_storage_manager(str(storage_root), str(uploads_dir))
+
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="stub",
+        model_provider="stub",
+        dimension=2,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, _StubEmbeddingAdapter()),
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.management.collection_manager.resolve_embedding_adapter",
+        lambda *args, **kwargs: (stub_config, _StubEmbeddingAdapter()),
+    )
+
+    SessionLocal = _init_test_db(tmp_path / "kb-real-publish.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-real-publish-test")
+        staged_file = tmp_path / "stage" / "doc.txt"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("published content", encoding="utf-8")
+        ingestion_config = IngestionConfig(
+            embedding_model_id="embedding-default",
+            chunk_size=1234,
+        )
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "published_kb",
+                "source_path": str(staged_file),
+                "target_path": str(target_file),
+                "file_id": "77777777-7777-4777-8777-777777777777",
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": staged_file.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": ingestion_config.model_dump(mode="json"),
+                "collection_existed_before": False,
+            },
+        )
+
+        result = handle_kb_ingest_document(db, job)
+
+        assert result["status"] == "success"
+        saved_config = asyncio.run(
+            get_metadata_store().get_collection_config(
+                collection="published_kb",
+                user_id=int(user.id),
+                is_admin=False,
+            )
+        )
+        # Listing visibility comes from this row, so the settings the job carried
+        # have to be in it once the documents landed.
+        assert saved_config is not None
+        assert '"chunk_size":1234' in saved_config
+    finally:
+        db.close()

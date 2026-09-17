@@ -7,6 +7,7 @@ import os
 import pathlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Iterator
 
 import pytest
 from dotenv import load_dotenv
@@ -20,6 +21,10 @@ from openai.types.chat.chat_completion_message_tool_call import (
     Function as ToolCallFunction,
 )
 
+from xagent.core.execution_scope import (
+    set_execution_scope_resolver,
+    set_execution_scope_snapshot_loader,
+)
 from xagent.core.model import ChatModelConfig, EmbeddingModelConfig, RerankModelConfig
 from xagent.core.tools.core.RAG_tools.storage import reset_rag_storage_for_tests
 from xagent.core.tracing.langfuse import reset_langfuse_client
@@ -55,6 +60,17 @@ elif example_env_file.exists():
     load_dotenv(example_env_file, override=False)
 else:
     print("Warning: Neither .env nor example.env file found")
+
+
+@pytest.fixture(autouse=True)
+def local_execution_unless_selected(monkeypatch):
+    """Existing suites select local execution; shared suites opt in explicitly."""
+    # A reachable CI Redis must not silently enable shared caches or rate limits.
+    # Tests that exercise Redis opt in explicitly after this fixture.
+    monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.delenv("XAGENT_CHANNEL_INGRESS_ENABLED", raising=False)
 
 
 def pytest_addoption(parser):
@@ -172,6 +188,16 @@ def temp_dir():
 
 
 @pytest.fixture(autouse=True, scope="function")
+def isolate_path_config_caches() -> Iterator[None]:
+    """Reset cwd-pinned config paths so test order cannot change results."""
+    from xagent.config import _reset_path_config_caches_for_tests
+
+    _reset_path_config_caches_for_tests()
+    yield
+    _reset_path_config_caches_for_tests()
+
+
+@pytest.fixture(autouse=True, scope="function")
 def isolate_rag_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Isolate per-test RAG/KB storage paths and reset global storage state.
 
@@ -243,6 +269,31 @@ def mock_workspace_db():
 
 
 @pytest.fixture(autouse=True, scope="function")
+def isolate_execution_scope_hooks() -> Iterator[None]:
+    """Reset the execution-scope resolver and snapshot loader around every test.
+
+    Both are process-global module state (``xagent.core.execution_scope``).
+    A test (or a direct ``startup_event()`` call in
+    ``tests/integration/test_auto_migration_startup.py``, which registers the
+    real Task-table-backed snapshot loader with no patch/reset of its own)
+    that registers either without resetting it leaks into every test that
+    runs afterward in the same process/worker. Root-level and autouse so no
+    test module can forget it; scoped narrowly to just these two globals so
+    it composes with any test's own *function-scoped* registration (a
+    session- or module-scoped registration would still be torn down mid-
+    session by this fixture's teardown, since that always re-registers
+    ``None`` regardless of what a wider-scoped fixture set up). That
+    teardown call also never carries the acknowledgement keyword, so this
+    safety net alone never exercises the acknowledged-registration path.
+    """
+    set_execution_scope_resolver(None)
+    set_execution_scope_snapshot_loader(None)
+    yield
+    set_execution_scope_resolver(None)
+    set_execution_scope_snapshot_loader(None)
+
+
+@pytest.fixture(autouse=True, scope="function")
 def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clear ambient proxy env vars so tests are deterministic across hosts.
 
@@ -261,6 +312,28 @@ def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HTTPS_PROXY",
         "https_proxy",
         "XAGENT_TRUSTED_EGRESS_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_meta_config_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient Meta Login Configuration env vars for the same reason as
+    isolate_proxy_env above: a developer's real .env can carry META_CONFIG_ID
+    or one of the per-app overrides (META_FACEBOOK_CONFIG_ID /
+    META_INSTAGRAM_CONFIG_ID / META_ADS_CONFIG_ID / META_WHATSAPP_CONFIG_ID --
+    exactly what example.env now documents setting), and without this an
+    otherwise unrelated test exercising the Meta OAuth authorize flow would
+    silently pick up that ambient value instead of the one it explicitly
+    sets/expects. Tests exercising config_id behavior already opt in with
+    ``monkeypatch.setenv(...)`` for the exact var(s) they need.
+    """
+    for name in (
+        "META_CONFIG_ID",
+        "META_FACEBOOK_CONFIG_ID",
+        "META_INSTAGRAM_CONFIG_ID",
+        "META_ADS_CONFIG_ID",
+        "META_WHATSAPP_CONFIG_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -701,7 +774,7 @@ def clear_langfuse_traces(request):
 # YAML entrypoint has been removed, commenting out this fixture
 # @pytest.fixture
 # def mock_migration_manager(tmp_path):
-#     """Initialize a temporary MigrationManager."""
+#    """Initialize a temporary MigrationManager."""
 #     test_migrations_dir = tmp_path / "test_migrations"
 #     test_migrations_dir.mkdir()
 #

@@ -96,3 +96,11 @@ def test_tools_list_is_copied_not_aliased():
     service = _make_service(tools=caller_list)
     caller_list.append(object())
     assert len(service.tools) == 1
+
+
+def test_default_tool_configuration_can_be_disabled() -> None:
+    service = _make_service(tools=[], enable_default_tools=False)
+
+    assert service.tools == []
+    assert service.tool_config is None
+    assert service.enable_default_tools is False

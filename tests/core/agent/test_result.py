@@ -17,6 +17,8 @@ class _FailureCodeStringSubclass(str):
     ("value", "expected"),
     [
         ("oauth_token_required", "oauth_token_required"),
+        ("unsupported_nested_interaction", "unsupported_nested_interaction"),
+        ("missing_delegated_output", "missing_delegated_output"),
         ("other_valid_code", None),
         (" oauth_token_required", None),
         ("OAUTH_TOKEN_REQUIRED", None),
@@ -36,6 +38,22 @@ def test_classified_tool_failure_accepts_only_allowlisted_plain_string():
 
     with pytest.raises(ValueError, match="invalid tool failure code"):
         ClassifiedToolFailure(failure_code="other_valid_code")
+
+    with pytest.raises(ValueError, match="invalid tool failure code"):
+        ClassifiedToolFailure(
+            failure_code=_FailureCodeStringSubclass("oauth_token_required")
+        )
+
+
+@pytest.mark.parametrize(
+    "code", ["unsupported_nested_interaction", "missing_delegated_output"]
+)
+def test_classified_tool_failure_rejects_non_oauth_runtime_codes(code):
+    """The runtime allowlist must not widen the OAuth sentinel's validator."""
+
+    assert normalize_tool_failure_code(code) == code
+    with pytest.raises(ValueError, match="invalid tool failure code"):
+        ClassifiedToolFailure(failure_code=code)
 
 
 @pytest.mark.parametrize(

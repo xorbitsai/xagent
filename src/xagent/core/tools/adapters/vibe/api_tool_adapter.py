@@ -1,6 +1,7 @@
 """Custom API Tool Adapter for Agent System."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -24,6 +25,7 @@ from .connector_runtime import (
     is_runtime_header_scalar,
     runtime_bindings_from_config,
 )
+from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 logger = logging.getLogger(__name__)
 
@@ -134,11 +136,39 @@ class CustomApiTool(AbstractBaseTool):
     ):
         # Format name for LLM (replace spaces/dashes with underscores)
         sanitized_name = name.replace(" ", "_").replace("-", "_")
+        # `name` is free-form user input (CustomApiCreate.name only bounds
+        # length, not charset), so anything the two replacements above
+        # didn't catch -- a `.` in a domain-like name, punctuation, etc. --
+        # would otherwise survive into `function.name` and 400 the whole
+        # LLM call the same way an unsanitized MCP tool name does.
+        sanitized_name = re.sub(r"[^A-Za-z0-9_-]", "_", sanitized_name)
         # Ensure name doesn't start with api_ twice if already prefixed
-        if sanitized_name.startswith("api_"):
-            self._name = f"{sanitized_name}_call"
-        else:
-            self._name = f"api_{sanitized_name}_call"
+        prefix = "" if sanitized_name.startswith("api_") else "api_"
+        suffix = "_call"
+        # Same failure mode as the character check above -- an over-long
+        # name is rejected by the same providers, just on length instead of
+        # charset. Budget the truncation around the fixed prefix/suffix so
+        # `_call` (the part that signals "this is an API call") survives
+        # instead of being cut off by a blind truncation of the whole
+        # string. `MAX_AGENT_TOOL_NAME_LENGTH` is this repo's own record of
+        # that provider limit (tool_naming_limits.py), shared here rather
+        # than redeclared so the two adapters can't drift apart on the number.
+        budget = MAX_AGENT_TOOL_NAME_LENGTH - len(prefix) - len(suffix)
+        if len(sanitized_name) > budget:
+            # `name` is a free-form, DB-unique string with no server
+            # prefix to squeeze the way the MCP adapter does -- the whole
+            # sanitized name is what a truncation would cut. Two long,
+            # descriptive Custom API names that share a common prefix and
+            # differ only in a trailing qualifier (a normal naming habit,
+            # e.g. two services named for the same team) truncate to the
+            # same string otherwise, and nothing downstream detects that
+            # collision -- mix in a short hash of the *original* name so a
+            # truncated name stays distinct instead of silently dispatching
+            # to whichever of the two tools registers first.
+            digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+            hash_suffix = f"_{digest}"
+            sanitized_name = sanitized_name[: budget - len(hash_suffix)] + hash_suffix
+        self._name = f"{prefix}{sanitized_name[:budget]}{suffix}"
 
         # Structured originating-server identity, normalized once through the
         # shared SSOT. A scoped mcp:<server> selector fronts this Custom-API

@@ -1,10 +1,10 @@
 "use client"
 
-import React, { useState, useEffect, useRef } from "react"
+import React, { useState, useEffect, useMemo, useRef } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
 import { PageHeader } from "@/components/ui/page-header"
-import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug, KeyRound, Webhook, Mic, Square, Loader2 } from "lucide-react"
+import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, ArrowUpDown, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug, KeyRound, Webhook, Mic, Square, Loader2 } from "lucide-react"
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
@@ -15,11 +15,18 @@ import {
   type AgentDeletePendingAction,
 } from "@/components/build/agent-delete-dialog"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
+import { SegmentedTabs, type SegmentedTabItem } from "@/components/ui/segmented-tabs"
+import { PersonaAvatar } from "@/components/templates/persona-avatar"
+import { pillClasses } from "@/components/templates/library-template-card"
+import { categoryLabel } from "@/lib/template-categories"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { useRouter, useSearchParams } from "next/navigation"
-import { apiRequest } from "@/lib/api-wrapper"
-import { getApiUrl } from "@/lib/utils"
+import { apiRequest, parseApiResponse } from "@/lib/api-wrapper"
+import { getApiUrl, resolveAgentLogoUrl } from "@/lib/utils"
+import { resolveTaskLlmSelection } from "@/lib/models"
+import type { Template } from "@/types/template"
+import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create"
 import {
   canDeleteAgent,
   canEditAgent,
@@ -39,46 +46,27 @@ import {
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { useVoiceInputControls } from "@/components/voice-input-controller"
+import {
+  BuildAgentCardExtension,
+  BuildPageExtensionProvider,
+} from "@/lib/build-page-extension"
 
-interface LlmModel {
-  model_id: string
-  is_default?: boolean
-}
+type StatusTab = "all" | "enabled" | "drafts"
 
-interface DefaultModelRecord {
-  config_type?: "general" | "small_fast" | "visual" | "compact"
-  model?: {
-    model_id?: string
-  } | null
-}
+// "drafts" means "not enabled" rather than a strict `=== "draft"` check, so
+// every agent lands in exactly one of Enabled/Drafts (matching the "All"
+// count) even for a status other than the two the UI otherwise names
+// (e.g. `archived`, defined on the backend but not currently reachable
+// through any create/update path).
+const matchesStatusTab = (agent: Agent, tab: StatusTab): boolean =>
+  tab === "all" ? true : tab === "enabled" ? agent.status === "published" : agent.status !== "published"
 
-interface TaskCreateResponse {
-  task_id: number
-}
+const matchesSearch = (agent: Agent, searchTerm: string): boolean =>
+  agent.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+  Boolean(agent.description && agent.description.toLowerCase().includes(searchTerm.toLowerCase()))
 
-const isLlmModel = (value: unknown): value is LlmModel => {
-  if (!value || typeof value !== "object") {
-    return false
-  }
-
-  const candidate = value as Record<string, unknown>
-  return (
-    typeof candidate.model_id === "string" &&
-    (candidate.is_default === undefined || typeof candidate.is_default === "boolean")
-  )
-}
-
-const isTaskCreateResponse = (value: unknown): value is TaskCreateResponse => {
-  if (!value || typeof value !== "object") {
-    return false
-  }
-
-  const candidate = value as Record<string, unknown>
-  return typeof candidate.task_id === "number"
-}
-
-export default function BuildsPage() {
-  const { t } = useI18n()
+function BuildsPageContent() {
+  const { t, locale } = useI18n()
   const { dispatch, setTaskId, setPendingMessage } = useApp()
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -87,9 +75,19 @@ export default function BuildsPage() {
   const isMountedRef = useRef(false)
   const agentListRequestGenerationRef = useRef(0)
   const agentDeleteActionGenerationRef = useRef(0)
+  const activeTaskCreateAttemptRef = useRef<number | null>(null)
+  const taskCreateCounterRef = useRef(0)
+  const draftRevisionRef = useRef(0)
   const [searchTerm, setSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
+  const [statusTab, setStatusTab] = useState<StatusTab>("all")
+  const [sortMode, setSortMode] = useState<"updated" | "name">("updated")
+  // Best-effort enrichment only: an agent traces back to the template it was
+  // hired from via `template_id`, and this lookup supplies that template's
+  // category/persona for the card badge and avatar. A custom, scratch-built
+  // agent has no `template_id` and simply renders without them.
+  const [templatesById, setTemplatesById] = useState<Record<string, Template>>({})
   const branding = getBrandingFromEnv();
 
   // Deploy Dialog State
@@ -158,34 +156,83 @@ export default function BuildsPage() {
     void fetchAgents()
     return () => {
       isMountedRef.current = false
+      activeTaskCreateAttemptRef.current = null
       agentListRequestGenerationRef.current += 1
       agentDeleteActionGenerationRef.current += 1
     }
   }, [])
 
-  const handlePublish = async (agentId: number) => {
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`)
+        if (cancelled) return
+        if (!response.ok) {
+          // Clear rather than leave stale data in place - otherwise a failed
+          // refetch after a locale switch would keep rendering the previous
+          // locale's persona role/category text beside the new-locale UI.
+          setTemplatesById({})
+          return
+        }
+        const data: Template[] = await response.json()
+        if (cancelled) return
+        const map: Record<string, Template> = {}
+        for (const template of data) map[template.id] = template
+        setTemplatesById(map)
+      } catch {
+        if (!cancelled) setTemplatesById({})
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [locale])
+
+  const publicationOperations = {
+    publish: {
+      suffix: "publish",
+      errorKey: "builds.publication.publishFailed",
+      diagnostic: "Failed to publish agent:",
+    },
+    unpublish: {
+      suffix: "unpublish",
+      errorKey: "builds.publication.unpublishFailed",
+      diagnostic: "Failed to unpublish agent:",
+    },
+  } as const
+
+  const performPublicationMutation = async (
+    agentId: number,
+    kind: keyof typeof publicationOperations,
+  ): Promise<"success" | "failed" | "stale"> => {
+    const operation = publicationOperations[kind]
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/publish`, {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/${operation.suffix}`, {
         method: "POST",
       })
-      if (response.ok) {
-        fetchAgents() // Refresh list
+      if (!isMountedRef.current) return "stale"
+      if (!response.ok) {
+        console.error(operation.diagnostic, response)
+        toast.error(t(operation.errorKey))
+        return "failed"
       }
+      return "success"
     } catch (error) {
-      console.error("Failed to publish agent:", error)
+      if (!isMountedRef.current) return "stale"
+      console.error(operation.diagnostic, error)
+      toast.error(t(operation.errorKey))
+      return "failed"
     }
   }
 
-  const handleUnpublish = async (agentId: number) => {
-    try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/unpublish`, {
-        method: "POST",
-      })
-      if (response.ok) {
-        fetchAgents() // Refresh list
-      }
-    } catch (error) {
-      console.error("Failed to unpublish agent:", error)
+  const handlePublication = async (
+    agentId: number,
+    kind: keyof typeof publicationOperations,
+  ) => {
+    const outcome = await performPublicationMutation(agentId, kind)
+    if (outcome === "success" && isMountedRef.current) {
+      void fetchAgents()
     }
   }
 
@@ -320,10 +367,35 @@ export default function BuildsPage() {
     })
   }
 
-  // Filter agents based on search term
-  const filteredAgents = agents.filter(agent =>
-    agent.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    (agent.description && agent.description.toLowerCase().includes(searchTerm.toLowerCase()))
+  const statusTabs: SegmentedTabItem[] = useMemo(
+    () =>
+      (["all", "enabled", "drafts"] as const).map((tab) => ({
+        id: tab,
+        label: (
+          <>
+            {t(`builds.list.tabs.${tab}`)}
+            <span className="ml-1.5 text-[10px] text-muted-foreground/70">
+              {
+                agents
+                  .filter((agent) => matchesStatusTab(agent, tab))
+                  .filter((agent) => matchesSearch(agent, searchTerm)).length
+              }
+            </span>
+          </>
+        ),
+      })),
+    [agents, searchTerm, t]
+  )
+
+  const filteredAgents = useMemo(
+    () =>
+      agents
+        .filter((agent) => matchesStatusTab(agent, statusTab))
+        .filter((agent) => matchesSearch(agent, searchTerm))
+        .sort((a, b) =>
+          sortMode === "name" ? a.name.localeCompare(b.name) : b.updated_at.localeCompare(a.updated_at)
+        ),
+    [agents, statusTab, searchTerm, sortMode]
   )
 
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
@@ -335,106 +407,105 @@ export default function BuildsPage() {
     setIsCreateModalOpen(true)
   }
 
-  const resolveTaskLlmIds = async (): Promise<[string, string | null, string | null, string | null] | null> => {
-    const apiUrl = getApiUrl()
-    const [modelsResponse, defaultResponse] = await Promise.all([
-      apiRequest(`${apiUrl}/api/models/?category=llm`, { headers: {} }),
-      apiRequest(`${apiUrl}/api/models/user-default`, { headers: {} }),
-    ])
-
-    let allModels: LlmModel[] = []
-    if (modelsResponse.ok) {
-      const modelsData = await modelsResponse.json()
-      if (Array.isArray(modelsData)) {
-        allModels = modelsData.filter(isLlmModel)
-      }
-    }
-
-    const defaultModels: Record<string, string | undefined> = {}
-    if (defaultResponse.ok) {
-      const defaultsData = await defaultResponse.json()
-      if (Array.isArray(defaultsData)) {
-        defaultsData.forEach((defaultConfig: DefaultModelRecord) => {
-          if (defaultConfig?.config_type && defaultConfig.model?.model_id) {
-            defaultModels[defaultConfig.config_type] = defaultConfig.model.model_id
-          }
-        })
-      }
-    }
-
-    const generalModelId =
-      defaultModels.general ||
-      allModels.find((model) => model.is_default)?.model_id ||
-      allModels[0]?.model_id
-
-    if (!generalModelId) {
-      return null
-    }
-
-    return [
-      generalModelId,
-      defaultModels.small_fast ?? null,
-      defaultModels.visual ?? null,
-      defaultModels.compact ?? null,
-    ]
-  }
-
   const handleBuildWithPrompt = async () => {
-    const prompt = createPrompt.trim()
-    if (!prompt || isStartingTask) return
+    const rawPrompt = createPrompt
+    const prompt = rawPrompt.trim()
+    if (!prompt || activeTaskCreateAttemptRef.current !== null) return
+
+    const attempt = ++taskCreateCounterRef.current
+    activeTaskCreateAttemptRef.current = attempt
+    const revision = draftRevisionRef.current
+    const isCurrent = () => isMountedRef.current && activeTaskCreateAttemptRef.current === attempt
 
     setIsStartingTask(true)
     try {
-      dispatch({ type: "RESET_STATE" })
-      const llmIds = await resolveTaskLlmIds()
-      if (!llmIds) {
-        toast.error(t("chatPage.input.noModelAlert"))
+      let task = null
+
+      try {
+        const selection = await resolveTaskLlmSelection()
+        if (!isCurrent()) return
+
+        if (selection.kind === "no_model") {
+          toast.error(t("chatPage.input.noModelAlert"))
+          return
+        }
+        if (selection.kind === "operational_error") throw selection.error
+
+        const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            title: normalizeTaskPromptTitle(rawPrompt),
+            description: prompt,
+            llm_ids: selection.llmIds,
+          }),
+        })
+
+        if (!isCurrent()) return
+        const parsed = await parseApiResponse(taskResponse)
+        if (!isCurrent()) return
+
+        task = taskResponse.ok ? parseTaskCreateCore(parsed.data) : null
+        if (!task) throw new Error("Task create response is invalid")
+      } catch (error) {
+        if (isCurrent()) {
+          console.error("Failed to start task from build modal:", error)
+          toast.error(t("builds.list.createModal.startTaskFailed"))
+        }
         return
       }
 
-      const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          title: prompt,
-          description: prompt,
-          llm_ids: llmIds,
-        }),
-      })
+      if (!isCurrent() || !task) return
 
-      if (!taskResponse.ok) {
-        throw new Error("Failed to create task")
+      try {
+        if (!isCurrent()) return
+        dispatch({ type: "RESET_STATE" })
+
+        if (!isCurrent()) return
+        setPendingMessage({
+          message: prompt,
+          files: [],
+          targetTaskId: task.taskId,
+        })
+
+        if (!isCurrent()) return
+        dispatch({ type: "TRIGGER_TASK_UPDATE" })
+
+        if (!isCurrent()) return
+        setTaskId(task.taskId)
+
+        if (!isCurrent()) return
+        setIsCreateModalOpen(false)
+
+        if (!isCurrent()) return
+        if (draftRevisionRef.current === revision) {
+          draftRevisionRef.current += 1
+          setCreatePrompt("")
+        }
+      } catch (error) {
+        if (isCurrent()) console.error("Failed to commit task creation:", error)
       }
-
-      const taskData = await taskResponse.json()
-      if (!isTaskCreateResponse(taskData)) {
-        throw new Error("Task create response is missing task_id")
-      }
-
-      setPendingMessage({
-        message: prompt,
-        files: [],
-        targetTaskId: taskData.task_id,
-      })
-      dispatch({ type: "TRIGGER_TASK_UPDATE" })
-      setTaskId(taskData.task_id)
-      setIsCreateModalOpen(false)
-      setCreatePrompt("")
-    } catch (error) {
-      console.error("Failed to start task from build modal:", error)
-      toast.error(t("builds.list.createModal.startTaskFailed"))
-      setIsCreateModalOpen(true)
-      setCreatePrompt(prompt)
     } finally {
-      setIsStartingTask(false)
+      if (isCurrent()) {
+        activeTaskCreateAttemptRef.current = null
+        setIsStartingTask(false)
+      }
     }
   }
 
+  const handleCreateModalOpenChange = (open: boolean) => {
+    if (!open) {
+      activeTaskCreateAttemptRef.current = null
+      setIsStartingTask(false)
+    }
+    setIsCreateModalOpen(open)
+  }
+
   const handleManualCreate = () => {
+    handleCreateModalOpenChange(false)
     router.push("/build/new")
-    setIsCreateModalOpen(false)
   }
 
   const createPromptVoiceInputLabel =
@@ -454,11 +525,6 @@ export default function BuildsPage() {
     if (createPromptVoiceInput.status === "idle") {
       createPromptVoiceInput.startRecording(createPromptRef.current)
     }
-  }
-
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString)
-    return date.toLocaleDateString()
   }
 
   return (
@@ -484,7 +550,7 @@ export default function BuildsPage() {
       />
 
       {/* Main Content */}
-      <div className="flex-1 px-4 md:px-6 pb-6 space-y-6 overflow-auto">
+      <div className="flex-1 px-4 md:px-6 py-6 space-y-6 overflow-auto">
         {/* Loading State */}
         {loading ? (
           <div className="flex items-center justify-center h-[400px]">
@@ -523,41 +589,64 @@ export default function BuildsPage() {
           />
         ) : (
           <>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <SegmentedTabs items={statusTabs} value={statusTab} onValueChange={(value) => setStatusTab(value as StatusTab)} />
+              <button
+                type="button"
+                onClick={() => setSortMode((mode) => (mode === "updated" ? "name" : "updated"))}
+                className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+              >
+                {t(`builds.list.sort.${sortMode}`)}
+                <ArrowUpDown className="h-3.5 w-3.5" />
+              </button>
+            </div>
+
             {/* List */}
             {filteredAgents.length > 0 ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                {filteredAgents.map((agent) => (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4">
+                {filteredAgents.map((agent) => {
+                  const resolvedLogoUrl = resolveAgentLogoUrl(agent.logo_url, getApiUrl())
+                  const template = agent.template_id ? templatesById[agent.template_id] : undefined
+                  const personaRole = template?.persona?.role
+                  const category = template?.category
+                  return (
                   <div
                     key={agent.id}
-                    className="group relative flex flex-col justify-between space-y-4 rounded-xl border bg-card p-6 shadow-sm transition-all cursor-pointer hover:shadow-md hover:border-primary/50"
+                    className="group relative flex flex-col rounded-[20px] border bg-card p-5 shadow-sm transition-all cursor-pointer hover:-translate-y-0.5 hover:shadow-md hover:border-primary/50"
                     onClick={() => router.push(`/build/${agent.id}`)}
                   >
-                    <div className="flex-1">
-                      <div className="space-y-4">
-                        <div className="flex items-start gap-4">
-                          <div className="h-10 w-10 shrink-0 rounded-lg bg-primary/10 flex items-center justify-center text-primary overflow-hidden">
-                            {agent.logo_url ? (
-                              <img src={`${getApiUrl()}${agent.logo_url}`} alt={agent.name} className="h-full w-full object-cover" />
-                            ) : (
-                              <Bot className="h-6 w-6" />
-                            )}
-                          </div>
-                          <div className="flex-1 min-w-0 pr-6">
-                            <h3 className="font-semibold text-base leading-tight truncate" title={agent.name}>
-                              {agent.name}
-                            </h3>
-                            <div className="mt-2">
-                              <span className={`inline-flex text-[11px] px-2 py-0.5 rounded-full capitalize font-medium ${agent.status === 'published'
-                                ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
-                                : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
-                                }`}>
-                                {agent.status === 'published' ? t('builds.list.status.published') : t('builds.list.status.draft')}
-                              </span>
-                            </div>
-                          </div>
+                    <div className="flex flex-col items-start gap-3">
+                      <PersonaAvatar
+                        persona={{ name: agent.name, avatar: resolvedLogoUrl || template?.persona?.avatar }}
+                        sizeClassName="h-20 w-20"
+                        textClassName="text-2xl"
+                        className="rounded-[22px] shadow-[0_0_0_4px_var(--card),0_0_0_6px_hsl(var(--primary)/0.15)]"
+                      />
+                      <div className="w-full min-w-0 pr-6">
+                        <h3 className="font-bold text-xl leading-tight truncate" title={agent.name}>
+                          {agent.name}
+                        </h3>
+                        {personaRole && (
+                          <p className="text-[12.5px] text-muted-foreground truncate mt-0.5">{personaRole}</p>
+                        )}
+                        <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                          <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full font-bold ${agent.status === 'published'
+                            ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
+                            : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
+                            }`}>
+                            <span className={`h-1.5 w-1.5 rounded-full ${agent.status === 'published' ? 'bg-green-500' : 'bg-gray-400'}`} />
+                            {agent.status === 'published' ? t('builds.list.status.published') : t('builds.list.status.draft')}
+                          </span>
+                          {category && (
+                            <span className={`inline-flex text-[11px] px-2 py-0.5 rounded-full font-medium ${pillClasses(category)}`}>
+                              {categoryLabel(t, category)}
+                            </span>
+                          )}
                         </div>
+                      </div>
+                    </div>
                         {(canPublishAgent(agent) || canDeleteAgent(agent) || canEditAgent(agent)) && (
-                          <div className="absolute right-4 top-1" onClick={(e) => e.stopPropagation()}>
+                          <div className="absolute right-4 top-4" onClick={(e) => e.stopPropagation()}>
                             <Popover>
                               <PopoverTrigger asChild>
                                 <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground">
@@ -602,9 +691,9 @@ export default function BuildsPage() {
                                       onClick={(e) => {
                                         e.stopPropagation()
                                         if (agent.status === 'published') {
-                                          handleUnpublish(agent.id)
+                                          void handlePublication(agent.id, "unpublish")
                                         } else {
-                                          handlePublish(agent.id)
+                                          void handlePublication(agent.id, "publish")
                                         }
                                       }}
                                     >
@@ -634,91 +723,82 @@ export default function BuildsPage() {
                           </div>
                         )}
 
-                        <p className="text-sm text-muted-foreground line-clamp-2 mt-4">
-                          {agent.description || t('builds.card.noDescription')}
-                        </p>
-                      </div>
-                    </div>
+                      <p className="mt-4 flex-1 text-[13px] leading-relaxed text-muted-foreground line-clamp-3 min-h-[60px]">
+                        {agent.description || t('builds.card.noDescription')}
+                      </p>
 
-                    <div className="space-y-4 pt-2">
-                      <div className="space-y-1.5">
-                        <div className="flex items-center text-xs text-muted-foreground">
-                          <Calendar className="h-3.5 w-3.5 mr-1.5" />
-                          {t('builds.card.createdAt')}: {formatDate(agent.created_at)}
-                        </div>
-                        <div className="flex items-center text-xs text-muted-foreground">
-                          <Clock className="h-3.5 w-3.5 mr-1.5" />
-                          {t('builds.card.updatedAt')}: {formatDate(agent.updated_at || agent.created_at)}
-                        </div>
-                      </div>
-                      <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
-                        {agent.status === 'published' ? (
-                          <>
-                            <Button
-                              variant="default"
-                              className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
-                              onClick={() => router.push(getAgentChatHref(agent))}
-                            >
-                              <MessageSquare className="mr-1.5 h-4 w-4" />
-                              {t('builds.list.actions.chat')}
-                            </Button>
-                            {canEditAgent(agent) ? (
-                              <>
+                    <div className="mt-4 border-t pt-3.5" onClick={(e) => e.stopPropagation()}>
+                      <div className="space-y-3.5">
+                        <BuildAgentCardExtension agentId={agent.id} />
+                        <div className="flex items-center gap-1.5">
+                          {agent.status === 'published' ? (
+                            <>
+                              <Button
+                                variant="default"
+                                className="flex-1 rounded-full h-[34px] bg-blue-600 hover:bg-blue-700 text-white"
+                                onClick={() => router.push(getAgentChatHref(agent))}
+                              >
+                                <MessageSquare className="mr-1.5 h-4 w-4" />
+                                {t('builds.list.actions.chat')}
+                              </Button>
+                              {canEditAgent(agent) ? (
+                                <>
+                                  <Button
+                                    variant="outline"
+                                    className="rounded-full h-[34px] px-4"
+                                    onClick={() => router.push(`/build/${agent.id}`)}
+                                  >
+                                    <Edit className="mr-1.5 h-4 w-4" />
+                                    {t('builds.list.actions.edit')}
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="icon"
+                                    className="rounded-full h-[34px] w-[34px] shrink-0"
+                                    title={t('builds.list.actions.deploy')}
+                                    onClick={() => setDeployAgent(agent)}
+                                  >
+                                    <Rocket className="h-4 w-4" />
+                                  </Button>
+                                </>
+                              ) : (
                                 <Button
                                   variant="outline"
-                                  size="icon"
-                                  onClick={() => {
-                                    setDeployAgent(agent);
-                                  }}
-                                  title="Deploy"
-                                >
-                                  <Rocket className="h-4 w-4" />
-                                </Button>
-                                <Button
-                                  variant="outline"
-                                  className="px-4"
+                                  className={canRunAgent(agent) ? "rounded-full h-[34px] px-4" : "flex-1 w-full rounded-full h-[34px]"}
                                   onClick={() => router.push(`/build/${agent.id}`)}
                                 >
-                                  <Edit className="mr-1.5 h-4 w-4" />
-                                  {t('builds.list.actions.edit')}
+                                  <Settings2 className="mr-1.5 h-4 w-4" />
+                                  {t('builds.list.actions.viewConfig')}
                                 </Button>
-                              </>
+                              )}
+                            </>
+                          ) : (
+                            canEditAgent(agent) ? (
+                              <Button
+                                variant="outline"
+                                className="flex-1 w-full rounded-full h-[34px]"
+                                onClick={() => router.push(`/build/${agent.id}`)}
+                              >
+                                <Edit className="mr-1.5 h-4 w-4" />
+                                {t('builds.list.actions.edit')}
+                              </Button>
                             ) : (
                               <Button
                                 variant="outline"
-                                className={canRunAgent(agent) ? "px-4" : "flex-1 w-full"}
+                                className="flex-1 w-full rounded-full h-[34px]"
                                 onClick={() => router.push(`/build/${agent.id}`)}
                               >
                                 <Settings2 className="mr-1.5 h-4 w-4" />
                                 {t('builds.list.actions.viewConfig')}
                               </Button>
-                            )}
-                          </>
-                        ) : (
-                          canEditAgent(agent) ? (
-                            <Button
-                              variant="outline"
-                              className="flex-1 w-full"
-                              onClick={() => router.push(`/build/${agent.id}`)}
-                            >
-                              <Edit className="mr-1.5 h-4 w-4" />
-                              {t('builds.list.actions.edit')}
-                            </Button>
-                          ) : (
-                            <Button
-                              variant="outline"
-                              className="flex-1 w-full"
-                              onClick={() => router.push(`/build/${agent.id}`)}
-                            >
-                              <Settings2 className="mr-1.5 h-4 w-4" />
-                              {t('builds.list.actions.viewConfig')}
-                            </Button>
-                          )
-                        )}
+                            )
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>
-                ))}
+                  )
+                })}
               </div>
             ) : (
               <div className="flex flex-col items-center justify-center h-[400px] text-center space-y-4 border rounded-lg bg-muted/10 border-dashed">
@@ -771,7 +851,7 @@ export default function BuildsPage() {
         onOpenChange={(open) => { if (!open) setTriggersAgent(null) }}
       />
 
-      <Dialog open={isCreateModalOpen} onOpenChange={setIsCreateModalOpen}>
+      <Dialog open={isCreateModalOpen} onOpenChange={handleCreateModalOpenChange}>
         <DialogContent className="sm:max-w-[550px] gap-0 p-0 overflow-hidden bg-background shadow-lg rounded-xl">
           <DialogHeader className="px-6 py-5 border-b pr-10">
             <DialogTitle className="flex items-start sm:items-center gap-2 text-xl font-semibold">
@@ -802,7 +882,7 @@ export default function BuildsPage() {
                   ref={createPromptRef}
                   data-voice-input="false"
                   value={createPrompt}
-                  onChange={(e) => setCreatePrompt(e.target.value)}
+                  onChange={(e) => { draftRevisionRef.current += 1; setCreatePrompt(e.target.value) }}
                   placeholder={t("builds.list.createModal.placeholder")}
                   className="min-h-[100px] flex-1 resize-none border-0 shadow-none focus-visible:ring-0"
                   onKeyDown={(e) => {
@@ -889,5 +969,13 @@ export default function BuildsPage() {
         </DialogContent>
       </Dialog>
     </div>
+  )
+}
+
+export default function BuildsPage() {
+  return (
+    <BuildPageExtensionProvider>
+      <BuildsPageContent />
+    </BuildPageExtensionProvider>
   )
 }

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ...core.utils.encryption import encrypt_value
 from ..auth_dependencies import get_current_user
 from ..builtin_mcp_registry import (
+    _persisted_builtin_provenance_matches,
     get_builtin_execution_fields,
     get_builtin_public_mcp_app,
     is_builtin_public_mcp_app,
@@ -97,19 +98,31 @@ class PublicMCPAppCreate(PublicMCPAppBase):
     def _enforce_auth_classification(self) -> "PublicMCPAppCreate":
         # Reuse the single source of truth (classify_app_auth) rather than
         # re-deriving the rule here. Reject an entry that declares a partial
-        # launch_config (command or required_env) yet still classifies as
-        # "unconnectable" — the write-time constraint issue #764 asked for. This
-        # covers both asymmetric shapes: command-without-required_env and
-        # required_env-without-command.
+        # launch_config (either the key-based or the remote-OAuth shape) yet
+        # still classifies as "unconnectable" — the write-time constraint
+        # issue #764 asked for. Covers the asymmetric shapes:
+        # required_env-without-command, url-without-auth.type=mcp_oauth, and
+        # auth.type=mcp_oauth-without-url. (command-without-required_env on a
+        # stdio transport is not partial — it classifies as "keyless"; the
+        # same shape on a remote transport still rejects here.)
         from ..mcp_apps import classify_app_auth
 
         launch = self.launch_config or {}
-        if (launch.get("command") or launch.get("required_env")) and (
+        declares_key_shape = bool(launch.get("command") or launch.get("required_env"))
+        auth = launch.get("auth")
+        declares_remote_oauth_shape = bool(launch.get("url")) or (
+            isinstance(auth, dict) and auth.get("type") == "mcp_oauth"
+        )
+        if (declares_key_shape or declares_remote_oauth_shape) and (
             classify_app_auth(self.transport, self.launch_config) == "unconnectable"
         ):
             raise ValueError(
                 "A key-based catalog app must declare both launch_config.command "
-                "and launch_config.required_env, otherwise it cannot be connected."
+                "and launch_config.required_env (a stdio command without "
+                "required_env is a keyless app); a remote-OAuth catalog app must "
+                "declare both launch_config.url and launch_config.auth.type == "
+                "'mcp_oauth' (with transport one of sse/websocket/streamable_http), "
+                "otherwise it cannot be connected."
             )
         return self
 
@@ -204,6 +217,10 @@ def _commit_public_mcp_app_write(
 def _public_mcp_app_response(app: PublicMCPApp) -> Dict[str, Any]:
     values = _public_mcp_app_values(app)
     execution_fields = get_builtin_execution_fields(app.app_id)
+    if execution_fields is not None and not _persisted_builtin_provenance_matches(
+        app.app_id, app.launch_config
+    ):
+        execution_fields = None
     if execution_fields is not None:
         values.update(execution_fields)
     return {
@@ -213,9 +230,20 @@ def _public_mcp_app_response(app: PublicMCPApp) -> Dict[str, Any]:
     }
 
 
-def _validate_public_mcp_app_values(values: Dict[str, Any]) -> None:
+def _validate_public_mcp_app_values(
+    values: Dict[str, Any], *, enforce_connect_shape: bool = True
+) -> None:
+    # F4: PublicMCPAppCreate's _enforce_auth_classification rejects a
+    # connect-shape that classifies as "unconnectable" (see that validator's
+    # docstring). Applying it unconditionally on every edit would let a shape
+    # rule added after a row was created (or a row otherwise grandfathered
+    # in) permanently block that row's unrelated fields (e.g. icon) from ever
+    # being edited again. Skip that one check — via PublicMCPAppBase, which
+    # PublicMCPAppCreate extends with no other override — when this edit
+    # doesn't touch the fields the shape check reads (transport/launch_config).
+    model = PublicMCPAppCreate if enforce_connect_shape else PublicMCPAppBase
     try:
-        PublicMCPAppCreate.model_validate(values)
+        model.model_validate(values)
     except ValidationError:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -225,7 +253,12 @@ def _validate_public_mcp_app_values(values: Dict[str, Any]) -> None:
 
 def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) -> None:
     canonical = get_builtin_public_mcp_app(db_app.app_id)
+    if canonical is not None and not _persisted_builtin_provenance_matches(
+        db_app.app_id, db_app.launch_config
+    ):
+        canonical = None
     persisted = _public_mcp_app_values(db_app)
+    enforce_connect_shape = bool({"transport", "launch_config"} & changes.keys())
 
     if canonical is not None:
         for field in _BUILTIN_PROTECTED_FIELDS.intersection(changes):
@@ -244,7 +277,9 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
             **writable_changes,
             **{field: canonical[field] for field in _BUILTIN_PROTECTED_FIELDS},
         }
-        _validate_public_mcp_app_values(merged)
+        _validate_public_mcp_app_values(
+            merged, enforce_connect_shape=enforce_connect_shape
+        )
     else:
         if "app_id" in changes and changes["app_id"] != db_app.app_id:
             raise HTTPException(
@@ -252,7 +287,9 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
                 detail="MCP app ID is immutable",
             )
         merged = {**persisted, **changes}
-        _validate_public_mcp_app_values(merged)
+        _validate_public_mcp_app_values(
+            merged, enforce_connect_shape=enforce_connect_shape
+        )
         writable_changes = {
             field: value for field, value in changes.items() if field != "app_id"
         }
@@ -525,7 +562,9 @@ async def delete_app(
     db_app = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_id).first()
     if not db_app:
         raise HTTPException(status_code=404, detail="App not found")
-    if is_builtin_public_mcp_app(db_app.app_id):
+    if is_builtin_public_mcp_app(
+        db_app.app_id
+    ) and _persisted_builtin_provenance_matches(db_app.app_id, db_app.launch_config):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Built-in MCP apps are managed by code",

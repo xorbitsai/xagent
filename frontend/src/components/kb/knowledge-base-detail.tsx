@@ -83,6 +83,8 @@ function getKnowledgeBaseToastCopy(
 ) {
   return {
     genericTitle,
+    nameUnavailableTitle: t("kb.errors.nameUnavailable"),
+    nameUnavailableDescription: t("kb.errors.nameUnavailableHint"),
     embeddingTitle: t("kb.errors.embeddingModelUnavailable"),
     embeddingDescription: t("kb.errors.embeddingModelUnavailableHint"),
     rollbackTitle: t("kb.errors.rollbackFailed"),
@@ -524,7 +526,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         : t("kb.detail.errors.uploadFailedGeneric")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric"))
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.uploadFailedGeneric")),
+        { status: undefined, adviseRename: false }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -720,7 +723,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         : t("kb.detail.errors.webImportFailed")
       const toastContent = getKnowledgeBaseErrorToastContent(
         rawMessage,
-        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.webImportFailed"))
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.webImportFailed")),
+        { status: undefined, adviseRename: false }
       )
       toast.error(toastContent.title, {
         description: toastContent.description,
@@ -814,7 +818,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
       if (!response.ok) {
-        const errorData = await response.json()
+        const errorData = await response.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.edit.errors.renameFailed"))
       }
 
@@ -823,7 +827,20 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       // Redirect to new URL after successful rename
       window.location.href = `/kb/${encodeURIComponent(editCollectionName)}`
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("kb.detail.edit.errors.updateFailed"))
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.edit.errors.updateFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.edit.errors.updateFailed")),
+        // Rename answers 409 for a taken name, a colliding storage directory and
+        // lock contention alike, so no single sentence we could substitute would
+        // be true of all three: show the one the backend actually chose.
+        { status: undefined, adviseRename: false }
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
     } finally {
       setIsUpdating(false)
     }
@@ -849,7 +866,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       })
 
       if (!response.ok) {
-        const errorData = await response.json()
+        const errorData = await response.json().catch(() => ({}))
         throw new Error(errorData.detail || t("kb.detail.errors.saveConfigFailed"))
       }
 
@@ -876,7 +893,19 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
       // Refresh info to ensure we're in sync
       await fetchCollectionInfo()
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("kb.detail.errors.saveConfigFailed"))
+      const rawMessage = err instanceof Error
+        ? err.message
+        : t("kb.detail.errors.saveConfigFailed")
+      const toastContent = getKnowledgeBaseErrorToastContent(
+        rawMessage,
+        getKnowledgeBaseToastCopy(t, t("kb.detail.errors.saveConfigFailed")),
+        // A 409 here means this collection is no longer visible to the caller,
+        // not that a name was just typed: show what the backend actually said.
+        { status: undefined, adviseRename: false }
+      )
+      toast.error(toastContent.title, {
+        description: toastContent.description,
+      })
     } finally {
       setIsSavingConfig(false)
     }

@@ -283,6 +283,12 @@ Use this tool to:
 - Comparing multiple images or videos
 - Answering specific questions about visual content
 
+Do not call this tool merely to inspect a standard uploaded image that is
+already attached to the current conversation as visual context; answer from the
+attached image directly. Use this tool as the fallback when that image is only
+available by file_id, or for video and SVG source inspection. Structured object
+localization and marked-image generation belong to detect_objects instead.
+
 Parameters:
 - media (required): One image/video path or file_id, or a list of them. Always use
   the exact file_id or filename from uploaded/generated file metadata.
@@ -310,6 +316,14 @@ video directly so motion, timing, and audio-capable model inputs are preserved.
 Other vision models use chronologically sampled, timestamped frames.
 
 Never pass a video to detect_objects or encode it as image_url; use this tool.
+
+This tool accepts images and videos only — plus SVG, which is listed above and
+belongs here whenever the question is about the design it encodes. It is not a way
+to find out what a file is: judge an unfamiliar file by the extension in its
+filename, and read other text or code with read_file. A bare file_id carries no
+filename: take the name from the same task's get_file_info or from the file
+listing that gave you the id, and if neither resolves it, skip the id rather than
+probing it here.
                 """.strip(),
             ),
             VisionFunctionTool(
@@ -514,7 +528,7 @@ async def create_vision_tools(config: "BaseToolConfig") -> List[Any]:
     if not vision_model:
         return []
 
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
 
     try:
         return get_vision_tool(vision_model=vision_model, workspace=workspace)

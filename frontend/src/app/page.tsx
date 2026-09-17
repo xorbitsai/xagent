@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import { useRouter } from "next/navigation";
 import {
   ChevronRight, Layers, Bot, Database,
@@ -19,33 +20,165 @@ import {
 } from "@/components/ui/alert-dialog";
 import Link from "next/link";
 import { useState, useEffect, useRef } from "react";
-import { apiRequest } from "@/lib/api-wrapper";
-import { getApiUrl } from "@/lib/utils";
-import type { ConnectionInfo, Template } from "@/types/template";
+import { apiRequest, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
+import { cn, getApiUrl, resolveAgentLogoUrl } from "@/lib/utils";
+import { formatDisplayDate } from "@/lib/time-utils";
+import { resolveTaskLlmSelection } from "@/lib/models";
+import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
+import * as homePageExtensionModule from "@/lib/home-page-extension";
+import { HomePageExtension } from "@/lib/home-page-extension";
+import type { HomeGetStartedDestinationOverrides } from "@/lib/page-extension-contracts";
+import { toast } from "@/components/ui/sonner";
+
+interface HomeTemplateConnection {
+  name: string;
+  logo: string | null;
+}
+
+interface HomeTemplateCard {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  features: string[];
+  connections: HomeTemplateConnection[];
+  setup_time: string;
+  likes: number;
+  used_count: number;
+  type: string;
+}
 
 interface RecentTask {
-  task_id: number | string;
-  title?: string | null;
-  agent_name?: string | null;
+  task_id: number;
+  title: string;
+  created_at?: string | null;
+  agent_name?: string;
   agent_logo_url?: string | null;
-  created_at: string;
 }
 
-interface LlmModel {
-  model_id: string;
-  is_default?: boolean;
+function isSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value);
 }
 
-interface DefaultModelRecord {
-  config_type?: "general" | "small_fast" | "visual" | "compact";
-  model?: {
-    model_id?: string;
-  } | null;
+function decodeHomeTemplateCard(value: unknown): HomeTemplateCard | null {
+  if (
+    !isJsonRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.name !== "string" ||
+    typeof value.category !== "string" ||
+    typeof value.description !== "string" ||
+    !Array.isArray(value.features) ||
+    !value.features.every((feature) => typeof feature === "string") ||
+    !Array.isArray(value.connections) ||
+    typeof value.setup_time !== "string" ||
+    !isSafeInteger(value.likes) ||
+    !isSafeInteger(value.used_count)
+  ) return null;
+
+  const connections: HomeTemplateConnection[] = [];
+  for (const connection of value.connections) {
+    if (
+      !isJsonRecord(connection) ||
+      typeof connection.name !== "string" ||
+      (typeof connection.logo !== "string" && connection.logo !== null)
+    ) return null;
+    connections.push({ name: connection.name, logo: connection.logo });
+  }
+
+  return {
+    id: value.id,
+    name: value.name,
+    category: value.category,
+    description: value.description,
+    features: [...value.features],
+    connections,
+    setup_time: value.setup_time,
+    likes: value.likes,
+    used_count: value.used_count,
+    // Optional on the wire (older cached responses, other clients); default
+    // to "agent" like the backend does everywhere else.
+    type: typeof value.type === "string" ? value.type : "agent",
+  };
+}
+
+function decodeHomeTemplates(value: unknown): HomeTemplateCard[] | null {
+  if (!Array.isArray(value)) return null;
+  const templates: HomeTemplateCard[] = [];
+  for (const template of value) {
+    const decoded = decodeHomeTemplateCard(template);
+    if (!decoded) return null;
+    // The home page's "Use Template" button only knows how to build a
+    // single agent (/build/new?template=). Workforce templates need the
+    // dedicated instantiation flow on the Templates page instead, so they
+    // are left out of this surface rather than silently producing a
+    // broken, empty-instruction agent.
+    if (decoded.type === "workforce") continue;
+    templates.push(decoded);
+  }
+  return templates;
+}
+
+function decodeRecentTask(value: unknown): RecentTask | null {
+  if (
+    !isJsonRecord(value) ||
+    !isSafeInteger(value.task_id) ||
+    value.task_id <= 0 ||
+    typeof value.title !== "string" ||
+    (value.created_at !== undefined && value.created_at !== null && typeof value.created_at !== "string") ||
+    (value.agent_name !== undefined && typeof value.agent_name !== "string") ||
+    (value.agent_logo_url !== undefined && value.agent_logo_url !== null && typeof value.agent_logo_url !== "string")
+  ) return null;
+
+  return {
+    task_id: value.task_id,
+    title: value.title,
+    created_at: value.created_at,
+    agent_name: value.agent_name,
+    agent_logo_url: value.agent_logo_url,
+  };
+}
+
+function decodeRecentTasks(value: unknown): RecentTask[] | null {
+  if (!isJsonRecord(value) || !Array.isArray(value.tasks)) return null;
+  const tasks: RecentTask[] = [];
+  for (const task of value.tasks) {
+    const decoded = decodeRecentTask(task);
+    if (!decoded) return null;
+    tasks.push(decoded);
+  }
+  return tasks;
+}
+
+// `homeGetStartedDestinationOverrides` is an OPTIONAL export of the replaceable
+// home-page-extension module: a replacement that only implements the required
+// `HomePageExtension` export must still build, so this is read through the
+// module namespace with a fallback rather than a static named import.
+const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =
+  (homePageExtensionModule as { homeGetStartedDestinationOverrides?: HomeGetStartedDestinationOverrides })
+    .homeGetStartedDestinationOverrides ?? {}
+
+const defaultHomeGetStartedDestinations: { video: null } & Record<
+  Exclude<keyof HomeGetStartedDestinationOverrides, "video">,
+  string
+> = {
+  video: null,
+  docs: "https://docs.xagent.co/api-reference/introduction",
+  guides: "https://docs.xagent.co/models/overview",
+  whatsNew: "https://docs.xagent.co/release-notes",
+}
+
+function resolveHomeGetStartedDestination(
+  configured: unknown,
+  defaultDestination: string | null,
+): string | null {
+  if (configured === undefined) return defaultDestination
+  if (typeof configured !== "string" || configured.trim().length === 0) return null
+  return configured
 }
 
 export default function Home() {
@@ -53,38 +186,75 @@ export default function Home() {
   const { t, locale } = useI18n();
   const { setPendingMessage, setTaskId } = useApp();
   const branding = getBrandingFromEnv();
-  const [templates, setTemplates] = useState<Template[]>([]);
+  const [templates, setTemplates] = useState<HomeTemplateCard[]>([]);
   const [recentTasks, setRecentTasks] = useState<RecentTask[]>([]);
   const [isCreating, setIsCreating] = useState(false);
   const [showNoModelAlert, setShowNoModelAlert] = useState(false);
   const [visibleGetStartedVideos, setVisibleGetStartedVideos] = useState<Set<number>>(new Set());
   const getStartedSectionRef = useRef<HTMLDivElement | null>(null);
   const homeChatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const mountedRef = useRef(false);
+  const activeTaskCreateAttemptRef = useRef<number | null>(null);
+  const taskCreateCounterRef = useRef(0);
+  const draftRevisionRef = useRef(0);
   const homeVoiceInput = useVoiceInputControls();
 
   useEffect(() => {
-    const fetchData = async () => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; activeTaskCreateAttemptRef.current = null; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const isCurrent = () => active;
+
+    const fetchTemplates = async () => {
       try {
-        const [templatesRes, tasksRes] = await Promise.all([
-          apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`),
-          apiRequest(`${getApiUrl()}/api/chat/tasks?page=1&per_page=5`)
-        ]);
+        const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
+        if (!isCurrent()) return;
+        if (!response.ok) throw new Error(`Template request failed: ${response.status}`);
 
-        if (templatesRes.ok) {
-          const data = await templatesRes.json();
-          setTemplates(Array.isArray(data) ? data.slice(0, 3) : []);
-        }
+        const parsed = await parseApiResponse(response);
+        if (!isCurrent()) return;
+        const decoded = decodeHomeTemplates(parsed.data);
+        if (!decoded) throw new Error("Invalid template response");
 
-        if (tasksRes.ok) {
-          const data = await tasksRes.json();
-          setRecentTasks((data.tasks || (Array.isArray(data) ? data : [])) as RecentTask[]);
-        }
+        setTemplates(decoded.slice(0, 3));
       } catch (error) {
-        console.error("Failed to fetch data", error);
+        if (isCurrent()) {
+          setTemplates([]);
+          console.error("Failed to fetch templates:", error);
+        }
       }
     };
-    fetchData();
+
+    void fetchTemplates();
+    return () => { active = false; };
   }, [locale]);
+
+  useEffect(() => {
+    let active = true;
+
+    const fetchRecentTasks = async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?page=1&per_page=5`);
+        if (!active) return;
+        if (!response.ok) throw new Error(`Recent task request failed: ${response.status}`);
+
+        const parsed = await parseApiResponse(response);
+        if (!active) return;
+        const decoded = decodeRecentTasks(parsed.data);
+        if (!decoded) throw new Error("Invalid recent task response");
+
+        setRecentTasks(decoded);
+      } catch (error) {
+        if (active) console.error("Failed to fetch recent tasks:", error);
+      }
+    };
+
+    void fetchRecentTasks();
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     const section = getStartedSectionRef.current;
@@ -132,103 +302,91 @@ export default function Home() {
     router.push(`/build/new?template=${templateId}`);
   };
 
-  const resolveTaskLlmIds = async (): Promise<[string, string | null, string | null, string | null] | null> => {
-    const apiUrl = getApiUrl();
-    const [modelsResponse, defaultResponse] = await Promise.all([
-      apiRequest(`${apiUrl}/api/models/?category=llm`, { headers: {} }),
-      apiRequest(`${apiUrl}/api/models/user-default`, { headers: {} }),
-    ]);
-
-    let allModels: LlmModel[] = [];
-    if (modelsResponse.ok) {
-      const modelsData = await modelsResponse.json();
-      if (Array.isArray(modelsData)) {
-        allModels = modelsData as LlmModel[];
-      }
-    }
-
-    const defaultModels: Record<string, string | undefined> = {};
-    if (defaultResponse.ok) {
-      const defaultsData = await defaultResponse.json();
-      if (Array.isArray(defaultsData)) {
-        defaultsData.forEach((defaultConfig: DefaultModelRecord) => {
-          if (defaultConfig?.config_type && defaultConfig.model?.model_id) {
-            defaultModels[defaultConfig.config_type] = defaultConfig.model.model_id;
-          }
-        });
-      }
-    }
-
-    const generalModelId =
-      defaultModels.general ||
-      allModels.find((model) => model.is_default)?.model_id ||
-      allModels[0]?.model_id;
-
-    if (!generalModelId) {
-      return null;
-    }
-
-    return [
-      generalModelId,
-      defaultModels.small_fast ?? null,
-      defaultModels.visual ?? null,
-      defaultModels.compact ?? null,
-    ];
-  };
-
   const handleCreateTask = async (content: string) => {
-    if (isCreating) return;
+    const submittedPrompt = content.trim();
+    if (!submittedPrompt) return;
+    if (activeTaskCreateAttemptRef.current !== null) return;
+
+    const attempt = ++taskCreateCounterRef.current;
+    activeTaskCreateAttemptRef.current = attempt;
+    const revision = draftRevisionRef.current;
+    const isCurrent = () => mountedRef.current && activeTaskCreateAttemptRef.current === attempt;
+
     setIsCreating(true);
+
     try {
-      const llmIds = await resolveTaskLlmIds();
-      if (!llmIds) {
-        setShowNoModelAlert(true);
+      let task = null;
+
+      try {
+        const selection = await resolveTaskLlmSelection();
+        if (!isCurrent()) return;
+
+        if (selection.kind === "no_model") {
+          setShowNoModelAlert(true);
+          return;
+        }
+        if (selection.kind === "operational_error") throw selection.error;
+
+        const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            title: normalizeTaskPromptTitle(submittedPrompt),
+            description: submittedPrompt,
+            llm_ids: selection.llmIds,
+          }),
+        });
+
+        if (!isCurrent()) return;
+        const parsed = await parseApiResponse(taskResponse);
+        if (!isCurrent()) return;
+
+        task = taskResponse.ok ? parseTaskCreateCore(parsed.data) : null;
+        if (!task) throw new Error("Failed to create task");
+      } catch (error) {
+        if (isCurrent()) {
+          console.error("Failed to create task:", error);
+          toast.error(t("common.errors.taskFailed"));
+        }
         return;
       }
 
-      const requestBody = {
-        title: content,
-        description: content,
-        llm_ids: llmIds,
-      };
+      if (!isCurrent() || !task) return;
 
-      const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(requestBody),
-      });
+      try {
+        if (!isCurrent()) return;
+        setPendingMessage({
+          message: submittedPrompt,
+          files: [],
+          targetTaskId: task.taskId,
+        });
 
-      if (taskResponse.ok) {
-        const taskData = await taskResponse.json();
-        const taskId = taskData.id || taskData.task_id;
+        if (!isCurrent()) return;
+        setTaskId(task.taskId);
 
-        if (taskId) {
-          const parsedTaskId = typeof taskId === 'string' ? parseInt(taskId) : taskId;
-
-          setPendingMessage({
-            message: content,
-            files: [],
-            targetTaskId: parsedTaskId
-          });
-
-          setTaskId(parsedTaskId);
+        if (!isCurrent()) return;
+        if (draftRevisionRef.current === revision && homeChatInputRef.current) {
+          homeChatInputRef.current.value = "";
+          homeChatInputRef.current.style.height = "auto";
+          draftRevisionRef.current += 1;
         }
-      } else {
-        console.error("Failed to create task");
+      } catch (error) {
+        if (isCurrent()) console.error("Failed to commit task creation:", error);
       }
-    } catch (err) {
-      console.error("Failed to send message:", err);
     } finally {
-      setIsCreating(false);
+      if (isCurrent()) {
+        activeTaskCreateAttemptRef.current = null;
+        setIsCreating(false);
+      }
     }
   };
 
   const handleChatButtonClick = () => {
     const val = homeChatInputRef.current?.value;
     if (val && val.trim()) {
-      handleCreateTask(val.trim());
+      handleCreateTask(val);
     }
   };
 
@@ -270,11 +428,11 @@ export default function Home() {
 
           <div className="flex flex-wrap justify-center items-center gap-1.5 sm:gap-2 bg-[hsl(234_30%_25%/0.4)] rounded-full border border-[hsl(234_30%_35%)] p-1.5 mb-10 backdrop-blur-md">
             <Link href="/templates" className="flex items-center gap-2 px-4 py-2 rounded-full hover:bg-[hsl(234_30%_35%)] text-white transition-colors text-[14px] font-semibold">
-              <Layers className="w-4 h-4" /> <span className="hidden sm:inline">{t("nav.templates")}</span>
+              <Layers className="w-4 h-4" /> <span className="hidden sm:inline">{t("nav.addTeammates")}</span>
             </Link>
             <div className="w-px h-5 bg-[hsl(234_30%_40%)] mx-0.5 sm:mx-1 hidden sm:block" />
             <Link href="/build" className="flex items-center gap-2 px-4 py-2 rounded-full hover:bg-[hsl(234_30%_35%)] text-white transition-colors text-[14px] font-semibold">
-              <Bot className="w-4 h-4" /> <span className="hidden sm:inline">{t("nav.build")}</span>
+              <Bot className="w-4 h-4" /> <span className="hidden sm:inline">{t("nav.myTeam")}</span>
             </Link>
             <div className="w-px h-5 bg-[hsl(234_30%_40%)] mx-0.5 sm:mx-1 hidden sm:block" />
             <Link href="/task" className="flex items-center gap-2 px-4 py-2 rounded-full bg-[hsl(234_40%_40%)] hover:bg-[hsl(234_40%_45%)] text-white transition-colors text-[14px] font-semibold shadow-sm">
@@ -294,6 +452,7 @@ export default function Home() {
               className="border-0 bg-transparent text-white text-[16px] leading-relaxed placeholder:text-[hsl(240_5%_60%)] focus-visible:ring-0 focus-visible:outline-none flex-1 resize-none overflow-hidden min-h-[28px] max-h-[120px] py-1 px-2"
               rows={1}
               onInput={(e) => {
+                draftRevisionRef.current += 1;
                 const target = e.target as HTMLTextAreaElement;
                 target.style.height = "auto";
                 target.style.height = Math.min(target.scrollHeight, 120) + "px";
@@ -302,7 +461,7 @@ export default function Home() {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
                   if (e.currentTarget.value.trim() && !isCreating) {
-                    handleCreateTask(e.currentTarget.value.trim());
+                    handleCreateTask(e.currentTarget.value);
                   }
                 }
               }}
@@ -368,14 +527,18 @@ export default function Home() {
           <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.getStarted.title")}</h2>
           <div ref={getStartedSectionRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-10">
             {[
-              { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4" },
-              { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: "https://docs.xagent.co/api-reference/introduction" },
-              { title: t("home.getStarted.guides.title"), desc: t("home.getStarted.guides.description"), icon: <ListChecks className="w-8 h-8 text-green-500" />, bg: "bg-green-50 dark:bg-green-950/30", link: "https://docs.xagent.co/models/overview" },
-              { title: t("home.getStarted.whatsNew.title"), desc: t("home.getStarted.whatsNew.description"), icon: <Sparkles className="w-8 h-8 text-orange-500" />, bg: "bg-orange-50 dark:bg-orange-950/30", link: "https://docs.xagent.co/release-notes" }
+              { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.video, defaultHomeGetStartedDestinations.video) },
+              { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.docs, defaultHomeGetStartedDestinations.docs) },
+              { title: t("home.getStarted.guides.title"), desc: t("home.getStarted.guides.description"), icon: <ListChecks className="w-8 h-8 text-green-500" />, bg: "bg-green-50 dark:bg-green-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.guides, defaultHomeGetStartedDestinations.guides) },
+              { title: t("home.getStarted.whatsNew.title"), desc: t("home.getStarted.whatsNew.description"), icon: <Sparkles className="w-8 h-8 text-orange-500" />, bg: "bg-orange-50 dark:bg-orange-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.whatsNew, defaultHomeGetStartedDestinations.whatsNew) }
             ].map((card, i) => {
               const shouldLoadVideo = card.video ? visibleGetStartedVideos.has(i) : false;
+              const isLinked = typeof card.link === "string";
               const cardContent = (
-                <Card className="py-0 gap-0 overflow-hidden border-border/60 hover:shadow-md transition-all duration-300 group cursor-pointer bg-card rounded-xl flex flex-col h-full">
+                <Card className={cn(
+                  "py-0 gap-0 overflow-hidden border-border/60 transition-all duration-300 bg-card rounded-xl flex flex-col h-full",
+                  isLinked && "hover:shadow-md group cursor-pointer",
+                )}>
                   <div
                     className={`h-[180px] relative flex items-center justify-center overflow-hidden ${card.video ? 'bg-muted' : card.bg}`}
                     data-get-started-video={card.video ? "true" : undefined}
@@ -401,24 +564,30 @@ export default function Home() {
                         </div>
                       )
                     ) : (
-                      <div className="group-hover:scale-110 transition-transform duration-300">
+                      <div className={cn(
+                        "transition-transform duration-300",
+                        isLinked && "group-hover:scale-110",
+                      )}>
                         {card.icon}
                       </div>
                     )}
                   </div>
                   <CardContent className="p-4 flex-1">
-                    <h3 className="font-semibold text-[13px] mb-1 group-hover:text-primary transition-colors">{card.title}</h3>
+                    <h3 className={cn(
+                      "font-semibold text-[13px] mb-1 transition-colors",
+                      isLinked && "group-hover:text-primary",
+                    )}>{card.title}</h3>
                     <p className="text-[12px] text-muted-foreground leading-relaxed">{card.desc}</p>
                   </CardContent>
                 </Card>
               );
 
-              return card.link ? (
-                <a key={i} href={card.link} target="_blank" rel="noopener noreferrer" className="block outline-none">
+              return isLinked ? (
+                <a key={i} href={card.link!} target="_blank" rel="noopener noreferrer" className="block rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
                   {cardContent}
                 </a>
               ) : (
-                <div key={i} className="block outline-none">
+                <div key={i} className="block">
                   {cardContent}
                 </div>
               );
@@ -471,7 +640,7 @@ export default function Home() {
                         <div className="flex items-center">
                           {template.connections && template.connections.length > 0 ? (
                             <div className="flex gap-1.5">
-                              {template.connections.slice(0, 4).map((conn: ConnectionInfo, idx: number) => (
+                              {template.connections.slice(0, 4).map((conn, idx: number) => (
                                 <div key={idx} className="w-8 h-8 rounded-lg bg-background border border-border flex items-center justify-center overflow-hidden shadow-sm">
                                   {conn.logo ? <img src={conn.logo} alt={conn.name} className="w-5 h-5 object-contain" /> : <span className="text-[10px] font-bold text-primary/70">{(conn.name || "").substring(0, 2).toUpperCase()}</span>}
                                 </div>
@@ -508,12 +677,17 @@ export default function Home() {
             <>
               <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.recent.title")}</h2>
               <div className="space-y-3">
-                {recentTasks.map(task => (
+                {recentTasks.map((task) => {
+                  const resolvedLogoUrl = resolveAgentLogoUrl(task.agent_logo_url, getApiUrl());
+                  const displayDate = formatDisplayDate(task.created_at, locale, {
+                    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+                  });
+                  return (
                   <Link key={task.task_id} href={`/task/${task.task_id}`} className="flex items-center justify-between p-4 rounded-2xl border border-border/60 bg-card hover:border-primary/30 hover:shadow-md transition-all duration-300 group">
                     <div className="flex items-center gap-5">
                       <div className="w-12 h-12 rounded-xl bg-primary/5 flex items-center justify-center shrink-0 border border-primary/10">
-                        {task.agent_logo_url ? (
-                          <img src={task.agent_logo_url.startsWith("http") ? task.agent_logo_url : `${getApiUrl()}${task.agent_logo_url}`} alt="Agent" className="w-7 h-7 rounded object-cover" />
+                        {resolvedLogoUrl ? (
+                          <img src={resolvedLogoUrl} alt="Agent" className="w-7 h-7 rounded object-cover" />
                         ) : (
                           <Bot className="w-6 h-6 text-primary/80" />
                         )}
@@ -521,7 +695,7 @@ export default function Home() {
                       <div>
                         <h4 className="font-semibold text-[16px] group-hover:text-primary transition-colors">{task.title || t("home.recent.untitledTask")}</h4>
                         <p className="text-[13px] text-muted-foreground mt-0.5 font-medium">
-                          {task.agent_name || t("home.recent.defaultAgent")} • {new Date(task.created_at).toLocaleDateString(locale === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          {task.agent_name || t("home.recent.defaultAgent")}{displayDate ? ` • ${displayDate}` : ""}
                         </p>
                       </div>
                     </div>
@@ -529,12 +703,16 @@ export default function Home() {
                       <ChevronRight className="w-4 h-4" />
                     </div>
                   </Link>
-                ))}
+                  );
+                })}
               </div>
             </>
           )}
 
         </div>
+      </div>
+      <div data-slot="home-page-extension" className="shrink-0">
+        <HomePageExtension />
       </div>
     </div>
   );

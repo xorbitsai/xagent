@@ -7,11 +7,22 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ...context.enrichment import (
+    latest_pending_user_response,
+    pending_user_responses,
+    top_level_user_request,
+)
 from ...language import (
-    OUTPUT_LANGUAGE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_PLAN,
+    detect_prose_script_mismatch,
+    detect_response_language_script_mismatch,
+    effective_output_language,
     normalize_response_language_label,
-    output_language_policy,
     plan_language_rules,
+    render_structured_request_language_policy,
+    request_context_output_language,
+    serialize_pending_user_response,
 )
 from ..base import (
     RequiredToolCallError,
@@ -41,6 +52,14 @@ class PlanToolArgumentsError(ValueError):
         super().__init__(message)
 
 
+class PlanLanguageMismatchError(PlanValidationError):
+    """Raised when generated plan prose contradicts its language declaration."""
+
+    def __init__(self, message: str, *, response_language: str) -> None:
+        self.response_language = response_language
+        super().__init__(message)
+
+
 @dataclass
 class PlanStep:
     """Serializable DAG step used by the execution runtime."""
@@ -52,6 +71,14 @@ class PlanStep:
     termination_condition: str | None = None
     completion_evidence: str | None = None
     tool_names: list[str] = field(default_factory=list)
+    # One of: pending, running, completed, failed, interrupted,
+    # clarification_invalidated. clarification_invalidated marks a step
+    # whose question was superseded by another step's question in the
+    # same concurrent batch before it reached the user; the step is not
+    # terminal and becomes schedulable again once the batch settles.
+    # waiting_for_user is never a step status -- a step waiting on the
+    # user stays "running" here, and only the owning pattern's own
+    # status field moves to "waiting_for_user".
     status: str = "pending"
     result: Any = None
     error: str | None = None
@@ -173,11 +200,13 @@ class PlanGenerationRequest:
     previous_plan: ExecutionPlan | None = None
     available_tool_names: list[str] = field(default_factory=list)
     completion_feedback: str | None = None
+    reply_driven: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "execution_id": self.execution_id,
             "replan": self.replan,
+            "reply_driven": self.reply_driven,
             "completed_step_results": dict(self.completed_step_results),
             "previous_plan": (
                 self.previous_plan.to_dict() if self.previous_plan is not None else None
@@ -295,6 +324,10 @@ class LLMPlanGenerator(PlanGenerator):
                     "user-facing prose should use for this request. If the "
                     "user prompt includes an output_language_policy field, "
                     "follow it exactly and make response_language match it. "
+                    "Emit response_language before steps in the tool arguments so "
+                    "it anchors every plan field generated after it. Determine it "
+                    "from latest_user_request and pending_response, not from "
+                    "the surrounding context. "
                     "For Chinese requests, response_language must be Simplified "
                     "Chinese or Traditional Chinese to match the request script; "
                     "do not use generic Chinese. "
@@ -309,11 +342,30 @@ class LLMPlanGenerator(PlanGenerator):
                     "dependency id must also appear in the returned steps. "
                     "Include completed steps that new work depends on so their "
                     "results can be reused."
+                    + (
+                        " pending_responses are the user's authoritative "
+                        "answers to questions steps asked, newest last: if "
+                        "any declines, cancels, or narrows the work, drop or "
+                        "modify the remaining steps and do not re-emit work "
+                        "an answer rejected."
+                        if request.reply_driven
+                        else ""
+                    )
                 ),
             },
             {"role": "user", "content": self._build_prompt(request)},
         ]
+
+        def finalize(plan: ExecutionPlan) -> ExecutionPlan:
+            return self._filter_suggested_tools(
+                plan=plan,
+                available_tool_names=request.available_tool_names,
+            )
+
         retry_feedback: str | None = None
+        # A plan that only triggered the soft language nudge stays usable, so a
+        # worse second attempt must not turn a working plan into a hard failure.
+        nudged_plan: ExecutionPlan | None = None
         for attempt in range(MAX_PLAN_TOOL_CALL_ATTEMPTS):
             attempt_messages = list(messages)
             if retry_feedback:
@@ -336,6 +388,8 @@ class LLMPlanGenerator(PlanGenerator):
                 )
             except RequiredToolCallError:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
                     raise
                 retry_feedback = self._required_tool_call_retry_feedback(
                     self.PLAN_TOOL_NAME
@@ -350,6 +404,8 @@ class LLMPlanGenerator(PlanGenerator):
                 continue
             except PlanToolArgumentsError as exc:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
                     raise
                 retry_feedback = self._invalid_tool_arguments_retry_feedback(exc)
                 logger.warning(
@@ -360,11 +416,17 @@ class LLMPlanGenerator(PlanGenerator):
                     exc,
                 )
                 continue
-            self._apply_response_language(request.context, plan_arguments)
             try:
                 plan = coerce_execution_plan(plan_arguments)
+                self._validate_plan_language(
+                    context=request.context,
+                    plan=plan,
+                    plan_arguments=plan_arguments,
+                )
             except PlanValidationError as exc:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
                     raise
                 retry_feedback = self._invalid_plan_retry_feedback(exc)
                 logger.warning(
@@ -374,10 +436,20 @@ class LLMPlanGenerator(PlanGenerator):
                     exc,
                 )
                 continue
-            return self._filter_suggested_tools(
-                plan=plan,
-                available_tool_names=request.available_tool_names,
-            )
+            if attempt + 1 < MAX_PLAN_TOOL_CALL_ATTEMPTS and not (
+                self._has_external_language_authority(request.context)
+            ):
+                reminder = self._request_language_reminder(request.context, plan)
+                if reminder is not None:
+                    retry_feedback = reminder
+                    nudged_plan = plan
+                    logger.info(
+                        "LLMPlanGenerator plan language may not match the request; "
+                        "asking the planner to re-check once. execution_id=%s",
+                        request.execution_id,
+                    )
+                    continue
+            return finalize(plan)
         raise RuntimeError("LLMPlanGenerator retry loop exited unexpectedly.")
 
     def _filter_suggested_tools(
@@ -417,6 +489,25 @@ class LLMPlanGenerator(PlanGenerator):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        # Keep response_language first. Tool arguments are emitted
+                        # autoregressively by supported models, so committing to the
+                        # language before generating plan prose gives every later
+                        # field a concrete anchor without another LLM call.
+                        "response_language": {
+                            "type": "string",
+                            "description": (
+                                "Emit this field before steps. Natural language to "
+                                "use for all plan text, user-facing prose, and "
+                                "persisted tool-argument prose produced by the plan, "
+                                "for example English, Simplified Chinese, Traditional "
+                                "Chinese, or Spanish. Determine it only from "
+                                "latest_user_request, pending_response, and "
+                                "output_language_policy. For Chinese requests, "
+                                "choose Simplified Chinese or Traditional Chinese to "
+                                "match the request script; do not use generic Chinese. "
+                                "If output_language_policy names a language, match it."
+                            ),
+                        },
                         "steps": {
                             "type": "array",
                             "items": {
@@ -479,27 +570,22 @@ class LLMPlanGenerator(PlanGenerator):
                                 "additionalProperties": False,
                             },
                         },
-                        "response_language": {
-                            "type": "string",
-                            "description": (
-                                "Natural language to use for all plan text, "
-                                "user-facing prose, and persisted tool-argument "
-                                "prose produced by the plan, for example English, "
-                                "Simplified Chinese, Traditional Chinese, or Spanish. "
-                                "For Chinese requests, choose Simplified Chinese or "
-                                "Traditional Chinese to match the request script; do "
-                                "not use generic Chinese. If output_language_policy "
-                                "is provided in the prompt, match that policy."
-                            ),
-                        },
                     },
-                    "required": ["steps", "response_language"],
+                    "required": ["response_language", "steps"],
                     "additionalProperties": False,
                 },
             },
         }
 
     def _build_prompt(self, request: PlanGenerationRequest) -> str:
+        canonical_request = top_level_user_request(request.context)
+        pending_response = latest_pending_user_response(request.context)
+        # Scoped to reply-driven replans: the helper spans the whole root
+        # context, so any other call must keep the payload byte-identical.
+        all_pending_responses = (
+            pending_user_responses(request.context) if request.reply_driven else []
+        )
+        expected_language, language_source = self._language_authority(request.context)
         latest_messages = [
             {"role": message.role, "content": message.content}
             for message in request.context.messages
@@ -508,8 +594,30 @@ class LLMPlanGenerator(PlanGenerator):
         payload = {
             "execution_id": request.execution_id,
             "replan": request.replan,
-            "output_language_policy": output_language_policy(
-                request.context.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
+            # Quoted whole: the planner picks response_language from this field,
+            # and "messages" below already carries the full text anyway.
+            "latest_user_request": canonical_request.language_text,
+            "pending_response": (
+                serialize_pending_user_response(pending_response)
+                if pending_response is not None
+                else None
+            ),
+            "pending_responses": [
+                {
+                    "step_id": response.step_id,
+                    "question": response.question,
+                    "answer": response.answer,
+                }
+                for response in all_pending_responses
+            ],
+            "output_language_policy": render_structured_request_language_policy(
+                request_field="latest_user_request",
+                pending_field="pending_response",
+                output_language=(
+                    None
+                    if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
+                    else expected_language
+                ),
             ),
             "messages": latest_messages,
             "retrieved_memory_context": request.context.metadata.get(
@@ -531,17 +639,112 @@ class LLMPlanGenerator(PlanGenerator):
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
-    def _apply_response_language(context: Any, plan_arguments: dict[str, Any]) -> None:
+    def _language_authority(context: Any) -> tuple[str, str]:
+        """Return language value/source and migrate legacy direct-DAG metadata."""
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return "", ""
+        language = effective_output_language(context)
+        source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
+        if (
+            language
+            and not source
+            and metadata.get("pattern") == "dag_plan_execute"
+            and language != request_context_output_language(metadata)
+        ):
+            source = OUTPUT_LANGUAGE_SOURCE_PLAN
+            metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = source
+        return language, source
+
+    @staticmethod
+    def _has_external_language_authority(context: Any) -> bool:
+        """Whether an API caller pinned the output language via request_context."""
+        language, _ = LLMPlanGenerator._language_authority(context)
+        metadata = getattr(context, "metadata", None)
+        return bool(language) and language == request_context_output_language(metadata)
+
+    @staticmethod
+    def _step_prose(step: PlanStep) -> str:
+        return "\n".join(
+            value
+            for value in (
+                step.task,
+                step.description or "",
+                step.termination_condition or "",
+                step.completion_evidence or "",
+            )
+            if value
+        )
+
+    @staticmethod
+    def _validate_plan_language(
+        *,
+        context: Any,
+        plan: ExecutionPlan,
+        plan_arguments: dict[str, Any],
+    ) -> None:
         response_language = normalize_response_language_label(
             str(plan_arguments.get("response_language") or "")
         )
         if not response_language:
-            return
-        metadata = getattr(context, "metadata", None)
-        if isinstance(metadata, dict) and not metadata.get(
-            OUTPUT_LANGUAGE_METADATA_KEY
+            raise PlanLanguageMismatchError(
+                "response_language must be a supported, non-empty language label.",
+                response_language="",
+            )
+
+        expected_language, language_source = LLMPlanGenerator._language_authority(
+            context
+        )
+        if (
+            expected_language
+            and language_source != OUTPUT_LANGUAGE_SOURCE_PLAN
+            and response_language != expected_language
         ):
-            metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
+            raise PlanLanguageMismatchError(
+                f"response_language is {response_language}, but the current output "
+                f"language policy requires {expected_language}.",
+                response_language=expected_language,
+            )
+
+        for step in plan.steps:
+            mismatch = detect_response_language_script_mismatch(
+                response_language, LLMPlanGenerator._step_prose(step)
+            )
+            if mismatch is not None:
+                raise PlanLanguageMismatchError(
+                    f"response_language is {response_language}, but plan step "
+                    f"{step.id!r} has predominantly {mismatch.observed_script}-script "
+                    f"user-facing text ({mismatch.han_count} Han characters versus "
+                    f"{mismatch.latin_count} Latin letters).",
+                    response_language=response_language,
+                )
+
+    @staticmethod
+    def _request_language_reminder(context: Any, plan: ExecutionPlan) -> str | None:
+        """Return one retry nudge when plan prose looks off-script for the request.
+
+        Script comparison cannot tell a biased plan from a request that legitimately
+        asks for another language, so it may only nudge once, never reject a plan.
+        """
+        request = top_level_user_request(context).language_text
+        for step in plan.steps:
+            mismatch = detect_prose_script_mismatch(
+                request, LLMPlanGenerator._step_prose(step)
+            )
+            if mismatch is None:
+                continue
+            return (
+                f"Plan step {step.id!r} is written in predominantly "
+                f"{mismatch.observed_script} script, which does not match the "
+                "script of the latest user request. Re-read latest_user_request "
+                "and pending_response "
+                "above and decide the output language from that request alone, "
+                "including any language change it asks for explicitly or "
+                f"implicitly. Call {LLMPlanGenerator.PLAN_TOOL_NAME} again exactly "
+                "once. If that language is still correct for this request, keep it "
+                "and return the same plan language."
+            )
+        return None
 
     def _required_tool_call_retry_feedback(self, tool_name: str) -> str:
         return (
@@ -572,6 +775,16 @@ class LLMPlanGenerator(PlanGenerator):
         )
 
     def _invalid_plan_retry_feedback(self, error: PlanValidationError) -> str:
+        if isinstance(error, PlanLanguageMismatchError):
+            language = error.response_language or "the supported target language"
+            return (
+                f"The previous {self.PLAN_TOOL_NAME} call returned plan prose that "
+                f"did not match its language declaration: {error} Call "
+                f"{self.PLAN_TOOL_NAME} again exactly once. Emit response_language "
+                f"first, set it to {language}, and write every step task, "
+                "description, termination_condition, and completion_evidence in "
+                f"{language}."
+            )
         return (
             f"The previous {self.PLAN_TOOL_NAME} call returned an invalid DAG "
             f"plan: {error} Call {self.PLAN_TOOL_NAME} again exactly once with "

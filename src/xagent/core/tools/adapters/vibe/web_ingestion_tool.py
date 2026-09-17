@@ -99,7 +99,10 @@ async def _create_knowledge_base_from_url_impl(
             WebCrawlConfig,
         )
         from ...core.RAG_tools.pipelines.web_ingestion import run_web_ingestion
-        from .agent_kb_service import AgentKnowledgeBaseService
+        from .agent_kb_service import (
+            AgentKnowledgeBaseError,
+            AgentKnowledgeBaseService,
+        )
 
         tool_args = CreateKnowledgeBaseFromUrlArgs.model_validate(args)
 
@@ -124,10 +127,10 @@ async def _create_knowledge_base_from_url_impl(
             user_id=user_id,
             is_admin=is_admin,
         )
-        collection_name = await kb_service.prepare_collection(
-            collection_name=collection_name,
-            ingestion_config=ingest_config,
-        )
+        collection_name = await kb_service.prepare_collection(collection_name)
+        # The ingest pipeline writes a metadata row of its own; remember whether
+        # the collection is ours to clean up if the import produces nothing.
+        collection_existed_before = await kb_service.collection_exists(collection_name)
 
         logger.info(
             "Starting background web ingestion for %s into %s",
@@ -144,6 +147,8 @@ async def _create_knowledge_base_from_url_impl(
         )
 
         if result.status == "error":
+            if not collection_existed_before:
+                await kb_service.cleanup_failed_collection(collection_name)
             return CreateKnowledgeBaseFromUrlResult(
                 success=False,
                 collection_name=collection_name,
@@ -151,7 +156,61 @@ async def _create_knowledge_base_from_url_impl(
                 pages_crawled=0,
             ).model_dump()
 
+        # A crawl can finish without a single recorded failure and still ingest
+        # nothing (robots.txt, an empty site). Publishing then would leave a
+        # visible, empty knowledge base.
+        if int(result.documents_created or 0) <= 0:
+            if not collection_existed_before:
+                await kb_service.cleanup_failed_collection(collection_name)
+            return CreateKnowledgeBaseFromUrlResult(
+                success=False,
+                collection_name=collection_name,
+                message=(
+                    f"No pages were ingested from {tool_args.url}, so the "
+                    f"knowledge base was not created"
+                ),
+                pages_crawled=result.pages_crawled,
+            ).model_dump()
+
+        try:
+            await kb_service.publish_collection(
+                collection_name,
+                ingest_config,
+                collection_existed_before=collection_existed_before,
+            )
+        except AgentKnowledgeBaseError as exc:
+            # The pages landed; retrying would re-crawl and duplicate them.
+            logger.error("Could not publish agent knowledge base: %s", exc)
+            return CreateKnowledgeBaseFromUrlResult(
+                success=False,
+                collection_name=collection_name,
+                message=(
+                    f"Imported {result.pages_crawled} page(s) into "
+                    f"'{collection_name}' but could not publish it, so it is not "
+                    f"listed yet. Do not re-import; retry publishing: {exc}"
+                ),
+                pages_crawled=result.pages_crawled,
+            ).model_dump()
         await kb_service.refresh_collection_metadata(collection_name)
+
+        if result.crawl_blocked_by_site:
+            # Narrower than status == "partial" on purpose: a partial caused by
+            # individual pages failing to parse keeps reporting success, which
+            # is the existing policy. This is the other kind - nothing failed,
+            # the site simply refused everything past the start page. The pages
+            # that did land stay published (re-importing would re-crawl them),
+            # but calling it success would let an agent build on a knowledge
+            # base holding one page.
+            return CreateKnowledgeBaseFromUrlResult(
+                success=False,
+                collection_name=collection_name,
+                message=(
+                    f"{result.message} '{collection_name}' is published and "
+                    f"usable with what did land. Re-importing under the same "
+                    f"crawl settings will hit the same refusals."
+                ),
+                pages_crawled=result.pages_crawled,
+            ).model_dump()
 
         return CreateKnowledgeBaseFromUrlResult(
             success=True,

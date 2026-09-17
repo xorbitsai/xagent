@@ -31,6 +31,8 @@ class GmailWatchState(Base):  # type: ignore
 
     callback_id = Column(String(128), nullable=True, unique=True, index=True)
     push_audience = Column(Text, nullable=True)
+    previous_push_audience = Column(Text, nullable=True)
+    previous_push_audience_expires_at = Column(DateTime(timezone=True), nullable=True)
     subscription_name = Column(String(512), nullable=True)
     status = Column(String(32), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

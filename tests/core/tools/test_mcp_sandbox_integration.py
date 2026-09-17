@@ -14,7 +14,11 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper im
     list_tools_in_sandbox,
     should_sandbox_mcp_connection,
 )
+from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
+    SANDBOX_BASE_DEPENDENCIES,
+)
 from xagent.core.tools.core.mcp.sessions import Connection
+from xagent.sandbox.base import Sandbox
 
 
 class TestShouldSandboxMcpConnection:
@@ -39,8 +43,32 @@ class TestListToolsInSandbox:
     """Tests for sandbox-side MCP list_tools helper."""
 
     @pytest.mark.asyncio
+    async def test_requirements_preserve_mcp_without_reinstalling_uv(self):
+        # spec=Sandbox: an unspecced AsyncMock auto-vivifies any attribute,
+        # including `.primary_sandbox`, which makes resolve_primary_sandbox
+        # mistake this plain-sandbox double for a SandboxLeaseProvider.
+        sandbox = AsyncMock(spec=Sandbox)
+        sandbox.exec.side_effect = [
+            MagicMock(exit_code=0, stderr="", error_message=None),
+            MagicMock(exit_code=0),
+        ]
+        sandbox.read_file.return_value = "[]"
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.SandboxDependencyManager.ensure_requirements",
+            new=AsyncMock(),
+        ) as mock_ensure_requirements:
+            await list_tools_in_sandbox(
+                sandbox,
+                {"transport": "stdio", "command": "uvx", "args": ["demo"]},
+            )
+
+        requirements = mock_ensure_requirements.await_args.args[1]
+        assert requirements == [*SANDBOX_BASE_DEPENDENCIES, "mcp>=1.12.4,<2"]
+
+    @pytest.mark.asyncio
     async def test_reads_result_file_and_builds_tools(self):
-        sandbox = AsyncMock()
+        sandbox = AsyncMock(spec=Sandbox)
         sandbox.name = "test-sandbox"
 
         json_payload = '[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{}}}]'
@@ -142,6 +170,13 @@ class TestLoadMcpToolsAsAgentTools:
 
     @pytest.mark.asyncio
     async def test_sandbox_list_failure_is_preserved_without_secret(self, caplog):
+        # Pinned below default: the sandboxed-load path also emits a DEBUG
+        # traceback (test_sandbox_list_failure_debug_traceback_is_opt_in
+        # below), which would otherwise make this secret-safety assertion
+        # fail under an ambient DEBUG log level (e.g. `pytest -o
+        # log_level=DEBUG`) for a reason unrelated to what it actually
+        # guards: the always-on ERROR log staying class-name-only.
+        caplog.set_level("WARNING")
         connection: Connection = {
             "transport": "stdio",
             "command": "npx",
@@ -165,6 +200,30 @@ class TestLoadMcpToolsAsAgentTools:
         assert result.failures[0].error_type == "RuntimeError"
         assert "planted-sandbox-list-secret" not in repr(result)
         assert "planted-sandbox-list-secret" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_sandbox_list_failure_debug_traceback_is_opt_in(self, caplog):
+        # Companion to the test above: pins the other half of the two-layer
+        # contract -- opting into DEBUG surfaces the full traceback, so
+        # reproducing a failure with XAGENT_LOG_LEVEL=DEBUG (or --debug)
+        # actually captures it rather than silently getting nothing more
+        # than the always-on ERROR log already gives.
+        caplog.set_level("DEBUG")
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["demo"],
+        }
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.list_tools_in_sandbox",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            await load_mcp_tools_as_agent_tools(
+                {"demo": connection}, sandbox=MagicMock()
+            )
+
+        assert "RuntimeError: boom" in caplog.text
 
     @pytest.mark.asyncio
     async def test_sandbox_wrap_failure_preserves_other_wrapped_tools(self):

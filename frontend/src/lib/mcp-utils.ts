@@ -540,3 +540,52 @@ export function buildMcpServerPayload(
   })
   return payload
 }
+
+// --- MCP OAuth (remote server) connect helpers -----------------------------
+
+export interface McpOAuthConnectResponse {
+  authorization_url: string
+}
+
+/** Extract a human-readable message from an MCP OAuth endpoint error body.
+ * Shared by the custom-server form and the catalog connect dialog. */
+export async function parseMcpOAuthErrorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = await response.json()
+    if (typeof payload?.detail === "string") return payload.detail
+    if (payload?.detail?.message) return payload.detail.message
+    if (payload?.detail?.code) return payload.detail.code
+  } catch {
+    // Keep the provided fallback.
+  }
+  return fallback
+}
+
+/** The window name the mcp_oauth catalog connect popup opens under
+ * (connect-mcp-dialog.tsx), and the query param the callback appends on
+ * success. Shared so that popup-open side and the tools page's self-close
+ * guard can't drift apart on either literal.
+ *
+ * Not (yet) used by custom-mcp-form.tsx's own OAuth flow: that popup still
+ * opens under the reserved target "_blank", so window.name is empty there
+ * and this self-close mechanism never fires for it — a pre-existing gap,
+ * not something this constant's naming implies is already covered. */
+export const MCP_OAUTH_POPUP_WINDOW_NAME = "mcp-oauth"
+export const MCP_OAUTH_SUCCESS_PARAM = "mcp_oauth_success"
+
+/** Whether the tools page, loaded with these search params under this window
+ * name, is the mcp_oauth connect popup landing on a successful callback and
+ * should self-close. Keyed on the explicit success param (not on the absence
+ * of error params) so a future error param added to the callback redirect
+ * can't be mistaken for success here — see the PR review that flagged this
+ * coupling (N5). Extracted as a pure function so it's unit-testable without
+ * mounting the full tools page. */
+export function shouldSelfCloseMcpOauthPopup(
+  windowName: string,
+  searchParams: URLSearchParams,
+): boolean {
+  return (
+    searchParams.get(MCP_OAUTH_SUCCESS_PARAM) !== null &&
+    windowName === MCP_OAUTH_POPUP_WINDOW_NAME
+  )
+}

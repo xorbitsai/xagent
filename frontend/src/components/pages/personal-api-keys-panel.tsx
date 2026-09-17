@@ -18,6 +18,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
 import { copyToClipboard } from "@/lib/clipboard"
+import { userDisplayLabel } from "@/lib/user-display"
 import {
   PersonalApiKeyCreated,
   PersonalApiKeyListItem,
@@ -137,10 +138,13 @@ export function PersonalApiKeysPanel({ active }: PersonalApiKeysPanelProps) {
   const activeCount = useMemo(() => keys.filter((k) => k.status === "active").length, [keys])
 
   const formatDate = (value: string) => new Date(value).toLocaleDateString()
+  const confirmOwner = confirmKey
+    ? userDisplayLabel(confirmKey.owner, `#${confirmKey.owner.id}`)
+    : ""
   const revokeDescription = confirmKey
     ? canManageOthers
-      ? t("personalApiKeys.confirm.revokeOtherDescription", { owner: confirmKey.owner.username }) ||
-        `Revoke this personal key for ${confirmKey.owner.username}?`
+      ? t("personalApiKeys.confirm.revokeOtherDescription", { owner: confirmOwner }) ||
+        `Revoke this personal key for ${confirmOwner}?`
       : t("personalApiKeys.confirm.revokeOwnDescription") || "Revoking immediately invalidates this key."
     : ""
 
@@ -230,7 +234,11 @@ export function PersonalApiKeysPanel({ active }: PersonalApiKeysPanelProps) {
                       {key.masked_key}
                     </span>
                   </TableCell>
-                  {canManageOthers && <TableCell className="text-sm">{key.owner.username}</TableCell>}
+                  {canManageOthers && (
+                    <TableCell className="text-sm">
+                      {userDisplayLabel(key.owner, `#${key.owner.id}`)}
+                    </TableCell>
+                  )}
                   <TableCell>
                     <span
                       className={`inline-flex text-[11px] px-2 py-0.5 rounded-full capitalize font-medium ${statusPillClass(key.status)}`}

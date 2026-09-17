@@ -11,12 +11,14 @@ from sqlalchemy.orm import Session
 
 from ..models.task import Task, TaskStatus
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .ops_signals import CHECKPOINT_LEGACY_POINTER_AMBIGUOUS, clear_degradation
 from .task_lease_service import (
+    CheckpointRecoveryVerdict,
     TaskLeaseRecoveryCandidate,
     get_expired_task_lease_candidates,
     get_next_expired_task_lease_candidate_for_update,
-    has_recoverable_agent_checkpoint,
     recover_expired_task_lease_no_commit,
+    resolve_checkpoint_recovery,
     utc_now,
 )
 from .task_orchestrator import (
@@ -54,9 +56,17 @@ def recover_task_lease_candidate_no_commit(
 ) -> TaskStatus | None:
     """Stage one recovery and all lifecycle projections without committing."""
 
+    verdict = resolve_checkpoint_recovery(db, candidate)
+    if verdict is CheckpointRecoveryVerdict.INDETERMINATE:
+        # The checkpoint pointer's row identity could not be resolved this
+        # round (an ambiguous legacy event_id match). Leave the candidate's
+        # lease and status untouched -- no recovery statement runs below --
+        # so the next sweep re-selects it and can retry cleanly instead of
+        # failing a task whose checkpoint may in fact be readable.
+        return None
     next_status = (
         TaskStatus.PAUSED
-        if has_recoverable_agent_checkpoint(db, candidate)
+        if verdict is CheckpointRecoveryVerdict.RECOVERABLE
         else TaskStatus.FAILED
     )
     task_error = None if next_status == TaskStatus.PAUSED else TASK_LEASE_EXPIRED_ERROR
@@ -281,6 +291,14 @@ async def recover_expired_task_leases_until_cutoff(
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
 
+    # One drain is the unit this signal reports on: "the most recent
+    # completed sweep saw at least one ambiguous legacy pointer". Clearing
+    # per candidate would let a later clean candidate erase an earlier
+    # ambiguity inside the same sweep; clearing per page would let page 2
+    # erase what page 1 registered, since the cursor has already advanced
+    # past it. At either finer grain the signal could never stay set.
+    clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+
     recovered = 0
     cursor: TaskLeaseRecoveryCursor | None = None
     while True:
@@ -305,6 +323,7 @@ async def run_task_lease_recovery_loop(
 ) -> None:
     """Continuously recover expired leases while the backend process is alive."""
 
+    secret_cursor: int | None = None
     while True:
         try:
             recovered = await recover_expired_task_leases_until_cutoff(
@@ -313,6 +332,19 @@ async def run_task_lease_recovery_loop(
             )
             if recovered:
                 logger.info("Recovered %s expired task lease(s)", recovered)
+            from ...config import get_shared_task_execution_enabled
+
+            if get_shared_task_execution_enabled():
+                from .task_runtime_secrets import clean_finished_runtime_values
+
+                await run_db_io_cancellation_safe(
+                    lambda: recover_expired_idle_task_leases(batch_size=batch_size)
+                )
+                secret_cursor = await run_db_io_cancellation_safe(
+                    lambda: clean_finished_runtime_values(
+                        after_id=secret_cursor, batch_size=batch_size
+                    )
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -324,3 +356,31 @@ async def run_task_lease_recovery_loop(
                 logger.exception("Task lease recovery tick failed")
 
         await asyncio.sleep(poll_interval_seconds)
+
+
+def recover_expired_idle_task_leases(*, batch_size: int) -> int:
+    """Recover a bounded page of expired owners whose execution already settled."""
+    from sqlalchemy import select
+
+    from ..models.database import get_session_local
+    from .task_coordinator_service import recover_expired_idle_task_lease_no_commit
+
+    with get_session_local()() as db:
+        candidates = (
+            db.execute(
+                select(Task.id)
+                .where(
+                    Task.status != TaskStatus.RUNNING,
+                    Task.lease_expires_at < utc_now(),
+                )
+                .order_by(Task.lease_expires_at, Task.id)
+                .limit(batch_size)
+            )
+            .scalars()
+            .all()
+        )
+    recovered = 0
+    for task_id in candidates:
+        with get_session_local()() as db, db.begin():
+            recovered += recover_expired_idle_task_lease_no_commit(db, task_id)
+    return recovered

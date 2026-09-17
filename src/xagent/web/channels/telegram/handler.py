@@ -1,12 +1,17 @@
 import logging
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
 
 from ....core.agent.trace import TraceAction, TraceCategory, TraceEvent, TraceHandler
-from .utils import markdown_to_tg_html, strip_telegram_image_refs
+from .utils import (
+    CancelledDelivery,
+    deliver_cancellation_safe,
+    markdown_to_tg_html,
+    strip_telegram_image_refs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +27,30 @@ class TelegramTraceHandler(TraceHandler):
         self.chat_id = chat_id
         self.message_id = message_id
         self.current_text = ""
+        self.cancelled = False
+        self.discard_output = False
         self._last_status_update_at = 0.0
         self._last_status_text = ""
         self._activity_items: list[str] = []
 
+    def cancel(self, *, discard_output: bool = True) -> None:
+        """Permanently suppress streaming updates from this execution.
+
+        Args:
+            discard_output: Whether the execution's final answer is stale and
+                must be withheld (and any late delivery compensated). True when
+                the user left the conversation via ``/switch`` or ``/new``.
+                False for ``/stop``, which leaves the user in this same
+                conversation still waiting to read the partial answer.
+        """
+
+        self.cancelled = True
+        if discard_output:
+            self.discard_output = True
+
     async def handle_event(self, event: TraceEvent) -> None:
         try:
-            if not self._matches_task(event):
+            if self.cancelled or not self._matches_task(event):
                 return
 
             # We only care about assistant messages and coarse tool activity for Telegram.
@@ -125,7 +147,7 @@ class TelegramTraceHandler(TraceHandler):
         await self._update_message(text)
 
     async def _update_message(self, text: str, final: bool = False) -> None:
-        if not text:
+        if self.cancelled or not text:
             return
 
         text, image_refs = strip_telegram_image_refs(text)
@@ -139,37 +161,105 @@ class TelegramTraceHandler(TraceHandler):
         if self.current_text == display_text:
             return
 
-        self.current_text = display_text
+        def is_cancelled() -> bool:
+            # Gate compensation on discard_output, not cancelled: /stop halts
+            # streaming but leaves the user in this conversation, so deleting
+            # the message they are reading would be wrong.
+            return self.discard_output
+
+        async def delete_sent(msg: Any) -> None:
+            await self.bot.delete_message(
+                chat_id=self.chat_id, message_id=msg.message_id
+            )
 
         try:
             html_text = markdown_to_tg_html(display_text[:4000])
             if self.message_id is None:
-                try:
-                    msg = await self.bot.send_message(
+
+                async def send_html() -> Any:
+                    return await self.bot.send_message(
                         chat_id=self.chat_id, text=html_text, parse_mode=ParseMode.HTML
                     )
-                except Exception:
-                    # Fallback if HTML parsing fails
-                    msg = await self.bot.send_message(
+
+                async def send_plain() -> Any:
+                    return await self.bot.send_message(
                         chat_id=self.chat_id, text=display_text[:4000]
                     )
-                self.message_id = msg.message_id
-            else:
+
                 try:
-                    await self.bot.edit_message_text(
+                    msg = await deliver_cancellation_safe(
+                        send_html,
+                        is_cancelled=is_cancelled,
+                        delete=delete_sent,
+                        description=f"stream message for task {self.task_id}",
+                    )
+                except CancelledDelivery:
+                    return
+                except Exception:
+                    # Fallback if HTML parsing fails. The failed request was
+                    # awaited too, so the latch is re-checked by the primitive.
+                    try:
+                        msg = await deliver_cancellation_safe(
+                            send_plain,
+                            is_cancelled=is_cancelled,
+                            delete=delete_sent,
+                            description=f"stream message for task {self.task_id}",
+                        )
+                    except CancelledDelivery:
+                        return
+                if msg is None:
+                    return
+                self.message_id = msg.message_id
+                # Recorded only now: a skipped or cancelled send must not be
+                # remembered as delivered, or the dedup check above would
+                # suppress a later retry of the same text.
+                self.current_text = display_text
+            else:
+                message_id = self.message_id
+
+                async def edit_html() -> Any:
+                    return await self.bot.edit_message_text(
                         chat_id=self.chat_id,
-                        message_id=self.message_id,
+                        message_id=message_id,
                         text=html_text,
                         parse_mode=ParseMode.HTML,
                     )
+
+                async def edit_plain() -> Any:
+                    return await self.bot.edit_message_text(
+                        chat_id=self.chat_id,
+                        message_id=message_id,
+                        text=display_text[:4000],
+                    )
+
+                # An edit has no new message to remove, so a late success is
+                # compensated by removing the message it wrote into.
+                async def delete_edited(_result: Any) -> None:
+                    await self.bot.delete_message(
+                        chat_id=self.chat_id, message_id=message_id
+                    )
+
+                try:
+                    await deliver_cancellation_safe(
+                        edit_html,
+                        is_cancelled=is_cancelled,
+                        delete=delete_edited,
+                        description=f"stream edit for task {self.task_id}",
+                    )
+                except CancelledDelivery:
+                    return
                 except Exception as e:
                     if "message is not modified" not in str(e).lower():
-                        # Fallback if HTML parsing fails
-                        await self.bot.edit_message_text(
-                            chat_id=self.chat_id,
-                            message_id=self.message_id,
-                            text=display_text[:4000],
-                        )
+                        try:
+                            await deliver_cancellation_safe(
+                                edit_plain,
+                                is_cancelled=is_cancelled,
+                                delete=delete_edited,
+                                description=f"stream edit for task {self.task_id}",
+                            )
+                        except CancelledDelivery:
+                            return
+                self.current_text = display_text
         except Exception as e:
             if "message is not modified" not in str(e).lower():
                 logger.error(f"Error updating Telegram message: {e}")

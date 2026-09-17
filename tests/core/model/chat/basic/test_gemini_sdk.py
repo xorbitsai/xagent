@@ -675,6 +675,40 @@ class TestGeminiLLMSDK:
         print("✅ 500 server error correctly caught as retryable")
 
     @pytest.mark.asyncio
+    async def test_context_overflow_uses_typed_non_retryable_error(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        from google.genai import errors as genai_errors
+
+        from xagent.core.model.chat.error import retry_on
+        from xagent.core.model.chat.exceptions import LLMContextLengthError
+
+        message = (
+            "The input token count (461428) exceeds the maximum number of "
+            "tokens allowed (131072)."
+        )
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 400
+        mock_response.json.return_value = {"error": {"code": 400, "message": message}}
+        mock_client = mocker.MagicMock()
+
+        async def mock_generate_content_error(*args: Any, **kwargs: Any) -> None:
+            raise genai_errors.ClientError(
+                code=400,
+                response_json={"error": {"code": 400, "message": message}},
+                response=mock_response,
+            )
+
+        mock_client.aio.models.generate_content = mock_generate_content_error
+        mocker.patch("google.genai.Client", return_value=mock_client)
+
+        with pytest.raises(LLMContextLengthError) as exc_info:
+            await llm.chat([{"role": "user", "content": "Test"}])
+
+        assert message in str(exc_info.value)
+        assert retry_on(exc_info.value) is False
+
+    @pytest.mark.asyncio
     async def test_504_deadline_exceeded_error_is_retryable(
         self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
     ) -> None:

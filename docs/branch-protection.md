@@ -191,7 +191,7 @@ The required contexts are therefore the two summary jobs:
 | context | job | covers |
 | --- | --- | --- |
 | `Migrations Summary` | `test-migrations.yml` | `detect-migration-changes`, `Test SQLite Migrations`, `Test PostgreSQL Migrations` |
-| `CI Summary` | `ci.yml` | `pre-commit`, `pytest-fast`, `pytest-fast-deepdoc`, `pytest-slow`, `e2e`, `frontend-build`, `prepare-deepdoc-cache` |
+| `CI Summary` | `ci.yml` | `changes`, `pre-commit`, `pytest-fast`, `pytest-fast-deepdoc`, `pytest-slow`, `e2e`, `frontend-build`, `prepare-deepdoc-cache` |
 
 Both declare `if: always()` and fail unless every job they gather reports
 `success` -- a gathered job that is `skipped`, `failure` or `cancelled` fails
@@ -217,6 +217,62 @@ which reports success, which is the exact hole the summary exists to close.
 Adding a job to either workflow does not automatically gate on it. It has to be
 added to that summary's `needs` and to its `check_job` list, or it is advisory
 only.
+
+`ci.yml` follows the same shape. Its `changes` job reports which halves of the
+tree a pull request touches, and `pytest-fast`, `pytest-fast-deepdoc`,
+`pytest-slow`, `e2e` and `frontend-build` gate every one of their *steps* on
+that output. On a docs-only pull request those five jobs still start and still
+report `success`, their own steps finishing in about twenty seconds.
+`prepare-deepdoc-cache` is not gated, so on a cache miss `pytest-fast-deepdoc`
+and `pytest-slow` wait on it first. Non-`pull_request` events --
+`merge_group`, `push` to `main`, `workflow_dispatch` -- never filter at all, so
+the queue re-runs the full suite against the tree that will actually land and
+stays the backstop for anything the filters get wrong.
+
+Step-level gating has a failure mode of its own that job-level gating does not: if the `changes` outputs come back empty, every guarded work step skips, only the `Skip` sentinel runs, and the job reports `success` having tested nothing. A skipped job at least shows up grey in the UI; this one is green, and `check_job` cannot tell the difference. `CI Summary` therefore also asserts that each output is a literal `true` or `false` and fails on an empty one -- that is the only way this summary could otherwise pass vacuously, so it is checked explicitly rather than trusted to the expression that produces it.
+
+The detector has a blind spot in the same family. `paths-filter` reads the changed file list from `pulls.listFiles`, which returns at most 3000 files, and it never compares the rows it received against the pull request's own `changed_files` count -- so past that cutoff it can report a perfectly genuine `false` while code sits in the part it could not see. Both outputs therefore fall back to "run everything" once `changed_files` exceeds 3000, or if that count is missing entirely; an absent count compares as `0`, so the `== null` clause is doing real work rather than restating the size check.
+
+The `frontend` filter names `.gitignore` because hatchling honours it when selecting the files that go into the wheel -- this repository's own `artifacts` override for `frontend_dist` exists precisely because gitignored paths are otherwise dropped -- and `frontend-build` runs the only step that inspects a built wheel. It names `README.md` for a related reason: `pyproject.toml` declares it as the project `readme`, root markdown is excluded from `code`, and `frontend-build` owns the only `python -m build --wheel` in the workflow. Without that rule a pull request that renames or deletes the README skips the one job that would notice hatchling can no longer resolve it. It names `src/xagent/**` rather than the entrypoint alone for the same reason read the other way: `pyproject.toml` packages the whole tree, and hatchling drops any file `.gitignore` matches -- without consulting git's index, so a tracked file force-added under a pattern like `data/` or `default.yaml` is simply absent from the wheel. That is a change no rule above would catch, because it touches only backend sources. Anything narrower here reopens the gap that the previously unconditional wheel build used to cover (PR #1848 review).
+
+`code` excludes `frontend/src/**` and not `frontend/**`, which looks timid but is the widest exclusion that is actually safe: `tests/test_docker_workflow_versions.py` reads `frontend/package.json` and `tests/templates/test_manager.py` reads `frontend/public`, and `paths-filter` cannot express "exclude the directory but keep those two" -- once a pattern excludes a file, no later pattern includes it back. So a frontend-source-only pull request skips the Python lanes, while a `package.json` or asset change still runs them.
+
+`tests/test_ci_summary_contract.py` holds all of the above as tests: that
+`needs` and `check_job` name the same set of jobs, that no gathered job carries
+a condition beyond the draft guard, that both outputs fall back to running
+everything on a truncated or missing file count, that the `frontend` filter still
+covers whatever `pyproject` points `readme` at, and that the paths-filter action
+stays pinned to its reviewed commit.
+
+Several of those assertions are narrower than they first look, because the
+obvious version of each passes while still being bypassable. A step guard is
+checked for *polarity*, not merely for naming the output: work steps must lead
+with `== 'true'`, the single `Skip` sentinel must be exactly `!= 'true'`, and any
+`&&` conjunct a work step adds has to match the matrix or cache predicates it is
+allowed to narrow itself with -- accepting an arbitrary conjunct would let
+`&& github.event_name == 'push'` skip the step on every pull request with the job
+still green. Guard polarity alone still describes a job that runs nothing, so
+each gated Python job must also carry a step invoking `python -m pytest`. The
+output expressions are frozen whole rather than checked for their clauses,
+because `&&` binds tighter than `||` and a rewritten chain keeps every clause
+while inverting what it means. The pin is asserted on the step carrying
+`id: filter`, and `paths-filter` must appear in the job exactly once -- searching
+the job for the SHA would also accept a dead pinned step sitting beside a real
+gate on a mutable tag.
+
+Each of these assertions was confirmed to fail against a deliberately broken
+workflow before being committed.
+
+### Two contract tests own ci.yml
+
+`ci.yml` is guarded from both sides, and a change to it usually has to update both:
+
+- `tests/test_ci_summary_contract.py` (runs ungated in `pre-commit`, and again in `pytest-fast-deepdoc`) checks the properties above structurally, over the parsed YAML.
+- `frontend/src/ci/frontend-test-manifest.test.ts` (runs in `frontend-build`) freezes exactly one region by *exact text*: the `Check required jobs` script, whose non-comment lines must match a hard-coded list element for element. It also executes that script under `bash` to prove failures propagate, so keep the `${{ needs.* }}` interpolations inline in `run:` -- moving them to `env:` leaves that execution with unset variables and silently guts the check.
+
+The six required `frontend-build` test steps are *not* frozen by text. They are checked semantically, over the parsed YAML: each `npm run` command must appear in exactly one step, with `working-directory: ./frontend`, no `continue-on-error`, a bash-compatible shell, and an `if:` that is either absent or exactly `needs.changes.outputs.frontend == 'true'`. Renaming a step, reordering it, or rewriting its key layout is therefore free; changing what it runs or how it is guarded is not. The gate is allowlisted by exact value and nothing else is, so the rule it protects still holds: no *arbitrary* condition can turn a required frontend step off.
+
+That file also pins both `jobs.changes` filter rule sets, which is a deliberate overlap rather than duplication. The Python contract's load-bearing run is the `pre-commit` job: it carries no `changes` condition, so no filter edit can skip it, and `CI Summary` gathers it. Its `pytest-fast-deepdoc` registration is duplicate coverage on top of that, not the thing holding the invariant up -- do not remove the `pre-commit` step as redundant, because that is what reopens the self-gating hole (`Run CI contract tests`, and `test_the_contract_runs_in_a_job_the_filter_cannot_gate` is what fails if it goes). The frontend contract is still `frontend`-gated, which is why pinning the rules in both places earns its keep: dropping `.github/workflows/ci.yml` from the `frontend` filter skips the frontend contract, and the ungated Python run is what still objects. The merge queue's unfiltered run is a further backstop behind both, not the only detector.
 
 This is also why `CI Summary` had to become required at all: before it did, only
 the migration checks gated, and a PR with red `pytest`, `e2e` or `pre-commit`

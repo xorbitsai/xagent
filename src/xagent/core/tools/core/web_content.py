@@ -124,6 +124,42 @@ def get_trusted_proxy_url() -> str | None:
     return proxy_url
 
 
+def build_isolated_httpx_client_kwargs(proxy_url: str | None) -> dict[str, Any]:
+    """Return ``httpx.AsyncClient`` kwargs that never trust ambient proxy config.
+
+    ``httpx.AsyncClient`` defaults to ``trust_env=True``, which (via
+    ``httpx._utils.get_environment_proxies()``) falls back to
+    ``urllib.request.getproxies()`` once no ``HTTP(S)_PROXY``/``ALL_PROXY``
+    env var is set -- and that function itself falls back to the OS's own
+    proxy configuration (``getproxies_macosx_sysconf()``/
+    ``getproxies_registry()`` on macOS/Windows, confirmed against the
+    installed httpx source). That reopens the DNS-rebinding TOCTOU window
+    ``get_trusted_proxy_url()`` exists to close, even when it returns
+    ``None`` because no proxy is explicitly trusted: the caller of this
+    module would still silently route through whatever proxy the OS itself
+    is configured with. ``trust_env=False`` disables that whole lookup, but
+    an explicit ``proxy=`` kwarg (passed by the caller here, never derived
+    from the client) is honored regardless of ``trust_env``.
+
+    ``trust_env=False`` also stops httpx from honoring ``SSL_CERT_FILE``/
+    ``SSL_CERT_DIR`` for the default CA bundle (both gated behind the same
+    ``trust_env`` flag in ``httpx.create_ssl_context()``), which would break
+    TLS verification for a host behind a private/internal CA. Build that SSL
+    context explicitly with ``trust_env=True`` and pass it as ``verify=``:
+    once ``verify`` is already a concrete ``ssl.SSLContext``,
+    ``create_ssl_context()`` returns it unchanged, so the client's own
+    ``trust_env=False`` no longer affects CA lookup at all.
+    """
+
+    client_kwargs: dict[str, Any] = {
+        "trust_env": False,
+        "verify": httpx.create_ssl_context(trust_env=True),
+    }
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+    return client_kwargs
+
+
 class WebContentFetcher:
     """Fetch webpages and convert readable HTML content to markdown."""
 
@@ -146,10 +182,9 @@ class WebContentFetcher:
 
         headers = {"User-Agent": DEFAULT_USER_AGENT}
         try:
-            client_kwargs: dict[str, Any] = {}
             if self._proxy_url:
-                client_kwargs["proxy"] = self._proxy_url
                 logger.info("Using proxy for webpage fetch: %s", self._proxy_url)
+            client_kwargs = build_isolated_httpx_client_kwargs(self._proxy_url)
 
             async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await fetch_public_http_bytes(

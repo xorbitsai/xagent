@@ -40,6 +40,12 @@ class ChatModelConfig(ModelConfig):
     default_max_tokens: Optional[int] = None
     context_window: Optional[int] = None  # Total context window in tokens
     thinking_mode: bool = False
+    # Runtime-only settings for a configured router model. They are populated
+    # from the user's Auto configuration and are intentionally not stored on a
+    # concrete provider model row.
+    router_config_name: Optional[str] = None
+    router_candidate_models: Optional[List[str]] = None
+    router_fallback_model: Optional[str] = None
 
 
 class ImageModelConfig(ModelConfig):

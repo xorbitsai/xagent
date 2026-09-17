@@ -11,6 +11,12 @@ import pytest
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
+from tests.web.pool_contention_shared import (
+    CONTENTION_POOL_TIMEOUT,
+    GUARD_TIMEOUT,
+    assert_pool_checkout_off_loop,
+    gated_pool_checkout,
+)
 from xagent.web.models.agent import Agent
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.user import User
@@ -31,6 +37,29 @@ from ..conftest import (
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+# Cross-thread handshake deadline.
+#
+# Every ``Event.wait`` and ``asyncio.wait_for`` below is a rendezvous, not a
+# latency assertion: the other side releases it the moment it reaches the
+# point under test. The deadline exists only so that a genuine deadlock fails
+# one test instead of hanging the suite, so it is sized for the worst CI
+# machine rather than for the expected one.
+#
+# It has to be generous because CI runs this suite as ``pytest -n 4`` on a
+# 4-vCPU runner that is simultaneously driving a Docker daemon and contended
+# database transactions. The 2s budget these waits used to carry was routinely
+# missed there. Oversubscribing an 18-core machine ~8x reproduces the exact CI
+# failures: ``assert False`` on a handshake wait, ``TimeoutError`` on a
+# settlement wait.
+_HANDSHAKE_TIMEOUT = 30.0
+
+# Deliberately short, and deliberately not the constant above: this probe
+# waits on something that must *not* happen (a second fence acquisition while
+# the first is still held), so the wait is pure cost -- a longer one would
+# only slow the suite down without strengthening the assertion.
+_NEGATIVE_PROBE_TIMEOUT = 0.1
 
 
 def _admin_identity() -> tuple[int, bool]:
@@ -69,18 +98,18 @@ async def _cancel_after_runtime_key_commit(
     committed: threading.Event,
     release: threading.Event,
 ) -> None:
-    assert await asyncio.to_thread(committed.wait, 2)
+    assert await asyncio.to_thread(committed.wait, _HANDSHAKE_TIMEOUT)
     operation.cancel()
     release.set()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(operation, timeout=2)
+        await asyncio.wait_for(operation, timeout=_HANDSHAKE_TIMEOUT)
 
 
 @pytest.mark.asyncio
 async def test_create_and_rotate_hash_without_holding_pool_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """bcrypt is worker-owned and runs before either write transaction opens."""
+    """Key hashing is worker-owned and precedes either write transaction."""
 
     from xagent.core.utils import api_key
 
@@ -89,23 +118,23 @@ async def test_create_and_rotate_hash_without_holding_pool_connection(
     event_loop_thread = threading.get_ident()
     hash_observations: list[tuple[int, int]] = []
     sql_threads: list[int] = []
-    original_hashpw = api_key.bcrypt.hashpw
+    original_hash_api_key = api_key.hash_api_key
 
     @event.listens_for(engine, "before_cursor_execute")
     def record_sql_thread(*_args) -> None:  # type: ignore[no-untyped-def]
         sql_threads.append(threading.get_ident())
 
-    def recording_hashpw(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def recording_hash_api_key(*args, **kwargs):  # type: ignore[no-untyped-def]
         hash_observations.append((threading.get_ident(), engine.pool.checkedout()))
-        return original_hashpw(*args, **kwargs)
+        return original_hash_api_key(*args, **kwargs)
 
-    monkeypatch.setattr(api_key.bcrypt, "hashpw", recording_hashpw)
+    monkeypatch.setattr(api_key, "hash_api_key", recording_hash_api_key)
     runtime = AgentManagementRuntime()
 
     created = await runtime.create_agent(
         user_id=user_id,
         is_admin=is_admin,
-        spec=_create_spec("bcrypt boundary"),
+        spec=_create_spec("hash boundary"),
     )
     rotated = await runtime.rotate_agent_runtime_key(
         user_id=user_id,
@@ -126,28 +155,25 @@ async def test_list_pool_wait_does_not_block_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user_id, _is_admin = _admin_identity()
-    engine = _install_one_slot_queue_pool(monkeypatch, pool_timeout=0.5)
+    engine = _install_one_slot_queue_pool(
+        monkeypatch, pool_timeout=CONTENTION_POOL_TIMEOUT
+    )
     held_connection = engine.connect()
     runtime = AgentManagementRuntime()
-    listing = asyncio.create_task(runtime.list_agents(user_id=user_id))
-
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        for _ in range(4):
-            await asyncio.sleep(0.01)
-            ticks += 1
-
     try:
-        await ticker()
-        assert ticks == 4
-        assert listing.done() is False
+        with gated_pool_checkout(engine) as gate:
+            listing = asyncio.create_task(runtime.list_agents(user_id=user_id))
+            try:
+                await gate.wait_until_contending()
+                assert not listing.done()
+            finally:
+                held_connection.close()
+                gate.let_through()
+                result = await asyncio.wait_for(listing, timeout=GUARD_TIMEOUT)
+        assert result == ()
     finally:
         held_connection.close()
-
-    assert await listing == ()
-    engine.dispose()
+        engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -176,13 +202,13 @@ async def test_list_cache_io_never_holds_database_pool_slot(
     def gated_cache_get(_key: str):  # type: ignore[no-untyped-def]
         cache_observations.append(("get", engine.pool.checkedout()))
         cache_get_entered.set()
-        assert allow_cache_get.wait(timeout=2)
+        assert allow_cache_get.wait(timeout=_HANDSHAKE_TIMEOUT)
         return None
 
     def gated_cache_set(_key: str, _value):  # type: ignore[no-untyped-def]
         cache_observations.append(("set", engine.pool.checkedout()))
         cache_set_entered.set()
-        assert allow_cache_set.wait(timeout=2)
+        assert allow_cache_set.wait(timeout=_HANDSHAKE_TIMEOUT)
 
     def probe_pool() -> None:
         with engine.connect() as connection:
@@ -194,12 +220,12 @@ async def test_list_cache_io_never_holds_database_pool_slot(
     listing = asyncio.create_task(AgentManagementRuntime().list_agents(user_id=user_id))
 
     try:
-        assert await asyncio.to_thread(cache_get_entered.wait, 2)
+        assert await asyncio.to_thread(cache_get_entered.wait, _HANDSHAKE_TIMEOUT)
         assert cache_observations == [("get", 0)]
         await asyncio.to_thread(probe_pool)
         allow_cache_get.set()
 
-        assert await asyncio.to_thread(cache_set_entered.wait, 2)
+        assert await asyncio.to_thread(cache_set_entered.wait, _HANDSHAKE_TIMEOUT)
         assert cache_observations == [("get", 0), ("set", 0)]
         await asyncio.to_thread(probe_pool)
         allow_cache_set.set()
@@ -257,7 +283,7 @@ async def test_write_pool_wait_does_not_block_event_loop(
         )
 
     try:
-        assert await asyncio.to_thread(candidate_ready.wait, 2)
+        assert await asyncio.to_thread(candidate_ready.wait, _HANDSHAKE_TIMEOUT)
         for _ in range(4):
             await asyncio.sleep(0.01)
         assert write.done() is False
@@ -286,7 +312,7 @@ async def test_cancelled_pool_wait_drains_worker_before_propagating(
     monkeypatch.setattr(runtime, "_list_agents_sync", recording_list)
     listing = asyncio.create_task(runtime.list_agents(user_id=user_id))
 
-    assert await asyncio.to_thread(worker_started.wait, 1)
+    assert await asyncio.to_thread(worker_started.wait, _HANDSHAKE_TIMEOUT)
     listing.cancel()
     held_connection.close()
 
@@ -320,7 +346,7 @@ async def test_cancel_after_committed_create_revokes_the_undelivered_exact_key(
         captured["agent_id"] = int(agent.id)
         captured["prefix"] = response.key_prefix
         committed.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=_HANDSHAKE_TIMEOUT)
         return agent, response
 
     monkeypatch.setattr(
@@ -425,7 +451,7 @@ async def test_cancel_after_committed_rotation_revokes_the_undelivered_exact_key
         assert response is not None
         captured["prefix"] = response.key_prefix
         committed.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=_HANDSHAKE_TIMEOUT)
         return response
 
     monkeypatch.setattr(
@@ -496,7 +522,7 @@ async def test_later_rotation_fence_prevents_stale_compensation_from_restoring_o
         if rotate_calls == 1:
             captured["first_prefix"] = response.key_prefix
             committed.set()
-            assert release.wait(timeout=2)
+            assert release.wait(timeout=_HANDSHAKE_TIMEOUT)
         return response
 
     monkeypatch.setattr(
@@ -510,7 +536,7 @@ async def test_later_rotation_fence_prevents_stale_compensation_from_restoring_o
             agent_id=target.agent.id,
         )
     )
-    assert await asyncio.to_thread(committed.wait, 2)
+    assert await asyncio.to_thread(committed.wait, _HANDSHAKE_TIMEOUT)
 
     later = await AgentManagementRuntime().rotate_agent_runtime_key(
         user_id=user_id,
@@ -521,7 +547,7 @@ async def test_later_rotation_fence_prevents_stale_compensation_from_restoring_o
     operation.cancel()
     release.set()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(operation, timeout=2)
+        await asyncio.wait_for(operation, timeout=_HANDSHAKE_TIMEOUT)
 
     db = _direct_db_session()
     try:
@@ -567,11 +593,11 @@ async def test_sqlite_runtime_key_transition_fence_serializes_transactions() -> 
         with SessionLocal() as db:
             assert acquire_runtime_key_transition_fence(db, target.agent.id)
             first_acquired.set()
-            assert release_first.wait(timeout=2)
+            assert release_first.wait(timeout=_HANDSHAKE_TIMEOUT)
             db.commit()
 
     def acquire_second_fence() -> None:
-        assert first_acquired.wait(timeout=2)
+        assert first_acquired.wait(timeout=_HANDSHAKE_TIMEOUT)
         with SessionLocal() as db:
             second_started.set()
             assert acquire_runtime_key_transition_fence(db, target.agent.id)
@@ -579,16 +605,18 @@ async def test_sqlite_runtime_key_transition_fence_serializes_transactions() -> 
             db.commit()
 
     first = asyncio.create_task(asyncio.to_thread(hold_first_fence))
-    assert await asyncio.to_thread(first_acquired.wait, 2)
+    assert await asyncio.to_thread(first_acquired.wait, _HANDSHAKE_TIMEOUT)
     second = asyncio.create_task(asyncio.to_thread(acquire_second_fence))
-    assert await asyncio.to_thread(second_started.wait, 2)
+    assert await asyncio.to_thread(second_started.wait, _HANDSHAKE_TIMEOUT)
     try:
-        assert not await asyncio.to_thread(second_acquired.wait, 0.1)
+        assert not await asyncio.to_thread(
+            second_acquired.wait, _NEGATIVE_PROBE_TIMEOUT
+        )
     finally:
         release_first.set()
 
-    await asyncio.wait_for(first, timeout=2)
-    await asyncio.wait_for(second, timeout=2)
+    await asyncio.wait_for(first, timeout=_HANDSHAKE_TIMEOUT)
+    await asyncio.wait_for(second, timeout=_HANDSHAKE_TIMEOUT)
     assert second_acquired.is_set()
     observer = _direct_db_session()
     try:
@@ -743,7 +771,7 @@ async def test_compensation_cancellation_is_not_swallowed_after_worker_settles(
 
     def delayed_compensation(_receipt: RuntimeKeyReceipt) -> None:
         started.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=_HANDSHAKE_TIMEOUT)
 
     monkeypatch.setattr(runtime, "_compensate_runtime_key_sync", delayed_compensation)
     compensation = asyncio.create_task(
@@ -751,12 +779,12 @@ async def test_compensation_cancellation_is_not_swallowed_after_worker_settles(
             RuntimeKeyReceipt(key_id=1, agent_id=2, key_prefix="ABC123")
         )
     )
-    assert await asyncio.to_thread(started.wait, 2)
+    assert await asyncio.to_thread(started.wait, _HANDSHAKE_TIMEOUT)
     compensation.cancel()
     release.set()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(compensation, timeout=2)
+        await asyncio.wait_for(compensation, timeout=_HANDSHAKE_TIMEOUT)
 
 
 @pytest.mark.asyncio
@@ -800,7 +828,7 @@ async def test_runtime_key_delivery_keeps_worker_error_as_cancellation_cause() -
 
     def operation() -> _RuntimeKeyDeliveryOutcome[object]:
         started.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=_HANDSHAKE_TIMEOUT)
         return _RuntimeKeyDeliveryOutcome(
             result=None,
             receipt=None,
@@ -811,12 +839,12 @@ async def test_runtime_key_delivery_keeps_worker_error_as_cancellation_cause() -
     caller = asyncio.create_task(
         AgentManagementRuntime()._run_runtime_key_delivery(operation)
     )
-    assert await asyncio.to_thread(started.wait, 2)
+    assert await asyncio.to_thread(started.wait, _HANDSHAKE_TIMEOUT)
     caller.cancel()
     release.set()
 
     with pytest.raises(asyncio.CancelledError) as exc_info:
-        await asyncio.wait_for(caller, timeout=1)
+        await asyncio.wait_for(caller, timeout=_HANDSHAKE_TIMEOUT)
 
     assert exc_info.value.__cause__ is worker_error
 
@@ -832,7 +860,7 @@ async def test_runtime_key_delivery_keeps_process_control_over_cancellation() ->
 
     def operation() -> _RuntimeKeyDeliveryOutcome[object]:
         started.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=_HANDSHAKE_TIMEOUT)
         return _RuntimeKeyDeliveryOutcome(
             result=None,
             receipt=None,
@@ -843,12 +871,12 @@ async def test_runtime_key_delivery_keeps_process_control_over_cancellation() ->
     caller = asyncio.create_task(
         AgentManagementRuntime()._run_runtime_key_delivery(operation)
     )
-    assert await asyncio.to_thread(started.wait, 2)
+    assert await asyncio.to_thread(started.wait, _HANDSHAKE_TIMEOUT)
     caller.cancel()
     release.set()
 
     with pytest.raises(WorkerShutdown) as exc_info:
-        await asyncio.wait_for(caller, timeout=1)
+        await asyncio.wait_for(caller, timeout=_HANDSHAKE_TIMEOUT)
 
     assert exc_info.value is shutdown
 
@@ -1077,7 +1105,7 @@ async def test_cancelled_receipt_failure_is_not_replaced_by_session_close_failur
         original_close(session)
         if close_calls == 1:
             close_started.set()
-            assert release_close.wait(timeout=2)
+            assert release_close.wait(timeout=_HANDSHAKE_TIMEOUT)
             raise close_error
 
     monkeypatch.setattr(Session, "commit", fail_after_commit)
@@ -1098,12 +1126,12 @@ async def test_cancelled_receipt_failure_is_not_replaced_by_session_close_failur
             runtime.rotate_agent_runtime_key(user_id=user_id, agent_id=agent_id)
         )
 
-    assert await asyncio.to_thread(close_started.wait, 2)
+    assert await asyncio.to_thread(close_started.wait, _HANDSHAKE_TIMEOUT)
     operation.cancel()
     release_close.set()
 
     with pytest.raises(asyncio.CancelledError) as exc_info:
-        await asyncio.wait_for(operation, timeout=2)
+        await asyncio.wait_for(operation, timeout=_HANDSHAKE_TIMEOUT)
 
     assert exc_info.value.__cause__ is primary_error
     monkeypatch.undo()
@@ -1150,7 +1178,9 @@ async def test_compensation_keeps_the_event_loop_responsive_while_pool_is_held(
     from xagent.web.services import agent_management
 
     user_id, is_admin = _admin_identity()
-    engine = _install_one_slot_queue_pool(monkeypatch, pool_timeout=2)
+    engine = _install_one_slot_queue_pool(
+        monkeypatch, pool_timeout=CONTENTION_POOL_TIMEOUT
+    )
     committed = threading.Event()
     release = threading.Event()
     original_create = (
@@ -1160,7 +1190,7 @@ async def test_compensation_keeps_the_event_loop_responsive_while_pool_is_held(
     def pause_after_commit(service, *args, **kwargs):  # type: ignore[no-untyped-def]
         result = original_create(service, *args, **kwargs)
         committed.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=_HANDSHAKE_TIMEOUT)
         return result
 
     monkeypatch.setattr(
@@ -1175,24 +1205,27 @@ async def test_compensation_keeps_the_event_loop_responsive_while_pool_is_held(
             spec=_create_spec("pool compensation"),
         )
     )
-    assert await asyncio.to_thread(committed.wait, 2)
+    assert await asyncio.to_thread(committed.wait, _HANDSHAKE_TIMEOUT)
     held_connection = engine.connect()
-    operation.cancel()
-    release.set()
     try:
-        ticks = 0
-        for _ in range(4):
-            await asyncio.sleep(0.01)
-            ticks += 1
-        assert ticks == 4
-        assert operation.done() is False
+        # Cancellation may swallow a worker failure. Assert the checkout's
+        # thread outside the worker as well as observing the parked operation.
+        with assert_pool_checkout_off_loop(engine), gated_pool_checkout(engine) as gate:
+            operation.cancel()
+            release.set()
+            try:
+                await gate.wait_until_contending()
+                assert not operation.done()
+            finally:
+                held_connection.close()
+                gate.let_through()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(operation, timeout=_HANDSHAKE_TIMEOUT)
     finally:
+        release.set()
         held_connection.close()
-
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(operation, timeout=2)
-    assert engine.pool.checkedout() == 0
-    engine.dispose()
+        assert engine.pool.checkedout() == 0
+        engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1213,7 +1246,7 @@ async def test_cancellation_stays_primary_when_runtime_key_compensation_fails(
     def pause_after_commit(service, *args, **kwargs):  # type: ignore[no-untyped-def]
         result = original_create(service, *args, **kwargs)
         committed.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=_HANDSHAKE_TIMEOUT)
         return result
 
     monkeypatch.setattr(
@@ -1233,12 +1266,12 @@ async def test_cancellation_stays_primary_when_runtime_key_compensation_fails(
             spec=_create_spec("compensation failure"),
         )
     )
-    assert await asyncio.to_thread(committed.wait, 2)
+    assert await asyncio.to_thread(committed.wait, _HANDSHAKE_TIMEOUT)
     operation.cancel()
     release.set()
 
     with pytest.raises(asyncio.CancelledError) as exc_info:
-        await asyncio.wait_for(operation, timeout=2)
+        await asyncio.wait_for(operation, timeout=_HANDSHAKE_TIMEOUT)
 
     assert exc_info.value.__cause__ is compensation_error
 
@@ -1264,7 +1297,7 @@ async def test_compensation_process_control_wins_over_caller_cancellation(
     def pause_after_commit(service, *args, **kwargs):  # type: ignore[no-untyped-def]
         result = original_create(service, *args, **kwargs)
         committed.set()
-        assert release.wait(timeout=2)
+        assert release.wait(timeout=_HANDSHAKE_TIMEOUT)
         return result
 
     monkeypatch.setattr(
@@ -1284,12 +1317,12 @@ async def test_compensation_process_control_wins_over_caller_cancellation(
             spec=_create_spec("compensation shutdown"),
         )
     )
-    assert await asyncio.to_thread(committed.wait, 2)
+    assert await asyncio.to_thread(committed.wait, _HANDSHAKE_TIMEOUT)
     operation.cancel()
     release.set()
 
     with pytest.raises(WorkerShutdown) as exc_info:
-        await asyncio.wait_for(operation, timeout=2)
+        await asyncio.wait_for(operation, timeout=_HANDSHAKE_TIMEOUT)
 
     assert exc_info.value is shutdown
 

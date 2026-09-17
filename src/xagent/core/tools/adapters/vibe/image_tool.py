@@ -67,31 +67,65 @@ class ImageGenerationTool(ImageGenerationToolCore):
 
     def get_tools(self) -> list:
         """Get all tool instances."""
-        # Format descriptions with model information
-        generate_description = self.GENERATE_IMAGE_DESCRIPTION.format(
-            self._model_info_text
-        )
-        edit_description = self.EDIT_IMAGE_DESCRIPTION.format(
-            self._edit_model_info_text
-        )
+        # A note inside the description is not enough: models blind-retry a
+        # registered-but-doomed tool, so an unusable one has to leave the schema.
+        # list_image_models stays whenever the ability probes return — it is the
+        # only way to answer "why is there nothing here". A probe that *raises*
+        # takes the whole toolset with it, by design: that is a broken model
+        # class, not a deployment without image models.
+        can_generate = self._get_model() is not None
+        can_edit = self._get_edit_model() is not None
 
-        tools = [
-            ImageGenerationFunctionTool(
-                self.generate_image,
-                name="generate_image",
-                description=generate_description,
-            ),
-            ImageGenerationFunctionTool(
-                self.edit_image,
-                name="edit_image",
-                description=edit_description,
-            ),
+        # Withholding a tool is silent otherwise: the operator sees "editing
+        # stopped working" with nothing in the log pointing at the abilities.
+        # isEnabledFor guards the summary, which walks every model eagerly.
+        if (not can_edit or not can_generate) and logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "Image tools withheld (generate=%s, edit=%s) from models: %s",
+                can_generate,
+                can_edit,
+                self._available_models_summary(),
+            )
+
+        tools = []
+
+        if can_generate:
+            generate_description = self.GENERATE_IMAGE_DESCRIPTION.format(
+                self._model_info_text
+            )
+            if not can_edit:
+                generate_description = (
+                    "IMAGE EDITING IS UNAVAILABLE here: no configured image model "
+                    "has the edit ability, so edit_image is not offered and passing "
+                    "images fails. Render each deliverable from a text prompt in "
+                    "one call.\n\n" + generate_description
+                )
+            tools.append(
+                ImageGenerationFunctionTool(
+                    self.generate_image,
+                    name="generate_image",
+                    description=generate_description,
+                )
+            )
+
+        if can_edit:
+            tools.append(
+                ImageGenerationFunctionTool(
+                    self.edit_image,
+                    name="edit_image",
+                    description=self.EDIT_IMAGE_DESCRIPTION.format(
+                        self._edit_model_info_text
+                    ),
+                )
+            )
+
+        tools.append(
             ImageGenerationFunctionTool(
                 self.list_available_models,
                 name="list_image_models",
-                description="List all available image generation models, including model ID, availability status, and detailed description information (Note: model information is already provided in the generate_image tool description)",
-            ),
-        ]
+                description="List all available image generation models, including model ID, availability status, and detailed description information",
+            )
+        )
 
         return tools
 
@@ -159,20 +193,16 @@ async def create_image_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     if not image_models:
         return []
 
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
     if not workspace:
         return []
 
-    try:
-        default_generate_model = config.get_image_generate_model()
-        default_edit_model = config.get_image_edit_model()
+    default_generate_model = config.get_image_generate_model()
+    default_edit_model = config.get_image_edit_model()
 
-        return create_image_tool(
-            image_models,
-            workspace=workspace,
-            default_generate_model=default_generate_model,
-            default_edit_model=default_edit_model,
-        )
-    except Exception as e:
-        logger.warning(f"Failed to create image tools: {e}")
-        return []
+    return create_image_tool(
+        image_models,
+        workspace=workspace,
+        default_generate_model=default_generate_model,
+        default_edit_model=default_edit_model,
+    )

@@ -1,23 +1,44 @@
 import asyncio
+import functools
+import inspect
 import logging
 import threading
-from types import SimpleNamespace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields, is_dataclass, replace
+from types import MappingProxyType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import create_engine, event
+from sqlalchemy import inspect as sqlalchemy_inspect
+from sqlalchemy import select
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm.state import InstanceState
 from sqlalchemy.pool import QueuePool
 
-from xagent.core.tools.adapters.vibe.config import MCPConfigLoadError
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
+from xagent.core.execution_scope import ExecutionScope
+from xagent.core.task_runtime import TaskRuntimeContext
+from xagent.core.tools.adapters.vibe.config import (
+    MCPConfigLoadError,
+    ToolFactoryRuntimeSessionBoundaryError,
+)
 from xagent.core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ConnectorRuntimeError,
 )
 from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+from xagent.web.models.mcp import MCPServer
 from xagent.web.models.tool_config import ToolConfig
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services.tool_credentials import (
     set_user_tool_allowlist_hook,
     set_user_tool_overrides_hook,
@@ -30,6 +51,106 @@ def _factory():
     return sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+_FACTORY_MODEL_VALUE_FIELDS = (
+    "vision_model",
+    "image_generate_model",
+    "image_edit_model",
+    "video_model",
+    "asr_model",
+    "tts_model",
+    "sound_effect_model",
+    "music_model",
+)
+_FACTORY_MODEL_MAPPING_FIELDS = (
+    "image_models",
+    "video_models",
+    "asr_models",
+    "tts_models",
+    "sound_effect_models",
+    "music_models",
+)
+
+
+def _factory_model_snapshot(generation):
+    from xagent.web.tools.config import (
+        _ToolFactoryRuntimeLoadPlan,
+        _ToolFactoryRuntimeSnapshot,
+    )
+
+    values = {field_name: object() for field_name in _FACTORY_MODEL_VALUE_FIELDS}
+    for field_name in _FACTORY_MODEL_MAPPING_FIELDS:
+        values[field_name] = {
+            "shared": object(),
+            f"only-{generation}": object(),
+        }
+    plan = _ToolFactoryRuntimeLoadPlan(
+        user_id=None,
+        task_id=None,
+        connector_runtime_turn_id=None,
+        load_policy=False,
+        load_basic=False,
+        load_sql=False,
+        load_custom_api=False,
+        load_vision=True,
+        load_image=True,
+        load_video=True,
+        load_audio=True,
+        published_agent_policy=None,
+    )
+    return _ToolFactoryRuntimeSnapshot(plan=plan, **values), values
+
+
+def _assert_factory_model_values(cfg, expected):
+    for field_name in _FACTORY_MODEL_VALUE_FIELDS:
+        getter = getattr(cfg, f"get_{field_name}")
+        assert getter() is expected[field_name]
+    for field_name in _FACTORY_MODEL_MAPPING_FIELDS:
+        getter = getattr(cfg, f"get_{field_name}")
+        actual = getter()
+        expected_mapping = expected[field_name]
+        assert actual.keys() == expected_mapping.keys()
+        assert all(actual[key] is value for key, value in expected_mapping.items())
+
+
+def _assert_factory_model_getters_are_neutral(cfg):
+    for field_name in _FACTORY_MODEL_VALUE_FIELDS:
+        assert getattr(cfg, f"get_{field_name}")() is None
+    for field_name in _FACTORY_MODEL_MAPPING_FIELDS:
+        assert getattr(cfg, f"get_{field_name}")() == {}
+
+
+_MAPPING_PROXY_TYPE = type(MappingProxyType({}))
+
+
+def _graph_reaches_identity(root, target):
+    visited = set()
+
+    def _visit(value):
+        if value is target:
+            return True
+        if id(value) in visited:
+            return False
+        if is_dataclass(value) and not isinstance(value, type):
+            children = (getattr(value, item.name) for item in fields(value))
+        elif type(value) in {dict, _MAPPING_PROXY_TYPE}:
+            children = (child for key, item in value.items() for child in (key, item))
+        elif type(value) in {list, tuple, set, frozenset}:
+            children = iter(value)
+        else:
+            return False
+        visited.add(id(value))
+        return any(_visit(child) for child in children)
+
+    return _visit(root)
+
+
+def _assert_identities_not_reachable(root, forbidden_by_name):
+    for name, forbidden in forbidden_by_name.items():
+        assert not _graph_reaches_identity(root, forbidden), (
+            f"retained model state reaches forbidden {name}"
+        )
+
+
 class _Chain:
     """Minimal chainable query stub: filter/join return self, terminals empty."""
 
@@ -39,11 +160,33 @@ class _Chain:
     def join(self, *a, **k):
         return self
 
+    def order_by(self, *a, **k):
+        return self
+
     def all(self):
         return []
 
     def first(self):
         return None
+
+
+class _NonEmptyMappingWithHostileBool(Mapping[str, object]):
+    def __init__(self, value):
+        self._value = value
+
+    def __bool__(self):
+        raise AssertionError("mapping truthiness must not be consulted")
+
+    def __getitem__(self, key):
+        if key != "model":
+            raise KeyError(key)
+        return self._value
+
+    def __iter__(self):
+        return iter(("model",))
+
+    def __len__(self):
+        return 1
 
 
 class _ListChain:
@@ -56,6 +199,9 @@ class _ListChain:
         return self
 
     def join(self, *a, **k):
+        return self
+
+    def order_by(self, *a, **k):
         return self
 
     def all(self):
@@ -218,12 +364,21 @@ def test_live_db_path_unchanged():
     cfg.close()  # must not raise; caller owns the request session
 
 
+def test_get_voice_defaults_to_none_when_not_passed():
+    """Every construction site that doesn't have a resolved voice in hand
+    (or predates the voice feature) omits the parameter - get_voice() must
+    degrade to the same no-op apply_output_voice already treats as
+    "no voice", not raise or silently return something else."""
+    cfg = WebToolConfig(db=None, request=None)
+    assert cfg.get_voice() is None
+
+
 @pytest.mark.asyncio
 async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     monkeypatch,
 ):
     """The chat bootstrap delegates all runtime preparation to ToolFactory."""
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     session_factory = object()
     captured: dict[str, object] = {}
@@ -231,6 +386,9 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     class _FakeToolConfig:
         def __init__(self, **kwargs):
             captured.update(kwargs)
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.task_runtime_contribution = contribution
 
         async def refresh_runtime_policy(self) -> None:
             raise AssertionError("create_default_tools must not pre-refresh policy")
@@ -245,21 +403,325 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
 
+    parameters = inspect.signature(create_default_tools).parameters
+    assert "db_task_id" in parameters
+    assert "file_operation_access_version" in parameters
+
     tools, config = await create_default_tools(
         None,
         user=SimpleNamespace(id=7, is_admin=False),
         task_id="web_task_11",
+        db_task_id=11,
+        file_operation_access_version=1,
     )
 
     assert tools == ["prepared-tool"]
     assert captured["db"] is None
     assert captured["db_factory"] is session_factory
+    assert captured["workspace_config"]["db_task_id"] == 11
+    assert captured["workspace_config"]["__xagent_file_operation_access_version"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_config", ["malformed", ["malformed"]])
+async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
+    monkeypatch,
+    agent_config,
+):
+    from xagent.web.services.agent_service_manager import AgentServiceManager
+
+    captured: dict[str, object] = {}
+
+    async def fake_create_default_tools(*_args, **kwargs):
+        captured.update(kwargs)
+        return [], object()
+
+    manager = AgentServiceManager()
+    monkeypatch.setattr(
+        manager,
+        "_get_or_create_task_sandbox",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.agent_service_manager.create_default_tools",
+        fake_create_default_tools,
+    )
+
+    await manager._build_tools_for_task(
+        task_id=11,
+        task=SimpleNamespace(user_id=7, agent_config=agent_config, source="internal"),
+        db=None,
+        user=SimpleNamespace(id=7, is_admin=False),
+        agent_config=None,
+        task_llm=None,
+        task_vision_llm=None,
+        task_setup_snapshot=SimpleNamespace(
+            workforce_runtime=None,
+            excluded_agent_id=None,
+            agent=None,
+        ),
+    )
+
+    assert captured["file_operation_access_version"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_preserves_legacy_positional_owner(
+    monkeypatch,
+):
+    from xagent.web.services.agent_service_manager import create_default_tools
+
+    captured: dict[str, object] = {}
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.task_runtime_contribution = contribution
+
+    async def create_tools(_config):
+        return []
+
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+
+    await create_default_tools(
+        None,
+        None,
+        SimpleNamespace(id=8, is_admin=False),
+        "web_task_11",
+        7,
+    )
+
+    assert captured["workspace_config"]["user_id"] == 7
+    assert captured["workspace_config"]["db_task_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_skips_runtime_workspace_without_providers(
+    monkeypatch,
+):
+    from xagent.web.services.agent_service_manager import create_default_tools
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs):
+            self.runtime_contribution = None
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+    async def create_tools(config):
+        return []
+
+    def unexpected_workspace(_config):
+        raise AssertionError("workspace must not be created without providers")
+
+    async def unexpected_runtime(_context):
+        raise AssertionError("runtime build must not run without providers")
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+    monkeypatch.setattr(ToolFactory, "create_workspace", unexpected_workspace)
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", unexpected_runtime)
+    monkeypatch.setattr(agent_runtime_service, "registered_task_extensions", lambda: ())
+
+    tools, config = await create_default_tools(
+        None,
+        user=SimpleNamespace(id=7, is_admin=False),
+        task_id="web_task_11",
+        task_runtime_context=TaskRuntimeContext(
+            task_id=11,
+            user_id=7,
+            source="internal",
+            session_factory=lambda: object(),
+        ),
+    )
+
+    assert tools == []
+    assert config.runtime_contribution.tools == ()
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
+    monkeypatch,
+    caplog,
+):
+    from xagent.web.services.agent_service_manager import create_default_tools
+    from xagent.web.services.task_runtime import TaskRuntimeExtensionError
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs):
+            self.runtime_contribution = None
+            self.runtime_workspace = None
+
+        def get_workspace_config(self):
+            return {"task_id": "web_task_11"}
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+        # Both runtime setters are concrete no-ops on ``BaseToolConfig``, so
+        # every real config has them; the double has to as well.
+        def set_task_runtime_workspace(self, workspace) -> None:
+            self.runtime_workspace = workspace
+
+    async def create_tools(config):
+        return ["core-tool"]
+
+    async def fail_runtime(_context):
+        raise TaskRuntimeExtensionError(
+            "broken_runtime",
+            "build_runtime",
+            RuntimeError("provider unavailable"),
+        )
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_workspace",
+        lambda _config: SimpleNamespace(id="workspace"),
+    )
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", fail_runtime)
+    monkeypatch.setattr(
+        agent_runtime_service,
+        "registered_task_extensions",
+        lambda: ("broken_runtime",),
+    )
+
+    with caplog.at_level("ERROR"):
+        tools, config = await create_default_tools(
+            None,
+            user=SimpleNamespace(id=7, is_admin=False),
+            task_id="web_task_11",
+            task_runtime_context=TaskRuntimeContext(
+                task_id=11,
+                user_id=7,
+                source="internal",
+                session_factory=lambda: object(),
+            ),
+        )
+
+    assert tools == ["core-tool"]
+    assert config.runtime_contribution.tools == ()
+    assert "broken_runtime" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_isolates_runtime_tool_name_collision(
+    monkeypatch,
+    caplog,
+):
+    from xagent.core.task_runtime import (
+        TaskRuntimeContribution,
+        merge_task_runtime_contributions,
+    )
+    from xagent.core.tools.adapters.vibe.config import (
+        ToolConfig as StandaloneToolConfig,
+    )
+    from xagent.web.services.agent_service_manager import create_default_tools
+
+    core_tool = SimpleNamespace(
+        name="computer",
+        metadata=SimpleNamespace(category="other"),
+    )
+    runtime_tool = SimpleNamespace(
+        name="computer",
+        metadata=SimpleNamespace(category="other"),
+    )
+
+    class _FakeToolConfig(StandaloneToolConfig):
+        def __init__(self, **kwargs):
+            super().__init__({})
+            self.runtime_contribution = TaskRuntimeContribution()
+            self.runtime_workspace = None
+
+        def get_workspace_config(self):
+            return {"task_id": "web_task_11"}
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+        def get_task_runtime_contribution(self):
+            return self.runtime_contribution
+
+        def set_task_runtime_workspace(self, workspace) -> None:
+            self.runtime_workspace = workspace
+
+        def get_task_runtime_workspace(self):
+            return self.runtime_workspace
+
+    async def create_registered_tools(config):
+        return [core_tool]
+
+    async def build_runtime(_context):
+        return merge_task_runtime_contributions(
+            {
+                "desktop_runtime": TaskRuntimeContribution(
+                    tools=(runtime_tool,),
+                    environment="Control the desktop.",
+                    preferred_input_modalities=("image",),
+                )
+            }
+        )
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_workspace",
+        lambda _config: SimpleNamespace(id="workspace"),
+    )
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", build_runtime)
+    monkeypatch.setattr(
+        agent_runtime_service,
+        "registered_task_extensions",
+        lambda: ("desktop_runtime",),
+    )
+
+    with caplog.at_level("WARNING"):
+        tools, config = await create_default_tools(
+            None,
+            user=SimpleNamespace(id=7, is_admin=False),
+            task_id="web_task_11",
+            task_runtime_context=TaskRuntimeContext(
+                task_id=11,
+                user_id=7,
+                source="internal",
+                session_factory=lambda: object(),
+            ),
+        )
+
+    assert tools == [core_tool]
+    assert config.runtime_contribution == TaskRuntimeContribution()
+    assert "Dropping task runtime extension 'desktop_runtime'" in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_create_default_tools_prefetches_excluded_agent_policy_once(monkeypatch):
     """The prefetched agent policy must include the excluded agent ID."""
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
     from xagent.web.tools.config import _ToolFactoryRuntimeSnapshot
 
     plans = []
@@ -340,25 +802,29 @@ async def test_tool_factory_credential_prefetch_waits_off_event_loop(tmp_path):
     async def build_tools() -> list:
         return await ToolFactory.create_all_tools(cfg)
 
-    ticker_task = asyncio.create_task(ticker())
-    build_task = asyncio.create_task(build_tools())
-    try:
-        await asyncio.sleep(0.08)
-        assert ticks >= 4
-        assert not build_task.done()
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        build_task = asyncio.create_task(build_tools())
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not build_task.done()
 
-        held_connection.close()
-        await build_task
-    finally:
-        if not held_connection.closed:
             held_connection.close()
-        if not build_task.done():
-            build_task.cancel()
+            gate.let_through()
+            await asyncio.wait_for(build_task, timeout=GUARD_TIMEOUT)
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            if not build_task.done():
+                build_task.cancel()
             await asyncio.gather(build_task, return_exceptions=True)
-        stop.set()
-        await ticker_task
-        cfg.close()
-        engine.dispose()
+            stop.set()
+            await ticker_task
+            cfg.close()
+            engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -417,14 +883,395 @@ async def test_tool_factory_releases_live_read_session_before_worker_checkout(
 
         assert await ToolFactory.create_all_tools(cfg) == []
         assert engine.pool.checkedout() == 0
+        assert cfg._live_db is None
 
         assert live_db.query(ToolConfig).all() == []
         assert engine.pool.checkedout() == 1
-        cfg.release_db_connection()
+        live_db.rollback()
         assert engine.pool.checkedout() == 0
     finally:
         live_db.close()
         cfg.close()
+        engine.dispose()
+
+
+@pytest.mark.parametrize("factory_owned", [False, True])
+def test_verified_factory_handoff_detaches_clean_sessions(factory_owned, tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'verified-handoff.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    ToolConfig.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    request = SimpleNamespace(user=object())
+    cfg = WebToolConfig(
+        db=None if factory_owned else factory(),
+        db_factory=factory if factory_owned else None,
+        request=request,
+        user=request.user,
+        user_id=1,
+    )
+    try:
+        cfg.db.query(ToolConfig).all()
+        assert engine.pool.checkedout() == 1
+
+        cfg.handoff_factory_runtime()
+
+        assert engine.pool.checkedout() == 0
+        assert cfg._live_db is None
+        assert cfg._lazy_db is None
+        assert cfg.request is None
+        assert cfg._user is None
+    finally:
+        cfg.close()
+        engine.dispose()
+
+
+def test_verified_factory_handoff_preserves_pending_caller_state(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'pending-handoff.db'}")
+    ToolConfig.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    live_db = factory()
+    request = SimpleNamespace(user=object())
+    cfg = WebToolConfig(
+        db=live_db,
+        request=request,
+        user=request.user,
+        user_id=1,
+    )
+    try:
+        live_db.add(
+            User(
+                username="pending-handoff-user",
+                password_hash="hash",
+                is_admin=False,
+            )
+        )
+
+        with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+            cfg.handoff_factory_runtime()
+
+        assert cfg._live_db is live_db
+        assert cfg.request is request
+        assert cfg._user is request.user
+        assert list(live_db.new)
+    finally:
+        live_db.rollback()
+        live_db.close()
+        cfg.close()
+        engine.dispose()
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_verified_factory_handoff_terminally_closes_failed_lazy_session(
+    rollback_fails,
+):
+    class FailingLazySession:
+        new = (object(),)
+        dirty = ()
+        deleted = ()
+        info = {}
+
+        def __init__(self, rollback_fails: bool) -> None:
+            self.rollback_calls = 0
+            self.close_calls = 0
+            self.invalidate_calls = 0
+            self.rollback_fails = rollback_fails
+
+        def in_transaction(self) -> bool:
+            return True
+
+        def rollback(self) -> None:
+            self.rollback_calls += 1
+            if self.rollback_fails:
+                raise RuntimeError("rollback failed")
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("close failed")
+
+        def invalidate(self) -> None:
+            self.invalidate_calls += 1
+
+    lazy_db = FailingLazySession(rollback_fails)
+    cfg = WebToolConfig(db=None, db_factory=lambda: lazy_db, request=None, user_id=1)
+    assert cfg.db is lazy_db
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+        cfg.handoff_factory_runtime()
+
+    assert lazy_db.rollback_calls == 1
+    assert lazy_db.close_calls == 1
+    assert lazy_db.invalidate_calls == 1
+    assert cfg._lazy_db is None
+
+
+def test_dual_lazy_cleanup_failure_retains_retry_ownership():
+    class RetryableLazySession:
+        new = (object(),)
+        dirty = ()
+        deleted = ()
+        info = {}
+
+        def __init__(self) -> None:
+            self.close_failures_remaining = 1
+            self.invalidate_failures_remaining = 1
+
+        def in_transaction(self) -> bool:
+            return True
+
+        def rollback(self) -> None:
+            return None
+
+        def close(self) -> None:
+            if self.close_failures_remaining:
+                self.close_failures_remaining -= 1
+                raise RuntimeError("close failed")
+
+        def invalidate(self) -> None:
+            if self.invalidate_failures_remaining:
+                self.invalidate_failures_remaining -= 1
+                raise RuntimeError("invalidate failed")
+
+    lazy_db = RetryableLazySession()
+    cfg = WebToolConfig(db=None, db_factory=lambda: lazy_db, request=None, user_id=1)
+    assert cfg.db is lazy_db
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+        cfg.handoff_factory_runtime()
+
+    assert cfg._lazy_db is lazy_db
+
+    cfg.close()
+
+    assert cfg._lazy_db is None
+
+
+def test_dual_lazy_cleanup_failure_retains_real_pool_owner_until_retry(
+    monkeypatch, tmp_path
+):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'dual-lazy-cleanup.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    ToolConfig.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    lazy_db = factory()
+    lazy_db.query(ToolConfig).all()
+    assert engine.pool.checkedout() == 1
+    real_close = lazy_db.close
+    real_invalidate = lazy_db.invalidate
+
+    def fail_close():
+        raise RuntimeError("close failed")
+
+    def fail_invalidate():
+        raise RuntimeError("invalidate failed")
+
+    monkeypatch.setattr(
+        "xagent.web.models.database.release_db_connection_if_clean",
+        lambda _db: False,
+    )
+    monkeypatch.setattr(lazy_db, "close", fail_close)
+    monkeypatch.setattr(lazy_db, "invalidate", fail_invalidate)
+    cfg = WebToolConfig(db=None, db_factory=lambda: lazy_db, request=None, user_id=1)
+    cfg._lazy_db = lazy_db
+    try:
+        with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+            cfg.handoff_factory_runtime()
+
+        assert cfg._lazy_db is lazy_db
+        lazy_db.connection()
+        assert engine.pool.checkedout() == 1
+
+        monkeypatch.setattr(lazy_db, "close", real_close)
+        monkeypatch.setattr(lazy_db, "invalidate", real_invalidate)
+        cfg.close()
+
+        assert cfg._lazy_db is None
+        assert engine.pool.checkedout() == 0
+    finally:
+        lazy_db.close()
+        engine.dispose()
+
+
+def test_verified_factory_handoff_preserves_live_state_while_cleaning_lazy_failure():
+    class PendingSession:
+        new = (object(),)
+        dirty = ()
+        deleted = ()
+        info = {}
+
+        def __init__(self, *, close_fails: bool = False) -> None:
+            self.rollback_calls = 0
+            self.close_calls = 0
+            self.invalidate_calls = 0
+            self.close_fails = close_fails
+
+        def in_transaction(self) -> bool:
+            return True
+
+        def rollback(self) -> None:
+            self.rollback_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_fails:
+                raise RuntimeError("close failed")
+
+        def invalidate(self) -> None:
+            self.invalidate_calls += 1
+
+    live_db = PendingSession()
+    lazy_db = PendingSession(close_fails=True)
+    request = SimpleNamespace(user=object())
+    cfg = WebToolConfig(
+        db=live_db,
+        db_factory=lambda: lazy_db,
+        request=request,
+        user=request.user,
+        user_id=1,
+    )
+    cfg._lazy_db = lazy_db
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+        cfg.handoff_factory_runtime()
+
+    assert live_db.rollback_calls == 0
+    assert live_db.close_calls == 0
+    assert cfg._live_db is live_db
+    assert cfg.request is request
+    assert cfg._user is request.user
+    assert lazy_db.rollback_calls == 1
+    assert lazy_db.close_calls == 1
+    assert lazy_db.invalidate_calls == 1
+    assert cfg._lazy_db is None
+
+
+def _contains_orm_instance(value, seen=None):
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return False
+    seen.add(value_id)
+
+    if isinstance(sqlalchemy_inspect(value, raiseerr=False), InstanceState):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _contains_orm_instance(item, seen)
+            for pair in value.items()
+            for item in pair
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_orm_instance(item, seen) for item in value)
+    if isinstance(value, functools.partial):
+        return (
+            _contains_orm_instance(value.func, seen)
+            or _contains_orm_instance(value.args, seen)
+            or _contains_orm_instance(value.keywords or {}, seen)
+        )
+    closure = getattr(value, "__closure__", None)
+    if closure:
+        return any(_contains_orm_instance(cell.cell_contents, seen) for cell in closure)
+    return False
+
+
+def test_orm_capture_walker_detects_partial_function_closure():
+    server = MCPServer(
+        name="walker-negative-control",
+        managed="external",
+        transport="streamable_http",
+    )
+
+    def captures_mapped_server():
+        return server
+
+    assert _contains_orm_instance(functools.partial(captures_mapped_server))
+
+
+def test_delegated_mcp_refresh_callback_detaches_real_orm_and_closes_its_session(
+    monkeypatch, tmp_path
+):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'delegated-refresh.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    MCPServer.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    with factory() as seed_db:
+        seed_db.add(
+            MCPServer(
+                name="detached-refresh-server",
+                managed="external",
+                transport="streamable_http",
+                url="https://mcp.example.test",
+            )
+        )
+        seed_db.commit()
+    construction_db = factory()
+    server = construction_db.scalar(
+        select(MCPServer).where(MCPServer.name == "detached-refresh-server")
+    )
+    assert server is not None
+    server_id = int(server.id)
+    assert engine.pool.checkedout() == 1
+    cfg = WebToolConfig(
+        db=construction_db,
+        db_factory=factory,
+        request=None,
+        user_id=7,
+        task_id="42",
+        connector_runtime_turn_id="turn-1",
+    )
+    bindings = [
+        {
+            "source": {"input_type": "secrets", "key": "authorization"},
+            "target": {"target_type": "transport_headers", "key": "Authorization"},
+        }
+    ]
+    operation_sessions = []
+
+    def load_runtime_view(*, db, **_kwargs):
+        operation_sessions.append(db)
+        assert db is not construction_db
+        assert db.scalar(select(MCPServer.id)) is not None
+        return {f"mcp:{server_id}": {"secrets": {"authorization": "fresh"}}}
+
+    monkeypatch.setattr(
+        "xagent.web.services.connector_runtime.load_connector_runtime_view",
+        load_runtime_view,
+    )
+    try:
+        refresh = cfg._build_delegated_mcp_refresh_callback(
+            server=server,
+            runtime_bindings=bindings,
+            allow_delegated_authorization=True,
+        )
+        assert isinstance(refresh, functools.partial)
+        assert not _contains_orm_instance(refresh)
+
+        construction_db.expire(server)
+        construction_db.expunge(server)
+        construction_db.close()
+        refreshed = refresh()
+
+        assert refreshed["headers"]["Authorization"] == "fresh"
+        assert len(operation_sessions) == 1
+        assert engine.pool.checkedout() == 0
+    finally:
+        cfg.close()
+        construction_db.close()
         engine.dispose()
 
 
@@ -510,6 +1357,533 @@ async def test_factory_runtime_snapshot_is_rebuilt_for_each_build(monkeypatch):
     assert len(sessions) == 2
     assert all(session.closed for session in sessions)
     assert cfg._factory_runtime_snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_handoff_retains_loaded_model_values_without_database_fallback():
+    from xagent.web.tools.config import (
+        _ToolFactoryRuntimeLoadPlan,
+        _ToolFactoryRuntimeSnapshot,
+    )
+
+    image_adapter = object()
+    video_adapter = object()
+    tts_adapter = object()
+    music_adapter = object()
+    credential_map = {("provider", "api_key"): "secret"}
+    sql_connections = {"database": "postgresql://secret"}
+    custom_api_configs = [{"id": object()}]
+    published_agent_records = [object()]
+    plan = _ToolFactoryRuntimeLoadPlan(
+        user_id=1,
+        task_id=None,
+        connector_runtime_turn_id=None,
+        load_policy=False,
+        load_basic=False,
+        load_sql=False,
+        load_custom_api=False,
+        load_vision=True,
+        load_image=True,
+        load_video=False,
+        load_audio=True,
+        published_agent_policy=None,
+    )
+    snapshot = _ToolFactoryRuntimeSnapshot(
+        plan=plan,
+        tool_credentials=credential_map,
+        sql_connections=sql_connections,
+        custom_api_configs=custom_api_configs,
+        vision_model=None,
+        image_models={"image": image_adapter},
+        image_generate_model=None,
+        image_edit_model=image_adapter,
+        video_models={"video": video_adapter},
+        video_model=video_adapter,
+        asr_models={},
+        asr_model=None,
+        tts_models={"tts": tts_adapter},
+        tts_model=tts_adapter,
+        sound_effect_models={},
+        sound_effect_model=None,
+        music_models={"music": music_adapter},
+        music_model=music_adapter,
+        published_agent_records=published_agent_records,
+    )
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=1,
+    )
+    cfg._factory_runtime_snapshot = snapshot
+    cfg.handoff_factory_runtime()
+
+    retained = cfg._retained_factory_model_state
+    assert is_dataclass(retained)
+    assert retained.__dataclass_params__.frozen
+    assert {item.name for item in fields(retained)} == {
+        "load_vision",
+        "load_image",
+        "load_video",
+        "load_audio",
+        "vision_model",
+        "image_models",
+        "image_generate_model",
+        "image_edit_model",
+        "video_models",
+        "video_model",
+        "asr_models",
+        "asr_model",
+        "tts_models",
+        "tts_model",
+        "sound_effect_models",
+        "sound_effect_model",
+        "music_models",
+        "music_model",
+    }
+    mapping_proxy_type = type(MappingProxyType({}))
+    for name in (
+        "image_models",
+        "video_models",
+        "asr_models",
+        "tts_models",
+        "sound_effect_models",
+        "music_models",
+    ):
+        assert isinstance(getattr(retained, name), mapping_proxy_type)
+    forbidden_state = {
+        "snapshot": snapshot,
+        "plan": plan,
+        "credential map": credential_map,
+        "SQL connections": sql_connections,
+        "Custom API configs": custom_api_configs,
+        "published-agent records": published_agent_records,
+    }
+    _assert_identities_not_reachable(vars(retained), forbidden_state)
+
+    positive_control = object()
+    positive_control_graph = {
+        "nested": [
+            (
+                MappingProxyType(
+                    {"set": {frozenset({positive_control})}},
+                ),
+            ),
+        ],
+    }
+    assert _graph_reaches_identity(positive_control_graph, positive_control)
+    with pytest.raises(AssertionError, match="positive control"):
+        _assert_identities_not_reachable(
+            positive_control_graph,
+            {"positive control": positive_control},
+        )
+    assert not _graph_reaches_identity(
+        SimpleNamespace(hidden=positive_control),
+        positive_control,
+    )
+
+    mutated_retained = replace(retained)
+    object.__setattr__(
+        mutated_retained,
+        "_hidden_construction_state",
+        {"snapshot": snapshot},
+    )
+    with pytest.raises(AssertionError, match="snapshot"):
+        _assert_identities_not_reachable(
+            vars(mutated_retained),
+            {"snapshot": snapshot},
+        )
+    _assert_identities_not_reachable(vars(retained), forbidden_state)
+
+    assert cfg.get_vision_model() is None
+    assert cfg.get_image_generate_model() is None
+    assert cfg.get_image_edit_model() is image_adapter
+    assert cfg.get_video_model() is None
+    assert cfg.get_asr_model() is None
+    assert cfg.get_tts_model() is tts_adapter
+    assert cfg.get_sound_effect_model() is None
+    assert cfg.get_music_model() is music_adapter
+
+    mapping_getters = (
+        (cfg.get_image_models, {"image": image_adapter}),
+        (cfg.get_video_models, {}),
+        (cfg.get_asr_models, {}),
+        (cfg.get_tts_models, {"tts": tts_adapter}),
+        (cfg.get_sound_effect_models, {}),
+        (cfg.get_music_models, {"music": music_adapter}),
+    )
+    for getter, expected in mapping_getters:
+        returned = getter()
+        assert returned == expected
+        returned["mutation"] = object()
+        assert getter() == expected
+        assert getter() is not returned
+
+    cfg.close()
+
+    assert cfg._retained_factory_model_state is None
+    assert cfg.get_vision_model() is None
+    assert cfg.get_image_generate_model() is None
+    assert cfg.get_image_edit_model() is None
+    assert cfg.get_video_model() is None
+    assert cfg.get_asr_model() is None
+    assert cfg.get_tts_model() is None
+    assert cfg.get_sound_effect_model() is None
+    assert cfg.get_music_model() is None
+    for getter, _expected in mapping_getters:
+        assert getter() == {}
+
+
+def test_handoff_replaces_retained_model_generation_without_merging():
+    snapshot_a, values_a = _factory_model_snapshot("a")
+    snapshot_b, values_b = _factory_model_snapshot("b")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+
+    cfg._apply_factory_runtime_snapshot(snapshot_a)
+    cfg.handoff_factory_runtime()
+    retained_a = cfg._retained_factory_model_state
+    assert retained_a is not None
+    _assert_factory_model_values(cfg, values_a)
+
+    cfg._apply_factory_runtime_snapshot(snapshot_b)
+    cfg.handoff_factory_runtime()
+    retained_b = cfg._retained_factory_model_state
+    assert retained_b is not None
+    assert retained_b is not retained_a
+    _assert_factory_model_values(cfg, values_b)
+
+
+@pytest.mark.asyncio
+async def test_policy_refresh_and_construction_discard_preserve_retained_generation():
+    snapshot_a, _values_a = _factory_model_snapshot("a")
+    snapshot_b, values_b = _factory_model_snapshot("b")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+    cfg._apply_factory_runtime_snapshot(snapshot_b)
+    cfg.handoff_factory_runtime()
+    retained_b = cfg._retained_factory_model_state
+    assert retained_b is not None
+
+    # Construction cleanup and policy refresh must not erase the last handoff.
+    cfg._apply_factory_runtime_snapshot(snapshot_a)
+    cfg.discard_prepared_factory_runtime()
+    assert cfg._retained_factory_model_state is retained_b
+    _assert_factory_model_values(cfg, values_b)
+
+    await cfg.refresh_runtime_policy()
+    assert cfg._retained_factory_model_state is retained_b
+    _assert_factory_model_values(cfg, values_b)
+
+
+def test_abort_discards_new_construction_without_erasing_retained_generation():
+    snapshot_a, values_a = _factory_model_snapshot("a")
+    snapshot_b, _values_b = _factory_model_snapshot("b")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+    cfg._apply_factory_runtime_snapshot(snapshot_a)
+    cfg.handoff_factory_runtime()
+    retained_a = cfg._retained_factory_model_state
+    assert retained_a is not None
+
+    cfg._apply_factory_runtime_snapshot(snapshot_b)
+    cfg.abort_factory_runtime()
+
+    assert cfg._factory_runtime_snapshot is None
+    assert cfg._retained_factory_model_state is retained_a
+    assert cfg._factory_runtime_handed_off is True
+    _assert_factory_model_values(cfg, values_a)
+
+
+def test_abort_without_retained_generation_leaves_neutral_handed_off_state():
+    snapshot, _values = _factory_model_snapshot("initial")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+    cfg._apply_factory_runtime_snapshot(snapshot)
+
+    cfg.abort_factory_runtime()
+
+    assert cfg._factory_runtime_snapshot is None
+    assert cfg._retained_factory_model_state is None
+    assert cfg._factory_runtime_handed_off is True
+    _assert_factory_model_getters_are_neutral(cfg)
+
+
+@pytest.mark.parametrize(
+    ("lazy_outcome", "expected_close_calls", "expected_invalidate_calls"),
+    [
+        ("absent", 0, 0),
+        ("close-succeeds", 1, 0),
+        ("invalidate-succeeds", 1, 1),
+        ("cleanup-fails", 1, 1),
+    ],
+)
+def test_close_clears_retained_generation_for_every_lazy_cleanup_outcome(
+    lazy_outcome,
+    expected_close_calls,
+    expected_invalidate_calls,
+):
+    class MatrixLazySession:
+        def __init__(self, outcome):
+            self.outcome = outcome
+            self.close_calls = 0
+            self.invalidate_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.outcome in {"invalidate-succeeds", "cleanup-fails"}:
+                raise RuntimeError("close failed")
+
+        def invalidate(self):
+            self.invalidate_calls += 1
+            if self.outcome == "cleanup-fails":
+                raise RuntimeError("invalidate failed")
+
+    snapshot, _values = _factory_model_snapshot("close")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+    cfg._apply_factory_runtime_snapshot(snapshot)
+    cfg.handoff_factory_runtime()
+    lazy_db = None if lazy_outcome == "absent" else MatrixLazySession(lazy_outcome)
+    cfg._lazy_db = lazy_db
+
+    if lazy_outcome == "cleanup-fails":
+        with pytest.raises(
+            ToolFactoryRuntimeSessionBoundaryError,
+            match="Tool runtime cleanup could not be completed",
+        ):
+            cfg.close()
+    else:
+        cfg.close()
+
+    assert cfg._retained_factory_model_state is None
+    assert cfg._factory_runtime_handed_off is True
+    _assert_factory_model_getters_are_neutral(cfg)
+    if lazy_db is not None:
+        assert lazy_db.close_calls == expected_close_calls
+        assert lazy_db.invalidate_calls == expected_invalidate_calls
+
+    if lazy_outcome == "cleanup-fails":
+        lazy_db.outcome = "close-succeeds"
+    cfg.close()
+    assert cfg._retained_factory_model_state is None
+    assert cfg._lazy_db is None
+    _assert_factory_model_getters_are_neutral(cfg)
+
+
+def test_failed_verified_handoff_does_not_replace_retained_generation(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'retained-handoff-failure.db'}")
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    live_db = factory()
+    snapshot_a, _values_a = _factory_model_snapshot("a")
+    snapshot_b, _values_b = _factory_model_snapshot("b")
+    request = SimpleNamespace(user=object())
+    cfg = WebToolConfig(
+        db=live_db,
+        db_factory=factory,
+        request=request,
+        user=request.user,
+        user_id=None,
+    )
+    try:
+        cfg._apply_factory_runtime_snapshot(snapshot_a)
+        cfg.handoff_factory_runtime()
+        retained_a = cfg._retained_factory_model_state
+        assert retained_a is not None
+
+        live_db.add(
+            User(
+                username="retained-handoff-failure",
+                password_hash="hash",
+                is_admin=False,
+            )
+        )
+        cfg._live_db = live_db
+        cfg.request = request
+        cfg._user = request.user
+        cfg._apply_factory_runtime_snapshot(snapshot_b)
+
+        with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+            cfg.handoff_factory_runtime()
+
+        assert cfg._retained_factory_model_state is retained_a
+        assert cfg._factory_runtime_snapshot is snapshot_b
+        assert cfg._live_db is live_db
+        assert cfg.request is request
+        assert cfg._user is request.user
+    finally:
+        live_db.rollback()
+        live_db.close()
+        cfg._live_db = None
+        cfg.request = None
+        cfg._user = None
+        cfg.close()
+        engine.dispose()
+
+
+def test_standalone_unhanded_off_model_getter_uses_legacy_loader_once(monkeypatch):
+    image_adapter = object()
+    loader_calls = 0
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+
+    def load_image_models():
+        nonlocal loader_calls
+        loader_calls += 1
+        return {"image": image_adapter}
+
+    monkeypatch.setattr(cfg, "_load_image_models", load_image_models)
+
+    first = cfg.get_image_models()
+    second = cfg.get_image_models()
+
+    assert loader_calls == 1
+    assert first == {"image": image_adapter}
+    assert second == {"image": image_adapter}
+    assert first is not second
+    assert first["image"] is image_adapter
+    assert second["image"] is image_adapter
+
+
+def test_model_getters_delegate_to_shared_resolver(monkeypatch):
+    vision_model = object()
+    image_model = object()
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+    resolver_calls = []
+
+    def resolve_factory_model_field(**kwargs):
+        resolver_calls.append(kwargs)
+        if kwargs["field_name"] == "vision_model":
+            return vision_model
+        return {"image": image_model}
+
+    monkeypatch.setattr(
+        cfg,
+        "_resolve_factory_model_field",
+        resolve_factory_model_field,
+    )
+
+    assert cfg.get_vision_model() is vision_model
+    assert cfg.get_image_models() == {"image": image_model}
+    assert resolver_calls[0]["terminal_neutral"] is None
+    assert resolver_calls[1]["terminal_neutral"] == {}
+
+
+def test_unhanded_off_mapping_loader_avoids_truthiness_and_preserves_values(
+    monkeypatch,
+):
+    image_model = object()
+    loader_calls = 0
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+
+    def load_image_models():
+        nonlocal loader_calls
+        loader_calls += 1
+        return _NonEmptyMappingWithHostileBool(image_model)
+
+    monkeypatch.setattr(cfg, "_load_image_models", load_image_models)
+
+    first = cfg.get_image_models()
+    second = cfg.get_image_models()
+
+    assert loader_calls == 1
+    assert type(first) is dict
+    assert first["model"] is image_model
+    assert second["model"] is image_model
+    assert first is not second
+    first["mutation"] = object()
+    assert "mutation" not in second
+
+
+def test_unhanded_off_invalid_mapping_loader_result_remains_fail_loud(monkeypatch):
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+
+    monkeypatch.setattr(cfg, "_load_image_models", lambda: None)
+
+    with pytest.raises(TypeError):
+        cfg.get_image_models()
+
+
+def test_empty_unhanded_off_mapping_loader_is_cached_and_returns_fresh_dicts(
+    monkeypatch,
+):
+    loader_calls = 0
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+
+    def load_image_models():
+        nonlocal loader_calls
+        loader_calls += 1
+        return {}
+
+    monkeypatch.setattr(cfg, "_load_image_models", load_image_models)
+
+    first = cfg.get_image_models()
+    second = cfg.get_image_models()
+
+    assert loader_calls == 1
+    assert first == second == {}
+    assert first is not second
+
+
+def test_close_neutralizes_prefilled_model_mapping_caches_without_loading(monkeypatch):
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+    mapping_getters = (
+        (cfg.get_image_models, "_cached_image_configs", "_load_image_models"),
+        (cfg.get_video_models, "_cached_video_configs", "_load_video_models"),
+        (cfg.get_asr_models, "_cached_asr_models", "_load_asr_models"),
+        (cfg.get_tts_models, "_cached_tts_models", "_load_tts_models"),
+        (
+            cfg.get_sound_effect_models,
+            "_cached_sound_effect_models",
+            "_load_sound_effect_models",
+        ),
+        (cfg.get_music_models, "_cached_music_models", "_load_music_models"),
+    )
+
+    def fail_if_called():
+        raise AssertionError("terminal config attempted a model loader")
+
+    for _getter, cache_name, loader_name in mapping_getters:
+        setattr(cfg, cache_name, {"prefilled": object()})
+        monkeypatch.setattr(cfg, loader_name, fail_if_called)
+
+    cfg.close()
+
+    for getter, _cache_name, _loader_name in mapping_getters:
+        assert getter() == {}
+
+
+def test_explicit_vision_model_remains_authoritative_after_close():
+    explicit_vision_model = object()
+    cfg = WebToolConfig(
+        db=object(),
+        request=None,
+        user_id=None,
+        vision_model=explicit_vision_model,
+    )
+
+    cfg.close()
+
+    assert cfg.get_vision_model() is explicit_vision_model
 
 
 @pytest.mark.asyncio
@@ -665,26 +2039,98 @@ async def test_factory_prepare_snapshots_selected_sync_factory_inputs(
     assert cfg.get_sql_connections() == {"WAREHOUSE": "sqlite:///warehouse.db"}
     assert cfg.get_custom_api_configs() == []
     assert cfg.get_vision_model() is model_values["get_default_vision_model"]
-    assert cfg.get_image_models() is model_values["get_image_models"]
     assert (
         cfg.get_image_generate_model()
         is model_values["get_default_image_generate_model"]
     )
     assert cfg.get_image_edit_model() is model_values["get_default_image_edit_model"]
-    assert cfg.get_video_models() is model_values["get_video_models"]
     assert cfg.get_video_model() is model_values["get_default_video_model"]
-    assert cfg.get_asr_models() is model_values["get_asr_models"]
     assert cfg.get_asr_model() is model_values["get_default_asr_model"]
-    assert cfg.get_tts_models() is model_values["get_tts_models"]
     assert cfg.get_tts_model() is model_values["get_default_tts_model"]
-    assert cfg.get_sound_effect_models() is model_values["get_sound_effect_models"]
     assert (
         cfg.get_sound_effect_model() is model_values["get_default_sound_effect_model"]
     )
-    assert cfg.get_music_models() is model_values["get_music_models"]
     assert cfg.get_music_model() is model_values["get_default_music_model"]
+    mapping_getters = (
+        (cfg.get_image_models, "get_image_models"),
+        (cfg.get_video_models, "get_video_models"),
+        (cfg.get_asr_models, "get_asr_models"),
+        (cfg.get_tts_models, "get_tts_models"),
+        (cfg.get_sound_effect_models, "get_sound_effect_models"),
+        (cfg.get_music_models, "get_music_models"),
+    )
+    for getter, model_value_name in mapping_getters:
+        expected = model_values[model_value_name]
+        returned = getter()
+        assert returned == expected
+        assert returned is not expected
+        assert all(returned[key] is value for key, value in expected.items())
     assert loader_thread_ids
     assert all(thread_id != main_thread_id for thread_id in loader_thread_ids)
+
+
+@pytest.mark.asyncio
+async def test_close_neutralizes_old_generation_before_public_prepare_installs_next(
+    monkeypatch,
+):
+    sessions: list[_TrackingSession] = []
+    generation_a_model = object()
+    generation_b_model = object()
+    cached_model = object()
+    current_model = generation_a_model
+
+    def session_factory() -> _TrackingSession:
+        session = _TrackingSession()
+        sessions.append(session)
+        return session
+
+    def load_image_models(*_args, **_kwargs):
+        return {"image": current_model}
+
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_image_models",
+        load_image_models,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_default_image_generate_model",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_default_image_edit_model",
+        lambda *_args, **_kwargs: None,
+    )
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        db_factory=session_factory,
+        user_id=1,
+        include_mcp_tools=False,
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["image"]),
+    )
+
+    try:
+        await cfg.prepare_factory_runtime()
+        assert cfg.get_image_models()["image"] is generation_a_model
+        cfg.handoff_factory_runtime()
+        assert cfg.get_image_models()["image"] is generation_a_model
+
+        cfg._cached_image_configs = {"image": cached_model}
+        cfg.close()
+        assert cfg.get_image_models() == {}
+
+        current_model = generation_b_model
+        await cfg.prepare_factory_runtime()
+
+        prepared_models = cfg.get_image_models()
+        assert prepared_models["image"] is generation_b_model
+        assert prepared_models["image"] is not generation_a_model
+        assert prepared_models["image"] is not cached_model
+        cfg.handoff_factory_runtime()
+        assert cfg.get_image_models()["image"] is generation_b_model
+        assert sessions
+        assert all(session.closed for session in sessions)
+    finally:
+        cfg.close()
 
 
 @pytest.mark.asyncio
@@ -1007,6 +2453,208 @@ def test_runtime_policy_propagates_later_input_checkout_timeout():
         set_user_tool_allowlist_hook(None)
 
 
+# --------------------------------------------------------------------------- #
+# Fail-closed policy resolution (xagent #1739)
+#
+# The policy hooks are how a registering application enforces authorization. On
+# the two branches below the hook never runs, so the application has nothing to
+# intercept: reporting "no policy configured" would build the globally available
+# tool set and run the turn unrestricted.
+# --------------------------------------------------------------------------- #
+class _UserReloadSession:
+    """Session whose ``User`` reload misbehaves in a configurable way."""
+
+    def __init__(self, mode: str):
+        self._mode = mode
+        self.closed = False
+
+    def connection(self):
+        return object()
+
+    def query(self, *_args, **_kwargs):
+        if self._mode == "raise":
+            raise RuntimeError("user reload failed")
+        if self._mode == "cancel":
+            raise asyncio.CancelledError()
+        return _ListChain([] if self._mode == "missing" else [SimpleNamespace(id=1)])
+
+    def close(self):
+        self.closed = True
+
+
+def _policy_snapshot_for(mode: str, *, overrides=None, allowlist=None):
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_UserReloadSession] = []
+
+    def session_factory() -> _UserReloadSession:
+        session = _UserReloadSession(mode)
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(overrides or (lambda _db, _user: {}))
+    set_user_tool_allowlist_hook(allowlist or (lambda _db, _user: None))
+    try:
+        return _load_tool_runtime_policy_snapshot(session_factory, 1), sessions
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+@pytest.mark.parametrize("mode", ["raise", "missing"])
+def test_runtime_policy_denies_every_tool_when_user_reload_fails(mode):
+    # ``raise`` is an ordinary loader failure; ``missing`` is a reload that
+    # returns None. Both used to yield overrides={} / allowlist=None, which the
+    # factory reads as "no disable set, no positive filter" — the full tool set.
+    snapshot, sessions = _policy_snapshot_for(
+        mode,
+        # A permissive-looking hook makes the point: even when the policy would
+        # have allowed something, an unresolved read grants nothing.
+        allowlist=lambda _db, _user: ["file", "shell"],
+    )
+
+    assert snapshot.tool_allowlist == []
+    # The overrides mapping stays a dict: the tool-listing API indexes it.
+    assert snapshot.tool_overrides == {}
+    assert all(session.closed for session in sessions)
+
+
+def test_runtime_policy_keeps_a_healthy_read_unrestricted():
+    # The guard above must be conditional, not a blanket deny: a resolvable
+    # policy is passed through untouched. Without this case, an implementation
+    # that denied every turn would satisfy the two tests above.
+    snapshot, _ = _policy_snapshot_for(
+        "ok",
+        overrides=lambda _db, _user: {"file": {"enabled": False}},
+        allowlist=lambda _db, _user: ["shell"],
+    )
+
+    assert snapshot.tool_allowlist == ["shell"]
+    assert snapshot.tool_overrides == {"file": {"enabled": False}}
+
+
+def test_runtime_policy_keeps_a_healthy_read_without_an_allowlist():
+    # "No allowlist configured" is a legitimate resolved answer and must stay
+    # ``None`` (no filtering) rather than collapsing into the deny-all value.
+    snapshot, _ = _policy_snapshot_for("ok")
+
+    assert snapshot.tool_allowlist is None
+    assert snapshot.tool_overrides == {}
+
+
+@pytest.mark.parametrize("mode", ["raise", "missing"])
+def test_runtime_policy_stays_open_without_a_registered_hook(mode):
+    """Standalone xagent must keep its unrestricted default."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_UserReloadSession] = []
+
+    def session_factory() -> _UserReloadSession:
+        session = _UserReloadSession(mode)
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(None)
+    set_user_tool_allowlist_hook(None)
+    snapshot = _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+    # No hook registered means no policy to lose: denying every tool here would
+    # break every deployment that never delegated authorization to a hook.
+    assert snapshot.tool_allowlist is None
+    assert snapshot.tool_overrides == {}
+    assert all(session.closed for session in sessions)
+
+
+def test_runtime_policy_still_propagates_pool_timeouts():
+    """A pool timeout is retried by the caller, not converted to deny-all."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    checkout_timeout = SQLAlchemyTimeoutError("overrides checkout timed out")
+    sessions: list[_PostgresAbortSession] = []
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession(checkout_error=checkout_timeout)
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(lambda _db, _user: {})
+    set_user_tool_allowlist_hook(lambda _db, _user: ["file"])
+    try:
+        with pytest.raises(SQLAlchemyTimeoutError) as exc_info:
+            _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        assert exc_info.value is checkout_timeout
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+def test_runtime_policy_still_propagates_cancellation():
+    """CancelledError is a BaseException and must not be swallowed."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_UserReloadSession] = []
+
+    def session_factory() -> _UserReloadSession:
+        session = _UserReloadSession("cancel")
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(lambda _db, _user: {})
+    set_user_tool_allowlist_hook(lambda _db, _user: ["file"])
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+def test_runtime_policy_denies_when_only_the_overrides_read_fails():
+    """An unresolved overrides read must not be rescued by a healthy allowlist.
+
+    The two inputs load through independent Sessions, so one can succeed while
+    the other fails. The disable set the hook would have returned is unknown, so
+    the allowlist it did return cannot be trusted to be complete.
+    """
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_PostgresAbortSession] = []
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession()
+        sessions.append(session)
+        return session
+
+    def load_overrides(db: _PostgresAbortSession, _user):
+        db.swallow_statement_failure()
+        raise RuntimeError("overrides read failed")
+
+    allowlist_hook_called = False
+
+    def load_allowlist(_db, _user):
+        nonlocal allowlist_hook_called
+        allowlist_hook_called = True
+        return ["file"]
+
+    set_user_tool_overrides_hook(load_overrides)
+    set_user_tool_allowlist_hook(load_allowlist)
+    try:
+        snapshot = _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        # The independent allowlist read still runs (its own Session is clean)…
+        assert allowlist_hook_called is True
+        # …but the unresolved overrides input still denies the turn.
+        assert snapshot.tool_allowlist == []
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
 @pytest.mark.asyncio
 async def test_default_model_prefetch_returns_every_pool_checkout(
     monkeypatch,
@@ -1203,28 +2851,34 @@ async def test_runtime_policy_refresh_waits_for_pool_off_event_loop(tmp_path):
             ticks += 1
             await asyncio.sleep(0.01)
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        await asyncio.sleep(0.02)
-        ticks_before_wait = ticks
-        refresh_task = asyncio.create_task(cfg.refresh_runtime_policy())
-        await asyncio.sleep(0.08)
-        assert ticks - ticks_before_wait >= 4
-        assert not refresh_task.done()
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            refresh_task = asyncio.create_task(cfg.refresh_runtime_policy())
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not refresh_task.done()
 
-        held_connection.close()
-        await refresh_task
-        assert cfg.get_user_tool_overrides() == {"calculator": {"enabled": False}}
-        assert cfg.get_user_tool_allowlist() == ["file"]
-    finally:
-        if not held_connection.closed:
             held_connection.close()
-        stop.set()
-        await ticker_task
-        cfg.close()
-        set_user_tool_overrides_hook(None)
-        set_user_tool_allowlist_hook(None)
-        engine.dispose()
+            gate.let_through()
+            await asyncio.wait_for(refresh_task, timeout=GUARD_TIMEOUT)
+            assert cfg.get_user_tool_overrides() == {"calculator": {"enabled": False}}
+            assert cfg.get_user_tool_allowlist() == ["file"]
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            await asyncio.wait_for(
+                asyncio.gather(refresh_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
+            stop.set()
+            await ticker_task
+            cfg.close()
+            set_user_tool_overrides_hook(None)
+            set_user_tool_allowlist_hook(None)
+            engine.dispose()
 
 
 def test_legacy_oauth_session_uses_engine_when_caller_is_connection_bound():
@@ -1313,6 +2967,122 @@ def test_connector_runtime_turn_switch_invalidates_runtime_caches():
     assert cfg._connector_runtime_turn_id == "turn-2"
     assert cfg._connector_runtime_view is None
     assert cfg._cached_mcp_configs is None
+
+
+@dataclass(frozen=True, eq=False)
+class _ScopeWithTurnPayload(ExecutionScope):
+    """Scope subclass carrying turn-only data outside the namespace fields.
+
+    ``__eq__`` deliberately compares only the inherited namespace fields (the
+    same ones ``ExecutionScope.__eq__`` compares), ignoring ``turn_marker``
+    and class identity -- mirroring a resolver that hands back a richer scope
+    object for the same namespace.
+    """
+
+    turn_marker: str = field(default="", compare=False)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ExecutionScope):
+            return NotImplemented
+        namespace = (
+            "sandbox_key_suffix",
+            "workspace_segments",
+            "sandbox_mount_segments",
+            "strict_memory_isolation",
+            "isolate_external_dirs",
+        )
+        return [getattr(self, f) for f in namespace] == [
+            getattr(other, f) for f in namespace
+        ] and dict(self.memory_dimensions) == dict(other.memory_dimensions)
+
+    def __hash__(self) -> int:
+        return hash((self.sandbox_key_suffix, self.workspace_segments))
+
+
+def _prime_scope_derived_caches(cfg: WebToolConfig) -> None:
+    cfg._cached_mcp_configs = [{"id": 1, "connector_runtime": {"context": {}}}]
+    cfg._factory_runtime_snapshot = object()
+    cfg._pending_runtime_policy = object()
+
+
+def _assert_scope_derived_caches_primed(cfg: WebToolConfig) -> None:
+    assert cfg._cached_mcp_configs is not None
+    assert cfg._factory_runtime_snapshot is not None
+    assert cfg._pending_runtime_policy is not None
+
+
+def _assert_scope_derived_caches_dropped(cfg: WebToolConfig) -> None:
+    assert cfg._cached_mcp_configs is None
+    assert cfg._factory_runtime_snapshot is None
+    assert cfg._pending_runtime_policy is None
+
+
+def test_set_execution_scope_swaps_the_scope_and_drops_scope_derived_caches():
+    scope_a = ExecutionScope(sandbox_key_suffix="tenant-a")
+    cfg = WebToolConfig(db=None, request=None, execution_scope=scope_a)
+    _prime_scope_derived_caches(cfg)
+
+    # Same scope object: no-op, every scope-derived cache untouched.
+    assert cfg.set_execution_scope(scope_a) is False
+    assert cfg.get_execution_scope() is scope_a
+    _assert_scope_derived_caches_primed(cfg)
+
+    # A fresh base-class instance comparing equal is also a no-op: the
+    # persisted-snapshot path decodes a fresh equal instance every turn and
+    # must not force a tool rebuild.
+    assert (
+        cfg.set_execution_scope(ExecutionScope(sandbox_key_suffix="tenant-a")) is False
+    )
+    assert cfg.get_execution_scope() is scope_a
+    _assert_scope_derived_caches_primed(cfg)
+
+    # Different scope: swaps and drops every scope-derived cache.
+    scope_b = ExecutionScope(sandbox_key_suffix="tenant-b")
+    assert cfg.set_execution_scope(scope_b) is True
+    assert cfg.get_execution_scope() is scope_b
+    _assert_scope_derived_caches_dropped(cfg)
+
+    # Repeating the same scope is a no-op again, leaving state alone.
+    cfg._cached_mcp_configs = ["sentinel"]
+    assert cfg.set_execution_scope(scope_b) is False
+    assert cfg.get_execution_scope() is scope_b
+    assert cfg._cached_mcp_configs == ["sentinel"]
+
+    # compare=False trap: a subclass instance that compares equal to scope_b
+    # by value (same namespace fields) but carries a different type must
+    # still be swapped in -- a resolver returning a richer scope for an
+    # unchanged namespace must not be dropped as a no-op equality match.
+    scope_b_with_turn_payload = _ScopeWithTurnPayload(
+        sandbox_key_suffix="tenant-b", turn_marker="turn-9"
+    )
+    assert scope_b_with_turn_payload == scope_b
+    assert type(scope_b_with_turn_payload) is not type(scope_b)
+
+    assert cfg.set_execution_scope(scope_b_with_turn_payload) is True
+    assert cfg.get_execution_scope() is scope_b_with_turn_payload
+    assert cfg._cached_mcp_configs is None
+
+
+def test_set_execution_scope_swaps_equal_same_subclass_instances():
+    # Two instances of the SAME subclass differing only in payload the
+    # subclass excludes from equality: successive turns of a resolver that
+    # returns a richer scope per turn. Value equality cannot prove freshness
+    # for a subclass, so the setter must swap.
+    turn_1 = _ScopeWithTurnPayload(sandbox_key_suffix="tenant-c", turn_marker="turn-1")
+    cfg = WebToolConfig(db=None, request=None, execution_scope=turn_1)
+    _prime_scope_derived_caches(cfg)
+
+    # The identical object stays a no-op even for a subclass.
+    assert cfg.set_execution_scope(turn_1) is False
+    _assert_scope_derived_caches_primed(cfg)
+
+    turn_2 = _ScopeWithTurnPayload(sandbox_key_suffix="tenant-c", turn_marker="turn-2")
+    assert turn_2 == turn_1
+    assert type(turn_2) is type(turn_1)
+
+    assert cfg.set_execution_scope(turn_2) is True
+    assert cfg.get_execution_scope() is turn_2
+    _assert_scope_derived_caches_dropped(cfg)
 
 
 def test_connector_runtime_view_resolution_errors_fail_closed(monkeypatch):
@@ -1407,7 +3177,7 @@ def test_custom_api_config_loader_propagates_runtime_view_resolution_error(monke
         allow_delegated_authorization=False,
     )
     cfg = WebToolConfig(
-        db=_StaticRowsSession([SimpleNamespace(custom_api=api)]),
+        db=_StaticRowsSession([api]),
         request=None,
         task_id="web_task_123",
         user_id=1,

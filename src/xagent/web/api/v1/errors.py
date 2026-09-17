@@ -27,6 +27,8 @@ from typing import Any, NoReturn
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+
 
 class V1ErrorCode(str, Enum):
     """Stable error codes for ``/v1/*`` responses.
@@ -94,8 +96,8 @@ class V1ErrorCode(str, Enum):
     # clients always switch on ``body.error.code``.
     INVALID_INPUT = "invalid_input"
 
-    # Reserved for rate limiting. The server does not emit this yet, but
-    # it stays in the enum so SDK clients can encode the mapping now.
+    # Emitted when a caller exceeds the v1 SSE stream concurrency caps
+    # (per-task or per-principal).
     RATE_LIMITED = "rate_limited"
 
     # Monthly execution quota exhausted. 402 Payment Required. Two distinct
@@ -110,6 +112,7 @@ class V1ErrorCode(str, Enum):
     # Server-side bug. Detail is sanitized; the raw exception stays in
     # the server log.
     INTERNAL_ERROR = "internal_error"
+    AUTO_MODEL_UNAVAILABLE = "auto_model_unavailable"
 
     CONNECTOR_NOT_FOUND = "connector_not_found"
     INVALID_RUNTIME_CONTEXT = "invalid_runtime_context"
@@ -121,6 +124,31 @@ class V1ErrorCode(str, Enum):
     CONNECTOR_RUNTIME_UNAVAILABLE = "connector_runtime_unavailable"
     MCP_OAUTH_AUTHORIZATION_FAILED = "mcp_oauth_authorization_failed"
     DELEGATED_AUTHORIZATION_FAILED = "delegated_authorization_failed"
+
+    # The task is waiting on an answer to a pending agent question and
+    # cannot accept a plain append. 409. Client should call
+    # ``POST /v1/chat/tasks/{id}/reply`` instead of retrying the append.
+    INTERACTION_RESPONSE_REQUIRED = "interaction_response_required"
+
+    # The task is waiting_for_user, but its saved execution progress
+    # cannot be resumed (no run-fenced checkpoint, or the checkpoint is
+    # unreadable/superseded). 409, not retryable -- the task stays in
+    # waiting_for_user and the caller must start a new task.
+    INTERACTION_NOT_RESUMABLE = "interaction_not_resumable"
+
+    # ``POST /v1/chat/tasks/{id}/reply`` was called on a task that is not
+    # currently waiting on a question (pending / paused / completed /
+    # failed). 409. Not retryable as-is; use ``append`` to start a new
+    # turn, or wait for the task to reach waiting_for_user.
+    NO_PENDING_INTERACTION = "no_pending_interaction"
+
+    # A reply's saved progress could not be read due to a transient
+    # infrastructure failure. 503, retryable -- distinct from
+    # ``interaction_not_resumable`` (which means resuming can never
+    # succeed) so clients know whether to retry or give up.
+    REPLY_OUTCOME_UNKNOWN = "reply_outcome_unknown"
+
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
 
 
 # Default human-readable text per code. Endpoints may override the
@@ -155,6 +183,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
         "Monthly execution quota exceeded for this client application."
     ),
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
+    V1ErrorCode.AUTO_MODEL_UNAVAILABLE: CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
     V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
     V1ErrorCode.INVALID_RUNTIME_CONTEXT: "Invalid connector runtime context.",
     V1ErrorCode.MISSING_RUNTIME_CONTEXT: "Required connector runtime context is missing.",
@@ -165,6 +194,24 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.CONNECTOR_RUNTIME_UNAVAILABLE: "Connector runtime context is unavailable.",
     V1ErrorCode.MCP_OAUTH_AUTHORIZATION_FAILED: "MCP OAuth authorization is unavailable.",
     V1ErrorCode.DELEGATED_AUTHORIZATION_FAILED: "Delegated authorization failed.",
+    V1ErrorCode.INTERACTION_RESPONSE_REQUIRED: (
+        "This task is waiting for an answer to a pending question; use "
+        "the task reply endpoint (POST .../reply) instead."
+    ),
+    V1ErrorCode.INTERACTION_NOT_RESUMABLE: (
+        "This task's saved progress cannot be resumed; it remains in "
+        "waiting_for_user. Start a new task instead of retrying."
+    ),
+    V1ErrorCode.NO_PENDING_INTERACTION: (
+        "This task has no pending question to answer."
+    ),
+    V1ErrorCode.REPLY_OUTCOME_UNKNOWN: (
+        "Reply was accepted but its outcome is not yet known. "
+        "Repeat the same command_id to check its outcome; do not send a new reply."
+    ),
+    V1ErrorCode.TEMPORARILY_UNAVAILABLE: (
+        "The task's saved progress could not be read. Please retry."
+    ),
 }
 
 
@@ -210,6 +257,16 @@ _TURN_REJECTION_CODES: dict[str, tuple[V1ErrorCode, int]] = {
     # The run row backing this conversation is gone; from the SDK's
     # perspective the task is simply no longer available.
     "workforce_run_not_found": (V1ErrorCode.TASK_NOT_FOUND, 404),
+    # The run itself was cancelled (archive path or the stale-preview-run
+    # reaper) -- same "conversation no longer available" outcome as
+    # workforce_run_not_found from the SDK's perspective.
+    "workforce_run_not_active": (V1ErrorCode.TASK_NOT_FOUND, 404),
+    # The task is waiting on an answer to a pending question; append is
+    # not the right entrypoint for that -- POST .../reply is.
+    "interaction_response_required": (
+        V1ErrorCode.INTERACTION_RESPONSE_REQUIRED,
+        409,
+    ),
 }
 
 

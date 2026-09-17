@@ -1,17 +1,15 @@
 """Router LLM: a virtual model that delegates to xrouter-llm for selection.
 
 On every call it asks the xrouter-llm decision library (imported in-process, no
-external service) to pick ONE concrete model for the prompt, then dispatches the
-actual completion through a single OpenAI-compatible backend pointed at
-OpenRouter. Every provider (Claude, DeepSeek, Gemini, GLM, GPT, ...) is reached
-via OpenRouter, so xagent needs only ONE credential pair: `OPENAI_API_KEY` (an
-OpenRouter key) and `OPENAI_BASE_URL` (https://openrouter.ai/api/v1).
+external service) to pick ONE routing profile for the prompt, then dispatches
+the actual completion through the concrete saved model bound to that profile.
+The legacy OpenRouter ``auto`` model remains supported and resolves every
+profile through its own OpenRouter credential pair.
 
 xrouter-llm ships a trained router, the model-profile registry, and the named
 router configs as package data, so the decision runs entirely in-process. The
-registry returns ids that are already canonical OpenRouter slugs (e.g.
-`anthropic/claude-opus-4.8`, `openai/gpt-5.5`), so the chosen id is passed
-straight through as the downstream model name.
+registry returns canonical ids (e.g. `anthropic/claude-opus-4.8`,
+`openai/gpt-5.5`) which configured Auto maps to concrete model records.
 
 Every decision (prompt, candidate models with their predicted completion and
 cost, and the chosen slug) is logged to a SQLite call history via xrouter-llm's
@@ -22,6 +20,7 @@ Env overrides (all optional; default to the bundled package data):
   XAGENT_XROUTER_MODELS_DIR     model-profile registry dir/file
   XAGENT_XROUTER_ROUTERS_DIR    router configs dir/file
   XAGENT_XROUTER_DB             routing-decision SQLite history path
+  XAGENT_XROUTER_EXCLUDED_MODELS comma-separated candidate model slugs to omit
   XAGENT_ROUTER_FALLBACK_MODEL  slug to use if routing fails
 """
 
@@ -32,10 +31,12 @@ import inspect
 import logging
 import os
 import threading
-from typing import Any, AsyncIterator, Callable, List, Optional, cast
+from typing import Any, AsyncIterator, Callable, List, Optional, Sequence
 
+from .....config import get_xrouter_excluded_models
 from ....context_ref import CONTEXT_REFS_KEY, normalize_context_references
 from ....model import ChatModelConfig
+from ....task_runtime import normalize_input_modalities
 from ...providers import default_base_url_for_provider
 from ..types import StreamChunk
 from .base import BaseLLM
@@ -44,7 +45,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
 _UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
-_DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
 _CONTENT_PART_MODALITIES = {
     "audio": "audio",
     "audio_url": "audio",
@@ -68,70 +68,6 @@ _MODALITY_ABILITIES = {
 
 class RouterModalityRoutingError(RuntimeError):
     """The installed router cannot enforce required input modalities."""
-
-
-def _should_retry_without_thinking(
-    exc: Exception,
-    *,
-    thinking: dict[str, Any] | None,
-    tool_choice: str | dict[str, Any] | None,
-) -> bool:
-    # Deliberate OpenRouter/DeepSeek compatibility bridge: the provider returns
-    # an OpenAI-compatible 400 without a typed error for this thinking/tool_choice
-    # conflict. Replace this with provider-owned typed exceptions once the
-    # follow-up tracking issue lands.
-    exc_msg = str(exc).lower()
-    return (
-        (thinking is None or isinstance(thinking, dict))
-        and tool_choice is not None
-        and "thinking" in exc_msg
-        and "tool_choice" in exc_msg
-    )
-
-
-def _should_retry_with_relaxed_tool_choice(
-    exc: Exception,
-    *,
-    tools: list[dict[str, Any]] | None,
-    tool_choice: str | dict[str, Any] | None,
-) -> bool:
-    if not tools or tool_choice in (None, "auto", "none"):
-        return False
-
-    # Deliberate OpenRouter compatibility bridge: official provider routing can
-    # reject strict tool_choice values before selecting an endpoint. This
-    # degrades forced tool use to "auto" instead of failing the whole agent run.
-    # Replace string matching with typed provider errors when available.
-    exc_msg = str(exc).lower()
-    return "no endpoints found" in exc_msg and "tool_choice" in exc_msg
-
-
-def _next_retry_state(
-    exc: Exception,
-    *,
-    tools: list[dict[str, Any]] | None,
-    thinking: dict[str, Any] | None,
-    tool_choice: str | dict[str, Any] | None,
-) -> tuple[str | dict[str, Any] | None, dict[str, Any] | None, str, str] | None:
-    if _should_retry_without_thinking(exc, thinking=thinking, tool_choice=tool_choice):
-        return (
-            tool_choice,
-            _DISABLE_DOWNSTREAM_THINKING,
-            "selected model rejected thinking with tool_choice; retrying without thinking",
-            "disable_thinking",
-        )
-
-    if _should_retry_with_relaxed_tool_choice(
-        exc, tools=tools, tool_choice=tool_choice
-    ):
-        return (
-            "auto",
-            thinking,
-            "selected OpenRouter endpoint rejected tool_choice; retrying with tool_choice=auto",
-            "relax_tool_choice",
-        )
-
-    return None
 
 
 class _NullStore:
@@ -221,13 +157,23 @@ class RouterLLM(BaseLLM):
         timeout: float = 180.0,
         abilities: Optional[List[str]] = None,
         downstream_resolver: Optional[Callable[[str], BaseLLM]] = None,
+        candidate_models: Optional[Sequence[str]] = None,
+        fallback_model: Optional[str] = None,
+        use_environment_fallback: bool = True,
     ) -> None:
         # model_name doubles as the xrouter-llm router config name (e.g. "auto").
         self._config_name = model_name or "auto"
-        # Given a chosen OpenRouter slug, build the LLM that runs it. Injected by
-        # the model store so "auto" reuses the user-configured OpenRouter model
-        # (credentials + base_url) instead of any environment variable.
+        # Given a chosen routing profile, build the concrete LLM that runs it.
+        # Configured Auto injects bindings to saved models; legacy OpenRouter
+        # Auto injects a resolver that reuses its own credentials and base URL.
         self._downstream_resolver = downstream_resolver
+        self._candidate_models = (
+            tuple(dict.fromkeys(str(model) for model in candidate_models))
+            if candidate_models is not None
+            else None
+        )
+        if self._candidate_models == ():
+            raise ValueError("A configured Auto model needs at least one candidate")
         # The auto model's own OpenRouter credentials. Routing is in-process (not
         # an HTTP call), but these are used by the fallback resolver below when no
         # downstream OpenRouter model is injected (e.g. test-connection paths), so
@@ -240,12 +186,31 @@ class RouterLLM(BaseLLM):
         # A virtual router cannot advertise one candidate's dynamic abilities.
         # The resolved per-call wrapper derives those from the selected model's
         # profile after xrouter applies any input-modality preferences.
+        configured_abilities = (
+            list(abilities) if abilities else list(_DEFAULT_ROUTER_ABILITIES)
+        )
         self._abilities = [
             ability
-            for ability in (abilities or _DEFAULT_ROUTER_ABILITIES)
+            for ability in configured_abilities
             if ability not in _UNROUTED_ROUTER_ABILITIES
         ]
-        self._fallback_model = os.getenv("XAGENT_ROUTER_FALLBACK_MODEL") or None
+        # Kept unfiltered (unlike ``self._abilities`` above) for the
+        # ``_resolve_route`` fallback branch: that branch builds a real
+        # downstream ``OpenRouterLLM`` from a ``ChatModelConfig``, and that
+        # client's own ``vision``/``thinking_mode`` support must reflect what
+        # the user actually configured, not this virtual router's
+        # deliberately-narrowed advertised abilities.
+        self._raw_abilities = configured_abilities
+        self._fallback_model = fallback_model
+        self._use_environment_fallback = use_environment_fallback
+        if self._fallback_model is None and use_environment_fallback:
+            self._fallback_model = os.getenv("XAGENT_ROUTER_FALLBACK_MODEL") or None
+        if (
+            self._candidate_models is not None
+            and self._fallback_model is not None
+            and self._fallback_model not in self._candidate_models
+        ):
+            raise ValueError("The Auto fallback model must be one of its candidates")
 
     # ---- BaseLLM interface --------------------------------------------------
     @property
@@ -260,56 +225,11 @@ class RouterLLM(BaseLLM):
     def supports_thinking_mode(self) -> bool:
         return "thinking_mode" in self._abilities
 
-    async def _run_non_streaming_with_provider_retry(
-        self,
-        method: Callable[..., Any],
-        messages: list[dict[str, Any]],
-        *,
-        temperature: float | None,
-        max_tokens: int | None,
-        tools: list[dict[str, Any]] | None,
-        tool_choice: str | dict[str, Any] | None,
-        response_format: dict[str, Any] | None,
-        thinking: dict[str, Any] | None,
-        output_config: dict[str, Any] | None,
-        kwargs: dict[str, Any],
-    ) -> str | dict[str, Any]:
-        current_tool_choice = tool_choice
-        current_thinking = thinking
-        attempted_retry_actions: set[str] = set()
+    @property
+    def uses_configured_candidates(self) -> bool:
+        """Whether this router is backed by an explicit Auto candidate set."""
 
-        while True:
-            try:
-                result = await method(
-                    messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    tool_choice=current_tool_choice,
-                    response_format=response_format,
-                    thinking=current_thinking,
-                    output_config=output_config,
-                    **kwargs,
-                )
-                return cast(str | dict[str, Any], result)
-            except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
-                retry_state = _next_retry_state(
-                    exc,
-                    tools=tools,
-                    thinking=current_thinking,
-                    tool_choice=current_tool_choice,
-                )
-                if retry_state is None:
-                    raise
-
-                next_tool_choice, next_thinking, log_message, action_key = retry_state
-                if action_key in attempted_retry_actions:
-                    raise
-
-                attempted_retry_actions.add(action_key)
-                logger.info(log_message)
-                current_tool_choice = next_tool_choice
-                current_thinking = next_thinking
+        return self._candidate_models is not None
 
     async def chat(
         self,
@@ -387,87 +307,62 @@ class RouterLLM(BaseLLM):
         ):
             yield chunk
 
-    async def _run_streaming_with_provider_retry(
+    # ---- Routing ------------------------------------------------------------
+    async def prepare_for_call(
         self,
-        llm: BaseLLM,
         messages: list[dict[str, Any]],
         *,
-        temperature: float | None,
-        max_tokens: int | None,
-        tools: list[dict[str, Any]] | None,
-        tool_choice: str | dict[str, Any] | None,
-        response_format: dict[str, Any] | None,
-        thinking: dict[str, Any] | None,
-        output_config: dict[str, Any] | None,
-        kwargs: dict[str, Any],
-    ) -> AsyncIterator[StreamChunk]:
-        has_yielded = False
-        current_tool_choice = tool_choice
-        current_thinking = thinking
-        attempted_retry_actions: set[str] = set()
-
-        while True:
-            try:
-                async for chunk in llm.stream_chat(
-                    messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    tool_choice=current_tool_choice,
-                    response_format=response_format,
-                    thinking=current_thinking,
-                    output_config=output_config,
-                    **kwargs,
-                ):
-                    has_yielded = True
-                    yield chunk
-                return
-            except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
-                if has_yielded:
-                    raise
-
-                retry_state = _next_retry_state(
-                    exc,
-                    tools=tools,
-                    thinking=current_thinking,
-                    tool_choice=current_tool_choice,
-                )
-                if retry_state is None:
-                    raise
-
-                next_tool_choice, next_thinking, log_message, action_key = retry_state
-                if action_key in attempted_retry_actions:
-                    raise
-
-                attempted_retry_actions.add(action_key)
-                logger.info(log_message)
-                current_tool_choice = next_tool_choice
-                current_thinking = next_thinking
-
-    # ---- Routing ------------------------------------------------------------
-    async def prepare_for_call(self, messages: list[dict[str, Any]]) -> BaseLLM:
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> BaseLLM:
         """Resolve one xrouter decision into a reusable per-call LLM.
 
-        The returned wrapper keeps RouterLLM's compatibility retries without
-        routing a second time, and carries the selected model's context window
-        from xrouter's model profile catalog.
+        The returned wrapper dispatches directly to the selected downstream
+        model without routing a second time, and carries the selected model's
+        context window from xrouter's model profile catalog. Both resolver
+        branches in ``_resolve_route`` currently build an ``OpenRouterLLM``
+        client for the chosen slug (the injected ``_downstream_resolver`` in
+        practice, and the ``create_base_llm`` fallback always, since it is
+        given ``model_provider="openrouter"``), so provider-compat retries (a
+        rejected tool_choice, a thinking/tool_choice conflict, a model that
+        mandates reasoning) are that client's own responsibility today, not
+        this router's. ``_downstream_resolver`` is typed as
+        ``Callable[[str], BaseLLM]``, not ``OpenRouterLLM``, so this is a
+        statement about current call sites, not a type-level guarantee.
+
+        ``preferred_input_modalities`` supplied by the caller (task runtime
+        extensions) is *advisory*: a router that cannot honour it degrades by
+        routing without it. Modalities derived from the messages themselves are
+        hard requirements, because the conversation genuinely cannot be sent to
+        a model that does not accept them.
         """
-        preferred_input_modalities = self._preferred_input_modalities(messages)
+        required_input_modalities = self._preferred_input_modalities(messages)
+        advisory_input_modalities = tuple(
+            modality
+            for modality in dict.fromkeys(
+                normalize_input_modalities(preferred_input_modalities)
+            )
+            if modality not in required_input_modalities
+        )
+        route_input_modalities = (
+            *advisory_input_modalities,
+            *required_input_modalities,
+        )
         model_id, downstream = await self._resolve_route(
             messages,
-            preferred_input_modalities=preferred_input_modalities,
+            preferred_input_modalities=required_input_modalities,
+            advisory_input_modalities=advisory_input_modalities,
         )
-        context_window = getattr(self, "context_window", None)
+        # A saved target model describes the endpoint that will actually serve
+        # the request, so its explicit context window wins over catalog data.
+        context_window = getattr(downstream, "context_window", None)
+        if not context_window:
+            context_window = getattr(self, "context_window", None)
         if not context_window:
             context_window = await asyncio.to_thread(
                 self._profile_context_window, model_id
             )
-        if not context_window:
-            context_window = getattr(downstream, "context_window", None)
         input_modalities = (
-            self._profile_input_modalities(model_id)
-            if preferred_input_modalities
-            else ()
+            self._profile_input_modalities(model_id) if route_input_modalities else ()
         )
         return _ResolvedRouterLLM(
             router=self,
@@ -482,6 +377,7 @@ class RouterLLM(BaseLLM):
         messages: list[dict[str, Any]],
         *,
         preferred_input_modalities: tuple[str, ...] = (),
+        advisory_input_modalities: tuple[str, ...] = (),
     ) -> tuple[str, BaseLLM]:
         # Route on the agent's current goal (the user's request, or a DAG step's
         # objective) rather than the scaffolded sub-prompt this particular LLM
@@ -489,16 +385,14 @@ class RouterLLM(BaseLLM):
         from ...intent import current_goal
 
         prompt = current_goal() or self._extract_prompt(messages)
+        select_kwargs: dict[str, Any] = {}
         if preferred_input_modalities:
-            model_id = await self._select_model(
-                prompt,
-                preferred_input_modalities=preferred_input_modalities,
-            )
-        else:
-            model_id = await self._select_model(prompt)
-        logger.info("xrouter selected %s -> openrouter", model_id)
+            select_kwargs["preferred_input_modalities"] = preferred_input_modalities
+        if advisory_input_modalities:
+            select_kwargs["advisory_input_modalities"] = advisory_input_modalities
+        model_id = await self._select_model(prompt, **select_kwargs)
+        logger.info("xrouter selected routing profile %s", model_id)
         if self._downstream_resolver is not None:
-            # Reuse the user-configured OpenRouter model (credentials + base_url).
             return model_id, self._downstream_resolver(model_id)
         # Fallback when no downstream resolver was injected: an OpenAI-compatible
         # client using this model's own OpenRouter credentials (or the ambient
@@ -515,7 +409,11 @@ class RouterLLM(BaseLLM):
             default_temperature=self.default_temperature,
             default_max_tokens=self.default_max_tokens,
             timeout=self.timeout,
-            abilities=self._abilities,
+            # Unfiltered abilities (see ``self._raw_abilities``): this builds
+            # a real downstream client, not the virtual router itself, so it
+            # must not inherit the router's own vision/thinking_mode
+            # exclusion.
+            abilities=self._raw_abilities,
         )
         return model_id, create_base_llm(config)
 
@@ -554,11 +452,28 @@ class RouterLLM(BaseLLM):
             )
         )
 
+    def _compatible_fallback(
+        self, required_input_modalities: tuple[str, ...]
+    ) -> str | None:
+        if self._fallback_model is None:
+            return None
+        if not required_input_modalities:
+            return self._fallback_model
+        supported = set(self._profile_input_modalities(self._fallback_model))
+        missing = sorted(set(required_input_modalities) - supported)
+        if missing:
+            raise RouterModalityRoutingError(
+                f"Auto fallback model {self._fallback_model!r} does not support "
+                f"required input modalities: {', '.join(missing)}"
+            )
+        return self._fallback_model
+
     async def _select_model(
         self,
         prompt: str,
         *,
         preferred_input_modalities: tuple[str, ...] = (),
+        advisory_input_modalities: tuple[str, ...] = (),
     ) -> str:
         # The decision loads/embeds in-process and is CPU-bound, so run it in a
         # worker thread to avoid blocking the event loop.
@@ -567,24 +482,31 @@ class RouterLLM(BaseLLM):
                 self._route_sync,
                 prompt,
                 preferred_input_modalities,
+                advisory_input_modalities,
             )
         except RouterModalityRoutingError:
             raise
         except Exception as exc:  # noqa: BLE001 - routing must not crash the agent
-            if self._fallback_model:
+            fallback_model = self._compatible_fallback(preferred_input_modalities)
+            if fallback_model:
                 logger.warning(
                     "xrouter route failed (%s); using fallback %s",
                     exc,
-                    self._fallback_model,
+                    fallback_model,
                 )
-                return self._fallback_model
+                return fallback_model
             raise RuntimeError(
                 f"xrouter-llm routing failed: {exc}. "
-                "Set XAGENT_ROUTER_FALLBACK_MODEL to degrade gracefully."
+                + (
+                    "Set XAGENT_ROUTER_FALLBACK_MODEL to degrade gracefully."
+                    if self._use_environment_fallback
+                    else "Configure an Auto fallback model to degrade gracefully."
+                )
             ) from exc
         if not selected:
-            if self._fallback_model:
-                return self._fallback_model
+            fallback_model = self._compatible_fallback(preferred_input_modalities)
+            if fallback_model:
+                return fallback_model
             raise RuntimeError("xrouter-llm returned no selected model")
         return str(selected[0])
 
@@ -592,22 +514,35 @@ class RouterLLM(BaseLLM):
         self,
         prompt: str,
         preferred_input_modalities: tuple[str, ...] = (),
+        advisory_input_modalities: tuple[str, ...] = (),
     ) -> list[str]:
+        """Route once.
+
+        ``preferred_input_modalities`` are hard requirements derived from the
+        conversation's own content; ``advisory_input_modalities`` are
+        preferences declared by a task runtime extension. When the installed
+        router cannot express modality preferences at all, the hard
+        requirements raise while the advisory ones are simply dropped.
+        """
         service = _get_service()
         route_kwargs: dict[str, Any] = {"config_name": self._config_name}
         try:
             route_parameters = dict(inspect.signature(service.route).parameters)
         except (TypeError, ValueError):
             route_parameters = {}
+        supports_keyword_arguments = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in route_parameters.values()
+        )
         supports_modality_preferences = (
             "preferred_input_modalities" in route_parameters
-            or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in route_parameters.values()
-            )
+            or supports_keyword_arguments
         )
-        if preferred_input_modalities and supports_modality_preferences:
-            route_kwargs["preferred_input_modalities"] = preferred_input_modalities
+        requested_modalities = tuple(
+            dict.fromkeys((*advisory_input_modalities, *preferred_input_modalities))
+        )
+        if requested_modalities and supports_modality_preferences:
+            route_kwargs["preferred_input_modalities"] = requested_modalities
         elif preferred_input_modalities:
             requested = ", ".join(preferred_input_modalities)
             raise RouterModalityRoutingError(
@@ -616,8 +551,44 @@ class RouterLLM(BaseLLM):
                 "install an xrouter-llm build whose route() API accepts "
                 "preferred_input_modalities."
             )
+        elif advisory_input_modalities:
+            # Advisory only: routing without the preference is a valid
+            # degradation, unlike a conversation that actually carries the
+            # unsupported modality.
+            logger.info(
+                "The installed xrouter-llm RoutingService cannot express input "
+                "modality preferences (%s); routing without them.",
+                ", ".join(advisory_input_modalities),
+            )
+
+        excluded_models = frozenset(get_xrouter_excluded_models())
+        configured_models = tuple(self._candidate_pool(service))
+        eligible_models = [
+            model for model in configured_models if model not in excluded_models
+        ]
+        if self._candidate_models is not None or (
+            excluded_models and len(eligible_models) != len(configured_models)
+        ):
+            if not eligible_models:
+                raise RuntimeError(
+                    f"{self._config_name!r} has no candidates after applying "
+                    "XAGENT_XROUTER_EXCLUDED_MODELS"
+                )
+            if "models" not in route_parameters and not supports_keyword_arguments:
+                raise RuntimeError(
+                    "The installed xrouter-llm RoutingService cannot apply "
+                    "XAGENT_XROUTER_EXCLUDED_MODELS; upgrade xrouter-llm."
+                )
+            route_kwargs["models"] = eligible_models
         result = service.route(prompt, **route_kwargs)
         return list(result.get("selected") or [])
+
+    def _candidate_pool(self, service: Any) -> list[str]:
+        """Return this Auto model's explicit or preset candidate pool."""
+        if self._candidate_models is not None:
+            return list(self._candidate_models)
+        config = getattr(service, "configs", {}).get(self._config_name)
+        return list(getattr(config, "models", ()) or ())
 
     @staticmethod
     def _preferred_input_modalities(
@@ -683,11 +654,13 @@ class _ResolvedRouterLLM(BaseLLM):
         self._downstream = downstream
         self._selected_model = selected_model
         self.context_window = context_window
-        abilities = list(router.abilities)
-        for modality in input_modalities:
-            ability = _MODALITY_ABILITIES.get(modality)
-            if ability is not None and ability not in abilities:
-                abilities.append(ability)
+        ability_source = downstream if router.uses_configured_candidates else router
+        abilities = list(getattr(ability_source, "abilities", router.abilities))
+        if not router.uses_configured_candidates:
+            for modality in input_modalities:
+                ability = _MODALITY_ABILITIES.get(modality)
+                if ability is not None and ability not in abilities:
+                    abilities.append(ability)
         self._abilities = abilities
 
     @property
@@ -696,7 +669,7 @@ class _ResolvedRouterLLM(BaseLLM):
 
     @property
     def timeout(self) -> float:
-        return self._router.timeout
+        return getattr(self._downstream, "timeout", self._router.timeout)
 
     @property
     def abilities(self) -> List[str]:
@@ -708,7 +681,13 @@ class _ResolvedRouterLLM(BaseLLM):
 
     @property
     def supports_thinking_mode(self) -> bool:
-        return self._router.supports_thinking_mode
+        if not self._router.uses_configured_candidates:
+            return self._router.supports_thinking_mode
+        return getattr(
+            self._downstream,
+            "supports_thinking_mode",
+            self._router.supports_thinking_mode,
+        )
 
     @property
     def supports_json_schema_response_format(self) -> bool:
@@ -730,8 +709,7 @@ class _ResolvedRouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        return await self._router._run_non_streaming_with_provider_retry(
-            self._downstream.chat,
+        return await self._downstream.chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -740,7 +718,7 @@ class _ResolvedRouterLLM(BaseLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            kwargs=kwargs,
+            **kwargs,
         )
 
     async def vision_chat(
@@ -755,8 +733,7 @@ class _ResolvedRouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        return await self._router._run_non_streaming_with_provider_retry(
-            self._downstream.vision_chat,
+        return await self._downstream.vision_chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -765,7 +742,7 @@ class _ResolvedRouterLLM(BaseLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            kwargs=kwargs,
+            **kwargs,
         )
 
     async def stream_chat(
@@ -780,8 +757,7 @@ class _ResolvedRouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
-        async for chunk in self._router._run_streaming_with_provider_retry(
-            self._downstream,
+        async for chunk in self._downstream.stream_chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -790,6 +766,6 @@ class _ResolvedRouterLLM(BaseLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            kwargs=kwargs,
+            **kwargs,
         ):
             yield chunk

@@ -32,6 +32,16 @@ describe("getApiSnippetTarget", () => {
     })
   })
 
+  it("prefers an explicit deployment origin over the canonical API URL", () => {
+    getApiUrlMock.mockReturnValue("https://cloud.example.test")
+
+    expect(
+      getApiSnippetTarget("https://sg-origin.cloud.example.test/"),
+    ).toEqual({
+      baseUrl: "https://sg-origin.cloud.example.test",
+    })
+  })
+
   it("resolves relative API URLs against the browser origin", () => {
     getApiUrlMock.mockReturnValue("/api")
 

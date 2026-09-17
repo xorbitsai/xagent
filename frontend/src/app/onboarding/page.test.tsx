@@ -1,0 +1,2640 @@
+import React from "react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
+import OnboardingPage from "./page"
+
+const routerPush = vi.hoisted(() => vi.fn())
+const routerReplace = vi.hoisted(() => vi.fn())
+const authUser = vi.hoisted(() => ({ id: "user-a", username: "Shulei" as string | undefined }))
+// Lets exactly one test diverge readAuthSessionSnapshot()'s userId from
+// authUser.id (which every other test keeps them equal to by default, so
+// none of them can tell whether wizardUserIdRef's initial capture actually
+// reads readAuthSessionSnapshot() at mount vs. user?.id). undefined (reset
+// every beforeEach) means "no override, fall back to authUser.id" - the
+// same behavior every other test already relies on.
+const sessionUserIdOverride = vi.hoisted(() => ({ current: undefined as string | null | undefined }))
+const apiRequestMock = vi.hoisted(() => vi.fn())
+const updateUserPreferencesMock = vi.hoisted(() => vi.fn())
+const hireAgentFromTemplateMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
+const markOnboardingSaveEscapedMock = vi.hoisted(() => vi.fn())
+const i18nState = vi.hoisted(() => ({ locale: "en" as "en" | "zh" }))
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: routerPush, replace: routerReplace }),
+}))
+
+vi.mock("sonner", () => ({
+  toast: { error: toastErrorMock },
+}))
+
+// Spreads into a NEW object on every call, rather than returning `authUser`
+// itself - the real AuthProvider replaces its `user` value via React state
+// (setProjection in auth-context.tsx) on an identity swap, it doesn't mutate
+// an existing object in place. Returning the same object reference here
+// would let a stale closure's `user.id` read "live" through that shared
+// reference, silently hiding bugs where a closure captured from an earlier
+// render can't actually observe a later identity change.
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({ user: { ...authUser } }),
+}))
+
+// readAuthSessionSnapshot() is called directly (not via a React hook) at
+// every identity-swap guard checkpoint, precisely so those checks read live
+// storage instead of a value that can only update while this page stays
+// mounted - see wizardUserIdRef's/currentSessionUserId's comments in
+// page.tsx. Backed by the SAME `authUser` object as the useAuth() mock
+// above (read fresh on every call, not spread into a snapshot at mock-setup
+// time) so mutating `authUser.id` mid-test - including after this
+// component has unmounted - is visible here too.
+vi.mock("@/lib/auth-cache", () => ({
+  readAuthSessionSnapshot: () => ({
+    userId: sessionUserIdOverride.current !== undefined ? sessionUserIdOverride.current : authUser.id,
+  }),
+}))
+
+vi.mock("@/contexts/i18n-context", () => ({
+  useI18n: () => ({
+    t: (key: string, vars?: Record<string, string | number>) =>
+      resolveTranslation(i18nState.locale, key as TranslationKey, vars),
+    locale: i18nState.locale,
+  }),
+}))
+
+vi.mock("@/lib/api-wrapper", () => ({
+  apiRequest: apiRequestMock,
+}))
+
+vi.mock("@/lib/user-preferences", () => ({
+  updateUserPreferences: updateUserPreferencesMock,
+  fetchUserPreferences: vi.fn(),
+  markOnboardingSaveEscaped: markOnboardingSaveEscapedMock,
+}))
+
+vi.mock("@/lib/hire-agent", () => ({
+  hireAgentFromTemplate: hireAgentFromTemplateMock,
+}))
+
+const TEMPLATES = [
+  {
+    id: "marketing-social-media-content-manager",
+    name: "Maya",
+    category: "Marketing",
+    description: "Turns briefs into posts.",
+    features: [],
+    persona: { name: "Maya", role: "Social Media Content Manager", intro: "Hi", kickoff_questions: [] },
+    connections: [{ name: "LinkedIn" }, { name: "Facebook Pages" }, { name: "Instagram" }, { name: "Google Drive" }],
+    setup_time: "5 min",
+    tags: [],
+    author: "xagent",
+    version: "1.0",
+    views: 0,
+    likes: 0,
+    used_count: 0,
+  },
+  {
+    id: "support-inbox-manager",
+    name: "Ellie",
+    category: "Support",
+    description: "Keeps your inbox triaged.",
+    features: [],
+    persona: { name: "Ellie", role: "Inbox Manager", intro: "Hi", kickoff_questions: [] },
+    connections: [],
+    setup_time: "5 min",
+    tags: [],
+    author: "xagent",
+    version: "1.0",
+    views: 0,
+    likes: 0,
+    used_count: 0,
+  },
+  {
+    id: "sales-meeting-agent",
+    name: "Kevin",
+    category: "Sales",
+    description: "Writes up your meetings.",
+    features: [],
+    persona: { name: "Kevin", role: "Meeting Agent", intro: "Hi", kickoff_questions: [] },
+    connections: [],
+    setup_time: "5 min",
+    tags: [],
+    author: "xagent",
+    version: "1.0",
+    views: 0,
+    likes: 0,
+    used_count: 0,
+  },
+]
+
+async function goToWelcomeThenBusiness() {
+  render(<OnboardingPage />)
+  await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+  fireEvent.click(screen.getByText("Let's go"))
+}
+
+describe("OnboardingPage", () => {
+  beforeEach(() => {
+    routerPush.mockClear()
+    routerReplace.mockClear()
+    i18nState.locale = "en"
+    authUser.id = "user-a"
+    authUser.username = "Shulei"
+    sessionUserIdOverride.current = undefined
+    apiRequestMock.mockReset()
+    apiRequestMock.mockResolvedValue({ ok: true, json: async () => TEMPLATES })
+    updateUserPreferencesMock.mockReset()
+    updateUserPreferencesMock.mockResolvedValue({ ok: true })
+    hireAgentFromTemplateMock.mockReset()
+    hireAgentFromTemplateMock.mockResolvedValue({ taskId: 42 })
+    toastErrorMock.mockReset()
+    markOnboardingSaveEscapedMock.mockReset()
+  })
+
+  afterEach(cleanup)
+
+  // The reference UI (onboarding.html) hardcodes "Gerard Santos" as a
+  // placeholder - this must come from the real logged-in user instead.
+  it("greets the real authenticated user by username, not a hardcoded placeholder", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getAllByText("Shulei").length).toBeGreaterThan(0))
+    expect(screen.queryByText(/Gerard Santos/)).not.toBeInTheDocument()
+  })
+
+  // Pins a PR review finding: the account badge's initial used to be
+  // firstName.slice(0, 1), which indexes by UTF-16 code unit - a username
+  // starting with a non-BMP character (surrogate pair) would split it and
+  // render a broken glyph instead of the actual character.
+  it("renders the account badge's initial from the first Unicode code point, not the first UTF-16 unit", async () => {
+    authUser.username = "\u{1F600}unicode"
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getAllByText(/unicode/).length).toBeGreaterThan(0))
+
+    const badge = document.querySelector(".ob-acct span")
+    expect(badge).toHaveTextContent("\u{1F600}")
+  })
+
+  // Pins a PR review finding: the welcome heading's closing punctuation used
+  // to be a hardcoded ASCII period in JSX, appended directly after
+  // <em>{firstName}</em> - now composed from a locale-owned titleSuffix key
+  // instead. Asserts the actual rendered heading, not just the raw locale
+  // string values (translations.test.ts covers those separately).
+  it("renders the welcome heading with the name and closing punctuation combined with no stray whitespace", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getAllByText("Shulei").length).toBeGreaterThan(0))
+
+    const heading = screen.getByRole("heading", { level: 1 })
+    expect(heading.textContent).toBe("Welcome to Xagent,Shulei.")
+  })
+
+  it("falls back to a generic name when the user has no username", async () => {
+    authUser.username = undefined
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    expect(screen.getAllByText("there").length).toBeGreaterThan(0)
+  })
+
+  // Pins a gap found in full-feature self-review: each step swaps the
+  // entire JSX subtree (only one `step === "..."` branch is ever mounted),
+  // so the browser drops focus to <body> on every transition with nothing
+  // to tell a keyboard/screen-reader user a new step even loaded. The new
+  // step's heading must receive focus so it's announced and Tab resumes
+  // from there instead of the very top of the page.
+  it("moves focus to the new step's heading after advancing to the next step", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1 }))
+
+    fireEvent.click(screen.getByText("Let's go"))
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("What doesyour team do?")
+    )
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1 }))
+  })
+
+  it("requires an industry value before Continue is enabled when 'Other' is picked", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+
+    const continueButton = screen.getByText("Continue").closest("button")!
+    expect(continueButton).toBeDisabled()
+
+    fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
+      target: { value: "Legal services" },
+    })
+    expect(continueButton).not.toBeDisabled()
+  })
+
+  // Pins a finding verified during PR review: switching the department away
+  // from "Other" only cleared the LOCAL `industry` state - since the save
+  // is a merge PATCH, omitting the key left a stale industry value stored
+  // server-side, silently paired with the new department. `null` is this
+  // endpoint's actual "clear this field" signal.
+  it("explicitly clears a previously-typed industry when switching the department away from 'Other'", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
+      target: { value: "Legal services" },
+    })
+
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalled())
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ department: "marketing", industry: null })
+    )
+  })
+
+  // Companion to the test above: an `industry: null` clear signal must only
+  // ever fire once a real department has actually been chosen - a user who
+  // never reached (or never touched) the business step must not have this
+  // field explicitly cleared on their behalf, which would be a different,
+  // wrong claim ("the user had an industry and removed it") from the true
+  // one ("this field was never touched").
+  it("omits industry entirely (neither a value nor a clear) when the department was never chosen", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalled())
+    const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
+    expect(call).not.toHaveProperty("industry")
+    expect(call).not.toHaveProperty("department")
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: the header
+  // "Skip setup" exit is reachable from any step regardless of Continue's
+  // validation state (it's only disabled while a save is in flight), so a
+  // user can pick "Other," type only whitespace, and exit before Continue
+  // would have ever required real text. Whitespace-only industry must
+  // never be sent as-is (`industry.trim() || ...` regressing to
+  // `industry || ...` would send the raw whitespace string).
+  //
+  // Sends an explicit `null`, not an omitted key, though - a later
+  // adversarial review found this field has the same "touched vs. never
+  // touched" ambiguity the goals fix (hasToggledGoalsRef) closed: typing
+  // anything at all (even whitespace that trims to nothing) is touching
+  // the field, and must clear a stale server-side value the same way a
+  // real typed-then-deleted value would - see hasTouchedIndustryRef's
+  // comment. Only a field the user never interacted with at all still
+  // omits the key (the test above).
+  it("sends an explicit null for industry (not omitted, not raw whitespace) when 'Other' is picked but only whitespace was typed, exited via header Skip", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
+      target: { value: "   " },
+    })
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalled())
+    const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
+    expect(call).toHaveProperty("department", "other")
+    expect(call).toHaveProperty("industry", null)
+  })
+
+  // Pins the actual motivating scenario for hasTouchedIndustryRef: a real
+  // value typed in, then fully deleted back to blank before exiting - the
+  // clearest case of "this WAS something, now it's explicitly empty,"
+  // which must send `null` (clear) rather than omit (leave whatever's
+  // stored, e.g. from an earlier onboarding attempt or a stale revisit).
+  it("sends an explicit null for industry after typing a real value and then deleting it back to blank", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    const input = screen.getByPlaceholderText("e.g. Property management")
+    fireEvent.change(input, { target: { value: "Legal" } })
+    fireEvent.change(input, { target: { value: "" } })
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalled())
+    const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
+    expect(call).toHaveProperty("department", "other")
+    expect(call).toHaveProperty("industry", null)
+  })
+
+  // Matches PREFERENCES_TEXT_FIELD_MAX_LENGTH in src/xagent/web/api/auth.py -
+  // a defensive client-side cap flagged by PR review.
+  it("caps the free-text industry field at 200 characters", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+
+    expect(screen.getByPlaceholderText("e.g. Property management")).toHaveAttribute("maxLength", "200")
+  })
+
+  it("reorders goals to bring the selected work type's goals first", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Sales"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    const chipLabels = screen.getAllByRole("button").map((b) => b.textContent).filter(Boolean) as string[]
+    const meetingsIndex = chipLabels.findIndex((t) => t.includes("Write up my meetings"))
+    const inboxIndex = chipLabels.findIndex((t) => t.includes("Keep my inbox under control"))
+    expect(meetingsIndex).toBeGreaterThanOrEqual(0)
+    expect(inboxIndex).toBeGreaterThan(meetingsIndex)
+  })
+
+  // Pins the dangerouslySetInnerHTML removal: free-text industry input must
+  // render as inert text on the Done step, never be interpreted as markup.
+  it("renders a script-tag industry value as literal escaped text on the Done step, never executing it", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
+      target: { value: "Legal services <script>alert(1)</script>" },
+    })
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    expect(document.querySelector("script")).toBeNull()
+    expect(
+      screen.getByText(
+        (_, node) => node?.tagName === "SPAN" && node.textContent === "Working in Legal services <script>alert(1)</script>"
+      )
+    ).toBeInTheDocument()
+  })
+
+  // Pins C1 from the onboarding-flow self-review: persistAndLeave must await
+  // the PATCH before navigating away - AuthGuard's onboarding recheck fires a
+  // GET as soon as the destination route mounts, and if that GET wins the
+  // race against an unawaited PATCH, it reads the old onboarded:false and
+  // bounces the user straight back into onboarding right after they left it.
+  it("waits for the preferences save to resolve before navigating away on Skip setup", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(expect.objectContaining({ onboarded: true }))
+    // The save is still pending - navigation must not have happened yet.
+    expect(routerReplace).not.toHaveBeenCalled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+
+    expect(routerReplace).toHaveBeenCalledWith("/task")
+  })
+
+  // Pins a PR review finding: the hire CTA already swaps to a "Hiring…"
+  // label while launching, but the header Skip button stayed on its
+  // resting "Skip setup" label with no indication a save was in flight,
+  // even though clicks were being ignored (disabled). Also asserts
+  // aria-busy, since a sighted-only label change leaves screen-reader
+  // users with no equivalent signal.
+  it("shows a Saving… label and aria-busy on the header exit button while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    const button = await screen.findByText("Saving…")
+    expect(button.closest("button")).toHaveAttribute("aria-busy", "true")
+    expect(screen.queryByText("Skip setup")).not.toBeInTheDocument()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  // Pins a test-coverage gap found by self-review: the header exit button's
+  // "Saving…"/aria-busy treatment was tested, but the goals-step and
+  // done-step skip buttons get the exact same treatment in the source with
+  // no test of their own - a future refactor (e.g. extracting a shared
+  // exit-button component) could drop it from just one of the other two
+  // with nothing failing.
+  it("shows a Saving… label and aria-busy on the goals-step skip button while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    // Grabbed by reference before the click, not re-queried by text after -
+    // the header exit button shows the same "Saving…" label at the same
+    // time (both share the `launching` state), so a text query afterward
+    // would match 2 elements.
+    const button = screen.getByText("Not sure yet — show me everyone").closest("button")!
+    fireEvent.click(button)
+
+    await waitFor(() => expect(button).toHaveTextContent("Saving…"))
+    expect(button).toHaveAttribute("aria-busy", "true")
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  it("shows a Saving… label and aria-busy on the done-step skip button while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // Grabbed by reference before the click - see the goals-step test's
+    // comment for why (the header exit button shares the same label at
+    // the same time).
+    const button = screen.getByText("Take me to the catalogue instead").closest("button")!
+    fireEvent.click(button)
+
+    await waitFor(() => expect(button).toHaveTextContent("Saving…"))
+    expect(button).toHaveAttribute("aria-busy", "true")
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  // Flagged by PR review (xorbitsai/xagent#1617): persistAndLeave had no
+  // double-click guard, unlike handleLaunch's launchingRef - a fast second
+  // click before the first PATCH resolved would fire two concurrent saves.
+  it("ignores a second click on Skip setup while the first save is still in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    const skipButton = screen.getByText("Skip setup")
+    fireEvent.click(skipButton)
+    fireEvent.click(skipButton)
+    fireEvent.click(skipButton)
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+    expect(skipButton.closest("button")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  // Pins a PR review finding: buildPreferencesPayload() snapshots its
+  // answers before the PATCH is sent, so an answer changed while a save is
+  // in flight would silently never be saved, then get discarded entirely
+  // once the page navigates away - the data-entry controls (not just the
+  // exit buttons) must be disabled for the duration of a save too.
+  it("disables the work chips and industry input while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
+      target: { value: "Legal services" },
+    })
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    expect(screen.getByText("Other").closest("button")).toBeDisabled()
+    expect(screen.getByPlaceholderText("e.g. Property management")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  // Pins a test-coverage gap found in incremental self-review: the test
+  // above only reaches the business step's work chips - the goals step's
+  // goal chips and the voice step's voice chips also got disabled={launching}
+  // in the same round but were never actually exercised.
+  it("disables the goal chips while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    expect(screen.getByText("Post on social media").closest("button")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  it("disables the voice chips while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Playful"))
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    expect(screen.getByText("Playful").closest("button")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  // Pins a bug found in full-feature self-review: the save-escape flag used
+  // to be marked unconditionally on the 2nd consecutive failure, even though
+  // the matching navigation right after it is gated on isMountedRef - an
+  // unmount between the two (e.g. a forced re-auth redirect elsewhere) left
+  // the flag live in sessionStorage with no navigation to consume it,
+  // wrongly suppressing AuthGuard's next check on wherever the user actually
+  // landed. The flag must only be marked alongside a navigation that's
+  // actually about to happen.
+  it("does not mark the save-escape flag if the component unmounts before the 2nd failure's navigation would fire", async () => {
+    updateUserPreferencesMock.mockResolvedValueOnce({ ok: false })
+    let resolveSecondSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveSecondSave = resolve })
+    )
+
+    const { unmount } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+    expect(routerReplace).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByText("Skip setup"))
+    unmount()
+
+    await act(async () => {
+      resolveSecondSave({ ok: false })
+    })
+
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Flagged by PR review (xorbitsai/xagent#1617): persistAndLeave awaited the
+  // save but never checked its result - a failed PATCH still navigated away,
+  // and AuthGuard would immediately bounce the user back since onboarded
+  // never actually got persisted server-side.
+  it("does not navigate and shows an error toast when the Skip setup save fails", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false })
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("Couldn't save your setup — please try again.")
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Pins a finding from full-feature self-review: PersonaAvatar's own doc
+  // comment explains `decorative` exists exactly for a picker button that
+  // renders the name right next to the avatar - without it, a screen reader
+  // announces the name twice ("Maya Maya...") since the avatar's fallback
+  // initial and the visible name text are both inside the same interactive
+  // <button aria-pressed>. The done-step's avatar reuse is inside a plain,
+  // non-interactive div, so it doesn't need this - only the team-step picker did.
+  it("hides the team card's persona avatar from the accessibility tree so its name isn't announced twice", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText("Maya")).toBeInTheDocument())
+    const card = screen.getByText("Maya").closest("button")!
+    expect(card.querySelector('[aria-hidden="true"]')).toHaveTextContent("M")
+  })
+
+  // Pins a test-coverage gap found in incremental self-review: every other
+  // test in this file renders in English only, and the raw-string spacing
+  // tests in translations.test.ts never render actual JSX - neither would
+  // catch a future JSX-level literal space reintroduced specifically on
+  // the Chinese render path. Drives the full flow in zh and asserts the
+  // exact combined textContent has no space between the full-width colon
+  // and the value, matching the originally-reported "所在领域： 市场营销" bug.
+  it("renders the Done step's 'working in' line with no stray space in Chinese", async () => {
+    i18nState.locale = "zh"
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/欢迎来到/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("开始吧"))
+    await waitFor(() => expect(screen.getByText(/你的团队/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("市场营销"))
+    fireEvent.click(screen.getByText("继续"))
+    await waitFor(() => expect(screen.getByText("发布社交媒体内容")).toBeInTheDocument())
+    fireEvent.click(screen.getByText("发布社交媒体内容"))
+    fireEvent.click(screen.getByText("继续"))
+    await waitFor(() => expect(screen.getByText("认识一下你的 AI 团队。")).toBeInTheDocument())
+    fireEvent.click(screen.getByText("继续"))
+    fireEvent.click(screen.getByText("继续"))
+    await waitFor(() => expect(screen.getByText("一切就绪。")).toBeInTheDocument())
+
+    const line = screen.getByText("市场营销").closest(".ob-sum-li")!
+    expect(line.textContent).toBe("所在领域：市场营销")
+  })
+
+  it("hires the selected agent and navigates to /task/{taskId} on launch", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    expect(hireAgentFromTemplateMock.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ templateId: "marketing-social-media-content-manager" })
+    )
+    expect(routerReplace).toHaveBeenCalledWith("/task/42")
+  })
+
+  // Pins a PR review finding: hireAgentFromTemplate itself makes 2
+  // independent network calls (resolve, then task/create), each
+  // authenticated with whatever session is live when IT fires - the guard
+  // right before this call only proves identity hadn't swapped BEFORE
+  // hireAgentFromTemplate was invoked. It's passed abortIfIdentityChanged
+  // so it can re-check between its own two calls; this pins that the
+  // callback passed actually reflects the LIVE identity guard state, not a
+  // snapshot frozen at the moment hireAgentFromTemplate was called.
+  it("passes an abortIfIdentityChanged callback to hireAgentFromTemplate that reflects the identity swap guard live", async () => {
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    const { abortIfIdentityChanged } = hireAgentFromTemplateMock.mock.calls[0][0]
+    expect(typeof abortIfIdentityChanged).toBe("function")
+    // Identity hasn't changed yet - the callback must say so.
+    expect(abortIfIdentityChanged()).toBe(false)
+
+    authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    // Same callback reference from the same hireAgentFromTemplate call -
+    // it must now report the swap live, proving it reads live session
+    // storage directly (readAuthSessionSnapshot()), not a value captured
+    // once when hireAgentFromTemplate was originally invoked.
+    expect(abortIfIdentityChanged()).toBe(true)
+  })
+
+  // Pins a test-coverage gap found by self-review: unlike the guard right
+  // before hireAgentFromTemplate is called (gated behind isMountedRef, so
+  // it never matters once genuinely unmounted - see its own comment),
+  // hireAgentFromTemplate's OWN internal calls (resolve, then task/create)
+  // are NOT gated by isMountedRef at all - the whole point of adding
+  // abortIfIdentityChanged was to protect the gap BETWEEN those two calls,
+  // which keeps running post-unmount by construction. This callback must
+  // therefore still correctly detect a swap even after the page that
+  // created it has unmounted, not only while it's still mounted (the test
+  // above only proves the latter, via rerender).
+  it("keeps reporting a swap live from the abortIfIdentityChanged callback even after this page has unmounted", async () => {
+    const { unmount } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    const { abortIfIdentityChanged } = hireAgentFromTemplateMock.mock.calls[0][0]
+    expect(abortIfIdentityChanged()).toBe(false)
+
+    unmount()
+    authUser.id = "user-b"
+
+    // No rerender happens (and none is possible) after unmount - a ref
+    // kept fresh only by a mounted component's effect could never see
+    // this, but a live storage read still can.
+    expect(abortIfIdentityChanged()).toBe(true)
+  })
+
+  // Pins a bug found in full-feature self-review: a redundant
+  // `if (!isMountedRef.current) return;` right before this 3rd call to
+  // markOnboardedAndNavigate used to skip the call ENTIRELY (including its
+  // own onboarded:true save attempt, not just its navigation) if the
+  // component unmounted while hireAgentFromTemplate was still in flight -
+  // reintroducing the exact "agent created but onboarded never even
+  // attempted" bug this whole split was meant to fix. The onboarded save
+  // must still be attempted after an unmount; only the navigation after it
+  // should be skipped, via markOnboardedAndNavigate's own internal check.
+  it("still attempts the onboarded save (but not navigation) if the component unmounts while hireAgentFromTemplate is in flight", async () => {
+    let resolveHire!: (v: { taskId: number }) => void
+    hireAgentFromTemplateMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveHire = resolve })
+    )
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+
+    cleanup()
+
+    await act(async () => {
+      resolveHire({ taskId: 42 })
+    })
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalledTimes(2))
+    expect(updateUserPreferencesMock.mock.calls[1][0]).toEqual(expect.objectContaining({ onboarded: true }))
+    expect(routerReplace).not.toHaveBeenCalledWith("/task/42")
+  })
+
+  // Pins a PR review finding: onboarded:true used to be saved durably as
+  // part of the FIRST preferences save, before the freshness re-check and
+  // hireAgentFromTemplate (both of which can still fail or the component
+  // can still unmount) ever ran - a later failure could leave the backend
+  // saying "onboarded" with no agent ever actually delivered, and no way
+  // back into onboarding to finish it. It must now be saved separately,
+  // only once an agent is confirmed to exist.
+  it("does not include onboarded:true in the main save - only in a separate save once the agent is confirmed", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalledTimes(2))
+    expect(updateUserPreferencesMock.mock.calls[0][0]).not.toHaveProperty("onboarded")
+    expect(updateUserPreferencesMock.mock.calls[1][0]).toEqual(expect.objectContaining({ onboarded: true }))
+    // The agent-confirming call must happen before the onboarded save, not
+    // just eventually - hireAgentFromTemplateMock resolves synchronously in
+    // this mock, so by the time updateUserPreferences is called a 2nd time,
+    // the agent already exists.
+    expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins the same finding from the failure side: if hireAgentFromTemplate
+  // itself throws, onboarded must never be sent at all - no agent was ever
+  // delivered, so there is nothing to mark complete.
+  it("never sends onboarded:true if hireAgentFromTemplate itself fails", async () => {
+    hireAgentFromTemplateMock.mockRejectedValueOnce(new Error("network down"))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalled())
+    for (const call of updateUserPreferencesMock.mock.calls) {
+      expect(call[0]).not.toHaveProperty("onboarded")
+    }
+  })
+
+  // Pins the ordering fix's own fallback: an agent that's genuinely hired
+  // must still navigate the user there even if the LAST-mile onboarded:true
+  // save itself fails - and that failure must still tell AuthGuard to stand
+  // down once, same as every other escape path, since the deliverable (the
+  // agent) is real regardless of whether the flag landed.
+  it("still navigates to the hired agent, and marks the escape flag, if only the final onboarded save fails", async () => {
+    updateUserPreferencesMock.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ ok: false, retryable: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/task/42"))
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: handleLaunch
+  // has the same launchingRef double-click guard as persistAndLeave, but
+  // every existing test awaits each click to full completion before firing
+  // the next one - a fast double-click on the primary CTA before its PATCH
+  // resolves was never actually exercised.
+  it("ignores a second click on 'Start with X' while the first save is still in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    const startButton = screen.getByText("Start with Maya")
+    fireEvent.click(startButton)
+    fireEvent.click(startButton)
+    fireEvent.click(startButton)
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+
+    expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: handleLaunch's
+  // outer catch (hireAgentFromTemplate itself rejecting, after a successful
+  // save and freshness re-check) had zero coverage - a broken retry here
+  // would strand a first-time user on the page with no way to proceed.
+  it("shows an error toast and resets launching state so the user can retry when hireAgentFromTemplate fails", async () => {
+    hireAgentFromTemplateMock.mockRejectedValueOnce(new Error("network down"))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("Couldn't hire Maya. Please try again.")
+    expect(routerReplace).not.toHaveBeenCalledWith(expect.stringContaining("/task/"))
+    expect(screen.getByText("Start with Maya").closest("button")).not.toBeDisabled()
+
+    // Retrying must actually work - launchingRef/setLaunching were reset.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(routerReplace).toHaveBeenCalledWith("/task/42")
+  })
+
+  // Pins a PR review finding: mount-time `selected.hired` can go stale if
+  // the same template gets hired from another tab/session mid-wizard.
+  // handleLaunch must re-check right before hiring, mirroring the identical
+  // guard in templates/[id]/page-client.tsx, instead of seeding a second
+  // opening message onto an agent the user already has a real conversation with.
+  it("re-checks hired status right before hiring and redirects to the existing agent if another session hired it meanwhile", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ ...TEMPLATES[0], hired: true, hired_agent_id: 77 }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/77"))
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-coverage gap found in incremental self-review: the
+  // freshness-recheck-hired branch's own onboarded-save call (via
+  // markOnboardedAndNavigate) was only ever exercised with the default
+  // succeeding mock - neither its success payload nor its failure path was
+  // directly asserted, unlike the freshly-hired branch which got both.
+  it("marks onboarded:true and navigates when the freshness recheck finds it already hired and the onboarded save succeeds", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ ...TEMPLATES[0], hired: true, hired_agent_id: 77 }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/77"))
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(expect.objectContaining({ onboarded: true }))
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  it("still navigates to the existing agent, and marks the escape flag, if the onboarded save fails after a freshness-recheck-confirmed hire", async () => {
+    // 1st call is the main (includeOnboarded: false) save - must succeed so
+    // handleLaunch proceeds past it; the 2nd call is markOnboardedAndNavigate's
+    // dedicated {onboarded: true} save, which is the one this test fails.
+    updateUserPreferencesMock.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ ok: false, retryable: true })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ ...TEMPLATES[0], hired: true, hired_agent_id: 77 }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/77"))
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a PR review test-coverage gap: handleLaunch's already-hired
+  // shortcut (skip hireAgentFromTemplate, go straight to the existing agent)
+  // was never exercised.
+  it("skips hireAgentFromTemplate and goes straight to the agent when it's already hired", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [{ ...TEMPLATES[0], hired: true, hired_agent_id: 99 }, TEMPLATES[1], TEMPLATES[2]],
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/99"))
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(expect.objectContaining({ onboarded: true }))
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-coverage gap found in incremental self-review: the
+  // already-hired shortcut's own onboarded-save failure path (via
+  // markOnboardedAndNavigate) was untested - only the freshly-hired branch
+  // had this covered.
+  it("still navigates to the already-hired agent, and marks the escape flag, if the onboarded save fails", async () => {
+    updateUserPreferencesMock.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ ok: false, retryable: true })
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [{ ...TEMPLATES[0], hired: true, hired_agent_id: 99 }, TEMPLATES[1], TEMPLATES[2]],
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/99"))
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a gap found in an external review round: the identity-swap guards
+  // used to compare against a ref (`currentUserIdRef`) kept fresh only by a
+  // useEffect that runs while this component is mounted. Once unmounted,
+  // that effect stops firing and the ref freezes at whatever it last held -
+  // so a swap happening AFTER an unmount (not while still mounted, which
+  // the other identity-swap tests cover) went completely undetected, even
+  // though handleLaunch's async chain keeps running post-unmount by design.
+  // Fixed by reading `readAuthSessionSnapshot().userId` directly at every
+  // checkpoint instead - a live storage read with no dependency on this
+  // component's mount state at all.
+  it("does not send the completion PATCH under a swapped-in identity if the swap happens after this page has already unmounted", async () => {
+    let resolveMainSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveMainSave = resolve })
+    )
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [{ ...TEMPLATES[0], hired: true, hired_agent_id: 99 }, TEMPLATES[1], TEMPLATES[2]],
+    })
+
+    const { unmount } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Start with Maya"))
+    // The main save (trySavePreferences) is now the one pending call.
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+
+    // Unmount BEFORE the swap - no rerender happens afterward, so a ref
+    // that only updates via a mounted component's effect could never see
+    // this. Then the main save resolves, and handleLaunch (still running
+    // post-unmount) reaches the already-hired shortcut and calls
+    // markOnboardedAndNavigate for the very first time.
+    unmount()
+    authUser.id = "user-b"
+
+    await act(async () => {
+      resolveMainSave({ ok: true })
+    })
+
+    // markOnboardedAndNavigate's entry guard must catch the swap and bail
+    // BEFORE sending its own completion PATCH at all - not just before
+    // navigating with it.
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+    expect(routerReplace).not.toHaveBeenCalledWith("/agent/99")
+  })
+
+  // Pins a PR review finding: markOnboardedAndNavigate checked identity
+  // before sending its OWN completion PATCH, but navigated unconditionally
+  // once that PATCH resolved - a swap happening DURING that specific await
+  // (not before entering this function, which the earlier identity-swap
+  // tests already cover) went undetected, and the swapped-in identity's
+  // browser would still get navigated to a destination that only made
+  // sense for the original identity.
+  it("does not navigate to the already-hired agent if the swap happens while THIS call's own onboarded save is in flight", async () => {
+    let resolveOnboardedSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: true }) // the main save (trySavePreferences), resolves immediately
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOnboardedSave = resolve })) // markOnboardedAndNavigate's own save
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [{ ...TEMPLATES[0], hired: true, hired_agent_id: 99 }, TEMPLATES[1], TEMPLATES[2]],
+    })
+
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    // The main save has resolved; markOnboardedAndNavigate's own save (the
+    // 2nd updateUserPreferences call) is now the one pending.
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(2)
+
+    authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    await act(async () => {
+      resolveOnboardedSave({ ok: true })
+    })
+
+    expect(routerReplace).not.toHaveBeenCalledWith("/agent/99")
+  })
+
+  // (A post-unmount variant of the test above was considered here and
+  // deliberately NOT added: this checkpoint's only observable effects -
+  // markOnboardingSaveEscaped and router.replace - are both already gated
+  // behind `isMountedRef.current`, independent of the identity check. Once
+  // genuinely unmounted, neither happens regardless of whether the
+  // identity check is correct, so a test asserting "no navigation after
+  // unmount" would pass for the wrong reason - isMountedRef, not the fix -
+  // and could stay green under a reverted, broken identity check. The
+  // ENTRY checkpoint's post-unmount test above is the meaningful one here,
+  // since it gates the network call itself, not just what happens after.)
+
+  // Pins a PR review test-coverage gap: only the thrown/rejected variant of
+  // a templates-fetch failure was tested - a non-throwing !response.ok, and
+  // a 200 response whose body isn't an array, are separate code paths.
+  it("stays on the loading spinner when the templates fetch resolves with a non-ok response (not a thrown error)", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByTestId("onboarding-team-loading")).toBeInTheDocument()
+    expect(screen.getByText("Continue").closest("button")).toBeDisabled()
+    // Pins a PR review finding: this spinner wasn't covered by
+    // onboarding.css's prefers-reduced-motion rule (which only targets the
+    // aurora/orb/step selectors), so it kept spinning under reduced motion.
+    expect(screen.getByTestId("onboarding-team-loading")).toHaveClass("motion-reduce:animate-none")
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: prior tests
+  // only asserted the loading spinner's presence via data-testid, never its
+  // accessible status semantics directly - a regression that dropped
+  // role="status" (or moved it off the wrapping element) would pass every
+  // other test in this file.
+  it("exposes the team-step loading state to assistive technology via role=status", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByRole("status")).toBeInTheDocument()
+  })
+
+  it("stays on the loading spinner when the templates fetch resolves ok with a non-array body", async () => {
+    apiRequestMock.mockResolvedValue({ ok: true, json: async () => ({ not: "an array" }) })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByTestId("onboarding-team-loading")).toBeInTheDocument()
+    expect(screen.getByText("Continue").closest("button")).toBeDisabled()
+  })
+
+  it("fetches templates for the current locale, not an unlocalized default", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalled())
+    expect(apiRequestMock.mock.calls[0][0]).toContain("/api/templates/?lang=en")
+  })
+
+  // Pins C3 from the onboarding-flow self-review: a failed preferences save
+  // must not be silently ignored - proceeding to hire anyway would leave the
+  // user believing setup is done while the backend still has onboarded:false.
+  it("does not hire the agent or navigate when saving preferences fails", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith("Couldn't save your setup — please try again."))
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalledWith(expect.stringContaining("/task/"))
+  })
+
+  // Flagged by PR review (xorbitsai/xagent#1617, major finding #4): unlike
+  // every persistAndLeave exit, "Start with X" had no escape hatch at all -
+  // a save that kept failing left the primary CTA permanently unusable.
+  it("proceeds to hire anyway after 2 consecutive RETRYABLE save failures on 'Start with X', marking the save-escape flag", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false, retryable: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    expect(routerReplace).toHaveBeenCalledWith("/task/42")
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a PR review finding: after escaping past 2 failed attempts to save
+  // the collected fields, the FINAL completion write must resend those same
+  // fields together with onboarded:true - sending only the marker would let
+  // the account end up "onboarded" with department/goals/voice never
+  // actually persisted, and no way back in to finish since onboarded:true
+  // skips onboarding entirely.
+  it("resends the full collected fields (not just the marker) in the final completion write after escaping 2 failed field saves", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+      .mockResolvedValueOnce({ ok: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(3)
+    // toEqual against the FULL exact object, not objectContaining a subset -
+    // a test-pinning review found objectContaining would stay green even if
+    // a future bug in buildPreferencesPayload silently dropped `voice`
+    // (reached via the "How should" step above, so hasReachedVoiceRef.current
+    // is true and it must be present) or `industry`.
+    expect(updateUserPreferencesMock.mock.calls[2][0]).toEqual({
+      onboarded: true,
+      department: "marketing",
+      industry: null,
+      goals: ["social"],
+      voice: "professional",
+    })
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a finding verified during PR review: unlike persistAndLeave's
+  // escape hatch (which just leaves without saving), handleLaunch's
+  // proceeds to an IRREVERSIBLE hireAgentFromTemplate call. A NON-retryable
+  // failure (e.g. a 422 the backend will reject identically every time)
+  // must never escalate to "proceed anyway," no matter how many times it's
+  // retried - it hires an agent while preferences were never actually
+  // saved, for a save that could never have succeeded.
+  it("never proceeds to hire after repeated NON-retryable save failures on 'Start with X'", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false, retryable: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    for (let i = 0; i < 4; i++) {
+      await act(async () => {
+        fireEvent.click(screen.getByText("Start with Maya"))
+      })
+    }
+
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalledWith(expect.stringContaining("/task/"))
+  })
+
+  // Pins a test-coverage gap found in incremental self-review: the escape
+  // decision looks only at the CURRENT attempt's retryable flag alongside
+  // the cumulative failure count, not some "was ever non-retryable" memory
+  // - these two tests exercise both attempts having DIFFERENT retryable
+  // values, which a constant-mock test can't distinguish from a sticky/
+  // AND'd implementation.
+  it("does not escalate when failure #1 is retryable but failure #2 is not", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+      .mockResolvedValueOnce({ ok: false, retryable: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a PR review finding: this exact scenario used to escalate, because
+  // the escape decision only looked at the LATEST attempt's retryable flag -
+  // a permanent (non-retryable) rejection of this payload doesn't stop
+  // being permanent just because the very next attempt happens to fail a
+  // different way. Once ANY failure in the streak is known non-retryable,
+  // this key must never escalate, matching "failure #1 retryable, #2 not"
+  // above - order must not matter.
+  it("does not escalate on failure #2 even though it's retryable, since failure #1 was not", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: false })
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-pinning gap found by self-review: the two tests above only
+  // drive a 2-attempt streak, so they can't distinguish the correct
+  // behavior ("hasPermanent" is set on any non-retryable failure and never
+  // cleared except by success) from a subtly wrong one (accidentally also
+  // clearing it on "retry_in_place"). Both behave identically for exactly 2
+  // attempts - the difference only shows up on a 3rd, still-failing attempt
+  // with no success in between.
+  it("still blocks escalation on a 3rd attempt after 2 permanent failures, even though the 3rd is itself retryable", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: false })
+      .mockResolvedValueOnce({ ok: false, retryable: false })
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a PR review finding: the failure streak used to be keyed only by
+  // destination, not by payload content - so editing answers between two
+  // failed "Start with Maya" attempts let the 2nd attempt (of a genuinely
+  // DIFFERENT, never-before-tried payload) wrongly inherit the 1st
+  // attempt's failure count and escalate to an irreversible hire after
+  // only ONE real failure of the edited payload.
+  it("does not inherit a prior payload's failure streak after the user edits their answers", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // 1st attempt fails - payload is {department: marketing, goals: [social]}.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    // Go back and edit: add another goal, changing the payload.
+    fireEvent.click(screen.getByText("Goals"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Keep my inbox under control"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // 2nd attempt is for the EDITED (different) payload - this is its 1st
+    // failure, not the 2nd failure of the old streak, so it must NOT
+    // escalate yet.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-coverage gap found by self-review: the payload-change reset
+  // must clear ALL THREE of saveFailureCountByDestRef,
+  // saveFailureHasPermanentByDestRef, and saveFailurePayloadByDestRef
+  // together, not just the count. The test above only ever sees retryable
+  // failures, so it can't tell whether hasPermanent specifically gets reset
+  // on a payload change - if a regression dropped just that one line, this
+  // exact scenario (a permanent failure on the OLD payload, then 2 purely
+  // retryable failures on an EDITED payload) would still wrongly refuse to
+  // escalate, blocked by the stale permanent flag from the old payload.
+  it("does not let a permanent failure on the OLD payload block escalation for 2 retryable failures on an EDITED payload", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: false }) // old payload: permanent failure
+      .mockResolvedValueOnce({ ok: false, retryable: true }) // edited payload: 1st failure
+      .mockResolvedValueOnce({ ok: false, retryable: true }) // edited payload: 2nd failure - must escalate
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // 1st attempt fails PERMANENTLY - payload is {department: marketing, goals: [social]}.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    // Go back and edit: add another goal, changing the payload.
+    fireEvent.click(screen.getByText("Goals"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Keep my inbox under control"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // Edited payload's 1st failure (purely retryable) - not yet at the
+    // 2-failure threshold, must not escalate.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    // Edited payload's 2nd failure, also purely retryable - the OLD
+    // payload's permanent failure must not still be blocking this streak.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a test-coverage gap found by self-review: a SUCCESS must clear the
+  // "this streak saw a non-retryable failure" memory, not just the failure
+  // count - otherwise a permanent rejection from an earlier, already-resolved
+  // streak would keep silently blocking escalation for every later streak on
+  // the same key, even after a real success in between.
+  it("allows a later streak of purely retryable failures to escalate after an earlier permanent failure was cleared by a success", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: false }) // 1st launch attempt: permanent failure
+      .mockResolvedValueOnce({ ok: true }) // 2nd attempt: main save succeeds, clearing hasPermanent
+      .mockResolvedValueOnce({ ok: false, retryable: true }) // 3rd attempt: 1st failure of a NEW streak
+      .mockResolvedValueOnce({ ok: false, retryable: true }) // 4th attempt: 2nd failure of that streak
+      .mockResolvedValue({ ok: true }) // the eventual last-mile onboarded save
+    hireAgentFromTemplateMock
+      .mockRejectedValueOnce(new Error("hire failed after a successful save")) // 2nd attempt's hire fails
+      .mockResolvedValueOnce({ taskId: 42 }) // 4th attempt's hire succeeds
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // Attempt 1: permanent failure - retry in place, count=1, hasPermanent=true.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    // Attempt 2: main save succeeds (resets count=0, hasPermanent=false), but
+    // hireAgentFromTemplate itself throws - handleLaunch's outer catch resets
+    // launching so a 3rd click is possible, without touching the just-reset refs.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1)
+
+    // Attempt 3: 1st failure of a brand new streak - purely retryable, count=1.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1)
+
+    // Attempt 4: 2nd failure of that same streak, still purely retryable -
+    // must escalate. If the success on attempt 2 hadn't cleared hasPermanent,
+    // attempt 1's stale "permanent" memory would wrongly block this.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(2))
+    expect(routerReplace).toHaveBeenCalledWith("/task/42")
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: the escape
+  // path still has the freshness re-check and hireAgentFromTemplate ahead of
+  // it after escalating, both of which can throw - the freshness re-check's
+  // own try/catch is documented as "fall through" on failure, but nothing
+  // proved the escalation (shouldMarkSaveEscape, the eventual hire and
+  // navigation) actually survives that specific combination rather than,
+  // say, an unhandled rejection short-circuiting the whole function.
+  it("still proceeds to hire and marks the escape flag when the escalated freshness re-check itself throws", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false, retryable: true })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return Promise.reject(new Error("network down"))
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+    expect(routerReplace).toHaveBeenCalledWith("/task/42")
+  })
+
+  // Pins C2: a recommended templateId that never loaded (or has no persona)
+  // must not leave the team step stuck on an invalid, unrenderable pick.
+  it("skips a recommended template that has no persona and falls back to the next valid one", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [
+        { ...TEMPLATES[0], persona: null },
+        TEMPLATES[1],
+      ],
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Keep my inbox under control"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.queryByText("Maya")).not.toBeInTheDocument()
+    expect(screen.getByText("Ellie")).toBeInTheDocument()
+    expect(screen.getByText("Continue").closest("button")).not.toBeDisabled()
+  })
+
+  // Pins a self-review finding: if EVERY recommended template for the
+  // selected goals fails to load or has no persona (not just one of them),
+  // the team step must fall back to the same 3 defaults it uses when no
+  // goals were picked at all, rather than showing zero cards with Continue
+  // stuck disabled and no explanation.
+  it("falls back to the 3 default agents when every recommended template is unavailable", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    // "docs" -> general-doc-summarizer-action-extractor, which isn't in the
+    // fetched TEMPLATES fixture at all.
+    fireEvent.click(screen.getByText("Summarise long documents"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByText("Maya")).toBeInTheDocument()
+    expect(screen.getByText("Ellie")).toBeInTheDocument()
+    expect(screen.getByText("Kevin")).toBeInTheDocument()
+    expect(screen.getByText("Continue").closest("button")).not.toBeDisabled()
+  })
+
+  // Flagged by PR review (xorbitsai/xagent#1617): the 3-card cap used to be
+  // applied before filtering for persona-availability, so a 4th-ranked
+  // match with a real persona could never fill a slot vacated by a top-3
+  // match that turned out to have none - the user saw fewer cards than
+  // their own goal selections actually supported.
+  it("promotes a 4th-ranked match to fill a slot when a top-3 match has no persona", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [
+        TEMPLATES[0], // social -> Maya, has persona
+        TEMPLATES[1], // inbox -> Ellie, has persona
+        { ...TEMPLATES[2], persona: null }, // meetings -> Kevin, NO persona this time
+        {
+          id: "support-ai-chatbot-agent",
+          name: "Chatbot",
+          category: "Support",
+          description: "Answers customer questions.",
+          features: [],
+          persona: { name: "Nora", role: "Support Chatbot", intro: "Hi", kickoff_questions: [] },
+          connections: [],
+          setup_time: "5 min",
+          tags: [],
+          author: "xagent",
+          version: "1.0",
+          views: 0,
+          likes: 0,
+          used_count: 0,
+        },
+      ],
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media")) // social
+    fireEvent.click(screen.getByText("Keep my inbox under control")) // inbox
+    fireEvent.click(screen.getByText("Write up my meetings")) // meetings - no persona
+    fireEvent.click(screen.getByText("Answer customer questions")) // support - 4th ranked, has persona
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByText("Maya")).toBeInTheDocument()
+    expect(screen.getByText("Ellie")).toBeInTheDocument()
+    expect(screen.getByText("Nora")).toBeInTheDocument()
+    expect(screen.queryByText("Kevin")).not.toBeInTheDocument()
+  })
+
+  // Pins a PR review finding: with 4 goals that ALL genuinely matched a
+  // real persona, the subtitle previously counted against matchedRecommended
+  // (uncapped) instead of validRecommended (the actually-rendered,
+  // capped-at-3 list) - since matchedRecommended.length equalled
+  // goals.length, the math reported zero "extra" even though the 4th real
+  // match is hidden by the display cap and never gets a card. It must
+  // still report 1 waiting, the same as if that goal hadn't matched at all
+  // from the user's point of view (they can't see it either way).
+  it("still reports 1 match waiting when 4 goals are all genuinely matched but only 3 cards fit", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [
+        TEMPLATES[0], // social -> Maya, has persona
+        TEMPLATES[1], // inbox -> Ellie, has persona
+        TEMPLATES[2], // meetings -> Kevin, has persona
+        {
+          id: "support-ai-chatbot-agent",
+          name: "Chatbot",
+          category: "Support",
+          description: "Answers customer questions.",
+          features: [],
+          persona: { name: "Nora", role: "Support Chatbot", intro: "Hi", kickoff_questions: [] },
+          connections: [],
+          setup_time: "5 min",
+          tags: [],
+          author: "xagent",
+          version: "1.0",
+          views: 0,
+          likes: 0,
+          used_count: 0,
+        },
+      ],
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media")) // social - matched
+    fireEvent.click(screen.getByText("Keep my inbox under control")) // inbox - matched
+    fireEvent.click(screen.getByText("Write up my meetings")) // meetings - matched
+    fireEvent.click(screen.getByText("Answer customer questions")) // support - matched, 4th
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    // All 4 selected goals matched a real persona, but only 3 cards fit -
+    // the 4th real match is still genuinely hidden and must be reported.
+    expect(screen.getByText(/the other match is waiting in Templates/)).toBeInTheDocument()
+  })
+
+  // Flagged by PR review (xorbitsai/xagent#1617): the templates fetch used to
+  // set templatesLoading:false in a finally block regardless of outcome,
+  // contradicting its own comment that failure should stay in a loading
+  // state rather than show a broken, empty card grid. Also pins that
+  // Continue can't go live off of a still-loading, unconfirmed pick.
+  it("stays on the loading spinner (Continue disabled) when the templates fetch fails, instead of showing an empty grid", async () => {
+    apiRequestMock.mockRejectedValue(new Error("network down"))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByTestId("onboarding-team-loading")).toBeInTheDocument()
+    expect(screen.queryByText("Maya")).not.toBeInTheDocument()
+    expect(screen.getByText("Continue").closest("button")).toBeDisabled()
+  })
+
+  // Pins a PR review finding: "professional" is a real, legitimate voice
+  // choice, not an empty placeholder like goals' [] - so unlike goals,
+  // voice must not be sent at all until the voice step has actually been
+  // reached. The goals step's skip is reachable well before that.
+  it("the goals step's 'not sure yet' link persists onboarded:true but not voice, since the voice step was never reached", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
+      target: { value: "Something" },
+    })
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        onboarded: true,
+        department: "other",
+        industry: "Something",
+      })
+    )
+    const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
+    expect(call).not.toHaveProperty("goals")
+    expect(call).not.toHaveProperty("voice")
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/templates"))
+  })
+
+  // Pins the same PR review finding from the other direction: once the
+  // voice step HAS been reached (even via the header Skip, not just a
+  // completed flow), the choice made there must be persisted.
+  it("persists voice on the header Skip once the voice step has actually been visited", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Playful"))
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, voice: "playful" })
+    )
+  })
+
+  // Pins a bug found in self-review: whether the voice step has been reached
+  // was a LIVE comparison against the current step index, not "has this ever
+  // happened" - so going Back past the voice step after already picking one
+  // silently dropped that choice, the same class of bug as the two tests
+  // above but in the opposite direction (losing a real choice instead of
+  // persisting one never made).
+  it("still persists voice on the header Skip after going Back past the voice step", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Playful"))
+
+    // Back past voice, to "Meet your AI team".
+    fireEvent.click(screen.getByText("Back"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, voice: "playful" })
+    )
+  })
+
+  // Pins a bug found in self-review: the reference UI's finish() persists
+  // whatever's been picked so far on EVERY exit path, unconditionally - this
+  // page used to special-case the goals-step skip to drop goals/voice,
+  // silently losing any selections already made before the user bailed out.
+  it("does not discard already-selected goals when leaving via the goals step's 'not sure yet' link", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, goals: ["social"] })
+    )
+  })
+
+  // Pins a PR review finding: omitting `goals` when the array is empty is
+  // correct for a user who never touched goal selection at all, but wrong
+  // for one who selected a goal, then explicitly deselected it back to
+  // zero before leaving - the merge PATCH treats an omitted key as "leave
+  // whatever's already stored," silently ignoring their explicit clear
+  // and leaving a stale nonempty list server-side.
+  it("sends an explicit empty goals array (not an omitted key) after selecting then deselecting every goal", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Post on social media")) // deselect - back to zero
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    // toEqual against the FULL exact object, not objectContaining a subset
+    // - a self-review finding caught that a subset check can't prove the
+    // goals-clear latch doesn't leak into (or get masked by) sibling
+    // fields: department must still be present, industry must still
+    // correctly be explicit `null` (work isn't "other" - pre-existing
+    // logic, unrelated to this fix), and voice must still be omitted
+    // entirely (the voice step was never reached in this flow).
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith({
+      onboarded: true,
+      department: "marketing",
+      industry: null,
+      goals: [],
+    })
+  })
+
+  // Pins a test-coverage gap found by self-review: the test above only
+  // ever toggles ONE goal (select, then deselect - 2 toggles). A latch
+  // that's actually derived from something toggle-count-dependent (e.g.
+  // "was toggleGoal called an odd number of times" or "is the goals array
+  // reference different from its initial empty one") could pass that test
+  // while failing here, where multiple goals are selected and deselected
+  // in a different order (4 toggles, ending at zero) - the scenario the
+  // fix's own comment cites as the real motivating case (a user who
+  // previously saved several goals, returns via the rail, and clears them
+  // all).
+  it("still sends an explicit empty goals array after selecting and deselecting multiple goals in a different order", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media")) // select A
+    fireEvent.click(screen.getByText("Keep my inbox under control")) // select B
+    fireEvent.click(screen.getByText("Post on social media")) // deselect A
+    fireEvent.click(screen.getByText("Keep my inbox under control")) // deselect B - back to zero
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, goals: [] })
+    )
+  })
+
+  it("omits goals entirely (not an explicit empty array) when the user never touched goal selection at all", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    const payload = updateUserPreferencesMock.mock.calls[0][0]
+    expect(payload).not.toHaveProperty("goals")
+  })
+
+  // Pins a PR review finding: the rail's "About you"/"My team" links always
+  // jumped to the FIRST step of their (multi-step) group via findIndex,
+  // never the step the user actually last visited in it.
+  it("returns to the last-visited step in a group when clicking its rail link, not always the first step", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    // "About you" (group 0) spans welcome+business - business was the last
+    // step actually visited there, so clicking it from a later step must
+    // return to business ("What does your team do?"), not the welcome splash.
+    fireEvent.click(screen.getByText("About you"))
+    expect(screen.getByText(/What does/)).toBeInTheDocument()
+    expect(screen.queryByText(/Welcome to Xagent/)).not.toBeInTheDocument()
+
+    // Drive through to voice, so "My team" (group 2) becomes reachable from
+    // "done" with voice as its last-visited step.
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("My team"))
+    expect(screen.getByText(/How should/)).toBeInTheDocument()
+    expect(screen.queryByText(/Meet your AI team/)).not.toBeInTheDocument()
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: prior rail
+  // tests only asserted via visible step content changing, never via the
+  // aria-current attribute itself - a regression that stopped setting it
+  // (while still updating the visual is-now CSS class) would pass every
+  // other test in this file.
+  it("marks only the current rail group with aria-current=step", async () => {
+    await goToWelcomeThenBusiness()
+
+    expect(screen.getByText("About you").closest("button")).toHaveAttribute("aria-current", "step")
+    expect(screen.getByText("Goals").closest("button")).not.toHaveAttribute("aria-current")
+
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    expect(screen.getByText("Goals").closest("button")).toHaveAttribute("aria-current", "step")
+    expect(screen.getByText("About you").closest("button")).not.toHaveAttribute("aria-current")
+  })
+
+  // Pins a self-review finding: a rail link (e.g. "About you", reachable
+  // from every later step) could still jump the user elsewhere while a
+  // header "Skip setup" save was in flight, racing that save's own
+  // eventual router.push - every other button was already guarded.
+  it("disables rail navigation links while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Skip setup"))
+    expect(screen.getByText("About you").closest("button")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  // Pins a PR review finding: persistAndLeave used to block navigation
+  // forever on a failed save, trapping the user on this full-screen page
+  // (with no other nav) if the backend kept rejecting it.
+  it("navigates away anyway after 2 consecutive save failures to the same destination, instead of trapping the user", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false })
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+    expect(routerReplace).not.toHaveBeenCalled()
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+    expect(routerReplace).toHaveBeenCalledWith("/task")
+    // Full-feature self-review finding: without telling AuthGuard about
+    // this, its own onboarding check on "/task" would see onboarded still
+    // false and immediately bounce the user right back, defeating the
+    // point of escaping at all.
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+    // Pins a PR review finding: the escape flag must be bound to the
+    // CURRENT user's id (not left identity-agnostic) so a cross-tab
+    // identity swap can't let a different user consume it.
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledWith("user-a")
+    // Pins a regression caught by self-reviewing the trySavePreferences
+    // extraction: the shared-helper refactor initially dropped this reset
+    // on the "escaped" outcome specifically (only restoring it on
+    // retry_in_place), leaving the exit button visibly stuck disabled for
+    // as long as router.replace takes to actually resolve and unmount.
+    expect(screen.getByText("Skip setup").closest("button")).not.toBeDisabled()
+  })
+
+  // Pins a self-review finding: the failure count is per-destination, not
+  // one global tally - a failure on one exit action must not spend down a
+  // DIFFERENT destination's own first-attempt retry-in-place chance.
+  it("does not let a failure on one destination's exit count toward a different destination's first attempt", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    // First failure via header "Skip setup" -> /task.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+    expect(routerReplace).not.toHaveBeenCalled()
+
+    // First-ever attempt via the goals step's own skip -> /templates: must
+    // still get its own retry-in-place chance, not be force-navigated
+    // immediately just because /task's counter is already at 1.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+    })
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-coverage gap flagged in self-review: the "N other matches"
+  // subtitle must not claim a count before templates have actually loaded.
+  it("does not claim 'other matches waiting' before templates have finished loading", async () => {
+    let resolveTemplates!: () => void
+    apiRequestMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveTemplates = () => resolve({ ok: true, json: async () => TEMPLATES })
+      })
+    )
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Keep my inbox under control"))
+    fireEvent.click(screen.getByText("Write up my meetings"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    // 3 goals picked, templates still loading - must not yet claim any
+    // goals are "waiting in Templates" (validRecommended is unresolved, not
+    // confirmed short by 0).
+    expect(screen.queryByText(/waiting in Templates/)).not.toBeInTheDocument()
+
+    await act(async () => {
+      resolveTemplates()
+    })
+    // All 3 goals map to the 3 fetched templates, so once loaded there's
+    // nothing extra waiting either - this only pins the *during-load* state
+    // above, not a specific post-load count.
+  })
+
+  // Pins a PR review finding: the subtitle's "N other matches waiting" count
+  // used to subtract validRecommended.length, which can be entirely fallback
+  // filler cards (unrelated to any selected goal) once every real
+  // recommendation fails to resolve - counting those as "matched" made the
+  // subtitle claim nothing more was waiting even though the one selected
+  // goal was never actually matched to anything.
+  it("counts a goal as unmatched (not fulfilled by fallback filler cards) when its recommended template never resolves", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    // "docs" maps to general-doc-summarizer-action-extractor, which isn't in
+    // the TEMPLATES fixture - its recommendation can never resolve, and the
+    // 3 fallback IDs (which ARE in the fixture) fill validRecommended instead.
+    fireEvent.click(screen.getByText("Summarise long documents"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByText(/the other match is waiting in Templates/)).toBeInTheDocument()
+  })
+
+  // Pins a test-coverage gap found by self-review: the existing subtitle
+  // tests only cover 0 real matches (fallback filler cards) and 4+ real
+  // matches (all past the 3-card cap) - both leave omittedGoalCount at
+  // goals.length, which several plausible wrong formulas would also
+  // produce. A partial, BELOW-cap case (some goals matched, some not, and
+  // the matched count never reaches the cap) is the only scenario that
+  // actually distinguishes the correct formula from those mutants.
+  it("counts exactly the unmatched goal when one of two selected goals matches and the other doesn't", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media")) // matches - in the TEMPLATES fixture
+    fireEvent.click(screen.getByText("Summarise long documents")) // does not match - see the test above
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    // 1 of 2 goals matched, well below the 3-card cap - exactly 1 must be
+    // reported as still waiting, not 0 (undercounting) and not 2
+    // (double-counting the one that already has a card).
+    expect(screen.getByText(/the other match is waiting in Templates/)).toBeInTheDocument()
+  })
+
+  // Pins a test-coverage gap found by self-review: every existing
+  // "N other matches" assertion in this file hits the SINGULAR string
+  // (count === 1) - subtitleExtraMany (the plural "other {count} matches")
+  // was never exercised anywhere, and the zero-real-match fallback branch
+  // was only ever tested with exactly 1 selected goal. A regression that
+  // hardcoded singular text, swapped the ternary, or miscounted with 2+
+  // unmatched goals would pass the entire suite undetected.
+  it("reports the plural 'other N matches' when 2 selected goals both fail to resolve to a real template", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    // Neither "docs" nor "leads" maps to a template in the TEMPLATES
+    // fixture - matchedRecommended stays empty, so validRecommended falls
+    // back to filler cards and omittedGoalCount must equal goals.length (2).
+    fireEvent.click(screen.getByText("Summarise long documents"))
+    fireEvent.click(screen.getByText("Reply to new leads fast"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByText(/the other 2 matches are waiting in Templates/)).toBeInTheDocument()
+  })
+
+  // Pins a test-coverage gap found by self-review: every other identity-swap
+  // test keeps useAuth()'s user.id and readAuthSessionSnapshot()'s userId
+  // equal at mount time (they only diverge AFTER mount, to simulate a
+  // swap), so none of them can tell whether wizardUserIdRef's initial
+  // capture actually reads readAuthSessionSnapshot() - the fix - or the
+  // stale user?.id it replaced. Diverging them from the very first render
+  // is the only way to distinguish the two: if a regression reverted just
+  // this one line back to `useRef(user?.id)`, wizardUserIdRef would
+  // capture "user-a" here instead of "user-b", and every guard in the file
+  // would then see a permanent (spurious) mismatch against the CURRENT,
+  // correct identity, since currentSessionUserId() itself was untouched
+  // and correctly reads "user-b" throughout.
+  it("captures wizardUserIdRef from the live session snapshot at mount, not from the user object", async () => {
+    authUser.id = "user-a"
+    sessionUserIdOverride.current = "user-b"
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    // Once mounted, resync the override to match authUser.id ("user-b") -
+    // if wizardUserIdRef had wrongly captured "user-a" (from user?.id) at
+    // mount, every guard would now see a mismatch against this genuinely
+    // unchanged, correct identity and refuse to save at all.
+    sessionUserIdOverride.current = undefined
+    authUser.id = "user-b"
+
+    fireEvent.click(screen.getByText("Post on social media"))
+    await act(async () => {
+      fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+    })
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, goals: ["social"] })
+    )
+  })
+
+  // Pins a PR review finding: this page's own state has no identity binding
+  // of its own, unlike the escape flag and AuthGuard's onboarding check.
+  // AuthProvider replaces `user` (via its `storage` event listener) on a
+  // same-origin cross-tab login as a DIFFERENT user, with no remount of
+  // this page - without a guard, a half-filled wizard's answers, or an
+  // agent hire, could be sent/completed under the swapped-in identity's
+  // session instead of the one that actually filled them in.
+  it("does not save, hire, or navigate if the authenticated identity changes mid-wizard", async () => {
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // Simulates a same-origin cross-tab login as a different user while this
+    // tab still has the wizard open, followed by the re-render that a real
+    // identity swap (a React state update in AuthProvider) actually causes -
+    // authUser is a stable mock reference, so mutating it and re-rendering
+    // stands in for that state update without an actual remount.
+    authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(updateUserPreferencesMock).not.toHaveBeenCalled()
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-coverage gap found by self-review: every identity-swap test
+  // so far simulates a swap to a DIFFERENT REAL user. A plain logout /
+  // session-clear mid-wizard (token expiry, an explicit logout in another
+  // tab) is arguably the more realistic trigger for this guard, and
+  // readAuthSessionSnapshot().userId genuinely can become `null` in that
+  // case (not just a different string) - this proves the comparison
+  // (`currentSessionUserId() !== wizardUserIdRef.current`) still correctly
+  // treats "session cleared" as a mismatch, not as some special "auth
+  // still resolving, let it through" case.
+  it("does not save, hire, or navigate if the session is cleared (logout) mid-wizard, not just swapped to another user", async () => {
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    sessionUserIdOverride.current = null
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(updateUserPreferencesMock).not.toHaveBeenCalled()
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Same guard, the other mutating path: persistAndLeave's exits must not
+  // send this identity's half-filled answers under a swapped-in session either.
+  it("does not save or navigate on Skip setup if the authenticated identity changes mid-wizard", async () => {
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+
+    expect(updateUserPreferencesMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Pins a gap found by 2 independent self-review agents: the identity
+  // guard above only re-reads identity via a live readAuthSessionSnapshot()
+  // call (an earlier version of this fix used a ref kept fresh through a
+  // useEffect([user?.id]) instead, since replaced) - it must correctly
+  // catch a swap that happens WHILE handleLaunch is already awaiting an
+  // earlier call, not only one
+  // that already happened before the click. This is the scenario the
+  // guard's own comment is actually about (an in-flight save/hire that
+  // started under the original identity), and it's a fundamentally
+  // different code path than "swap happened before the click" above: the
+  // first save must still complete normally (it started under the right
+  // identity), but the LATER markOnboardedAndNavigate call - reached only
+  // after that first save resolves - must see the swap and refuse to run.
+  it("does not complete onboarding under a swapped-in identity if the swap happens while an earlier save in the same click is still in flight", async () => {
+    let resolveFirstSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveFirstSave = resolve })
+    )
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ ...TEMPLATES[0], hired: true, hired_agent_id: 77 }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    // The first (main fields) save is still pending - handleLaunch is
+    // parked awaiting it, exactly the in-flight window the guard must cover.
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+
+    authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    await act(async () => {
+      resolveFirstSave({ ok: true })
+    })
+
+    // handleLaunch resumes past the first save (it was legitimately sent
+    // under the original identity before the swap) and reaches the
+    // already-hired shortcut, which calls markOnboardedAndNavigate - that
+    // call's own guard must now see the swap and refuse to send the
+    // completion write or navigate.
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Pins a gap found in full-feature self-review: of the identity guard's 3
+  // checkpoints (trySavePreferences, markOnboardedAndNavigate, and this one -
+  // right before hireAgentFromTemplate), only the first two had a test that
+  // would fail if that SPECIFIC checkpoint were deleted. This one isolates
+  // the third: the template is NOT already hired (so the two tests above's
+  // shortcuts never apply), the main save and the freshness recheck both
+  // complete normally under the ORIGINAL identity, and the swap happens only
+  // in the narrow window after the freshness recheck resolves but before
+  // hireAgentFromTemplate would fire - the one window only this checkpoint's
+  // guard covers.
+  it("does not hire an agent under a swapped-in identity if the swap happens after the freshness recheck but before the hire call", async () => {
+    let resolveFreshCheck!: (v: { ok: boolean }) => void
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return new Promise((resolve) => { resolveFreshCheck = resolve })
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    // Main save (default beforeEach mock, resolves immediately) already went
+    // through under the original identity; the freshness recheck is now the
+    // one pending call.
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    await act(async () => {
+      resolveFreshCheck({ ok: false })
+    })
+
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+})

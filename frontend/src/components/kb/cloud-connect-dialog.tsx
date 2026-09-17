@@ -28,6 +28,7 @@ export interface CloudFile {
   type: 'file' | 'folder'
   size?: string
   updatedAt?: string
+  resourceKey?: string
 }
 
 interface ConnectedAccount {
@@ -36,6 +37,9 @@ interface ConnectedAccount {
   email: string
   created_at: string
 }
+
+// Keep in sync with CloudIngestRequest.files max_length in src/xagent/web/api/kb.py.
+const MAX_CLOUD_INGEST_FILES = 5
 
 interface CloudConnectDialogProps {
   open: boolean
@@ -132,6 +136,12 @@ export function CloudConnectDialog({
     if (isSelected(file.id)) {
       setSelectedFiles(prev => prev.filter(f => f.id !== file.id))
     } else {
+      if (selectedFiles.length >= MAX_CLOUD_INGEST_FILES) {
+        toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
+          count: MAX_CLOUD_INGEST_FILES,
+        }))
+        return
+      }
       setSelectedFiles(prev => [...prev, file])
     }
   }

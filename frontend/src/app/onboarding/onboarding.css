@@ -1,0 +1,787 @@
+/* Onboarding wizard visuals, extracted from page.tsx's styled-jsx block for
+   readability (flagged in PR review: xorbitsai/xagent#1617). This is a plain
+   global stylesheet, not a CSS Module - every selector below is prefixed
+   `ob-` specifically to stay collision-free project-wide, so there is
+   nothing to gain from per-file hashing, and importing it directly avoids
+   the styled-jsx scoping gotcha this file used to need :global() for: Chip/
+   Orb/PersonaAvatar render their DOM from a different component than
+   OnboardingPage, so styled-jsx's scope class never reached them (see git
+   history on this file for the bug that caused). Plain CSS has no such
+   scoping, so none of that is needed here. */
+
+.ob-aurora {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+.ob-aurora b {
+  position: absolute;
+  display: block;
+  border-radius: 50%;
+  filter: blur(80px);
+}
+.ob-aurora::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.16;
+  mix-blend-mode: soft-light;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='160' height='160' filter='url(%23n)'/></svg>");
+}
+.ob-a1 {
+  width: min(1280px, 128vw);
+  height: 740px;
+  left: 50%;
+  top: 44%;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(
+    closest-side,
+    rgba(150, 198, 255, 0.58),
+    rgba(150, 198, 255, 0.4) 38%,
+    rgba(150, 198, 255, 0.16) 64%,
+    rgba(150, 198, 255, 0.04) 84%,
+    rgba(150, 198, 255, 0) 100%
+  );
+  animation: ob-drift1 26s ease-in-out infinite;
+}
+.ob-a2 {
+  width: min(1080px, 116vw);
+  height: 680px;
+  left: 46%;
+  top: 92%;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(
+    closest-side,
+    rgba(247, 190, 226, 0.5),
+    rgba(247, 190, 226, 0.33) 38%,
+    rgba(247, 190, 226, 0.13) 64%,
+    rgba(247, 190, 226, 0.03) 84%,
+    rgba(247, 190, 226, 0) 100%
+  );
+  animation: ob-drift2 31s ease-in-out infinite;
+}
+.ob-a3 {
+  width: 680px;
+  height: 560px;
+  left: 63%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(
+    closest-side,
+    rgba(186, 176, 255, 0.38),
+    rgba(186, 176, 255, 0.24) 40%,
+    rgba(186, 176, 255, 0.09) 66%,
+    rgba(186, 176, 255, 0) 100%
+  );
+  animation: ob-drift3 23s ease-in-out infinite;
+}
+@keyframes ob-drift1 {
+  50% {
+    transform: translate(-52%, -46%) scale(1.06);
+  }
+}
+@keyframes ob-drift2 {
+  50% {
+    transform: translate(-44%, -54%) scale(1.08);
+  }
+}
+@keyframes ob-drift3 {
+  50% {
+    transform: translate(-58%, -50%) scale(0.94);
+  }
+}
+
+.ob-shell {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.ob-top {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px 26px;
+  flex: 0 0 auto;
+}
+.ob-logo {
+  height: 26px;
+  width: auto;
+  display: block;
+}
+.ob-acct {
+  position: absolute;
+  right: 26px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 14px 5px 5px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--card) / 0.72);
+  backdrop-filter: blur(8px);
+  font-size: 13px;
+  font-weight: 550;
+  letter-spacing: -0.01em;
+  color: hsl(var(--foreground));
+}
+.ob-acct span {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  font-size: 11.5px;
+  font-weight: 650;
+}
+.ob-acct b {
+  font-weight: 550;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* :hover rules across this file (.ob-exit/.ob-rl/.ob-btn-back/.ob-chip/.ob-tm
+   below) are now scoped `:not(:disabled)` - a PR review finding caught that
+   a disabled native <button> still matches a bare :hover selector in CSS
+   (disabling only suppresses click/focus, not :hover), so these controls
+   kept showing their full interactive hover treatment - highlight color,
+   lifted card shadow/transform, etc. - while a save was in flight and
+   clicks were actually being ignored, with only .ob-btn-next's hover rule
+   correctly scoped already. */
+.ob-exit {
+  position: absolute;
+  left: 26px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 12.5px;
+  color: hsl(var(--muted-foreground));
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  transition: color 0.14s, background 0.14s;
+}
+.ob-exit:hover:not(:disabled) {
+  color: hsl(var(--foreground));
+  background: hsl(var(--muted));
+}
+.ob-exit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ob-rail {
+  position: fixed;
+  left: 26px;
+  top: 74px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ob-rl {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+  letter-spacing: -0.012em;
+  color: hsl(var(--muted-foreground));
+  padding: 2px 4px 2px 0;
+  border-radius: 10px;
+  text-align: left;
+  transition: color 0.16s;
+  cursor: default;
+  border: 0;
+  background: none;
+}
+.ob-rl i {
+  flex: 0 0 auto;
+  width: 19px;
+  height: 19px;
+  border-radius: 50%;
+  border: 1.6px solid hsl(var(--border));
+  display: grid;
+  place-items: center;
+  color: hsl(var(--primary-foreground));
+  transition: border-color 0.18s, background 0.18s;
+}
+.ob-rl-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: hsl(var(--primary));
+  display: block;
+}
+.ob-rl.is-now {
+  color: hsl(var(--foreground));
+  font-weight: 600;
+}
+.ob-rl.is-now i {
+  border-color: hsl(var(--primary));
+}
+.ob-rl.is-done {
+  color: hsl(var(--foreground));
+}
+.ob-rl.is-done i {
+  background: hsl(var(--primary));
+  border-color: hsl(var(--primary));
+}
+.ob-rl.can-go {
+  cursor: pointer;
+}
+.ob-rl.can-go:hover:not(:disabled) {
+  color: hsl(var(--foreground));
+}
+.ob-rl:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.ob-body {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 26px 48px;
+  min-height: 0;
+}
+.ob-step {
+  width: 100%;
+  max-width: 980px;
+  margin: 0 auto;
+  text-align: center;
+  animation: ob-rise 0.38s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+@keyframes ob-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.ob-step .ob-orb {
+  position: relative;
+  width: 58px;
+  height: 58px;
+  margin: 0 auto 26px;
+}
+.ob-step .ob-orb::before,
+.ob-step .ob-orb::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+.ob-step .ob-orb::before {
+  border-radius: 52% 48% 44% 56% / 50% 54% 46% 50%;
+  background: conic-gradient(from 200deg, #8cc6ff, #b7a6ff, #f3aadb, #8fd8ff, #8cc6ff);
+  filter: blur(6px);
+  animation: ob-orbm 8s ease-in-out infinite;
+}
+.ob-step .ob-orb::after {
+  inset: 9px;
+  border-radius: 50%;
+  filter: blur(4px);
+  background: radial-gradient(
+    circle at 36% 30%,
+    rgba(255, 255, 255, 0.92),
+    rgba(255, 255, 255, 0.2) 32%,
+    rgba(255, 255, 255, 0) 58%
+  );
+  animation: ob-orbm 8s ease-in-out infinite reverse;
+}
+@keyframes ob-orbm {
+  50% {
+    border-radius: 44% 56% 54% 46% / 46% 44% 56% 54%;
+    transform: rotate(140deg) scale(1.08);
+  }
+}
+.ob-step .ob-orb.sm {
+  width: 44px;
+  height: 44px;
+  margin-bottom: 20px;
+}
+
+.ob-step h1 {
+  margin: 0;
+  font-size: clamp(32px, 5.2vw, 58px);
+  line-height: 1.05;
+  font-weight: 760;
+  letter-spacing: -0.036em;
+  color: hsl(var(--foreground));
+  /* This heading gets tabIndex={-1} and a programmatic .focus() call on
+     every step change (page.tsx's stepHeadingRef effect) purely so screen
+     readers announce the new step - tabIndex={-1} already keeps it out of
+     the normal Tab order entirely, so no keyboard user ever reaches it by
+     tabbing. Without this, the browser's native focus ring (visible right
+     after a step change, until the next pointer interaction anywhere on
+     the page flips :focus-visible's heuristic) showed up as an unrelated,
+     confusing blue box around the heading text for sighted mouse users -
+     a user-reported bug, reproduced in both Chrome and Safari. */
+  outline: none;
+}
+.ob-step h1 em {
+  font-style: normal;
+  color: hsl(var(--primary));
+}
+.ob-sub {
+  margin: 18px auto 0;
+  max-width: 520px;
+  font-size: 15.5px;
+  line-height: 1.55;
+  color: hsl(var(--muted-foreground));
+}
+
+.ob-cta {
+  margin-top: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+.ob-btn-next {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  height: 50px;
+  padding: 0 30px;
+  border-radius: 999px;
+  border: 0;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  box-shadow: 0 10px 26px hsl(var(--primary) / 0.26);
+  cursor: pointer;
+  transition: filter 0.14s, transform 0.12s, box-shadow 0.14s, opacity 0.14s;
+}
+.ob-btn-next:hover:not(:disabled) {
+  filter: brightness(0.9);
+  box-shadow: 0 12px 30px hsl(var(--primary) / 0.32);
+}
+.ob-btn-next:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.ob-btn-next:disabled {
+  background: hsl(var(--muted-foreground) / 0.5);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+.ob-btn-back {
+  height: 50px;
+  padding: 0 20px;
+  border-radius: 999px;
+  border: 0;
+  background: none;
+  font-size: 14.5px;
+  font-weight: 500;
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+  transition: color 0.14s, background 0.14s;
+}
+.ob-btn-back:hover:not(:disabled) {
+  color: hsl(var(--foreground));
+  background: hsl(var(--muted));
+}
+.ob-btn-back:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.ob-skip {
+  margin-top: 18px;
+  font-size: 12.5px;
+  color: hsl(var(--muted-foreground));
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  transition: color 0.14s, background 0.14s;
+}
+.ob-skip:hover:not(:disabled) {
+  color: hsl(var(--foreground));
+  background: hsl(var(--muted));
+}
+.ob-skip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ob-form {
+  margin: 24px auto 0;
+  max-width: 420px;
+  text-align: left;
+}
+.ob-fl {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin-bottom: 10px;
+  color: hsl(var(--foreground));
+}
+.ob-input {
+  width: 100%;
+  height: 56px;
+  padding: 0 18px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 14px;
+  background: hsl(var(--card));
+  color: hsl(var(--foreground));
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  transition: border-color 0.14s, box-shadow 0.14s;
+}
+.ob-input::placeholder {
+  color: hsl(var(--muted-foreground));
+}
+.ob-input:focus {
+  outline: none;
+  border-color: hsl(var(--primary));
+  box-shadow: 0 0 0 4px hsl(var(--primary) / 0.1);
+}
+.ob-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ob-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  max-width: 760px;
+  margin: 0 auto;
+}
+.ob-chips .ob-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 42px;
+  padding: 0 18px;
+  border-radius: 999px;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--card) / 0.62);
+  font-size: 14px;
+  letter-spacing: -0.012em;
+  color: hsl(var(--foreground));
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s, transform 0.12s, box-shadow 0.15s;
+}
+.ob-chips .ob-chip:hover:not(:disabled) {
+  border-color: hsl(var(--foreground) / 0.25);
+  background: hsl(var(--card));
+  box-shadow: 0 6px 16px rgba(20, 22, 40, 0.06);
+}
+.ob-chips .ob-chip:active {
+  transform: translateY(1px);
+}
+.ob-chips .ob-chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.ob-chips .ob-chip[aria-pressed="true"] {
+  border-color: hsl(var(--primary));
+  background: hsl(var(--primary) / 0.12);
+  /* No color override here (inherits the base rule's --foreground) - text
+     was previously recolored to hsl(var(--primary)), but computed contrast
+     against this 12%-tinted background is only ~3.4-3.5:1 on the
+     blue/green/purple/cyberLight presets (verified against theme.ts's real
+     palette values), below the 4.5:1 AA floor. --foreground is guaranteed
+     high-contrast against any background token in every theme by
+     definition, and the border/background tint alone still clearly signal
+     "selected" without needing the text itself recolored. */
+  font-weight: 560;
+}
+.ob-chips .ob-chip .ob-ic {
+  opacity: 0.55;
+}
+.ob-chips .ob-chip[aria-pressed="true"] .ob-ic {
+  opacity: 1;
+}
+
+.ob-team {
+  margin: 36px auto 0;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.ob-team.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-width: 680px;
+}
+.ob-team.one {
+  grid-template-columns: minmax(0, 340px);
+  justify-content: center;
+}
+.ob-tm {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 26px 20px 22px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 22px;
+  background: hsl(var(--card));
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.16s, box-shadow 0.18s, transform 0.18s;
+}
+.ob-tm:hover:not(:disabled) {
+  border-color: hsl(var(--border));
+  box-shadow: 0 14px 34px rgba(20, 22, 40, 0.09);
+  transform: translateY(-3px);
+}
+.ob-tm[aria-pressed="true"] {
+  border-color: hsl(var(--primary));
+  box-shadow: 0 0 0 1px hsl(var(--primary)), 0 16px 38px hsl(var(--primary) / 0.14);
+}
+.ob-tm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.ob-tm-tick {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  display: grid;
+  place-items: center;
+}
+.ob-tm-name {
+  margin-top: 15px;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  text-transform: uppercase;
+  color: hsl(var(--foreground));
+}
+.ob-tm-role {
+  margin-top: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  color: hsl(var(--muted-foreground));
+}
+.ob-tm-cat {
+  margin-top: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: hsl(var(--muted));
+  border: 1px solid hsl(var(--border));
+  font-size: 11px;
+  color: hsl(var(--muted-foreground));
+}
+.ob-tm-cat i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: block;
+}
+.ob-tm-desc {
+  margin-top: 13px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: hsl(var(--foreground));
+  min-height: 60px;
+}
+.ob-tm-why {
+  margin-top: 12px;
+  font-size: 11.5px;
+  color: hsl(var(--muted-foreground));
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ob-tm-why i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: hsl(var(--primary));
+  opacity: 0.5;
+  display: block;
+}
+
+.ob-say {
+  margin: 24px auto 0;
+  max-width: 560px;
+  padding: 16px 20px;
+  border-radius: 18px;
+  background: hsl(var(--card) / 0.78);
+  border: 1px solid hsl(var(--border));
+  box-shadow: 0 8px 24px rgba(20, 22, 40, 0.05);
+  text-align: left;
+}
+.ob-say b {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: hsl(var(--muted-foreground));
+  margin-bottom: 7px;
+}
+.ob-say i {
+  font-style: normal;
+  font-size: 14.5px;
+  line-height: 1.6;
+  color: hsl(var(--foreground));
+}
+
+.ob-sum {
+  margin: 34px auto 0;
+  max-width: 520px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 22px;
+  background: hsl(var(--card));
+  padding: 26px 24px;
+  text-align: left;
+  box-shadow: 0 18px 44px rgba(20, 22, 40, 0.08);
+}
+.ob-sum-hd {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+}
+.ob-sum-nm {
+  font-size: 17px;
+  font-weight: 660;
+  letter-spacing: -0.018em;
+  color: hsl(var(--foreground));
+}
+.ob-sum-rl {
+  margin-top: 3px;
+  font-size: 12.5px;
+  color: hsl(var(--muted-foreground));
+}
+.ob-sum-list {
+  margin: 20px 0 0;
+  padding: 18px 0 0;
+  border-top: 1px solid hsl(var(--border));
+  display: grid;
+  gap: 12px;
+}
+.ob-sum-li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 11px;
+  align-items: start;
+  font-size: 13.5px;
+  color: hsl(var(--foreground));
+}
+.ob-sum-li b {
+  font-weight: 600;
+  color: hsl(var(--foreground));
+  overflow-wrap: break-word;
+}
+
+@media (max-width: 1180px) {
+  .ob-rail {
+    position: static;
+    flex-direction: row;
+    justify-content: center;
+    gap: 8px;
+    padding: 0 26px 4px;
+    margin-bottom: 8px;
+  }
+  /* Visually hidden, not display:none: a completed/future step's rail
+     button keeps only a check icon or dot at this width, but the button
+     itself stays enabled/focusable (is-done ones are clickable) - removing
+     its label from the accessibility tree entirely would leave screen
+     reader/keyboard users with an unlabeled control, not just a visually
+     compact one. */
+  .ob-rl span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .ob-rl.is-now span {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    overflow: visible;
+    clip: auto;
+    white-space: normal;
+  }
+  .ob-rl i {
+    width: 16px;
+    height: 16px;
+  }
+}
+@media (max-width: 880px) {
+  .ob-team {
+    grid-template-columns: 1fr;
+    max-width: 400px;
+  }
+  .ob-team.two,
+  .ob-team.one {
+    grid-template-columns: 1fr;
+    max-width: 400px;
+  }
+  .ob-tm-desc {
+    min-height: 0;
+  }
+  .ob-body {
+    padding-bottom: 36px;
+  }
+}
+@media (max-width: 480px) {
+  /* The centered logo and the absolutely positioned left Skip/right account
+     controls reserve no space for one another - a long username's badge can
+     grow wide enough to overlap the logo at narrow phone widths. Hiding the
+     username text (keeping just the small avatar circle) caps the badge's
+     footprint regardless of username length, without needing a layout
+     rewrite. */
+  .ob-acct b {
+    display: none;
+  }
+  .ob-acct {
+    padding: 5px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* iteration-count:1, not just a near-zero duration: .ob-aurora b and
+     .ob-orb::before/::after are infinite animations, so a near-zero
+     duration alone still loops forever on those - just at high speed,
+     causing rapid repeated phase changes instead of the static composition
+     this rule is meant to produce. Stopping after one (near instant) pass
+     actually holds still. (.ob-step's own entrance animation already runs
+     once - iteration-count:1 is a no-op for it, just along for the ride as
+     part of this shared selector list.) */
+  .ob-aurora b,
+  .ob-step .ob-orb::before,
+  .ob-step .ob-orb::after,
+  .ob-step {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

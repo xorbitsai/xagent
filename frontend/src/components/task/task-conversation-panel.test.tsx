@@ -2,33 +2,81 @@ import React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+type PanelTraceEvent = {
+  event_id?: string
+  event_type?: string
+  timestamp?: string | number
+  data?: Record<string, unknown>
+  [key: string]: unknown
+}
+
 const appState = vi.hoisted(() => ({
-  messages: [],
-  traceEvents: [],
-  currentTask: null,
+  messages: [] as Array<Record<string, unknown>>,
+  traceEvents: [] as PanelTraceEvent[],
+  currentTask: null as null | Record<string, unknown>,
+  taskRuntimeExtensions: {} as Record<string, Record<string, unknown>>,
   isProcessing: false,
   isHistoryLoading: false,
   taskId: 42,
-  filePreview: { isOpen: false, fileName: "", viewMode: "preview" },
+  filePreview: { isOpen: false, fileId: "", fileName: "", viewMode: "preview" },
   dagExecution: null,
   steps: [],
+}))
+const openFilePreviewMock = vi.hoisted(() => vi.fn())
+const sendMessageMock = vi.hoisted(() => vi.fn())
+const pauseTaskMock = vi.hoisted(() => vi.fn())
+const resumeTaskMock = vi.hoisted(() => vi.fn())
+const getFileDownloadUrlMock = vi.hoisted(() => vi.fn())
+const fileAccessRequestMock = vi.hoisted(() => vi.fn())
+const appControls = vi.hoisted(() => ({
+  filesDisabled: false,
+  voiceInputEnabled: true,
+  taskControlsEnabled: true,
+  isConversationResetPending: false,
+  isMessageDeliveryPending: false,
+  isSessionInteractionLocked: false,
+}))
+const chatInputProps = vi.hoisted(() => ({
+  current: null as null | {
+    files?: File[]
+    filesDisabled?: boolean
+    voiceInputEnabled?: boolean
+    hideFileUpload?: boolean
+    isLoading?: boolean
+    currentInteractionRequestId?: string
+    onFilesChange?: (files: File[]) => void
+    onPause?: () => void
+    onResume?: () => void
+    onSend: (message: string, config?: unknown, files?: File[]) => Promise<void> | void
+  },
 }))
 
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
     state: appState,
-    sendMessage: vi.fn(),
-    pauseTask: vi.fn(),
-    resumeTask: vi.fn(),
-    openFilePreview: vi.fn(),
+    filesDisabled: appControls.filesDisabled,
+    voiceInputEnabled: appControls.voiceInputEnabled,
+    taskControlsEnabled: appControls.taskControlsEnabled,
+    sendMessage: sendMessageMock,
+    pauseTask: pauseTaskMock,
+    resumeTask: resumeTaskMock,
+    openFilePreview: openFilePreviewMock,
     closeFilePreview: vi.fn(),
     requestStatus: vi.fn(),
     dispatch: vi.fn(),
+    getFileDownloadUrl: getFileDownloadUrlMock,
+    isConversationResetPending: appControls.isConversationResetPending,
+    isMessageDeliveryPending: appControls.isMessageDeliveryPending,
+    isSessionInteractionLocked: appControls.isSessionInteractionLocked,
   }),
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: (key: string) => key }),
+}))
+
+vi.mock("@/contexts/file-access-context", () => ({
+  useFileAccess: () => ({ request: fileAccessRequestMock }),
 }))
 
 vi.mock("dagre", () => {
@@ -68,7 +116,12 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     taskStatus,
     processStatus,
     showEmptyStatus,
+    showProcessView,
     onOpenExecutionPlan,
+    contextBadges,
+    taskRuntimeExtensionMetadata,
+    interactionRequestId,
+    interactions,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -76,7 +129,15 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     taskStatus?: string
     processStatus?: string
     showEmptyStatus?: boolean
+    showProcessView?: boolean
     onOpenExecutionPlan?: () => void
+    contextBadges?: Array<{ kind: string; label: string; detail: string }>
+    taskRuntimeExtensionMetadata?: {
+      bindings: string[]
+      publicMetadata: Record<string, Record<string, unknown>>
+    }
+    interactionRequestId?: string
+    interactions?: unknown[]
   }) => (
     <div
       data-testid="chat-message"
@@ -85,6 +146,11 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-task-status={taskStatus || ""}
       data-process-status={processStatus || ""}
       data-show-empty-status={showEmptyStatus ? "true" : "false"}
+      data-show-process-view={showProcessView ? "true" : "false"}
+      data-context-badges={JSON.stringify(contextBadges || [])}
+      data-runtime-extension-metadata={JSON.stringify(taskRuntimeExtensionMetadata || {})}
+      data-request-id={interactionRequestId || ""}
+      data-interactions={JSON.stringify(interactions || [])}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -107,7 +173,29 @@ vi.mock("@/components/chat/ChatMessage", () => ({
 }))
 
 vi.mock("@/components/chat/ChatInput", () => ({
-  ChatInput: () => <div data-testid="chat-input" />,
+  ChatInput: (props: NonNullable<typeof chatInputProps.current>) => {
+    chatInputProps.current = props
+    return (
+      <div data-testid="chat-input">
+        <button
+          type="button"
+          disabled={props.isLoading}
+          onClick={() => props.onFilesChange?.([
+            new File(["draft"], "draft.txt", { type: "text/plain" }),
+          ])}
+        >
+          stage file
+        </button>
+        <button
+          type="button"
+          disabled={props.isLoading}
+          onClick={() => void props.onSend("send draft", { mode: "balanced" })}
+        >
+          send draft
+        </button>
+      </div>
+    )
+  },
 }))
 
 vi.mock("@/components/chat/TokenUsageDisplay", () => ({
@@ -115,7 +203,9 @@ vi.mock("@/components/chat/TokenUsageDisplay", () => ({
 }))
 
 vi.mock("@/components/file/task-file-manager", () => ({
-  TaskFileManager: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TaskFileManager: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="task-file-manager">{children}</div>
+  ),
 }))
 
 vi.mock("@/components/file/file-preview-content", () => ({
@@ -123,11 +213,17 @@ vi.mock("@/components/file/file-preview-content", () => ({
 }))
 
 vi.mock("@/components/file/file-preview-action-buttons", () => ({
-  FilePreviewActionButtons: () => null,
+  FilePreviewActionButtons: ({ onDownload }: { onDownload: () => void }) => (
+    <button type="button" data-testid="file-preview-actions" onClick={onDownload}>
+      download
+    </button>
+  ),
 }))
 
 vi.mock("@/components/preview-sheet", () => ({
-  PreviewSheet: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  PreviewSheet: ({ children, actions }: { children: React.ReactNode; actions?: React.ReactNode }) => (
+    <>{actions}{children}</>
+  ),
 }))
 
 vi.mock("@/components/layout/center-panel", () => ({
@@ -151,6 +247,20 @@ import { TaskConversationPanel } from "./task-conversation-panel"
 describe("TaskConversationPanel", () => {
   beforeEach(() => {
     vi.spyOn(console, "error").mockImplementation(() => undefined)
+    openFilePreviewMock.mockReset()
+    sendMessageMock.mockReset()
+    sendMessageMock.mockResolvedValue(undefined)
+    pauseTaskMock.mockReset()
+    resumeTaskMock.mockReset()
+    getFileDownloadUrlMock.mockReset()
+    fileAccessRequestMock.mockReset()
+    chatInputProps.current = null
+    appControls.isConversationResetPending = false
+    appControls.isMessageDeliveryPending = false
+    appControls.isSessionInteractionLocked = false
+    appControls.filesDisabled = false
+    appControls.voiceInputEnabled = true
+    appControls.taskControlsEnabled = true
   })
 
   afterEach(() => {
@@ -159,9 +269,269 @@ describe("TaskConversationPanel", () => {
     appState.messages = []
     appState.traceEvents = []
     appState.currentTask = null
+    appState.taskRuntimeExtensions = {}
+    appState.taskId = 42
     appState.isProcessing = false
     appState.isHistoryLoading = false
-    appState.filePreview = { isOpen: false, fileName: "", viewMode: "preview" }
+    appState.filePreview = { isOpen: false, fileId: "", fileName: "", viewMode: "preview" }
+  })
+
+  it("marks user turns with the task's Local browser context", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Inspect this window",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+    appState.taskRuntimeExtensions = {
+      local_browser: { kind: "local_browser" },
+    }
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-context-badges",
+      JSON.stringify([{
+        kind: "computer_use",
+        label: "chatPage.input.localBrowser.chipLabel",
+        detail: "chatPage.input.localBrowser.label",
+      }]),
+    )
+  })
+
+  it("passes bindings and public metadata through the message extension slot", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Inspect my browser",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+    appState.currentTask = {
+      id: "42",
+      runtimeExtensionBindings: ["browser_relay"],
+    }
+    appState.taskRuntimeExtensions = {
+      browser_relay: { kind: "browser_relay", connected: true },
+    }
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-runtime-extension-metadata",
+      JSON.stringify({
+        bindings: ["browser_relay"],
+        publicMetadata: {
+          browser_relay: { kind: "browser_relay", connected: true },
+        },
+      }),
+    )
+  })
+
+  it("restores the Computer use badge from the task's persisted binding", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Inspect this window",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+    appState.currentTask = {
+      id: "823",
+      title: "Local browser task",
+      description: "Inspect this window",
+      status: "completed",
+      createdAt: "2026-08-07T07:00:00Z",
+      updatedAt: "2026-08-07T07:01:00Z",
+      runtimeExtensionBindings: ["local_browser"],
+    }
+    appState.taskId = 823
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-context-badges",
+      JSON.stringify([{
+        kind: "computer_use",
+        label: "chatPage.input.localBrowser.chipLabel",
+        detail: "chatPage.input.localBrowser.label",
+      }]),
+    )
+  })
+
+  it("does not reuse the previous task's Computer use badge", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Inspect this window",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+    appState.taskId = 824
+    appState.currentTask = {
+      id: "823",
+      title: "Previous local browser task",
+      description: "Inspect another window",
+      status: "completed",
+      createdAt: "2026-08-07T07:00:00Z",
+      updatedAt: "2026-08-07T07:01:00Z",
+      runtimeExtensionBindings: ["local_browser"],
+    }
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-context-badges",
+      JSON.stringify([]),
+    )
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-runtime-extension-metadata",
+      JSON.stringify({ bindings: [], publicMetadata: {} }),
+    )
+  })
+
+  it("disables every file surface and drops staged files when the capability is disabled", async () => {
+    appState.filePreview = {
+      isOpen: true,
+      fileId: "secret-file",
+      fileName: "secret.txt",
+      viewMode: "preview",
+    }
+    const { rerender } = render(
+      <TaskConversationPanel mode="page" />
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "stage file" }))
+    expect(chatInputProps.current?.files).toHaveLength(1)
+
+    appControls.filesDisabled = true
+    rerender(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.hideFileUpload).toBe(true)
+    expect(chatInputProps.current?.filesDisabled).toBe(true)
+    expect(chatInputProps.current?.files).toEqual([])
+    expect(screen.queryByTestId("task-file-manager")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("file-preview-content")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("file-preview-actions")).not.toBeInTheDocument()
+
+    window.dispatchEvent(new CustomEvent("openFilePreview", {
+      detail: { filePath: "file-secret", fileName: "secret.txt" },
+    }))
+    expect(openFilePreviewMock).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "send draft" }))
+    expect(sendMessageMock).toHaveBeenCalledWith(
+      "send draft",
+      { mode: "balanced" },
+      [],
+    )
+  })
+
+  it("preserves the existing file behavior when the capability is enabled", () => {
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.hideFileUpload).toBe(false)
+    expect(chatInputProps.current?.filesDisabled).toBe(false)
+    expect(screen.getByTestId("task-file-manager")).toBeInTheDocument()
+
+    window.dispatchEvent(new CustomEvent("openFilePreview", {
+      detail: { filePath: "file-default", fileName: "default.txt" },
+    }))
+    expect(openFilePreviewMock).toHaveBeenCalledWith(
+      "file-default",
+      "default.txt",
+    )
+  })
+
+  it("downloads through the provider-scoped file request policy", async () => {
+    appState.filePreview = {
+      isOpen: true,
+      fileId: "public-file-id",
+      fileName: "report.pdf",
+      viewMode: "preview",
+    }
+    getFileDownloadUrlMock.mockReturnValue(
+      "/api/files/public/download/public-file-id?token=guest-token",
+    )
+    fileAccessRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(["file"]),
+    })
+
+    render(<TaskConversationPanel mode="page" />)
+    fireEvent.click(screen.getByTestId("file-preview-actions"))
+
+    await Promise.resolve()
+    expect(getFileDownloadUrlMock).toHaveBeenCalledWith("public-file-id")
+    expect(fileAccessRequestMock).toHaveBeenCalledWith(
+      "/api/files/public/download/public-file-id?token=guest-token",
+    )
+  })
+
+  it("passes the transport voice capability through to ChatInput", () => {
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.voiceInputEnabled).toBe(true)
+
+    appControls.voiceInputEnabled = false
+    rerender(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.voiceInputEnabled).toBe(false)
+  })
+
+  it("omits task controls from ChatInput when the transport disables them", () => {
+    appControls.taskControlsEnabled = false
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onPause).toBeUndefined()
+    expect(chatInputProps.current?.onResume).toBeUndefined()
+  })
+
+  it("preserves task control callbacks when the transport leaves them enabled", () => {
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onPause).toBe(pauseTaskMock)
+    expect(chatInputProps.current?.onResume).toBe(resumeTaskMock)
+  })
+
+  it("does not offer a retained waiting request identity from a different task", () => {
+    appState.taskId = 43
+    appState.currentTask = {
+      id: "42",
+      title: "Previous waiting task",
+      description: "Previous waiting task",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingRequestId: "inputreq_stale",
+    }
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.currentInteractionRequestId).toBeUndefined()
+  })
+
+  it("keeps the composer busy during Session reset and durable delivery", () => {
+    appControls.isConversationResetPending = true
+    const { rerender } = render(
+      <TaskConversationPanel mode="page" />
+    )
+    expect(chatInputProps.current?.isLoading).toBe(true)
+
+    appControls.isConversationResetPending = false
+    appControls.isMessageDeliveryPending = true
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(chatInputProps.current?.isLoading).toBe(true)
+
+    appControls.isMessageDeliveryPending = false
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(chatInputProps.current?.isLoading).toBe(false)
+  })
+
+  it("blocks the established-conversation composer when the Session outcome requires reload", () => {
+    appControls.isSessionInteractionLocked = true
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByRole("button", { name: "send draft" })).toBeDisabled()
+    fireEvent.click(screen.getByRole("button", { name: "send draft" }))
+    expect(sendMessageMock).not.toHaveBeenCalled()
   })
 
   it("renders waiting-for-user prompts from normal task state", () => {
@@ -190,6 +560,131 @@ describe("TaskConversationPanel", () => {
 
     expect(screen.getByText("Which dataset should I use?")).toBeInTheDocument()
     expect(screen.getByTestId("chat-message")).toHaveAttribute("data-active", "true")
+  })
+
+  it("keeps each rendered clarification bound to its own request id", () => {
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: "1000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        interactionRequestId: "inputreq_q1",
+      },
+      {
+        id: "q2",
+        role: "assistant",
+        content: "Which hotel?",
+        timestamp: "2000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "hotel", label: "Hotel" }],
+        interactionRequestId: "inputreq_q2",
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which hotel?",
+      waitingRequestId: "inputreq_q2",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    expect(rendered[0]).toHaveAttribute("data-request-id", "inputreq_q1")
+    expect(rendered[1]).toHaveAttribute("data-request-id", "inputreq_q2")
+  })
+
+  it("keeps an identified text-only wait separate from stale structured trace interactions", () => {
+    appState.messages = [{
+      id: "user-r2",
+      role: "user",
+      content: "Start the next question",
+      timestamp: 2000,
+    }]
+    appState.traceEvents = [{
+      event_id: "stale-r1",
+      event_type: "agent_message",
+      timestamp: 1000,
+      data: {
+        message: "Choose the old city",
+        expect_response: true,
+        metadata: {
+          interactions: [{
+            type: "select_one",
+            field: "city",
+            label: "City",
+            options: [{ label: "Paris", value: "paris" }],
+          }],
+        },
+      },
+    }]
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Type the current answer",
+      waitingRequestId: "inputreq_r2",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const currentWait = screen.getAllByTestId("chat-message").find(
+      (message) => message.getAttribute("data-request-id") === "inputreq_r2",
+    )
+    expect(currentWait).toHaveAttribute("data-interactions", "[]")
+    expect(chatInputProps.current?.currentInteractionRequestId).toBe("inputreq_r2")
+  })
+
+  it("keeps the historical trace fallback for id-less waiting state", () => {
+    appState.messages = [{
+      id: "user-legacy",
+      role: "user",
+      content: "Start the legacy question",
+      timestamp: 2000,
+    }]
+    appState.traceEvents = [{
+      event_id: "legacy-wait",
+      event_type: "agent_message",
+      timestamp: 1000,
+      data: {
+        message: "Choose a city",
+        expect_response: true,
+        metadata: {
+          interactions: [{ type: "text_input", field: "city", label: "City" }],
+        },
+      },
+    }]
+    appState.currentTask = {
+      id: "42",
+      title: "Legacy preview",
+      description: "Legacy preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Choose a city",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const activeWait = screen.getAllByTestId("chat-message").find(
+      (message) => message.getAttribute("data-active") === "true",
+    )
+    expect(activeWait).toHaveAttribute(
+      "data-interactions",
+      JSON.stringify([{ type: "text_input", field: "city", label: "City" }]),
+    )
+    expect(chatInputProps.current?.currentInteractionRequestId).toBeUndefined()
   })
 
   it("shows history loading before waiting-for-user content while history is loading", () => {
@@ -429,6 +924,15 @@ describe("TaskConversationPanel", () => {
     // Only the user turn and the failure reason — no extra virtual message.
     expect(renderedMessages).toHaveLength(2)
     expect(renderedMessages[1]).toHaveTextContent(quotaReason)
+    // Trace visible: the reason renders as plain content, not the failed path.
+    expect(renderedMessages[1]).toHaveAttribute("data-task-status", "")
+    cleanup()
+
+    // With the trace hidden the same verbatim reason must reach ChatMessage
+    // flagged as failed, so its raw text gets the generic replacement there.
+    render(<TaskConversationPanel mode="page" showProcessView={false} />)
+    const hiddenTraceMessages = screen.getAllByTestId("chat-message")
+    expect(hiddenTraceMessages[1]).toHaveAttribute("data-task-status", "failed")
   })
 
   it("applies current task status only to the latest trace process group", () => {
@@ -817,5 +1321,46 @@ describe("TaskConversationPanel", () => {
 
     expect(await screen.findByTestId("center-panel")).toHaveAttribute("data-node-count", "3")
     expect(screen.getByTestId("center-panel")).toHaveAttribute("data-edge-count", "0")
+  })
+
+  it("shows the process view by default and hides it when asked to", () => {
+    const runningTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "running",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+    appState.messages = []
+    appState.traceEvents = [
+      {
+        event_id: "tool-1",
+        event_type: "tool_call",
+        timestamp: 1000,
+        data: { tool_name: "web_search", args: { query: "secret" } },
+      },
+    ] as any
+    appState.currentTask = runningTask
+    appState.isProcessing = true
+
+    const { unmount } = render(<TaskConversationPanel mode="page" />)
+    for (const message of screen.getAllByTestId("chat-message")) {
+      expect(message).toHaveAttribute("data-show-process-view", "true")
+    }
+    unmount()
+
+    render(<TaskConversationPanel mode="page" showProcessView={false} />)
+    for (const message of screen.getAllByTestId("chat-message")) {
+      expect(message).toHaveAttribute("data-show-process-view", "false")
+    }
+    cleanup()
+
+    // Unlike the mode-derived sibling flags, showProcessView defaults to true
+    // for every mode; only the widget opts out explicitly.
+    render(<TaskConversationPanel mode="embedded-preview" />)
+    for (const message of screen.getAllByTestId("chat-message")) {
+      expect(message).toHaveAttribute("data-show-process-view", "true")
+    }
   })
 })

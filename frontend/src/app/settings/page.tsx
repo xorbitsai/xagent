@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import React, { useEffect, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -16,10 +16,11 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { Select } from "@/components/ui/select"
-import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT } from "@/lib/auth-cache"
+import { inspectAuthSession, updateAuthSessionUser } from "@/lib/auth-cache"
+import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
 
 export default function SettingsPage() {
-  const { user } = useAuth()
+  const { user, session } = useAuth()
   const { t, locale, setLocale } = useI18n()
   const [email, setEmail] = useState(user?.email || "")
   const [isProfileLoading, setIsProfileLoading] = useState(true)
@@ -37,15 +38,21 @@ export default function SettingsPage() {
     const loadProfile = async () => {
       setIsProfileLoading(true)
       try {
+        const capturedSession = session
         const response = await apiRequest(`${getApiUrl()}/api/auth/me`)
         const data = await response.json()
 
         if (!isMounted) return
 
         if (response.ok && data.success) {
-          setEmail(data.user.email || "")
-          syncCachedUser(data.user)
-          setEmailMessage(null)
+          const updated = await syncCachedUser(capturedSession, data.user)
+          if (!isMounted) return
+          if (updated.status === "updated") {
+            setEmail(data.user.email || "")
+            setEmailMessage(null)
+          } else if (updated.status === "advanced") {
+            applyCanonicalEmail()
+          }
         } else {
           setEmailMessage({ type: 'error', text: data.message || data.detail || t("settings.email.failed") })
         }
@@ -65,7 +72,7 @@ export default function SettingsPage() {
     return () => {
       isMounted = false
     }
-  }, [t])
+  }, [session.sessionId, t])
 
   return (
     <div className="h-full w-full overflow-y-auto p-8 space-y-6">
@@ -77,6 +84,8 @@ export default function SettingsPage() {
       </div>
 
       <div className="space-y-6">
+        <TaskRuntimeSettingsExtension />
+
         {/* Language Section */}
         <Card>
           <CardHeader>
@@ -124,14 +133,12 @@ export default function SettingsPage() {
               </Alert>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="account-username">{t("settings.email.username")}</Label>
-              <Input
-                id="account-username"
-                value={user?.username || ""}
-                disabled
-              />
-            </div>
+            {!user?.email?.trim() && user?.username?.trim() && (
+              <div className="space-y-2">
+                <Label htmlFor="account-username">{t("settings.email.username")}</Label>
+                <Input id="account-username" value={user.username} disabled />
+              </div>
+            )}
 
             <div className="space-y-2">
               <Label htmlFor="account-email">{t("settings.email.current")}</Label>
@@ -278,6 +285,7 @@ export default function SettingsPage() {
     setEmailMessage(null)
 
     try {
+      const capturedSession = session
       const response = await apiRequest(`${getApiUrl()}/api/auth/email`, {
         method: 'PATCH',
         headers: {
@@ -292,9 +300,18 @@ export default function SettingsPage() {
 
       if (response.ok && data.success) {
         const nextEmail = data.user?.email || ""
-        setEmail(nextEmail)
-        syncCachedUser(data.user)
-        setEmailMessage({ type: 'success', text: t("settings.email.success") })
+        const updated = await syncCachedUser(capturedSession, data.user)
+        if (updated.status === "updated") {
+          setEmail(nextEmail)
+          setEmailMessage({ type: 'success', text: t("settings.email.success") })
+        } else if (updated.status === "advanced") {
+          applyCanonicalEmail()
+          setEmailMessage(null)
+        } else {
+          applyCanonicalEmail()
+          setEmailMessage({ type: 'error', text: t("settings.email.failed") })
+          return
+        }
       } else {
         setEmailMessage({ type: 'error', text: data.message || data.detail || t("settings.email.failed") })
       }
@@ -305,25 +322,15 @@ export default function SettingsPage() {
     }
   }
 
-  function syncCachedUser(nextUser: { id: string; username: string; email?: string | null; is_admin?: boolean }) {
-    localStorage.setItem("auth_user", JSON.stringify(nextUser))
+  async function syncCachedUser(
+    capturedSession: typeof session,
+    nextUser: { id: string; username: string; email?: string | null; is_admin?: boolean },
+  ) {
+    return updateAuthSessionUser(capturedSession, nextUser)
+  }
 
-    const cached = localStorage.getItem(AUTH_CACHE_KEY)
-    if (cached) {
-      try {
-        const parsed = JSON.parse(cached)
-        parsed.user = {
-          ...(parsed.user || {}),
-          ...nextUser,
-        }
-        localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(parsed))
-        window.dispatchEvent(new StorageEvent(AUTH_TOKEN_UPDATED_EVENT, {
-          key: AUTH_CACHE_KEY,
-          newValue: localStorage.getItem(AUTH_CACHE_KEY),
-        }))
-      } catch {
-        // Ignore cache sync failures and keep the latest profile in auth_user.
-      }
-    }
+  function applyCanonicalEmail() {
+    const inspection = inspectAuthSession()
+    if (inspection.status === "valid") setEmail(inspection.projection.cache.user.email || "")
   }
 }

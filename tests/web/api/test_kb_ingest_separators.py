@@ -1206,12 +1206,12 @@ async def _fake_run_web_ingestion(
     return WebIngestionResult(
         status="success",
         collection=collection,
-        total_urls_found=0,
-        pages_crawled=0,
+        total_urls_found=1,
+        pages_crawled=1,
         pages_failed=0,
-        documents_created=0,
-        chunks_created=0,
-        embeddings_created=0,
+        documents_created=1,
+        chunks_created=1,
+        embeddings_created=1,
         message="ok",
         elapsed_time_ms=0,
     )
@@ -1395,6 +1395,7 @@ def test_ingest_web_error_cleans_new_collection_config(app_with_kb):
         )
 
     assert response.status_code == 500
+    metadata_store.save_collection_config.assert_not_awaited()
     metadata_store.delete_collection_metadata.assert_awaited_once_with(
         collection_name="web_new_collection",
         user_id=1,
@@ -1411,7 +1412,6 @@ def test_ingest_web_error_with_successful_docs_keeps_new_collection_config(
     metadata_store.get_collection_config = AsyncMock(return_value=None)
     metadata_store.save_collection_config = AsyncMock()
     metadata_store.delete_collection_metadata = AsyncMock()
-    metadata_store.delete_collection = AsyncMock()
 
     with (
         patch(
@@ -1452,13 +1452,12 @@ def test_ingest_web_error_with_successful_docs_keeps_new_collection_config(
     assert response.status_code == 500
     metadata_store.delete_collection_metadata.assert_not_awaited()
     metadata_store.save_collection_config.assert_awaited_once()
-    metadata_store.delete_collection.assert_not_awaited()
 
 
-def test_ingest_web_error_with_rollback_side_effects_keeps_new_collection_config(
+def test_ingest_web_error_with_rollback_side_effects_skips_metadata_cleanup(
     app_with_kb,
 ):
-    """A single-page rollback failure should not orphan rows by deleting config."""
+    """A single-page rollback failure should not orphan rows by deleting metadata."""
     metadata_store = MagicMock()
     metadata_store.get_collection_config = AsyncMock(return_value=None)
     metadata_store.save_collection_config = AsyncMock()
@@ -1504,16 +1503,15 @@ def test_ingest_web_error_with_rollback_side_effects_keeps_new_collection_config
     assert response.status_code == 500
     assert response.json()["side_effects_may_remain"] is True
     metadata_store.delete_collection_metadata.assert_not_awaited()
-    metadata_store.save_collection_config.assert_awaited_once()
+    metadata_store.save_collection_config.assert_not_awaited()
 
 
-def test_ingest_web_existing_collection_error_restores_previous_config(app_with_kb):
-    """POST ingest-web should restore old config when an existing collection fails."""
+def test_ingest_web_existing_collection_error_keeps_previous_config(app_with_kb):
+    """POST ingest-web should leave an existing collection's config untouched."""
     metadata_store = MagicMock()
     metadata_store.get_collection_config = AsyncMock(return_value='{"chunk_size":333}')
     metadata_store.save_collection_config = AsyncMock()
     metadata_store.delete_collection_metadata = AsyncMock()
-    metadata_store.delete_collection = AsyncMock()
 
     with (
         patch(
@@ -1552,25 +1550,18 @@ def test_ingest_web_existing_collection_error_restores_previous_config(app_with_
         )
 
     assert response.status_code == 500
-    assert metadata_store.save_collection_config.await_count == 2
-    restore_call = metadata_store.save_collection_config.await_args_list[-1]
-    assert restore_call.kwargs == {
-        "collection": "web_existing_collection",
-        "config_json": '{"chunk_size":333}',
-        "user_id": 1,
-    }
+    metadata_store.save_collection_config.assert_not_awaited()
     metadata_store.delete_collection_metadata.assert_not_awaited()
 
 
-def test_ingest_web_config_only_collection_error_restores_previous_config(
+def test_ingest_web_config_only_collection_error_drops_ghost_config(
     app_with_kb,
 ):
-    """A config-only web collection should restore old config on failed ingest."""
+    """A config-only ghost must be cleaned up, not refreshed, by a failed ingest."""
     metadata_store = MagicMock()
     metadata_store.get_collection_config = AsyncMock(return_value='{"chunk_size":333}')
     metadata_store.save_collection_config = AsyncMock()
     metadata_store.delete_collection_metadata = AsyncMock()
-    metadata_store.delete_collection = AsyncMock()
 
     with (
         patch(
@@ -1611,21 +1602,17 @@ def test_ingest_web_config_only_collection_error_restores_previous_config(
         )
 
     assert response.status_code == 500
-    assert metadata_store.save_collection_config.await_count == 2
-    restore_call = metadata_store.save_collection_config.await_args_list[-1]
-    assert restore_call.kwargs == {
-        "collection": "web_config_only_collection",
-        "config_json": '{"chunk_size":333}',
-        "user_id": 1,
-    }
-    metadata_store.delete_collection_metadata.assert_not_awaited()
-    metadata_store.delete_collection.assert_awaited_once_with(
-        "web_config_only_collection"
+    metadata_store.save_collection_config.assert_not_awaited()
+    metadata_store.delete_collection_metadata.assert_awaited_once_with(
+        collection_name="web_config_only_collection",
+        user_id=1,
+        is_admin=False,
+        delete_orphaned_metadata=True,
     )
 
 
-def test_ingest_web_existing_collection_partial_restores_previous_config(app_with_kb):
-    """POST ingest-web should restore old config when an existing collection is partial."""
+def test_ingest_web_existing_collection_partial_publishes_new_config(app_with_kb):
+    """A partial web crawl created documents, so its config must be committed."""
     metadata_store = MagicMock()
     metadata_store.get_collection_config = AsyncMock(return_value='{"chunk_size":555}')
     metadata_store.save_collection_config = AsyncMock()
@@ -1669,13 +1656,10 @@ def test_ingest_web_existing_collection_partial_restores_previous_config(app_wit
 
     assert response.status_code == 200
     assert response.json()["status"] == "partial"
-    assert metadata_store.save_collection_config.await_count == 2
-    restore_call = metadata_store.save_collection_config.await_args_list[-1]
-    assert restore_call.kwargs == {
-        "collection": "web_existing_collection",
-        "config_json": '{"chunk_size":555}',
-        "user_id": 1,
-    }
+    saved = metadata_store.save_collection_config.await_args_list
+    assert len(saved) == 1
+    assert saved[0].kwargs["collection"] == "web_existing_collection"
+    assert '"chunk_size":2048' in saved[0].kwargs["config_json"]
     metadata_store.delete_collection_metadata.assert_not_awaited()
 
 
@@ -1735,3 +1719,53 @@ def test_ingest_web_surfaces_embedding_configuration_fix_guidance(app_with_kb):
     )
     assert "Current embedding_model_id: 'text-embedding-v4'." in message
     assert "How to fix:" in message
+
+
+def test_ingest_web_zero_pages_without_failures_reports_error(app_with_kb):
+    """A crawl that ingested nothing publishes no KB, so it must not report success."""
+    metadata_store = MagicMock()
+    metadata_store.get_collection_config = AsyncMock(return_value=None)
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock()
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
+        patch(
+            "xagent.web.api.kb.get_collection_sync", side_effect=ValueError("missing")
+        ),
+        patch(
+            "xagent.web.api.kb.run_web_ingestion",
+            return_value=WebIngestionResult(
+                status="success",
+                collection="web_robots_blocked",
+                total_urls_found=0,
+                pages_crawled=0,
+                pages_failed=0,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[],
+                failed_urls={},
+                message="crawl completed",
+                warnings=[],
+                elapsed_time_ms=0,
+            ),
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_robots_blocked",
+                "start_url": "https://example.com",
+                "chunk_size": "2048",
+            },
+        )
+
+    assert response.status_code == 500
+    assert "No pages were ingested" in response.json()["message"]
+    metadata_store.save_collection_config.assert_not_awaited()

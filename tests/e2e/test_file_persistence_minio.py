@@ -17,6 +17,7 @@ from tests.e2e.minio_harness import (
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 
 pytestmark = [pytest.mark.e2e, pytest.mark.docker]
 
@@ -240,6 +241,7 @@ def test_websocket_output_persistence_sends_error_and_rolls_back_when_minio_writ
     from xagent.core.file_storage.storage import FsspecFileStorage
 
     real_put_file = FsspecFileStorage.put_file
+    failed_output_keys: list[str] = []
 
     def fail_task_output_put_file(
         self: FsspecFileStorage,
@@ -248,6 +250,7 @@ def test_websocket_output_persistence_sends_error_and_rolls_back_when_minio_writ
         content_type: str | None = None,
     ) -> Any:
         if f"/tasks/{task_id}/outputs/" in f"/{key}":
+            failed_output_keys.append(key)
             raise RuntimeError("simulated MinIO output write outage")
         return real_put_file(self, source, key, content_type)
 
@@ -260,13 +263,18 @@ def test_websocket_output_persistence_sends_error_and_rolls_back_when_minio_writ
         assert execution_started["type"] == "execution_started"
         error_message = _receive_until_execution_error(websocket)
 
-    error_text = str(
-        error_message.get("error") or error_message.get("message") or ""
-    ).lower()
-    assert "durable object" in error_text
+    assert error_message["message"] == CLIENT_SAFE_TASK_FAILURE
+    assert error_message["error"] == CLIENT_SAFE_TASK_FAILURE
+    assert "simulated MinIO output write outage" not in repr(error_message)
+    assert failed_output_keys
+    assert all(f"/tasks/{task_id}/outputs/" in f"/{key}" for key in failed_output_keys)
 
     db = session_factory()
     try:
+        task = db.get(Task, task_id)
+        assert task is not None
+        assert task.status == TaskStatus.FAILED
+        assert "durable object" in str(task.error_message).lower()
         assert (
             db.query(UploadedFile)
             .filter(

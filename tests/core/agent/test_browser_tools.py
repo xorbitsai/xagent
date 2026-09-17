@@ -24,6 +24,7 @@ def test_browser_debug_tools_are_opt_in() -> None:
 
     assert "browser_list_sessions" not in default_names
     assert "browser_list_sessions" in debug_names
+    assert "computer" in default_names
 
 
 @pytest.mark.asyncio

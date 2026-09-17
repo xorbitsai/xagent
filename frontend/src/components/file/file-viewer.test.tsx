@@ -88,6 +88,30 @@ describe("FileViewer HTML preview", () => {
   })
 })
 
+describe("FileViewer Markdown preview", () => {
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+  })
+
+  it("passes files-disabled presentation constraints into Markdown previews", () => {
+    render(
+      <FileViewer
+        fileName="report.md"
+        fileId="markdown-file-id"
+        content="[private report](file:tenant-secret)"
+        isLoading={false}
+        error={null}
+        viewMode="preview"
+        filesDisabled
+      />,
+    )
+
+    expect(screen.getByText("private report")).not.toHaveAttribute("href")
+    expect(screen.queryByRole("link")).not.toBeInTheDocument()
+  })
+})
+
 describe("FileViewer video preview", () => {
   afterEach(() => {
     cleanup()

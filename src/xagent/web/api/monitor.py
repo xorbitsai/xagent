@@ -1,10 +1,12 @@
 """Monitoring management API route handlers"""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import Text
+from sqlalchemy import cast as sql_cast
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import expression
@@ -19,6 +21,38 @@ logger = logging.getLogger(__name__)
 
 # Create router
 monitor_router = APIRouter(prefix="/api/monitor", tags=["monitor"])
+
+# The guard below matches on the payload's *text* form, where a doubled
+# backslash is an escaped backslash rather than the start of an escape.
+# Those are neutralized first, so every backslash that survives opens a
+# real JSON escape. That is what makes the match exact in both directions:
+# without it, text that merely looks like an escape is dropped, and worse,
+# a real unpaired surrogate sitting right after such text is missed.
+PG_ESCAPED_BACKSLASH = r"\\"
+PG_ESCAPED_BACKSLASH_STANDIN = "__"
+
+# A valid surrogate pair converts to text without complaint, so pairs are
+# removed before matching -- any surrogate escape still standing after that
+# is unpaired by construction. Stripping is also what keeps this cheap:
+# the lookahead/lookbehind form this replaces cost roughly an order of
+# magnitude more on a table the monitoring dashboard scans.
+PG_SURROGATE_PAIR_PATTERN = (
+    r"\\u[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}"
+)
+
+# What PostgreSQL stores happily in a json column but refuses to convert to
+# text: the NUL escape, and either half of an unpaired surrogate. Matched
+# against the normalized, pair-stripped text produced above.
+#
+# This assumes a UTF8 server encoding, which is what the shipped compose file
+# runs. On a server in another encoding ->> also rejects any escape naming a
+# character outside that charset -- including a valid surrogate pair, which
+# the step above deliberately strips -- so the list is not exhaustive there.
+PG_UNSAFE_ESCAPE_PATTERN = (
+    r"\\u0000"
+    r"|\\u[dD][89abAB][0-9a-fA-F]{2}"
+    r"|\\u[dD][c-fC-F][0-9a-fA-F]{2}"
+)
 
 
 def is_admin_user(user: User) -> bool:
@@ -61,13 +95,66 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
     dialect_name = db_session.bind.dialect.name
 
     if dialect_name == "postgresql":
-        # PostgreSQL uses ->> operator to extract JSON field as text
-        # First filter out records containing binary data, then safely extract
+        # PostgreSQL extracts a JSON field as text with ->>. A json value can
+        # legally carry escape sequences that ->> then refuses to convert --
+        # NUL raises "unsupported Unicode escape sequence", an unpaired UTF-16
+        # surrogate raises "invalid input syntax for type json" -- and one such
+        # row fails the entire query. Null those payloads out before extracting
+        # so the row drops instead.
+        #
+        # These columns are jsonb since #1248, and jsonb rejects such payloads
+        # at INSERT, so on a migrated database this guard can never match. It
+        # stays because it is not this module's business to assume the
+        # migration has run: a database still on the json type -- one upgraded
+        # by hand, or mid-rollout -- carries exactly the rows it defends
+        # against.
+        #
+        # Retirement condition, so this does not linger on an unmeasurable
+        # "while any deployment might still hold one": it can go once no
+        # supported upgrade path reaches this code with a json column -- that
+        # is, once skipping the 20260813 migration is no longer supported.
+        # What to check on a given database before removing it:
+        #
+        #     SELECT data_type FROM information_schema.columns
+        #     WHERE table_name = 'trace_events' AND column_name = 'data';
+        #
+        # Because jsonb makes this branch unreachable over the model's own
+        # table, its drop path is exercised against a throwaway native-json
+        # table by tests/web/api/test_monitor_postgresql.py's
+        # TestReadGuardAgainstNativeJson -- delete that alongside this.
+        #
+        # Matching runs on the column's text form because valid JSON never
+        # holds a raw control character or a bare surrogate (RFC 8259 requires
+        # escaping) -- the escape sequence is what has to be found. ~ is the
+        # regex-match operator and applies to text; the ~? used here before
+        # does not exist in PostgreSQL at all, so every query through this
+        # branch failed.
+        #
+        # Two normalizations run before the match, and both are load-bearing:
+        # escaped backslashes become an inert stand-in so nothing that merely
+        # looks like an escape is treated as one, and valid surrogate pairs are
+        # deleted so whatever surrogate escape remains is unpaired. Only then
+        # is a plain alternation enough -- no lookaround, which is what made an
+        # earlier version of this guard cost an order of magnitude more on a
+        # table these dashboard endpoints scan.
+        #
+        # The MySQL/SQLite branches strip the escape and keep the row. Doing
+        # that here would mean casting the edited text back to json, which
+        # raises whenever the edit leaves invalid JSON -- one bad row would
+        # again fail the request.
+        payload_text = func.replace(
+            sql_cast(column, Text),
+            PG_ESCAPED_BACKSLASH,
+            PG_ESCAPED_BACKSLASH_STANDIN,
+        )
+        unpaired_only = func.regexp_replace(
+            payload_text, PG_SURROGATE_PAIR_PATTERN, "", "g"
+        )
         valid_data = expression.case(
             (
-                column.op("~?")(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F]"),
-                None,
-            ),  # Filter control characters
+                unpaired_only.op("~")(PG_UNSAFE_ESCAPE_PATTERN),
+                expression.null(),
+            ),
             else_=column,
         )
         return valid_data.op("->>")(field_name)
@@ -86,8 +173,7 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
 
 
 def safe_get_json_field(column: Any, field_path: str, db_session: Session) -> Any:
-    """
-    Safe JSON field extraction with NULL checks
+    """JSON field extraction expression for the session's dialect.
 
     Args:
         column: SQLAlchemy column object
@@ -95,10 +181,9 @@ def safe_get_json_field(column: Any, field_path: str, db_session: Session) -> An
         db_session: Database session
 
     Returns:
-        JSON field extraction expression with NULL checks
+        JSON field extraction expression suitable for the current database
     """
-    json_expr = get_json_field_expression(column, field_path, db_session)
-    return expression.case((json_expr.isnot(None), json_expr), else_=None)
+    return get_json_field_expression(column, field_path, db_session)
 
 
 @monitor_router.get("/tools")
@@ -173,7 +258,12 @@ async def get_monitoring_stats(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Get monitoring statistics"""
+    """Get monitoring statistics.
+
+    The daily fields (``todayCalls``, ``activeModels``) are counted over the
+    current UTC calendar day, so they reset at 00:00 UTC rather than on the
+    server's or the viewer's local day.
+    """
     try:
         from ..models.task import TraceEvent
 
@@ -215,9 +305,11 @@ async def get_monitoring_stats(
         )
         total_calls = llm_calls_end + tool_executions_end
 
-        # Get today's call count
-        today = datetime.now().date()
-        today_start = datetime.combine(today, datetime.min.time())
+        # Get today's call count. "Today" is the UTC day: the boundary must be
+        # in the same frame as the aware-UTC timestamps the column stores.
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
         today_calls = (
             db.query(TraceEvent)
             .filter(
@@ -506,29 +598,39 @@ async def get_model_stats(
             logger.error(f"Failed to query model stats: {e}")
             model_stats = []
 
-        # Get total call count for calculating usage rate
-        total_calls = sum(stat.total_calls for stat in model_stats)
+        # Rows the response will carry. Filtered here rather than inside the
+        # loop so a dropped row stays out of the denominator too: the query
+        # rejects a NULL model name but not an empty one, and counting calls
+        # that are never reported would deflate every rate that is.
+        counted_models = [
+            (model_name, model_calls)
+            for model_name, model_calls in model_stats
+            if model_name and model_calls > 0
+        ]
+
+        # Denominator for each model's share of the traffic. Must stay distinct
+        # from the loop's per-model variable: while the two shared a name the
+        # rate divided a model's calls by itself and every model reported 100%
+        # (#1245).
+        all_model_calls = sum(model_calls for _, model_calls in counted_models)
 
         result = []
-        for model_name, total_calls in model_stats:
-            if model_name and total_calls > 0:
-                usage_rate = (total_calls / total_calls * 100) if total_calls > 0 else 0
+        for model_name, model_calls in counted_models:
+            # No zero-guard needed: the sum runs over these same rows, each of
+            # which the comprehension above established is positive.
+            usage_rate = model_calls / all_model_calls * 100
 
-                result.append(
-                    {
-                        "name": model_name,
-                        "status": "running",
-                        "usage_rate": round(usage_rate, 1),
-                        "success_rate": None,  # Simplified, do not calculate success rate
-                        "total_tasks": total_calls,
-                        "successful_tasks": None,
-                        "failed_tasks": None,
-                    }
-                )
-
-        # If no real data, return empty list
-        if not result:
-            return []
+            result.append(
+                {
+                    "name": model_name,
+                    "status": "running",
+                    "usage_rate": round(usage_rate, 1),
+                    "success_rate": None,  # Simplified, do not calculate success rate
+                    "total_tasks": model_calls,
+                    "successful_tasks": None,
+                    "failed_tasks": None,
+                }
+            )
 
         return result
     except Exception as e:
@@ -541,9 +643,14 @@ async def get_dashboard_stats(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Get dashboard statistics"""
+    """Get dashboard statistics.
+
+    The daily fields (``todayCalls``, ``activeAgents``) are counted over the
+    current UTC calendar day, so they reset at 00:00 UTC rather than on the
+    server's or the viewer's local day.
+    """
     try:
-        from ..models.task import Task, TraceEvent
+        from ..models.task import Task, TaskStatus, TraceEvent, task_status_predicate
 
         # Build filter conditions based on user permissions
         task_filter = []
@@ -553,15 +660,20 @@ async def get_dashboard_stats(
         # Get total task count
         total_tasks = db.query(Task).filter(*task_filter).count()
 
-        # Get active agent count (based on tasks with recent activity)
-        recent_active_time = datetime.now().replace(
+        # Start of the current UTC day, in the same frame as the aware-UTC
+        # ``Task.updated_at`` and ``TraceEvent.timestamp`` columns. Read the
+        # clock once: two reads either side of midnight would leave a single
+        # response reporting one metric for yesterday and the other for today.
+        today_start = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
+
+        # Get active agent count (based on tasks with recent activity)
         active_agents = (
             db.query(Task)
             .filter(
-                Task.updated_at >= recent_active_time,
-                Task.status.in_(["RUNNING", "PENDING"]),
+                Task.updated_at >= today_start,
+                task_status_predicate.in_([TaskStatus.RUNNING, TaskStatus.PENDING]),
                 *task_filter,
             )
             .count()
@@ -569,9 +681,6 @@ async def get_dashboard_stats(
 
         # Get deployed application count (temporarily set to 0, waiting for Deploy feature implementation)
         deployed_apps = 0
-
-        # Get today's call count
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
         # Build TraceEvent filter conditions
         trace_event_filter = []
@@ -582,6 +691,7 @@ async def get_dashboard_stats(
                 )
             )
 
+        # Get today's call count
         today_calls = (
             db.query(TraceEvent)
             .filter(

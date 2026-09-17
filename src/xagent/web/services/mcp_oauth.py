@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import socket
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 from ...config import get_mcp_oauth_allow_private_hosts, get_mcp_oauth_proxy_url
 from ...core.utils.security import (
     PrivateNetworkHostError,
+    build_ca_bundle_ssl_context,
     reject_private_network_host,
 )
 
@@ -133,16 +135,68 @@ class MCPOAuthRuntimeAuth:
     refreshed: bool = False
 
 
+def _ca_bundle_error_detail(configured_ca_vars: list[str]) -> str:
+    if configured_ca_vars:
+        return (
+            f"Server TLS trust store is misconfigured ({'/'.join(configured_ca_vars)})."
+        )
+    return "Server TLS trust store could not be initialized."
+
+
 class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
     """HTTP transport that resolves and pins OAuth hosts before connecting."""
 
     def __init__(self) -> None:
         proxy_url = get_mcp_oauth_proxy_url()
+        configured_ca_vars = [
+            name for name in ("SSL_CERT_FILE", "SSL_CERT_DIR") if os.environ.get(name)
+        ]
+        try:
+            ssl_context = build_ca_bundle_ssl_context()
+        except OSError as exc:
+            # SSL_CERT_FILE/SSL_CERT_DIR were never read on this path before
+            # this transport verified against an explicit context, so a
+            # stale/misconfigured value was previously harmless. Surface it
+            # as a structured OAuth error instead of letting the raw
+            # FileNotFoundError/ssl.SSLError (a subclass of OSError) escape
+            # as an unhandled 500. Only blame the env vars when one is
+            # actually set -- create_ssl_context() can also raise OSError
+            # from the certifi-backed default path when neither is set (a
+            # broken/partial certifi install), which is an environment
+            # problem, not an admin misconfiguration of these two vars.
+            raise MCPOAuthDiscoveryError(
+                "invalid_configuration", _ca_bundle_error_detail(configured_ca_vars)
+            ) from exc
+        if configured_ca_vars and not ssl_context.get_ca_certs():
+            # ssl.create_default_context(capath=...) silently loads zero
+            # certs -- no OSError -- when SSL_CERT_DIR names a directory
+            # that doesn't exist or contains no certs (unlike SSL_CERT_FILE,
+            # which does raise for a missing/empty file). Left unguarded,
+            # this transport would build successfully with an empty trust
+            # store, and every TLS request through it would fail later with
+            # a generic httpx.ConnectError instead of this structured error.
+            raise MCPOAuthDiscoveryError(
+                "invalid_configuration",
+                _ca_bundle_error_detail(configured_ca_vars)
+                + " No CA certificates were loaded.",
+            )
+        # An https:// proxy also needs the isolated context on its own CONNECT
+        # TLS leg -- passing proxy_url as a bare string leaves that leg's
+        # ssl_context as None, which httpx/httpcore then defaults to the
+        # certifi-only trust store, bypassing a private CA configured via
+        # SSL_CERT_FILE/SSL_CERT_DIR for the proxy hop itself. httpcore
+        # rejects a non-None proxy_ssl_context outright for a plain http://
+        # proxy (there's no TLS leg to configure there), so only attach it
+        # for an https:// proxy.
+        proxy: httpx.Proxy | str | None = proxy_url
+        if proxy_url and urlsplit(proxy_url).scheme == "https":
+            proxy = httpx.Proxy(url=proxy_url, ssl_context=ssl_context)
         self._transport = httpx.AsyncHTTPTransport(
             limits=httpx.Limits(max_keepalive_connections=0),
             trust_env=False,
             http2=False,
-            proxy=proxy_url,
+            proxy=proxy,
+            verify=ssl_context,
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -266,6 +320,15 @@ async def oauth_post(
                 **request_kwargs,
             )
         else:
+            # A bounded read must not invite compression: httpx advertises
+            # gzip/br/zstd by default, and the Content-Encoding refusal below
+            # would then reject compliant servers that simply honored it.
+            # Force identity on the request so compliant servers send plain
+            # bytes; the response-side check stays as the hard guard against
+            # peers that compress anyway.
+            headers = httpx.Headers(request_kwargs.pop("headers", None))
+            headers["accept-encoding"] = "identity"
+            request_kwargs["headers"] = headers
             async with client.stream(
                 "POST",
                 url,
@@ -277,14 +340,26 @@ async def oauth_post(
                         "invalid_resource",
                         "OAuth token endpoint redirects are not supported",
                     )
+                # max_response_bytes bounds the decoded byte count, but
+                # aiter_bytes() yields httpx's auto-decompressed output, so a
+                # compressed body can inflate far past the cap before the
+                # check below ever sees it. Refuse encoded bodies outright
+                # instead of decompressing-then-measuring; callers that need
+                # compression must not pass max_response_bytes.
+                content_encoding = streamed_response.headers.get("content-encoding", "")
+                if content_encoding.strip().lower() not in {"", "identity"}:
+                    raise MCPOAuthDiscoveryError(
+                        "unsupported_response_encoding",
+                        "OAuth endpoint response used an unsupported content encoding",
+                    )
                 content = bytearray()
                 async for chunk in streamed_response.aiter_bytes():
-                    content.extend(chunk)
-                    if len(content) > max_response_bytes:
+                    if len(content) + len(chunk) > max_response_bytes:
                         raise MCPOAuthDiscoveryError(
                             "response_too_large",
                             "OAuth endpoint response exceeded the allowed size",
                         )
+                    content.extend(chunk)
                 response = httpx.Response(
                     streamed_response.status_code,
                     headers=[
@@ -371,6 +446,11 @@ async def register_mcp_oauth_public_client(
             raise MCPOAuthDiscoveryError(
                 "client_registration_failed",
                 "OAuth client registration response exceeded the allowed size",
+            ) from exc
+        if exc.code == "unsupported_response_encoding":
+            raise MCPOAuthDiscoveryError(
+                "client_registration_failed",
+                "OAuth client registration response used an unsupported content encoding",
             ) from exc
         raise
     except (httpx.HTTPError, ValueError) as exc:
@@ -791,6 +871,30 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
         return runtime_auth
     finally:
         refresh_db.close()
+
+
+def select_mcp_oauth_owner(
+    db: Any,
+    *,
+    server_id: int,
+    user_id: int,
+    actor_owner_key: str,
+    auth_config: dict[str, Any],
+) -> str:
+    """Prefer one usable exact actor grant, otherwise use the workspace owner."""
+
+    actor_grants = select_mcp_oauth_grants(
+        db,
+        server_id=server_id,
+        user_id=user_id,
+        auth_config=auth_config,
+        resource_owner_key=actor_owner_key,
+    )
+    try:
+        _select_runtime_grant(actor_grants, set())
+    except MCPOAuthRuntimeError:
+        return f"xagent:user:{user_id}"
+    return actor_owner_key
 
 
 def select_mcp_oauth_grants(  # noqa: PLR0913

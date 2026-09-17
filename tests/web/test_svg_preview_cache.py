@@ -9,7 +9,7 @@ Covers review findings from PR #977:
 """
 
 import asyncio
-import time
+import threading
 
 import pytest
 
@@ -74,44 +74,34 @@ def test_rasterize_svg_preview_does_not_alias_across_relative_assets(
 async def test_inline_preview_response_does_not_block_event_loop(
     storage_root, tmp_path, monkeypatch
 ) -> None:
-    """``_inline_preview_response`` must offload the synchronous SVG
-    read+rasterize work (e.g. via ``asyncio.to_thread``) rather than run it
-    inline on the async request path — otherwise one expensive preview
-    blocks every other request handled by the same event loop."""
-
+    """Rasterization must leave the loop running while its worker is blocked."""
     svg_path = tmp_path / "big.svg"
     svg_path.write_bytes(SVG_A)
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
 
-    def slow_rasterize(svg_bytes: bytes) -> bytes:
-        time.sleep(0.3)
-        return SVG_A  # placeholder bytes; content isn't checked here
+    def blocked_rasterize(svg_bytes: bytes) -> bytes:
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "rasterization was never released"
+        return SVG_A
 
-    monkeypatch.setattr(files_module, "rasterize_svg_bytes", slow_rasterize)
-
-    ticks: list[float] = []
-
-    async def ticker() -> None:
-        for _ in range(20):
-            ticks.append(time.monotonic())
-            await asyncio.sleep(0.01)
-
-    ticker_task = asyncio.ensure_future(ticker())
-    await asyncio.sleep(0.01)
-    await files_module._inline_preview_response(
-        svg_path,
-        filename="big.svg",
-        media_type="image/svg+xml",
-        file_id="event-loop-test-file-id",
+    monkeypatch.setattr(files_module, "rasterize_svg_bytes", blocked_rasterize)
+    preview = asyncio.create_task(
+        files_module._inline_preview_response(
+            svg_path,
+            filename="big.svg",
+            media_type="image/svg+xml",
+            file_id="event-loop-test-file-id",
+        )
     )
-    await ticker_task
-
-    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
-    assert gaps, "ticker should have produced measurable ticks"
-    assert max(gaps) < 0.2, (
-        "the ticker was starved for a stretch close to the 0.3s "
-        "rasterization delay — the SVG preview is still running "
-        "synchronously on the event loop thread"
-    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not preview.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(preview, timeout=30)
 
 
 @pytest.mark.asyncio

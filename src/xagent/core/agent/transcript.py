@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from ..context_ref import CONTEXT_REFS_KEY, normalize_context_references
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,19 +77,32 @@ def build_assistant_transcript_content(
 
 def normalize_transcript_messages(
     messages: List[Dict[str, Any]],
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     """Normalize transcript messages for use by LLM-backed chat patterns."""
-    normalized: List[Dict[str, str]] = []
+    normalized: List[Dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role", "")).strip().lower()
         content = str(message.get("content", "")).strip()
 
-        if role not in {"user", "assistant", "system"} or not content:
+        try:
+            context_refs = normalize_context_references(
+                message.get(CONTEXT_REFS_KEY, message.get("context_refs"))
+            )
+        except (TypeError, ValueError):
+            logger.debug("Filtered invalid transcript context refs", exc_info=True)
+            context_refs = ()
+
+        if role not in {"user", "assistant", "system"} or not (content or context_refs):
             logger.debug(
                 f"Filtered invalid message: role={role}, content_length={len(content)}"
             )
             continue
-        normalized.append({"role": role, "content": content})
+        normalized_message: Dict[str, Any] = {"role": role, "content": content}
+        if context_refs:
+            normalized_message[CONTEXT_REFS_KEY] = [
+                reference.durable_dict() for reference in context_refs
+            ]
+        normalized.append(normalized_message)
     return normalized
 
 

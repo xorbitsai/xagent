@@ -50,6 +50,12 @@ def create_memory_store(
             connect_args={"check_same_thread": False}
             if "sqlite" in database_url
             else {},
+            # Same database as the shared web engine
+            # (web/models/database.py) -- the Model table this hub
+            # reads/writes has an encrypted API key column, so a
+            # bind/commit failure here must not surface it as a bound
+            # SQL parameter either.
+            hide_parameters=True,
         )
         # Create session factory
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

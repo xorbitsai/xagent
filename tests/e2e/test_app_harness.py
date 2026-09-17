@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import jwt
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -64,3 +65,14 @@ def test_seed_registered_local_file_creates_file_and_db_record(tmp_path):
     finally:
         db.close()
         engine.dispose()
+
+
+@pytest.mark.parametrize("timeout", [0, -1])
+def test_shared_wait_task_reports_timeout_before_first_read(tmp_path, timeout):
+    from tests.e2e.shared_execution_harness import SharedExecutionApp
+
+    app = SharedExecutionApp(root=tmp_path, environment={}, token="unused", user_id=1)
+    with pytest.raises(
+        pytest.fail.Exception, match="Task did not reach completed: None"
+    ):
+        app.wait_task(1, timeout=timeout)

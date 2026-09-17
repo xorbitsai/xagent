@@ -13,7 +13,10 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
-from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPToolAdapter,
+    redact_urls_in_text,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -31,10 +34,11 @@ from xagent.web.tools.config import (
 )
 
 
-def test_token_request_refresh_defaults_to_none():
+def test_token_request_refresh_and_auth_type_default_to_none():
     request = TokenRequest(provider="google", user_id=1)
 
     assert request.refresh is None
+    assert request.auth_type is None
 
 
 def test_resolver_contract_repr_hides_token_and_generation():
@@ -220,12 +224,14 @@ def _add_user_oauth(
     *,
     provider: str = "google",
     access_token: str = "user-token",
+    instance_url: str | None = None,
 ) -> UserOAuth:
     account = UserOAuth(
         user_id=user.id,
         provider=provider,
         access_token=access_token,
         provider_user_id=f"{provider}-user",
+        instance_url=instance_url,
     )
     db.add(account)
     db.commit()
@@ -286,7 +292,7 @@ def _assert_unavailable_mcp_config(
         assert "failure_code" not in config["config"]
     expected_user_id = str(server.user_mcpservers[0].user_id)
     assert config["user_id"] == expected_user_id
-    assert config["allow_users"] == [expected_user_id]
+    assert "allow_users" not in config
     assert "runtime_input_schema" not in config
     assert "runtime_bindings" not in config
     assert "allow_delegated_authorization" not in config
@@ -424,10 +430,12 @@ async def test_hook_request_receives_provider_resource_and_scope_verbatim(db_ses
     scope = object()
     resource = "https://MCP.EXAMPLE.com:443/mcp/%7Euser/?Q=1#Fragment"
     _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
-    seen: list[tuple[str, str | None, object | None]] = []
+    seen: list[tuple[str, str | None, object | None, str | None]] = []
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
-        seen.append((request.provider, request.resource, request.scope))
+        seen.append(
+            (request.provider, request.resource, request.scope, request.auth_type)
+        )
         if request.provider == "resolver-google-drive":
             return ResolvedToken(
                 access_token="hook-token",
@@ -441,9 +449,13 @@ async def test_hook_request_receives_provider_resource_and_scope_verbatim(db_ses
         db, user, execution_scope=scope
     ).get_mcp_server_configs()
 
+    # These catalog OAuth apps have no `auth` object of their own; the
+    # transport ("oauth") itself implies OAuth, so the request always
+    # reports the fixed "builtin_oauth" auth_type rather than something
+    # derived from a per-connector auth config.
     assert seen == [
-        ("google", resource, scope),
-        ("resolver-google-drive", resource, scope),
+        ("google", resource, scope, "builtin_oauth"),
+        ("resolver-google-drive", resource, scope, "builtin_oauth"),
     ]
     assert _access_token_env(configs[0]) == "hook-token"
 
@@ -520,6 +532,110 @@ async def test_hook_supply_launch_config_env_matches_user_oauth_shape(db_session
         token_key="CUSTOM_ACCESS_TOKEN",
         hook_token="hook-token",
         user_token="user-token",
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_supply_instance_url_env_matches_user_oauth_shape(db_session):
+    launch_config = {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+        "env_mapping": {
+            "SALESFORCE_ACCESS_TOKEN": "access_token",
+            "SALESFORCE_INSTANCE_URL": "instance_url",
+        },
+    }
+    db, user = db_session
+    _add_oauth_server(db, user, provider="salesforce", launch_config=launch_config)
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            instance_url="https://acme.my.salesforce.com",
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    hook_config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+    set_oauth_token_resolver_hook(None)
+    _add_user_oauth(
+        db,
+        user,
+        provider="salesforce",
+        access_token="user-token",
+        instance_url="https://acme.my.salesforce.com",
+    )
+    user_config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    assert (
+        hook_config["config"]["env"]["SALESFORCE_INSTANCE_URL"]
+        == "https://acme.my.salesforce.com"
+    )
+    _assert_same_oauth_config_except_token(
+        hook_config,
+        user_config,
+        token_key="SALESFORCE_ACCESS_TOKEN",
+        hook_token="hook-token",
+        user_token="user-token",
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_missing_instance_url_retains_unavailable_server(db_session):
+    launch_config = {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+        "env_mapping": {
+            "SALESFORCE_ACCESS_TOKEN": "access_token",
+            "SALESFORCE_INSTANCE_URL": "instance_url",
+        },
+    }
+    db, user = db_session
+    server = _add_oauth_server(
+        db, user, provider="salesforce", launch_config=launch_config
+    )
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    _assert_unavailable_mcp_config(
+        config, server, reason="oauth_token_required", oauth_token_required=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_missing_instance_url_retains_unavailable_server(db_session):
+    """Same as test_hook_missing_instance_url_retains_unavailable_server but
+    via the legacy UserOAuth DB path (no resolver hook installed) -- the two
+    call sites of _build_oauth_mcp_stdio_transport_config each have their
+    own except _OAuthInstanceUrlRequired handler, and only the hook path had
+    a regression test for it."""
+    launch_config = {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+        "env_mapping": {
+            "SALESFORCE_ACCESS_TOKEN": "access_token",
+            "SALESFORCE_INSTANCE_URL": "instance_url",
+        },
+    }
+    db, user = db_session
+    server = _add_oauth_server(
+        db, user, provider="salesforce", launch_config=launch_config
+    )
+    _add_user_oauth(db, user, provider="salesforce", access_token="user-token")
+
+    config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    _assert_unavailable_mcp_config(
+        config, server, reason="oauth_token_required", oauth_token_required=True
     )
 
 
@@ -847,10 +963,15 @@ async def test_unexpected_server_config_failure_retains_failure_and_later_server
 
 
 @pytest.mark.asyncio
-async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invalid_record(
+async def test_user_oauth_refresh_transient_failure_retains_unavailable_without_deleting_record(
     db_session,
     monkeypatch,
 ):
+    """A refresh failure that doesn't confirm the refresh token is dead --
+    e.g. a network error, timeout, or provider outage -- must not delete the
+    connection: it may well succeed the next time it's used. See
+    _OAuthRefreshPermanentlyInvalid.
+    """
     db, user = db_session
     oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
     oauth_account = _add_user_oauth(
@@ -887,13 +1008,116 @@ async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invali
     assert "expired-secret-token" not in repr(configs[0])
     assert pending_app in db.new
     with isolated_session_factory() as verification_db:
-        assert verification_db.get(UserOAuth, account_id) is None
+        assert verification_db.get(UserOAuth, account_id) is not None
         assert (
             verification_db.query(PublicMCPApp)
             .filter(PublicMCPApp.app_id == pending_app.app_id)
             .first()
             is None
         )
+
+
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_permanently_invalid_deletes_record(
+    db_session,
+    monkeypatch,
+):
+    """Only a confirmed-dead refresh token (_OAuthRefreshPermanentlyInvalid)
+    should cost the user their stored connection.
+    """
+    db, user = db_session
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="expired-secret-token"
+    )
+    account_id = oauth_account.id
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    async def fail_refresh(*args, **kwargs):
+        raise web_tools_config._OAuthRefreshPermanentlyInvalid()
+
+    monkeypatch.setattr(web_tools_config, "refresh_oauth_token_if_needed", fail_refresh)
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Google Drive"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        assert verification_db.get(UserOAuth, account_id) is None
+
+
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_generic_invalid_grant_retains_row(
+    db_session, monkeypatch
+):
+    """RFC 6749 section 5.2's invalid_grant also covers a refresh token
+    "issued to another client" -- reachable if a shared OAuthProvider
+    row's client_id/secret get rotated while an existing UserOAuth row
+    still holds a refresh_token issued under the old ones. A generic
+    (non-github/slack/meta) invalid_grant must not be trusted as proof
+    THIS account's grant is dead end-to-end through the real resolver, or
+    one credential rotation would mass-delete every user's connection to
+    that provider."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("rotated-client-id"),
+            client_secret=encrypt_value("rotated-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+        )
+    )
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="old-token"
+    )
+    oauth_account.refresh_token = "refresh-token-issued-under-old-client"
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    account_id = oauth_account.id
+    db.commit()
+
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    class RotatedCredentialAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(400, json={"error": "invalid_grant"})
+
+    monkeypatch.setattr(
+        web_tools_config.httpx, "AsyncClient", RotatedCredentialAsyncClient
+    )
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Google Drive"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        assert verification_db.get(UserOAuth, account_id) is not None
 
 
 @pytest.mark.asyncio
@@ -985,8 +1209,8 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
     exception_secret = "transport-exception-secret-token"
     db.add(
         OAuthProvider(
-            provider_name="google",
-            name="Google",
+            provider_name="github",
+            name="GitHub",
             client_id=encrypt_value("client-id-secret"),
             client_secret=encrypt_value("client-secret-value"),
             auth_url="https://auth.example/authorize",
@@ -994,7 +1218,7 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
         )
     )
     oauth_account = _add_user_oauth(
-        db, user, provider="google", access_token="expired-access-secret"
+        db, user, provider="github", access_token="expired-access-secret"
     )
     oauth_account.refresh_token = "refresh-secret-value"
     oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -1013,7 +1237,7 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
             return httpx.Response(
                 400,
                 json={
-                    "error": "invalid_grant",
+                    "error": "bad_refresh_token",
                     "error_description": response_secret,
                     "access_token": "leaked-response-access-token",
                 },
@@ -1026,16 +1250,336 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
     )
 
     with caplog.at_level(logging.ERROR):
-        is_valid = await web_tools_config.refresh_oauth_token_if_needed(
-            db, oauth_account, "google"
-        )
+        if failure_kind == "response":
+            # GitHub's own confirmed-dead bad_refresh_token is a permanent
+            # failure (see _OAuthRefreshPermanentlyInvalid) and is
+            # signalled by raising, not by returning False, so the caller
+            # knows to drop the connection instead of retrying it later.
+            with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
+                await web_tools_config.refresh_oauth_token_if_needed(
+                    db, oauth_account, "github"
+                )
+        else:
+            is_valid = await web_tools_config.refresh_oauth_token_if_needed(
+                db, oauth_account, "github"
+            )
+            assert is_valid is False
 
-    assert is_valid is False
     assert response_secret not in caplog.text
     assert exception_secret not in caplog.text
     assert "leaked-response-access-token" not in caplog.text
     assert "client-secret-value" not in caplog.text
     assert "refresh-secret-value" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(400, json={"error": ""}),
+        httpx.Response(400, json={}),
+        httpx.Response(400, json=[]),
+        httpx.Response(400, json="not a mapping"),
+        httpx.Response(400, content=b"not json"),
+    ],
+)
+def test_oauth_refresh_error_code_rejects_malformed_bodies(response):
+    """An empty/absent `error`, a non-dict JSON body (list/string), or a
+    non-JSON body must all resolve to "no error code extracted" rather than
+    a falsy-but-truthy value (e.g. "") that would defeat the `error_code or
+    "unknown"` logging fallback or accidentally satisfy an `in` check
+    against _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES."""
+    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
+
+
+def test_oauth_refresh_error_code_swallows_non_value_error_parse_failures():
+    """response.json() isn't guaranteed to raise only ValueError -- a
+    pathological body (e.g. deeply nested enough to hit the parser's
+    recursion limit) can raise something else entirely. Catching only
+    ValueError would let that escape uncaught to the caller's generic
+    exception handler, losing the status-code-bearing log line this
+    function's caller emits."""
+
+    class ExplodingJsonResponse:
+        def json(self):
+            raise RecursionError("maximum recursion depth exceeded")
+
+    assert (
+        web_tools_config._oauth_refresh_error_code(ExplodingJsonResponse(), "google")
+        is None
+    )
+
+
+def test_oauth_refresh_error_code_gates_meta_shape_on_provider():
+    """Meta's nested-error-object normalization must only apply when the
+    caller is actually refreshing a Meta connection -- an unrelated
+    provider whose error body happens to carry the same {"type":
+    "OAuthException", "code": 190} shape must not be misread as Meta's
+    "access token is invalid/expired" signal."""
+    response = httpx.Response(
+        400, json={"error": {"type": "OAuthException", "code": 190}}
+    )
+    assert web_tools_config._oauth_refresh_error_code(response, "meta") == (
+        "invalid_grant"
+    )
+    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_unknown_provider_is_transient(db_session):
+    """No OAuthProvider row for this provider name is an admin-fixable
+    config problem (the row was never created, or was deleted), not
+    evidence this account's refresh token is dead -- must not raise
+    _OAuthRefreshPermanentlyInvalid, unlike a confirmed-dead token."""
+    db, user = db_session
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="not-a-configured-provider",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "not-a-configured-provider"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_missing_provider_credentials_is_transient(
+    db_session, monkeypatch
+):
+    """A provider row with no client_id/client_secret (and no env-var
+    fallback) is the same admin-fixable config problem as an unknown
+    provider -- must not raise _OAuthRefreshPermanentlyInvalid.
+
+    Deletes the actual fallback env vars (_resolve_oauth_secret /
+    _oauth_env_name resolve "google" + "CLIENT_ID" to plain
+    GOOGLE_CLIENT_ID, not an XAGENT_-prefixed name) and asserts via an
+    exploding AsyncClient that the missing-credentials early return is
+    genuinely what's under test -- a real GOOGLE_CLIENT_ID/SECRET present
+    in a developer or Docker environment would otherwise resolve real
+    credentials and build an unmocked HTTP client, making this pass or
+    fail for ambient reasons instead of exercising the code path at all.
+    """
+    db, user = db_session
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id="",
+            client_secret="",
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            redirect_uri="https://app.example.com/api/auth/google/callback",
+            userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
+            user_id_path="sub",
+            email_path="email",
+            default_scopes=["email"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="google",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class ExplodingAsyncClient:
+        def __call__(self, *args, **kwargs):
+            raise AssertionError(
+                "refresh_oauth_token_if_needed must not open an HTTP client "
+                "when provider credentials are missing"
+            )
+
+    monkeypatch.setattr(web_tools_config.httpx, "AsyncClient", ExplodingAsyncClient())
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "google"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_5xx_with_oauth_shaped_body_is_transient(db_session, monkeypatch):
+    """A 5xx is the provider's own signal that something went wrong on its
+    end -- e.g. a proxy/gateway outage, or a misbehaving custom/admin-
+    configured token endpoint -- never proof that this specific grant is
+    dead. It must stay transient even if its body happens to carry an
+    otherwise-recognized permanent error code.
+
+    Uses GitHub + bad_refresh_token (a code that IS in
+    _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES for this provider) rather than
+    a generic provider + invalid_grant: since generic invalid_grant is
+    never trusted for any provider regardless of status (see
+    test_user_oauth_refresh_generic_invalid_grant_retains_row), that
+    combination would pass this assertion even if the status_code >= 500
+    guard were removed entirely, silently testing nothing about the 5xx
+    exclusion itself.
+    """
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="github",
+            name="GitHub",
+            client_id=encrypt_value("client-id-secret"),
+            client_secret=encrypt_value("client-secret-value"),
+            auth_url="https://auth.example/authorize",
+            token_url="https://auth.example/token",
+        )
+    )
+    oauth_account = _add_user_oauth(
+        db, user, provider="github", access_token="expired-access-secret"
+    )
+    oauth_account.refresh_token = "refresh-secret-value"
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+
+    class FiveHundredAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(502, json={"error": "bad_refresh_token"})
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        FiveHundredAsyncClient,
+    )
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "github"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_slack_style_200_invalid_refresh_token_is_permanent(
+    db_session, monkeypatch
+):
+    """Slack's Web API convention -- HTTP 200 with {"ok": false, "error":
+    ...} -- applies to its oauth.v2.access refresh grant too (for
+    workspaces with token rotation enabled). invalid_refresh_token is
+    Slack's non-standard equivalent of invalid_grant/bad_refresh_token and
+    must still raise _OAuthRefreshPermanentlyInvalid despite the 200
+    status, the same way GitHub's bad_refresh_token does."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="slack",
+            name="Slack",
+            client_id=encrypt_value("slack-client-id"),
+            client_secret=encrypt_value("slack-client-secret"),
+            auth_url="https://slack.com/oauth/v2/authorize",
+            token_url="https://slack.com/api/oauth.v2.access",
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="slack",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class SlackAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(
+                200, json={"ok": False, "error": "invalid_refresh_token"}
+            )
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        SlackAsyncClient,
+    )
+
+    with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
+        await web_tools_config.refresh_oauth_token_if_needed(db, oauth_account, "slack")
+
+
+@pytest.mark.asyncio
+async def test_refresh_provider_specific_dead_token_codes_are_gated_by_provider(
+    db_session, monkeypatch
+):
+    """bad_refresh_token/invalid_refresh_token are GitHub's/Slack's own
+    non-standard vocabulary, not a generic OAuth2 code -- an unrelated
+    provider that happens to return one of these strings for a different,
+    non-fatal reason must not be misread as a dead-token signal, the same
+    way Meta's differently-shaped error object is gated on provider_name
+    rather than trusted for any provider."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("client-id-secret"),
+            client_secret=encrypt_value("client-secret-value"),
+            auth_url="https://auth.example/authorize",
+            token_url="https://auth.example/token",
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="google",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class GoogleAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(400, json={"error": "bad_refresh_token"})
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        GoogleAsyncClient,
+    )
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "google"
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -1109,6 +1653,197 @@ async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
             "exception_type": "RuntimeError",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_includes_failure_code(
+    db_session,
+    caplog,
+):
+    """The warning logged for a resolver failure must carry the classified
+    failure code (e.g. 'oauth_token_required'), not just the exception's
+    class name -- the class name alone tells an on-call engineer nothing
+    about whether this is a routine reconnect-required case versus an
+    unexpected resolver bug."""
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_oauth_server(db, user, launch_config=_launch_config())
+    _add_user_oauth(db, user, provider="google", access_token="user-token")
+
+    class ReauthorizationRequired(RuntimeError):
+        oauth_token_resolver_failure_code = "oauth_token_required"
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise ReauthorizationRequired("secret-reauth-detail")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["config"]["failure_code"] == "oauth_token_required"
+    assert "oauth_token_required" in caplog.text
+    assert "secret-reauth-detail" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_and_bounds_resource(
+    db_session,
+    caplog,
+):
+    """The resource logged on a resolver failure can fall back to a
+    self-hosted MCP server's own URL, and custom connectors commonly carry
+    an API key or other secret in that URL's query string or userinfo. The
+    warning must strip those before logging, and it must still bound the
+    result the way every other field logged here already is."""
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = (
+        "https://user:pw@mcp.example.com/oauth/"
+        + "r" * 160
+        + "?api_key=SECRET-abc123&tenant=acme"
+    )
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    expected = web_tools_config._bounded_oauth_metadata(redact_urls_in_text(resource))
+    assert "SECRET-abc123" not in caplog.text
+    assert "tenant=acme" not in caplog.text
+    assert "user:pw@" not in caplog.text
+    assert "mcp.example.com" in caplog.text
+    assert f"resource={expected}" in caplog.text
+    assert expected.endswith("...")
+    assert len(expected) == 128
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == expected
+    assert configs[0]["config"]["diagnostic"]["resource"] == expected
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_short_resource_query_string(
+    db_session,
+    caplog,
+):
+    """A resource short enough to survive the 128-character bound intact must
+    still lose its query string. Without this case the bound alone satisfies
+    the secret-absence assertions on the long resource above, so redaction
+    could regress without turning any test red."""
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.test/oauth?api_key=SECRET-abc123&tenant=acme"
+    assert len(resource) < 128
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "SECRET-abc123" not in caplog.text
+    assert "tenant=acme" not in caplog.text
+    assert "mcp.example.test" in caplog.text
+    assert "resource=https://mcp.example.test/oauth" in caplog.text
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+    assert configs[0]["config"]["diagnostic"]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_resource_userinfo_pushed_out_by_query(
+    db_session,
+    caplog,
+):
+    """The resource logged here is the connector URL the user typed
+    verbatim -- it never passes through an HTTP client and is never
+    truncated -- so the userinfo-provenance rule that rejects a token
+    still carrying an ``@`` its parsed authority does not must be
+    provided by the shared ``redact_urls_in_text`` helper itself, not
+    duplicated by this call site.
+    """
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://SECRET_API_KEY?x@mcp.example.test/oauth"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "SECRET_API_KEY" not in caplog.text
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == "<url redacted>"
+    assert configs[0]["config"]["diagnostic"]["resource"] == "<url redacted>"
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_redacts_resource_query_value_containing_quote(
+    db_session,
+    caplog,
+):
+    """Same call site as the test above, for the token-boundary
+    correction rather than the userinfo-provenance rule: a query value
+    containing a single quote must not end the URL token early and leave
+    the ``api_key=`` key name -- and the secret after it -- outside the
+    token entirely.
+    """
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.test/oauth?api_key='SECRET-abc123'"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "SECRET-abc123" not in caplog.text
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+    assert configs[0]["config"]["diagnostic"]["resource"] == (
+        "https://mcp.example.test/oauth"
+    )
+
+
+def test_redacted_bounded_resource_treats_none_and_empty_string_alike():
+    """``_build_oauth_token_resolver_diagnostic`` and
+    ``_resolver_failure_config`` used to guard the same expression with
+    ``is not None`` and truthiness respectively, so the two calls would
+    have disagreed on a ``""`` resource (kept as ``""`` vs. treated as
+    absent) had one ever reached them -- neither of this value's two
+    producers (``mcp_runtime.py``'s resource selection and this module's
+    ``_oauth_token_configured_resource``) emits ``""``, so this was never
+    reachable, but the shared helper now makes the two call sites agree by
+    construction rather than by their producers' contract.
+    """
+    assert web_tools_config._redacted_bounded_resource(None) is None
+    assert web_tools_config._redacted_bounded_resource("") is None
+    resource = "https://mcp.example.com/oauth?api_key=SECRET-abc123"
+    assert web_tools_config._redacted_bounded_resource(
+        resource
+    ) == web_tools_config._bounded_oauth_metadata(redact_urls_in_text(resource))
 
 
 @pytest.mark.asyncio
@@ -1303,6 +2038,14 @@ async def test_hook_failure_drops_non_string_or_empty_actor_id(
             ResolvedToken(access_token="hook-token", expires_at="soon"),
             "InvalidExpiresAt",
         ),
+        (
+            ResolvedToken(access_token="hook-token", instance_url=123),
+            "InvalidInstanceUrl",
+        ),
+        (
+            ResolvedToken(access_token="hook-token", instance_url=""),
+            "InvalidInstanceUrl",
+        ),
     ],
 )
 async def test_hook_malformed_token_creates_unavailable_config(
@@ -1346,6 +2089,7 @@ async def test_hook_preserves_valid_generation_during_normalization(
     resolved = await _tool_config(db, user)._resolve_oauth_token_from_hook(
         providers=["google"],
         resource=None,
+        auth_type=None,
     )
 
     assert resolved is not None
@@ -1421,10 +2165,84 @@ async def test_hook_is_skipped_when_user_id_is_none(db_session):
     resolved = await cfg._resolve_oauth_token_from_hook(
         providers=["google"],
         resource=None,
+        auth_type=None,
     )
 
     assert resolved is None
     assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_hook_ignores_bare_meta_token_for_app_scoped_facebook(db_session):
+    """A resolver-hook token keyed to the bare "meta" provider must not be
+    injected for the Facebook connector, mirroring the legacy UserOAuth
+    scoping in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT: the bare provider flow
+    never requested Facebook's app-specific oauth_scopes (e.g.
+    pages_read_user_content), so it can't stand in for an app-scoped grant.
+    """
+    db, user = db_session
+    server = _add_oauth_server(
+        db,
+        user,
+        name="Facebook Pages",
+        app_id="facebook",
+        provider="meta",
+        launch_config=_launch_config(env_key="META_ACCESS_TOKEN"),
+    )
+    seen_providers: list[str] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        seen_providers.append(request.provider)
+        if request.provider == "meta":
+            return ResolvedToken(access_token="bare-meta-hook-token", expires_at=None)
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert seen_providers == ["facebook"]
+    _assert_unavailable_mcp_config(
+        configs[0], server, reason="oauth_token_required", oauth_token_required=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_still_accepts_bare_meta_token_for_instagram(db_session):
+    """Negative counterpart to the Facebook filtering test above: Instagram is
+    deliberately absent from APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT (its
+    required scopes haven't changed), so a resolver-hook token keyed to the
+    bare "meta" provider must still be usable. Guards against an
+    over-filtering regression in _oauth_token_provider_candidates that only
+    the Facebook-side test above wouldn't catch.
+    """
+    db, user = db_session
+    _add_oauth_server(
+        db,
+        user,
+        name="Instagram",
+        app_id="instagram",
+        provider="meta",
+        launch_config=_launch_config(env_key="META_ACCESS_TOKEN"),
+    )
+    seen_providers: list[str] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        seen_providers.append(request.provider)
+        if request.provider == "meta":
+            return ResolvedToken(access_token="bare-meta-hook-token", expires_at=None)
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert seen_providers == ["meta"]
+    assert _access_token_env(configs[0], key="META_ACCESS_TOKEN") == (
+        "bare-meta-hook-token"
+    )
 
 
 @pytest.mark.asyncio
@@ -1724,16 +2542,29 @@ async def test_remote_hook_near_expiry_token_is_used_but_not_cached(db_session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auth", "expected_auth_type"),
+    [
+        (
+            {"type": "mcp_oauth", "resource": "https://auth.example/resource"},
+            "mcp_oauth",
+        ),
+        (None, "none"),
+    ],
+    ids=["mcp-oauth", "no-auth-declared"],
+)
 async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
     db_session,
     caplog,
+    auth,
+    expected_auth_type,
 ):
     db, user = db_session
     scope = object()
     server = _add_remote_server(
         db,
         user,
-        auth={"type": "mcp_oauth", "resource": "https://auth.example/resource"},
+        auth=auth,
         headers={"X-Static": "static", "authorization": "Bearer static-token"},
         runtime_bindings=_remote_runtime_bindings(),
         allow_delegated_authorization=True,
@@ -1772,8 +2603,16 @@ async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
         configs = await cfg.get_mcp_server_configs()
 
     assert [
-        (request.provider, request.resource, request.scope) for request in requests
-    ] == [("records", " https://selector.example/resource ", scope)]
+        (request.provider, request.resource, request.scope, request.auth_type)
+        for request in requests
+    ] == [
+        (
+            "records",
+            " https://selector.example/resource ",
+            scope,
+            expected_auth_type,
+        )
+    ]
     assert configs[0]["config"]["headers"] == {
         "X-Static": "static",
         "X-Runtime": "runtime",
@@ -2049,12 +2888,23 @@ async def test_remote_hook_failure_code_property_error_is_sanitized(db_session):
     assert "resolver-internal-secret" not in public_output
 
 
+@pytest.mark.parametrize(
+    ("auth", "expected_auth_type"),
+    [
+        (None, "none"),
+        ({"type": "mcp_oauth", "resource": "https://mcp.example/api"}, "mcp_oauth"),
+    ],
+    ids=["auth-none", "auth-mcp-oauth"],
+)
 @pytest.mark.asyncio
-async def test_remote_hook_consecutive_refreshes_advance_failed_generation(db_session):
+async def test_remote_hook_consecutive_refreshes_advance_failed_generation(
+    db_session, auth, expected_auth_type
+):
     db, user = db_session
     server = _add_remote_server(
         db,
         user,
+        auth=auth,
         headers={"X-Static": "static", "Authorization": "Bearer static-token"},
     )
     requests: list[TokenRequest] = []
@@ -2075,6 +2925,7 @@ async def test_remote_hook_consecutive_refreshes_advance_failed_generation(db_se
 
     assert requests[1].provider == requests[0].provider == "records"
     assert requests[1].resource == requests[0].resource == server.url
+    assert requests[1].auth_type == requests[0].auth_type == expected_auth_type
     assert requests[1].refresh == web_tools_config.OAuthRefreshContext(
         reason="invalid_token",
         resource_metadata_url=(
@@ -2315,6 +3166,37 @@ async def test_remote_hook_refresh_unknown_failure_code_remains_unclassified(
 
 
 @pytest.mark.asyncio
+async def test_refresh_failure_ignores_non_oauth_runtime_failure_code(
+    db_session,
+):
+    """A runtime-allowlisted code that isn't OAuth-specific must not raise.
+
+    ``ClassifiedToolFailure`` now validates against the OAuth-only set, not
+    the wider runtime allowlist. A resolver that raises with a non-OAuth
+    runtime code (allowlisted for other consumers) must fall through to
+    ``None`` here rather than let a ``ValueError`` escape the handler.
+    """
+    db, user = db_session
+    _add_remote_server(db, user)
+
+    class RefreshFailure(RuntimeError):
+        oauth_token_resolver_failure_code = "unsupported_nested_interaction"
+
+    async def resolver(request: TokenRequest):
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        raise RefreshFailure("refresh-private-secret")
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    assert await refresh(_challenge()) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "refresh_result",
     [
@@ -2444,7 +3326,7 @@ async def test_remote_hook_refresh_classification_reaches_tool_failure_trace(
             inputSchema={"type": "object", "properties": {}},
         ),
         connection=connection,
-        allow_users=configs[0]["allow_users"],
+        allow_users=None,
     )
     request = httpx.Request("POST", "https://mcp.example/api")
     response = httpx.Response(
@@ -2495,3 +3377,42 @@ async def test_remote_hook_refresh_classification_reaches_tool_failure_trace(
     public_output = repr(result) + repr(tracer.events) + caplog.text
     assert private_exception_text not in public_output
     assert "http-private-exception-secret" not in public_output
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_warning_reads_the_resource_from_the_diagnostic(
+    db_session,
+    caplog,
+    monkeypatch,
+):
+    """The resource in the log line and the resource in the diagnostic dict
+    must come from the same computation rather than each being computed
+    separately from ``error.resource``. Both paths return the same value
+    today, so asserting on the value cannot tell them apart; this asserts
+    on how many times the redacting helper was called instead.
+    """
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.test/oauth?api_key=SECRET-abc123"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    calls: list[Any] = []
+    original = web_tools_config._redacted_bounded_resource
+
+    def _counting(value):
+        calls.append(value)
+        return original(value)
+
+    monkeypatch.setattr(web_tools_config, "_redacted_bounded_resource", _counting)
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert calls == [resource]
+    assert f"resource={configs[0]['config']['diagnostic']['resource']}" in caplog.text

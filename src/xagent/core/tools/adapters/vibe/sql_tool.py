@@ -164,7 +164,7 @@ async def create_sql_tools(config: "BaseToolConfig") -> list:
     Returns:
         List of tool instances
     """
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
     connection_map = config.get_sql_connections()
     tool_instance = SqlQueryTool(workspace, connection_map=connection_map)
     return tool_instance.get_tools()

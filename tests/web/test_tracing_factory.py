@@ -23,7 +23,7 @@ def test_create_task_tracer_without_langfuse(langfuse_client_reset):
     assert handler_names == [
         "ConsoleTraceHandler",
         "DatabaseTraceHandler",
-        "WebSocketTraceHandler",
+        "TaskEventTraceHandler",
     ]
 
 

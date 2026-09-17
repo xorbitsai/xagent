@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useMemo } from "react";
 import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
@@ -6,13 +6,23 @@ import { Button } from "@/components/ui/button";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
+import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
+import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors";
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids";
+import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
 import { toast } from "@/components/ui/sonner";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
+import { LocalBrowserMenu, type LocalBrowserTarget } from "./LocalBrowserMenu";
+import {
+  hasTaskRuntimeComposerExtension,
+  type TaskRuntimeComposerSelection,
+} from "@/lib/task-runtime-ui-extension";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -34,6 +44,13 @@ interface ChatInputProps {
   onModeChange?: (mode: "task" | "process") => void;
   inputValue?: string;
   onInputChange?: (value: string) => void;
+  currentInteractionRequestId?: string;
+  // Fires on the editor's own focus/blur, independent of `isLoading`/task
+  // status - lets a controlled caller know it's currently unsafe to rely
+  // on a programmatic `inputValue` change being reflected in the visible
+  // editor (see the DOM-sync effect below, which intentionally skips
+  // updating a focused editor from an external value change).
+  onFocusChange?: (focused: boolean) => void;
   taskStatus?: TaskStatus | string;
   onPause?: () => void;
   onResume?: () => void;
@@ -41,20 +58,25 @@ interface ChatInputProps {
   hideConfig?: boolean;
   readOnlyConfig?: boolean;
   hideFileUpload?: boolean;
+  filesDisabled?: boolean;
+  voiceInputEnabled?: boolean;
   compact?: boolean;
   autoFocus?: boolean;
   minHeightClass?: string;
   promptHighlightTerms?: string[];
+  // Drives `hasSelectedAgent` below (skips the no-model-selected guard) -
+  // never rendered as a visible chip; callers that assign a task lead show
+  // that in their own header instead (see ChatStartScreen's hero swap).
   selectedAgents?: Array<{
     id: number | string;
     name: string;
   }>;
-  onRemoveSelectedAgent?: (agentId: number | string) => void;
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>;
   deferFileUpload?: boolean;
 }
 
-type ExecutionMode = "flash" | "balanced" | "think";
+type ExecutionMode = "auto" | "flash" | "balanced" | "think";
+const EXECUTION_MODES: ExecutionMode[] = ["auto", "flash", "balanced", "think"];
 type ExecutionModeConfig = ExecutionMode | { mode: ExecutionMode };
 
 interface AgentConfig {
@@ -65,6 +87,8 @@ interface AgentConfig {
   memorySimilarityThreshold?: number;
   executionMode?: ExecutionModeConfig;
   clientMessageId?: string;
+  metadata?: Record<string, unknown>;
+  runtimeExtensions?: Record<string, Record<string, unknown>>;
 }
 
 interface ModelRecord {
@@ -87,6 +111,8 @@ export function ChatInput({
   mode,
   inputValue,
   onInputChange,
+  currentInteractionRequestId,
+  onFocusChange,
   taskStatus,
   onPause,
   onResume,
@@ -94,12 +120,13 @@ export function ChatInput({
   hideConfig = false,
   readOnlyConfig = false,
   hideFileUpload = false,
+  filesDisabled = false,
+  voiceInputEnabled = true,
   compact = false,
   autoFocus = false,
   minHeightClass = "min-h-[130px]",
   promptHighlightTerms = [],
   selectedAgents = [],
-  onRemoveSelectedAgent,
   uploadFile,
   deferFileUpload = false,
 }: ChatInputProps) {
@@ -108,16 +135,25 @@ export function ChatInput({
   const [isFocused, setIsFocused] = useState(false);
   const [showNoModelAlert, setShowNoModelAlert] = useState(false);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  // Undefined until picked, so an untouched composer keeps the server default.
+  const [pickedExecutionMode, setPickedExecutionMode] = useState<ExecutionMode>();
+  const [executionModeMenuOpen, setExecutionModeMenuOpen] = useState(false);
+  const [localBrowserTarget, setLocalBrowserTarget] =
+    useState<LocalBrowserTarget | null>(null);
+  const [taskRuntimeSelection, setTaskRuntimeSelection] =
+    useState<TaskRuntimeComposerSelection | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const isSubmittingRef = useRef(false);
   const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
+  const draftRequestSnapshotRef = useRef<{ requestId: string | undefined } | null>(null);
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
+  const { user } = useAuth();
   const { openFilePreview } = useApp();
-  const voiceInput = useVoiceInputControls();
+  const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
 
   useEffect(() => {
     if (!autoFocus || !editorRef.current) return;
@@ -201,15 +237,25 @@ export function ChatInput({
     fileMention.checkTrigger();
   };
 
-  const fileMention = useFileMention(editorRef, containerRef, handleInput, t);
+  const fileMention = useFileMention(
+    editorRef,
+    containerRef,
+    handleInput,
+    t,
+    filesDisabled,
+  );
+  const enabledFiles = useMemo(
+    () => filesDisabled ? [] : files,
+    [files, filesDisabled],
+  );
 
   // Track files for async operations
-  const filesRef = useRef(files);
+  const filesRef = useRef(enabledFiles);
   const uploadAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
 
   useEffect(() => {
-    filesRef.current = files;
-  }, [files]);
+    filesRef.current = enabledFiles;
+  }, [enabledFiles]);
 
   // Determine if controlled or uncontrolled
   const isControlled = inputValue !== undefined;
@@ -218,6 +264,8 @@ export function ChatInput({
 
   // Handle click on delete button and file chip preview
   useEffect(() => {
+    if (filesDisabled) return;
+
     const editor = editorRef.current;
     if (!editor) return;
 
@@ -259,7 +307,7 @@ export function ChatInput({
 
     editor.addEventListener('click', handleClick);
     return () => editor.removeEventListener('click', handleClick);
-  }, [fileMention.fileList, openFilePreview]);
+  }, [fileMention.fileList, filesDisabled, openFilePreview]);
   const [agentConfig, setAgentConfig] = useState<AgentConfig>({
     model: "",
     memorySimilarityThreshold: 1.5,
@@ -292,9 +340,21 @@ export function ChatInput({
     setIsDraggingFiles(false);
   };
 
+  useEffect(() => {
+    if (!filesDisabled) return;
+
+    uploadAbortControllersRef.current.forEach((controller) => {
+      controller.abort();
+    });
+    uploadAbortControllersRef.current.clear();
+    setUploadingFiles(new Set());
+    dragDepthRef.current = 0;
+    setIsDraggingFiles(false);
+  }, [filesDisabled]);
+
   // Helper to upload files immediately
   const uploadFiles = async (newFiles: File[]) => {
-    if (newFiles.length === 0) return;
+    if (filesDisabled || newFiles.length === 0) return;
 
     // Mark as uploading (use name + lastModified as rough unique ID)
     const fileIds = newFiles.map(f => `${f.name}-${f.lastModified}`);
@@ -305,6 +365,7 @@ export function ChatInput({
     });
 
     const failedFiles = new Set<File>();
+    const uploadedFileIds = new Map<File, string>();
     let uploadErrorMessage: string | null = null;
 
     // Upload files individually to ensure better reliability and progress tracking
@@ -318,8 +379,9 @@ export function ChatInput({
 
         if (uploadFile) {
           const result = await uploadFile(file, { taskType: currentTaskType });
-          if (result && typeof result.file_id === 'string') {
-            (file as File & { file_id?: string }).file_id = result.file_id;
+          const fileId = normalizeUploadFileIds([result?.file_id], 1)?.[0] ?? null;
+          if (fileId) {
+            uploadedFileIds.set(file, fileId);
           } else {
             failedFiles.add(file);
           }
@@ -337,20 +399,15 @@ export function ChatInput({
 
           const parsed = await parseApiResponse(response);
 
-          if (response.ok && isJsonRecord(parsed.data)) {
-            const data = parsed.data;
-            if (data.success && typeof data.file_id === 'string') {
-              // Attach file_id to the File object
-              (file as File & { file_id?: string }).file_id = data.file_id;
-            } else {
-              failedFiles.add(file);
-            }
+          const data = isJsonRecord(parsed.data) ? parsed.data : null;
+          const fileId = normalizeUploadFileIds([data?.file_id], 1)?.[0] ?? null;
+          if (response.ok && data?.success === true && fileId) {
+            uploadedFileIds.set(file, fileId);
           } else {
             failedFiles.add(file);
-            uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
-              generic: t("files.uploadFailed") || "Failed to upload some files",
-              ...UPLOAD_ERROR_MESSAGES,
-            });
+            const uploadError = classifyUploadError(response, parsed);
+            uploadErrorMessage = uploadErrorMessage
+              || t(clientErrorTranslationKey(uploadError.errorCode));
           }
         }
       } catch (error) {
@@ -359,7 +416,7 @@ export function ChatInput({
         } else {
           console.error("Error uploading file:", error);
           failedFiles.add(file);
-          uploadErrorMessage = uploadErrorMessage || (error instanceof Error ? error.message : null);
+          uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
         }
       } finally {
         uploadAbortControllersRef.current.delete(fileId);
@@ -371,6 +428,30 @@ export function ChatInput({
       }
     }));
 
+    const successfulFiles = newFiles.filter(file => (
+      !failedFiles.has(file) && uploadedFileIds.has(file)
+    ));
+    const existingUploadedFileIds = filesRef.current
+      .filter(file => !newFiles.includes(file))
+      .map(file => (file as File & { file_id?: unknown }).file_id)
+      .filter(fileId => fileId !== undefined);
+    const normalizedFileIds = normalizeUploadFileIds(
+      [
+        ...existingUploadedFileIds,
+        ...successfulFiles.map(file => uploadedFileIds.get(file)),
+      ],
+      existingUploadedFileIds.length + successfulFiles.length,
+    );
+    if (!normalizedFileIds) {
+      successfulFiles.forEach(file => failedFiles.add(file));
+      uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
+    } else {
+      const newFileIds = normalizedFileIds.slice(existingUploadedFileIds.length);
+      successfulFiles.forEach((file, index) => {
+        (file as File & { file_id?: string }).file_id = newFileIds[index];
+      });
+    }
+
     // Handle failed files
     if (failedFiles.size > 0) {
       toast.error(uploadErrorMessage || t("files.uploadFailed") || "Failed to upload some files");
@@ -381,7 +462,12 @@ export function ChatInput({
   };
 
   const appendFiles = (newFiles: File[]) => {
-    if (newFiles.length === 0 || !onFilesChange || isInputBusy) return;
+    if (
+      filesDisabled
+      || newFiles.length === 0
+      || !onFilesChange
+      || isInputBusy
+    ) return;
     onFilesChange([...filesRef.current, ...newFiles]);
     if (!deferFileUpload) {
       uploadFiles(newFiles);
@@ -480,6 +566,21 @@ export function ChatInput({
         compactModel: defaultAgentConfig.compactModel,
         executionMode: undefined
       }));
+    } else {
+      // readOnlyConfig is true but taskConfig hasn't arrived yet - e.g. the
+      // caller just switched to a different lead and that lead's own
+      // config fetch is still in flight. The disabled read-only model
+      // button below renders straight from `agentConfig`, so leaving the
+      // previous lead's stale model/mode in place would show it as if it
+      // belonged to whoever is selected now.
+      setAgentConfig(prev => ({
+        ...prev,
+        model: "",
+        smallFastModel: undefined,
+        visualModel: undefined,
+        compactModel: undefined,
+        executionMode: undefined
+      }));
     }
   }, [taskConfig, readOnlyConfig, defaultAgentConfig]);
 
@@ -496,6 +597,51 @@ export function ChatInput({
     !!isLoading &&
     !allowsLiveGuidanceInput &&
     !isStoppedTaskStatus(normalizedTaskStatus);
+  // Only a new standalone task: the backend takes execution_mode at creation
+  // only, and an agent (a template resolves into one) overrides it anyway.
+  const showExecutionModePicker =
+    !hideConfig && !readOnlyConfig && !taskConfig;
+  // Unset reads as "Default", not "Auto": the server default is auto only when
+  // XAGENT_AGENT_RUNTIME is unset (config.get_default_task_execution_mode).
+  const executionModeTriggerLabel = pickedExecutionMode
+    ? t(`builds.configForm.executionMode.${pickedExecutionMode}.title`)
+    : t("builds.configForm.executionMode.unset");
+  const showLocalBrowser = Boolean(user?.is_admin) && !readOnlyConfig && !hideConfig;
+  const showTaskRuntimeExtension =
+    hasTaskRuntimeComposerExtension && !readOnlyConfig && !hideConfig;
+  const activeLocalBrowserTarget = showLocalBrowser ? localBrowserTarget : null;
+  const activeTaskRuntimeSelection = showTaskRuntimeExtension
+    ? taskRuntimeSelection
+    : null;
+  // `agentConfig` mirrors `taskConfig` via a separate effect (below) that
+  // runs asynchronously after a prop change, not synchronously with it - a
+  // read landing in that gap (e.g. right after switching to a different
+  // read-only lead, before its own config has finished loading) would
+  // otherwise still show/send the PREVIOUS lead's model, even though
+  // `taskConfig` itself already correctly reflects the new one (or the
+  // absence of one yet). Read model fields straight from the live prop
+  // instead of the mirror, whenever one is meant to be authoritative -
+  // shared by both the read-only model badge below and handleSubmit, so a
+  // future caller of either one doesn't have to remember this separately.
+  // `hideConfig` alone (no taskConfig, not read-only) legitimately means
+  // "use my own configured default", not "mirror of taskConfig", so it's
+  // excluded here even though no current caller combines them.
+  const configIsDrivenByTaskConfig = readOnlyConfig || Boolean(taskConfig);
+  const displayModel = configIsDrivenByTaskConfig
+    ? taskConfig?.model || ""
+    : agentConfig.model;
+  useEffect(() => {
+    if (!showExecutionModePicker) {
+      setPickedExecutionMode(undefined);
+      setExecutionModeMenuOpen(false);
+    }
+  }, [showExecutionModePicker]);
+  useEffect(() => {
+    if (!showLocalBrowser) setLocalBrowserTarget(null);
+  }, [showLocalBrowser]);
+  useEffect(() => {
+    if (!showTaskRuntimeExtension) setTaskRuntimeSelection(null);
+  }, [showTaskRuntimeExtension]);
   const voiceInputLabel =
     voiceInput.status === "recording"
       ? t("voiceInput.stop")
@@ -510,12 +656,22 @@ export function ChatInput({
       voiceInput.stopRecording();
       return;
     }
-    if (voiceInput.status === "idle") {
+    if (voiceInputEnabled && voiceInput.status === "idle") {
       voiceInput.startRecording(editorRef.current);
     }
   };
 
-  const hasDraft = message.trim().length > 0 || files.length > 0;
+  const hasDraft = message.trim().length > 0 || enabledFiles.length > 0;
+  useEffect(() => {
+    if (!hasDraft) {
+      draftRequestSnapshotRef.current = null;
+      deliveryAttemptRef.current = null;
+    } else if (draftRequestSnapshotRef.current === null) {
+      draftRequestSnapshotRef.current = {
+        requestId: currentInteractionRequestId,
+      };
+    }
+  }, [currentInteractionRequestId, hasDraft]);
   const canSubmit = () => {
     const isUploadingFiles = uploadingFiles.size > 0;
     return hasDraft && !isInputBusy && !isUploadingFiles;
@@ -527,7 +683,12 @@ export function ChatInput({
   const shouldShowPauseButton = canPauseTask && !hasDraft;
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
-    if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
+    if (
+      !isFileDragEvent(e)
+      || isInputBusy
+      || hideFileUpload
+      || filesDisabled
+    ) return;
     e.preventDefault();
     e.stopPropagation();
     dragDepthRef.current += 1;
@@ -535,7 +696,12 @@ export function ChatInput({
   };
 
   const handleDragOver = (e: React.DragEvent<HTMLFormElement>) => {
-    if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
+    if (
+      !isFileDragEvent(e)
+      || isInputBusy
+      || hideFileUpload
+      || filesDisabled
+    ) return;
     e.preventDefault();
     e.stopPropagation();
     e.dataTransfer.dropEffect = "copy";
@@ -555,7 +721,12 @@ export function ChatInput({
   };
 
   const handleDrop = (e: React.DragEvent<HTMLFormElement>) => {
-    if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
+    if (
+      !isFileDragEvent(e)
+      || isInputBusy
+      || hideFileUpload
+      || filesDisabled
+    ) return;
     e.preventDefault();
     e.stopPropagation();
     const droppedFiles = extractDroppedFiles(e.dataTransfer);
@@ -579,32 +750,80 @@ export function ChatInput({
       isSubmittingRef.current = true;
       const trimmed = message.trim();
       const messageToSend = trimmed;
-      const executionMode = taskConfig?.executionMode;
+      const executionMode = showExecutionModePicker
+        ? pickedExecutionMode
+        : taskConfig?.executionMode;
+      const normalizedExecutionMode = executionMode
+        ? (typeof executionMode === "string" ? { mode: executionMode } : executionMode)
+        : undefined;
+      const extraRuntimeExtensions = activeLocalBrowserTarget
+        ? { local_browser: { ...activeLocalBrowserTarget } }
+        : activeTaskRuntimeSelection?.runtimeExtensions;
       const deliveryKey = JSON.stringify([
         messageToSend,
-        files.map((file) => [file.name, file.size, file.lastModified]),
+        extraRuntimeExtensions || null,
+        enabledFiles.map((file) => [
+          file.name,
+          file.size,
+          file.lastModified,
+        ]),
       ]);
       const previousAttempt = deliveryAttemptRef.current;
       const clientMessageId = previousAttempt?.key === deliveryKey
         ? previousAttempt.clientMessageId
         : generateClientMessageId();
       deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
+      const existingMetadata = {
+        ...(agentConfig.metadata || {}),
+        ...(configIsDrivenByTaskConfig ? taskConfig?.metadata || {} : {}),
+      };
+      const draftRequestId = draftRequestSnapshotRef.current?.requestId;
+      const metadataToSend = draftRequestId
+        ? { ...existingMetadata, request_id: draftRequestId }
+        : Object.keys(existingMetadata).length > 0
+          ? existingMetadata
+          : undefined;
 
       const configToSend = {
         ...agentConfig,
-        clientMessageId,
-        ...(executionMode
+        ...(configIsDrivenByTaskConfig
           ? {
-              executionMode:
-                typeof executionMode === "string"
-                  ? { mode: executionMode }
-                  : executionMode,
+              model: displayModel,
+              smallFastModel: taskConfig?.smallFastModel,
+              visualModel: taskConfig?.visualModel,
+              compactModel: taskConfig?.compactModel,
+              // Same live-vs-mirror reasoning as the model fields above,
+              // applied to executionMode: a falsy live value must still
+              // explicitly clear the key here rather than being skipped,
+              // or it would silently fall through to whatever stale
+              // executionMode `agentConfig` (spread below) still carries
+              // from the previous lead while its own mirroring effect
+              // hasn't caught up yet.
+              executionMode: normalizedExecutionMode,
             }
+          : {}),
+        clientMessageId,
+        ...(metadataToSend ? { metadata: metadataToSend } : {}),
+        ...(extraRuntimeExtensions
+          ? {
+              runtimeExtensions: {
+                ...(agentConfig.runtimeExtensions || {}),
+                ...extraRuntimeExtensions,
+              },
+            }
+          : {}),
+        ...(!configIsDrivenByTaskConfig && normalizedExecutionMode
+          ? { executionMode: normalizedExecutionMode }
           : {}),
       };
 
       await onSend(messageToSend, configToSend);
       deliveryAttemptRef.current = null;
+      draftRequestSnapshotRef.current = null;
+      setPickedExecutionMode(undefined);
+      setExecutionModeMenuOpen(false);
+      setLocalBrowserTarget(null);
+      setTaskRuntimeSelection(null);
       fileMention.resetMention();
 
       if (isControlled) {
@@ -619,8 +838,14 @@ export function ChatInput({
       ) {
         deliveryAttemptRef.current = null;
       }
-      toast.error(
-        error instanceof Error
+      const errorCode = typeof error === "object" && error !== null
+        ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
+        : null;
+      const userFacing = typeof error === "object" && error !== null
+        && (error as { userFacing?: unknown }).userFacing === true;
+      toast.error(errorCode
+        ? t(clientErrorTranslationKey(errorCode))
+        : userFacing && error instanceof Error
           ? error.message
           : t("builds.list.chat.sendFailed") || "Message was not sent"
       );
@@ -651,7 +876,7 @@ export function ChatInput({
     const items = Array.from(e.clipboardData.items || []);
     const fileItems = items.filter(item => item.kind === 'file');
 
-    if (fileItems.length > 0 && !hideFileUpload) {
+    if (fileItems.length > 0 && !hideFileUpload && !filesDisabled) {
       e.preventDefault();
       const pastedFiles: File[] = [];
 
@@ -692,6 +917,8 @@ export function ChatInput({
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (filesDisabled) return;
+
     const selectedFiles = Array.from(e.target.files || []);
     appendFiles(selectedFiles);
     if (fileInputRef.current) {
@@ -700,7 +927,7 @@ export function ChatInput({
   };
 
   const removeFile = (index: number) => {
-    const fileToRemove = files[index];
+    const fileToRemove = enabledFiles[index];
     if (fileToRemove) {
       const fileId = `${fileToRemove.name}-${fileToRemove.lastModified}`;
       const controller = uploadAbortControllersRef.current.get(fileId);
@@ -709,7 +936,7 @@ export function ChatInput({
         uploadAbortControllersRef.current.delete(fileId);
       }
     }
-    onFilesChange?.(files.filter((_, i) => i !== index));
+    onFilesChange?.(enabledFiles.filter((_, i) => i !== index));
   };
 
   useEffect(() => {
@@ -721,6 +948,18 @@ export function ChatInput({
         editor.innerHTML = "";
       }
     } else if (document.activeElement !== editor) {
+      if (filesDisabled) {
+        let html = applyPromptHighlights(
+          escapeHtml(sanitizeFilesDisabledPresentationText(message)),
+          promptHighlightTerms,
+        );
+        html = html.replace(/\n/g, "<br>");
+        if (editor.innerHTML !== html) {
+          editor.innerHTML = html;
+        }
+        return;
+      }
+
       const currentText = serializeEditorContent(editor);
 
       if (message !== currentText) {
@@ -741,58 +980,30 @@ export function ChatInput({
         editor.innerHTML = html;
       }
     }
-  }, [message, promptHighlightTerms]);
+  }, [filesDisabled, message, promptHighlightTerms]);
 
   return (
     <div className="space-y-3">
       {/* Input area */}
       <div
-        className={cn("relative", selectedAgents.length > 0 && "pt-9")}
+        className="relative"
         ref={containerRef}
       >
-        <FileMentionDropdown
-          show={fileMention.showFilePicker}
-          isLoading={fileMention.isLoadingFiles}
-          filteredFiles={fileMention.filteredFiles}
-          selectedFileIndex={fileMention.selectedFileIndex}
-          onInsert={fileMention.insertFile}
-          t={t}
-          position={fileMention.dropdownPosition}
-        />
-        {selectedAgents.length > 0 && (
-          <div className="absolute top-0 z-10 flex flex-wrap gap-2">
-            {selectedAgents.map((agent) => (
-              <div
-                key={agent.id}
-                className="inline-flex h-9 items-center gap-1 rounded-t-xl rounded-b-none border border-b-0 px-3 text-xs font-medium shadow-[0_-1px_0_rgba(53,88,255,0.08)]"
-                style={{ borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" }}
-              >
-                <span className="italic">Using</span>
-                <span
-                  className="rounded-md border px-2 py-0.5 not-italic"
-                  style={{ borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" }}
-                >{`@${agent.name}`}</span>
-                {onRemoveSelectedAgent && (
-                  <button
-                    type="button"
-                    onClick={() => onRemoveSelectedAgent(agent.id)}
-                    className="rounded-sm p-0.5 hover:bg-[#dfe6ff]"
-                    title={t("common.remove")}
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
+        {fileMention.fileMentionsEnabled && (
+          <FileMentionDropdown
+            show={fileMention.showFilePicker}
+            isLoading={fileMention.isLoadingFiles}
+            filteredFiles={fileMention.filteredFiles}
+            selectedFileIndex={fileMention.selectedFileIndex}
+            onInsert={fileMention.insertFile}
+            t={t}
+            position={fileMention.dropdownPosition}
+          />
         )}
         <form
           onSubmit={handleSubmit}
           className={cn(
-            "relative flex flex-col overflow-hidden border-2 bg-card shadow-sm",
-            selectedAgents.length > 0
-              ? "rounded-tr-2xl rounded-br-2xl rounded-bl-2xl rounded-tl-none"
-              : "rounded-2xl",
+            "relative flex flex-col overflow-hidden border-2 bg-card shadow-sm rounded-2xl",
             isFocused
               ? "shadow-[0_0_0_3px_rgba(48,64,207,0.16)]"
               : ""
@@ -802,7 +1013,7 @@ export function ChatInput({
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           style={{
-            borderColor: selectedAgents.length > 0 ? "#3040cf" : isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
+            borderColor: isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
           }}
         >
           {isDraggingFiles && (
@@ -817,9 +1028,9 @@ export function ChatInput({
               </div>
             </div>
           )}
-          {files.length > 0 && (
+          {enabledFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">
-              {files.map((file, index) => {
+              {enabledFiles.map((file, index) => {
                 const isUploading = uploadingFiles.has(`${file.name}-${file.lastModified}`);
                 return (
                   <div
@@ -864,8 +1075,14 @@ export function ChatInput({
               onInput={handleInput}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              onFocus={() => setIsFocused(true)}
-              onBlur={() => setIsFocused(false)}
+              onFocus={() => {
+                setIsFocused(true);
+                onFocusChange?.(true);
+              }}
+              onBlur={() => {
+                setIsFocused(false);
+                onFocusChange?.(false);
+              }}
               role="textbox"
               aria-multiline="true"
             />
@@ -879,7 +1096,7 @@ export function ChatInput({
           {/* Bottom toolbar or inline button */}
           {compact ? (
             <div className="absolute right-2 bottom-2 flex items-center gap-2">
-              {!hideFileUpload && (
+              {!hideFileUpload && !filesDisabled && (
                 <>
                   <input
                     ref={fileInputRef}
@@ -902,7 +1119,7 @@ export function ChatInput({
                   </Button>
                 </>
               )}
-              {voiceInput.hasAsrModel && (
+              {voiceInputEnabled && voiceInput.hasAsrModel && (
                 <Button
                   type="button"
                   variant="ghost"
@@ -958,11 +1175,11 @@ export function ChatInput({
                         size="sm"
                         className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
                         disabled={true}
-                        title={models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                        title={models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
                       >
                         <Globe className="h-4 w-4" />
                         <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                          {models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                          {models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
                         </span>
                       </Button>
                     ) : (
@@ -988,30 +1205,78 @@ export function ChatInput({
                     )}
                   </>
                 )}
-                {/* Upload button - adjacent to bottom toolbar */}
-                {!hideFileUpload && (
-                  <>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      multiple
-                      onChange={handleFileSelect}
-                      className="hidden"
-                      accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
-                    />
-                    <Button
+                {showExecutionModePicker && (
+                  // Popover, not ui/select: the form is overflow-hidden and clips it.
+                  <Popover open={executionModeMenuOpen} onOpenChange={setExecutionModeMenuOpen}>
+                    <PopoverTrigger
                       type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
-                      onClick={() => fileInputRef.current?.click()}
+                      className="inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs text-muted-foreground hover:bg-secondary/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                       disabled={isInputBusy}
-                      title={t("chatPage.input.actions.upload")}
+                      title={t("builds.configForm.executionMode.label")}
+                      aria-label={`${t("builds.configForm.executionMode.label")}: ${executionModeTriggerLabel}`}
                     >
-                      <Paperclip className="h-4 w-4" />
-                    </Button>
-                  </>
+                      <Sparkles className="h-4 w-4" />
+                      <span className="max-w-[150px] truncate hidden sm:inline-block">
+                        {executionModeTriggerLabel}
+                      </span>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" side="top" className="w-64 space-y-0.5 p-1.5">
+                      {EXECUTION_MODES.map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          aria-pressed={mode === pickedExecutionMode}
+                          onClick={() => {
+                            setPickedExecutionMode(mode);
+                            setExecutionModeMenuOpen(false);
+                          }}
+                          className={cn(
+                            "flex w-full flex-col items-start gap-0.5 rounded-lg px-3 py-2 text-left transition-colors hover:bg-muted",
+                            mode === pickedExecutionMode && "bg-muted"
+                          )}
+                        >
+                          <span className="text-sm font-medium">
+                            {t(`builds.configForm.executionMode.${mode}.title`)}
+                          </span>
+                          <span className="text-xs text-muted-foreground">
+                            {t(`builds.configForm.executionMode.${mode}.description`)}
+                          </span>
+                        </button>
+                      ))}
+                    </PopoverContent>
+                  </Popover>
                 )}
+                {/* Add files or bind this new task to a local host window. */}
+                {(!hideFileUpload && !filesDisabled)
+                  || showLocalBrowser
+                  || showTaskRuntimeExtension ? (
+                  <>
+                    {!hideFileUpload && !filesDisabled && (
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        onChange={handleFileSelect}
+                        className="hidden"
+                        accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+                      />
+                    )}
+                    <LocalBrowserMenu
+                      disabled={isInputBusy}
+                      selectedTarget={localBrowserTarget}
+                      onTargetChange={setLocalBrowserTarget}
+                      extensionSelection={taskRuntimeSelection}
+                      onExtensionSelectionChange={setTaskRuntimeSelection}
+                      onAddFiles={
+                        !hideFileUpload && !filesDisabled
+                          ? () => fileInputRef.current?.click()
+                          : undefined
+                      }
+                      showLocalBrowser={showLocalBrowser}
+                      showTaskRuntimeExtension={showTaskRuntimeExtension}
+                    />
+                  </>
+                ) : null}
               </div>
 
               <div className="flex items-center gap-2">
@@ -1029,7 +1294,7 @@ export function ChatInput({
                 <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
                   ⏎ {t("common.send")}
                 </span>
-                {voiceInput.hasAsrModel && (
+                {voiceInputEnabled && voiceInput.hasAsrModel && (
                   <Button
                     type="button"
                     variant="ghost"

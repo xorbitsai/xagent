@@ -51,6 +51,19 @@ class TestLanceDBConnectionManager:
         assert conn is not None
         assert Path(db_dir).exists()
 
+    def test_get_connection_installs_the_jieba_dictionary(
+        self, tmp_path, connection_manager, monkeypatch
+    ):
+        """FTS queries need it too, so it is placed when the connection opens."""
+        from xagent.core.tools.core.RAG_tools.LanceDB import jieba_dictionary
+
+        monkeypatch.setenv("LANCE_LANGUAGE_MODEL_HOME", str(tmp_path / "lm"))
+        monkeypatch.setattr(jieba_dictionary, "_installed", False)
+
+        connection_manager.get_connection(str(tmp_path / "db"))
+
+        assert (tmp_path / "lm" / "jieba" / "default" / "dict.txt").exists()
+
     def test_get_connection_caching(self, temp_db_dir, connection_manager):
         """Test connection caching."""
         # First call

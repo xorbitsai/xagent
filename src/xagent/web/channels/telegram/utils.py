@@ -1,15 +1,22 @@
 import html
+import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
 from ....core.file_ref import parse_file_id_ref
+from ...services.assistant_history_safety import (
+    LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from ....core.agent.service import AgentService
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -210,12 +217,15 @@ async def restore_telegram_task_context(
     task_id: int,
 ) -> None:
     """Restore prior chat transcript and execution context for a Telegram turn."""
-    from ...services.chat_history_service import load_task_transcript
+    from ...services.chat_history_service import load_task_transcript_window
     from ...services.task_execution_context_service import (
         load_task_execution_recovery_state,
     )
 
-    agent_service.set_conversation_history(load_task_transcript(db, task_id))
+    transcript_window = load_task_transcript_window(db, task_id)
+    agent_service.set_conversation_history(
+        transcript_window.messages, watermark=transcript_window.watermark
+    )
 
     recovery_state: dict[str, Any] = await load_task_execution_recovery_state(
         db, task_id
@@ -230,7 +240,7 @@ def persist_telegram_assistant_turn(
     user_id: int,
     content: str,
     interactions: list[dict[str, Any]] | None = None,
-    message_type: str = "assistant_message",
+    message_type: str = LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
 ) -> None:
     """Persist a Telegram assistant turn when it has text or structured prompts."""
     from ...services.chat_history_service import persist_assistant_message
@@ -262,3 +272,51 @@ def _extract_local_file_id(target: str) -> str | None:
             return unquote(path[len(prefix) :].strip("/")) or None
 
     return None
+
+
+class CancelledDelivery(Exception):
+    """Raised when a delivery completed after its execution was cancelled.
+
+    The message was already sent, so the caller must stop the remaining output
+    sequence. ``deliver_cancellation_safe`` has already removed it.
+    """
+
+
+async def deliver_cancellation_safe(
+    send: "Callable[[], Awaitable[Any]]",
+    *,
+    is_cancelled: "Callable[[], bool]",
+    delete: "Callable[[Any], Awaitable[None]] | None" = None,
+    description: str = "Telegram delivery",
+) -> Any:
+    """Send something only while the execution is still current.
+
+    A send is an awaited round trip, so ``/stop``, ``/new``, or ``/switch`` can
+    land while it is in flight. Checking only before the call would leave that
+    output visible in a conversation the user has already left, so the latch is
+    re-checked afterwards and a late success is compensated by deleting it.
+
+    Returns the send result, or None when the send was skipped. Raises
+    CancelledDelivery when the send succeeded but was compensated, so callers
+    abandon the rest of the output sequence.
+    """
+
+    if is_cancelled():
+        return None
+
+    result = await send()
+
+    if not is_cancelled():
+        return result
+
+    if delete is not None:
+        try:
+            await delete(result)
+        except Exception:
+            # A message that cannot be removed (for example older than
+            # Telegram's delete window) is logged rather than raised: the
+            # caller still needs to stop the remaining output.
+            logger.debug(
+                "Failed to remove %s after cancellation", description, exc_info=True
+            )
+    raise CancelledDelivery(description)

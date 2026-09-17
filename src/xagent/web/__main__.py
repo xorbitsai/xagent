@@ -17,7 +17,7 @@ from typing import cast
 import uvicorn
 from dotenv import load_dotenv
 
-from ..config import get_default_task_execution_mode
+from ..config import get_default_task_execution_mode, get_worker_count
 from .logging_config import LogLevel, setup_logging
 
 # Load environment variables from .env file
@@ -159,6 +159,19 @@ def main() -> None:
         logger.info("🐛 Debug mode: verbose logging enabled")
 
     try:
+        worker_count = get_worker_count()
+        if worker_count is not None:
+            if args.reload:
+                raise ValueError("XAGENT_WORKER_COUNT cannot be used with --reload")
+            from .worker_pool import run_combined_worker_pool
+
+            run_combined_worker_pool(
+                worker_count=worker_count,
+                host=args.host,
+                port=args.port,
+                log_level=log_level.lower() if log_level else None,
+            )
+            return
         uvicorn.run(
             "xagent.web.app:app",
             host=args.host,

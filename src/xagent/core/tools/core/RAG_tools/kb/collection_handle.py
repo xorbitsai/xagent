@@ -83,6 +83,7 @@ from ..storage.contracts import (
 from ..utils import check_file_type, compute_file_hash
 from ..utils.filter_utils import parse_legacy_filters, validate_filter_depth
 from ..utils.hash_utils import compute_chunk_hash
+from ..utils.lancedb_query_utils import build_fts_query
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import generate_deterministic_doc_id
 from .models import KBBackendCapabilities, KBCollectionContext, KBStorageBackend
@@ -2576,7 +2577,12 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                     )
                 )
 
-            search_query = table.search(query_text, query_type="fts").limit(top_k)
+            fts_query = build_fts_query(query_text)
+            search_query = (
+                None
+                if fts_query is None
+                else table.search(fts_query, query_type="fts").limit(top_k)
+            )
 
             # Convert legacy dict format to FilterExpression if needed
             filter_expr: Optional[FilterExpression] = None
@@ -2633,11 +2639,15 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                     user_id=user_id,
                     is_admin=is_admin,
                 )
-                if backend_filter:
+                if backend_filter and search_query is not None:
                     search_query = search_query.where(backend_filter)
 
             # LanceDB's search().to_pandas() returns Any due to missing type stubs
-            raw_results_df = pd.DataFrame(search_query.to_pandas())
+            raw_results_df = (
+                pd.DataFrame()
+                if search_query is None
+                else pd.DataFrame(search_query.to_pandas())
+            )
 
             if not raw_results_df.empty:
                 search_results: List[SearchResult] = []
@@ -3783,12 +3793,15 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         """Delete or preview embedding rows for a failed operation (#515).
 
         Ports the former facade ``_cleanup_vectors_for_operation_impl``: builds
-        per-table predicates via ``kb/cleanup_filters`` (relocation tracked in
-        #821), counts/deletes through this handle's raw store connection, and
-        derives status / side_effects_may_remain exactly as before.
+        per-table predicates via ``storage/lancedb_cleanup_filters``,
+        counts/deletes through this handle's raw store connection, and derives
+        status / side_effects_may_remain exactly as before.
         """
+        from ..storage.lancedb_cleanup_filters import (
+            build_embedding_cleanup_filters,
+        )
         from ..utils.lancedb_query_utils import _safe_count_rows
-        from .cleanup_filters import KBCleanupScope, build_embedding_cleanup_filters
+        from .cleanup_filters import KBCleanupScope
         from .models import KBVectorStorageCleanupResult
 
         scope = KBCleanupScope(

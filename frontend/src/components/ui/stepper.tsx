@@ -30,7 +30,7 @@ export function Stepper({
       {...props}
     >
       <div
-        className="flex items-center gap-4 mb-6 overflow-x-auto overflow-y-hidden py-2"
+        className="flex items-center gap-4 overflow-x-auto overflow-y-hidden py-2"
         role="list"
         aria-label="Steps"
       >

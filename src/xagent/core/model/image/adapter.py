@@ -4,7 +4,7 @@ import aiohttp
 
 from ...model import ImageModelConfig
 from ...retry import create_retry_wrapper
-from .base import BaseImageModel
+from .base import BaseImageModel, default_image_abilities
 from .dashscope import DashScopeImageModel
 from .gemini import GeminiImageModel
 from .openai import OpenAIImageModel
@@ -29,7 +29,9 @@ def get_image_model_instance(db_model: Any) -> BaseImageModel:
     model_name = str(db_model.model_name)
     api_key = str(db_model.api_key) if db_model.api_key else None
     base_url = str(db_model.base_url) if db_model.base_url else None
-    abilities = list(db_model.abilities) if db_model.abilities else ["generate"]
+    abilities = list(
+        db_model.abilities or default_image_abilities(provider, model_name)
+    )
     timeout = getattr(db_model, "timeout", 300.0) or 300.0
     max_retries = getattr(db_model, "max_retries", 3) or 3
 

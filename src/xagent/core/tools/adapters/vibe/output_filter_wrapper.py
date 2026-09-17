@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
 from pydantic import BaseModel
 
+from ....agent.result import normalize_tool_failure_code
 from ...user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
@@ -33,6 +34,29 @@ _INTERACTION_DISPLAY_KEYS = frozenset(
         "title",
     }
 )
+
+
+def _is_classified_tool_failure(result: Any) -> bool:
+    """Return whether ``result`` is a classified structured tool failure.
+
+    Matches on the ``success is False`` **and** ``is_error is True`` pair that
+    the shared classified-failure contract always carries, rather than on any
+    dict with an ``is_error`` key — a plain MCP error result
+    (``{"content": [...], "is_error": True}``) has no ``success`` key and is
+    left to ordinary recursive filtering.
+
+    Unavailable-MCP results do carry both keys and are matched deliberately:
+    they carry a ``failure_code``, and the restore below is purely additive,
+    so their ``content``/``reason`` fields keep whatever ordinary filtering
+    left them while the classification keys are guaranteed to survive
+    field-count truncation.
+    """
+
+    return (
+        isinstance(result, dict)
+        and result.get("is_error") is True
+        and result.get("success") is False
+    )
 
 
 def _accepts_kwarg(func: Any, name: str) -> bool:
@@ -222,23 +246,52 @@ class OutputFilteredToolWrapper(AbstractBaseTool):
         return wrapped_func_async
 
     def _filter_result(self, result: Any) -> Any:
-        """Filter output without dropping the user-interaction control envelope."""
+        """Filter output without dropping a control or classification envelope."""
 
         filtered = self._filter.filter(result, self._target.name)
-        if not tool_result_waits_for_user(result) or not isinstance(filtered, dict):
+        if not isinstance(filtered, dict) or not isinstance(result, dict):
             return filtered
 
-        filtered["status"] = WAITING_FOR_USER_STATUS
-        assert isinstance(result, dict)
-        for key in ("interaction_id", "message_type"):
-            if key in result:
-                filtered[key] = result[key]
-        if "message" in result:
-            filtered["message"] = self._filter.filter(
-                result["message"], self._target.name
+        if tool_result_waits_for_user(result):
+            filtered["status"] = WAITING_FOR_USER_STATUS
+            for key in ("interaction_id", "message_type"):
+                if key in result:
+                    filtered[key] = result[key]
+            if "message" in result:
+                filtered["message"] = self._filter.filter(
+                    result["message"], self._target.name
+                )
+            if "interactions" in result:
+                filtered["interactions"] = self._filter_interactions(
+                    result["interactions"]
+                )
+            return filtered
+
+        if _is_classified_tool_failure(result):
+            # ``success``/``is_error`` were matched by identity above, so
+            # they are literally ``False``/``True``; the two caller-supplied
+            # classification values are re-checked before bypassing the
+            # filter. Only ``"error"`` can reach this branch for ``status``:
+            # both producers of the ``success=False``/``is_error=True`` pair
+            # hardcode it (agent_tool._classified_failure,
+            # mcp_adapter._run_unavailable), and a waiting result is handled
+            # above. Exact plain-string match keeps a ``str`` subclass from
+            # writing itself back unfiltered.
+            filtered["success"] = result["success"]
+            filtered["is_error"] = result["is_error"]
+            status = result.get("status")
+            if type(status) is str and status == "error":
+                filtered["status"] = status
+            normalized_failure_code = normalize_tool_failure_code(
+                result.get("failure_code")
             )
-        if "interactions" in result:
-            filtered["interactions"] = self._filter_interactions(result["interactions"])
+            if normalized_failure_code is not None:
+                filtered["failure_code"] = normalized_failure_code
+            for key in ("error", "output", "response"):
+                if key in result:
+                    filtered[key] = self._filter.filter(result[key], self._target.name)
+            return filtered
+
         return filtered
 
     def _filter_interactions(self, interactions: Any) -> Any:

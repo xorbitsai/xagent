@@ -47,25 +47,37 @@ class Workforce(Base):  # type: ignore[no-any-unimported]
 
     owner = relationship("User", foreign_keys=[owner_user_id])
     manager_agent = relationship("Agent", foreign_keys=[manager_agent_id])
+    # passive_deletes=True on all four: their child FK is a real
+    # ON DELETE CASCADE (workforce_agents.workforce_id, workforce_runs.
+    # workforce_id, workforce_builder_messages.workforce_id, agent_triggers.
+    # workforce_id) and this project enables SQLite foreign-key enforcement
+    # per connection (db/sqlite.py's PRAGMA foreign_keys=ON), so deleting a
+    # Workforce can rely on the database to cascade-delete these rows
+    # instead of the ORM loading and deleting every child row in Python one
+    # at a time.
     workers = relationship(
         "WorkforceAgent",
         back_populates="workforce",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     runs = relationship(
         "WorkforceRun",
         back_populates="workforce",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     builder_messages = relationship(
         "WorkforceBuilderMessage",
         back_populates="workforce",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     triggers = relationship(
         "AgentTrigger",
         back_populates="workforce",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -119,10 +131,13 @@ class WorkforceRun(Base):  # type: ignore[no-any-unimported]
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    # Nullable: ephemeral preview runs (test-before-save in the workforce
+    # builder) have a manager + inline worker configs but no persisted
+    # Workforce row to point at.
     workforce_id = Column(
         Integer,
         ForeignKey("workforces.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     task_id = Column(
@@ -140,6 +155,25 @@ class WorkforceRun(Base):  # type: ignore[no-any-unimported]
     snapshot = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # Bumped on every sync_workforce_run_status call (workforce_runtime.py)
+    # that actually changes this row, i.e. once per turn of an active
+    # conversation. created_at alone can't tell a genuinely-abandoned preview
+    # run from one that's mid-conversation but has simply been open a long
+    # time -- the preview-run reaper keys staleness off this column instead
+    # (PR review round 8, F-NEW-1: reaping off created_at could permanently
+    # cancel an actively-used preview session).
+    #
+    # The precise "only on a real transition" semantics above come from
+    # sync_workforce_run_status's own `changed` check, which sets this
+    # column explicitly -- NOT from the onupdate=func.now() below, which is
+    # a blunter instrument: it fires on *any* UPDATE statement that touches
+    # this row, transition or not. That only lines up with the comment above
+    # today because sync_workforce_run_status is the only code path that
+    # updates WorkforceRun rows; it would stop lining up the moment another
+    # write path is added without the same guard.
+    last_activity_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
     workforce = relationship("Workforce", back_populates="runs")
     task = relationship("Task")

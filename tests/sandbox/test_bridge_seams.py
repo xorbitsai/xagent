@@ -46,7 +46,7 @@ def event_loop():
 
 @pytest.fixture(scope="module")
 def docker_service():
-    return DockerSandboxService(MemDockerStore())
+    return DockerSandboxService(MemDockerStore(), namespace="test")
 
 
 def _unique_name(prefix: str) -> str:
@@ -132,9 +132,11 @@ class TestBridgeSeams:
         the live label/facts, so a container with a verified label but no
         store row still reports MATCH here. Recognizing that this
         specific combination (label present, store row absent) is the one
-        case reconciliation must always treat as needing a rebuild is a
-        consumer-side contract documented on spec_matches_inspection() in
-        base.py, not something this matcher call enforces on its own.
+        case reconciliation must always treat as needing a store-row
+        backfill — never a rebuild, since the label already attests the
+        live container matches desired — is a consumer-side contract
+        documented on spec_matches_inspection() in base.py, not something
+        this matcher call enforces on its own.
         """
         service = docker_service
         name = _unique_name("bridge-no-store-row")

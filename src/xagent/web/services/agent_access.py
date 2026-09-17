@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..models.agent import Agent, AgentOrigin, AgentStatus
@@ -166,7 +167,31 @@ def list_accessible_published_agents(
     purpose: str = "workforce_select",
     exclude_agent_ids: Iterable[int] | None = None,
     include_private_workforce_manager_agents: bool = False,
+    limit: int | None = None,
 ) -> list[Agent]:
+    if limit is not None:
+        bounded_limit = max(1, int(limit))
+        excluded = _normalize_excluded_agent_ids(exclude_agent_ids)
+        team_scope = get_agent_team_scope(db, int(user.id))
+        access_clauses = [owned_agent_clause(int(user.id), team_scope)]
+        if user.is_admin:
+            access_query = db.query(Agent)
+        else:
+            visible_agent_ids = get_visible_agent_ids(db, user, purpose)
+            if visible_agent_ids:
+                access_clauses.append(
+                    (Agent.id.in_(visible_agent_ids)) & (Agent.visibility != "admins")
+                )
+            access_query = db.query(Agent).filter(or_(*access_clauses))
+        access_query = access_query.filter(
+            Agent.__table__.c.status == AgentStatus.PUBLISHED.value
+        )
+        if excluded:
+            access_query = access_query.filter(Agent.id.notin_(excluded))
+        if not include_private_workforce_manager_agents:
+            access_query = _exclude_private_workforce_manager_agents(access_query)
+        return list(access_query.order_by(Agent.id).limit(bounded_limit).all())
+
     return [
         item.agent
         for item in list_accessible_published_agent_items(

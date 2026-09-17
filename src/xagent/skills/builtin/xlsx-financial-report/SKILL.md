@@ -1,19 +1,12 @@
 ---
 name: xlsx-financial-report
 description: |
-  Generate a native Excel (.xlsx) file styled as a clean financial /
-  KPI / dashboard report. Use when the user asks for an "Excel report",
-  "financial report", "KPI dashboard", "monthly report", ".xlsx", or
-  similar tabular deliverable where the output must look professional
-  (not just raw data). Output is a single .xlsx file produced via
-  `openpyxl` through the `execute_python_code` tool. Output opens cleanly
-  in Excel / Google Sheets / Numbers.
-  Do NOT use this skill for ad-hoc data exploration or raw CSV dumps —
-  use the regular `excel` tool for those.
+  A native .xlsx styled as a financial, KPI, or dashboard report:
+  "Excel report", "financial report", "KPI dashboard", "monthly report".
+  Opens cleanly in Excel / Google Sheets / Numbers.
 when_to_use: |
-  When the user wants a polished financial / KPI / dashboard Excel deliverable
-  (xlsx) where the file is meant to be opened and skimmed — not raw data dumps.
-  Use the regular `excel` tool instead for ad-hoc exploration / CSV-style output.
+  A polished xlsx meant to be opened and skimmed, not a raw data dump. Use the
+  regular excel tool instead for ad-hoc exploration or CSV-style output.
 tags:
   - xlsx
   - excel

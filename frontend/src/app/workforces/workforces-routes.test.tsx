@@ -12,8 +12,10 @@ const listWorkforceRunsMock = vi.hoisted(() => vi.fn())
 const runWorkforceMock = vi.hoisted(() => vi.fn())
 const addWorkforceAgentMock = vi.hoisted(() => vi.fn())
 const archiveWorkforceMock = vi.hoisted(() => vi.fn())
+const deleteWorkforcePermanentlyMock = vi.hoisted(() => vi.fn())
 const publishWorkforceMock = vi.hoisted(() => vi.fn())
 const removeWorkforceAgentMock = vi.hoisted(() => vi.fn())
+const unarchiveWorkforceMock = vi.hoisted(() => vi.fn())
 const unpublishWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceAgentMock = vi.hoisted(() => vi.fn())
@@ -24,6 +26,7 @@ const closeFilePreviewMock = vi.hoisted(() => vi.fn())
 const dispatchMock = vi.hoisted(() => vi.fn())
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const toastSuccessMock = vi.hoisted(() => vi.fn())
 const workforceAppState = vi.hoisted(() => ({
   currentTask: null as null | { id: string; status: string },
   traceEvents: [] as Array<Record<string, unknown>>,
@@ -82,6 +85,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
     getFileDownloadUrl: (fileId: string) => `/api/files/${fileId}/download`,
     state: workforceAppState,
   }),
+  isTerminalTaskStatus: (status: string | null | undefined) => status === "completed" || status === "failed",
 }))
 
 vi.mock("@/components/task/task-conversation-panel", () => ({
@@ -139,9 +143,30 @@ vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
 }))
 
+vi.mock("@/components/ui/confirm-dialog", () => ({
+  ConfirmDialog: ({
+    isOpen,
+    onConfirm,
+  }: {
+    isOpen: boolean
+    onConfirm: () => void
+  }) => (isOpen ? <button onClick={onConfirm}>confirm-delete</button> : null),
+}))
+
+// Same simplification as build/page.test.tsx's Popover mock: render every
+// menu item unconditionally rather than driving Radix's real open/close
+// state, so tests can click a menu action directly instead of simulating
+// a trigger click + portal + floating-ui positioning first.
+vi.mock("@/components/ui/popover", () => ({
+  Popover: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  PopoverTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  PopoverContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+}))
+
 vi.mock("@/lib/workforces-api", () => ({
   addWorkforceAgent: addWorkforceAgentMock,
   archiveWorkforce: archiveWorkforceMock,
+  deleteWorkforcePermanently: deleteWorkforcePermanentlyMock,
   getWorkforce: getWorkforceMock,
   getWorkforceAgentExecution: getWorkforceAgentExecutionMock,
   getWorkforceRun: getWorkforceRunMock,
@@ -151,6 +176,7 @@ vi.mock("@/lib/workforces-api", () => ({
   publishWorkforce: publishWorkforceMock,
   removeWorkforceAgent: removeWorkforceAgentMock,
   runWorkforce: runWorkforceMock,
+  unarchiveWorkforce: unarchiveWorkforceMock,
   unpublishWorkforce: unpublishWorkforceMock,
   updateWorkforce: updateWorkforceMock,
   updateWorkforceAgent: updateWorkforceAgentMock,
@@ -159,7 +185,7 @@ vi.mock("@/lib/workforces-api", () => ({
 vi.mock("sonner", () => ({
   toast: {
     error: toastErrorMock,
-    success: vi.fn(),
+    success: toastSuccessMock,
   },
 }))
 
@@ -297,8 +323,10 @@ describe("workforce route entry points", () => {
     runWorkforceMock.mockReset()
     addWorkforceAgentMock.mockReset()
     archiveWorkforceMock.mockReset()
+    deleteWorkforcePermanentlyMock.mockReset()
     publishWorkforceMock.mockReset()
     removeWorkforceAgentMock.mockReset()
+    unarchiveWorkforceMock.mockReset()
     unpublishWorkforceMock.mockReset()
     updateWorkforceMock.mockReset()
     updateWorkforceAgentMock.mockReset()
@@ -309,6 +337,7 @@ describe("workforce route entry points", () => {
     dispatchMock.mockReset()
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
+    toastSuccessMock.mockReset()
     workforceAppState.currentTask = null
     workforceAppState.traceEvents = []
     workforceAppState.filePreview = {
@@ -571,36 +600,253 @@ describe("workforce route entry points", () => {
     expect(screen.getByRole("button", { name: /workforces.actions.run/ })).toBeDisabled()
   })
 
-  it("uses the shared Runs list on the workforce detail page", async () => {
-    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
-    listWorkforceRunsMock.mockResolvedValueOnce({
+  it("gates the list Deploy button behind the same status check as Run (PR review round 7, finding #3)", async () => {
+    // Regression test: the Deploy hub button used to render unconditionally,
+    // regardless of workforce status -- a regression from the old detail
+    // page, which only ever rendered its equivalent Deploy button when
+    // status === "active". Restoring the gate means a user can no longer
+    // mint live REST API keys or configure webhook triggers against a draft
+    // or archived workforce with no warning.
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
       items: [
         {
-          id: 9,
-          task_id: 99,
-          status: "completed",
-          is_preview: false,
-          task_title: "Launch Workforce: draft plan",
-          message: "draft plan",
-          created_at: "2026-07-19T10:00:00Z",
-          completed_at: "2026-07-19T10:03:00Z",
+          ...listResponse.items[0],
+          id: 43,
+          name: "Draft Workforce",
+          status: "draft",
+          last_run: null,
         },
       ],
-      total: 1,
-      page: 1,
-      size: 20,
-      pages: 1,
     })
 
-    render(<WorkforceDetailPage />)
+    render(<WorkforcesPage />)
 
-    fireEvent.click(
-      await screen.findByRole("button", { name: /workforces.runs.title/ }),
-    )
-    fireEvent.click(await screen.findByText("Launch Workforce: draft plan"))
+    expect(await screen.findByText("Draft Workforce")).toBeInTheDocument()
+    // Deploy-specific wording, not Run's -- a disabled Deploy button reusing
+    // Run's tooltip text verbatim ("...before running it") would be
+    // confusing on a button that mints API keys / configures webhooks.
+    const deployButton = screen.getByTitle("workforces.deploy.inactiveDisabled")
+    expect(deployButton).toBeDisabled()
+  })
 
-    expect(listWorkforceRunsMock).toHaveBeenCalledWith("42", { page: 1, size: 20 })
-    expect(routerPushMock).toHaveBeenCalledWith("/workforces/42/run?run=9")
+  it("unarchives a workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "archived" }],
+    })
+    unarchiveWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, status: "draft" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+
+    render(<WorkforcesPage />)
+
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.unarchive" }))
+
+    await waitFor(() => {
+      expect(unarchiveWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    // Reloads the list after a successful unarchive, same as archive/publish.
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.unarchived")
+  })
+
+  it("publishes a draft workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+    publishWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, status: "active" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "active" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.publish" }))
+
+    await waitFor(() => {
+      expect(publishWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.published")
+  })
+
+  it("unpublishes an active workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse) // fixture default status: "active"
+    unpublishWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, status: "draft" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.unpublish" }))
+
+    await waitFor(() => {
+      expect(unpublishWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.unpublished")
+  })
+
+  it("archives a workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse) // fixture default status: "active"
+    archiveWorkforceMock.mockResolvedValueOnce({ id: 42, status: "archived" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "archived" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.archive" }))
+
+    await waitFor(() => {
+      expect(archiveWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.archived")
+  })
+
+  it("shows an error toast when permanent delete fails", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse)
+    deleteWorkforcePermanentlyMock.mockRejectedValueOnce(new Error("Failed to delete workforce"))
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.delete" }))
+    fireEvent.click(await screen.findByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("Failed to delete workforce")
+    })
+    // A failed delete must not reload the list as if it succeeded.
+    expect(listWorkforcesMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("hides Archive/Publish/Unpublish on an archived card's menu", async () => {
+    // The Popover mock renders its content unconditionally (ignores `open`),
+    // so this exercises page.tsx's own per-status conditional rendering --
+    // an archived card must only ever offer Unarchive and Delete.
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "archived" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+
+    expect(screen.getByRole("button", { name: "workforces.actions.unarchive" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.delete" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.archive" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.publish" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unpublish" })).not.toBeInTheDocument()
+  })
+
+  it("shows Unpublish + Archive (not Publish/Unarchive) on an active card's menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse) // fixture default status: "active"
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+
+    expect(screen.getByRole("button", { name: "workforces.actions.unpublish" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.archive" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.delete" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.publish" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unarchive" })).not.toBeInTheDocument()
+  })
+
+  it("shows Publish + Archive (not Unpublish/Unarchive) on a draft card's menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+
+    expect(screen.getByRole("button", { name: "workforces.actions.publish" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.archive" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.delete" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unpublish" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unarchive" })).not.toBeInTheDocument()
+  })
+
+  it("deletes a workforce from the list card's three-dot menu through the confirm dialog", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse)
+    deleteWorkforcePermanentlyMock.mockResolvedValueOnce(undefined)
+    listWorkforcesMock.mockResolvedValueOnce({ ...listResponse, items: [], total: 0, pages: 0 })
+
+    render(<WorkforcesPage />)
+
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.delete" }))
+    // ConfirmDialog is mocked to a plain button once open -- the Delete menu
+    // item only opens it, the actual deleteWorkforcePermanently call is
+    // gated behind this second click.
+    expect(deleteWorkforcePermanentlyMock).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(deleteWorkforcePermanentlyMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  it("steps pagination back when deleting the last card on a page beyond the first", async () => {
+    // Regression coverage for the out-of-range-page fix: deleting the only
+    // item on page 2 must not reload page 2 as-is (the backend would return
+    // zero items for it, rendering the "no workforces" empty state with
+    // pagination hidden since `pages` shrank below the stale page value).
+    listWorkforcesMock
+      // Initial page-1 load: pages > 1 so the Next button renders.
+      .mockResolvedValueOnce({ ...listResponse, pages: 2, total: 11 })
+      // After clicking Next: a single item on page 2.
+      .mockResolvedValueOnce({
+        ...listResponse,
+        items: [{ ...listResponse.items[0], id: 99, name: "Only Item On Page Two" }],
+        pages: 2,
+        total: 11,
+      })
+    deleteWorkforcePermanentlyMock.mockResolvedValueOnce(undefined)
+    // Reload after the step-back: back to the normal page-1 fixture.
+    listWorkforcesMock.mockResolvedValueOnce({ ...listResponse, pages: 1, total: 10 })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.pagination.next" }))
+
+    expect(await screen.findByText("Only Item On Page Two")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.delete" }))
+    fireEvent.click(await screen.findByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(deleteWorkforcePermanentlyMock).toHaveBeenCalledWith(99)
+    })
+    // The reload after stepping back must have been for page 1, not a
+    // re-fetch of the now out-of-range page 2.
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ page: 1 }),
+      )
+    })
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
   })
 
   it("runs an active workforce and opens the created task", async () => {
@@ -648,6 +894,36 @@ describe("workforce route entry points", () => {
       "data-show-task-files",
       "true",
     )
+  })
+
+  it("resets to the empty composer when New run is clicked without a run query param", async () => {
+    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
+    runWorkforceMock.mockResolvedValueOnce({
+      workforce_run_id: 5,
+      task_id: 99,
+      status: "running",
+      redirect_url: "/task/99",
+    })
+
+    const { container } = render(<WorkforceRunPage />)
+
+    const textarea = await screen.findByPlaceholderText("workforces.run.placeholder")
+    fireEvent.change(textarea, { target: { value: "Draft launch plan" } })
+
+    await waitFor(() => {
+      const submitBtn = container.querySelector("textarea + button:not([disabled])")
+      expect(submitBtn).not.toBeNull()
+    })
+    fireEvent.click(container.querySelector("textarea + button:not([disabled])")!)
+
+    expect(await screen.findByTestId("task-conversation-panel")).toBeInTheDocument()
+
+    fireEvent.click(await screen.findByRole("button", { name: "workforces.runs.title" }))
+    fireEvent.click(await screen.findByRole("button", { name: "workforces.run.newRun" }))
+
+    expect(routerPushMock).not.toHaveBeenCalled()
+    expect(screen.queryByTestId("task-conversation-panel")).not.toBeInTheDocument()
+    expect(await screen.findByText("workforces.run.readyTitle")).toBeInTheDocument()
   })
 
   it("opens a historical run from the shared Runs popover", async () => {
@@ -863,36 +1139,85 @@ describe("workforce route entry points", () => {
     })
   })
 
-  it("shows run history in the detail page runs tab and opens a run", async () => {
+  it("starts a fresh test run instead of continuing a stale one after the config changes mid-session", async () => {
     getWorkforceMock.mockResolvedValueOnce(workforceDetail)
-    listWorkforceRunsMock.mockResolvedValue({
-      items: [
+    listAgentOptionsMock.mockResolvedValueOnce([
+      {
+        id: 8,
+        name: "Worker Agent",
+        description: null,
+        logo_url: null,
+        status: "published",
+      },
+    ])
+    runWorkforceMock
+      .mockResolvedValueOnce({
+        workforce_run_id: 6,
+        task_id: 100,
+        status: "running",
+        redirect_url: "/task/100",
+      })
+      .mockResolvedValueOnce({
+        workforce_run_id: 7,
+        task_id: 200,
+        status: "running",
+        redirect_url: "/task/200",
+      })
+    addWorkforceAgentMock.mockResolvedValueOnce({ id: 101 })
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      workers: [
         {
-          id: 9,
-          task_id: 99,
-          status: "completed",
-          is_preview: false,
-          task_title: "Launch Workforce: draft plan",
-          message: "draft plan",
-          created_at: "2026-07-19T10:00:00Z",
-          completed_at: "2026-07-19T10:03:00Z",
+          id: 100,
+          agent: {
+            id: 8,
+            name: "Worker Agent",
+            description: null,
+            logo_url: null,
+            status: "published",
+          },
+          alias: null,
+          assignment_instructions: "Worker Agent",
+          source_type: "existing",
+          template_id: null,
+          enabled: true,
+          sort_order: 1,
+          canvas_position: null,
+          created_at: null,
+          updated_at: null,
         },
       ],
-      total: 1,
-      page: 1,
-      size: 20,
-      pages: 1,
     })
 
     render(<WorkforceDetailPage />)
 
-    fireEvent.click(await screen.findByRole("button", { name: /workforces.runs.title/ }))
+    // First test message pins a run in flight.
+    fireEvent.click(await screen.findByRole("button", { name: "Send Test" }))
+    await waitFor(() => {
+      expect(runWorkforceMock).toHaveBeenCalledTimes(1)
+    })
 
-    const runRow = await screen.findByText("Launch Workforce: draft plan")
-    expect(listWorkforceRunsMock).toHaveBeenCalledWith("42", { page: 1, size: 20 })
+    // Editing the roster mid-session -- this persists immediately and must
+    // invalidate the pinned run, since its snapshot no longer matches.
+    fireEvent.click(screen.getByText("workforces.actions.addAgent"))
+    fireEvent.click(await screen.findByText("Worker Agent"))
+    await waitFor(() => {
+      expect(addWorkforceAgentMock).toHaveBeenCalled()
+    })
 
-    fireEvent.click(runRow)
-    expect(routerPushMock).toHaveBeenCalledWith("/workforces/42/run?run=9")
+    // A later test message must start a brand-new run (second runWorkforce
+    // call) instead of silently continuing to chat into the run pinned
+    // before the edit, which would test a config that no longer exists.
+    fireEvent.click(await screen.findByRole("button", { name: "Send Test" }))
+    await waitFor(() => {
+      expect(runWorkforceMock).toHaveBeenCalledTimes(2)
+    })
+    expect(runWorkforceMock).toHaveBeenLastCalledWith("42", {
+      files: [],
+      is_preview: true,
+      is_visible: false,
+      message: "test message",
+    })
   })
 
   it("opens a past run on the run page via the run query param", async () => {
@@ -989,6 +1314,43 @@ describe("workforce route entry points", () => {
     })
   })
 
+  it("opens the member detail dialog when a worker card is activated via keyboard", async () => {
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      workers: [
+        {
+          id: 100,
+          agent: {
+            id: 8,
+            name: "Worker Agent",
+            description: null,
+            logo_url: null,
+            status: "published",
+          },
+          alias: "Researcher",
+          assignment_instructions: "Research launch tasks",
+          source_type: "existing",
+          template_id: null,
+          enabled: true,
+          sort_order: 1,
+          canvas_position: null,
+          created_at: null,
+          updated_at: null,
+        },
+      ],
+    })
+    listAgentOptionsMock.mockResolvedValueOnce([])
+
+    render(<WorkforceDetailPage />)
+
+    const card = (await screen.findByText("Researcher")).closest('[role="button"]')!
+    expect(card).toHaveAttribute("tabIndex", "0")
+    fireEvent.keyDown(card, { key: "Enter" })
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument()
+    expect(within(screen.getByRole("dialog")).getByDisplayValue("Research launch tasks")).toBeInTheDocument()
+  })
+
   it("keeps the detail page visible while refreshing after adding a worker", async () => {
     const agentOptions = [
       {
@@ -1056,6 +1418,62 @@ describe("workforce route entry points", () => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
     })
     expect(await screen.findByText("Worker Agent")).toBeInTheDocument()
+  })
+
+  it("does not collide with a surviving worker's sort_order when the roster has a gap", async () => {
+    getWorkforceMock.mockResolvedValueOnce({
+      ...workforceDetail,
+      workers: [
+        {
+          id: 100,
+          agent: {
+            id: 8,
+            name: "Analyst",
+            description: null,
+            logo_url: null,
+            status: "published",
+          },
+          alias: null,
+          assignment_instructions: "Research launch tasks",
+          source_type: "existing",
+          template_id: null,
+          enabled: true,
+          // A middle worker was removed earlier, leaving a gap (no #2):
+          // length (1) + 1 would recompute 2, which happens to still be
+          // free here, so use 3 to force a real collision against length+1.
+          sort_order: 3,
+          canvas_position: null,
+          created_at: null,
+          updated_at: null,
+        },
+      ],
+    })
+    listAgentOptionsMock.mockResolvedValueOnce([
+      {
+        id: 9,
+        name: "New Recruit",
+        description: null,
+        logo_url: null,
+        status: "published",
+      },
+    ])
+    addWorkforceAgentMock.mockResolvedValueOnce({ id: 102 })
+
+    render(<WorkforceDetailPage />)
+
+    fireEvent.click(await screen.findByText("workforces.actions.addAgent"))
+    fireEvent.click((await screen.findByText("New Recruit")).closest("button")!)
+
+    await waitFor(() => {
+      expect(addWorkforceAgentMock).toHaveBeenCalledWith("42", {
+        agent_id: 9,
+        alias: undefined,
+        assignment_instructions: "New Recruit",
+        enabled: true,
+        sort_order: 4,
+        source_type: "existing",
+      })
+    })
   })
 
 })

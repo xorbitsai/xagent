@@ -2,7 +2,11 @@ import asyncio
 import json
 import logging
 import os
-from contextlib import suppress
+import random
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from typing import Any, cast
 
 from fastapi import FastAPI, Request
@@ -15,23 +19,46 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..config import (
     get_agent_runtime,
+    get_background_job_sweep_interval_seconds,
+    get_external_upload_dirs,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
+    get_orphan_upload_sweep_interval_seconds,
     get_session_secret,
+    get_shared_task_execution_enabled,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
+    get_taskless_upload_ttl_seconds,
+    get_temp_file_cleanup_shutdown_timeout_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_trigger_dispatcher_startup_jitter_seconds,
     get_uploaded_file_recovery_batch_size,
     get_uploaded_file_recovery_interval_seconds,
     get_uploaded_file_recovery_stale_seconds,
     get_uploads_dir,
 )
+from ..core.execution_scope import (
+    ExecutionScopeAuthorityError,
+    ExecutionScopeResolverContractError,
+)
+from ..core.file_storage import StorageKeyScopeError
+from ..core.runtime_performance import (
+    initialize_runtime_performance_telemetry,
+    register_observable_gauge,
+    shutdown_runtime_performance_telemetry,
+    start_event_loop_lag_monitor,
+    stop_event_loop_lag_monitor,
+)
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
+from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
 from .api.admin_mcp import admin_mcp_router
+from .api.admin_memory_embedding_authority import (
+    router as admin_memory_embedding_authority_router,
+)
 from .api.admin_users import router as admin_users_router
 from .api.agent_api_keys import router as agent_api_keys_router
 from .api.agents import router as agents_router
@@ -39,8 +66,10 @@ from .api.auth import auth_router
 from .api.channel import router as channel_router
 from .api.chat import chat_router
 from .api.cloud_storage import cloud_router
+from .api.computer import computer_router
 from .api.conversation_logs import router as conversation_logs_router
 from .api.custom_api import custom_api_router
+from .api.deployment_config import router as deployment_config_router
 from .api.files import file_router
 from .api.jobs import jobs_router
 from .api.kb import kb_router
@@ -59,7 +88,7 @@ from .api.templates import router as templates_router
 from .api.tools import tools_router
 from .api.triggers import router as triggers_router
 from .api.v1 import v1_router
-from .api.v1.errors import V1ApiError, v1_api_error_handler
+from .api.v1.errors import V1ApiError, V1ErrorCode, v1_api_error_handler
 from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
@@ -67,23 +96,83 @@ from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
+from .services.connector_team_scope import (
+    ConnectorHookSessionBoundaryError,
+    connector_hook_session_boundary_error_handler,
+)
+from .services.interaction_rollout import (
+    get_interaction_rollout_policy,
+    is_native_schema_ready,
+    mark_native_schema_ready,
+    validate_interaction_rollout_at_startup,
+)
+from .services.local_browser_runtime import (
+    register_local_browser_runtime,
+    unregister_local_browser_runtime,
+)
+from .services.ops_signals import (
+    INTERACTION_ROLLOUT_SCHEMA_ABSENT,
+    clear_degradation,
+    register_degradation,
+)
+from .services.orphan_upload_gc import run_orphan_upload_gc_loop
+from .services.skill_runtime import (
+    SkillRuntimeSessionBoundaryError,
+    skill_runtime_session_boundary_error_handler,
+)
+from .services.task_interaction_schema import interaction_requests_table_exists
 from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
+from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
 setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
 
 logger = logging.getLogger(__name__)
 
-
 __all__ = ["app"]
+
+
+@contextmanager
+def _startup_phase(name: str) -> Iterator[None]:
+    """Log a begin/end pair with duration around a startup phase.
+
+    A slow phase awaited inline with no logs makes a multi-minute stall look
+    like a fast start. One line in, one line out per phase (never per
+    loop/tick) makes the next slow start obvious. A failing phase still logs
+    its end line before the error propagates.
+    """
+    logger.info("startup phase begin: %s", name)
+    started = time.monotonic()
+    try:
+        yield
+    except asyncio.CancelledError:
+        # WHY: CancelledError is a BaseException, so the Exception handler
+        # below misses it and the terminal line would be dropped.
+        logger.error(
+            "startup phase cancelled: %s (after %.2fs)",
+            name,
+            time.monotonic() - started,
+        )
+        raise
+    except Exception:
+        logger.error(
+            "startup phase failed: %s (after %.2fs)", name, time.monotonic() - started
+        )
+        raise
+    else:
+        logger.info("startup phase done: %s (%.2fs)", name, time.monotonic() - started)
 
 
 # Ensure web, uploads directory exists before configuring static files
 uploads_dir = get_uploads_dir()
 uploads_dir.mkdir(parents=True, exist_ok=True)
+# Validate deployment-owned external roots independently of whether a sandbox
+# backend is enabled or supports runtime-spec readiness. Otherwise an ambiguous
+# path can pass health checks and fail only when the first task reads it.
+get_external_upload_dirs()
 
 
 # FastAPI app creation here
@@ -200,12 +289,30 @@ async def _run_trigger_dispatcher(
     *,
     poll_interval_seconds: int,
     batch_size: int,
+    startup_jitter_seconds: int = 0,
 ) -> None:
+    if startup_jitter_seconds > 0:
+        # Runs before the loop below's first tick, which otherwise fires
+        # immediately on startup -- see
+        # get_trigger_dispatcher_startup_jitter_seconds for why that's a
+        # problem right after a container restart.
+        delay = random.uniform(0, startup_jitter_seconds)
+        logger.info(
+            "Trigger dispatcher delaying first tick by %.1fs past startup",
+            delay,
+        )
+        await asyncio.sleep(delay)
+
     from .models.database import get_session_local
     from .services.gmail_triggers import scan_due_gmail_watch_renewals
     from .services.triggers import (
         dispatch_pending_trigger_runs,
         scan_due_scheduled_triggers,
+    )
+    from .services.workforce_runtime import (
+        WorkforceRunPauseTarget,
+        pause_workforce_tasks_after_archive,
+        reap_stale_preview_workforce_runs,
     )
 
     def _scan_due_scheduled_triggers_tick() -> int:
@@ -216,6 +323,19 @@ async def _run_trigger_dispatcher(
         db = SessionLocal()
         try:
             return len(scan_due_scheduled_triggers(db))
+        finally:
+            db.close()
+
+    def _reap_stale_preview_workforce_runs_tick() -> list[WorkforceRunPauseTarget]:
+        # This is the third of three trigger-scan entrypoints (alongside the
+        # Celery Beat and BackgroundJob-driven variants) -- runs in-process
+        # for the same reason _scan_due_scheduled_triggers_tick does: a
+        # deployment without Celery Beat must still reap abandoned
+        # workforce-builder preview runs, not silently skip it.
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            return reap_stale_preview_workforce_runs(db)
         finally:
             db.close()
 
@@ -242,6 +362,7 @@ async def _run_trigger_dispatcher(
 
     loop = asyncio.get_running_loop()
     next_gmail_watch_scan_at = 0.0
+    next_preview_run_reap_at = 0.0
     while True:
         try:
             now = loop.time()
@@ -273,6 +394,31 @@ async def _run_trigger_dispatcher(
                     "Trigger dispatcher processed %s due schedule(s)", processed
                 )
 
+            # Gated on its own, much coarser timer (matching the Gmail
+            # watch-renewal gating above): the staleness threshold this
+            # sweep acts on is hours-scale (get_workforce_preview_run_stale_
+            # seconds, default 7200s), so checking on every dispatcher tick
+            # (as low as a few seconds, get_trigger_dispatcher_interval_
+            # seconds) is unnecessary load with no corresponding benefit.
+            if now >= next_preview_run_reap_at:
+                try:
+                    reaped_pause_targets = await asyncio.to_thread(
+                        _reap_stale_preview_workforce_runs_tick
+                    )
+                    if reaped_pause_targets:
+                        await pause_workforce_tasks_after_archive(
+                            reaped_pause_targets, reason="preview-reap"
+                        )
+                        logger.info(
+                            "Trigger dispatcher paused %s orphaned preview "
+                            "workforce run(s)",
+                            len(reaped_pause_targets),
+                        )
+                finally:
+                    next_preview_run_reap_at = (
+                        now + get_background_job_sweep_interval_seconds()
+                    )
+
             SessionLocal = get_session_local()
             db = SessionLocal()
             try:
@@ -303,18 +449,22 @@ def start_trigger_dispatcher_task(app_instance: FastAPI) -> asyncio.Task[Any] | 
 
     poll_interval_seconds = get_trigger_dispatcher_interval_seconds()
     batch_size = get_trigger_dispatcher_batch_size()
+    startup_jitter_seconds = get_trigger_dispatcher_startup_jitter_seconds()
     task = asyncio.create_task(
         _run_trigger_dispatcher(
             poll_interval_seconds=poll_interval_seconds,
             batch_size=batch_size,
+            startup_jitter_seconds=startup_jitter_seconds,
         )
     )
     _trigger_dispatcher_task = task
     app_instance.state.trigger_dispatcher_task = task
     logger.info(
-        "Started trigger dispatcher task (interval=%ss, batch_size=%s)",
+        "Started trigger dispatcher task (interval=%ss, batch_size=%s, "
+        "startup_jitter=%ss)",
         poll_interval_seconds,
         batch_size,
+        startup_jitter_seconds,
     )
     return task
 
@@ -323,6 +473,11 @@ def start_task_lease_recovery_task(
     app_instance: FastAPI,
 ) -> asyncio.Task[Any] | None:
     """Start automatic expired task-lease recovery for this backend process."""
+
+    from .services.task_execution_host import consumes_task_commands
+
+    if not consumes_task_commands():
+        return None
 
     existing_task = cast(
         asyncio.Task[Any] | None,
@@ -455,6 +610,161 @@ async def stop_uploaded_file_recovery_task(app_instance: FastAPI) -> None:
             )
 
 
+def start_orphan_upload_gc_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the orphan task-less-upload GC loop for this process (#973).
+
+    Runs in-app (like the uploaded-file recovery loop) so every supported
+    deployment reaps abandoned task-less public uploads — the GC must not
+    depend on an optional Celery worker while Gunicorn-only deployments keep
+    accepting task-less uploads.
+    """
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "orphan_upload_gc_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error(
+                "Previous orphan upload GC loop failed",
+                exc_info=failure,
+            )
+        app_instance.state.orphan_upload_gc_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping orphan upload GC loop (test environment)")
+        return None
+
+    poll_interval_seconds = get_orphan_upload_sweep_interval_seconds()
+    ttl_seconds = get_taskless_upload_ttl_seconds()
+    task = asyncio.create_task(
+        run_orphan_upload_gc_loop(
+            poll_interval_seconds=poll_interval_seconds,
+            ttl_seconds=ttl_seconds,
+        )
+    )
+    app_instance.state.orphan_upload_gc_task = task
+    logger.info(
+        "Started orphan upload GC loop (interval=%ss, ttl=%ss)",
+        poll_interval_seconds,
+        ttl_seconds,
+    )
+    return task
+
+
+async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's orphan upload GC loop."""
+
+    task = getattr(app_instance.state, "orphan_upload_gc_task", None)
+    app_instance.state.orphan_upload_gc_task = None
+    if task is not None and not task.done():
+        logger.info("Cancelling orphan upload GC loop...")
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Orphan upload GC loop stopped after failure",
+                exc_info=exc,
+            )
+
+
+def start_temp_file_cleanup_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the background orphaned temp-file cleanup sweep for this process.
+
+    This walks the entire uploads tree and can take minutes on a large tree,
+    so it runs in the background (fire-and-forget scheduling like the
+    uploaded-files reconcile step) instead of being awaited inline, letting
+    the lifespan finish and /health open immediately regardless of tree size.
+
+    Unlike that reconcile task, this one is tracked on app_instance.state and
+    stopped at shutdown: the threading.Event lets the walk unwind
+    cooperatively so a mid-sweep restart does not block process exit on the
+    executor thread. Extracted into its own function (matching
+    start_orphan_upload_gc_task above) so the pytest gate below can be
+    exercised directly in a test without also spinning up the other
+    startup_event background loops.
+    """
+
+    existing_cleanup_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "temp_file_cleanup_task", None),
+    )
+    if existing_cleanup_task is not None and not existing_cleanup_task.done():
+        # WHY: never schedule a second concurrent walk -- it would orphan the
+        # in-flight one and discard its only stop handle. An already-signalled
+        # generation is unwinding, not sweeping, so say so instead of "running".
+        existing_stop = getattr(app_instance.state, "temp_file_cleanup_stop", None)
+        if existing_stop is not None and existing_stop.is_set():
+            logger.warning(
+                "Previous orphaned temp-file cleanup is still unwinding after a "
+                "shutdown signal; this startup gets no sweep"
+            )
+        else:
+            logger.debug(
+                "Orphaned temp-file cleanup already running; not scheduling another"
+            )
+        return existing_cleanup_task
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        # The sweep walks the real uploads tree, which tests must not trigger.
+        logger.info("Skipping orphaned temp-file cleanup (test environment)")
+        return None
+
+    temp_file_cleanup_stop = threading.Event()
+    app_instance.state.temp_file_cleanup_stop = temp_file_cleanup_stop
+
+    async def run_temp_file_cleanup_background() -> None:
+        from .services.storage_maintenance import cleanup_orphaned_temp_files
+
+        started = time.monotonic()
+        logger.info("Background orphaned temp-file cleanup started")
+        try:
+            cleaned_count = await asyncio.to_thread(
+                cleanup_orphaned_temp_files, stop_event=temp_file_cleanup_stop
+            )
+        except Exception:  # noqa: BLE001
+            # WHY: keep the traceback (exc_info) even at WARNING -- the sweep
+            # runs unattended, so a failure has no other surface.
+            logger.warning(
+                "Background orphaned temp-file cleanup failed after %.2fs",
+                time.monotonic() - started,
+                exc_info=True,
+            )
+            return
+        # WHY: this reports duration/count only, and deliberately does NOT
+        # re-read temp_file_cleanup_stop to label the run interrupted. Shutdown
+        # sets that flag as its first statement, so it can flip between the
+        # walk finishing and this coroutine being resumed -- and the walk can
+        # also complete its last directory after the flag is set. Either way a
+        # completed sweep would be logged as truncated. cleanup_orphaned_temp_files
+        # tracks that state internally and logs it authoritatively.
+        logger.info(
+            "Background orphaned temp-file cleanup finished in %.2fs "
+            "(removed %d file(s))",
+            time.monotonic() - started,
+            cleaned_count,
+        )
+
+    task = asyncio.create_task(run_temp_file_cleanup_background())
+    app_instance.state.temp_file_cleanup_task = task
+    logger.info("Scheduled background orphaned temp-file cleanup")
+    return task
+
+
 async def wait_for_file_storage_startup_sync(app_instance: FastAPI) -> None:
     """Wait until durable file storage startup sync has completed successfully."""
     while True:
@@ -563,7 +873,20 @@ async def health_check() -> dict[str, Any]:
 
 @app.get("/ready")
 async def readiness_check() -> JSONResponse:
-    """Readiness check that reflects startup file storage sync status."""
+    """Readiness check for startup file storage sync and, in native
+    interaction-rollout mode, task_interaction_requests schema presence.
+
+    The interaction-rollout segment below is a one-way latch: once the
+    schema has been observed present, this endpoint never queries for it
+    again for the lifetime of the process (the table is only ever added,
+    never dropped, so a stale "present" reading cannot happen). In legacy
+    or read mode the schema check and the database query it would trigger
+    are skipped entirely -- zero added query. The frozen policy read
+    above the mode check always runs regardless of mode, including its
+    RuntimeError-if-uninitialized contract (see
+    ``get_interaction_rollout_policy``'s docstring); that read is cheap
+    (no I/O once the policy is frozen at startup) but it is not skipped.
+    """
     task = getattr(app.state, "file_storage_startup_sync_task", None)
     error = getattr(app.state, "file_storage_startup_sync_error", None)
 
@@ -580,6 +903,54 @@ async def readiness_check() -> JSONResponse:
                 "detail": "Startup file storage sync running",
             },
         )
+
+    policy = get_interaction_rollout_policy()
+    if policy.mode == "native" and not is_native_schema_ready():
+        # If the database itself is unreachable here (connection refused,
+        # timeout), that exception propagates out of this route unhandled
+        # and FastAPI turns it into a 500 -- asymmetric with the deliberate
+        # 503 below for "database reachable, schema not yet migrated".
+        # Accepted: a 500 still fails the readiness probe the same way a
+        # 503 would, and folding "database unreachable" into that same
+        # typed 503 would misreport a connectivity outage as a pending
+        # migration.
+        #
+        # get_session_local is imported here rather than hoisted with the
+        # policy/schema imports above: tests replace
+        # database_module.get_session_local itself with a stub session
+        # factory (see tests/web/test_interaction_rollout_observability.py),
+        # and this import must re-resolve that name from the module on
+        # every call for the replacement to take effect. A module-level
+        # import would bind the original function once at process start
+        # and keep calling it through that binding, silently defeating the
+        # test's monkeypatch.
+        from .models.database import get_session_local
+
+        SessionLocal = get_session_local()
+        db = SessionLocal()
+        try:
+            schema_present = interaction_requests_table_exists(db)
+        finally:
+            db.close()
+
+        if not schema_present:
+            # This endpoint is unauthenticated -- the detail below
+            # deliberately does not name the missing table.
+            register_degradation(
+                INTERACTION_ROLLOUT_SCHEMA_ABSENT,
+                "task_interaction_requests table not present",
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "detail": "Interaction rollout schema not ready",
+                },
+            )
+
+        mark_native_schema_ready()
+        clear_degradation(INTERACTION_ROLLOUT_SCHEMA_ABSENT)
+
     return JSONResponse(status_code=200, content={"status": "ready"})
 
 
@@ -724,6 +1095,87 @@ async def global_exception_handler(request: Request, exc: Exception) -> Any:
     raise exc
 
 
+STORAGE_NAMESPACE_AUTHORITY_MESSAGE = "Storage namespace authority violation."
+
+
+async def storage_namespace_authority_error_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Answer a storage namespace containment/authority fault once, app-wide.
+
+    ``StorageKeyScopeError`` (a storage key outside the prefix its handle is
+    bound to), ``ExecutionScopeAuthorityError`` (the scope resolver and a
+    task's persisted snapshot disagree about the task's namespace) and
+    ``ExecutionScopeResolverContractError`` (a resolver broke its return
+    contract, or a persisted snapshot cannot be decoded at all) are permanent
+    server-side configuration/authority faults. Registering them
+    here instead of at each file endpoint keeps one classification for every
+    route that touches durable storage -- and keeps them out of the retryable
+    503 that ``DurableStorageOperationError`` maps to, since retrying a
+    containment violation can never succeed.
+
+    Status is 500: the fault is on the server, in its own namespace
+    configuration or in a task's persisted scope, and there is nothing for the
+    client to correct or retry. 503 would tell operators and clients to wait
+    and retry a condition that is stable until someone changes the
+    configuration, and no 4xx applies because the request itself is
+    well-formed and authorized.
+
+    The response body names the fault and nothing else. Scope segments,
+    storage prefixes, and tenant identifiers can encode end-user identity, and
+    ``str(exc)`` carries them; that detail belongs in the server-side log line
+    below, which records the full traceback.
+
+    ``/v1/*`` keeps the SDK's ``{"error": {"code", "message"}}`` envelope (see
+    web/api/v1/errors.py) -- those endpoints reach durable storage while
+    resolving a turn's attachments, and a bare ``{"detail": ...}`` there would
+    break clients that switch on ``body.error.code``. Every other path gets
+    FastAPI's default ``{"detail": ...}`` shape.
+
+    Only HTTP scopes get a response. Starlette routes websocket exceptions
+    through the same handler table, and websocket file attachments do reach
+    durable storage, but a websocket connection cannot receive an HTTP
+    response -- so those scopes re-raise and stay owned by the connection
+    handler that established them.
+    """
+    logger.error(
+        "Storage namespace authority violation for %s",
+        request.url.path,
+        exc_info=exc,
+    )
+    if request.scope.get("type") != "http":
+        raise exc
+    if request.url.path.startswith("/v1/"):
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": V1ErrorCode.INTERNAL_ERROR.value,
+                    "message": STORAGE_NAMESPACE_AUTHORITY_MESSAGE,
+                }
+            },
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": STORAGE_NAMESPACE_AUTHORITY_MESSAGE},
+    )
+
+
+app.add_exception_handler(
+    StorageKeyScopeError, storage_namespace_authority_error_handler
+)
+# Covers ExecutionScopeAbstentionMismatchError too: Starlette matches a
+# handler by walking the raised exception's MRO.
+app.add_exception_handler(
+    ExecutionScopeAuthorityError, storage_namespace_authority_error_handler
+)
+# A resolver that broke its return contract, or a persisted snapshot that
+# cannot be decoded, is the same permanent authority fault: nothing about the
+# request can be corrected or retried into working.
+app.add_exception_handler(
+    ExecutionScopeResolverContractError, storage_namespace_authority_error_handler
+)
+
 # /v1/* SDK surface uses a stable {"error": {"code", "message"}} envelope
 # distinct from FastAPI's default {"detail": "..."} shape used by /api/*.
 # Typed V1ApiError raises pass through this handler so endpoints can
@@ -731,6 +1183,14 @@ async def global_exception_handler(request: Request, exc: Exception) -> Any:
 # See web/api/v1/errors.py for the contract.
 app.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
 app.add_exception_handler(A2AApiError, a2a_api_error_handler)  # type: ignore[arg-type]
+app.add_exception_handler(
+    SkillRuntimeSessionBoundaryError,
+    cast(Any, skill_runtime_session_boundary_error_handler),
+)
+app.add_exception_handler(
+    ConnectorHookSessionBoundaryError,
+    cast(Any, connector_hook_session_boundary_error_handler),
+)
 
 
 # Add CORS middleware
@@ -760,6 +1220,7 @@ memory_router = MemoryManagementRouter(get_memory_store).get_router()
 app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(cloud_router)
+app.include_router(computer_router)
 app.include_router(conversation_logs_router)
 app.include_router(file_router)
 app.include_router(jobs_router)
@@ -773,8 +1234,11 @@ app.include_router(progress_ws_router)
 app.include_router(memory_router)
 app.include_router(mcp_router)
 app.include_router(custom_api_router)
+app.include_router(deployment_config_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
+app.include_router(admin_interaction_rollout_router)
+app.include_router(admin_memory_embedding_authority_router)
 app.include_router(admin_mcp_router)
 app.include_router(skills_router)
 app.include_router(skill_hub_router)
@@ -793,33 +1257,170 @@ app.include_router(share_router)
 app.include_router(v1_router)
 
 
+def start_runtime_performance_monitor(app_instance: FastAPI) -> None:
+    """Start one event-loop lag sampler for the current app lifespan."""
+
+    existing = getattr(app_instance.state, "runtime_performance_task", None)
+    if existing is not None and not existing.done():
+        return
+    try:
+        if not initialize_runtime_performance_telemetry():
+            app_instance.state.runtime_performance_task = None
+            return
+
+        from .api.websocket import manager
+        from .services.task_execution import background_task_manager
+
+        register_observable_gauge(
+            "xagent.agent_tasks.running",
+            lambda: len(background_task_manager.running_tasks),
+            unit="{task}",
+            description="Current locally running agent tasks",
+        )
+        register_observable_gauge(
+            "xagent.agent_tasks.resuming",
+            lambda: len(background_task_manager.resume_tasks),
+            unit="{task}",
+            description="Current local resume coordinators",
+        )
+        register_observable_gauge(
+            "xagent.websocket.connections",
+            manager.connection_count,
+            unit="{connection}",
+            description="Current task WebSocket connections",
+        )
+        app_instance.state.runtime_performance_task = start_event_loop_lag_monitor()
+    except Exception:
+        # Telemetry is observational and must not block application startup.
+        app_instance.state.runtime_performance_task = None
+        shutdown_runtime_performance_telemetry()
+        logger.warning("Could not start runtime performance monitor", exc_info=True)
+
+
+async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:
+    task = getattr(app_instance.state, "runtime_performance_task", None)
+    app_instance.state.runtime_performance_task = None
+    await stop_event_loop_lag_monitor(task)
+    await asyncio.to_thread(shutdown_runtime_performance_telemetry)
+
+
+async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
+    """Prepare the database, admit the host, then open runtime work ingress."""
+    with _startup_phase("database init"):
+        init_db()
+
+    # Host checks may rely on the fully migrated database. Nothing below this
+    # boundary may admit tasks or launch a writer/dispatcher until every check
+    # has passed. An exception deliberately aborts startup unchanged.
+    with _startup_phase("host admission"):
+        await run_host_startup_admissions(app_instance)
+
+    # Validate the default-on async trace backend before opening task ingress.
+    from .services.trace_database import get_trace_database_runtime
+
+    with _startup_phase("trace database init"):
+        get_trace_database_runtime()
+
+    # Keep built-in task-runtime providers scoped to the application lifespan.
+    # Register even when disabled so task creation receives a precise 403
+    # instead of an ambiguous "unknown extension" error.
+    register_local_browser_runtime()
+
+    # Reopen process-local task admission before any trigger, command, or
+    # channel ingress can create background execution work for this lifespan.
+    from .services.task_execution import background_task_manager
+
+    if not get_shared_task_execution_enabled():
+        background_task_manager.start_accepting()
+
+    start_file_storage_startup_sync_task(app_instance)
+    if not get_shared_task_execution_enabled():
+        start_trigger_dispatcher_task(app_instance)
+        start_task_lease_recovery_task(app_instance)
+    start_uploaded_file_recovery_task(app_instance)
+    start_orphan_upload_gc_task(app_instance)
+
+
+async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
+    """Open shared ingress only after runtime resources and the bridge are ready."""
+    from .api.websocket import manager
+    from .services.task_command_execution import execute_durable_task_command
+    from .services.task_command_transport import (
+        start_task_command_dispatcher,
+        stop_task_command_dispatcher,
+    )
+    from .services.task_coordinator_runtime import close_task_coordinators
+    from .services.task_event_bridge import (
+        start_task_event_bridge,
+        stop_task_event_bridge,
+    )
+    from .services.task_execution import background_task_manager
+
+    global _task_command_dispatcher_task, _trigger_dispatcher_task
+    await start_task_event_bridge(
+        deliver=manager.deliver_shared_event,
+        stream_status=manager.shared_stream_status,
+    )
+    try:
+        manager.start_stream_reconciliation()
+        background_task_manager.start_accepting()
+        start_trigger_dispatcher_task(app_instance)
+        start_task_lease_recovery_task(app_instance)
+        _task_command_dispatcher_task = start_task_command_dispatcher(
+            execute_durable_task_command
+        )
+        app_instance.state.task_command_dispatcher_task = _task_command_dispatcher_task
+    except BaseException:
+        await stop_task_command_dispatcher()
+        await stop_task_lease_recovery_task(app_instance)
+        if _trigger_dispatcher_task is not None:
+            _trigger_dispatcher_task.cancel()
+            await asyncio.gather(_trigger_dispatcher_task, return_exceptions=True)
+            _trigger_dispatcher_task = None
+        await close_task_coordinators()
+        await background_task_manager.shutdown()
+        await manager.stop_stream_reconciliation()
+        await stop_task_event_bridge()
+        raise
+
+
 # initial database and skill manager
 @app.on_event("startup")
 async def startup_event() -> None:
     global _migration_task
+    from ..config import get_task_execution_role, validate_task_execution_host_config
+
+    validate_task_execution_host_config()
+    if get_task_execution_role() == "worker":
+        raise ValueError("Use python -m xagent.web.worker for the worker role")
     logger.info("Agent runtime configured: %s", get_agent_runtime())
-    logger.info("Initializing database...")
-    init_db()
-    logger.info("Database initialized successfully")
+    validate_interaction_rollout_at_startup()
+    await _initialize_database_and_admit_runtime(app)
 
-    # Reopen process-local task admission before any trigger, command, or
-    # channel ingress can create background execution work for this lifespan.
-    from .api.websocket import background_task_manager
-
-    background_task_manager.start_accepting()
-
-    start_file_storage_startup_sync_task(app)
-    start_trigger_dispatcher_task(app)
-    start_task_lease_recovery_task(app)
-    start_uploaded_file_recovery_task(app)
-
-    # Persisted ExecutionScope snapshots (workforce sub-tasks) are preferred
-    # over the embedder's resolver during per-task scope resolution.
+    # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a
+    # sub-task scoped across process restarts. With no resolver registered
+    # they are the sole answer; with one registered they are a
+    # corroborating candidate (see
+    # xagent.core.execution_scope.resolve_execution_scope).
+    from ..core.execution_scope import execution_scope_resolver_registered
     from .services.execution_scope_snapshot import (
         register_execution_scope_snapshot_loader,
     )
 
     register_execution_scope_snapshot_loader()
+    # This reflects only whether a resolver is registered at this point in
+    # startup; it is not re-evaluated afterward. An embedder that registers
+    # its resolver later (e.g. from its own startup hook running after this
+    # one) leaves this line reporting "snapshot-only" even once a resolver
+    # is in fact authoritative -- the mode itself is live and re-checked on
+    # every resolution (see resolve_execution_scope), only this log line is
+    # a startup-time snapshot of it.
+    logger.info(
+        "Execution scope authority mode at startup: %s",
+        "resolver-authoritative (snapshot is a corroborating candidate)"
+        if execution_scope_resolver_registered()
+        else "snapshot-only (no resolver registered yet)",
+    )
 
     from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
 
@@ -827,9 +1428,11 @@ async def startup_event() -> None:
 
     from .services.trigger_providers.gmail import (
         warn_if_gmail_oidc_verification_degraded,
+        warn_if_gmail_watch_registration_degraded,
     )
 
     warn_if_gmail_oidc_verification_degraded()
+    warn_if_gmail_watch_registration_degraded()
 
     initialize_langfuse()
 
@@ -837,7 +1440,8 @@ async def startup_event() -> None:
     from ..skills.utils import create_skill_manager
 
     skill_manager = create_skill_manager()
-    await skill_manager.initialize()
+    with _startup_phase("skill manager init"):
+        await skill_manager.initialize()
     app.state.skill_manager = skill_manager
     logger.info(
         f"Skill manager initialized with {len(await skill_manager.list_skills())} skills"
@@ -847,7 +1451,8 @@ async def startup_event() -> None:
     from ..templates.utils import create_template_manager
 
     template_manager = create_template_manager()
-    await template_manager.initialize()
+    with _startup_phase("template manager init"):
+        await template_manager.initialize()
     app.state.template_manager = template_manager
     logger.info(
         f"Template manager initialized with {len(await template_manager.list_templates())} templates"
@@ -1203,32 +1808,30 @@ async def startup_event() -> None:
         asyncio.create_task(run_uploaded_file_reconcile_background())
         logger.info("Started background uploaded files reconcile task")
 
-        # Clean up orphaned temporary files from interrupted atomic replacements
-        try:
-            from .api.kb import cleanup_orphaned_temp_files
-
-            def _run_temp_file_cleanup() -> int:
-                return cleanup_orphaned_temp_files()
-
-            cleaned_count = await asyncio.to_thread(_run_temp_file_cleanup)
-            if cleaned_count > 0:
-                logger.info(
-                    "Startup cleanup: removed %d orphaned temporary file(s)",
-                    cleaned_count,
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Temporary file cleanup skipped due to error: %s",
-                e,
-            )
-
     # Warmup sandbox manager
-    from .sandbox_manager import get_sandbox_manager
+    from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 
-    sandbox_mgr = get_sandbox_manager()
+    # WHY: the getter can construct the backend service and inventory
+    # containers on a cold process, so a hang here needs its own phase line.
+    with _startup_phase("sandbox manager init"):
+        sandbox_mgr = get_sandbox_manager()
     if sandbox_mgr:
-        await sandbox_mgr.cleanup()
-        await sandbox_mgr.warmup()
+        # Readiness runs before cleanup/warmup and is deliberately not
+        # wrapped in try/except: a static SANDBOX_VOLUMES/code-mount/
+        # external-upload-dir conflict must fail startup outright rather
+        # than surface later as a per-task SandboxRuntimeConflictError.
+        # This also resolves and caches the backend-capability probe as a
+        # side effect, so cleanup() below reads the cached value instead of
+        # resolving it again.
+        # cleanup() quiesce can be awaited inline for minutes with no logs.
+        # Time each sub-phase so the next slow start names the exact one; the
+        # quiesce summary breaks it down further.
+        with _startup_phase("sandbox static readiness"):
+            await check_sandbox_static_readiness(sandbox_mgr)
+        with _startup_phase("sandbox cleanup"):
+            await sandbox_mgr.cleanup()
+        with _startup_phase("sandbox warmup"):
+            await sandbox_mgr.warmup()
         logger.info("Sandbox manager initialized and warmed up")
 
         from ..config import get_sandbox_idle_ttl
@@ -1244,34 +1847,64 @@ async def startup_event() -> None:
 
     # Recover accepted-but-unfinished task commands only after the runtime,
     # skill/template managers, tracing, and sandbox services are ready.
-    from .api.websocket import execute_durable_task_command
+    from .services.task_command_execution import execute_durable_task_command
     from .services.task_command_transport import start_task_command_dispatcher
 
     global _task_command_dispatcher_task
-    _task_command_dispatcher_task = start_task_command_dispatcher(
-        execute_durable_task_command
-    )
-    app.state.task_command_dispatcher_task = _task_command_dispatcher_task
-    logger.info("Started durable task command dispatcher")
+    if get_shared_task_execution_enabled():
+        await _start_shared_task_runtime(app)
+    else:
+        _task_command_dispatcher_task = start_task_command_dispatcher(
+            execute_durable_task_command
+        )
+        app.state.task_command_dispatcher_task = _task_command_dispatcher_task
+    logger.info("Task command dispatch configured")
 
-    # Start Telegram and FeiShu channels if enabled
+    # Start configured chat channels.
     try:
         from .channels.feishu.bot import get_feishu_channel
+        from .channels.slack.bot import get_slack_channel
         from .channels.telegram.bot import get_telegram_channel
 
         telegram_channel = get_telegram_channel()
         if telegram_channel.enabled:
             logger.info("Initializing Telegram channel manager...")
             app.state.telegram_task = asyncio.create_task(telegram_channel.start())
-            logger.info("Telegram channel background task created successfully")
+            logger.info(
+                "Telegram channel manager scheduled; connection status follows in manager logs"
+            )
 
         feishu_channel = get_feishu_channel()
         if feishu_channel.enabled:
             logger.info("Initializing Feishu channel manager...")
             app.state.feishu_task = asyncio.create_task(feishu_channel.start())
-            logger.info("Feishu channel background task created successfully")
+            logger.info(
+                "Feishu channel manager scheduled; connection status follows in manager logs"
+            )
+
+        slack_channel = get_slack_channel()
+        if slack_channel.enabled:
+            logger.info("Initializing Slack channel manager...")
+            app.state.slack_task = asyncio.create_task(slack_channel.start())
+            logger.info(
+                "Slack channel manager scheduled; connection status follows in manager logs"
+            )
     except Exception as e:
-        logger.error(f"Failed to start Telegram channel manager: {e}", exc_info=True)
+        logger.error(f"Failed to start chat channel managers: {e}", exc_info=True)
+
+    # Kept under the same migration toggle as the uploaded-files reconcile above;
+    # see start_temp_file_cleanup_task for the backgrounding/shutdown rationale.
+    #
+    # WHY LAST: a startup exception skips Starlette's ``async with`` teardown, so
+    # shutdown_event -- the only place the sweep's stop flag is set -- never runs.
+    # Scheduling before a step that can raise (sandbox static readiness raises on
+    # a mount conflict) leaves the walk sweeping the whole uploads tree in an
+    # executor thread that asyncio.run()'s teardown joins, untimed before 3.12.
+    # WARN: anything appended below must not raise, or must set the flag itself;
+    # test_failed_startup_leaves_no_unsignaled_temp_file_cleanup pins this.
+    if auto_migrate:
+        start_temp_file_cleanup_task(app)
+    start_runtime_performance_monitor(app)
 
 
 @app.on_event("shutdown")
@@ -1283,6 +1916,16 @@ async def shutdown_event() -> None:
         _trigger_dispatcher_task, \
         _sandbox_idle_sweep_task
 
+    # WHY: signal the background temp-file cleanup walk to unwind before any other
+    # teardown runs. It sweeps in an executor thread that a task cancel cannot
+    # stop, and asyncio.run()'s teardown joins that thread at loop close, so if an
+    # earlier shutdown step hangs (e.g. an unresponsive flush_langfuse) the walk
+    # would keep running and block process exit — the exact F1 regression this
+    # guards against. Setting the flag first is unconditional and cannot hang.
+    temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
+    if temp_file_cleanup_stop is not None:
+        temp_file_cleanup_stop.set()
+
     flush_langfuse()
 
     if _task_command_dispatcher_task is not None:
@@ -1291,6 +1934,7 @@ async def shutdown_event() -> None:
         await stop_task_command_dispatcher()
     _task_command_dispatcher_task = None
 
+    await stop_orphan_upload_gc_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_lease_recovery_task(app)
 
@@ -1330,13 +1974,19 @@ async def shutdown_event() -> None:
             with suppress(asyncio.CancelledError):
                 await task
 
-    # Shutdown Telegram channel if enabled
+    # Shutdown chat channels before draining task finalizers.
     try:
-        if hasattr(app.state, "telegram_task"):
-            app.state.telegram_task.cancel()
-            logger.info("Cancelled Telegram polling task")
+        channel_tasks = [
+            task
+            for name in ("telegram_task", "feishu_task", "slack_task")
+            if (task := getattr(app.state, name, None)) is not None
+        ]
+        for task in channel_tasks:
+            task.cancel()
+        await asyncio.gather(*channel_tasks, return_exceptions=True)
 
         from .channels.feishu.bot import get_feishu_channel
+        from .channels.slack.bot import get_slack_channel
         from .channels.telegram.bot import get_telegram_channel
 
         telegram_channel = get_telegram_channel()
@@ -1346,16 +1996,49 @@ async def shutdown_event() -> None:
 
         feishu_channel = get_feishu_channel()
         await feishu_channel.stop()
+
+        slack_channel = get_slack_channel()
+        await slack_channel.stop()
     except Exception as e:
-        logger.error("Failed to stop Telegram channel: %s", e, exc_info=True)
+        logger.error("Failed to stop chat channels: %s", e, exc_info=True)
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.
-    from .api.websocket import background_task_manager
+    from .services.task_coordinator_runtime import close_task_coordinators
+    from .services.task_execution import background_task_manager
     from .services.task_lease_service import wait_for_heartbeat_manager_idle
 
+    await close_task_coordinators()
     await background_task_manager.shutdown()
     await wait_for_heartbeat_manager_idle()
+    if get_shared_task_execution_enabled():
+        from .api.websocket import manager
+        from .services.task_event_bridge import stop_task_event_bridge
+
+        await manager.stop_stream_reconciliation()
+        await stop_task_event_bridge()
+
+    from .services.trace_database import close_trace_database_runtime
+
+    await close_trace_database_runtime()
+
+    # Export task-finalization metrics and post-drain gauges before stopping
+    # telemetry. Exporter shutdown must not delay cancellation of live tasks.
+    await stop_runtime_performance_monitor(app)
+
+    from .services.task_runtime import shutdown_task_runtime_hook_executor
+
+    shutdown_task_runtime_hook_executor()
+    unregister_local_browser_runtime()
+
+    from .services.chrome_mcp_runtime import (
+        shutdown_chrome_execution_session_pool,
+    )
+
+    try:
+        await shutdown_chrome_execution_session_pool()
+    except Exception:
+        logger.error("Failed to drain Chrome execution sessions", exc_info=True)
 
     # Shutdown all sandboxes
     from .sandbox_manager import get_sandbox_manager
@@ -1363,6 +2046,42 @@ async def shutdown_event() -> None:
     sandbox_mgr = get_sandbox_manager()
     if sandbox_mgr:
         await sandbox_mgr.cleanup()
+
+    # Wait briefly for the background orphaned temp-file cleanup to unwind (its
+    # stop flag was already set at the top of this handler). This runs LAST on
+    # purpose: the wait has no ordering dependency on anything above -- the stop
+    # signal is already delivered and this only collects the task -- so putting
+    # it here donates every preceding teardown step's duration to the walk as
+    # free grace time, and keeps its timeout off the critical path of lease
+    # draining and sandbox cleanup, which must finish inside the orchestrator's
+    # termination grace period.
+    #
+    # Use asyncio.wait rather than asyncio.wait_for: wait_for's cancellation only
+    # kills the awaiting coroutine, not the executor thread doing the real work,
+    # so cancelling early buys nothing. It also keeps the walk collectable after
+    # this wait -- on the timeout branch the completion/failure log is lost
+    # either way, since asyncio.run()'s teardown cancels the pending task and
+    # CancelledError is a BaseException the coroutine's handler does not catch.
+    if hasattr(app.state, "temp_file_cleanup_task"):
+        cleanup_task = app.state.temp_file_cleanup_task
+        if cleanup_task and not cleanup_task.done():
+            timeout = get_temp_file_cleanup_shutdown_timeout_seconds()
+            done, _pending = await asyncio.wait({cleanup_task}, timeout=timeout)
+            if not done:
+                logger.warning(
+                    "Orphaned temp-file cleanup still running %ss after stop "
+                    "signal; the executor thread will unwind at its next "
+                    "stop-check boundary",
+                    timeout,
+                )
+        # WHY: only release the handles once the task is actually finished.
+        # Clearing them while the walk is still running would discard its only
+        # stop handle and let a re-entrant startup schedule a second concurrent
+        # sweep over the same tree -- exactly what the guard in
+        # start_temp_file_cleanup_task exists to prevent.
+        if cleanup_task is None or cleanup_task.done():
+            app.state.temp_file_cleanup_task = None
+            app.state.temp_file_cleanup_stop = None
 
 
 from ..config import get_frontend_dist_dir  # noqa: E402

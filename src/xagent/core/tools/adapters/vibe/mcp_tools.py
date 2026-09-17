@@ -3,6 +3,7 @@
 import logging
 from typing import TYPE_CHECKING, Any, List
 
+from ....utils.setup_metrics import mcp_setup
 from .config import (
     MCPConfigLoadError,
     MCPToolLoadSummary,
@@ -168,6 +169,7 @@ async def _finish_mcp_setup(
 
 
 @register_tool(categories={"mcp"}, selection_gate="mcp")
+@mcp_setup.measure()
 async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     """Create MCP tools from configuration.
 
@@ -267,9 +269,20 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     try:
         from .factory import ToolFactory
 
+        identity_getter = getattr(
+            config, "get_actor_mcp_stdio_session_identities", None
+        )
+        session_identities = identity_getter() if callable(identity_getter) else {}
+        consumer_getter = getattr(config, "get_actor_mcp_stdio_session_consumer", None)
+        session_consumer = consumer_getter() if callable(consumer_getter) else None
+        create_kwargs: dict[str, Any] = {"sandbox": config.get_sandbox()}
+        if session_identities:
+            create_kwargs.update(
+                actor_stdio_session_identities=session_identities,
+                actor_stdio_session_consumer=session_consumer,
+            )
         tools = await ToolFactory._create_mcp_tools_from_configs(
-            mcp_configs,
-            sandbox=config.get_sandbox(),
+            mcp_configs, **create_kwargs
         )
     except ConnectorRuntimeError:
         summary = _build_mcp_load_summary(

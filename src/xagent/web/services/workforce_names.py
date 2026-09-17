@@ -9,6 +9,38 @@ from ..models.workforce import Workforce
 from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .workforce_snapshot import normalize_text
 
+# Shared with workforce_creator.py's SAVEPOINT retry around Workforce
+# creation, which needs to tell "a concurrent request took this exact name"
+# apart from any other IntegrityError.
+WORKFORCE_SCOPE_NAME_UNIQUE_INDEX = "uq_workforce_scope_name"
+
+
+def is_workforce_name_unique_violation(error: BaseException) -> bool:
+    """Recognize the authoritative (scope_type, scope_id, name) unique
+    constraint failure - the `Workforce` counterpart to
+    `is_agent_name_unique_violation` in `agent_management.py`. Postgres
+    includes the constraint name in its error message; sqlite instead names
+    the columns. Matching either keeps this from misclassifying an
+    unrelated IntegrityError (e.g. a manager_agent_id FK violation) as a
+    name collision.
+    """
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if WORKFORCE_SCOPE_NAME_UNIQUE_INDEX.lower() in message:
+            return True
+        if (
+            "workforces.scope_type" in message
+            and "workforces.scope_id" in message
+            and "workforces.name" in message
+            and ("unique" in message or "duplicate" in message)
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
 
 def workforce_name_exists(
     db: Session,

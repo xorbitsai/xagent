@@ -115,6 +115,15 @@ class CreateTaskRequest(BaseModel):
             "validated and applied below the LLM/tool-argument layer."
         ),
     )
+    timezone: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "IANA timezone name for the end user's local clock, used to render "
+            "the date the agent reasons from. Omit to keep UTC. An "
+            "unresolvable name degrades to UTC rather than failing the request."
+        ),
+    )
 
 
 class UploadedFileInfo(BaseModel):
@@ -231,10 +240,20 @@ class V1TemplateSummary(BaseModel):
     tags: list[str] = Field(default_factory=list)
     author: str = ""
     version: str = ""
+    type: Literal["agent", "workforce"] = Field(
+        default="agent",
+        description="'agent' for a single-agent template, 'workforce' for a "
+        "manager + worker-agents template that this API does not yet "
+        "support instantiating.",
+    )
 
 
 class V1TemplateDetail(V1TemplateSummary):
-    agent_config: dict[str, Any]
+    agent_config: dict[str, Any] | None = Field(
+        default=None,
+        description="Agent configuration for an 'agent'-type template. None "
+        "for a 'workforce'-type template.",
+    )
 
 
 class CreateTaskResponse(BaseModel):
@@ -358,6 +377,105 @@ class AppendMessageResponse(BaseModel):
     control_state: str = Field(..., description="Detailed task control state.")
 
 
+class ReplyRequest(BaseModel):
+    """Body for ``POST /v1/chat/tasks/{task_id}/reply``.
+
+    Answers the agent's pending question on a task whose
+    ``status == 'waiting_for_user'``, resuming the same run rather than
+    starting a new turn. Owner-scoping fields have the same shape and
+    semantics as :class:`AppendMessageRequest`: agent-bound keys pass
+    ``agent_id`` (required), workforce-bound keys optionally pass
+    ``workforce_id``.
+
+    Deliberately narrower than :class:`AppendMessageRequest`:
+
+    - No ``files``: the resume reattaches to the paused run, which has
+      no turn-file binding point (that only exists when a new turn is
+      claimed).
+    - No ``connector_runtime_context``: the resume reuses the connector
+      context already resolved for the run in progress.
+    - No ``metadata``: not passed through by this endpoint.
+    In shared execution mode, repeat ``command_id`` to retrieve the original
+    command outcome without injecting the answer again. If omitted, the server
+    creates an ID and includes it in the response or uncertain-outcome error.
+    """
+
+    command_id: str | None = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9._:-]+$",
+        description="Stable reply command ID; reuse it when checking an uncertain outcome.",
+    )
+    agent_id: Optional[int] = Field(
+        None,
+        description=(
+            "Target agent's primary key. Required for agent-bound keys; "
+            "must match the agent the key is bound to and the task's "
+            "agent_id. Omit for workforce-bound keys."
+        ),
+    )
+    workforce_id: Optional[int] = Field(
+        None,
+        description=(
+            "Target workforce's primary key. Optional for workforce-bound "
+            "keys; must match the workforce the key is bound to when "
+            "provided. Omit for agent-bound keys."
+        ),
+    )
+    message: MessageBody = Field(
+        ..., description="The user's answer to the agent's pending question."
+    )
+
+
+class ReplyResponse(BaseModel):
+    """``POST /v1/chat/tasks/{task_id}/reply`` -> 202 Accepted response.
+
+    Same fields and semantics as :class:`AppendMessageResponse`, except:
+    ``status`` is always ``'running'`` (a reply always resumes
+    execution), and ``run_id`` is the *same* run the task was waiting
+    on -- the reply resumes the paused execution rather than starting a
+    new one.
+    """
+
+    command_id: str | None = Field(
+        None, description="The accepted shared reply command ID."
+    )
+    task_id: int = Field(..., description="Existing task primary key.")
+    agent_id: int = Field(
+        ...,
+        description=(
+            "Agent the task is bound to. For workforce runs this is the "
+            "workforce's manager agent."
+        ),
+    )
+    workforce_id: Optional[int] = Field(
+        None,
+        description=(
+            "Workforce the task belongs to when the key is workforce-bound; "
+            "null for agent-bound keys."
+        ),
+    )
+    status: str = Field(
+        ..., description="Always 'running': a reply always resumes execution."
+    )
+    accepted_at: datetime = Field(
+        ...,
+        description="UTC timestamp when the server accepted the reply.",
+    )
+    run_id: str = Field(
+        ...,
+        description=(
+            "Identity of the resumed execution run -- the same run_id the "
+            "task was waiting on before this reply."
+        ),
+    )
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
+    control_state: str = Field(..., description="Detailed task control state.")
+
+
 class CreateWorkforceRunRequest(BaseModel):
     """Body for ``POST /v1/workforces/{workforce_id}/runs``.
 
@@ -387,6 +505,14 @@ class CreateWorkforceRunRequest(BaseModel):
         description=(
             "Caller-supplied dedup token. A retry with the same key returns "
             "the original run rather than creating a new one."
+        ),
+    )
+    timezone: Optional[str] = Field(
+        default=None,
+        description=(
+            "IANA timezone name for the end user's local clock, used to render "
+            "the date the workforce reasons from. Omit to keep UTC. An "
+            "unresolvable name degrades to UTC rather than failing the request."
         ),
     )
 
@@ -429,6 +555,31 @@ class CreateWorkforceRunResponse(BaseModel):
     control_state: str = Field("idle", description="Detailed task control state.")
 
 
+class PendingInteraction(BaseModel):
+    """The agent's most recent question on a waiting task.
+
+    ``interactions`` is an opaque list of structured-control descriptors
+    (the agent tool's own JSON shape, e.g. ``{"type": "text_input",
+    "field": ..., "label": ...}``) passed through as-is rather than typed
+    against a fixed schema, because the seven-value ``type`` enum lives
+    with the agent tool and duplicating it here would be a second source
+    of truth to keep in sync. ``[]`` and ``null`` both mean "no
+    structured control, answer with plain text" and are intentionally
+    not normalized to one value server-side -- callers should treat them
+    the same way.
+    """
+
+    question: str = Field(..., description="The agent's pending question text.")
+    interactions: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description=(
+            "Opaque structured-control descriptors for this question, or "
+            "null. May also be an empty list; treat [] and null the same "
+            "way (both mean plain-text answer)."
+        ),
+    )
+
+
 class TaskInfoResponse(BaseModel):
     """``GET /v1/chat/tasks/{task_id}`` response.
 
@@ -449,7 +600,10 @@ class TaskInfoResponse(BaseModel):
     )
     status: str = Field(
         ...,
-        description="One of: pending / running / paused / completed / failed.",
+        description=(
+            "One of: pending / running / paused / waiting_for_user / "
+            "completed / failed."
+        ),
     )
     run_id: Optional[str] = Field(None, description="Current execution run identity.")
     state_version: int = Field(
@@ -479,6 +633,35 @@ class TaskInfoResponse(BaseModel):
             "(completed or failed). Null while still running."
         ),
     )
+    pending_interaction: Optional[PendingInteraction] = Field(
+        None,
+        description=(
+            "Convenience projection of the current pending question on a "
+            "waiting task. Always present in the response body, but null "
+            "unless status='waiting_for_user'. Even while waiting, this "
+            "field is only null when: no question has ever been recorded "
+            "for the task; the task's persisted interaction row's payload "
+            "cannot be parsed; or the row's protocol version is not one "
+            "this reader recognizes. When the row's resume anchor is "
+            "missing or its checkpoint is unavailable instead, this field "
+            "is NOT null -- it carries the question text with an empty "
+            "interactions list, since the text is still readable even "
+            "though the structured controls are not. In all cases the "
+            "task itself stays in waiting_for_user -- a null field here "
+            "reflects an unreadable or absent question, not a resolved "
+            "one. Whichever of those tiers this task falls into, when the "
+            "answer comes from the legacy transcript rather than a native "
+            "interaction row, the read is by row id, not by wait: it "
+            "returns this task's most recently persisted question row "
+            "with no check on which turn wrote it or whether it was "
+            "already answered. So a task that re-entered "
+            "waiting_for_user without persisting a new question of its "
+            "own surfaces the last question an earlier turn asked and "
+            "already got answered, instead of null. This is a "
+            "convenience read, not the historical interaction record; "
+            "see #1079 for the full typed interaction surface."
+        ),
+    )
 
 
 # ``PublicStep.type`` is the public surface for what was internally one
@@ -488,9 +671,13 @@ class TaskInfoResponse(BaseModel):
 # internal->public mapping table.
 PublicStepType = Literal["thinking", "tool_call", "agent_delegation", "message"]
 
-# ``running`` means a start event was seen with no matching end (the
-# task is still mid-step at the time of the GET). ``completed`` /
-# ``failed`` reflect the end event's success flag.
+# ``running`` means a start event was seen with no matching end; a
+# terminal task can still contain running steps (interrupted/cancelled
+# steps never get an end event). ``completed`` / ``failed`` are read
+# off the end event, but the field that carries the outcome differs by
+# family: tool events use ``success`` (or a dedicated ``*_failed``
+# event), step events use their own ``data['status']``. See the
+# ``PublicStep.status`` field description below for the full rule.
 PublicStepStatus = Literal["running", "completed", "failed"]
 
 
@@ -532,9 +719,26 @@ class PublicStep(BaseModel):
         ...,
         description=(
             "running while the corresponding end event has not yet "
-            "fired (i.e. the SDK polled mid-step), completed on a "
-            "normal end event, failed when the end event carries "
-            "success=false."
+            "fired, completed on a normal end event, failed when the "
+            "end event reports failure (success=false or a dedicated "
+            "*_failed event for tool events, status='failed' for step "
+            "events). A task in a terminal "
+            "state can still contain running steps: interrupted or "
+            "cancelled steps never get an end event, so terminal "
+            "state is judged from the task's own status, not from "
+            "the absence of running steps. A planning ('thinking' with "
+            "data.phase='planning') step follows the same terminal-"
+            "event rule only while plan generation is still in "
+            "flight: it is marked failed when the DAG pattern's own "
+            "run reports a literal status='failed' during that "
+            "window, and it is left running if plan generation is "
+            "itself interrupted, reports waiting_for_user, or raises "
+            "an error that never reaches a terminal event, before "
+            "that window closes. Once plan generation finishes, the "
+            "executing-phase signal closes this step as completed "
+            "immediately, so an interrupted run or a wait for user "
+            "input that happens afterward, during step execution, "
+            "can no longer affect it."
         ),
     )
     started_at: datetime = Field(

@@ -5,21 +5,33 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from ...config import get_uploads_dir
 from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
+from ..task_runtime import (
+    EMPTY_TASK_RUNTIME_CONTRIBUTION,
+    FILE_OPERATION_ACCESS_VERSION_KEY,
+    TaskRuntimeContribution,
+    normalize_input_modalities,
+)
 from ..tools.adapters.vibe import Tool
 from ..tools.adapters.vibe.config import (
+    BaseToolConfig,
     RequiredMCPUnavailableError,
+    ToolFactoryRuntimeSessionBoundaryError,
     normalize_tool_allowlist,
 )
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
+from .context.execution import TRANSCRIPT_WATERMARK_METADATA_KEY
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
+
+if TYPE_CHECKING:
+    from .runner import UserMessageInjectionOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +39,15 @@ _UNSET = object()
 
 
 class AgentService:
-    """Service facade that executes tasks through agent only."""
+    """Service facade that executes tasks through agent only.
+
+    Capability controls are deny-capable overrides: ``enable_default_tools``
+    controls automatic tool construction, ``skills_enabled=False`` suppresses
+    supplied skill managers and allowlists, and ``user_interaction_enabled=False``
+    blocks outbound user-facing control calls and waits. ``execution_metadata``
+    is trusted internal metadata copied into runner and result records; untrusted
+    request data belongs in the separate task context passed to ``execute_task``.
+    """
 
     def __init__(
         self,
@@ -54,7 +74,13 @@ class AgentService:
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
+        preferred_input_modalities: tuple[str, ...] | list[str] | None = None,
         tools_initialized: bool | None = None,
+        react_max_iterations: int = 200,
+        enable_default_tools: bool = True,
+        skills_enabled: bool = True,
+        user_interaction_enabled: bool = True,
+        execution_metadata: dict[str, Any] | None = None,
         **agent_kwargs: Any,
     ) -> None:
         self.name = name
@@ -67,9 +93,25 @@ class AgentService:
         self.fast_llm = fast_llm
         self.vision_llm = vision_llm
         self.compact_llm = compact_llm
-        self.system_prompt = system_prompt
+        self._base_system_prompt = system_prompt
+        self._base_preferred_input_modalities = normalize_input_modalities(
+            preferred_input_modalities
+        )
+        self.system_prompt = self._base_system_prompt
+        self.preferred_input_modalities = self._base_preferred_input_modalities
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
+        self.react_max_iterations = max(1, int(react_max_iterations))
+        self.enable_default_tools = enable_default_tools
+        self.skills_enabled = skills_enabled
+        self.user_interaction_enabled = user_interaction_enabled
+        self.execution_metadata = dict(execution_metadata or {})
+        if tools is not None and tool_config is not None:
+            handoff_factory_runtime = getattr(
+                tool_config, "handoff_factory_runtime", None
+            )
+            if callable(handoff_factory_runtime):
+                handoff_factory_runtime()
         self.tool_config = tool_config
         self.tracer = tracer or Tracer()
         # Default infer: if the caller passed ``tools`` (even ``[]``) the
@@ -108,14 +150,11 @@ class AgentService:
                     name,
                     exc,
                 )
-        self._is_paused = False
-        self._pause_event = None
-        self._current_runner = None
         self._execution_adapter: Any | None = None
         self._outbound_message_handler: Callable[[dict[str, Any]], Any] | None = None
         self._interrupt_checker: Callable[[], Any] | None = None
         self._conversation_history: list[dict[str, Any]] = []
-        self._execution_context_messages: list[dict[str, str]] = []
+        self._execution_context_messages: list[dict[str, Any]] = []
         self._recovered_skill_context: str | None = None
         self.allowed_skills = self._get_allowed_skills_from_config(tool_config)
         self.skill_scope_context = self._get_skill_scope_context_from_config(
@@ -161,13 +200,22 @@ class AgentService:
                 scope_segments=tuple(
                     ws_config.get("scope_segments") or self.scope_segments
                 ),
+                durable_storage_segments=ws_config.get("durable_storage_segments"),
+            )
+            user_id = ws_config.get("user_id")
+            if isinstance(user_id, int) and not isinstance(user_id, bool):
+                self.workspace.owner_user_id = user_id
+            self.workspace.file_operation_access_version = ws_config.get(
+                FILE_OPERATION_ACCESS_VERSION_KEY
             )
         elif self.enable_workspace:
             self._setup_workspace()
 
-        if not self.tools and not self.tool_config:
+        if self.enable_default_tools and not self.tools and not self.tool_config:
             self.tool_config = self._create_default_tool_config()
             self.allowed_skills = self._get_allowed_skills_from_config(self.tool_config)
+
+        self._refresh_task_runtime_context()
 
         # Compatibility shim for callers/tests that inspect service.agent.tools.
         self.agent = SimpleNamespace(
@@ -193,6 +241,31 @@ class AgentService:
         self._tools_initialized = False
         self._tool_policy_signature = None
 
+    def _refresh_task_runtime_context(self) -> None:
+        """Refresh prompt and model preferences from the current tool contribution."""
+
+        contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
+        if isinstance(self.tool_config, BaseToolConfig):
+            value = self.tool_config.get_task_runtime_contribution()
+            if isinstance(value, TaskRuntimeContribution):
+                contribution = value
+
+        prompt_parts = [
+            value.strip()
+            for value in (
+                self._base_system_prompt,
+                contribution.environment,
+            )
+            if isinstance(value, str) and value.strip()
+        ]
+        self.system_prompt = "\n\n".join(prompt_parts) or None
+        self.preferred_input_modalities = normalize_input_modalities(
+            (
+                *self._base_preferred_input_modalities,
+                *contribution.preferred_input_modalities,
+            )
+        )
+
     async def execute_task(
         self,
         task: str,
@@ -213,16 +286,19 @@ class AgentService:
         return result
 
     async def pause_execution(self) -> bool:
-        if self._is_paused:
-            logger.warning("Agent '%s' is already paused", self.name)
-            return True
+        """Request an interrupt for whichever run is live right now.
+
+        Deliberately stateless: whether a run is interruptible is owned by the
+        runner/registry and is scoped to a single run, while this service is
+        cached per task and outlives every run it starts. Caching that answer
+        here made a second stop short-circuit against the first stop's run.
+        """
 
         execution_id = self._current_task_id or self.id
         paused = self.pause_execution_by_id(
             str(execution_id), reason="paused by websocket"
         )
         if paused:
-            self._is_paused = True
             logger.info(
                 "Agent '%s' agent execution %s pause requested",
                 self.name,
@@ -235,15 +311,6 @@ class AgentService:
             execution_id,
         )
         return False
-
-    async def resume_execution(self) -> None:
-        if not self._is_paused:
-            logger.warning("Agent '%s' is not paused", self.name)
-            return
-        self._is_paused = False
-
-    def is_paused(self) -> bool:
-        return self._is_paused
 
     def handle_websocket_input(self, user_input: str) -> bool:
         logger.info(
@@ -286,10 +353,11 @@ class AgentService:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> bool:
+    ) -> "UserMessageInjectionOutcome":
         if self._execution_adapter is None:
             self._execution_adapter = self._build_execution_adapter()
-        return bool(
+        return cast(
+            "UserMessageInjectionOutcome",
             await self._execution_adapter.post_user_message(
                 execution_id,
                 message,
@@ -299,7 +367,7 @@ class AgentService:
                 turn_id=turn_id,
                 request_interrupt=request_interrupt,
                 reason=reason,
-            )
+            ),
         )
 
     async def resume_execution_by_id(
@@ -307,7 +375,6 @@ class AgentService:
         execution_id: str,
         **kwargs: Any,
     ) -> dict[str, Any] | None:
-        self._is_paused = False
         await self._ensure_tools_initialized()
         if self._execution_adapter is None:
             self._execution_adapter = self._build_execution_adapter()
@@ -361,11 +428,35 @@ class AgentService:
     def get_dag_pattern(self) -> Any | None:
         return None
 
-    def set_conversation_history(self, messages: list[dict[str, Any]]) -> None:
+    def set_conversation_history(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        watermark: int | None = None,
+    ) -> None:
+        """Install the prior conversation, and where a summary may pick up.
+
+        ``watermark`` is the largest stored transcript row ``messages``
+        covers. It rides along in ``execution_metadata`` so a compaction
+        during this turn can record which stored rows its summary stands in
+        for; the next turn then replays the summary instead of those rows.
+        Callers without one leave the slot cleared, and compaction emits a
+        summary that no later turn can position -- correct, just not reusable.
+        """
         self._conversation_history = list(messages)
+        if isinstance(watermark, int) and not isinstance(watermark, bool):
+            self.execution_metadata[TRANSCRIPT_WATERMARK_METADATA_KEY] = watermark
+        else:
+            # Cleared rather than left stale: a watermark from an earlier turn
+            # describes a window this one is not replaying, and reusing it
+            # would tell compaction it absorbed rows nobody showed it.
+            self.execution_metadata.pop(TRANSCRIPT_WATERMARK_METADATA_KEY, None)
         if self._execution_adapter is not None:
             self._execution_adapter.config.conversation_history = (
                 self._conversation_history
+            )
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
             )
 
     def set_execution_context_messages(self, messages: list[dict[str, Any]]) -> None:
@@ -431,6 +522,9 @@ class AgentService:
             self._execution_adapter.config.llm = self.llm
             self._execution_adapter.config.compact_llm = self.compact_llm
             self._execution_adapter.config.pattern = self.pattern
+            self._execution_adapter.config.react_max_iterations = (
+                self.react_max_iterations
+            )
             self._execution_adapter.config.outbound_message_handler = (
                 self._outbound_message_handler
             )
@@ -448,8 +542,20 @@ class AgentService:
                 self.memory if self.memory_enabled else None
             )
             self._execution_adapter.config.allowed_skills = self.allowed_skills
+            self._execution_adapter.config.skills_enabled = self.skills_enabled
+            self._execution_adapter.config.workspace_enabled = self.enable_workspace
+            self._execution_adapter.config.user_interaction_enabled = (
+                self.user_interaction_enabled
+            )
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
+            )
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
+            )
+            self._execution_adapter.config.system_prompt = self.system_prompt
+            self._execution_adapter.config.preferred_input_modalities = (
+                self.preferred_input_modalities
             )
 
         return cast(
@@ -487,10 +593,12 @@ class AgentService:
                 tracer=tracer,
                 system_prompt=self.system_prompt,
                 workspace_base_dir=self.workspace_base_dir,
+                workspace_enabled=self.enable_workspace,
                 allowed_external_dirs=self.allowed_external_dirs,
                 scope_segments=self.scope_segments,
                 current_task_id=self._current_task_id,
                 service_id=self.id,
+                react_max_iterations=self.react_max_iterations,
                 outbound_message_handler=self._outbound_message_handler,
                 interrupt_checker=self._interrupt_checker,
                 conversation_history=self._conversation_history,
@@ -500,6 +608,10 @@ class AgentService:
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 skill_scope_context=self.skill_scope_context,
                 allowed_skills=self.allowed_skills,
+                skills_enabled=self.skills_enabled,
+                user_interaction_enabled=self.user_interaction_enabled,
+                preferred_input_modalities=self.preferred_input_modalities,
+                execution_metadata=dict(self.execution_metadata),
             )
         )
 
@@ -610,6 +722,12 @@ class AgentService:
                 def get_allowed_collections(self) -> list[Any] | None:
                     return None
 
+                # get_agent_creator_user_id / get_declared_knowledge_bases are
+                # not overridden here: ToolConfig already gives both a
+                # fail-closed ``None`` default (see config.py), which is
+                # exactly what this default, non-team-governed tool config
+                # needs.
+
                 def get_allowed_skills(self) -> list[Any] | None:
                     return None
 
@@ -658,18 +776,27 @@ class AgentService:
                     self._tools_initialized
                     and policy_signature == self._tool_policy_signature
                 ):
-                    release_factory_runtime = getattr(
+                    handoff_factory_runtime = getattr(
                         self.tool_config,
-                        "release_prepared_factory_runtime",
+                        "handoff_factory_runtime",
                         None,
                     )
-                    if callable(release_factory_runtime):
-                        release_factory_runtime()
+                    if callable(handoff_factory_runtime):
+                        handoff_factory_runtime()
+                    else:
+                        release_factory_runtime = getattr(
+                            self.tool_config,
+                            "release_prepared_factory_runtime",
+                            None,
+                        )
+                        if callable(release_factory_runtime):
+                            release_factory_runtime()
                     return
 
                 # Rebuild the tool list so disabled tools disappear from reused agents.
                 new_tools = await ToolFactory.create_all_tools(self.tool_config)
                 self.tools = list(new_tools)
+                self._refresh_task_runtime_context()
 
                 if hasattr(self.tool_config, "get_allowed_tools"):
                     allowed_tools = self.tool_config.get_allowed_tools()
@@ -684,11 +811,17 @@ class AgentService:
                 self.agent.tools = self.tools
                 if self._execution_adapter is not None:
                     self._execution_adapter.config.tools = self.tools
+                    self._execution_adapter.config.system_prompt = self.system_prompt
+                    self._execution_adapter.config.preferred_input_modalities = (
+                        self.preferred_input_modalities
+                    )
                 self._tools_initialized = True
                 self._tool_policy_signature = policy_signature
             except ConnectorRuntimeError:
                 raise
             except RequiredMCPUnavailableError:
+                raise
+            except ToolFactoryRuntimeSessionBoundaryError:
                 raise
             except Exception as exc:
                 logger.error("Failed to initialize tools from configuration: %s", exc)

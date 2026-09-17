@@ -5,18 +5,79 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
+import openai
 import pytest
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from pydantic import BaseModel, ConfigDict
 
+from xagent.core.agent.context.execution import ExecutionContext
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.openai import (
     PROVIDER_STATE_METADATA_KEY,
     OpenAILLM,
     _format_openai_error,
+    field_content,
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
+from xagent.core.model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+)
 from xagent.core.retry.strategy import FixedDelay
 from xagent.core.retry.wrapper import create_retry_wrapper
+
+
+def _stream_chunk(tool_calls=None, finish_reason=None):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=None, tool_calls=tool_calls),
+                finish_reason=finish_reason,
+            )
+        ]
+    )
+
+
+def _tool_call_delta(index, call_id, name, arguments, call_type="function"):
+    return SimpleNamespace(
+        index=index,
+        id=call_id,
+        type=call_type,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def _response_format_bad_request(message: str) -> openai.BadRequestError:
+    """A 400 whose text matches the response_format fallback's trigger check."""
+    return openai.BadRequestError(
+        f"Error code: 400 - {{'error': {{'message': '{message}'}}}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": message, "code": 400}},
+    )
+
+
+def _unrelated_bad_request() -> openai.BadRequestError:
+    """A 400 that has nothing to do with response_format."""
+    return openai.BadRequestError(
+        "Error code: 400 - {'error': {'message': 'Unsupported image format'}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": "Unsupported image format", "code": 400}},
+    )
+
+
+def _api_timeout_error() -> openai.APITimeoutError:
+    """The SDK's timeout error, as raised by a request that never answered."""
+    return openai.APITimeoutError(
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    )
 
 
 class TestOpenAILLM:
@@ -203,30 +264,12 @@ class TestOpenAILLM:
     def test_parse_stream_chunk_ignores_empty_idless_tool_call_placeholder(self, llm):
         """Some OpenAI-compatible providers emit empty id-less tool-call slots."""
 
-        def chunk(tool_calls=None, finish_reason=None):
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        delta=SimpleNamespace(content=None, tool_calls=tool_calls),
-                        finish_reason=finish_reason,
-                    )
-                ]
-            )
-
-        def tool_call(index, call_id, name, arguments, call_type="function"):
-            return SimpleNamespace(
-                index=index,
-                id=call_id,
-                type=call_type,
-                function=SimpleNamespace(name=name, arguments=arguments),
-            )
-
         accumulated_tool_calls = {}
 
         llm._parse_stream_chunk(
-            chunk(
+            _stream_chunk(
                 [
-                    tool_call(
+                    _tool_call_delta(
                         0,
                         "call_sum",
                         "mcp_everything_mcp_get_sum",
@@ -237,9 +280,9 @@ class TestOpenAILLM:
             accumulated_tool_calls,
         )
         llm._parse_stream_chunk(
-            chunk(
+            _stream_chunk(
                 [
-                    tool_call(
+                    _tool_call_delta(
                         1,
                         "call_long",
                         "mcp_everything_mcp_trigger_long_running_operation",
@@ -250,12 +293,12 @@ class TestOpenAILLM:
             accumulated_tool_calls,
         )
         llm._parse_stream_chunk(
-            chunk([tool_call(2, None, "", "", None)]),
+            _stream_chunk([_tool_call_delta(2, None, "", "", None)]),
             accumulated_tool_calls,
         )
 
         final_chunk = llm._parse_stream_chunk(
-            chunk(finish_reason="tool_calls"),
+            _stream_chunk(finish_reason="tool_calls"),
             accumulated_tool_calls,
         )
 
@@ -598,6 +641,96 @@ class TestOpenAILLM:
         call_args = mock_client.chat.completions.create.call_args
         assert call_args.kwargs["temperature"] == 0.0
         assert "max_tokens" not in call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_returns_the_response_format_retry_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Dropping response_format must not also drop the answer.
+
+        The retry succeeds, so vision_chat has to return that reply's
+        envelope. Returning ``None`` instead reaches the vision tool as an
+        unsupported response shape, turning a successful answer into a
+        detection failure.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}],
+            response_format={"type": "json_object"},
+        )
+
+        assert response == {
+            "type": "text",
+            "content": "Hello World",
+            "raw": mock_chat_completion.model_dump(),
+        }
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_unrelated_bad_request_is_terminal(
+        self, openai_llm_config, mocker
+    ):
+        """A 400 unrelated to response_format keeps failing with its own message."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = _unrelated_bad_request()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_reports_a_failed_retry_as_a_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """A retry that is rejected too surfaces as the documented RuntimeError.
+
+        The method documents ``Raises: RuntimeError``; a raw provider
+        exception escaping from the retry would break that, and would differ
+        from how ``stream_chat`` reports the same double rejection.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            _unrelated_bad_request(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 2
 
     @pytest.mark.asyncio
     async def test_cleanup(self, openai_llm_config, mock_chat_completion, mocker):
@@ -1210,3 +1343,1000 @@ class TestOpenAILLM:
         assert "response_format" in call_args.kwargs
         assert call_args.kwargs["response_format"]["type"] == "json_schema"
         assert "json_schema" in call_args.kwargs["response_format"]
+
+    @pytest.mark.parametrize(
+        ("empty_arguments", "expected"),
+        [("", ""), ("   ", "   "), (None, "")],
+    )
+    @pytest.mark.parametrize("method", ["chat", "vision_chat"])
+    @pytest.mark.asyncio
+    async def test_empty_tool_arguments_are_not_fatal(
+        self,
+        openai_llm_config,
+        mock_tool_call_completion,
+        mocker,
+        method,
+        empty_arguments,
+        expected,
+    ):
+        """Providers send `""` for parameterless calls; patterns repair the rest.
+
+        Passed through rather than normalized to `"{}"`: the blank string is
+        what auto's and the DAG plan generator's retry paths key on. `None`
+        coerces to `""`; whitespace-only passes through unchanged.
+        """
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        mock_tool_call_completion.choices[0].message.tool_calls[
+            0
+        ].function.arguments = empty_arguments
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_tool_call_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        response = await getattr(llm, method)([{"role": "user", "content": "hi"}])
+
+        assert response["type"] == "tool_call"
+        assert response["tool_calls"][0]["function"]["arguments"] == expected
+
+    @pytest.mark.parametrize(
+        ("empty_arguments", "expected"),
+        [("", ""), ("   ", "   "), (None, "")],
+    )
+    def test_parse_stream_chunk_passes_empty_tool_arguments_through(
+        self, llm, empty_arguments, expected
+    ):
+        """Same on the streaming finish-reason path; `None` accumulates as `""`."""
+        accumulated_tool_calls = {}
+        llm._parse_stream_chunk(
+            _stream_chunk(
+                [
+                    _tool_call_delta(
+                        0, "call_empty", "list_image_models", empty_arguments
+                    )
+                ]
+            ),
+            accumulated_tool_calls,
+        )
+
+        final_chunk = llm._parse_stream_chunk(
+            _stream_chunk(finish_reason="tool_calls"),
+            accumulated_tool_calls,
+        )
+
+        assert final_chunk is not None
+        assert final_chunk.tool_calls[0]["function"]["arguments"] == expected
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_retry_failure_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """A second BadRequestError from the response_format resend must be
+        wrapped into RuntimeError, not escape as a bare SDK exception, just
+        like every other ``chat()`` failure path. This pins WHICH of the two
+        errors becomes ``__cause__``: it must be the resend's own failure,
+        not the first attempt's, and the wrapped message must carry the
+        resend's text."""
+        first_error = _response_format_bad_request(
+            "the model does not support response_format on the first attempt"
+        )
+        second_error = _response_format_bad_request(
+            "the model still rejects response_format on the resend"
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [first_error, second_error]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.chat(
+                [{"role": "user", "content": "hi"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert exc_info.value.__cause__ is second_error
+        assert "on the resend" in str(exc_info.value)
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_retry_success_returns_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """When the resend succeeds, ``chat()`` already returns the processed
+        result today; this pins that behavior against the same failure-path
+        restructuring."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat(
+            [{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result.get("content") == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_retry_failure_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Same guarantee as ``chat()``: the vision path must not leak a bare
+        BadRequestError when the response_format resend also fails. This
+        pins WHICH of the two errors becomes ``__cause__``: it must be the
+        resend's own failure, not the first attempt's, and the wrapped
+        message must carry the resend's text."""
+        first_error = _response_format_bad_request(
+            "the model does not support response_format on the first attempt"
+        )
+        second_error = _response_format_bad_request(
+            "the model still rejects response_format on the resend"
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [first_error, second_error]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert exc_info.value.__cause__ is second_error
+        assert "on the resend" in str(exc_info.value)
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_retry_success_returns_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """A successful resend must return the processed result, not fall
+        through to an implicit ``None`` (the vision_chat() half of #1650)."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat(
+            [{"role": "user", "content": "describe this"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result is not None
+        assert result.get("type") == "text"
+        assert result.get("content") == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_resend_timeout_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Before this PR the response_format resend lived directly inside
+        the ``except openai.BadRequestError`` clause, so a non-BadRequestError
+        failure from that resend escaped unwrapped. The nested-try
+        restructuring routes it to ``chat()``'s own
+        ``except openai.APITimeoutError`` handler instead; this path is
+        newly correct and was previously untested."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.chat(
+                [{"role": "user", "content": "hi"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_resend_timeout_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Before this PR the response_format resend lived directly inside
+        the ``except openai.BadRequestError`` clause, so a non-BadRequestError
+        failure from that resend escaped unwrapped. The nested-try
+        restructuring routes it to ``vision_chat()``'s own
+        ``except openai.APITimeoutError`` handler instead; this path is
+        newly correct and was previously untested."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_response_format_resend_timeout_is_retryable(
+        self, openai_llm_config, mocker
+    ):
+        """``stream_chat`` already had this nested-try shape before this PR;
+        its diff is untouched here. This test pins the sibling contract that
+        ``test_chat_...`` and ``test_vision_chat_...`` above were aligned
+        to: ``stream_chat`` classifies the same response_format-resend
+        timeout as ``LLMRetryableError`` rather than ``RuntimeError``."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(LLMRetryableError) as exc_info:
+            _ = [
+                chunk
+                async for chunk in llm.stream_chat(
+                    [{"role": "user", "content": "hi"}],
+                    response_format={"type": "json_object"},
+                )
+            ]
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_empty_content_after_resend_raises_empty_content_error(
+        self, openai_llm_config, mocker
+    ):
+        """Pins ``vision_chat()``'s empty-content contract, which had zero
+        tests of its own (``chat()`` has ``test_empty_content_response``;
+        ``vision_chat()`` had nothing). The response_format resend is the
+        carrier here because falling through to the normal processing path
+        is what makes this outcome reachable on the resend at all: before
+        this PR, a successful resend short-circuited to ``None`` instead of
+        running that processing path."""
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "stop"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = None
+        mock_choice.message = mock_message
+        empty_response = MagicMock()
+        empty_response.choices = [mock_choice]
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            empty_response,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(
+            LLMEmptyContentError,
+            match="LLM returned empty content and no tool calls",
+        ):
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+
+class TestFieldContent:
+    """``field_content`` must not mistake a pydantic model's declared default
+    for a value the provider actually sent."""
+
+    class _MessageWithDeclaredDefault(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+        reasoning_content: str = "sdk-default-not-from-provider"
+
+    def test_field_content_ignores_a_declared_default_on_a_pydantic_model(self):
+        message = self._MessageWithDeclaredDefault()
+
+        assert field_content(message, "reasoning_content") == (False, None)
+
+    def test_field_content_reads_a_value_passed_through_model_extra(self):
+        """The real-world path: the OpenAI SDK builds response and delta
+        objects through ``construct()``, which -- unlike a normal pydantic
+        ``__init__`` -- only adds explicitly-declared fields to
+        ``model_fields_set`` and routes every unrecognized field straight to
+        ``model_extra``. ``ChoiceDelta`` doesn't declare ``reasoning_content``,
+        so this is exactly how a provider's reasoning field actually arrives
+        on a streaming delta."""
+        delta = ChoiceDelta.construct(role="assistant", reasoning_content="step 1")
+
+        assert "reasoning_content" not in delta.model_fields_set
+        assert field_content(delta, "reasoning_content") == (True, "step 1")
+
+
+def _bad_request(
+    message: str,
+    *,
+    param: str | None = None,
+    code: str | None = None,
+    metadata: dict | None = None,
+) -> openai.BadRequestError:
+    """Build the error the way the SDK does, from a wire-shaped response.
+
+    Constructing the exception directly with a hand-written ``body`` is what
+    made an earlier revision's structural lookup look tested when it could
+    never fire in production: the SDK unwraps the outer ``error`` object in
+    ``_make_status_error``, so a fixture that passes the wrapped shape is
+    testing a shape no real error has. Going through
+    ``_make_status_error_from_response`` keeps the fixture honest.
+    """
+    error_payload: dict = {"message": message, "type": "invalid_request_error"}
+    if param is not None:
+        error_payload["param"] = param
+    if code is not None:
+        error_payload["code"] = code
+    if metadata is not None:
+        error_payload["metadata"] = metadata
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        json={"error": error_payload},
+    )
+    error = openai.AsyncOpenAI(api_key="test")._make_status_error_from_response(
+        response
+    )
+    assert isinstance(error, openai.BadRequestError)
+    return error
+
+
+_MAX_TOKENS_REJECTION = (
+    "Unsupported parameter: 'max_tokens' is not supported with this model. "
+    "Use 'max_completion_tokens' instead."
+)
+
+_REASONING_TOOLS_REJECTION = (
+    "Function tools with reasoning_effort are not supported for this model in "
+    "/v1/chat/completions. To use function tools, use /v1/responses or set "
+    "reasoning_effort to 'none'."
+)
+
+
+class TestRejectedParameterDegrade:
+    """Reasoning models spell the output budget ``max_completion_tokens``.
+
+    Context compaction is the only caller that sends an output budget at all,
+    so without this a reasoning model converses normally while every
+    compaction fails and falls back to dropping messages.
+    """
+
+    @pytest.mark.asyncio
+    async def test_chat_renames_max_tokens(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Summarize."}], max_tokens=5000
+        )
+
+        assert response["content"] == "Hello World"
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        # Renamed, not dropped: for compaction the budget is what keeps a
+        # summary from re-triggering the next compaction.
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_chat_disables_reasoning_for_function_tools(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _REASONING_TOOLS_REJECTION,
+                param="reasoning_effort",
+                code="validation_error",
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "noop",
+                    "description": "No operation",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Call the tool."}], tools=tools
+        )
+
+        assert response["content"] == "Hello World"
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "reasoning_effort" not in first_kwargs
+        assert retry_kwargs["reasoning_effort"] == "none"
+        assert retry_kwargs["tools"] == tools
+
+    @pytest.mark.asyncio
+    async def test_one_rejection_naming_both_degrades_both(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """The two degrades are independent, not alternatives.
+
+        Judging them with if/elif let a response_format rejection be skipped
+        whenever the same error text also mentioned max_tokens -- and
+        ``vision_chat`` always sends both parameters together, so the
+        precondition is routinely met.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "Unsupported parameter: 'max_tokens' is not supported with this "
+                "model. Use 'max_completion_tokens' instead. response_format is "
+                "also not supported."
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_response_format_degrade_survives_a_max_tokens_mention(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """An error that merely echoes ``max_tokens`` in its upstream blob
+        must not consume the response_format degrade.
+
+        Here max_tokens is in the request but the rejection is about
+        response_format alone, so only response_format is degraded.
+        Passes against the pre-PR code too, because renaming max_tokens did
+        not exist there -- so this is not a regression test for main. It
+        guards a mistake this PR made and had to correct: an
+        earlier revision judged the two degrades with if/elif, which let a
+        response_format rejection be skipped whenever the same text mentioned
+        max_tokens.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "response_format is not supported by this model "
+                "(request had max_tokens=5000)"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+        assert "max_completion_tokens" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_an_out_of_range_value_does_not_trigger_the_rename(
+        self, openai_llm_config, mocker
+    ):
+        """Anchoring on an unsupported-parameter signal keeps arbitrary
+        upstream text -- ``provider_raw`` can echo a whole request body --
+        from starting a retry that cannot help.
+        Passes against the pre-PR code too, because renaming max_tokens did
+        not exist there -- so this is not a regression test for main. It
+        guards a mistake this PR made and had to correct: an earlier
+        revision treated ``param == "max_tokens"`` as sufficient on its own,
+        which re-opened exactly this hole, and went unnoticed because the
+        fixture did not set ``param``.
+        """
+        mock_client = mocker.AsyncMock()
+        # A real out-of-range rejection names the same param as an
+        # unsupported-parameter one; the param alone must not be taken as
+        # licence to rename.
+        mock_client.chat.completions.create.side_effect = _bad_request(
+            "max_tokens is too large: 200000", param="max_tokens"
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        with pytest.raises(RuntimeError, match="too large"):
+            await llm.chat(
+                [{"role": "user", "content": "Summarize."}], max_tokens=200000
+            )
+
+        assert mock_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_renames_max_tokens(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}], max_tokens=5000
+        )
+
+        assert response["content"] == "Hello World"
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_renames_max_tokens_and_keeps_extra_body(
+        self, openai_llm_config, mocker
+    ):
+        """The streaming path rebuilds the stream itself rather than reusing
+        the non-streaming helper, so its retry needs its own coverage --
+        including the ``extra_body`` branch, which the sibling methods do not
+        have."""
+
+        async def one_chunk_stream():
+            yield _stream_chunk(finish_reason="stop")
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            one_chunk_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        mocker.patch.object(
+            llm, "_prepare_provider_reasoning_extra_body", return_value={"probe": 1}
+        )
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}], max_tokens=5000
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert retry_kwargs["max_completion_tokens"] == 5000
+        assert retry_kwargs["extra_body"] == {"probe": 1}
+
+
+class TestReasoningFallbackIsDeclared:
+    """The client marks content it substituted, and compaction honours it.
+
+    These two live in different packages; without a test that runs the real
+    producer into the real consumer, a change to the response shape on one
+    side would silently stop the other from recognising it.
+    """
+
+    @staticmethod
+    def _truncated_reasoning_completion():
+        message = SimpleNamespace(
+            role="assistant",
+            content="",
+            tool_calls=None,
+            reasoning_content="Let me think about the file first",
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="length")],
+            usage=None,
+            model_dump=lambda: {"choices": [{"finish_reason": "length"}]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_client_marks_a_substituted_reasoning_trace(
+        self, openai_llm_config, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = (
+            self._truncated_reasoning_completion()
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        assert response["content"] == "Let me think about the file first"
+        assert response[CONTENT_SOURCE_KEY] == CONTENT_SOURCE_REASONING_FALLBACK
+
+    @pytest.mark.asyncio
+    async def test_compaction_rejects_what_the_client_marked(
+        self, openai_llm_config, mocker
+    ):
+        """The producer's real output, fed to the real consumer."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = (
+            self._truncated_reasoning_completion()
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        context = ExecutionContext()
+        context.compact_config.threshold = 1
+        context.add_user_message("current request")
+        context.add_tool_result(
+            "read_file", {"output": "x" * 200}, tool_call_id="call-1"
+        )
+        before = list(context.messages)
+
+        result = context.compact_with_llm_response(response, llm=None)
+
+        assert not result.compacted
+        assert context.messages == before
+
+
+class TestRejectedParameterIdentification:
+    """Which parameter a 400 is about, when the text alone cannot say.
+
+    ``_format_openai_error`` appends ``provider_raw`` and ``previous_errors``,
+    so for a gateway that tried several upstreams the message is several
+    providers' complaints concatenated. A keyword found there may belong to an
+    attempt unrelated to this failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_echoed_request_does_not_condemn_an_unrejected_parameter(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """The rejection is about response_format; an earlier upstream in the
+        gateway's chain merely grumbled about max_tokens. Renaming max_tokens
+        here would spend the retry on a parameter this endpoint accepts, and
+        lose the response_format recovery that would have worked.
+        Passes against the pre-PR code too, because renaming max_tokens did
+        not exist there -- so this is not a regression test for main. It
+        guards a mistake this PR made and had to correct: the
+        case a reviewer reproduced against an earlier revision of this branch.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "Unsupported parameter: 'response_format' is not supported "
+                "with this model.",
+                param="response_format",
+                metadata={
+                    "provider_name": "upstream-a",
+                    "previous_errors": (
+                        '{"error": "max_tokens must be <= 4096 for this model"}'
+                    ),
+                },
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+        assert "max_completion_tokens" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_upstream_blob_naming_the_replacement_does_not_rename(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """The sharpest form of the problem.
+
+        Here the echoed upstream text names ``max_completion_tokens`` itself,
+        which is the one phrase the text-only rule trusts. Only the endpoint's
+        own ``param`` can say that this rejection is about response_format --
+        so this fails unless that field is actually readable, which it is not
+        when the code looks for a wrapper the SDK has already unwrapped.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                "Unsupported parameter: 'response_format' is not supported "
+                "with this model.",
+                param="response_format",
+                code="unsupported_parameter",
+                metadata={
+                    "provider_name": "upstream-a",
+                    "previous_errors": (
+                        '{"error": "use max_completion_tokens for this model"}'
+                    ),
+                },
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+        assert retry_kwargs["max_tokens"] == 5000
+        assert "max_completion_tokens" not in retry_kwargs
+
+
+class TestSequentiallyRejectedParameters:
+    """Endpoints commonly report one invalid parameter per response."""
+
+    @pytest.mark.asyncio
+    async def test_two_rejections_in_a_row_are_both_degraded(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.",
+                param="response_format",
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat(
+            [{"role": "user", "content": "Summarize."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        assert response["content"] == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 3
+        final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
+        assert final_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in final_kwargs
+
+    @pytest.mark.asyncio
+    async def test_the_loop_is_bounded_by_the_supported_degrades(
+        self, openai_llm_config, mocker
+    ):
+        """Bounded by construction: each degrade removes or renames a
+        parameter and fires only while that parameter is still present, so an
+        endpoint that keeps rejecting the same one cannot spin.
+
+        Four identical rejections are queued for two degradable parameters;
+        the loop must stop after three requests, not consume them all.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.", param="response_format"
+            ),
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        with pytest.raises(RuntimeError):
+            await llm.chat(
+                [{"role": "user", "content": "Summarize."}],
+                max_tokens=5000,
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_degrades_two_rejections_in_a_row(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.", param="response_format"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}],
+            max_tokens=5000,
+            response_format={"type": "json_object"},
+        )
+
+        assert response["content"] == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 3
+        final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
+        assert final_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in final_kwargs
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_degrades_two_rejections_in_a_row(
+        self, openai_llm_config, mocker
+    ):
+        """The streaming path rebuilds the stream inside the loop rather than
+        calling the shared helper the other two use, so its second round needs
+        its own coverage."""
+
+        async def one_chunk_stream():
+            yield _stream_chunk(finish_reason="stop")
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(
+                _MAX_TOKENS_REJECTION, param="max_tokens", code="unsupported_parameter"
+            ),
+            _bad_request(
+                "Unsupported parameter: 'response_format'.", param="response_format"
+            ),
+            one_chunk_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}],
+                max_tokens=5000,
+                response_format={"type": "json_object"},
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 3
+        final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
+        assert final_kwargs["max_completion_tokens"] == 5000
+        assert "response_format" not in final_kwargs

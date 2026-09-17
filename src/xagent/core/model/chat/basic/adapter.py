@@ -5,6 +5,7 @@ from ....model import ChatModelConfig, ModelConfig
 from ....retry import create_retry_wrapper
 from ...providers import (
     AUTO_MODEL_NAME,
+    ROUTER_PROVIDER,
     canonical_provider_name,
     is_auto_router_model,
     provider_compatibility_for_provider,
@@ -31,9 +32,8 @@ def create_base_llm(
     """
     Creates a custom BaseLLM instance from a ModelConfig.
 
-    ``downstream_resolver`` is only used by the OpenRouter ``auto`` model: given
-    a chosen OpenRouter slug it returns the LLM that runs it, so "auto" reuses
-    the user-configured OpenRouter model instead of any environment variable.
+    ``downstream_resolver`` is used by virtual ``auto`` models: given a chosen
+    routing profile it returns the concrete configured LLM that runs it.
     """
     if not isinstance(model, ChatModelConfig):
         raise TypeError(f"Invalid model type: {type(model).__name__}")
@@ -43,10 +43,10 @@ def create_base_llm(
     llm: BaseLLM
 
     if is_auto_router_model(provider, model.model_name):
-        # OpenRouter model named "auto": pick a concrete model via xrouter-llm,
-        # then dispatch it through this same OpenRouter config.
+        # Pick a concrete model via xrouter-llm. Legacy OpenRouter Auto clones
+        # its own provider config; configured Auto injects saved model bindings.
         router = RouterLLM(
-            model_name=AUTO_MODEL_NAME,
+            model_name=model.router_config_name or AUTO_MODEL_NAME,
             api_key=model.api_key,
             base_url=model.base_url,
             default_temperature=model.default_temperature,
@@ -54,6 +54,9 @@ def create_base_llm(
             timeout=model.timeout,
             abilities=model.abilities,
             downstream_resolver=downstream_resolver,
+            candidate_models=model.router_candidate_models,
+            fallback_model=model.router_fallback_model,
+            use_environment_fallback=provider != ROUTER_PROVIDER,
         )
         router.context_window = model.context_window
         # No _model_id stamp here: RouterLLM delegates every call to a resolved

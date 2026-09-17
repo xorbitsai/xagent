@@ -12,6 +12,11 @@ from sqlalchemy.orm import Session
 from ...core.file_ref import build_file_id_ref
 from ...skills.utils import create_skill_manager
 from ..models.task import TraceEvent
+from .trace_event_types import (
+    GENERAL_ERROR_EVENT_TYPES,
+    STEP_GENERAL_ERROR_EVENT_TYPE,
+    TASK_GENERAL_ERROR_EVENT_TYPE,
+)
 
 
 @dataclass(frozen=True)
@@ -202,27 +207,41 @@ def load_latest_execution_failure_summary(
         .filter(
             TraceEvent.task_id == task_id,
             TraceEvent.build_id.is_(None),
-            TraceEvent.event_type.in_(("dag_execute_end", "trace_error")),
+            TraceEvent.event_type.in_(("dag_execute_end", *GENERAL_ERROR_EVENT_TYPES)),
         )
         .order_by(TraceEvent.timestamp.desc(), TraceEvent.id.desc())
         .first()
     )
     if trace_event is None or not isinstance(trace_event.data, dict):
         return None
-    return summarize_execution_failure_event(trace_event.data)
+    return summarize_execution_failure_event(
+        trace_event.data,
+        event_type=str(trace_event.event_type or ""),
+    )
 
 
-def summarize_execution_failure_event(data: Dict[str, Any]) -> Optional[str]:
+def summarize_execution_failure_event(
+    data: Dict[str, Any],
+    *,
+    event_type: str | None = None,
+) -> Optional[str]:
     result = data.get("result") if isinstance(data.get("result"), dict) else data
     if not isinstance(result, dict):
         return None
 
     success = result.get("success")
     status = str(result.get("status") or data.get("status") or "").strip()
-    if success is not False and status not in {"failed", "error"}:
+    failure_is_proven = event_type in {
+        TASK_GENERAL_ERROR_EVENT_TYPE,
+        STEP_GENERAL_ERROR_EVENT_TYPE,
+    }
+    if (
+        not failure_is_proven
+        and success is not False
+        and status not in {"failed", "error"}
+    ):
         return None
 
-    error = str(result.get("error") or data.get("error_message") or "").strip()
     failure_reason = str(result.get("failure_reason") or "").strip()
     failed_step_id = str(result.get("failed_step_id") or "").strip()
 
@@ -231,11 +250,8 @@ def summarize_execution_failure_event(data: Dict[str, Any]) -> Optional[str]:
         details.append(f"step={failed_step_id}")
     if failure_reason:
         details.append(f"reason={failure_reason}")
-    if error:
-        details.append(f"error={_compact_preview_string(error, max_string_length=180)}")
-
     if not details:
-        return None
+        return "- Previous execution failed."
     return "- Previous execution failed: " + "; ".join(details)
 
 

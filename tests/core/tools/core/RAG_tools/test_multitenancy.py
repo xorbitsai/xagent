@@ -833,6 +833,58 @@ class TestAPIMultiTenancy:
         assert result.status == "success"
         assert result.total_count == 0
 
+    @patch("xagent.web.api.kb.list_collections")
+    @pytest.mark.asyncio
+    async def test_list_collections_api_stays_runner_keyed_when_a_team_hook_is_installed(
+        self, mock_list_collections
+    ):
+        """The fourth consumer of the team-scope seam: this endpoint answers
+        "what can the requesting user see" and must keep doing that even
+        when an application has installed a team-keyed visibility hook for
+        the knowledge-base search path -- it has no governing agent to key
+        on, so it must go on calling the user-keyed overlay hook
+        (``visible_team_knowledge_bases``) and must never touch the
+        team-keyed one (``team_knowledge_bases`` /
+        ``resolve_team_knowledge_bases_or_raise``).
+        """
+        from xagent.core.tools.core.RAG_tools.core.schemas import ListCollectionsResult
+        from xagent.web.models.user import User
+        from xagent.web.services import knowledge_base_team_scope as kb_scope
+
+        mock_user = MagicMock(spec=User)
+        mock_user.id = 123
+        mock_user.is_admin = False
+
+        mock_list_collections.return_value = ListCollectionsResult(
+            status="success",
+            total_count=0,
+            collections=[],
+            message="No collections found",
+            warnings=[],
+        )
+
+        user_keyed_calls: list[int] = []
+        team_keyed_calls: list[int] = []
+
+        def _user_keyed(db, user_id: int):
+            user_keyed_calls.append(user_id)
+            return []
+
+        def _team_keyed(db, *, team_id: int):
+            team_keyed_calls.append(team_id)
+            return []
+
+        with kb_scope.snapshot_knowledge_base_team_hooks():
+            kb_scope.set_knowledge_base_team_hooks(
+                visibility=_user_keyed, team_visibility=_team_keyed
+            )
+
+            result = await list_collections_api(_user=mock_user)
+
+        assert result.status == "success"
+        assert user_keyed_calls == [123]
+        assert team_keyed_calls == []
+
     @pytest.mark.asyncio
     @patch("xagent.web.api.kb.get_vector_index_store")
     @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)

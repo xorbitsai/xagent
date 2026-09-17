@@ -253,7 +253,7 @@ describe("ConversationLogsPage", () => {
     // A completed task's trace is collapsed behind a toggle; expand it first.
     fireEvent.click(await screen.findByRole("button", { name: /showProcess/ }))
     expect(
-      await screen.findByRole("button", { name: /web_search/ })
+      await screen.findByRole("button", { name: /Web Search/ })
     ).toBeInTheDocument()
   })
 

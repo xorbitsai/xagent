@@ -110,6 +110,10 @@ class MemoryStore(ABC):
 
         Returns:
             List[MemoryNote]: List of matching memory notes.
+
+        Raises:
+            Exception: If the backend cannot complete the search. An empty list
+                is reserved for a successful search with no matching notes.
         """
         pass
 
@@ -130,6 +134,10 @@ class MemoryStore(ABC):
 
         Returns:
             List[MemoryNote]: List of memory notes matching the filters.
+
+        Raises:
+            Exception: If the backend cannot complete the listing. An empty list
+                is reserved for a successful listing of an empty store.
         """
         pass
 

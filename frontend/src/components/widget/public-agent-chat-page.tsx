@@ -1,18 +1,20 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useState } from "react"
-import { Loader2 } from "lucide-react"
+import { Loader2, MessageSquarePlus } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+import { iconButtonClassName, WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
+import { resolveReportedTimezone } from "@/hooks/use-websocket"
+import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+import { clientErrorTranslationKey } from "@/lib/client-errors"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import {
   getApiUrl,
-  getFilePublicDownloadUrl,
-  getFilePublicPreviewUrl,
-  setPublicAccessToken,
 } from "@/lib/utils"
 
 interface PublicAgentChatPageProps {
@@ -142,7 +144,14 @@ function PublicConversationContent({
   suggestedPrompts,
   onAuthInvalidated,
 }: PublicConversationContentProps) {
-  const { state, dispatch, sendMessage, setTaskId, connectionError } = useApp()
+  const {
+    state,
+    dispatch,
+    sendMessage,
+    setTaskId,
+    connectionError,
+    voiceInputEnabled,
+  } = useApp()
   const { t } = useI18n()
   const [createTaskError, setCreateTaskError] = useState<string | null>(null)
   const [draftMessage, setDraftMessage] = useState("")
@@ -215,6 +224,25 @@ function PublicConversationContent({
     setTaskId(null, { navigate: false })
   }, [authMode, connectionError, state.taskId, storageKey, setTaskId])
 
+  // Ending a conversation is purely client-side: drop the persisted id and the
+  // active taskId, and the visitor is back on the start screen; the next
+  // message creates a fresh task through handleSend. #1039
+  const handleNewConversation = useCallback(() => {
+    safeRemoveItem(storageKey)
+    setTaskId(null, { navigate: false })
+    // Nulling taskId closes the socket, so no terminal WS event will ever
+    // reset these. Left stale mid-run, isProcessing keeps the start screen's
+    // composer disabled forever, currentTask pins the header on
+    // "Connecting...", and isHistoryLoading (cleared by an onConnect timer
+    // that may never have been scheduled) pins it on "Initializing".
+    dispatch({ type: "SET_PROCESSING", payload: false })
+    dispatch({ type: "SET_CURRENT_TASK", payload: null })
+    dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+    setDraftMessage("")
+    setDraftFiles([])
+    setCreateTaskError(null)
+  }, [dispatch, storageKey, setTaskId])
+
   const handleSend = useCallback(async (
     message: string,
     config?: PublicMessageConfig,
@@ -239,6 +267,13 @@ function PublicConversationContent({
         title: message,
         description: message,
       }
+      // Workforce opening turns start inside this request and never reach
+      // sendChatMessage, so the zone has to ride along here or the first
+      // answer is rendered against UTC.
+      const openingTimezone = resolveReportedTimezone()
+      if (openingTimezone) {
+        taskPayload.timezone = openingTimezone
+      }
       if (agentId) {
         taskPayload.agent_id = agentId
       }
@@ -256,8 +291,16 @@ function PublicConversationContent({
           file,
           taskType: "task",
           fallbackError: t("files.uploadFailed"),
+          formatError: (code) => t(clientErrorTranslationKey(code)),
         })))
-        taskPayload.files = uploaded.map((item) => item.file_id)
+        const uploadedFileIds = normalizeUploadFileIds(
+          uploaded.map(item => item.file_id),
+          files.length,
+        )
+        if (!uploadedFileIds) {
+          throw new Error(t("clientErrors.uploadFailed"))
+        }
+        taskPayload.files = uploadedFileIds
       }
 
       const response = await fetch(`${getApiUrl()}${publicApiPrefix}/chat/task/create`, {
@@ -363,6 +406,30 @@ function PublicConversationContent({
               <p className="text-xs text-destructive">{createTaskError}</p>
             )}
           </div>
+          {/* A standalone share link has no parent widget.js to signal, so
+              it keeps its own visible reset button instead of the "..."
+              menu -- the embedded widget is the only mode that can be
+              hidden from a host page. */}
+          {authMode === "share" ? (
+            state.taskId && (
+              <button
+                type="button"
+                onClick={handleNewConversation}
+                title={t("widgetChat.newConversation")}
+                aria-label={t("widgetChat.newConversation")}
+                className={`ml-auto ${iconButtonClassName}`}
+              >
+                <MessageSquarePlus className="w-4 h-4" />
+              </button>
+            )
+          ) : (
+            <WidgetChromeControls
+              newConversation={state.taskId ? {
+                label: t("widgetChat.newConversation"),
+                onClick: handleNewConversation,
+              } : undefined}
+            />
+          )}
         </div>
       </div>
 
@@ -388,6 +455,7 @@ function PublicConversationContent({
                 hideConfig={true}
                 compactInput={true}
                 deferFileUpload={true}
+                voiceInputEnabled={voiceInputEnabled}
                 autoFocus={true}
                 inputMinHeightClass="min-h-[44px]"
               />
@@ -400,6 +468,10 @@ function PublicConversationContent({
             showTokenUsage={false}
             showDagPreview={false}
             showTaskFiles={false}
+            // A visitor on a customer's site gets the answer, not the run: no
+            // reasoning, no tool arguments, no raw tool output. Share links
+            // keep the trace — #1041 scopes the hiding to the widget only.
+            showProcessView={authMode === "share"}
             hideFileUpload={false}
             hideConfig={true}
             compactInput={true}
@@ -441,7 +513,6 @@ export function PublicAgentChatPage({
       safeRemoveItem(shareAuthStorageKey)
     }
     setAuthResult(null)
-    setPublicAccessToken(null)
     setIsInitializing(true)
     setReauthNonce((n) => n + 1)
   }, [shareAuthStorageKey])
@@ -503,7 +574,6 @@ export function PublicAgentChatPage({
         const persisted = readPersistedShareAuth()
         if (persisted) {
           setAuthResult(persisted)
-          setPublicAccessToken(persisted.access_token ?? null)
           setErrorMessage(null)
           return
         }
@@ -534,30 +604,35 @@ export function PublicAgentChatPage({
         const authData = await authResponse.json()
         persistShareAuth(authData)
         setAuthResult(authData)
-        setPublicAccessToken(authData.access_token ?? null)
         setErrorMessage(null)
       } catch (error) {
         console.error(error)
         setErrorMessage((error as Error).message || t("widgetChat.messages.error_init"))
-        setPublicAccessToken(null)
       } finally {
         setIsInitializing(false)
       }
     }
 
     initPublicChat()
-    return () => setPublicAccessToken(null)
   }, [authMode, embedTicket, widgetKey, normalizedGuestId, routeToken, searchAgentId, shareAuthStorageKey, reauthNonce, t])
 
   const publicAccessToken = authResult?.access_token ?? ""
+  const fileAccess = usePublicFileAccessPolicy(publicAccessToken)
 
   const transport = useMemo<AppProviderTransportConfig>(() => ({
+    legacyErrorProse: "untrusted",
+    capabilities: {
+      agentCards: "disabled",
+      voice: "disabled",
+      // Widget mode covers both the embedded iframe and direct top-level
+      // visits to the widget URL; in either case the conversation has no
+      // other home, so an in-tab navigation loses it. A "share" visitor has
+      // an ordinary full page, where in-tab navigation is expected behavior.
+      linksOpenInNewTab: authMode === "widget" ? "enabled" : "disabled",
+    },
     buildWebSocketUrl: ({ baseUrl, taskId, token }) =>
       `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}${token ? `?token=${token}` : ""}`,
-    buildFilePreviewUrl: ({ baseUrl, fileId }) =>
-      getFilePublicPreviewUrl(fileId, baseUrl),
-    buildFileDownloadUrl: ({ baseUrl, fileId }) =>
-      getFilePublicDownloadUrl(fileId, baseUrl),
+    fileAccess,
     uploadFiles: (files, params) =>
       Promise.all(files.map((file) =>
         uploadPublicChatFile({
@@ -567,9 +642,10 @@ export function PublicAgentChatPage({
           taskType: params.taskType,
           taskId: params.taskId,
           fallbackError: t("files.uploadFailed"),
+          formatError: (code) => t(clientErrorTranslationKey(code)),
         }),
       )),
-  }), [authMode, publicAccessToken, t])
+  }), [authMode, fileAccess, publicAccessToken, t])
 
   if (isInitializing) {
     return (

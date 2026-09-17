@@ -16,6 +16,10 @@ from ..models.database import get_db
 from ..models.oauth_provider import OAuthProvider
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..services.user_oauth import (
+    get_scoped_user_oauth_account,
+    scoped_user_oauth_query,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +46,11 @@ def get_google_credentials(
     user_id: int, db: Session, account_id: Optional[int] = None
 ) -> Any:
     """Get Google Credentials for user, refreshing if necessary"""
-    query = db.query(UserOAuth).filter(
-        UserOAuth.user_id == user_id, UserOAuth.provider == "google-drive"
-    )
+    query = scoped_user_oauth_query(
+        db,
+        user_id=user_id,
+        resource_owner_key=None,
+    ).filter(UserOAuth.provider == "google-drive")
 
     if account_id:
         query = query.filter(UserOAuth.id == account_id)
@@ -105,7 +111,11 @@ async def list_connected_accounts(
     user: User = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """List connected cloud accounts"""
-    query = db.query(UserOAuth).filter(UserOAuth.user_id == user.id)
+    query = scoped_user_oauth_query(
+        db,
+        user_id=cast(int, user.id),
+        resource_owner_key=None,
+    )
 
     if provider:
         query = query.filter(UserOAuth.provider == provider)
@@ -130,17 +140,42 @@ async def delete_connected_account(
     user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Delete a connected cloud account"""
-    account = (
-        db.query(UserOAuth)
-        .filter(UserOAuth.id == account_id, UserOAuth.user_id == user.id)
-        .first()
+    account = get_scoped_user_oauth_account(
+        db,
+        user_id=cast(int, user.id),
+        account_id=account_id,
+        resource_owner_key=None,
     )
 
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
+    # Snapshot before the delete: it's a bulk-free single-row delete here,
+    # but the same "read the token before it's gone" constraint applies as
+    # in mcp.py's disconnect endpoints -- this must run before db.delete,
+    # while the row (and its access_token) still exists.
+    from .auth import resolve_builtin_oauth_revocation
+
+    revocation = resolve_builtin_oauth_revocation(
+        db,
+        provider=str(account.provider),
+        access_token=str(account.access_token) if account.access_token else "",
+        provider_user_id=(
+            str(account.provider_user_id)
+            if account.provider_user_id is not None
+            else None
+        ),
+    )
+
     db.delete(account)
     db.commit()
+
+    if revocation is not None:
+        from .auth import revoke_builtin_oauth_grants
+
+        await revoke_builtin_oauth_grants(
+            db, [revocation], context=f"deleting connected account {account_id}"
+        )
 
     return {"success": True, "message": "Account deleted successfully"}
 
@@ -209,7 +244,10 @@ async def list_google_drive_files(
             .list(
                 q=query,
                 pageSize=100,
-                fields="nextPageToken, files(id, name, mimeType, size, modifiedTime)",
+                fields=(
+                    "nextPageToken, "
+                    "files(id, name, mimeType, size, modifiedTime, resourceKey)"
+                ),
                 orderBy="folder,name",
                 supportsAllDrives=supports_all_drives,
                 includeItemsFromAllDrives=include_items_from_all_drives,
@@ -255,6 +293,7 @@ async def list_google_drive_files(
                     "size": size_str,
                     "updatedAt": updated_at,
                     "mimeType": mime_type,  # Optional, helpful for debugging
+                    "resourceKey": file.get("resourceKey"),
                 }
             )
 

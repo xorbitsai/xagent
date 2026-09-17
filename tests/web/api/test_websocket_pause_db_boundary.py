@@ -11,12 +11,20 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy.orm import Session
 
-from xagent.web.api import chat as chat_api
+from tests.shared.execution_scope import register_scope_resolver
+from xagent.core.execution_scope import (
+    ExecutionScope,
+    set_execution_scope_snapshot_loader,
+)
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_setup_snapshot as snapshot_module
 from xagent.web.services.task_execution_controller import (
     StaleTaskRunError,
@@ -63,7 +71,7 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
         }
         return snapshot
 
-    def resolve_scope(resolved_task_id: int) -> None:
+    def resolve_scope_off_turn(resolved_task_id: int) -> None:
         worker_threads["scope"] = threading.get_ident()
         assert resolved_task_id == task_id
         return None
@@ -86,25 +94,33 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
     connection_manager.broadcast_to_task = AsyncMock()
 
     monkeypatch.setattr(snapshot_module, "load_task_setup_snapshot_sync", load_snapshot)
-    monkeypatch.setattr(websocket_api, "resolve_execution_scope", resolve_scope)
+    # Pause is a control operation on an already-running task, so it resolves
+    # off-turn: it must stay available while the scope is in dispute.
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
+        "resolve_execution_scope_off_turn",
+        resolve_scope_off_turn,
+    )
+    monkeypatch.setattr(
+        command_execution_service,
         "_apply_pause_requested_isolated",
         finalize_pause,
         raising=False,
     )
     monkeypatch.setattr(database_module, "get_db", forbidden_event_loop_db)
-    monkeypatch.setattr(chat_api, "get_agent_manager", lambda: agent_manager)
+    monkeypatch.setattr(
+        agent_runtime_service, "get_agent_manager", lambda: agent_manager
+    )
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
     try:
-        await websocket_api._handle_pause_task_unserialized(
-            MagicMock(),
+        await command_execution_service.pause_task(
+            _make_command_reply(MagicMock()),
             task_id,
             {"user": actor},
         )
     finally:
-        websocket_api._clear_task_pause_accepted(task_id)
+        task_execution_service._clear_task_pause_accepted(task_id)
 
     assert set(worker_threads) == {"snapshot", "scope", "finalize"}
     assert all(thread_id != event_loop_thread for thread_id in worker_threads.values())
@@ -119,6 +135,75 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
     }
     agent_service.pause_execution.assert_awaited_once_with()
     connection_manager.broadcast_to_task.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pause_survives_a_scope_authority_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user must be able to pause a task whose scope is in dispute.
+
+    Pause locates an already-running task; it selects no namespace for new
+    bytes. Resolving fail-closed here would let a resolver/snapshot
+    disagreement escape the socket loop and leave the task unstoppable.
+    """
+    task_id = 43
+    owner_id = 7
+    actor = SimpleNamespace(id=owner_id, is_admin=False)
+    runtime_user = SimpleNamespace(id=owner_id, is_admin=False)
+    snapshot = SimpleNamespace(
+        task=SimpleNamespace(
+            user_id=owner_id, status=TaskStatus.RUNNING, run_id="run-2"
+        ),
+        runtime_user=runtime_user,
+    )
+    register_scope_resolver(
+        lambda resolved_task_id: ExecutionScope(
+            sandbox_key_suffix="from-resolver", workspace_segments=("from-resolver",)
+        )
+    )
+    set_execution_scope_snapshot_loader(
+        lambda resolved_task_id: ExecutionScope(
+            sandbox_key_suffix="from-snapshot", workspace_segments=("from-snapshot",)
+        )
+    )
+    agent_service = MagicMock()
+    agent_service.pause_execution = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    connection_manager = MagicMock()
+    connection_manager.send_personal_message = AsyncMock()
+    connection_manager.broadcast_to_task = AsyncMock()
+
+    monkeypatch.setattr(
+        snapshot_module, "load_task_setup_snapshot_sync", lambda *a, **k: snapshot
+    )
+    monkeypatch.setattr(
+        command_execution_service,
+        "_apply_pause_requested_isolated",
+        lambda *a, **k: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent_runtime_service, "get_agent_manager", lambda: agent_manager
+    )
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+
+    try:
+        await command_execution_service.pause_task(
+            _make_command_reply(MagicMock()), task_id, {"user": actor}
+        )
+    finally:
+        task_execution_service._clear_task_pause_accepted(task_id)
+
+    # The pause went through on the resolver's answer instead of raising.
+    agent_service.pause_execution.assert_awaited_once_with()
+    assert (
+        agent_manager.get_agent_for_task.await_args.kwargs[
+            "resolved_execution_scope"
+        ].sandbox_key_suffix
+        == "from-resolver"
+    )
 
 
 def _running_task(db_session: Session, *, run_id: str = "run-1") -> Task:
@@ -147,7 +232,7 @@ def test_pause_transition_updates_only_the_expected_running_run(
 ) -> None:
     task = _running_task(db_session)
 
-    applied = websocket_api._apply_pause_requested_isolated(
+    applied = command_execution_service._apply_pause_requested_isolated(
         int(task.id),
         expected_run_id="run-1",
     )
@@ -165,7 +250,7 @@ def test_pause_transition_rejects_a_replacement_run(db_session: Session) -> None
     task = _running_task(db_session, run_id="replacement-run")
 
     with pytest.raises(StaleTaskRunError, match="run changed"):
-        websocket_api._apply_pause_requested_isolated(
+        command_execution_service._apply_pause_requested_isolated(
             int(task.id),
             expected_run_id="original-run",
         )
@@ -185,7 +270,7 @@ def test_pause_transition_leaves_a_terminal_task_unchanged(
     setattr(task, "control_state", TaskControlState.COMPLETED.value)
     db_session.commit()
 
-    applied = websocket_api._apply_pause_requested_isolated(
+    applied = command_execution_service._apply_pause_requested_isolated(
         int(task.id),
         expected_run_id="run-1",
     )

@@ -7,6 +7,7 @@ import {
   parseApiResponse,
 } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import type {
   WorkforceAgentOption,
   WorkforceAgentExecution,
@@ -15,6 +16,7 @@ import type {
   WorkforceCreatePayload,
   WorkforceDetail,
   WorkforceListResponse,
+  WorkforcePreviewRunPayload,
   WorkforcePromptCreatePayload,
   WorkforceRunHistoryItem,
   WorkforceRunHistoryResponse,
@@ -64,6 +66,13 @@ function formatApiDetail(detail: unknown, fallback: string): string {
     if (messages.length > 0) {
       return messages.join("; ")
     }
+  }
+  // Structured error shape used by delete/unarchive on this route:
+  // { detail: { code, message } }. Without this branch the object falls
+  // through to parseApiError's raw-JSON-text fallback, surfacing the whole
+  // response body as the error message instead of the intended one.
+  if (isJsonRecord(detail) && typeof detail.message === "string" && detail.message.trim()) {
+    return detail.message
   }
   return fallback
 }
@@ -164,6 +173,30 @@ export async function archiveWorkforce(
     throw await parseApiError(response, "Failed to archive workforce")
   }
   return response.json()
+}
+
+export async function unarchiveWorkforce(
+  workforceId: number | string,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/unarchive`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to unarchive workforce")
+  }
+  return response.json()
+}
+
+export async function deleteWorkforcePermanently(
+  workforceId: number | string,
+): Promise<void> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}?permanent=true`,
+    { method: "DELETE" },
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to delete workforce")
+  }
 }
 
 export async function discardWorkforce(
@@ -273,11 +306,23 @@ export async function removeWorkforceAgent(
   }
 }
 
+// The workforce opening turn starts inside this HTTP request and never reaches
+// the websocket send path, so the zone is attached here. An explicit value on
+// the payload wins; otherwise fall back to the browser/data-timezone resolution.
+function withReportedTimezone<T extends { timezone?: string }>(payload: T): T {
+  if (payload.timezone) return payload
+  const timezone = resolveReportedTimezone()
+  return timezone ? { ...payload, timezone } : payload
+}
+
+
 export async function runWorkforce(
   workforceId: number | string,
   payload: WorkforceRunPayload | string,
 ): Promise<WorkforceRunResponse> {
-  const body = typeof payload === "string" ? { message: payload } : payload
+  const body = withReportedTimezone(
+    typeof payload === "string" ? { message: payload } : payload,
+  )
   const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/runs`, {
     method: "POST",
     headers: jsonHeaders(),
@@ -285,6 +330,20 @@ export async function runWorkforce(
   })
   if (!response.ok) {
     throw await parseApiError(response, "Failed to run workforce")
+  }
+  return response.json()
+}
+
+export async function runWorkforcePreview(
+  payload: WorkforcePreviewRunPayload,
+): Promise<WorkforceRunResponse> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/preview/runs`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(withReportedTimezone(payload)),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to run workforce preview")
   }
   return response.json()
 }

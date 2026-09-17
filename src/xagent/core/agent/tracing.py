@@ -26,7 +26,9 @@ TRACE_TURN_IDS_KEY = "_user_message_trace_turn_ids"
 # Stamped on ``context.metadata`` by ``runner.inject_user_message`` just
 # before persisting a freshly-injected user message, and cleared when the
 # follow-up persist records the advanced watermark. Carries the injected
-# message's ISO-UTC timestamp.
+# message's ISO-UTC timestamp. Only reached on a POSTED_FRESH outcome (see
+# ``UserMessageInjectionOutcome``): a short-circuited replay returns before
+# this stamp, or any other mutation of the context, ever happens.
 #
 # The catch-up loop on resume uses this to disambiguate three cases:
 # - both absent  -> old/pre-PR checkpoint, do nothing (don't replay history)
@@ -85,9 +87,11 @@ class TraceEventCallback:
 
         # Resume / checkpoint replay: emit any user messages the prior turn
         # did not get to trace. This handles two real scenarios:
-        #   1. ``inject_user_message`` was called, the checkpoint was
-        #      persisted, but the in-process trace emission was lost
-        #      (worker crash between persist and emit).
+        #   1. ``inject_user_message`` returned POSTED_FRESH, the checkpoint
+        #      was persisted, but the in-process trace emission was lost
+        #      (worker crash between persist and emit). A POSTED_REPLAY
+        #      outcome never reaches this scenario -- it persists nothing,
+        #      so there is no fresh turn here to catch up on.
         #   2. Defensive double-coverage for the continuation flow even
         #      though ``on_user_message_posted`` already covers the happy
         #      path — keeps the chip from disappearing if the callback
@@ -103,6 +107,11 @@ class TraceEventCallback:
         files: list[dict[str, Any]] | None = None,
     ) -> None:
         """Fire when ``runner.inject_user_message`` lands a fresh user turn.
+
+        Only a ``POSTED_FRESH`` outcome (see ``UserMessageInjectionOutcome``)
+        reaches here: the short-circuit that produces ``POSTED_REPLAY``
+        returns before the runner dispatches this callback, so a replayed
+        turn id never re-fires it.
 
         ``message`` is the freshly added ``Message`` instance. ``files`` is
         the normalized attachment list the websocket layer received; when

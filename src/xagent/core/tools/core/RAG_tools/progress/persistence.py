@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -16,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 class ProgressPersistence:
     """Handles persistence of progress data to various storage backends."""
+
+    MAX_FILENAME_BYTES = 255
 
     def __init__(self, storage_dir: Optional[str] = None):
         """Initialize persistence layer.
@@ -44,6 +49,8 @@ class ProgressPersistence:
         Args:
             task_progress: The task progress to save
         """
+        file_path = None
+
         try:
             file_path = self._get_task_file_path(task_progress.task_id)
 
@@ -60,16 +67,35 @@ class ProgressPersistence:
                 "metadata": task_progress.metadata,
             }
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            # A truncated file would survive as broken JSON that
+            # cleanup_old_tasks can never date, and so never remove. mkstemp
+            # rather than a name derived from file_path: two writers racing on
+            # one task id would share that name, and it has no byte budget left.
+            fd, tmp_name = tempfile.mkstemp(dir=self.storage_dir, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                os.replace(tmp_name, file_path)
+            finally:
+                Path(tmp_name).unlink(missing_ok=True)
 
         except Exception as e:
+            location = self.storage_dir if file_path is None else file_path
+            # %r: a task id carrying a lone surrogate from os.fsdecode cannot be
+            # encoded by a UTF-8 log handler.
             logger.error(
-                "Failed to save task progress for %s: %s", task_progress.task_id, e
+                "Failed to save task progress for %r to %s: %s",
+                task_progress.task_id,
+                location,
+                e,
             )
             raise ProgressPersistenceError(
-                f"Failed to save task progress: {e}",
-                details={"task_id": task_progress.task_id, "error": str(e)},
+                f"Failed to save task progress to {location}: {e}",
+                details={
+                    "task_id": task_progress.task_id,
+                    "file_path": str(location),
+                    "error": str(e),
+                },
             ) from e
 
     def load_task_progress(self, task_id: str) -> Optional[TaskProgress]:
@@ -93,7 +119,7 @@ class ProgressPersistence:
             return TaskProgress(**data)
 
         except Exception as e:
-            logger.error("Failed to load task progress for %s: %s", task_id, e)
+            logger.error("Failed to load task progress for %r: %s", task_id, e)
             return None
 
     def delete_task_progress(self, task_id: str) -> bool:
@@ -112,7 +138,7 @@ class ProgressPersistence:
                 return True
             return False
         except Exception as e:
-            logger.error("Failed to delete task progress for %s: %s", task_id, e)
+            logger.error("Failed to delete task progress for %r: %s", task_id, e)
             return False
 
     def list_active_tasks(
@@ -266,4 +292,20 @@ class ProgressPersistence:
         if not safe_task_id:
             safe_task_id = "unknown"
 
-        return self.storage_dir / f"{safe_task_id}.json"
+        suffix = ".json"
+        # task_id is caller-supplied and unbounded; filesystems cap a filename at
+        # 255 *bytes*, and a CJK collection name is 3 bytes per character.
+        budget = self.MAX_FILENAME_BYTES - len(suffix)
+        encoded = safe_task_id.encode("utf-8")
+        if len(encoded) > budget:
+            # surrogatepass: an OS path with undecodable bytes must still hash.
+            # 64-bit digest, so ids differing before the cap differ in practice.
+            digest = hashlib.sha256(
+                task_id.encode("utf-8", "surrogatepass")
+            ).hexdigest()[:16]
+            prefix = encoded[: max(budget - len(digest) - 1, 0)].decode(
+                "utf-8", "ignore"
+            )
+            safe_task_id = f"{prefix}-{digest}"
+
+        return self.storage_dir / f"{safe_task_id}{suffix}"

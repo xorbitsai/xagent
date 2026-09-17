@@ -79,6 +79,7 @@ def _gmail_env(monkeypatch: pytest.MonkeyPatch):
         "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
         "pubsub-push@e2e-emulator-project.iam.gserviceaccount.com",
     )
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
 
 
 @pytest.fixture()

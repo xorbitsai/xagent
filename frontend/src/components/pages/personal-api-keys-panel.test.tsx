@@ -94,7 +94,11 @@ function listResponse(canManageOthers: boolean): PersonalApiKeyListResponse {
       revoked_at: null as string | null,
       expires_at: null,
       created_at: "2026-07-22T00:00:00Z",
-      owner: { id: 1, username: "alice", email: "alice@example.com" },
+      owner: {
+        id: 1,
+        username: "acct_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        email: "alice@example.com",
+      },
     },
   ]
 
@@ -107,7 +111,11 @@ function listResponse(canManageOthers: boolean): PersonalApiKeyListResponse {
       revoked_at: null,
       expires_at: null,
       created_at: "2026-07-22T00:00:00Z",
-      owner: { id: 2, username: "bob", email: "bob@example.com" },
+      owner: {
+        id: 2,
+        username: "acct_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        email: "bob@example.com",
+      },
     })
   }
 
@@ -147,7 +155,7 @@ describe("PersonalApiKeysPanel", () => {
     render(<PersonalApiKeysPanel active />)
 
     expect(await screen.findByText("xag_personal_self123_••••••••")).toBeInTheDocument()
-    expect(screen.queryByText("bob")).not.toBeInTheDocument()
+    expect(screen.queryByText("bob@example.com")).not.toBeInTheDocument()
     expect(screen.queryByText("Owner")).not.toBeInTheDocument()
     expect(screen.getByRole("button", { name: "Create Personal Key" })).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Create Personal Key for Me" })).not.toBeInTheDocument()
@@ -158,7 +166,8 @@ describe("PersonalApiKeysPanel", () => {
 
     render(<PersonalApiKeysPanel active />)
 
-    expect(await screen.findByText("bob")).toBeInTheDocument()
+    expect(await screen.findByText("bob@example.com")).toBeInTheDocument()
+    expect(screen.queryByText("acct_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")).not.toBeInTheDocument()
     expect(screen.getByText("Owner")).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "Create Personal Key for Me" })).toBeInTheDocument()
   })
@@ -191,10 +200,10 @@ describe("PersonalApiKeysPanel", () => {
 
     render(<PersonalApiKeysPanel active />)
 
-    await screen.findByText("bob")
+    await screen.findByText("bob@example.com")
     fireEvent.click(screen.getAllByRole("button", { name: "Revoke" })[1])
 
-    expect(screen.getByText("Revoke this personal key for bob?")).toBeInTheDocument()
+    expect(screen.getByText("Revoke this personal key for bob@example.com?")).toBeInTheDocument()
 
     fireEvent.click(screen.getAllByRole("button", { name: "Revoke" })[2])
     await waitFor(() => expect(revokePersonalApiKeyMock).toHaveBeenCalledWith(2))

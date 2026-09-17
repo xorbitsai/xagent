@@ -1,10 +1,14 @@
+from .actor_mcp_connection import ActorMCPServerConnection
+from .actor_oauth_flow import ActorOAuthFlowState
 from .agent import Agent
 from .agent_api_key import AgentApiKey
+from .auto_model import AutoModelCandidate, AutoModelConfig
 from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobType
 from .chat_message import TaskChatMessage
 from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
 from .deployment import Deployment, DeploymentOwnerType
+from .global_memory_embedding_authority import GlobalMemoryEmbeddingAuthority
 from .gmail_watch import GmailWatchState
 from .kb_ingest_target import KBIngestTarget
 from .mcp import MCPServer, UserMCPServer
@@ -13,11 +17,16 @@ from .model import Model
 from .oauth_provider import OAuthProvider
 from .oidc_consumed_token import OidcConsumedToken
 from .public_mcp import PublicMCPApp, PublicMCPAppAudit
-from .sandbox import SandboxInfo, SandboxSnapshot
+from .sandbox import DurableSandboxLifecycle, SandboxInfo, SandboxSnapshot
 from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
+from .task_channel_delivery import TaskChannelDelivery
 from .task_command import TaskExecutionCommand
+from .task_command_terminal_event import TaskCommandTerminalEvent
+from .task_execution_event import TaskExecutionEvent
+from .task_interaction import TaskInteractionRequest
+from .task_runtime_secret import TaskRuntimeSecret
 from .template_stats import TemplateStats, UserTemplateRelation
 from .tool_config import ToolConfig, ToolUsage
 from .trigger import (
@@ -32,13 +41,16 @@ from .trigger import (
 from .uploaded_file import UploadedFile
 from .user import User, UserDefaultModel, UserModel
 from .user_api_key import UserApiKey
-from .user_channel import UserChannel
+from .user_channel import SlackOAuthFlowState, UserChannel
 from .user_identity import UserIdentity
 from .user_oauth import UserOAuth
 from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, WorkforceRun
 
 __all__ = [
+    "TaskChannelDelivery",
     "Base",
+    "ActorOAuthFlowState",
+    "ActorMCPServerConnection",
     "get_engine",
     "get_db",
     "get_session_local",
@@ -48,6 +60,7 @@ __all__ = [
     "UserApiKey",
     "UserOAuth",
     "UserChannel",
+    "SlackOAuthFlowState",
     "UserIdentity",
     "Model",
     "MCPServer",
@@ -61,6 +74,10 @@ __all__ = [
     "DeploymentOwnerType",
     "Task",
     "TaskExecutionCommand",
+    "TaskCommandTerminalEvent",
+    "TaskExecutionEvent",
+    "TaskInteractionRequest",
+    "TaskRuntimeSecret",
     "TaskConnectorRuntimeContext",
     "DAGExecution",
     "TemplateStats",
@@ -77,15 +94,19 @@ __all__ = [
     "SystemSetting",
     "Agent",
     "AgentApiKey",
+    "AutoModelConfig",
+    "AutoModelCandidate",
     "BackgroundJob",
     "BackgroundJobStatus",
     "BackgroundJobType",
     "GmailWatchState",
+    "GlobalMemoryEmbeddingAuthority",
     "KBIngestTarget",
     "TaskChatMessage",
     "UploadedFile",
     "SandboxInfo",
     "SandboxSnapshot",
+    "DurableSandboxLifecycle",
     "UserSkill",
     "UserSkillFile",
     "OAuthProvider",

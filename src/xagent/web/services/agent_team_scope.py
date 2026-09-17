@@ -8,6 +8,7 @@ and whether that user is a team admin.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Optional, cast
 
@@ -31,6 +32,10 @@ _team_agent_connector_validator = None
 
 # (db, user_id, team_id, knowledge_bases) -> list of unshared KB dicts.
 _team_agent_knowledge_base_validator = None
+
+_MAX_POSTGRES_INTEGER = 2**31 - 1
+_MAX_POSTGRES_INTEGER_DECIMAL_DIGITS = len(str(_MAX_POSTGRES_INTEGER))
+_CANONICAL_AGENT_ID = re.compile(r"[1-9][0-9]*")
 
 
 def set_agent_team_hooks(
@@ -128,4 +133,40 @@ def owned_agent_clause(
     return or_(
         and_(Agent.team_id.is_(None), Agent.user_id == user_id),
         team_clause,
+    )
+
+
+def resolve_authorized_agent(
+    db: Session, owner_user_id: int, candidate_id: Any
+) -> Agent | None:
+    """Resolve a canonical Agent id within the task owner's team scope.
+
+    Persisted task config is untrusted at every read boundary. Reject malformed
+    values before constructing the SQL predicate, then reuse the same owner/team
+    clause as all normal Agent reads.
+
+    Lifecycle status is caller-owned; each use case must apply its required status policy after resolution.
+    """
+    if isinstance(candidate_id, bool):
+        return None
+    if isinstance(candidate_id, int):
+        agent_id = candidate_id
+    elif isinstance(candidate_id, str):
+        # Bound untrusted text before regex scanning or integer conversion.
+        if len(candidate_id) > _MAX_POSTGRES_INTEGER_DECIMAL_DIGITS:
+            return None
+        if not _CANONICAL_AGENT_ID.fullmatch(candidate_id):
+            return None
+        agent_id = int(candidate_id)
+    else:
+        return None
+    if not 0 < agent_id <= _MAX_POSTGRES_INTEGER:
+        return None
+    return (
+        db.query(Agent)
+        .filter(
+            Agent.id == agent_id,
+            owned_agent_clause(owner_user_id, get_agent_team_scope(db, owner_user_id)),
+        )
+        .first()
     )

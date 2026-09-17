@@ -617,7 +617,7 @@ class SearchResult(BaseModel):
         None,
         description="Additional metadata for the chunk (page_number, section, source, etc.)",
     )
-    # Original scores and ranks for RRF fallback (optional, populated during hybrid search)
+    # Original scores and ranks from hybrid fusion (optional, populated during hybrid search)
     vector_score: Optional[float] = Field(
         None,
         description="Original vector search score (before rerank/fusion)",
@@ -1255,6 +1255,31 @@ class IngestionResult(BaseModel):
         description="Uploaded file ID for preview/download via /api/files (when ingest registers the file)",
     )
 
+    @property
+    def produced_documents(self) -> int:
+        """How many documents this run left in the collection.
+
+        Keyed on the ``register_document`` step rather than on chunk counts: a
+        registered document is listed in the knowledge base and can be opened and
+        deleted, so it must be published even when it produced no chunks (an
+        empty file, a re-ingest with nothing new to embed). Counting chunks here
+        would leave those runs with documents and no config row — invisible to
+        their owner and blocking the name, which is the failure this PR removes.
+
+        This describes the run, not the collection, which is why callers that
+        roll back still differ in what they publish: `/ingest`, its job twin and
+        `/ingest-cloud` roll a ``partial`` document back, so they exclude those
+        states and publish nothing for them; the agent tools do not roll back, so
+        for them a ``partial`` document is still in the collection and must be
+        published. Same predicate, different rollback policy — a caller that rolls
+        back must either ask before doing so or exclude what it rolled back.
+        """
+        if self.status == "error":
+            return 0
+        return int(
+            any(step.name == "register_document" for step in self.completed_steps)
+        )
+
 
 # ------------------------- Management -------------------------
 
@@ -1506,15 +1531,21 @@ class CollectionInfo(BaseModel):
             }
         )
 
-        # Serialize complex types to JSON strings for LanceDB
-        data["extra_metadata"] = json.dumps(data["extra_metadata"])
+        # Serialize complex types to JSON strings for LanceDB. extra_metadata is
+        # caller-supplied and untyped (Dict[str, Any]), so default=str is the
+        # fallback for values json.dumps() can't otherwise serialize (e.g. an
+        # Enum, datetime, or UUID a caller stuffed in there).
+        data["extra_metadata"] = json.dumps(data["extra_metadata"], default=str)
         data["document_names"] = json.dumps(data["document_names"])
         # Do not persist owners; they are computed from user_id when listing
         data["owners"] = "[]"
 
-        # Serialize ingestion_config if present
-        if data.get("ingestion_config"):
-            data["ingestion_config"] = json.dumps(data["ingestion_config"])
+        # model_dump_json() serializes ingestion_config's enum fields to their
+        # .value per the type annotation, unlike json.dumps() on the
+        # model_dump()'d dict above (which left them as ParseMethod/
+        # ChunkStrategy instances and crashed on any non-null ingestion_config).
+        if self.ingestion_config is not None:
+            data["ingestion_config"] = self.ingestion_config.model_dump_json()
         else:
             # Use empty string sentinel instead of None to prevent LanceDB non-null schema errors
             data["ingestion_config"] = LANCEDB_NULL_STR_SENTINEL
@@ -2244,7 +2275,20 @@ class WebIngestionResult(BaseModel):
 
     status: str = Field(
         ...,
-        description="Overall status: success|error|partial",
+        description=(
+            "Overall status: success|error|partial. A crawl the site blocked "
+            "is still success when its pages were ingested; see "
+            "crawl_blocked_by_site."
+        ),
+    )
+    crawl_blocked_by_site: bool = Field(
+        default=False,
+        description=(
+            "The crawl ended because the site refused every link past the "
+            "start page. Only ever set alongside status='success' - a run with "
+            "page failures is already partial or error, and this flag is about "
+            "what the site did rather than about how ingestion went."
+        ),
     )
     collection: str = Field(..., description="Target collection name")
 

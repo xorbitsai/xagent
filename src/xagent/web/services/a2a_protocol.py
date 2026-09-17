@@ -12,7 +12,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import and_, false, or_
 
-from ...config import get_public_api_base_url
+from ...config import get_s2s_api_base_url
 from ..models.agent import Agent, AgentStatus
 from ..models.task import Task, TaskStatus
 from .task_execution_controller import TaskControlState
@@ -196,7 +196,7 @@ def is_published_agent(agent: object | None) -> bool:
 
 
 def normalize_agent_card_base_url(request: Request, agent_id: int) -> str:
-    root = get_public_api_base_url() or str(request.base_url).rstrip("/")
+    root = get_s2s_api_base_url() or str(request.base_url).rstrip("/")
     return f"{root}/api/a2a/agents/{agent_id}"
 
 

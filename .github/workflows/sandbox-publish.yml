@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Free GitHub-hosted runner disk space
         uses: endersonmenezes/free-disk-space@e6ed9b02e683a3b55ed0252f1ee469ce3b39a885
@@ -50,10 +50,10 @@ jobs:
           rmz_version: "3.1.1"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Log in to Docker Hub
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
@@ -64,7 +64,7 @@ jobs:
 
       - name: Extract metadata for sandbox
         id: meta-sandbox
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.SANDBOX_IMAGE }}
           tags: |
@@ -73,7 +73,7 @@ jobs:
             type=raw,value=${{ github.event.inputs.tag || 'latest' }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push sandbox image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.sandbox
@@ -83,3 +83,16 @@ jobs:
           labels: ${{ steps.meta-sandbox.outputs.labels }}
           cache-from: type=registry,ref=${{ env.SANDBOX_IMAGE }}:buildcache
           cache-to: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true') && format('type=registry,ref={0}:buildcache,mode=max', env.SANDBOX_IMAGE) || '' }}
+
+      - name: Update Docker Hub repository description
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
+        # WHY: this PATCH needs a stronger Hub entitlement than the image push,
+        # so a 403 here must not fail a release whose image is already public.
+        continue-on-error: true
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          repository: ${{ env.SANDBOX_IMAGE }}
+          short-description: "Sandbox runtime image for Xagent: isolated Node.js and Python execution for agent tool calls"
+          readme-filepath: ./docker/README.sandbox.md

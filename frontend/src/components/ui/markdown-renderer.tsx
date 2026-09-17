@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react'
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
+import { remarkCurrencySafeMath } from '@/lib/remark-currency-safe-math'
+import { remarkPreserveTableContent } from '@/lib/remark-preserve-table-content'
 import type { Components, ExtraProps } from 'react-markdown'
 import { apiRequest } from '@/lib/api-wrapper'
 import { AgentCard } from '@/components/chat/AgentCard'
@@ -16,6 +17,16 @@ import {
   type PreviewableInlineFileKind,
 } from '@/components/file/inline-file-preview-utils'
 import { getApiUrl } from '@/lib/utils'
+import {
+  AgentCardPresentationCapability,
+  LinksOpenInNewTabCapability,
+  resolveAgentCardPresentationCapability,
+} from '@/contexts/presentation-capabilities'
+import {
+  isManagedFileUrl,
+  projectFilesDisabledPresentation,
+  sanitizeFilesDisabledPresentationText,
+} from '@/lib/files-disabled-presentation'
 
 
 interface AgentInfo {
@@ -43,9 +54,15 @@ const isLikelyMarkdown = (s: string): boolean => {
   )
 }
 
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+)
+
 interface MarkdownRendererProps {
   content: string
   className?: string
+  filesDisabled?: boolean
+  agentCardsEnabled?: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
 }
@@ -206,19 +223,54 @@ const nodeText = (children: React.ReactNode): string => {
 
 function resolvePreviewableFileLink({
   fileNameFromPath,
-  fileName,
+  title,
+  visibleText,
 }: {
   fileNameFromPath: string
-  fileName: string
+  /**
+   * Link title, if any. The backend injects the real filename here
+   * precisely so type detection survives when the model rewrites the
+   * visible label/alt text into descriptive prose that drops the
+   * extension — so this is tried before ``visibleText`` for detection.
+   */
+  title: string
+  /**
+   * The model's own label (link) or alt text (image), if any. Preferred
+   * over the title for what's *shown* to the user — the title is a
+   * detection hint, not display text — and also tried for *detection*
+   * whenever the title itself doesn't classify as any previewable kind,
+   * so a label that reveals the type (e.g. a plain ``report.mp4``) still
+   * classifies correctly when there's no title, or a stale/irrelevant one.
+   *
+   * Detection tries ``title`` first and stops at the first candidate that
+   * classifies to *any* previewable kind — it does not compare the two and
+   * prefer visibleText's kind when it differs from title's. This is looser
+   * than the backend's own gate for when it injects/overwrites a title
+   * (``label_reveals_type`` in file_reference_output_service.py): the
+   * backend only touches the title when the label doesn't already reveal a
+   * type, so in the reference-generation path the two never disagree in
+   * practice. A hand-authored or otherwise unusual reference where both
+   * title and label classify, to different kinds, resolves to title's kind
+   * here rather than label's -- pinned by the "lets a title that
+   * classifies differently than the label win detection" test in
+   * markdown-renderer.test.tsx; this component does not attempt to close
+   * that edge case.
+   */
+  visibleText: string
 }): { previewKind: PreviewableInlineFileKind; displayFilename: string } | null {
+  const displayFilename = visibleText || title || fileNameFromPath
+
   const pathKind = getInlineFilePreviewKind({ filename: fileNameFromPath })
   if (isPreviewableInlineFileKind(pathKind)) {
-    return { previewKind: pathKind, displayFilename: fileName }
+    return { previewKind: pathKind, displayFilename }
   }
 
-  const labelKind = getInlineFilePreviewKind({ filename: fileName })
-  if (isPreviewableInlineFileKind(labelKind)) {
-    return { previewKind: labelKind, displayFilename: fileName }
+  for (const candidate of [title, visibleText]) {
+    if (!candidate) continue
+    const kind = getInlineFilePreviewKind({ filename: candidate })
+    if (isPreviewableInlineFileKind(kind)) {
+      return { previewKind: kind, displayFilename }
+    }
   }
 
   return null
@@ -231,8 +283,10 @@ function containsPreviewFileLinkNode(node: any): boolean {
     const filePath = href.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
     const title = typeof node.properties?.title === 'string' ? node.properties.title : ''
-    const label = title || hastText(node)
-    if (resolvePreviewableFileLink({ fileNameFromPath, fileName: label })) return true
+    const label = hastText(node)
+    if (resolvePreviewableFileLink({ fileNameFromPath, title, visibleText: label })) {
+      return true
+    }
   }
   const src = node.properties?.src
   if (typeof src === 'string' && src.startsWith('file:')) {
@@ -243,6 +297,9 @@ function containsPreviewFileLinkNode(node: any): boolean {
 }
 
 type MarkdownRendererContextValue = {
+  filesDisabled: boolean
+  agentCardsEnabled: boolean
+  linksOpenInNewTab: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
   openLabel: string
@@ -282,6 +339,20 @@ function MarkdownParagraph({
   return <p {...props}>{children}</p>
 }
 
+function MarkdownTable({ node: _node, children, ...props }: MarkdownComponentProps<'table'>) {
+  const { t } = useI18n()
+  return (
+    <div
+      className="markdown-table-scroll"
+      role="region"
+      aria-label={t('markdownRenderer.tableScrollLabel')}
+      tabIndex={0}
+    >
+      <table {...props}>{children}</table>
+    </div>
+  )
+}
+
 function MarkdownLink({
   node,
   href,
@@ -289,16 +360,37 @@ function MarkdownLink({
   children,
   ...props
 }: MarkdownComponentProps<'a'>) {
-  const { onFileClick, onAgentClick, openLabel, loadErrorText } =
+  const {
+    filesDisabled,
+    agentCardsEnabled,
+    linksOpenInNewTab,
+    onFileClick,
+    onAgentClick,
+    openLabel,
+    loadErrorText,
+  } =
     useMarkdownRendererContext()
+  const linkText = (node ? hastText(node) : nodeText(children)).trim()
+  const presentationChildren = filesDisabled
+    ? sanitizeFilesDisabledPresentationText(linkText)
+    : children
+  const presentationTitle = filesDisabled && title
+    ? sanitizeFilesDisabledPresentationText(title)
+    : title
 
   if (href && href.startsWith('file:')) {
     const filePath = href.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
-    const linkText = (node ? hastText(node) : nodeText(children)).trim()
-    const fileName = title || linkText || fileNameFromPath
-    const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+    const preview = resolvePreviewableFileLink({
+      fileNameFromPath,
+      title: title || '',
+      visibleText: linkText,
+    })
     const fileId = resolveInlineFileId(filePath)
+
+    if (filesDisabled) {
+      return <span>{presentationChildren}</span>
+    }
 
     if (preview) {
       return (
@@ -319,7 +411,10 @@ function MarkdownLink({
     const handleClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
       if (onFileClick) {
         event.preventDefault()
-        const fallbackTitle = title || linkText || fileNameFromPath
+        // linkText-first, matching every other display path in this
+        // component: title is a detection hint (see resolvePreviewableFileLink
+        // above), not the name a user should see in the resulting preview.
+        const fallbackTitle = linkText || title || fileNameFromPath
         onFileClick(fileId, fallbackTitle)
       }
     }
@@ -343,6 +438,10 @@ function MarkdownLink({
     const agentNameFromLink =
       (node ? hastText(node) : nodeText(children)).trim() || `Agent ${agentId}`
 
+    if (!agentCardsEnabled) {
+      return <span>{presentationChildren}</span>
+    }
+
     return React.createElement('div', {
       className: 'my-2',
       key: `agent-${agentId}-wrapper`,
@@ -355,9 +454,29 @@ function MarkdownLink({
     }))
   }
 
+  if (
+    filesDisabled
+    && href
+    && (
+      isManagedFileUrl(href)
+      || sanitizeFilesDisabledPresentationText(href) !== href
+    )
+  ) {
+    return <span>{presentationChildren}</span>
+  }
+
+  const opensInNewTab = linksOpenInNewTab && !!href
+    && !(href.startsWith('#') || href.toLowerCase().startsWith('mailto:'))
+
   return (
-    <a href={href || undefined} title={title || undefined} {...props}>
-      {children}
+    <a
+      {...props}
+      href={href || undefined}
+      title={presentationTitle || undefined}
+      target={opensInNewTab ? '_blank' : undefined}
+      rel={opensInNewTab ? 'noopener noreferrer' : undefined}
+    >
+      {presentationChildren}
     </a>
   )
 }
@@ -369,21 +488,45 @@ function MarkdownImage({
   title,
   ...props
 }: MarkdownComponentProps<'img'>) {
-  const { onFileClick, openLabel, loadErrorText } =
+  const { filesDisabled, onFileClick, openLabel, loadErrorText } =
     useMarkdownRendererContext()
   const resolvedSrc = src || ''
+  const presentationAlt = filesDisabled
+    ? sanitizeFilesDisabledPresentationText(alt || '')
+    : alt || ''
+  const presentationTitle = filesDisabled && title
+    ? sanitizeFilesDisabledPresentationText(title)
+    : title
 
   if (resolvedSrc.startsWith('file:')) {
     const filePath = resolvedSrc.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
-    const fileName = title || alt || fileNameFromPath
-    const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
+    const displayName = alt || title || fileNameFromPath
+    const preview = resolvePreviewableFileLink({
+      fileNameFromPath,
+      title: title || '',
+      visibleText: alt || '',
+    })
     const previewKind = preview?.previewKind ?? 'image'
+    if (filesDisabled) {
+      // Unreachable via MarkdownRenderer today: sanitizeFilesDisabledPresentationText
+      // (see the pre-parse step in MarkdownRenderer below) already converts
+      // any ![alt](file:...) node to plain text before ReactMarkdown ever
+      // builds this <img>, so a `file:` src can't reach this component
+      // while filesDisabled is set. Kept as defense-in-depth -- if that
+      // ever changes, falling through to InlineFilePreview below would
+      // render an interactive preview despite files being disabled, which
+      // is a much worse regression than a display-order nit. displayName
+      // is alt-first, matching the rule this component applies everywhere
+      // else (the title is a detection hint, not display text).
+      return <span>{sanitizeFilesDisabledPresentationText(displayName)}</span>
+    }
+
     return (
       <InlineFilePreview
         source={{
           fileId: resolveInlineFileId(filePath),
-          filename: preview?.displayFilename ?? fileName,
+          filename: preview?.displayFilename ?? displayName,
           type: previewKind,
           mimeType: getInlineFilePreviewMimeType(previewKind),
         }}
@@ -395,7 +538,40 @@ function MarkdownImage({
     )
   }
 
-  return <img src={resolvedSrc} alt={alt || ''} title={title || alt || ''} {...props} />
+  if (
+    filesDisabled
+    && (
+      isManagedFileUrl(resolvedSrc)
+      || sanitizeFilesDisabledPresentationText(resolvedSrc) !== resolvedSrc
+    )
+  ) {
+    // Rarely (if ever) reached via MarkdownRenderer: the tree-level
+    // pre-sanitizer (sanitizeFilesDisabledPresentationText) replaces any
+    // image/link node whose url is isInertFileTarget -- which includes the
+    // same isManagedFileUrl check this condition duplicates -- with its
+    // alt-first plain text before ReactMarkdown ever builds this <img>
+    // node. Every straightforward managed-URL shape is intercepted there
+    // (no current test reaches this line), but the two checks decode/
+    // normalize URLs slightly differently, so an encoding edge case
+    // slipping past the tree level while matching here has been reported
+    // in review and cannot be ruled out. Alt-first to match the rule this
+    // component applies everywhere else: the title can carry a
+    // backend-injected filename and must not replace the model's own alt
+    // text as visible content.
+    return <span>{presentationAlt || presentationTitle}</span>
+  }
+
+  return (
+    <img
+      src={resolvedSrc}
+      alt={presentationAlt}
+      // Title-first is correct here, unlike the filesDisabled span above:
+      // this is the standard <img title> tooltip, where the markdown title
+      // is the expected content and the alt text already rides in `alt`.
+      title={presentationTitle || presentationAlt}
+      {...props}
+    />
+  )
 }
 
 // Keep these component identities stable across chat/trace updates. Replacing
@@ -405,30 +581,51 @@ const markdownComponents: Components = {
   p: MarkdownParagraph,
   a: MarkdownLink,
   img: MarkdownImage,
+  table: MarkdownTable,
 }
 
-export function MarkdownRenderer({ content, className = '', onFileClick, onAgentClick }: MarkdownRendererProps) {
+export function MarkdownRenderer({
+  content,
+  className = '',
+  filesDisabled = false,
+  agentCardsEnabled,
+  onFileClick,
+  onAgentClick,
+}: MarkdownRendererProps) {
   const { t } = useI18n()
+  const inheritedAgentCardsEnabled = React.useContext(AgentCardPresentationCapability)
+  const resolvedAgentCardsEnabled = resolveAgentCardPresentationCapability(
+    filesDisabled,
+    agentCardsEnabled,
+    inheritedAgentCardsEnabled,
+  )
+  const linksOpenInNewTab = React.useContext(LinksOpenInNewTabCapability)
   const contextValue = React.useMemo<MarkdownRendererContextValue>(
     () => ({
+      filesDisabled,
+      agentCardsEnabled: resolvedAgentCardsEnabled,
+      linksOpenInNewTab,
       onFileClick,
       onAgentClick,
       openLabel: t('files.previewDialog.buttons.open'),
       loadErrorText: t('files.previewDialog.errors.loadFailed'),
     }),
-    [onFileClick, onAgentClick, t]
+    [filesDisabled, onFileClick, onAgentClick, resolvedAgentCardsEnabled, linksOpenInNewTab, t]
   )
+  const displayContent = filesDisabled
+    ? sanitizeFilesDisabledPresentationText(content)
+    : content
 
   return (
     <MarkdownRendererContext.Provider value={contextValue}>
       <div className={`prose prose-invert max-w-none break-words [overflow-wrap:anywhere] ${className}`}>
         <ReactMarkdown
-          remarkPlugins={[remarkGfm, remarkMath]}
+          remarkPlugins={[remarkGfm, remarkCurrencySafeMath, remarkPreserveTableContent]}
           rehypePlugins={[rehypeKatex]}
           components={markdownComponents}
           urlTransform={safeUrlTransform}
         >
-          {content}
+          {displayContent}
         </ReactMarkdown>
       </div>
     </MarkdownRendererContext.Provider>
@@ -438,44 +635,86 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
 interface JsonRendererProps {
   data: any
   className?: string
+  filesDisabled?: boolean
+  agentCardsEnabled?: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
 }
 
-export function JsonRenderer({ data, className = '', onFileClick, onAgentClick }: JsonRendererProps) {
+export function JsonRenderer({
+  data,
+  className = '',
+  filesDisabled = false,
+  agentCardsEnabled,
+  onFileClick,
+  onAgentClick,
+}: JsonRendererProps) {
   const [expanded, setExpanded] = React.useState(true)
 
   if (typeof data === 'string') {
     // Try to parse as JSON first
     try {
       const parsed = JSON.parse(data)
-      return <JsonRenderer data={parsed} className={className} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+      return (
+        <JsonRenderer
+          data={parsed}
+          className={className}
+          filesDisabled={filesDisabled}
+          agentCardsEnabled={agentCardsEnabled}
+          onFileClick={onFileClick}
+          onAgentClick={onAgentClick}
+        />
+      )
     } catch {
       // If not JSON, try to identify Markdown more comprehensively
-      if (isLikelyMarkdown(data)) {
-        return <MarkdownRenderer content={data} className={className} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+      const displayText = filesDisabled ? sanitizeFilesDisabledPresentationText(data) : data
+      if (isLikelyMarkdown(displayText)) {
+        return (
+          <MarkdownRenderer
+            content={displayText}
+            className={className}
+            filesDisabled={filesDisabled}
+            agentCardsEnabled={agentCardsEnabled}
+            onFileClick={onFileClick}
+            onAgentClick={onAgentClick}
+          />
+        )
       }
       // Otherwise display as plain text
       return (
         <pre className={`py-3 rounded text-sm font-mono overflow-x-auto whitespace-pre-wrap ${className}`}>
-          {data}
+          {displayText}
         </pre>
       )
     }
   }
 
-  if (typeof data === 'object' && data !== null) {
+  const displayData = filesDisabled ? projectFilesDisabledPresentation(data) : data
+
+  if (typeof displayData === 'object' && displayData !== null) {
     // Check if it's a result object with output that might be markdown
-    if (data.output && typeof data.output === 'string' && isLikelyMarkdown(data.output.trim())) {
+    if (
+      isRecord(data) &&
+      typeof data.output === 'string' &&
+      isLikelyMarkdown(data.output.trim()) &&
+      isRecord(displayData) &&
+      typeof displayData.output === 'string'
+    ) {
       return (
         <div className={`space-y-3 ${className}`}>
           <div className="bg-muted p-3 rounded text-sm font-mono overflow-x-auto whitespace-pre-wrap">
             <div className="text-green-400 mb-2">✅ Task completed successfully</div>
-            <div className="text-gray-400">Goal: {data.goal}</div>
+            <div className="text-gray-400">Goal: {displayData.goal as React.ReactNode}</div>
           </div>
           <div className="border-t border-border pt-3">
             <div className="text-sm font-medium text-foreground mb-2">Result:</div>
-            <MarkdownRenderer content={data.output} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+            <MarkdownRenderer
+              content={displayData.output}
+              filesDisabled={filesDisabled}
+              agentCardsEnabled={agentCardsEnabled}
+              onFileClick={onFileClick}
+              onAgentClick={onAgentClick}
+            />
           </div>
         </div>
       )
@@ -492,7 +731,7 @@ export function JsonRenderer({ data, className = '', onFileClick, onAgentClick }
         </button>
         {expanded && (
           <pre className="bg-muted p-3 rounded text-xs font-mono overflow-x-auto whitespace-pre-wrap">
-            {JSON.stringify(data, null, 2)}
+            {JSON.stringify(displayData, null, 2)}
           </pre>
         )}
       </div>

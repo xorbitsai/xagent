@@ -28,6 +28,7 @@ class _FakeMetadataStore:
     def __init__(self, collection: Optional[CollectionInfo]) -> None:
         self.collection = collection
         self.saved: list[CollectionInfo] = []
+        self.deleted: list[str] = []
 
     async def get_collection(self, collection: str) -> CollectionInfo:
         if self.collection is None or self.collection.name != collection:
@@ -38,13 +39,31 @@ class _FakeMetadataStore:
         self.saved.append(collection)
         self.collection = collection
 
+    async def delete_collection_metadata(
+        self,
+        *,
+        collection_name: str,
+        user_id: int,
+        is_admin: bool = False,
+        delete_orphaned_metadata: bool = False,
+    ) -> dict[str, int]:
+        self.deleted.append(collection_name)
+        self.collection = None
+        return {"metadata_rows": 1, "config_rows": 0}
+
 
 class _FakeStorageShim:
     def __init__(self, metadata_store: _FakeMetadataStore) -> None:
         self.metadata_store = metadata_store
+        self.vector_store: object | None = None
 
     def get_metadata_store(self) -> _FakeMetadataStore:
         return self.metadata_store
+
+    def get_vector_index_store(self) -> object:
+        if self.vector_store is None:
+            raise AssertionError("vector store was not configured")
+        return self.vector_store
 
 
 def test_kb_tool_facade_public_surface_imports() -> None:
@@ -63,7 +82,7 @@ async def test_public_list_knowledge_bases_routes_through_tool_facade(monkeypatc
     from xagent.core.tools.core import document_search
 
     sentinel = object()
-    calls: list[tuple[object, int, bool]] = []
+    calls: list[tuple] = []
 
     class Facade:
         async def list_knowledge_bases(
@@ -71,8 +90,16 @@ async def test_public_list_knowledge_bases_routes_through_tool_facade(monkeypatc
             tool_args: object,
             user_id: Optional[int] = None,
             is_admin: bool = False,
+            governing_team_id: Optional[int] = None,
         ) -> object:
-            calls.append((tool_args, user_id or 0, is_admin))
+            calls.append(
+                (
+                    tool_args,
+                    user_id or 0,
+                    is_admin,
+                    governing_team_id,
+                )
+            )
             return sentinel
 
     args = document_search.ListKnowledgeBasesArgs()
@@ -82,10 +109,59 @@ async def test_public_list_knowledge_bases_routes_through_tool_facade(monkeypatc
         args,
         user_id=7,
         is_admin=True,
+        governing_team_id=42,
     )
 
     assert result is sentinel
-    assert calls == [(args, 7, True)]
+    # The governing team id must reach the facade call unmodified -- a
+    # facade-layer bug that drops it would leave a team-governed listing
+    # silently resolving against the runner's own team memberships.
+    assert calls == [(args, 7, True, 42)]
+
+
+@pytest.mark.asyncio
+async def test_public_search_knowledge_base_routes_through_tool_facade(monkeypatch):
+    from xagent.core.tools.core import document_search
+
+    sentinel = object()
+    calls: list[tuple] = []
+
+    class Facade:
+        async def search_knowledge_base(
+            self,
+            tool_args: object,
+            user_id: Optional[int] = None,
+            is_admin: bool = False,
+            governing_team_id: Optional[int] = None,
+            agent_creator_user_id: Optional[int] = None,
+            declared_knowledge_bases: Optional[list] = None,
+        ) -> object:
+            calls.append(
+                (
+                    tool_args,
+                    user_id or 0,
+                    is_admin,
+                    governing_team_id,
+                    agent_creator_user_id,
+                    declared_knowledge_bases,
+                )
+            )
+            return sentinel
+
+    args = document_search.KnowledgeSearchArgs(query="q")
+    monkeypatch.setattr(document_search, "_get_tool_compatibility_facade", Facade)
+
+    result = await document_search.search_knowledge_base(
+        args,
+        user_id=7,
+        is_admin=True,
+        governing_team_id=42,
+        agent_creator_user_id=99,
+        declared_knowledge_bases=["kb1", "kb2"],
+    )
+
+    assert result is sentinel
+    assert calls == [(args, 7, True, 42, 99, ["kb1", "kb2"])]
 
 
 @pytest.mark.asyncio
@@ -102,22 +178,14 @@ async def test_ensure_agent_collection_backend_binding_creates_missing_metadata(
 
 
 @pytest.mark.asyncio
-async def test_prepare_agent_collection_saves_user_config_before_backend_binding(
-    monkeypatch,
-):
+async def test_prepare_agent_collection_writes_nothing(monkeypatch):
+    """A failed agent import must leave no row that blocks the name."""
     from xagent.core.tools.adapters.vibe import agent_kb_service
 
     metadata_store = _FakeMetadataStore(None)
     facade = KBToolCompatibilityFacade(storage_shim=_FakeStorageShim(metadata_store))
-    prepare_calls: list[int] = []
 
-    async def fake_prepare_collection_impl(
-        *,
-        collection_name: str,
-        ingestion_config: IngestionConfig,
-        user_id: int,
-    ) -> str:
-        prepare_calls.append(user_id)
+    async def fake_prepare_collection_impl(*, collection_name: str) -> str:
         return collection_name
 
     monkeypatch.setattr(
@@ -126,14 +194,42 @@ async def test_prepare_agent_collection_saves_user_config_before_backend_binding
         fake_prepare_collection_impl,
     )
 
-    collection = await facade.prepare_agent_collection(
+    collection = await facade.prepare_agent_collection(collection_name="demo")
+
+    assert collection == "demo"
+    assert metadata_store.saved == []
+
+
+@pytest.mark.asyncio
+async def test_publish_agent_collection_binds_backend_with_the_config(monkeypatch):
+    from xagent.core.tools.adapters.vibe import agent_kb_service
+
+    metadata_store = _FakeMetadataStore(None)
+    facade = KBToolCompatibilityFacade(storage_shim=_FakeStorageShim(metadata_store))
+    published: list[int] = []
+
+    async def fake_publish_collection_impl(
+        *,
+        collection_name: str,
+        ingestion_config: IngestionConfig,
+        user_id: int,
+        collection_existed_before: bool = False,
+    ) -> None:
+        published.append(user_id)
+
+    monkeypatch.setattr(
+        agent_kb_service,
+        "_publish_collection_impl",
+        fake_publish_collection_impl,
+    )
+
+    await facade.publish_agent_collection(
         collection_name="demo",
         ingestion_config=IngestionConfig(),
         user_id=7,
     )
 
-    assert collection == "demo"
-    assert prepare_calls == [7]
+    assert published == [7]
     assert metadata_store.saved[-1].owners == []
     assert metadata_store.saved[-1].extra_metadata["kb_storage"] == {
         "backend": "lancedb"
@@ -229,3 +325,74 @@ def test_coordinator_accepts_injected_tool_facade() -> None:
 
     assert coordinator.tool_compatibility is facade
     assert coordinator.tools is facade
+
+
+class _CountingVectorStore:
+    def __init__(self, records: list[object]) -> None:
+        self.records = records
+        self.read_calls: list[dict[str, object]] = []
+
+    def list_document_records(self, **kwargs: object) -> list[object]:
+        self.read_calls.append(kwargs)
+        return self.records
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_agent_collection_drops_an_empty_metadata_row():
+    """The row is invisible to its owner but 409-blocks the name, so it must go."""
+    metadata_store = _FakeMetadataStore(CollectionInfo(name="agent_kb"))
+    shim = _FakeStorageShim(metadata_store)
+    shim.vector_store = _CountingVectorStore([])
+    facade = KBToolCompatibilityFacade(storage_shim=shim)
+
+    await facade.cleanup_failed_agent_collection("agent_kb", user_id=7)
+
+    assert metadata_store.deleted == ["agent_kb"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_agent_collection_keeps_a_populated_collection():
+    metadata_store = _FakeMetadataStore(CollectionInfo(name="agent_kb"))
+    shim = _FakeStorageShim(metadata_store)
+    shim.vector_store = _CountingVectorStore([{"doc_id": "d1"}])
+    facade = KBToolCompatibilityFacade(storage_shim=shim)
+
+    await facade.cleanup_failed_agent_collection("agent_kb", user_id=7)
+
+    assert metadata_store.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failed_agent_collection_reads_and_deletes_as_the_owner():
+    """Admin scoping on either side is wrong: the read would see another tenant's
+    documents and abort a safe cleanup, the delete would drop their metadata row."""
+    metadata_store = _FakeMetadataStore(CollectionInfo(name="agent_kb"))
+    calls: list[dict[str, object]] = []
+
+    async def _delete_collection_metadata(**kwargs: object) -> dict[str, int]:
+        calls.append(kwargs)
+        return {"metadata_rows": 1, "config_rows": 0}
+
+    metadata_store.delete_collection_metadata = _delete_collection_metadata  # type: ignore[assignment]
+    shim = _FakeStorageShim(metadata_store)
+    shim.vector_store = _CountingVectorStore([])
+    facade = KBToolCompatibilityFacade(storage_shim=shim)
+
+    await facade.cleanup_failed_agent_collection("agent_kb", user_id=7)
+
+    assert shim.vector_store.read_calls == [
+        {
+            "collection_name": "agent_kb",
+            "user_id": 7,
+            "is_admin": False,
+            "max_results": 1,
+        }
+    ]
+    assert calls == [
+        {
+            "collection_name": "agent_kb",
+            "user_id": 7,
+            "is_admin": False,
+            "delete_orphaned_metadata": True,
+        }
+    ]

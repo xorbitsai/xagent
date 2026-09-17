@@ -14,6 +14,24 @@ from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 
 
 class TestTryUpgradeDb:
+    def test_unsupported_dialect_fails_before_fresh_schema_or_migration(self):
+        engine = MagicMock()
+        engine.dialect.name = "mysql"
+
+        with pytest.raises(RuntimeError, match="partial unique indexes"):
+            try_upgrade_db(engine)
+
+        engine.connect.assert_not_called()
+
+    def test_non_string_dialect_name_does_not_bypass_startup_invariant(self):
+        engine = MagicMock()
+        engine.dialect.name = None
+
+        with pytest.raises(RuntimeError, match="partial unique indexes"):
+            try_upgrade_db(engine)
+
+        engine.connect.assert_not_called()
+
     def test_postgresql_serializes_startup_migration_before_reading_revision(
         self,
         monkeypatch,
@@ -218,6 +236,78 @@ class TestTryUpgradeDb:
                 assert conn.exec_driver_sql("PRAGMA foreign_key_check").all() == [
                     ("workforces", 1, "agents", 0)
                 ]
+        finally:
+            engine.dispose()
+
+    def test_owner_table_rebuild_preserves_inbound_gmail_row_via_try_upgrade_db(
+        self, tmp_path
+    ):
+        engine = create_engine(f"sqlite:///{tmp_path / 'owner-inbound.db'}")
+        apply_sqlite_concurrency_pragmas(engine)
+        config = create_alembic_config(engine)
+        parent = "b1efe0dbe0af"
+
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "CREATE TABLE users (id INTEGER PRIMARY KEY, "
+                        "username VARCHAR(50) NOT NULL, password_hash VARCHAR(255) "
+                        "NOT NULL, is_admin BOOLEAN NOT NULL)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE TABLE user_oauth (id INTEGER PRIMARY KEY, "
+                        "user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+                        "provider VARCHAR(50) NOT NULL, access_token VARCHAR NOT NULL, "
+                        "provider_user_id VARCHAR, CONSTRAINT uq_user_provider_account "
+                        "UNIQUE (user_id, provider, provider_user_id))"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "CREATE TABLE gmail_watch_states (id INTEGER PRIMARY KEY, "
+                        "user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+                        "oauth_account_id INTEGER NOT NULL UNIQUE REFERENCES "
+                        "user_oauth(id) ON DELETE CASCADE, email VARCHAR(255) NOT NULL, "
+                        "history_id VARCHAR(255) NOT NULL, topic_name VARCHAR(512) NOT NULL)"
+                    )
+                )
+            command.stamp(config, parent)
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO users (id, username, password_hash, is_admin) "
+                        "VALUES (7, 'owner', 'hash', 0)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO user_oauth "
+                        "(id, user_id, provider, access_token, provider_user_id) "
+                        "VALUES (9, 7, 'gmail', 'token', 'provider-account')"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO gmail_watch_states "
+                        "(id, user_id, oauth_account_id, email, history_id, topic_name) "
+                        "VALUES (11, 7, 9, 'owner@example.com', 'history', 'topic')"
+                    )
+                )
+
+            try_upgrade_db(engine)
+
+            with engine.connect() as conn:
+                assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+                assert conn.execute(
+                    text("SELECT id, oauth_account_id FROM gmail_watch_states")
+                ).all() == [(11, 9)]
+                assert conn.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+                assert "resource_owner_key" in {
+                    column["name"] for column in inspect(conn).get_columns("user_oauth")
+                }
         finally:
             engine.dispose()
 
@@ -715,13 +805,14 @@ class TestTryUpgradeDb:
         self, mock_get_revision, mock_create_config, mock_upgrade, _mock_check
     ):
         engine = MagicMock()
+        engine.dialect.name = "postgresql"
         mock_get_revision.return_value = "abc123"
         mock_config = mock_create_config.return_value
         mock_config.attributes = {}
 
-        # Mock connection context manager
+        # PostgreSQL startup serialization and Alembic share this connection.
         connection = Mock()
-        engine.begin.return_value.__enter__.return_value = connection
+        engine.connect.return_value.__enter__.return_value = connection
 
         try_upgrade_db(engine)
 
@@ -737,13 +828,14 @@ class TestTryUpgradeDb:
         self, mock_get_revision, mock_create_config, mock_stamp, mock_is_empty
     ):
         engine = MagicMock()
+        engine.dialect.name = "postgresql"
         mock_get_revision.return_value = None
         mock_is_empty.return_value = True
         mock_config = mock_create_config.return_value
         mock_config.attributes = {}
 
         connection = Mock()
-        engine.begin.return_value.__enter__.return_value = connection
+        engine.connect.return_value.__enter__.return_value = connection
 
         try_upgrade_db(engine)
 
@@ -757,7 +849,8 @@ class TestTryUpgradeDb:
     def test_raises_when_existing_database_unversioned(
         self, mock_get_revision, mock_create_config, mock_is_empty
     ):
-        engine = Mock()
+        engine = MagicMock()
+        engine.dialect.name = "postgresql"
         mock_get_revision.return_value = None
         mock_is_empty.return_value = False  # Database has tables but no revision
 
@@ -774,6 +867,7 @@ class TestTryUpgradeDb:
         self, mock_get_revision, mock_create_config, mock_upgrade, _mock_check
     ):
         engine = MagicMock()
+        engine.dialect.name = "postgresql"
         mock_get_revision.return_value = "abc123"
         mock_upgrade.side_effect = Exception("Upgrade failed")
 
@@ -794,6 +888,7 @@ class TestTryUpgradeDb:
         _mock_check,
     ):
         engine = MagicMock()
+        engine.dialect.name = "postgresql"
         mock_get_revision.return_value = "abc123"
         mock_config = mock_create_config.return_value
         mock_config.attributes = {}
@@ -809,7 +904,8 @@ class TestTryUpgradeDb:
     @patch("xagent.db.migration.logger")
     @patch("xagent.db.migration.get_alembic_revision")
     def test_logs_error_on_failure(self, mock_get_revision, mock_logger):
-        engine = Mock()
+        engine = MagicMock()
+        engine.dialect.name = "postgresql"
         mock_get_revision.side_effect = RuntimeError("DB error")
 
         with pytest.raises(RuntimeError, match="DB error"):

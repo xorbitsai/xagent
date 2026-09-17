@@ -7,6 +7,7 @@ import { useWebSocket } from "@/hooks/use-websocket"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
+import { userDisplayLabel } from "@/lib/user-display"
 
 export function ApiExample() {
   const { user, token, refreshToken } = useAuth()
@@ -57,6 +58,10 @@ export function ApiExample() {
   if (!user) {
     return <div>{t('agentStore.loginRequiredTitle')}</div>
   }
+  const userLabel = userDisplayLabel(
+    user,
+    t("agent.vibeMode.descriptions.think.examples.apiExample.labels.defaultUser"),
+  )
 
   return (
     <div className="p-6 space-y-6">
@@ -65,7 +70,7 @@ export function ApiExample() {
 
         <div className="space-y-4">
           <div className="p-4 bg-gray-50 rounded">
-            <p><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.currentUser')}</strong> {user.username}</p>
+            <p><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.currentUser')}</strong> {userLabel}</p>
             <p><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.accessTokenStatus')}</strong> {token ? t('agent.vibeMode.descriptions.think.examples.apiExample.status.obtained') : t('agent.vibeMode.descriptions.think.examples.apiExample.status.notObtained')}</p>
             <p><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.refreshTokenStatus')}</strong> {refreshToken ? t('agent.vibeMode.descriptions.think.examples.apiExample.status.obtained') : t('agent.vibeMode.descriptions.think.examples.apiExample.status.notObtained')}</p>
             <p><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.wsStatus')}</strong> {wsStatus}</p>

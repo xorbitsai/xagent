@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sqlalchemy import event
 from sqlalchemy.orm import Session, joinedload
 
 from ..models.model import Model as DBModel
@@ -18,7 +19,7 @@ from .hot_path_cache import (
     user_default_model_key,
     user_default_models_key,
 )
-from .llm_utils import CoreStorage
+from .llm_utils import CoreStorage, ModelWriteMode
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,44 @@ DEFAULT_MODEL_CONFIG_TYPES = [
 
 class ModelSharingConflictError(ValueError):
     """Raised when a model sharing state transition violates model constraints."""
+
+
+_PENDING_CACHE_INVALIDATIONS = "xagent_pending_model_cache_invalidations"
+_MODEL_TRANSACTION_COMMITTED = "xagent_model_transaction_committed"
+
+
+def _stage_cache_invalidation(db: Session, user_id: int | None) -> None:
+    pending = db.info.setdefault(_PENDING_CACHE_INVALIDATIONS, set())
+    pending.add(user_id)
+
+
+@event.listens_for(Session, "after_commit")
+def _mark_model_transaction_committed(db: Session) -> None:
+    if db.in_nested_transaction():
+        return
+    db.info[_MODEL_TRANSACTION_COMMITTED] = True
+
+
+@event.listens_for(Session, "after_rollback")
+def _mark_model_transaction_rolled_back(db: Session) -> None:
+    if db.in_nested_transaction():
+        return
+    db.info[_MODEL_TRANSACTION_COMMITTED] = False
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _finish_staged_model_cache_invalidation(db: Session, transaction: Any) -> None:
+    if transaction.parent is not None:
+        return
+    pending = db.info.pop(_PENDING_CACHE_INVALIDATIONS, set())
+    committed = db.info.pop(_MODEL_TRANSACTION_COMMITTED, False)
+    if not committed:
+        return
+    if None in pending:
+        invalidate_model_cache(None)
+        return
+    for user_id in pending:
+        invalidate_model_cache(user_id)
 
 
 class ModelStore:
@@ -298,8 +337,17 @@ class ModelStore:
         return response
 
     def create_user_model_link(
-        self, *, user_id: int, model_id: int, is_shared: bool
+        self,
+        *,
+        user_id: int,
+        model_id: int,
+        is_shared: bool,
+        write_mode: ModelWriteMode = ModelWriteMode.COMMIT,
     ) -> UserModel:
+        """Create an owner link, optionally joining a caller-owned transaction."""
+
+        if not isinstance(write_mode, ModelWriteMode):
+            raise TypeError("write_mode must be a ModelWriteMode")
         user_model = UserModel(
             user_id=user_id,
             model_id=model_id,
@@ -309,8 +357,13 @@ class ModelStore:
             is_shared=is_shared,
         )
         self.db.add(user_model)
-        self.db.commit()
-        invalidate_model_cache(None if is_shared else user_id)
+        invalidation_user_id = None if is_shared else user_id
+        if write_mode is ModelWriteMode.COMMIT:
+            self.db.commit()
+            invalidate_model_cache(invalidation_user_id)
+        else:
+            self.db.flush()
+            _stage_cache_invalidation(self.db, invalidation_user_id)
         return user_model
 
     def set_user_default_model(
@@ -320,7 +373,12 @@ class ModelStore:
         model_id: int,
         config_type: str,
         user_model: UserModel,
+        write_mode: ModelWriteMode = ModelWriteMode.COMMIT,
     ) -> UserDefaultModel:
+        """Upsert a default, optionally joining a caller-owned transaction."""
+
+        if not isinstance(write_mode, ModelWriteMode):
+            raise TypeError("write_mode must be a ModelWriteMode")
         # Use a single atomic upsert to avoid UNIQUE-constraint races
         # when the client (e.g. React strict mode, double click) fires
         # two set_default requests for the same (user_id, config_type)
@@ -346,7 +404,10 @@ class ModelStore:
                 set_={"model_id": model_id},
             )
             self.db.execute(stmt)
-            self.db.commit()
+            if write_mode is ModelWriteMode.COMMIT:
+                self.db.commit()
+            else:
+                self.db.flush()
         else:
             # Fallback: delete + insert (kept for any other dialect)
             existing_default = (
@@ -365,7 +426,10 @@ class ModelStore:
                     user_id=user_id, model_id=model_id, config_type=config_type
                 )
             )
-            self.db.commit()
+            if write_mode is ModelWriteMode.COMMIT:
+                self.db.commit()
+            else:
+                self.db.flush()
 
         user_default = (
             self.db.query(UserDefaultModel)
@@ -376,8 +440,12 @@ class ModelStore:
             .first()
         )
         new_default_is_shared = bool(user_model.is_shared)
-        invalidate_model_cache(None if new_default_is_shared else user_id)
-        return user_default  # type: ignore[return-value]  # Always exists after commit
+        invalidation_user_id = None if new_default_is_shared else user_id
+        if write_mode is ModelWriteMode.COMMIT:
+            invalidate_model_cache(invalidation_user_id)
+        else:
+            _stage_cache_invalidation(self.db, invalidation_user_id)
+        return user_default  # type: ignore[return-value]  # Always exists after flush
 
     def delete_user_default_model(
         self, *, user_id: int, config_type: str
@@ -401,6 +469,29 @@ class ModelStore:
         invalidate_model_cache(None if default_was_shared else user_id)
         return user_default
 
+    def refresh_auto_model_abilities(self, config_ids: list[int]) -> None:
+        if not config_ids:
+            return
+
+        from ..models.auto_model import AutoModelCandidate, AutoModelConfig
+        from .auto_model_service import AutoModelService
+
+        self.db.flush()
+        for config in self.db.query(AutoModelConfig).filter(
+            AutoModelConfig.id.in_(config_ids)
+        ):
+            targets = (
+                self.db.query(DBModel)
+                .join(
+                    AutoModelCandidate, AutoModelCandidate.target_model_id == DBModel.id
+                )
+                .filter(AutoModelCandidate.config_id == config.id)
+                .all()
+            )
+            AutoModelService._update_router_model_abilities(
+                config.router_model, targets
+            )
+
     def commit_model_update(
         self, *, user_id: int, db_model: DBModel, invalidate_globally: bool
     ) -> None:
@@ -422,6 +513,11 @@ class ModelStore:
         if share_with_users:
             user_model.is_shared = True  # type: ignore[assignment]
         elif currently_shared:
+            self.prune_external_auto_references(
+                model_id=model_id,
+                owner_user_id=user_id,
+            )
+
             owner_defaults = (
                 self.db.query(UserDefaultModel)
                 .filter(
@@ -449,6 +545,45 @@ class ModelStore:
         self.db.refresh(db_model)
         self.db.refresh(user_model)
         invalidate_model_cache(None)
+
+    def prune_external_auto_references(
+        self, *, model_id: int, owner_user_id: int
+    ) -> int:
+        """Remove Auto bindings that lose access when an owner mutates a model."""
+
+        from ..models.auto_model import AutoModelCandidate, AutoModelConfig
+
+        external_config_ids = [
+            int(config_id)
+            for (config_id,) in (
+                self.db.query(AutoModelCandidate.config_id)
+                .join(
+                    AutoModelConfig,
+                    AutoModelCandidate.config_id == AutoModelConfig.id,
+                )
+                .filter(
+                    AutoModelCandidate.target_model_id == model_id,
+                    AutoModelConfig.user_id != owner_user_id,
+                )
+                .all()
+            )
+        ]
+        if not external_config_ids:
+            return 0
+        self.db.query(AutoModelConfig).filter(
+            AutoModelConfig.id.in_(external_config_ids),
+            AutoModelConfig.fallback_model_id == model_id,
+        ).update({AutoModelConfig.fallback_model_id: None}, synchronize_session=False)
+        deleted = int(
+            self.db.query(AutoModelCandidate)
+            .filter(
+                AutoModelCandidate.config_id.in_(external_config_ids),
+                AutoModelCandidate.target_model_id == model_id,
+            )
+            .delete(synchronize_session=False)
+        )
+        self.refresh_auto_model_abilities(external_config_ids)
+        return deleted
 
     def delete_model(
         self, *, model_storage: CoreStorage, user_model: UserModel

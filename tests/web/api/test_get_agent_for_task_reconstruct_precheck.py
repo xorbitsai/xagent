@@ -40,10 +40,15 @@ from xagent.core.tools.adapters.vibe.config import (
     MCPUnavailableSummary,
     RequiredMCPUnavailableError,
 )
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
+from xagent.web.services.llm_utils import AutoModelUnavailableError
+from xagent.web.services.mcp_runtime import (
+    MCPActorAuthorizationPolicy,
+    MCPActorExecutionIdentity,
+)
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskOwnerMismatchError,
@@ -188,7 +193,11 @@ def _build_db(
     return db
 
 
-def _stub_downstream(manager: AgentServiceManager):
+def _stub_downstream(
+    manager: AgentServiceManager,
+    *,
+    create_tools: AsyncMock | None = None,
+):
     """Patch the heavy work past the reconstruct decision so the test
     asserts only on whether reconstruct was called.
 
@@ -222,19 +231,54 @@ def _stub_downstream(manager: AgentServiceManager):
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch(
-            "xagent.web.api.chat.create_task_tracer",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
             return_value=MagicMock(),
         ),
         patch(
-            "xagent.web.api.chat.create_default_tools",
-            new=AsyncMock(return_value=([], MagicMock())),
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools or AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=None,
         ),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_fresh_actor_tool_build_receives_explicit_execution_identity() -> None:
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.RUNNING, agent_id=7)
+    task.agent_config = {
+        "__xagent_mcp_runtime_authorization_policy_required": True,
+        "mcp_runtime_authorization_policy_identity": "actor:alice",
+    }
+    snapshot = _build_snapshot(task, user)
+    create_tools = AsyncMock(return_value=([], MagicMock()))
+    identity = MCPActorExecutionIdentity(
+        task_id=42,
+        run_id="run-a",
+        turn_id="turn-a",
+        lease_attempt_id="attempt-a",
+    )
+    policy = MCPActorAuthorizationPolicy(
+        resource_owner_key="actor:alice",
+        allow_builtin_stdio=True,
+    )
+
+    with _Patches(_stub_downstream(manager, create_tools=create_tools)):
+        await manager.get_agent_for_task(
+            task_id=42,
+            db=_build_db(task, agent=_make_agent(), user=user),
+            user=user,
+            task_setup_snapshot=snapshot,
+            mcp_runtime_authorization_policy=policy,
+            mcp_actor_execution_identity=identity,
+        )
+
+    assert create_tools.await_args.kwargs["mcp_actor_execution_identity"] is identity
 
 
 @pytest.mark.asyncio
@@ -260,7 +304,7 @@ async def test_running_with_no_history_skips_reconstruct() -> None:
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(
@@ -311,7 +355,7 @@ async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(
@@ -335,6 +379,9 @@ async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
         db,
         scope=None,
         task_setup_snapshot=snapshot,
+        connector_runtime_turn_id=None,
+        mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -365,7 +412,7 @@ async def test_required_mcp_failure_does_not_fall_back_after_reconstruct() -> No
             manager, "_reconstruct_agent_from_history", side_effect=fail_reconstruct
         ),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(
@@ -397,7 +444,7 @@ async def test_active_snapshot_owner_mismatch_does_not_fall_back() -> None:
     mismatch = TaskOwnerMismatchError(42, expected=999, actual=1)
 
     with patch(
-        "xagent.web.api.chat.load_task_setup_snapshot_sync",
+        "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
         side_effect=mismatch,
     ) as snapshot_loader:
         with pytest.raises(TaskOwnerMismatchError) as exc_info:
@@ -410,6 +457,33 @@ async def test_active_snapshot_owner_mismatch_does_not_fall_back() -> None:
 
     assert exc_info.value is mismatch
     snapshot_loader.assert_called_once_with(42, 999)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.RUNNING, TaskStatus.PENDING])
+async def test_auto_model_unavailable_does_not_fall_back_during_task_setup(
+    status: TaskStatus,
+) -> None:
+    """Auto exhaustion must escape both reconstruction and normal setup."""
+
+    manager = AgentServiceManager()
+    fallback = MagicMock()
+    manager._default_llm = fallback
+    user = _make_user()
+    task = _make_task(status)
+    db = _build_db(task, user=user)
+    error = AutoModelUnavailableError("Auto model has no active configured candidates")
+
+    with patch(
+        "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
+        side_effect=error,
+    ) as snapshot_loader:
+        with pytest.raises(AutoModelUnavailableError) as exc_info:
+            await manager.get_agent_for_task(task_id=42, db=db, user=user)
+
+    assert exc_info.value is error
+    assert manager._default_llm is fallback
+    snapshot_loader.assert_called_once_with(42, None)
 
 
 @pytest.mark.asyncio
@@ -434,7 +508,7 @@ async def test_running_with_dag_plan_runs_reconstruct() -> None:
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(
@@ -458,6 +532,9 @@ async def test_running_with_dag_plan_runs_reconstruct() -> None:
         db,
         scope=None,
         task_setup_snapshot=snapshot,
+        connector_runtime_turn_id=None,
+        mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -487,7 +564,7 @@ async def test_paused_with_no_history_still_runs_reconstruct() -> None:
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
     ):
@@ -505,6 +582,9 @@ async def test_paused_with_no_history_still_runs_reconstruct() -> None:
         db,
         scope=None,
         task_setup_snapshot=snapshot,
+        connector_runtime_turn_id=None,
+        mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -530,7 +610,7 @@ async def test_waiting_for_user_with_no_history_still_runs_reconstruct() -> None
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
     ):
@@ -548,6 +628,9 @@ async def test_waiting_for_user_with_no_history_still_runs_reconstruct() -> None
         db,
         scope=None,
         task_setup_snapshot=snapshot,
+        connector_runtime_turn_id=None,
+        mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -586,14 +669,20 @@ async def test_reconstruct_return_path_syncs_connector_runtime_turn() -> None:
         _db: Any,
         scope: Any = None,
         task_setup_snapshot: TaskSetupSnapshot | None = None,
+        connector_runtime_turn_id: str | None = None,
+        mcp_runtime_authorization_policy: Any = None,
+        mcp_actor_execution_identity: Any = None,
     ) -> None:
         assert task_setup_snapshot is snapshot
+        assert connector_runtime_turn_id == "turn-reconstructed"
+        assert mcp_runtime_authorization_policy is None
+        assert mcp_actor_execution_identity is None
         manager._agents[task_id] = reconstructed_agent
 
     with (
         patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
         patch(
-            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            "xagent.web.services.agent_service_manager.load_task_setup_snapshot_sync",
             return_value=snapshot,
         ) as snapshot_loader,
         patch.object(manager, "_load_persisted_conversation_history"),

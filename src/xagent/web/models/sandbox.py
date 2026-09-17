@@ -2,7 +2,17 @@
 Sandbox database models.
 """
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 
 from .database import Base
 
@@ -52,3 +62,92 @@ class SandboxSnapshot(Base):  # type: ignore[no-any-unimported]
     metadata_json = Column("metadata", Text, nullable=False)
     created_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class DurableSandboxLifecycle(Base):  # type: ignore[no-any-unimported]
+    """Opaque, crash-recoverable ownership record for a physical sandbox.
+
+    This table deliberately contains no raw actor, user, resource-owner, or
+    backend connection identity.  ``scope_digest`` is the stable logical
+    lookup key; ``lifecycle_token`` makes every physical generation unique;
+    and ``owner_token`` plus ``version`` is the CAS fence for destructive
+    work.
+    """
+
+    __tablename__ = "durable_sandbox_lifecycles"
+    __table_args__ = (
+        CheckConstraint("length(scope_digest) = 64", name="ck_dsl_scope_digest"),
+        CheckConstraint("length(lifecycle_token) = 64", name="ck_dsl_lifecycle_token"),
+        CheckConstraint(
+            "length(backend_lifecycle_digest) = 64",
+            name="ck_dsl_backend_lifecycle_digest",
+        ),
+        CheckConstraint("length(owner_token) = 64", name="ck_dsl_owner_token"),
+        CheckConstraint(
+            "turn_digest IS NULL OR length(turn_digest) = 64",
+            name="ck_dsl_turn_digest",
+        ),
+        CheckConstraint("version >= 1", name="ck_dsl_version"),
+        CheckConstraint("delete_attempts >= 0", name="ck_dsl_delete_attempts"),
+        CheckConstraint(
+            "state IN ('registered', 'ready', 'deleting')",
+            name="ck_dsl_state",
+        ),
+        CheckConstraint(
+            "(state = 'registered' AND ready_at IS NULL AND deleting_at IS NULL "
+            "AND delete_claim_expires_at IS NULL) OR "
+            "(state = 'ready' AND ready_at IS NOT NULL AND deleting_at IS NULL "
+            "AND delete_claim_expires_at IS NULL) OR "
+            "(state = 'deleting' AND deleting_at IS NOT NULL "
+            "AND delete_claim_expires_at IS NOT NULL)",
+            name="ck_dsl_state_shape",
+        ),
+        UniqueConstraint("scope_digest", name="uq_dsl_scope_digest"),
+        UniqueConstraint("lifecycle_token", name="uq_dsl_lifecycle_token"),
+        UniqueConstraint(
+            "backend_lifecycle_digest", name="uq_dsl_backend_lifecycle_digest"
+        ),
+        Index(
+            "ix_dsl_reclaim",
+            "state",
+            "eligible_at",
+            "retry_at",
+            "delete_claim_expires_at",
+            "id",
+        ),
+        Index(
+            "ix_dsl_task_attempt",
+            "task_id",
+            "run_id",
+            "lease_attempt_id",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scope_digest = Column(String(64), nullable=False)
+    lifecycle_token = Column(String(64), nullable=False)
+    backend_lifecycle_digest = Column(String(64), nullable=False)
+    owner_token = Column(String(64), nullable=False)
+    version = Column(Integer, nullable=False, default=1, server_default="1")
+    state = Column(String(16), nullable=False, default="registered")
+
+    # Minimal opaque task-attempt fence.  No FK: the lifecycle must remain
+    # discoverable after task deletion until backend cleanup is confirmed.
+    task_id = Column(Integer, nullable=False)
+    run_id = Column(String(64), nullable=False)
+    lease_attempt_id = Column(String(64), nullable=False)
+    turn_digest = Column(String(64), nullable=True)
+
+    eligible_at = Column(DateTime(timezone=True), nullable=False)
+    owner_lease_expires_at = Column(DateTime(timezone=True), nullable=False)
+    delete_claim_expires_at = Column(DateTime(timezone=True), nullable=True)
+    retry_at = Column(DateTime(timezone=True), nullable=True)
+    registered_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    ready_at = Column(DateTime(timezone=True), nullable=True)
+    deleting_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    delete_attempts = Column(Integer, nullable=False, default=0, server_default="0")

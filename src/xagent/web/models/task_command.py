@@ -38,14 +38,30 @@ class TaskExecutionCommand(Base):  # type: ignore
         nullable=True,
         index=True,
     )
+    # Immutable acceptance-time pseudonym. ``actor_user_id`` remains the live
+    # relational join and may be NULLed when the account is deleted.
+    actor_subject = Column(String(64), nullable=True)
+    # Immutable task-owner correlation captured at command acceptance. Legacy
+    # rows stay NULL because a current numeric owner cannot prove historical
+    # ownership after account deletion and SQLite id reuse.
+    task_owner_user_id = Column(Integer, nullable=True)
+    task_owner_subject = Column(String(64), nullable=True)
     command_id = Column(String(64), nullable=False)
     kind = Column(String(32), nullable=False)
     payload = Column(JSON, nullable=False)
+
+    # Server-generated route, bound before the command becomes visible.
+    reply_host_id = Column(String(64), nullable=True)
+    reply_origin = Column(String(64), nullable=True)
 
     # The run/worker observed when the command was accepted. Commands aimed at
     # a live run stay with its lease owner; once that lease expires another
     # worker may recover them from the durable inbox.
     target_run_id = Column(String(64), nullable=True)
+    # Legacy rows created before this snapshot existed remain NULL: treating
+    # an unknown historical version as a real version 0 would create a false
+    # run-correlation tuple during recovery.
+    target_state_version = Column(Integer, nullable=True)
     target_runner_id = Column(String(255), nullable=True)
 
     status = Column(

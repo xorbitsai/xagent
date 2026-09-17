@@ -1,6 +1,43 @@
 from abc import ABC, abstractmethod
 from typing import Any, List
 
+# NOT a claim that these providers edit across their lineup -- xinference defaults
+# to stable-diffusion-2-1 and raises unless the backend exposes image_to_image, and
+# openai's advertised DALL-E 3 cannot serve images.edit. It is the default both web
+# call sites already applied to their NULL rows, kept so this change stays about
+# agreement between the two paths rather than about widening or narrowing access.
+_EDIT_CAPABLE_PROVIDERS = ("openai", "xinference")
+
+# Per provider, so a marker added for one cannot silently move the other's answer:
+# "3-pro" is Gemini vocabulary and has no meaning in a dashscope name.
+_NAME_MARKERS_BY_PROVIDER = {
+    "dashscope": ("edit",),
+    "gemini": ("edit", "3-pro"),
+}
+
+
+def default_image_abilities(provider: str, model_name: str) -> List[str]:
+    """Abilities for an image model whose row declares none.
+
+    The single answer for an unconfigured row, so that the two paths building a
+    model from one -- get_image_model_instance and model_service.get_image_models
+    -- cannot disagree about what it can do. A declared non-empty abilities list is
+    authoritative and short-circuits before this function, or an operator's
+    deliberate generate-only choice gets overridden.
+
+    A marker match trusts the name over the endpoint, so a model named for editing
+    but served by one that cannot edit advertises the ability and fails at call
+    time. Declaring abilities explicitly overrides that.
+    """
+    normalized = provider.strip().lower()
+    if normalized in _EDIT_CAPABLE_PROVIDERS:
+        return ["generate", "edit"]
+    markers = _NAME_MARKERS_BY_PROVIDER.get(normalized, ())
+    lowered = model_name.lower()
+    if any(marker in lowered for marker in markers):
+        return ["generate", "edit"]
+    return ["generate"]
+
 
 class BaseImageModel(ABC):
     """

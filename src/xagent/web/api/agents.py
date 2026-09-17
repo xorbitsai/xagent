@@ -8,10 +8,16 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
+from ...core.agent.language import (
+    detect_prose_script_mismatch,
+    render_structured_request_language_policy,
+)
 from ...core.agent.service import AgentService
+from ...core.agent.voice_policy import _VOICE_INSTRUCTIONS as _core_voice_instructions
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
@@ -26,6 +32,7 @@ from ..schemas.agent_api_key import (
     APIKeyRevokeResponse,
 )
 from ..schemas.widget import WidgetAllowedDomain
+from ..services import agent_prompt as agent_prompt_service
 from ..services.agent_access import (
     AccessibleAgent,
     accessible_agent_permissions,
@@ -37,6 +44,9 @@ from ..services.agent_management import (
     AgentWorkforceConflictError,
     DuplicateAgentNameError,
     TemplateNotFoundError,
+    TemplateQuickAccessRaceError,
+    WorkforceTemplateNotSupportedError,
+    is_agent_name_unique_violation,
 )
 from ..services.agent_store import (
     AgentStore,
@@ -49,10 +59,13 @@ from ..services.agent_team_scope import (
     owned_agent_clause,
 )
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
-from ..services.llm_utils import UserAwareModelStorage
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ..services.llm_utils import AutoModelUnavailableError, UserAwareModelStorage
 from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
+from .auth import VALID_USER_VOICES
+from .templates import get_or_create_template_stats, increment_template_used_count
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +136,7 @@ class AgentResponse(BaseModel):
     name: str
     description: Optional[str]
     instructions: Optional[str]
+    template_id: Optional[str] = None
     execution_mode: str
     models: Optional[dict]
     knowledge_bases: List[str]
@@ -153,7 +167,9 @@ class AgentListItem(BaseModel):
     team_id: Optional[int] = None
     name: str
     description: Optional[str]
+    template_id: Optional[str] = None
     logo_url: Optional[str]
+    suggested_prompts: List[str] = []
     status: str
     visibility: str = "team"
     created_at: str
@@ -176,6 +192,14 @@ class AgentShareLinkResponse(BaseModel):
     share_enabled: bool
     share_token: Optional[str]
     share_updated_at: Optional[str]
+
+
+def _workforce_template_not_supported_response() -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail="This template creates a workforce, not a single agent; "
+        "use it from the Templates page instead",
+    )
 
 
 def _unshared_error_response(
@@ -261,29 +285,21 @@ def _serialize_share_link_response(agent: Agent) -> AgentShareLinkResponse:
     )
 
 
-def enhance_system_prompt_with_kb(
-    system_prompt: Optional[str], knowledge_bases: Optional[List[str]]
-) -> Optional[str]:
-    """Append knowledge-base priority instructions when KBs are configured."""
-    if not knowledge_bases:
-        return system_prompt
-
-    kb_list = ", ".join(knowledge_bases)
-    kb_prompt = (
-        f"\n\nAvailable knowledge bases: {kb_list}. "
-        "These knowledge bases are already selected. "
-        "Do not call list_knowledge_bases to discover them; "
-        "use knowledge_search directly for answers. "
-        "For specific how-to or factual questions, start with one targeted "
-        "knowledge_search, inspect all returned results as one evidence set, "
-        "and answer from that evidence when it is relevant. Search again only "
-        "when the returned results as a group are missing the information "
-        "needed to answer the current question."
+# Re-exported from core.agent.voice_policy (not defined here) so a
+# delegated AgentTool child - built in core/tools/adapters/vibe/agent_tool.py,
+# which cannot import a web route module - applies the exact same policy.
+# See VALID_USER_VOICES/UpdatePreferencesRequest in api/auth.py for the
+# schema-level source of truth this module-level check guards.
+_VOICE_INSTRUCTIONS = _core_voice_instructions
+if set(_VOICE_INSTRUCTIONS) != VALID_USER_VOICES:
+    # A plain assert would be stripped under `python -O`, silently losing
+    # this consistency guarantee in production rather than failing loudly.
+    raise ValueError(
+        "core.agent.voice_policy._VOICE_INSTRUCTIONS must define exactly the "
+        "voices UpdatePreferencesRequest accepts (api/auth.py's "
+        "VALID_USER_VOICES) - otherwise a valid, storable voice preference "
+        "could silently have no prompt effect."
     )
-
-    if system_prompt:
-        return system_prompt + kb_prompt
-    return kb_prompt.lstrip("\n")
 
 
 # ===== Helper Functions =====
@@ -478,10 +494,14 @@ async def optimize_instructions(
             "You are an expert agent builder and prompt engineer. "
             "Your task is to refine and optimize the user's draft instructions for an AI agent. "
             "The output should be clear, structured, and effective for an LLM to follow. "
-            "Do not include any conversational filler. Just output the optimized instructions."
+            "Do not include any conversational filler. Just output the optimized instructions. "
+            "Use draft_instructions as the independent user request. "
+            "The surrounding API prompt is written in English only as an execution "
+            "environment; it is not language evidence for the optimized instructions. "
+            f"{render_structured_request_language_policy(request_field='draft_instructions', pending_field='pending_response', output_language=None)}"
         )
 
-        user_prompt = f"Draft instructions:\n{request.instructions}\n\nPlease optimize these instructions."
+        user_prompt = f"draft_instructions:\n{request.instructions}"
 
         # Call LLM
         response = await llm.chat(
@@ -492,12 +512,24 @@ async def optimize_instructions(
         )
 
         if isinstance(response, dict) and "content" in response:
-            content = response["content"]
+            content = str(response["content"])
         else:
             content = response if isinstance(response, str) else str(response)
 
+        mismatch = detect_prose_script_mismatch(request.instructions, content)
+        if mismatch is not None:
+            logger.warning(
+                "Instruction optimization returned %s-script prose for a "
+                "%s-script draft; returning the original draft",
+                mismatch.observed_script,
+                mismatch.expected_script,
+            )
+            content = request.instructions
+
         return {"optimized_instructions": content}
 
+    except AutoModelUnavailableError as exc:
+        raise HTTPException(409, detail=CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE) from exc
     except Exception as e:
         logger.error(f"Failed to optimize instructions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -506,6 +538,112 @@ async def optimize_instructions(
 class AgentFromTemplateRequest(BaseModel):
     template_id: str
     name: Optional[str] = None
+
+
+class ResolvedTemplateAgentResponse(BaseModel):
+    """Result of the get-or-create resolve flow for a template's agent."""
+
+    agent: AgentResponse
+    # True when this call minted (and published) a fresh agent; False when an
+    # existing agent for this template was reused.
+    created: bool
+
+
+@router.post("/from-template/resolve", response_model=ResolvedTemplateAgentResponse)
+async def resolve_agent_from_template(
+    data: AgentFromTemplateRequest,
+    fastapi_request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ResolvedTemplateAgentResponse:
+    """Get-or-create the caller's quick-access agent for a template,
+    atomically.
+
+    Reuses the caller's own existing quick-access agent for this template
+    as-is (never silently republishing a draft - see the note on
+    ``_resolve_agent_from_template_sync``), or creates and publishes a new
+    one, disambiguating the name server-side on collision. Idempotent per
+    (user, template) for this flow specifically: unlike the plain
+    POST /from-template (used by the workforce-builder UI to mint several
+    named instances of one template), repeat calls here return the same
+    agent, backed by a DB-level unique index scoped to this flow's own
+    origin marker.
+
+    ``name`` only seeds a freshly created agent; on reuse it is ignored and
+    the existing agent's own name is returned as-is (see
+    ``AgentManagementService.resolve_agent_from_template``).
+    """
+    user_id = int(current_user.id)
+    is_admin = bool(current_user.is_admin)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=500,
+            detail="Agent creation requires a clean request database transaction",
+        )
+
+    template_manager = getattr(fastapi_request.app.state, "template_manager", None)
+    try:
+        snapshot, created = await AgentManagementRuntime(
+            template_manager=template_manager
+        ).resolve_agent_from_template(
+            user_id=user_id,
+            is_admin=is_admin,
+            template_id=data.template_id,
+            name=data.name,
+        )
+        if created:
+            # This endpoint is the entry point for two frontend flows that
+            # never touch /use or /use-as-workforce, the two endpoints that
+            # otherwise record usage: the marketplace Hire flow AND the
+            # task page's quick-access template picker
+            # (frontend/src/app/task/page.tsx, resolveAgentForTemplate).
+            # Both genuinely put the template into use, so counting either
+            # here is correct - without this, used_count would stay
+            # permanently stale for any template only ever adopted through
+            # one of these paths, which matters because the featured
+            # section's hero ranking (templates/page.tsx) sorts by exactly
+            # that count. An analytics-counter failure must not fail an
+            # already-successful agent creation, so it's caught and logged
+            # the same way use_template_as_workforce's counter update is.
+            try:
+                get_or_create_template_stats(db, data.template_id)
+                increment_template_used_count(db, data.template_id)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Failed to record used_count for template_id=%s after "
+                    "successfully resolving a fresh agent for user_id=%s",
+                    data.template_id,
+                    user_id,
+                )
+        return ResolvedTemplateAgentResponse(
+            agent=AgentResponse.model_validate(snapshot.to_response_dict()),
+            created=created,
+        )
+    except TemplateNotFoundError:
+        raise HTTPException(status_code=404, detail="Template not found")
+    except WorkforceTemplateNotSupportedError:
+        raise _workforce_template_not_supported_response()
+    except DuplicateAgentNameError:
+        raise HTTPException(
+            status_code=400, detail="Agent with this name already exists"
+        )
+    except TemplateQuickAccessRaceError:
+        # Distinct from the name-collision case above: every one of
+        # TEMPLATE_RESOLVE_RACE_RETRIES concurrent attempts lost the
+        # (user_id, template_id) quick-access race to another request, with
+        # no name collision involved at all - "already exists" would be
+        # misleading here since the client never even chose a name.
+        raise HTTPException(
+            status_code=409,
+            detail="Too many concurrent requests for this template; please retry",
+        )
+    except Exception as e:
+        logger.exception(f"Failed to resolve agent from template {data.template_id}")
+        raise HTTPException(
+            status_code=500, detail="Failed to resolve agent from template"
+        ) from e
 
 
 @router.post("/from-template", response_model=AgentResponse)
@@ -546,6 +684,8 @@ async def create_agent_from_template(
         return AgentResponse.model_validate(result.agent.to_response_dict())
     except TemplateNotFoundError:
         raise HTTPException(status_code=404, detail="Template not found")
+    except WorkforceTemplateNotSupportedError:
+        raise _workforce_template_not_supported_response()
     except DuplicateAgentNameError:
         raise HTTPException(
             status_code=400, detail="Agent with this name already exists"
@@ -576,19 +716,31 @@ async def create_agent(
         )
         await _validate_knowledge_bases_exist(agent_data.knowledge_bases, current_user)
 
-        agent = store.create_agent(
-            user_id=user_id,
-            name=agent_data.name,
-            description=agent_data.description,
-            instructions=agent_data.instructions,
-            execution_mode=agent_data.execution_mode or "graph",
-            models=agent_data.models,
-            knowledge_bases=agent_data.knowledge_bases,
-            skills=agent_data.skills,
-            tool_categories=agent_data.tool_categories,
-            suggested_prompts=agent_data.suggested_prompts,
-            visibility=agent_data.visibility,
-        )
+        # agent_name_exists above is a fast-path pre-check, not the source of
+        # truth: uq_agents_user_id_name_active is what actually prevents a
+        # concurrent-request race, so the insert itself can still raise
+        # IntegrityError here.
+        try:
+            agent = store.create_agent(
+                user_id=user_id,
+                name=agent_data.name,
+                description=agent_data.description,
+                instructions=agent_data.instructions,
+                execution_mode=agent_data.execution_mode or "graph",
+                models=agent_data.models,
+                knowledge_bases=agent_data.knowledge_bases,
+                skills=agent_data.skills,
+                tool_categories=agent_data.tool_categories,
+                suggested_prompts=agent_data.suggested_prompts,
+                visibility=agent_data.visibility,
+            )
+        except IntegrityError as exc:
+            db.rollback()
+            if not is_agent_name_unique_violation(exc):
+                raise
+            raise HTTPException(
+                status_code=400, detail="Agent with this name already exists"
+            ) from exc
 
         # Save logo if provided
         if agent_data.logo_base64:
@@ -763,16 +915,29 @@ async def update_agent(
             updates["logo_url"] = logo_url
 
         if updates:
-            agent = (
-                store.update_agent_fields(
-                    user_id,
-                    agent_id,
-                    updates,
-                    team_scope=team_scope,
-                    agent=agent,
+            # agent_name_exists above is a fast-path pre-check, not the source
+            # of truth: uq_agents_user_id_name_active is what actually
+            # prevents a concurrent-rename race, so the write itself can
+            # still raise IntegrityError here (see the matching handling in
+            # create_agent above).
+            try:
+                agent = (
+                    store.update_agent_fields(
+                        user_id,
+                        agent_id,
+                        updates,
+                        team_scope=team_scope,
+                        agent=agent,
+                    )
+                    or agent
                 )
-                or agent
-            )
+            except IntegrityError as exc:
+                db.rollback()
+                if not is_agent_name_unique_violation(exc):
+                    raise
+                raise HTTPException(
+                    status_code=400, detail="Agent with this name already exists"
+                ) from exc
 
         logger.info(f"Updated agent {agent_id} for user {current_user.id}")
         return AgentResponse.model_validate(store.agent_to_response_dict(agent))
@@ -1237,7 +1402,7 @@ async def generate_agent_api_key(
     endpoint revokes it and inserts a new active row in a single
     transaction. The new ``full_key`` is returned exactly once in the
     response; the plaintext secret is never persisted server-side, only
-    its bcrypt hash.
+    its one-way verifier.
 
     Args:
         agent_id: Path parameter; the target agent's primary key.
@@ -1268,7 +1433,7 @@ async def generate_agent_api_key(
           the multi-key endpoints; two racing legacy rotations both succeed
           sequentially, and the later rotation leaves its key active.
         - Logs include the ``key_prefix`` only -- never the ``full_key``,
-          the secret half, or the bcrypt hash.
+          the secret half, or the stored verifier.
     """
     try:
         # Ownership gate. Raises 404 on miss; never reveals "exists but
@@ -1522,6 +1687,7 @@ async def preview_agent(
             exclude_custom_api_when_unconfigured=True,
         )
 
+        current_user_voice = agent_prompt_service.voice_from_runtime_user(current_user)
         tool_config = WebToolConfig(
             db=db,
             request=MinimalRequest(int(current_user.id)),
@@ -1536,6 +1702,15 @@ async def preview_agent(
             include_mcp_tools=should_load_mcp_server_configs(tool_selection_spec),
             task_id=preview_task_id,
             workspace_base_dir=str(get_uploads_dir() / "preview"),
+            # A preview request carries tool_categories, not an agent id, so
+            # there is no governing agent to key team connector visibility
+            # on. The live agent (once promoted) can still diverge from
+            # this preview for a team connector -- a known, accepted gap.
+            connector_team_id=None,
+            # Threaded through so a delegated AgentTool child the preview
+            # calls also honors the previewing user's voice (see
+            # BaseToolConfig.get_voice's docstring).
+            voice=current_user_voice,
         )
 
         # Determine execution mode (default to "think")
@@ -1557,9 +1732,12 @@ async def preview_agent(
             },
         )
 
-        enhanced_system_prompt = enhance_system_prompt_with_kb(
+        enhanced_system_prompt = agent_prompt_service.enhance_system_prompt_with_kb(
             request.instructions if request.instructions else None,
             request.knowledge_bases if request.knowledge_bases is not None else None,
+        )
+        enhanced_system_prompt = agent_prompt_service.apply_user_voice(
+            enhanced_system_prompt, current_user_voice
         )
 
         # Create agent service (Langfuse only, no database/websocket logging)

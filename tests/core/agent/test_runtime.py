@@ -6,6 +6,12 @@ from typing import Any
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
+from xagent.core.agent import runtime as runtime_module
+from xagent.core.agent.context.execution import (
+    COMPACT_SUMMARY_METADATA_KEY,
+    COMPACT_WATERMARK_METADATA_KEY,
+    TRANSCRIPT_WATERMARK_METADATA_KEY,
+)
 from xagent.core.agent.pattern.final_answer_stream import (
     ToolCallStringFieldStreamer,
     _JsonStringFieldReader,
@@ -16,7 +22,13 @@ from xagent.core.agent.runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
-from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.model.chat.types import (
+    CONTENT_SOURCE_KEY,
+    CONTENT_SOURCE_REASONING_FALLBACK,
+    ChunkType,
+    StreamChunk,
+)
+from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
 class SlowLLM:
@@ -38,8 +50,14 @@ async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -
         context_window = 1_048_576
 
     class VirtualLLM:
-        async def prepare_for_call(self, messages: list[dict[str, Any]]) -> Any:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
             assert messages[-1]["content"] == "make a podcast"
+            assert preferred_input_modalities == ()
             return PreparedLLM()
 
     context = ExecutionContext()
@@ -55,6 +73,75 @@ async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -
         "selected_model": "deepseek/deepseek-v4-flash",
         "context_window": 1_048_576,
     }
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_passes_runtime_modality_preferences() -> None:
+    captured: list[tuple[str, ...]] = []
+
+    class PreparedLLM:
+        context_window = 128_000
+
+    class VirtualLLM:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            captured.append(preferred_input_modalities)
+            return PreparedLLM()
+
+    context = ExecutionContext()
+    context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = [
+        "IMAGE",
+        "image",
+        "audio",
+    ]
+
+    await prepare_llm_for_context(
+        llm=VirtualLLM(),
+        messages=[{"role": "user", "content": "inspect the selected target"}],
+        context=context,
+    )
+
+    assert captured == [("image", "audio")]
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_reads_runtime_metadata_once() -> None:
+    class PreparedLLM:
+        pass
+
+    class VirtualLLM:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            assert preferred_input_modalities == ("image",)
+            return PreparedLLM()
+
+    class Metadata(dict[str, list[str]]):
+        pass
+
+    class Context:
+        metadata_reads = 0
+
+        @property
+        def metadata(self) -> Metadata:
+            self.metadata_reads += 1
+            return Metadata({PREFERRED_INPUT_MODALITIES_METADATA_KEY: ["image"]})
+
+    context = Context()
+    await prepare_llm_for_context(
+        llm=VirtualLLM(),
+        messages=[{"role": "user", "content": "inspect the selected target"}],
+        context=context,
+    )
+
+    assert context.metadata_reads == 1
 
 
 @pytest.mark.asyncio
@@ -91,6 +178,222 @@ class StreamingLLM:
         yield StreamChunk(type=ChunkType.TOKEN, delta="hello")
         yield StreamChunk(type=ChunkType.TOKEN, delta=" world")
         yield StreamChunk(type=ChunkType.END)
+
+
+@pytest.mark.asyncio
+async def test_buffered_stream_yields_to_other_callbacks_between_chunks() -> None:
+    runtime = PatternRuntime()
+    observed = []
+    received = []
+    loop = asyncio.get_running_loop()
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk)
+        loop.call_soon(lambda: observed.append(len(received)))
+
+    result = await runtime.run_streaming_llm_call(StreamingLLM(), on_chunk=on_chunk)
+
+    assert result == "hello world"
+    assert observed == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_buffered_stream_can_be_stopped_between_chunks(interrupt: bool) -> None:
+    runtime = PatternRuntime()
+    received = []
+    loop = asyncio.get_running_loop()
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.delta)
+        if interrupt:
+            loop.call_soon(runtime.request_interrupt, "stop buffered stream")
+        else:
+            loop.call_soon(call.cancel)
+
+    call = asyncio.create_task(
+        runtime.run_streaming_llm_call(StreamingLLM(), on_chunk=on_chunk)
+    )
+    expected = LLMCallInterrupted if interrupt else asyncio.CancelledError
+    with pytest.raises(expected):
+        await call
+    assert received == ["hello"]
+    assert not runtime._active_llm_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    ["complete", "provider_error", "callback_error", "cancel", "interrupt", "checker"],
+)
+async def test_stream_is_closed_before_runtime_returns(mode: str) -> None:
+    closed = asyncio.Event()
+    stop = asyncio.Event()
+
+    class RetainedStream:
+        def __init__(self) -> None:
+            # Keep a reference so GC cannot hide missing explicit cleanup.
+            self.stream = self.generate()
+
+        def stream_chat(self, **_: Any) -> Any:
+            return self.stream
+
+        async def generate(self) -> Any:
+            owner = asyncio.current_task()
+            try:
+                yield StreamChunk(type=ChunkType.TOKEN, delta="first")
+                yield StreamChunk(
+                    type=ChunkType.ERROR
+                    if mode == "provider_error"
+                    else ChunkType.TOKEN,
+                    content="provider failed",
+                    delta="second",
+                )
+            finally:
+                assert asyncio.current_task() is owner
+                await asyncio.sleep(0)
+                closed.set()
+
+    runtime = PatternRuntime(
+        interrupt_checker=lambda: "checker stopped" if stop.is_set() else False
+    )
+    llm = RetainedStream()
+    received = []
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.delta)
+        if mode == "callback_error":
+            raise ValueError("callback failed")
+        loop = asyncio.get_running_loop()
+        if mode == "cancel":
+            loop.call_soon(call.cancel)
+        elif mode == "interrupt":
+            loop.call_soon(runtime.request_interrupt, "requested stop")
+        elif mode == "checker":
+            # No explicit cancel/request_interrupt: exercise the checker path.
+            loop.call_soon(stop.set)
+
+    call = asyncio.create_task(runtime.run_streaming_llm_call(llm, on_chunk=on_chunk))
+    try:
+        if mode == "complete":
+            assert await call == "firstsecond"
+        else:
+            exception = {
+                "provider_error": RuntimeError,
+                "callback_error": ValueError,
+                "cancel": asyncio.CancelledError,
+                "interrupt": LLMCallInterrupted,
+                "checker": LLMCallInterrupted,
+            }[mode]
+            with pytest.raises(exception) as error:
+                await call
+            if mode == "checker":
+                assert str(error.value) == "checker stopped"
+            assert received == ["first"]
+        assert closed.is_set()
+        assert not runtime._active_llm_tasks
+    finally:
+        await llm.stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_error", [False, True])
+async def test_stream_close_error_does_not_mask_source_error(
+    source_error: bool,
+) -> None:
+    class BrokenClose:
+        def stream_chat(self, **_: Any) -> Any:
+            return self
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> Any:
+            if source_error:
+                raise ValueError("source failed")
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(0)
+            raise RuntimeError("close failed")
+
+    expected = ValueError if source_error else RuntimeError
+    message = "source failed" if source_error else "close failed"
+    with pytest.raises(expected, match=message):
+        await PatternRuntime().run_streaming_llm_call(BrokenClose())
+
+
+@pytest.mark.asyncio
+async def test_stream_without_aclose_remains_supported() -> None:
+    class Iterator:
+        def __init__(self) -> None:
+            self.done = False
+
+        def __aiter__(self) -> Any:
+            return self
+
+        async def __anext__(self) -> StreamChunk:
+            if self.done:
+                raise StopAsyncIteration
+            self.done = True
+            return StreamChunk(type=ChunkType.TOKEN, delta="answer")
+
+    class LLM:
+        def stream_chat(self, **_: Any) -> Any:
+            return Iterator()
+
+    assert await PatternRuntime().run_streaming_llm_call(LLM()) == "answer"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_cancellation_wins_over_concurrent_provider_error(
+    interrupt: bool,
+) -> None:
+    runtime = PatternRuntime()
+
+    class ErrorStream:
+        async def stream_chat(self, **_: Any) -> Any:
+            loop = asyncio.get_running_loop()
+            if interrupt:
+                loop.call_soon(runtime.request_interrupt, "requested stop")
+            else:
+                loop.call_soon(call.cancel)
+            yield StreamChunk(type=ChunkType.ERROR, content="provider failed")
+
+    call = asyncio.create_task(runtime.run_streaming_llm_call(ErrorStream()))
+    expected = LLMCallInterrupted if interrupt else asyncio.CancelledError
+    with pytest.raises(expected):
+        await call
+
+
+@pytest.mark.asyncio
+async def test_buffered_protocol_error_keeps_usage_and_yields() -> None:
+    from xagent.core.model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
+
+    class ProtocolStream:
+        async def stream_chat(self, **_: Any) -> Any:
+            yield StreamChunk(
+                type=ChunkType.PROTOCOL_ERROR,
+                protocol_error={"code": "invalid_tool_call"},
+            )
+            yield StreamChunk(type=ChunkType.USAGE, usage={"total_tokens": 10})
+
+    observed = []
+    received = []
+
+    def on_chunk(chunk: StreamChunk) -> None:
+        received.append(chunk.type)
+        asyncio.get_running_loop().call_soon(lambda: observed.append(len(received)))
+
+    result = await PatternRuntime().run_streaming_llm_call(
+        ProtocolStream(), on_chunk=on_chunk
+    )
+    assert observed == [1, 2]
+    assert result[TOOL_PROTOCOL_ERROR_KEY] == {"code": "invalid_tool_call"}
+    assert result["usage"] == {"total_tokens": 10}
+    assert result["content"] == ""
+    assert result["tool_calls"] == []
 
 
 class StreamingLLMWithUsage:
@@ -542,6 +845,167 @@ async def test_runtime_stream_final_answer_emits_error_terminal_event() -> None:
     assert runtime.last_final_answer_stream_message_id is None
 
 
+class RecordingLogger:
+    """Records info/warning calls without depending on the logging module's
+    own configuration - per the project rule against log assertions that
+    depend on caplog or other global logging state, this replaces the
+    module-level ``logger`` binding directly."""
+
+    def __init__(self) -> None:
+        self.info_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.warning_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def info(self, msg: str, *args: Any) -> None:
+        self.info_calls.append((msg, args))
+
+    def warning(self, msg: str, *args: Any) -> None:
+        self.warning_calls.append((msg, args))
+
+
+_NEWLINE_AND_QUOTE_EXCEPTION_TEXT = (
+    "Traceback (most recent call last):\n"
+    '  File "provider.py", line 42, in call\n'
+    "    raise ValueError(\"bad 'quoted' response\")\n"
+    "ValueError: bad 'quoted' response"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,reason,expected_reason",
+    [
+        (
+            "known_literal",
+            "interrupted during LLM stream",
+            "interrupted during LLM stream",
+        ),
+        (
+            "tool_protocol_retry_template",
+            "invalid some_provider_code tool protocol, retrying",
+            "invalid tool protocol (code:18 chars), retrying",
+        ),
+        ("unparsed_provider_exception", "x" * 5000, "<unparsed>:5000"),
+        (
+            "unparsed_exception_with_newlines_and_quotes",
+            _NEWLINE_AND_QUOTE_EXCEPTION_TEXT,
+            f"<unparsed>:{len(_NEWLINE_AND_QUOTE_EXCEPTION_TEXT)}",
+        ),
+    ],
+)
+async def test_runtime_stream_close_log_records_reason_in_one_of_three_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    reason: str,
+    expected_reason: str,
+) -> None:
+    """I-8: fail_final_answer_stream logs a normalized reason that is always
+    one of three shapes - a known fixed string verbatim, the
+    tool-protocol-retry template folded to a fixed shape that keeps only the
+    provider error code's length, or <unparsed>:<length> for anything else -
+    never the raw external text itself."""
+
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    runtime = PatternRuntime(execution_id="task-1")
+    runtime.last_final_answer_stream_message_id = "final_answer_abc"
+
+    await runtime.fail_final_answer_stream("final_answer_abc", reason)
+
+    assert len(recording_logger.warning_calls) == 1
+    msg, args = recording_logger.warning_calls[0]
+    logged = msg % args
+    assert f"reason={expected_reason}" in logged
+    if reason != expected_reason:
+        assert reason[:40] not in logged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "has_handler", [True, False], ids=["with_handler", "without_handler"]
+)
+async def test_runtime_stream_events_are_logged_once_each(
+    monkeypatch: pytest.MonkeyPatch,
+    has_handler: bool,
+) -> None:
+    """I-9: each of the three final_answer stream events logs exactly once
+    per call, with the acting message_id present in the logged line - except
+    start_final_answer_stream, which logs nothing at all (and returns None)
+    when there is no outbound handler, because no stream was actually
+    opened."""
+
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    outbound = OutboundCollector() if has_handler else None
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    message_id = await runtime.start_final_answer_stream()
+
+    if not has_handler:
+        assert message_id is None
+        assert recording_logger.info_calls == []
+        assert recording_logger.warning_calls == []
+        return
+
+    assert message_id is not None
+    assert len(recording_logger.info_calls) == 1
+    logged_start = recording_logger.info_calls[0][0] % recording_logger.info_calls[0][1]
+    assert message_id in logged_start
+
+    await runtime.end_final_answer_stream(message_id, "answer text")
+    assert len(recording_logger.info_calls) == 2
+    logged_end = recording_logger.info_calls[1][0] % recording_logger.info_calls[1][1]
+    assert message_id in logged_end
+    assert "content_chars=11" in logged_end
+    # The answer text itself must never reach the log - only its length.
+    assert "answer text" not in logged_end
+
+    second_message_id = await runtime.start_final_answer_stream()
+    assert second_message_id is not None
+    assert len(recording_logger.info_calls) == 3
+
+    await runtime.fail_final_answer_stream(
+        second_message_id, "interrupted during LLM stream"
+    )
+    assert len(recording_logger.warning_calls) == 1
+    logged_fail = (
+        recording_logger.warning_calls[0][0] % recording_logger.warning_calls[0][1]
+    )
+    assert second_message_id in logged_fail
+    assert "reason=interrupted during LLM stream" in logged_fail
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_log_suppressed_when_outbound_handler_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opened/closed/failed log lines sit after the outbound emit call in
+    all three stream methods, not before it - so when the outbound handler
+    itself raises, the exception propagates to the caller and the
+    corresponding log line is never written, because the emit it was meant
+    to describe never actually succeeded."""
+
+    async def raising_handler(payload: dict[str, Any]) -> None:
+        raise RuntimeError("outbound send failed")
+
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    runtime = PatternRuntime(
+        execution_id="task-1", outbound_message_handler=raising_handler
+    )
+
+    with pytest.raises(RuntimeError, match="outbound send failed"):
+        await runtime.start_final_answer_stream()
+    assert recording_logger.info_calls == []
+
+    with pytest.raises(RuntimeError, match="outbound send failed"):
+        await runtime.end_final_answer_stream("final_answer_abc", "answer text")
+    assert recording_logger.info_calls == []
+
+    with pytest.raises(RuntimeError, match="outbound send failed"):
+        await runtime.fail_final_answer_stream("final_answer_abc", "some reason")
+    assert recording_logger.warning_calls == []
+
+
 @pytest.mark.asyncio
 async def test_runtime_streaming_llm_call_merges_tool_call_argument_deltas() -> None:
     runtime = PatternRuntime()
@@ -801,17 +1265,17 @@ async def test_on_llm_start_emits_context_usage_fields() -> None:
     runtime = PatternRuntime(tracer=tracer, execution_id="task-1")
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 96000
-    ctx.add_message("user", "x" * 400)
+    ctx.add_message("user", "persisted-only")
 
-    await runtime.on_llm_start(
-        context=ctx, messages=[{"role": "user", "content": "x" * 400}]
-    )
+    messages = [{"role": "user", "content": "x" * 400}]
+    tools = [{"function": {"name": "save", "description": "d" * 400}}]
+    await runtime.on_llm_start(context=ctx, messages=messages, tools=tools)
 
     usage = [e["data"] for e in tracer.events if "context_threshold" in e["data"]]
     assert usage, tracer.events
     assert usage[0]["context_threshold"] == 96000
     assert isinstance(usage[0]["context_tokens"], int)
-    assert usage[0]["context_tokens"] > 0
+    assert usage[0]["context_tokens"] == ctx.estimate_context_tokens(messages, tools)
 
 
 @pytest.mark.asyncio
@@ -892,6 +1356,100 @@ async def test_on_tool_end_emits_only_allowlisted_top_level_failure_code(
 
 
 @pytest.mark.asyncio
+async def test_on_tool_end_marks_classified_nested_wait_as_failed() -> None:
+    """A classified nested-wait failure must route through on_tool_error.
+
+    The ReAct loop records ``status="failed"`` for this tool call and
+    continues (it does not stop the parent run — see
+    ``react.py:2787-2803``). This test covers the runtime half only: that a
+    classified failure dict, not an exception, is enough to route through
+    ``on_tool_error`` and carry ``failure_code`` into the emitted trace
+    event.
+    """
+
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-nested-wait")
+    result = {
+        "success": False,
+        "is_error": True,
+        "status": "error",
+        "failure_code": "unsupported_nested_interaction",
+        "error": "Nested agent calls cannot forward interactive prompts.",
+        "output": "Nested agent calls cannot forward interactive prompts.",
+        "response": "Nested agent calls cannot forward interactive prompts.",
+    }
+
+    await runtime.on_tool_end(
+        tool_call={"name": "delegated_agent", "id": "call-nested"},
+        result=result,
+    )
+
+    assert [event["type"] for event in tracer.events] == ["action_error_tool"]
+    event_data = tracer.events[0]["data"]
+    assert event_data["failure_code"] == "unsupported_nested_interaction"
+    assert event_data["result"] == result
+    assert runtime._tool_result_success(result) is False
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_carries_missing_output_failure_code() -> None:
+    """The missing-delegated-output code must propagate into trace data too.
+
+    Same runtime-level contract as the nested-wait case: a classified failure
+    dict is enough, no exception required, to carry a new allowlisted
+    failure_code into the emitted trace event.
+    """
+
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-missing-output")
+    result = {
+        "success": False,
+        "is_error": True,
+        "status": "error",
+        "failure_code": "missing_delegated_output",
+        "error": "The delegated agent reported completion without returning "
+        "any usable output, so there is no answer from it to use.",
+        "output": "The delegated agent reported completion without returning "
+        "any usable output, so there is no answer from it to use.",
+        "response": "The delegated agent reported completion without "
+        "returning any usable output, so there is no answer from it to use.",
+    }
+
+    await runtime.on_tool_end(
+        tool_call={"name": "delegated_agent", "id": "call-missing-output"},
+        result=result,
+    )
+
+    assert [event["type"] for event in tracer.events] == ["action_error_tool"]
+    event_data = tracer.events[0]["data"]
+    assert event_data["failure_code"] == "missing_delegated_output"
+
+
+@pytest.mark.asyncio
 async def test_concurrent_tool_calls_all_count() -> None:
     """A concurrent batch (asyncio.gather) increments the shared counter once per tool.
 
@@ -968,3 +1526,589 @@ async def test_runtime_surfaces_cached_tokens_in_usage_and_trace() -> None:
     await runtime.on_llm_end(context=context, response=result)
     assert events[-1]["data"]["cached_input_tokens"] == 4
     assert events[-1]["data"]["input_tokens"] == 7
+
+
+class RaisingCompactLLM:
+    """Stub whose ``chat`` always fails, driving the llm_summary -> truncate
+    fallback in ``PatternRuntime.compact_context_if_needed``."""
+
+    model_name = "raising-compact-llm"
+    context_window = 32_000
+
+    async def chat(self, **_: Any) -> Any:
+        raise RuntimeError("compact llm exploded")
+
+
+@pytest.mark.asyncio
+async def test_compact_context_if_needed_falls_back_to_truncate_without_orphans() -> (
+    None
+):
+    """When the LLM-summary compaction path raises, the runtime must fall back
+    to ``truncate`` -- and the fallback must never leave a native ``tool``
+    message without the assistant message that declared its ``tool_calls``
+    immediately before it, since providers reject that shape outright.
+    """
+    runtime = PatternRuntime(execution_id="task-compact-fallback")
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    # 9 messages total (u0, assistant+2 tool results, tail-0..tail-4). A
+    # max_messages of 4 would land the naive tail slice entirely inside the
+    # 5 trailing user messages (tail-1..tail-4) -- no "tool" message would
+    # ever survive, making assert_no_orphan_tool_messages below vacuous: it
+    # would pass identically even if `_tail_window_preserving_tool_pairs`
+    # were replaced by a naive `messages[-keep_count:]`. max_messages=6 puts
+    # the boundary inside the assistant+tool block instead, so the
+    # pair-preservation walk-back must expand the window back to include
+    # both tool results and their declaring assistant message, giving the
+    # assertions below something real to check.
+    ctx.compact_config.max_messages = 6
+    ctx.add_user_message("u0")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+            {"id": "call-2", "type": "function", "function": {"name": "write_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "read"}, tool_call_id="call-1")
+    ctx.add_tool_result("write_file", {"output": "written"}, tool_call_id="call-2")
+    for i in range(5):
+        ctx.add_user_message(f"tail-{i}")
+
+    result = await runtime.compact_context_if_needed(
+        context=ctx, llm=RaisingCompactLLM()
+    )
+
+    assert result is not None
+    assert result.compacted is True
+    assert result.strategy == "truncate"
+    assert result.metadata["fallback_strategy"] == "truncate"
+    assert "llm_compact_error" in result.metadata
+
+    # This is the load-bearing check for this test: with a naive
+    # `messages[-keep_count:]` slice (keep_count=6 here), the survivors would
+    # be tail-1..tail-4 plus the two dangling tool results with no preceding
+    # assistant message -- 0 messages would have role "assistant" among the
+    # last 6. The real pair-preserving walk-back must expand the window left
+    # to include the assistant message that declared both tool_calls.
+    final_roles = [message.role for message in ctx.messages]
+    assert final_roles.count("tool") == 2, (
+        "expected both tool results to survive the pair-preserving "
+        "walk-back -- if this is 0, `_tail_window_preserving_tool_pairs` "
+        "has regressed to a naive `messages[-keep_count:]` slice"
+    )
+    assert final_roles[:3] == ["assistant", "tool", "tool"]
+
+    def assert_no_orphan_tool_messages(messages: list[dict[str, Any]]) -> None:
+        for index, message in enumerate(messages):
+            if message.get("role") != "tool":
+                continue
+            assert index > 0, "tool message with no preceding message"
+            # A parallel tool-call batch is one assistant(tool_calls) message
+            # followed by a contiguous run of "tool" messages -- so a tool
+            # message's own predecessor can itself be another "tool" message
+            # from the same batch. Walk back over that run to find the
+            # declaring assistant message.
+            declaring_index = index - 1
+            while (
+                declaring_index >= 0 and messages[declaring_index].get("role") == "tool"
+            ):
+                declaring_index -= 1
+            assert declaring_index >= 0, "tool message with no preceding message"
+            declaring = messages[declaring_index]
+            assert declaring.get("role") == "assistant" and declaring.get(
+                "tool_calls"
+            ), "tool message not immediately preceded by its assistant tool_calls"
+            declared_ids = {
+                str(tool_call.get("id"))
+                for tool_call in declaring["tool_calls"]
+                if isinstance(tool_call, dict) and tool_call.get("id")
+            }
+            assert message.get("tool_call_id") in declared_ids
+
+    assert_no_orphan_tool_messages(ctx.get_messages_for_llm())
+    assert_no_orphan_tool_messages(
+        [
+            {
+                "role": message.role,
+                "tool_calls": message.tool_calls,
+                "tool_call_id": message.tool_call_id,
+            }
+            for message in ctx.messages
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_compaction_records_that_an_unusable_summary_was_discarded() -> None:
+    """A summary that was requested and then discarded must leave a trace.
+
+    The error path already records ``llm_compact_error``. Without an
+    equivalent here, a summary that came back empty -- or that the client
+    marked as a substituted reasoning trace -- is indistinguishable in the
+    trace from compaction that never attempted to summarize, which is exactly
+    the case an operator would want to see.
+    """
+
+    class CompactTracer:
+        """Accepts the full trace_event signature, including ``step_id``,
+        which the compaction events carry."""
+
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(
+            self, event_type: Any, *, data: dict[str, Any] | None = None, **_: Any
+        ) -> None:
+            self.events.append(
+                {
+                    "event_type": getattr(event_type, "value", str(event_type)),
+                    "data": data or {},
+                }
+            )
+
+    tracer = CompactTracer()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="unusable-summary")
+    context.compact_config.threshold = 1
+    context.add_user_message("current request")
+    context.add_tool_result("read_file", {"output": "x" * 200}, tool_call_id="call-1")
+
+    class EmptySummaryLLM:
+        model_name = "compact-test"
+        context_window = 32_000
+
+        async def chat(self, **_: Any) -> Any:
+            return {"content": ""}
+
+    result = await runtime.compact_context_if_needed(
+        context=context,
+        llm=EmptySummaryLLM(),
+        metadata={"phase": "test"},
+    )
+
+    assert result.compacted
+    # Fell back to dropping messages, and said so.
+    assert result.strategy == "truncate"
+    assert result.metadata["llm_summary_unusable"] is True
+    assert result.metadata["fallback_strategy"] == "truncate"
+    # The emitted compact event carries it too, so this is visible without
+    # reading the return value.
+    assert any(
+        event["data"].get("llm_summary_unusable") is True for event in tracer.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_compaction_retries_with_a_smaller_budget_before_truncating() -> None:
+    """The requested budget is a guess; a wrong guess must not cost the summary.
+
+    It follows the model's *input* window, while providers cap the *output*
+    separately and much lower. Nothing in the model config records that limit
+    -- the one number stored per model is a default to send, not a ceiling the
+    model can produce -- so a model whose output cap sits below the requested
+    budget would previously have lost its summary entirely and fallen back to
+    dropping messages, the outcome this path exists to avoid.
+    """
+    context = ExecutionContext(execution_id="budget-retry")
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+
+    class OutputCappedLLM:
+        model_name = "compact-test"
+        context_window = 64_000
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            budget = kwargs["max_tokens"]
+            self.budgets.append(budget)
+            if budget > 4096:
+                raise RuntimeError("max_tokens is too large for this model")
+            return {"content": "summary within the model's output cap"}
+
+    llm = OutputCappedLLM()
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=llm, metadata={"phase": "test"}
+    )
+
+    # Asked big, was refused, stepped down, succeeded -- and summarized rather
+    # than dropping messages. The step lands on the largest rung the cap
+    # allows, not the smallest one available.
+    assert llm.budgets == [8000, 4096]
+    assert result.compacted
+    assert result.strategy == "llm_summary"
+    assert "output cap" in context.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_compaction_ladder_skips_a_budget_the_model_cannot_use() -> None:
+    """The step down must not go straight to the floor.
+
+    A reasoning model draws its reasoning from the same allowance, so a
+    budget that is merely *accepted* can still produce no summary -- the
+    client marks such a response as a substituted reasoning trace and
+    compaction rejects it. 1024 is on the ladder because it was the ceiling
+    before this PR raised it, and is therefore known to leave room for an
+    answer; jumping from 8000 to 256 would spend a request to arrive at the
+    same truncation.
+    """
+    context = ExecutionContext(execution_id="budget-ladder")
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+
+    class CappedReasoningLLM:
+        model_name = "compact-test"
+        context_window = 64_000
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            budget = kwargs["max_tokens"]
+            self.budgets.append(budget)
+            if budget > 4096:
+                raise RuntimeError("max_tokens is too large for this model")
+            if budget < 1024:
+                # Whole allowance spent reasoning; the client surfaces the
+                # trace in place of content and marks it.
+                return {
+                    "content": "thinking about the file",
+                    CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
+                    "reasoning_content": "thinking about the file",
+                }
+            return {"content": "a real summary of the prior work"}
+
+    llm = CappedReasoningLLM()
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=llm, metadata={"phase": "test"}
+    )
+
+    assert llm.budgets == [8000, 4096]
+    assert result.compacted
+    assert result.strategy == "llm_summary"
+    assert "a real summary" in context.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_compaction_stops_descending_once_a_budget_is_accepted() -> None:
+    """Accepted-but-unusable ends the ladder rather than continuing down.
+
+    A response is unusable because the allowance was too small for the model
+    to finish, so usability is monotone in the budget: every smaller rung is
+    unusable too. Continuing to step down would spend requests to arrive at
+    the same truncation. Here the model accepts anything but can never
+    produce a summary, so the ladder must stop at the first accepted rung.
+    """
+    context = ExecutionContext(execution_id="budget-monotone")
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+
+    class AlwaysReasoningLLM:
+        model_name = "compact-test"
+        context_window = 64_000
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.budgets.append(kwargs["max_tokens"])
+            return {
+                "content": "still thinking",
+                CONTENT_SOURCE_KEY: CONTENT_SOURCE_REASONING_FALLBACK,
+                "reasoning_content": "still thinking",
+            }
+
+    llm = AlwaysReasoningLLM()
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=llm, metadata={"phase": "test"}
+    )
+
+    # One request, not one per rung.
+    assert llm.budgets == [8000]
+    assert result.strategy == "truncate"
+    assert result.metadata["llm_summary_unusable"] is True
+
+
+@pytest.mark.asyncio
+async def test_compaction_marks_messages_dropped_for_want_of_a_summary_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping messages because no summary model was reachable used to look
+    exactly like dropping them after a summary failed -- both produced a bare
+    ``truncate`` result, and only the failure path left a marker behind. That
+    made "nothing could summarize" invisible in the trace.
+    """
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    context = ExecutionContext(execution_id="no-compact-model")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    for index in range(6):
+        context.add_user_message(f"m{index}")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=None, metadata={"phase": "test"}
+    )
+
+    assert result.compacted is True
+    assert result.strategy == "truncate"
+    # Without this the test cannot tell a real drop from the no-op window that
+    # keeps every message, which is exactly what the marker must not claim.
+    assert result.metadata["removed_count"] == 4
+    assert result.metadata["llm_summary_unavailable"] is True
+    assert result.metadata["fallback_strategy"] == "truncate"
+    assert len(recording_logger.warning_calls) == 1
+    msg, args = recording_logger.warning_calls[0]
+    assert "no reachable summary path" in msg % args
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_claim_a_drop_when_the_window_kept_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A context can be over budget while holding fewer messages than the tail
+    window keeps -- one huge tool result does it. ``_drop_oldest_messages``
+    still reports ``compacted=True`` there, so keying the marker off that flag
+    announced a drop that never happened, once per turn, forever.
+    """
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    context = ExecutionContext(execution_id="nothing-to-drop")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 20
+    context.add_user_message("only message")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=None, metadata={"phase": "test"}
+    )
+
+    assert result.metadata["removed_count"] == 0
+    assert "llm_summary_unavailable" not in result.metadata
+    assert recording_logger.warning_calls == []
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_blame_the_model_when_nothing_is_summarizable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A usable summary model plus a context that declines to build a request
+    (over budget, but every message hidden) is not the same failure as having
+    no summarizer at all, and must not be reported as one.
+
+    This is the only test that reaches the line clearing
+    ``summary_unavailable_metadata``: delete that line and the marker below
+    reappears.
+    """
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+
+    class UnusedCompactLLM:
+        model_name = "compact-test"
+        context_window = 32_000
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - never called
+            raise AssertionError("no request should have been built")
+
+    context = ExecutionContext(execution_id="nothing-summarizable")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    for index in range(6):
+        context.add_user_message(f"m{index}", hidden=True)
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=UnusedCompactLLM(), metadata={"phase": "test"}
+    )
+
+    assert result.compacted is True
+    assert result.metadata["removed_count"] == 4
+    assert "llm_summary_unavailable" not in result.metadata
+    assert recording_logger.warning_calls == []
+
+
+class _SummarizingLLM:
+    model_name = "compact-test"
+    context_window = 32_000
+
+    async def chat(self, **_: Any) -> Any:
+        return {"content": "what happened earlier"}
+
+
+@pytest.mark.asyncio
+async def test_compaction_does_not_truncate_an_unsendable_safe_request() -> None:
+    context = ExecutionContext(execution_id="unsafe-to-truncate")
+    context.compact_config.threshold = 24000
+    context.compact_config.max_messages = 2
+    for _ in range(6):
+        context.add_user_message("z" * 17_000)
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "large_call",
+                    "arguments": "v" * 200_000,
+                },
+            }
+        ],
+    )
+    original_messages = list(context.messages)
+
+    class UnusedLLM:
+        context_window = 32_000
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+            raise AssertionError("an oversized compact request must not be sent")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context,
+        llm=UnusedLLM(),
+    )
+
+    assert not result.compacted
+    assert result.metadata["llm_compact_request_too_large"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_context_after_provider_rejects_its_length() -> None:
+    context = ExecutionContext(execution_id="provider-context-rejection")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    marker = "ORIGINAL_REQUIREMENT_MUST_SURVIVE"
+    context.add_user_message(marker)
+    for index in range(4):
+        context.add_assistant_message(f"work-{index}")
+    original_messages = list(context.messages)
+
+    class RejectingLLM:
+        context_window = 32_000
+
+        def __init__(self) -> None:
+            self.budgets: list[int] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.budgets.append(kwargs["max_tokens"])
+            raise RuntimeError(
+                "The input token count (461428) exceeds the maximum number "
+                "of tokens allowed (131072)."
+            )
+
+    llm = RejectingLLM()
+    result = await PatternRuntime().compact_context_if_needed(context=context, llm=llm)
+
+    assert llm.budgets == [256]
+    assert not result.compacted
+    assert result.strategy == "none"
+    assert result.metadata["llm_compact_context_length_error"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+    assert marker in context.messages[0].content
+
+
+def _oversized_context(execution_id: str) -> ExecutionContext:
+    context = ExecutionContext(execution_id=execution_id)
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+    return context
+
+
+@pytest.mark.asyncio
+async def test_compaction_publishes_the_summary_and_its_watermark() -> None:
+    """The summary has to leave the turn on the compact event.
+
+    The in-memory context holding it is rebuilt from scratch next turn, and
+    the checkpoint that also holds it is pruned within this one, so without
+    this the work is paid for and then discarded every turn.
+    """
+    context = _oversized_context("watermark-publish")
+    context.metadata[TRANSCRIPT_WATERMARK_METADATA_KEY] = 42
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=_SummarizingLLM(), metadata={"phase": "test"}
+    )
+
+    assert result.strategy == "llm_summary"
+    assert result.metadata[COMPACT_WATERMARK_METADATA_KEY] == 42
+    # Byte-identical to the system message this turn actually ran on, so a
+    # replay reproduces the context rather than an approximation of it.
+    assert result.metadata[COMPACT_SUMMARY_METADATA_KEY] == context.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_compaction_omits_the_watermark_when_the_caller_issued_none() -> None:
+    """A reader must be able to tell "covers rows up to N" from "cannot be
+    positioned at all". Storing None would collapse those into one value."""
+    context = _oversized_context("watermark-absent")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=_SummarizingLLM(), metadata={"phase": "test"}
+    )
+
+    assert result.strategy == "llm_summary"
+    assert COMPACT_WATERMARK_METADATA_KEY not in result.metadata
+    assert COMPACT_SUMMARY_METADATA_KEY in result.metadata
+
+
+@pytest.mark.asyncio
+async def test_dropping_messages_publishes_no_summary_to_replay() -> None:
+    """The backstop stands in for nothing. Emitting a summary key here would
+    let a later turn skip stored rows on the strength of a compaction that
+    never wrote one."""
+    context = ExecutionContext(execution_id="watermark-backstop")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    context.metadata[TRANSCRIPT_WATERMARK_METADATA_KEY] = 42
+    for index in range(6):
+        context.add_user_message(f"m{index}")
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context, llm=None, metadata={"phase": "test"}
+    )
+
+    assert result.strategy == "truncate"
+    assert COMPACT_SUMMARY_METADATA_KEY not in result.metadata
+    assert COMPACT_WATERMARK_METADATA_KEY not in result.metadata

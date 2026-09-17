@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
@@ -264,42 +263,56 @@ class SshDownloadTool(_SshTransferTool):
         return SshOpResult(ok=True, message="downloaded").model_dump()
 
 
-def _agent_id_from_task(task: Any) -> int | None:
-    """Resolve the agent id a task runs as. Normal tasks carry ``agent_id``;
-    build-preview tasks (#459) leave it NULL and carry the edited agent id in
-    ``agent_config["preview_agent_id"]``."""
-    if task is None:
-        return None
-    if task.agent_id is not None:
-        return int(task.agent_id)
-    cfg = task.agent_config or {}
-    pid = cfg.get("preview_agent_id") if isinstance(cfg, dict) else None
-    return int(pid) if pid is not None else None
-
-
 def _numeric_task_id(task_id: Any) -> int | None:
-    """Extract the DB task id. The tool config hands us a workspace-scoped
-    string like ``"web_task_30"`` (or a non-task id like ``"tools_list"``),
-    not the bare integer primary key."""
+    """Extract the DB task id from the workspace-scoped id the tool config
+    hands us (``"web_task_30"`` -> 30); anything else is "no task".
+
+    Strict prefix match, never a trailing-digit search: ``agent_7_a1b2cd34``
+    would otherwise yield 34 -- an unrelated task, whose owner the caller then
+    resolves the SSH bindings against."""
     if task_id is None:
         return None
-    # Assumption: the DB id is the trailing integer of the workspace-scoped id
-    # (``web_task_30`` → 30); ids with no trailing digits (``tools_list``) are
-    # intentionally treated as "no task". If the id format ever grows an
-    # internal number this trailing-match would need revisiting.
-    match = re.search(r"(\d+)$", str(task_id))
-    return int(match.group(1)) if match else None
+    normalized = str(task_id).strip()
+    if normalized.startswith("web_task_"):
+        value = normalized.removeprefix("web_task_")
+        return int(value) if value.isdecimal() else None
+    return int(normalized) if normalized.isdecimal() else None
 
 
-def _agent_id_for_task(session_factory: Any, numeric_task_id: int | None) -> int | None:
+def _agent_id_for_task(
+    session_factory: Any, numeric_task_id: int | None, owner_user_id: int
+) -> int | None:
     if numeric_task_id is None:
         return None
+    from .....web.models.agent import AgentStatus
     from .....web.models.task import Task
+    from .....web.services.agent_team_scope import resolve_authorized_agent
     from .db_session import tool_session_scope
 
     with tool_session_scope(session_factory) as db:
         task = db.query(Task).filter(Task.id == numeric_task_id).first()
-        return _agent_id_from_task(task)
+        if task is None:
+            return None
+        # Every caller derives both ids from the same task, so a mismatch means
+        # a mis-wired config -- refuse rather than bind another owner's targets.
+        if int(task.user_id) != owner_user_id:
+            logger.warning(
+                "ssh tools: task %s is owned by %s, not the executing user %s",
+                numeric_task_id,
+                task.user_id,
+                owner_user_id,
+            )
+            return None
+        candidate_id = task.agent_id
+        if candidate_id is None:
+            config = task.agent_config
+            candidate_id = (
+                config.get("preview_agent_id") if isinstance(config, dict) else None
+            )
+        agent = resolve_authorized_agent(db, int(task.user_id), candidate_id)
+        if agent is None or agent.status == AgentStatus.ARCHIVED:
+            return None
+        return int(agent.id)
 
 
 def _make_ssh_sandbox_lease(
@@ -378,7 +391,7 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
         logger.error("ssh tools: provider does not implement SshSecretStore; skipping")
         return []
     numeric_task_id = _numeric_task_id(task_id)
-    agent_id = _agent_id_for_task(session_factory, numeric_task_id)
+    agent_id = _agent_id_for_task(session_factory, numeric_task_id, int(user_id))
     if agent_id is None:
         logger.info("ssh tools: skip (unresolved agent_id for task_id=%r)", task_id)
         return []
@@ -443,7 +456,7 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
     )
     # SFTP tools resolve/containment-check local paths against the task
     # workspace; None (e.g. tool-listing) disables transfers, not execute.
-    workspace = ToolFactory._create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.create_workspace(config.get_workspace_config())
     return [
         SshListTargetsTool(provider=provider, context=context),
         SshExecuteTool(executor=executor, context=context),

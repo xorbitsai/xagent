@@ -53,6 +53,31 @@ def test_non_sqlite_engine_uses_configured_pool(monkeypatch):
     assert engine.pool._timeout == 11
 
 
+def test_sqlite_adhoc_engine_hides_bound_parameters(tmp_path, monkeypatch):
+    """Same database as the shared web engine (models/database.py) -- a
+    commit failure here can bind the same credential-bearing columns
+    (OAuth tokens, password hashes) as a query parameter, so this engine
+    must hide them too, not just the primary one."""
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/a.db")
+
+    db = storage_manager.create_db_session()
+    try:
+        assert db.get_bind().hide_parameters is True
+    finally:
+        db.close()
+
+
+def test_non_sqlite_adhoc_engine_hides_bound_parameters(monkeypatch):
+    pytest.importorskip("psycopg2")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:1/nowhere")
+    monkeypatch.setattr(
+        storage_manager.Base.metadata, "create_all", lambda *a, **k: None
+    )
+
+    engine = storage_manager._get_adhoc_engine()
+    assert engine.hide_parameters is True
+
+
 def test_engine_swaps_when_database_url_changes(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/a.db")
     db1 = storage_manager.create_db_session()

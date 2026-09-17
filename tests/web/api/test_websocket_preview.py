@@ -9,11 +9,10 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import assert_pool_checkout_off_loop
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.web import dynamic_memory_store as dynamic_memory_store_module
-from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.chat import AgentServiceManager, resolve_agent_service_memory_policy
 from xagent.web.api.websocket import (
     ConnectionManager,
     _normalize_file_outputs,
@@ -25,6 +24,12 @@ from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.schemas.chat import TaskCreateResponse
+from xagent.web.schemas.connector_runtime import ConnectorRuntimeRequirementsModel
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    resolve_agent_service_memory_policy,
+)
 
 
 class _BlockingPreviewWebSocket:
@@ -87,6 +92,7 @@ async def test_handle_build_preview_execution_uses_normal_task_flow():
     mock_user.is_admin = False
 
     message_data = {
+        "agent_id": 41,
         "instructions": "test instructions",
         "execution_mode": "graph",
         "models": {
@@ -102,6 +108,9 @@ async def test_handle_build_preview_execution_uses_normal_task_flow():
         title="test message",
         status="pending",
         created_at="2026-05-20T00:00:00Z",
+        connector_runtime_requirements=ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        ),
     )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
@@ -127,6 +136,7 @@ async def test_handle_build_preview_execution_uses_normal_task_flow():
     assert create_request.is_visible is False
     assert create_request.agent_id is None
     assert create_request.agent_config["instructions"] == "test instructions"
+    assert create_request.agent_config["preview_agent_id"] == 41
     assert create_request.llm_ids == ["1", None, None, None]
     assert create_request.files is None
     mock_register_connection.assert_called_once_with(mock_websocket, 123)
@@ -156,6 +166,9 @@ async def test_handle_build_preview_execution_does_not_use_preview_sessions():
         title="test message",
         status="pending",
         created_at="2026-05-20T00:00:00Z",
+        connector_runtime_requirements=ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        ),
     )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
@@ -241,6 +254,9 @@ async def test_handle_build_preview_execution_creates_task_when_no_preview_task_
         title="second turn",
         status="pending",
         created_at="2026-05-20T00:00:00Z",
+        connector_runtime_requirements=ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        ),
     )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
@@ -331,31 +347,22 @@ async def test_memory_policy_pool_timeout_does_not_block_loop_or_fallback(
 
     monkeypatch.setattr(dynamic_memory_store_module, "get_db", get_test_db)
     memory_manager = DynamicMemoryStoreManager()
-    monkeypatch.setattr(chat_api, "get_memory_store", memory_manager.get_memory_store)
+    monkeypatch.setattr(
+        agent_runtime_service,
+        "get_memory_store",
+        memory_manager.get_memory_store,
+    )
 
     held_connection = engine.connect()
-    stop_ticker = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not stop_ticker.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
-
-    ticker_task = asyncio.create_task(ticker())
     try:
-        with pytest.raises(SQLAlchemyTimeoutError):
-            await chat_api.resolve_agent_service_memory_policy_async(
-                agent_config={},
-            )
+        with assert_pool_checkout_off_loop(engine):
+            with pytest.raises(SQLAlchemyTimeoutError):
+                await agent_runtime_service.resolve_agent_service_memory_policy_async(
+                    agent_config={},
+                )
     finally:
-        stop_ticker.set()
-        await ticker_task
         held_connection.close()
         engine.dispose()
-
-    assert ticks >= 3
 
 
 def test_historical_file_projection_never_writes_unregistered_output(

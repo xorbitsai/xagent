@@ -5,10 +5,38 @@ from datetime import datetime
 
 from sqlalchemy import JSON, Boolean, Column, DateTime
 from sqlalchemy import Enum as SQLEnum
-from sqlalchemy import ForeignKey, Integer, String, Text
+from sqlalchemy import ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.orm import relationship
 
 from .database import Base
+
+# Per-user name uniqueness, excluding workforce-generated manager agents
+# (which are allowed to share names - see agent_name_exists). Declared here
+# so brand-new databases get it via Base.metadata.create_all(); existing
+# databases get the same index from the
+# 20260728_add_agent_template_id_and_name_uniqueness migration, which also
+# dedupes any pre-existing collisions first.
+#
+# This is keyed on (user_id, name) only, so it mirrors agent_name_exists
+# exactly in standalone xagent. When a SaaS team-scope hook is installed,
+# agent_name_exists becomes a team-wide check (see agent_team_scope.py) that
+# this per-user index does not enforce - it only guarantees a single user
+# can't race a duplicate name past themselves, not across teammates.
+_NON_WORKFORCE_MANAGER_CLAUSE = text("origin != 'workforce_generated_manager'")
+
+# Shared with agent_management.py, which inspects a raised IntegrityError's
+# message for this name to distinguish this specific violation from any other
+# IntegrityError (e.g. a widget_key collision or an unrelated FK failure).
+AGENT_NAME_UNIQUE_INDEX = "uq_agents_user_id_name_active"
+
+# Scopes the (user_id, template_id) uniqueness below to agents created by the
+# /task template quick-access resolve flow specifically - the plain
+# POST /from-template create path (workforce-builder UI) deliberately mints
+# multiple named instances of one template and must not be constrained by
+# it. Also shared with agent_management.py's IntegrityError matching.
+_QUICK_ACCESS_ORIGIN = "template_quick_access"
+_QUICK_ACCESS_ORIGIN_CLAUSE = text(f"origin = '{_QUICK_ACCESS_ORIGIN}'")
+AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX = "uq_agents_user_id_template_id_quick_access"
 
 
 class AgentStatus(enum.Enum):
@@ -24,6 +52,12 @@ class AgentOrigin(enum.Enum):
 
     USER = "user"
     WORKFORCE_GENERATED_MANAGER = "workforce_generated_manager"
+    # The /task template quick-access get-or-create flow
+    # (AgentManagementService.resolve_agent_from_template). Distinct from
+    # USER so its (user_id, template_id) reuse query can't adopt an
+    # unrelated agent the workforce-builder UI created from the same
+    # template under a user-chosen name (PR review finding B4).
+    TEMPLATE_QUICK_ACCESS = _QUICK_ACCESS_ORIGIN
 
 
 class ExecutionMode(enum.Enum):
@@ -57,6 +91,11 @@ class Agent(Base):  # type: ignore
     name = Column(String(200), nullable=False)
     description = Column(Text, nullable=True)
     instructions = Column(Text, nullable=True)  # System prompt/instructions
+    # Built-in template id this agent was instantiated from (e.g. via
+    # "/api/agents/from-template"), or NULL for agents built from scratch.
+    # Lets create-or-reuse flows key off a stable id instead of the
+    # user-editable display name.
+    template_id = Column(String(255), nullable=True, index=True)
 
     # Configuration
     execution_mode = Column(
@@ -103,6 +142,31 @@ class Agent(Base):  # type: ignore
         nullable=False,
     )  # type: ignore[assignment]
     published_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index(
+            AGENT_NAME_UNIQUE_INDEX,
+            "user_id",
+            "name",
+            unique=True,
+            sqlite_where=_NON_WORKFORCE_MANAGER_CLAUSE,
+            postgresql_where=_NON_WORKFORCE_MANAGER_CLAUSE,
+        ),
+        # Backs the /task template quick-access resolve flow's atomicity:
+        # scoped to TEMPLATE_QUICK_ACCESS origin only, so a workforce-builder
+        # agent built from the same template (a deliberate, user-named,
+        # possibly-multiple instance) never collides with it. See
+        # AgentManagementService._resolve_agent_from_template_sync and PR
+        # review findings B1/B2/D2/D3.
+        Index(
+            AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX,
+            "user_id",
+            "template_id",
+            unique=True,
+            sqlite_where=_QUICK_ACCESS_ORIGIN_CLAUSE,
+            postgresql_where=_QUICK_ACCESS_ORIGIN_CLAUSE,
+        ),
+    )
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), default=datetime.now, nullable=False)

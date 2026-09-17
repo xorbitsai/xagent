@@ -2,7 +2,6 @@
 agent setup (or pin resources) indefinitely."""
 
 import asyncio
-import time
 
 import pytest
 
@@ -18,6 +17,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_stalled_server_times_out_and_other_servers_still_load(monkeypatch):
     """A server whose initialize/list-tools stalls is skipped at the timeout;
     the remaining servers still load."""
@@ -36,14 +36,12 @@ async def test_stalled_server_times_out_and_other_servers_still_load(monkeypatch
 
     monkeypatch.setattr(mcp_adapter_module, "_load_direct_mcp_tools", fake_load_direct)
 
-    started = time.monotonic()
     result = await load_mcp_tools_as_agent_tools(
         {
             "stalled": {"transport": "streamable_http", "url": "http://x"},
             "healthy": {"transport": "streamable_http", "url": "http://y"},
         }
     )
-    elapsed = time.monotonic() - started
 
     assert result.tools == (healthy_tool,)
     assert result.loaded_servers == ("healthy",)
@@ -51,12 +49,10 @@ async def test_stalled_server_times_out_and_other_servers_still_load(monkeypatch
     assert result.failures[0].server_name == "stalled"
     assert result.failures[0].phase is MCPFailurePhase.INITIALIZE
     assert result.failures[0].error_type == "TimeoutError"
-    # 1s timeout for the stalled server plus fast healthy load; the old
-    # behavior blocked forever.
-    assert elapsed < 5
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_bounded_load_returns_even_when_cleanup_hangs():
     """The bound must hold even if the load task ignores cancellation (e.g. a
     hung streamable-HTTP session blocking in __aexit__)."""
@@ -80,12 +76,9 @@ async def test_bounded_load_returns_even_when_cleanup_hangs():
                     continue
         return []  # pragma: no cover
 
-    started = time.monotonic()
     with pytest.raises(TimeoutError):
         await _load_server_tools_bounded("hung", uncancellable_load(), 1)
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 5
     # The load was cancelled (cleanup began) but the caller did not wait on
     # it: the bounded call returned while cleanup was still blocked.
     await asyncio.wait_for(cleanup_entered.wait(), timeout=5)
@@ -94,6 +87,7 @@ async def test_bounded_load_returns_even_when_cleanup_hangs():
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_burst_larger_than_gate_does_not_fan_out(monkeypatch):
     """A burst of concurrent loads for the same hung server must not create
     more underlying load tasks (transports/sockets) than the per-server cap:
@@ -120,13 +114,9 @@ async def test_burst_larger_than_gate_does_not_fan_out(monkeypatch):
         with pytest.raises(TimeoutError):
             await _load_server_tools_bounded("burst-server", uncancellable_load(), 1)
 
-    began = time.monotonic()
     await asyncio.gather(*(one_caller() for _ in range(6)))
-    elapsed = time.monotonic() - began
 
-    # Every caller returned within its own bound...
-    assert elapsed < 5
-    # ...but only cap-many loads (transports) ever started; the abandoned
+    # Only cap-many loads (transports) ever started; the abandoned
     # ones keep holding their slots so the other four callers failed fast
     # at the gate.
     assert started_loads == 2

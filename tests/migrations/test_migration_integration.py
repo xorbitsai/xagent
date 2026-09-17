@@ -12,8 +12,10 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -21,7 +23,8 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import sessionmaker
 
 # Project root directory
 project_root = Path(__file__).parent.parent.parent
@@ -105,8 +108,31 @@ class MigrationTester:
         self.alembic_cfg = Config(str(project_root / "alembic.ini"))
         self.alembic_cfg.set_main_option("sqlalchemy.url", db_url)
 
-        # DO NOT create tables with SQLAlchemy - we want to test migrations
-        # can build the schema from scratch
+        # Metadata-owned core tables are prepared explicitly by tests that
+        # exercise the production migration contract. Historical Alembic
+        # revisions do not create ``users`` themselves.
+
+    def create_metadata_owned_users_table(self) -> None:
+        """Create the core parent table that Alembic intentionally does not own."""
+        from xagent.web.models.user import User
+
+        User.__table__.create(bind=self.engine, checkfirst=True)
+
+    def assert_user_oauth_user_cascade_fk(self) -> None:
+        """Require the cascade that cleans up ordinary and actor OAuth rows."""
+        if self.db_type == "sqlite":
+            # Alembic's batch rename can leave the pooled connection's schema
+            # cache stale. Reopen the file before inspecting the final DDL.
+            self.engine.dispose()
+        foreign_keys = inspect(self.engine).get_foreign_keys("user_oauth")
+        assert any(
+            tuple(foreign_key.get("constrained_columns") or ()) == ("user_id",)
+            and foreign_key.get("referred_table") == "users"
+            and tuple(foreign_key.get("referred_columns") or ()) == ("id",)
+            and str((foreign_key.get("options") or {}).get("ondelete")).upper()
+            == "CASCADE"
+            for foreign_key in foreign_keys
+        ), "user_oauth.user_id must cascade to users.id"
 
     def _restore_database_url(self) -> None:
         """Restore ``DATABASE_URL`` to its pre-test value."""
@@ -191,6 +217,7 @@ class TestMigrations:
 
         # Run upgrade from empty database (but with base tables present)
         command.upgrade(sqlite_tester.alembic_cfg, "head")
+        sqlite_tester.assert_user_oauth_user_cascade_fk()
 
         # Verify alembic_version table
         with sqlite_tester.engine.begin() as conn:
@@ -232,16 +259,15 @@ class TestMigrations:
 
     @pytest.mark.postgresql
     def test_postgresql_upgrade(self, postgresql_tester):
-        """Test full migration upgrade on PostgreSQL from empty database.
+        """Test a full PostgreSQL migration upgrade with its core parent table.
 
-        This tests that migrations can correctly create all tables and columns
-        from scratch, not just when tables are pre-created by SQLAlchemy.
+        Historical migrations intentionally leave core metadata-owned tables
+        to SQLAlchemy. Create only ``users`` so the migration chain must still
+        build its own tables while preserving the OAuth cascade contract.
         """
-        # DO NOT use Base.metadata.create_all() - we want to test migrations
-        # can build the database schema from scratch
-
-        # Run upgrade from empty database
+        postgresql_tester.create_metadata_owned_users_table()
         command.upgrade(postgresql_tester.alembic_cfg, "head")
+        postgresql_tester.assert_user_oauth_user_cascade_fk()
 
         # Verify alembic_version table
         with postgresql_tester.engine.begin() as conn:
@@ -249,15 +275,16 @@ class TestMigrations:
             version = result.scalar()
             assert version is not None, "Version should be set after upgrade"
 
-        # Verify key tables exist
+        # Verify migration-owned tables exist. Core tables created by current
+        # SQLAlchemy metadata are intentionally outside this test's contract.
         tables = postgresql_tester.get_table_names()
         assert "agents" in tables, "agents table should exist"
         assert "alembic_version" in tables, "alembic_version table should exist"
-        assert "models" in tables, "models table should exist"
-        assert "users" in tables, "users table should exist"
-        assert "tasks" in tables, "tasks table should exist"
+        assert "public_mcp_apps" in tables, "public_mcp_apps table should exist"
+        assert "user_oauth" in tables, "user_oauth table should exist"
+        assert "durable_sandbox_lifecycles" in tables
 
-        # Verify agents table structure
+        # Verify agents table structure.
         columns = postgresql_tester.get_column_names("agents")
         assert "models" in columns, "models column should exist"
         assert "name" in columns, "name column should exist"
@@ -265,11 +292,239 @@ class TestMigrations:
         assert "status" in columns, "status column should exist"
         assert "suggested_prompts" in columns, "suggested_prompts column should exist"
 
-        # Verify models table has encrypted column
-        models_columns = postgresql_tester.get_column_names("models")
-        assert "_api_key_encrypted" in models_columns, (
-            "_api_key_encrypted column should exist"
+        user_oauth_columns = postgresql_tester.get_column_names("user_oauth")
+        assert "resource_owner_key" in user_oauth_columns, (
+            "owner-aware OAuth column should exist"
         )
+
+    @pytest.mark.postgresql
+    def test_postgresql_owner_index_collision_allows_retry_after_remediation(
+        self, postgresql_tester
+    ):
+        """After operator remediation, retry starts from the intact old schema."""
+        down_revision = "b1efe0dbe0af"
+        ordinary_index = "uq_user_oauth_ordinary_account"
+        actor_index = "uq_user_oauth_actor_account"
+        old_constraint = "uq_user_provider_account"
+
+        postgresql_tester.create_metadata_owned_users_table()
+        command.upgrade(postgresql_tester.alembic_cfg, down_revision)
+        with postgresql_tester.engine.begin() as conn:
+            conn.execute(text(f"CREATE INDEX {actor_index} ON user_oauth (user_id)"))
+
+        with pytest.raises(SQLAlchemyError):
+            command.upgrade(postgresql_tester.alembic_cfg, "head")
+
+        inspector = inspect(postgresql_tester.engine)
+        assert "resource_owner_key" not in {
+            column["name"] for column in inspector.get_columns("user_oauth")
+        }
+        assert old_constraint in {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("user_oauth")
+        }
+        indexes = {index["name"] for index in inspector.get_indexes("user_oauth")}
+        assert actor_index in indexes
+        assert ordinary_index not in indexes
+        script_dir = ScriptDirectory.from_config(postgresql_tester.alembic_cfg)
+        current_revisions = postgresql_tester.get_alembic_versions()
+        assert _revision_reached(script_dir, down_revision, current_revisions)
+        assert not _revision_reached(
+            script_dir,
+            "20260818_user_oauth_resource_owner",
+            current_revisions,
+        )
+
+        with postgresql_tester.engine.begin() as conn:
+            conn.execute(text(f"DROP INDEX {actor_index}"))
+        command.upgrade(postgresql_tester.alembic_cfg, "head")
+
+        assert "resource_owner_key" in postgresql_tester.get_column_names("user_oauth")
+
+    @pytest.mark.postgresql
+    def test_postgresql_owner_indexes_enforce_namespace_boundaries(
+        self, postgresql_tester
+    ):
+        """The migrated PostgreSQL predicates separate ordinary and actor rows."""
+        parent = "b1efe0dbe0af"
+        owner_revision = "20260818_user_oauth_resource_owner"
+        command.upgrade(postgresql_tester.alembic_cfg, parent)
+        with postgresql_tester.engine.begin() as conn:
+            conn.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY)"))
+            conn.execute(text("INSERT INTO users (id) VALUES (7101)"))
+
+        command.upgrade(postgresql_tester.alembic_cfg, owner_revision)
+        with postgresql_tester.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO user_oauth "
+                    "(user_id, provider, provider_user_id, access_token, "
+                    "resource_owner_key) VALUES "
+                    "(7101, 'gmail', 'shared', 'ordinary', NULL), "
+                    "(7101, 'gmail', 'shared', 'actor', 'actor:alice')"
+                )
+            )
+
+        with pytest.raises(IntegrityError):
+            with postgresql_tester.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO user_oauth "
+                        "(user_id, provider, provider_user_id, access_token) "
+                        "VALUES (7101, 'gmail', 'shared', 'duplicate-ordinary')"
+                    )
+                )
+
+        with pytest.raises(IntegrityError):
+            with postgresql_tester.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO user_oauth "
+                        "(user_id, provider, provider_user_id, access_token, "
+                        "resource_owner_key) VALUES "
+                        "(7101, 'gmail', 'shared', 'duplicate-actor', 'actor:alice')"
+                    )
+                )
+
+    @pytest.mark.postgresql
+    def test_postgresql_user_delete_cascades_actor_owned_oauth_rows(
+        self, postgresql_tester
+    ):
+        """Filtered ordinary relationship leaves actor cleanup to the FK."""
+        from xagent.web.models.database import Base
+        from xagent.web.models.user import User
+        from xagent.web.models.user_oauth import UserOAuth
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        db = sessionmaker(
+            bind=postgresql_tester.engine,
+            autoflush=False,
+            autocommit=False,
+        )()
+        try:
+            user = User(username="oauth-cascade-owner", password_hash="hash")
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            db.add_all(
+                [
+                    UserOAuth(
+                        user_id=int(user.id),
+                        provider="gmail",
+                        provider_user_id="ordinary",
+                        access_token="ordinary-token",
+                    ),
+                    UserOAuth(
+                        user_id=int(user.id),
+                        provider="gmail",
+                        resource_owner_key="actor:alice",
+                        provider_user_id="alice",
+                        access_token="actor-token",
+                    ),
+                ]
+            )
+            db.commit()
+            db.expire(user, ["oauth_accounts"])
+
+            assert [row.resource_owner_key for row in user.oauth_accounts] == [None]
+
+            db.delete(user)
+            db.commit()
+
+            assert db.query(UserOAuth).count() == 0
+        finally:
+            db.close()
+
+    @pytest.mark.postgresql
+    def test_postgresql_owner_migration_downgrade_restores_legacy_schema(
+        self, postgresql_tester
+    ):
+        """The supported PostgreSQL downgrade restores the old identity shape."""
+        parent = "b1efe0dbe0af"
+        owner_revision = "20260818_user_oauth_resource_owner"
+        command.upgrade(postgresql_tester.alembic_cfg, parent)
+        with postgresql_tester.engine.begin() as conn:
+            # The historical migration chain creates user_oauth from scratch
+            # but assumes the core users table already exists. Complete that
+            # legacy shape explicitly before exercising the owner revision.
+            conn.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY)"))
+            conn.execute(
+                text(
+                    "ALTER TABLE user_oauth ADD CONSTRAINT "
+                    "fk_user_oauth_user_id_users FOREIGN KEY (user_id) "
+                    "REFERENCES users(id) ON DELETE CASCADE"
+                )
+            )
+            conn.execute(text("INSERT INTO users (id) VALUES (7001)"))
+            conn.execute(
+                text(
+                    "INSERT INTO user_oauth "
+                    "(id, user_id, provider, access_token, provider_user_id) "
+                    "VALUES (9001, 7001, 'gmail', 'token', 'provider-account')"
+                )
+            )
+
+        command.upgrade(postgresql_tester.alembic_cfg, owner_revision)
+        command.downgrade(postgresql_tester.alembic_cfg, parent)
+
+        inspector = inspect(postgresql_tester.engine)
+        assert "resource_owner_key" not in {
+            column["name"] for column in inspector.get_columns("user_oauth")
+        }
+        assert "uq_user_provider_account" in {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("user_oauth")
+        }
+        assert not {
+            "uq_user_oauth_ordinary_account",
+            "uq_user_oauth_actor_account",
+        } & {index["name"] for index in inspector.get_indexes("user_oauth")}
+        with postgresql_tester.engine.begin() as conn:
+            assert conn.execute(
+                text("SELECT provider, access_token FROM user_oauth WHERE id = 9001")
+            ).one() == ("gmail", "token")
+
+    def test_sqlite_owner_downgrade_preserves_stripe_head(self, sqlite_tester):
+        """Rollback removes owner storage without removing the Stripe seed."""
+        owner_revision = "20260818_user_oauth_resource_owner"
+        stripe_revision = "20260818_seed_stripe_mcp_app"
+        script_dir = ScriptDirectory.from_config(sqlite_tester.alembic_cfg)
+
+        # Not `== [owner_revision]`: that only held while this was the sole
+        # unmerged branch. A sibling connector's migration branch merging
+        # with this one moves the single head to that merge revision instead
+        # -- the actual precondition this test needs is just that "head"
+        # resolves unambiguously (one head) and still descends from
+        # owner_revision, not that owner_revision is literally still it.
+        heads = script_dir.get_heads()
+        assert len(heads) == 1
+        assert _revision_reached(script_dir, owner_revision, set(heads))
+
+        sqlite_tester.create_metadata_owned_users_table()
+        command.upgrade(sqlite_tester.alembic_cfg, "head")
+        command.downgrade(sqlite_tester.alembic_cfg, stripe_revision)
+
+        # Not `== {stripe_revision}`: downgrading past a merge revision
+        # re-splits the version table back into each parent branch's own
+        # tip, and only the branch actually being downgraded (this one)
+        # continues past that split -- a sibling branch merged in here (this
+        # one has no dependency on the owner revision) legitimately keeps
+        # its own tip applied alongside stripe_revision.
+        #
+        # Plain membership, not _revision_reached: this checks the actual
+        # applied version rows, not ancestry, so it still fails if
+        # downgrade() silently no-ops and leaves a later descendant of
+        # stripe_revision applied instead -- _revision_reached would treat
+        # that descendant as "reaching" stripe_revision and miss the bug.
+        assert stripe_revision in sqlite_tester.get_alembic_versions()
+        assert "resource_owner_key" not in sqlite_tester.get_column_names("user_oauth")
+        with sqlite_tester.engine.begin() as conn:
+            assert (
+                conn.execute(
+                    text("SELECT count(*) FROM public_mcp_apps WHERE app_id = 'stripe'")
+                ).scalar_one()
+                == 1
+            )
 
     def test_sqlite_idempotence_with_sqlalchemy(self, sqlite_tester):
         """Test that migrations are idempotent when tables pre-created by SQLAlchemy.
@@ -311,19 +566,21 @@ class TestMigrations:
         assert "name" in agents_columns
 
     @pytest.mark.postgresql
-    def test_postgresql_idempotence_with_sqlalchemy(self, postgresql_tester):
-        """Test that migrations are idempotent when tables pre-created by SQLAlchemy.
-
-        This tests the production scenario where SQLAlchemy's Base.metadata.create_all()
-        creates tables first, then Alembic migrations run. Migrations should correctly
-        detect existing tables/columns and skip already-applied changes.
-        """
-        # First, create tables using SQLAlchemy (mimics production)
+    def test_postgresql_owner_migration_accepts_current_metadata(
+        self, postgresql_tester
+    ):
+        """The owner revision accepts its schema from current metadata."""
         from xagent.web.models.database import Base
 
         Base.metadata.create_all(bind=postgresql_tester.engine)
+        # Older migrations are not all compatible with current pre-created
+        # foreign keys. Stamp the immediate parent so this test isolates the
+        # owner migration's fresh-schema path.
+        command.stamp(
+            postgresql_tester.alembic_cfg,
+            "b1efe0dbe0af",
+        )
 
-        # Then run migrations - should be idempotent and not fail
         command.upgrade(postgresql_tester.alembic_cfg, "head")
 
         # Get version after upgrade
@@ -340,6 +597,175 @@ class TestMigrations:
             version2 = result.scalar()
 
         assert version1 == version2, "Version should not change on re-run"
+
+    @pytest.mark.postgresql
+    @pytest.mark.parametrize(
+        "drift_sql",
+        [
+            "ALTER TABLE actor_mcp_server_connections "
+            "ALTER COLUMN encrypted_env TYPE TEXT USING encrypted_env::text",
+            "ALTER TABLE actor_mcp_server_connections "
+            "ALTER COLUMN lifecycle_generation SET DEFAULT "
+            "'00000000-0000-0000-0000-000000000000'::uuid",
+            "ALTER TABLE actor_mcp_server_connections DROP CONSTRAINT "
+            "ck_actor_mcp_server_connections_generation_nonempty; "
+            "ALTER TABLE actor_mcp_server_connections ADD CONSTRAINT "
+            "ck_actor_mcp_server_connections_generation_nonempty CHECK (1 = 1)",
+            "ALTER TABLE actor_mcp_server_connections ADD CONSTRAINT "
+            "uq_actor_mcp_server_connections_user_id_drift UNIQUE (user_id)",
+        ],
+        ids=["encrypted-type", "fixed-uuid-default", "same-name-check", "extra-unique"],
+    )
+    def test_postgresql_actor_metadata_adoption_rejects_schema_drift(
+        self, postgresql_tester, drift_sql
+    ):
+        """The actor-storage revision fails closed on reflected semantic drift."""
+        from xagent.web.models.database import Base
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        with postgresql_tester.engine.begin() as conn:
+            conn.exec_driver_sql(drift_sql)
+        command.stamp(
+            postgresql_tester.alembic_cfg,
+            "20260901_seed_zendesk_mcp_app",
+        )
+
+        with pytest.raises(RuntimeError, match="incompatible schema"):
+            command.upgrade(
+                postgresql_tester.alembic_cfg,
+                "20260909_actor_mcp_connections",
+            )
+
+    @pytest.mark.postgresql
+    def test_postgresql_actor_create_is_idempotent_under_real_concurrency(
+        self, postgresql_tester, monkeypatch
+    ):
+        """Two database sessions converge on one row without damaging either tx."""
+        import xagent.web.services.actor_mcp_connections as service
+        from xagent.web.models.database import Base
+        from xagent.web.models.public_mcp import PublicMCPApp
+        from xagent.web.models.user import User
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        session_factory = sessionmaker(bind=postgresql_tester.engine)
+        with session_factory.begin() as session:
+            user = User(username="pg-race-owner", password_hash="x")
+            app = PublicMCPApp(
+                app_id="posthog",
+                name="posthog",
+                transport="stdio",
+                launch_config={"command": "stored-command-is-not-trusted"},
+            )
+            session.add_all([user, app])
+            session.flush()
+            user_id = user.id
+
+        barrier = threading.Barrier(2)
+        thread_state = threading.local()
+        real_lookup = service.get_current_actor_mcp_connection_for_create
+
+        def synchronized_initial_lookup(session, **kwargs):
+            row = real_lookup(session, **kwargs)
+            if row is None and not getattr(thread_state, "initial_lookup_seen", False):
+                thread_state.initial_lookup_seen = True
+                barrier.wait(timeout=10)
+            return row
+
+        monkeypatch.setattr(
+            service,
+            "get_current_actor_mcp_connection_for_create",
+            synchronized_initial_lookup,
+        )
+
+        def create(index):
+            with session_factory() as session:
+                snapshot = service.create_actor_mcp_connection(
+                    session,
+                    user_id=user_id,
+                    resource_owner_key="toby:postgres:race-owner",
+                    app_id="posthog",
+                    credentials={
+                        "POSTHOG_API_KEY": "same-secret",
+                        "POSTHOG_HOST": "https://x.test",
+                    },
+                )
+                session.add(
+                    User(username=f"pg-race-transaction-{index}", password_hash="x")
+                )
+                session.commit()
+                return snapshot.lifecycle_generation
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            generations = list(executor.map(create, range(2)))
+
+        assert generations[0] == generations[1]
+        with session_factory() as session:
+            assert (
+                session.execute(
+                    text("SELECT count(*) FROM actor_mcp_server_connections")
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                session.execute(
+                    text(
+                        "SELECT count(*) FROM users WHERE username LIKE 'pg-race-transaction-%'"
+                    )
+                ).scalar_one()
+                == 2
+            )
+
+    @pytest.mark.postgresql
+    def test_postgresql_durable_lifecycle_cas_has_one_delete_claim_winner(
+        self, postgresql_tester
+    ):
+        """Two real PostgreSQL sessions cannot both own one backend deletion."""
+        from datetime import datetime, timedelta, timezone
+
+        from xagent.web.models.database import Base
+        from xagent.web.services.durable_sandbox_lifecycle import (
+            DurableSandboxLifecycleRepository,
+            RegisterLifecycle,
+        )
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        session_factory = sessionmaker(
+            bind=postgresql_tester.engine, expire_on_commit=False
+        )
+        now = datetime.now(timezone.utc)
+        with session_factory() as session:
+            fence = DurableSandboxLifecycleRepository(session).register(
+                RegisterLifecycle(
+                    scope_digest="a" * 64,
+                    task_id=42,
+                    run_id="run",
+                    lease_attempt_id="attempt",
+                    turn_digest=None,
+                    eligible_at=now - timedelta(minutes=2),
+                    owner_lease_expires_at=now - timedelta(minutes=1),
+                )
+            )
+            session.commit()
+
+        barrier = threading.Barrier(2)
+
+        def claim(_index):
+            with session_factory() as session:
+                barrier.wait(timeout=10)
+                result = DurableSandboxLifecycleRepository(session).claim_for_delete(
+                    fence,
+                    now=now,
+                    claim_ttl=timedelta(minutes=1),
+                )
+                session.commit()
+                return result
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(claim, range(2)))
+
+        winners = [outcome for outcome in outcomes if outcome is not None]
+        assert len(winners) == 1
+        assert winners[0].delete_attempts == 1
 
     def test_sqlite_incremental_upgrade(self, sqlite_tester):
         """Test incremental upgrades from b9d890ed31b5 to head on SQLite.
@@ -474,12 +900,15 @@ if __name__ == "__main__":
     try:
         if args.test == "upgrade":
             tester.setup_database()
+            tester.create_metadata_owned_users_table()
             command.upgrade(tester.alembic_cfg, "head")
+            tester.assert_user_oauth_user_cascade_fk()
             print(f"✅ {args.db.upper()} upgrade test PASSED")
             tester.teardown_database()
 
         elif args.test == "idempotence":
             tester.setup_database()
+            tester.create_metadata_owned_users_table()
             command.upgrade(tester.alembic_cfg, "head")
             command.upgrade(tester.alembic_cfg, "head")
             print(f"✅ {args.db.upper()} idempotence test PASSED")
@@ -487,6 +916,7 @@ if __name__ == "__main__":
 
         elif args.test == "incremental":
             tester.setup_database()
+            tester.create_metadata_owned_users_table()
             script_dir = ScriptDirectory.from_config(tester.alembic_cfg)
             revisions = list(script_dir.walk_revisions("base", "heads"))
             revisions.reverse()
@@ -499,6 +929,7 @@ if __name__ == "__main__":
 
         elif args.test == "downgrade":
             tester.setup_database()
+            tester.create_metadata_owned_users_table()
             command.upgrade(tester.alembic_cfg, "head")
             command.downgrade(tester.alembic_cfg, "base")
             print(f"✅ {args.db.upper()} downgrade test PASSED")
@@ -506,6 +937,7 @@ if __name__ == "__main__":
 
         elif args.test == "all":
             tester.setup_database()
+            tester.create_metadata_owned_users_table()
             command.upgrade(tester.alembic_cfg, "head")
             command.upgrade(tester.alembic_cfg, "head")
             command.downgrade(tester.alembic_cfg, "base")

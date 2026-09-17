@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useCallback, useEffect, useRef, useState } from "react"
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 import { Loader2, Mic, Square } from "lucide-react"
 
 import { toast } from "@/components/ui/sonner"
@@ -18,9 +18,12 @@ export type VoiceStatus = "idle" | "recording" | "transcribing"
 
 interface UseVoiceInputControlsOptions {
   autoRefresh?: boolean
+  enabled?: boolean
 }
 
 const TEXT_INPUT_TYPES = new Set(["", "email", "search", "tel", "text", "url"])
+const useIsomorphicLayoutEffect =
+  typeof window === "undefined" ? useEffect : useLayoutEffect
 const SENSITIVE_FIELD_PATTERN =
   /(api[_-]?key|authorization|bearer|card[_-]?number|cardnumber|client[_-]?id|client[_-]?secret|credit[_-]?card|csc|cvc|cvv|one[_-]?time|otp|passcode|password|pin|security[_-]?code|securitycode|secret|social[_-]?security|ssn|token)/i
 const SENSITIVE_AUTOCOMPLETE_TOKENS = new Set([
@@ -244,7 +247,7 @@ function extensionForMimeType(mimeType: string): string {
 }
 
 export function useVoiceInputControls(
-  { autoRefresh = true }: UseVoiceInputControlsOptions = {}
+  { autoRefresh = true, enabled = true }: UseVoiceInputControlsOptions = {}
 ) {
   const { t } = useI18n()
   const [hasAsrModel, setHasAsrModel] = useState(false)
@@ -255,18 +258,89 @@ export function useVoiceInputControls(
   const streamRef = useRef<MediaStream | null>(null)
   const chunksRef = useRef<BlobPart[]>([])
   const lastAvailabilityFetchRef = useRef(0)
+  const availabilityRequestRef = useRef(0)
+  const enabledRef = useRef(enabled)
+  const mountedRef = useRef(false)
+  const capabilityEpochRef = useRef(0)
+  const isCurrentCapability = useCallback(
+    (capabilityEpoch: number) =>
+      mountedRef.current &&
+      enabledRef.current &&
+      capabilityEpoch === capabilityEpochRef.current,
+    []
+  )
+
+  const stopStream = useCallback(() => {
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+  }, [])
+
+  const retireCapability = useCallback(
+    ({ clearAvailability }: { clearAvailability: boolean }) => {
+      capabilityEpochRef.current += 1
+      availabilityRequestRef.current += 1
+      targetRef.current = null
+      recordingTargetRef.current = null
+      chunksRef.current = []
+      const recorder = recorderRef.current
+      recorderRef.current = null
+      if (recorder && recorder.state !== "inactive") {
+        recorder.stop()
+      }
+      stopStream()
+      if (mountedRef.current) {
+        if (clearAvailability) {
+          setHasAsrModel(false)
+        }
+        setStatus("idle")
+      }
+    },
+    [stopStream]
+  )
+
+  useIsomorphicLayoutEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      enabledRef.current = false
+      retireCapability({ clearAvailability: false })
+    }
+  }, [retireCapability])
+
+  useIsomorphicLayoutEffect(() => {
+    if (enabledRef.current === enabled) return
+
+    enabledRef.current = enabled
+    retireCapability({ clearAvailability: !enabled })
+  }, [enabled, retireCapability])
 
   const refreshAvailability = useCallback(async () => {
+    const capabilityEpoch = capabilityEpochRef.current
+    const requestId = ++availabilityRequestRef.current
+    if (!isCurrentCapability(capabilityEpoch)) return
+
     lastAvailabilityFetchRef.current = Date.now()
     try {
       const response = await apiRequest(
         `${getApiUrl()}/api/models/?category=speech&limit=1000`
       )
+      if (
+        !isCurrentCapability(capabilityEpoch)
+        || requestId !== availabilityRequestRef.current
+      ) {
+        return
+      }
       if (!response.ok) {
         setHasAsrModel(false)
         return
       }
       const models = await response.json()
+      if (
+        !isCurrentCapability(capabilityEpoch)
+        || requestId !== availabilityRequestRef.current
+      ) {
+        return
+      }
       const available =
         Array.isArray(models) &&
         models.some((model) => {
@@ -275,30 +349,39 @@ export function useVoiceInputControls(
         })
       setHasAsrModel(available)
     } catch {
-      setHasAsrModel(false)
+      if (
+        isCurrentCapability(capabilityEpoch)
+        && requestId === availabilityRequestRef.current
+      ) {
+        setHasAsrModel(false)
+      }
     }
-  }, [])
+  }, [isCurrentCapability])
 
   useEffect(() => {
+    if (!enabled) {
+      return
+    }
+
     if (autoRefresh) {
       refreshAvailability()
     }
-  }, [autoRefresh, refreshAvailability])
+  }, [autoRefresh, enabled, refreshAvailability])
 
   const refreshAvailabilityIfStale = useCallback(() => {
+    if (!enabledRef.current) return
     if (Date.now() - lastAvailabilityFetchRef.current > 30_000) {
       refreshAvailability()
     }
   }, [refreshAvailability])
 
-  const stopStream = useCallback(() => {
-    streamRef.current?.getTracks().forEach((track) => track.stop())
-    streamRef.current = null
-  }, [])
-
   const transcribeBlob = useCallback(
-    async (blob: Blob, target: VoiceTarget | null) => {
-      if (!target) return
+    async (
+      blob: Blob,
+      target: VoiceTarget | null,
+      capabilityEpoch: number
+    ) => {
+      if (!isCurrentCapability(capabilityEpoch) || !target) return
       if (blob.size === 0) {
         toast.error(t("voiceInput.errors.emptyAudio"))
         return
@@ -314,6 +397,7 @@ export function useVoiceInputControls(
         const formData = new FormData()
         formData.append("file", file)
 
+        if (!isCurrentCapability(capabilityEpoch)) return
         const response = await apiRequest(
           `${getUploadApiUrl()}/api/models/speech/transcribe`,
           {
@@ -321,7 +405,9 @@ export function useVoiceInputControls(
             body: formData,
           }
         )
+        if (!isCurrentCapability(capabilityEpoch)) return
         const parsed = await parseApiResponse(response)
+        if (!isCurrentCapability(capabilityEpoch)) return
         if (!response.ok) {
           throw new Error(
             getApiErrorMessage(response, parsed, t("voiceInput.errors.failed"))
@@ -338,20 +424,29 @@ export function useVoiceInputControls(
         }
         insertTranscribedText(target, text)
       } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : t("voiceInput.errors.failed")
-        )
+        if (isCurrentCapability(capabilityEpoch)) {
+          toast.error(
+            error instanceof Error ? error.message : t("voiceInput.errors.failed")
+          )
+        }
       } finally {
-        setStatus("idle")
+        if (isCurrentCapability(capabilityEpoch)) {
+          setStatus("idle")
+        }
       }
     },
-    [t]
+    [isCurrentCapability, t]
   )
 
   const startRecording = useCallback(
     async (target?: VoiceTarget | null) => {
+      const capabilityEpoch = capabilityEpochRef.current
       const recordingTarget = target ?? targetRef.current
-      if (!recordingTarget || status !== "idle") return
+      if (
+        !isCurrentCapability(capabilityEpoch)
+        || !recordingTarget
+        || status !== "idle"
+      ) return
       if (
         !navigator.mediaDevices?.getUserMedia ||
         typeof MediaRecorder === "undefined"
@@ -364,6 +459,10 @@ export function useVoiceInputControls(
 
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        if (!isCurrentCapability(capabilityEpoch)) {
+          stream.getTracks().forEach((track) => track.stop())
+          return
+        }
         streamRef.current = stream
         chunksRef.current = []
         recordingTargetRef.current = recordingTarget
@@ -375,11 +474,19 @@ export function useVoiceInputControls(
         recorderRef.current = recorder
 
         recorder.ondataavailable = (event) => {
+          if (
+            !isCurrentCapability(capabilityEpoch)
+            || recorderRef.current !== recorder
+          ) return
           if (event.data.size > 0) {
             chunksRef.current.push(event.data)
           }
         }
         recorder.onstop = () => {
+          if (
+            !isCurrentCapability(capabilityEpoch)
+            || recorderRef.current !== recorder
+          ) return
           const blob = new Blob(chunksRef.current, {
             type: recorder.mimeType || mimeType || "audio/webm",
           })
@@ -388,9 +495,13 @@ export function useVoiceInputControls(
           const target = recordingTargetRef.current
           recordingTargetRef.current = null
           stopStream()
-          transcribeBlob(blob, target)
+          transcribeBlob(blob, target, capabilityEpoch)
         }
         recorder.onerror = () => {
+          if (
+            !isCurrentCapability(capabilityEpoch)
+            || recorderRef.current !== recorder
+          ) return
           stopStream()
           recorderRef.current = null
           recordingTargetRef.current = null
@@ -402,6 +513,7 @@ export function useVoiceInputControls(
         recorder.start()
         setStatus("recording")
       } catch (error) {
+        if (!isCurrentCapability(capabilityEpoch)) return
         stopStream()
         recordingTargetRef.current = null
         setStatus("idle")
@@ -412,7 +524,7 @@ export function useVoiceInputControls(
         )
       }
     },
-    [status, stopStream, t, transcribeBlob]
+    [isCurrentCapability, status, stopStream, t, transcribeBlob]
   )
 
   const stopRecording = useCallback(() => {
@@ -421,16 +533,6 @@ export function useVoiceInputControls(
       recorder.stop()
     }
   }, [])
-
-  useEffect(() => {
-    return () => {
-      if (recorderRef.current?.state !== "inactive") {
-        recorderRef.current?.stop()
-      }
-      recordingTargetRef.current = null
-      stopStream()
-    }
-  }, [stopStream])
 
   return {
     hasAsrModel,

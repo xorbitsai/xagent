@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .file_ref import sanitize_file_ref_for_context
 
 CONTEXT_REFS_KEY = "_xagent_context_refs"
+SUPERSEDES_SCOPE_KEY = "_xagent_supersedes_scope"
 
 _PATH_METADATA_PARTS = {
     "cwd",
@@ -245,3 +246,18 @@ def split_tool_result_context_references(
     public_result = dict(result)
     raw_refs = public_result.pop(CONTEXT_REFS_KEY)
     return public_result, normalize_context_references(raw_refs)
+
+
+def split_tool_result_supersedes_scope(result: Any) -> tuple[Any, str | None]:
+    """Detach a bounded internal scope used to supersede stale tool output."""
+
+    if not isinstance(result, dict) or SUPERSEDES_SCOPE_KEY not in result:
+        return result, None
+    public_result = dict(result)
+    raw_scope = public_result.pop(SUPERSEDES_SCOPE_KEY)
+    scope = str(raw_scope).strip() if raw_scope is not None else ""
+    if not scope:
+        return public_result, None
+    if len(scope) > 512 or any(ord(character) < 0x20 for character in scope):
+        raise ValueError("tool result supersedes scope is invalid")
+    return public_result, scope

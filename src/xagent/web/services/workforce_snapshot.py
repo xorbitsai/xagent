@@ -12,11 +12,20 @@ from xagent.core.execution_scope import (
 from xagent.core.tools.adapters.vibe.agent_tool_names import (
     gen_workforce_agent_tool_name,
 )
-from xagent.web.models.agent import Agent
+from xagent.web.models.agent import (
+    Agent,
+    AgentStatus,
+    is_workforce_generated_manager_agent,
+)
 from xagent.web.models.user import User
 
 from ..models.workforce import Workforce, WorkforceAgent
-from .workforce_access import ensure_workforce_access, ensure_workforce_agent_run_access
+from .task_runtime import SELECTED_FILE_IDS_AGENT_CONFIG_KEY
+from .workforce_access import (
+    ensure_workforce_access,
+    ensure_workforce_agent_run_access,
+    get_workforce_policy,
+)
 from .workforce_errors import WorkforceRunError, WorkforceRunErrorCode
 
 WORKFORCE_STATUSES = {"draft", "active", "archived"}
@@ -358,6 +367,159 @@ def build_workforce_snapshot(
     return snapshot
 
 
+def _ensure_preview_agent_run_access(
+    agent: Agent | None, user: User, db: Session
+) -> Agent:
+    """Run-scope access check for a preview run's agents, with no persisted
+    Workforce to check against.
+
+    Unlike ``ensure_agent_access`` (used for *selecting* agents into a
+    workforce, purpose="workforce_select"), a preview run actually executes
+    the manager/worker agents, so it must go through the same pluggable
+    ``WorkforcePolicy.is_agent_in_workforce_run_scope`` hook as the persisted
+    path's ``ensure_workforce_agent_run_access`` -- passing ``workforce=None``
+    -- rather than hardcoding the default policy's ownership rule here. A
+    custom policy (e.g. team-shared execution) must apply identically to
+    preview and saved runs.
+    """
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if is_workforce_generated_manager_agent(agent):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.status != AgentStatus.PUBLISHED:
+        raise HTTPException(
+            status_code=400, detail="Workforce agents must be published"
+        )
+    if not get_workforce_policy().is_agent_in_workforce_run_scope(
+        db, user, None, agent
+    ):
+        raise HTTPException(status_code=403, detail="Access denied to agent")
+    return agent
+
+
+def build_preview_workforce_snapshot(
+    db: Session,
+    user: User,
+    *,
+    name: str | None,
+    description: str | None,
+    manager_agent_id: int,
+    workers: list[dict[str, Any]],
+) -> tuple[dict[str, Any], Agent]:
+    """Build a run snapshot for an unsaved (never-persisted) workforce draft.
+
+    Mirrors ``build_workforce_snapshot`` but reads the manager/workers by id
+    from the request instead of a ``Workforce`` row's relationships, so the
+    builder can test-run a draft without saving it first. Access is checked
+    per-agent via ``_ensure_preview_agent_run_access`` (strict ownership,
+    matching the persisted run path), not via ``ensure_workforce_agent_run_access``
+    which requires a real Workforce, and not via the looser
+    ``ensure_agent_access`` used for agent *selection*.
+
+    Returns ``(snapshot, manager_agent)`` -- the caller needs the already-
+    validated manager ORM object too (for the Task's ``agent_id``/execution
+    mode), and re-fetching it by id would be a redundant, unvalidated lookup.
+    """
+    manager_agent = _ensure_preview_agent_run_access(
+        db.get(Agent, manager_agent_id), user, db
+    )
+
+    # Sort like the persisted path's ``_sorted_workers`` (sort_order, then a
+    # stable tiebreaker -- request order stands in for row id, since these
+    # are draft dicts with no id yet), then drop disabled workers like
+    # ``validate_workforce_for_run``'s ``enabled_workers`` -- a preview must
+    # actually execute the same worker set the saved run would.
+    enabled_workers = [
+        worker
+        for _, worker in sorted(
+            enumerate(workers),
+            key=lambda pair: (pair[1].get("sort_order") or 0, pair[0]),
+        )
+        if worker.get("enabled", True)
+    ]
+
+    if not enabled_workers:
+        raise HTTPException(
+            status_code=400, detail="Workforce requires at least one enabled worker"
+        )
+
+    snapshot_workers: list[dict[str, Any]] = []
+    seen_worker_agent_ids: set[int] = set()
+    for worker in enabled_workers:
+        agent_id = worker.get("agent_id")
+        if not isinstance(agent_id, int) or isinstance(agent_id, bool):
+            raise HTTPException(
+                status_code=400, detail="agent_id is required for each worker"
+            )
+        if int(agent_id) == int(manager_agent.id):
+            raise HTTPException(
+                status_code=400, detail="Manager agent cannot also be a worker"
+            )
+        if int(agent_id) in seen_worker_agent_ids:
+            raise HTTPException(
+                status_code=400, detail="Each agent can only be added once"
+            )
+        seen_worker_agent_ids.add(int(agent_id))
+        agent = _ensure_preview_agent_run_access(db.get(Agent, agent_id), user, db)
+        assignment_instructions = normalize_text(
+            cast(str | None, worker.get("assignment_instructions")),
+            "assignment_instructions",
+            required=True,
+        )
+        if assignment_instructions is None:
+            raise HTTPException(
+                status_code=400, detail="assignment_instructions is required"
+            )
+        alias = normalize_text(cast(str | None, worker.get("alias")), "alias") or cast(
+            str, agent.name
+        )
+
+        snapshot_workers.append(
+            {
+                "member_id": None,
+                "agent_id": agent.id,
+                "name": agent.name,
+                "alias": alias,
+                "description": agent.description,
+                "assignment_instructions": assignment_instructions,
+                "execution_mode": agent.execution_mode,
+                "tool_name": build_worker_tool_name(int(agent.id), alias),
+                "enabled": True,
+            }
+        )
+
+    workforce_name = normalize_text(name, "name") or "Workforce preview"
+    snapshot: dict[str, Any] = {
+        "version": 1,
+        "workforce": {
+            "id": None,
+            "name": workforce_name,
+            "description": description,
+            "status": "draft",
+            "scope_type": "user",
+            "scope_id": str(user.id),
+            "owner_user_id": user.id,
+        },
+        "manager": {
+            "agent_id": manager_agent.id,
+            "name": manager_agent.name,
+            "description": manager_agent.description,
+            "instructions": manager_agent.instructions,
+            "execution_mode": manager_agent.execution_mode,
+            "models": manager_agent.models or {},
+        },
+        "workers": snapshot_workers,
+    }
+    snapshot["manager"]["runtime_prompt"] = build_manager_system_prompt(snapshot)
+    # No live Workforce row exists to re-check a fingerprint against on
+    # later turns; ``ensure_workforce_turn_allowed`` already skips the
+    # comparison whenever the run's workforce_id is None (see
+    # workforce_runtime.py), so leaving this unset is safe.
+    snapshot["config_fingerprint"] = None
+    snapshot["config_fingerprint_version"] = WORKFORCE_CONFIG_FINGERPRINT_VERSION
+    return snapshot, manager_agent
+
+
 def build_workforce_task_config(
     snapshot: dict[str, Any],
     selected_file_ids: list[str] | None = None,
@@ -370,12 +532,17 @@ def build_workforce_task_config(
     if workforce_run_id is not None:
         config["workforce_run_id"] = workforce_run_id
     if selected_file_ids:
-        config["selected_file_ids"] = selected_file_ids
+        config[SELECTED_FILE_IDS_AGENT_CONFIG_KEY] = selected_file_ids
     # Workforce runs create fresh Task rows whose ids the embedder's scope
     # resolver cannot map. Persist the creating context's ExecutionScope
-    # snapshot into agent_config (no schema migration); per-turn activation
-    # prefers this snapshot over the resolver, so the run executes fully
-    # scoped even after a process restart.
+    # snapshot into agent_config (no schema migration); resolve_execution_scope
+    # treats this as a corroborating candidate, not an override -- it is
+    # authoritative only when a resolver defers to it or none is registered,
+    # and is ignored when its version predates the current shape -- so the
+    # run stays scoped across a process restart without ever overriding a
+    # registered resolver's answer. ``to_dict()`` always stamps the current
+    # shape version, regardless of whether the in-context scope was itself
+    # decoded from an older persisted snapshot.
     scope = get_execution_scope()
     if scope is not None:
         config[EXECUTION_SCOPE_AGENT_CONFIG_KEY] = scope.to_dict()

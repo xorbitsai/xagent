@@ -1,5 +1,6 @@
 import asyncio
-import time
+import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -17,11 +18,6 @@ from xagent.core.execution_scope import (
     ExecutionScopeContext,
 )
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
-from xagent.web.api.chat import (
-    AgentServiceManager,
-    _build_tool_selection_spec_for_task,
-    create_default_tools,
-)
 from xagent.web.models import Agent, Base, Task, User, Workforce, WorkforceRun
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import AgentStatus
@@ -30,12 +26,24 @@ from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services import workforce_runs as workforce_runs_module
-from xagent.web.services.task_lease_service import acquire_task_lease
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    _build_tool_selection_spec_for_task,
+    create_default_tools,
+)
+from xagent.web.services.task_lease_service import (
+    acquire_task_lease,
+    bind_task_lease_context,
+)
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
-from xagent.web.services.workforce_runs import create_workforce_run
+from xagent.web.services.workforce_runs import (
+    create_preview_workforce_run,
+    create_workforce_run,
+)
 from xagent.web.services.workforce_runtime import (
     WorkforceTaskRuntime,
     _map_task_status,
+    ensure_workforce_turn_allowed,
     release_current_runner_task_lease_with_workforce_sync,
     release_task_lease_with_workforce_sync,
     resolve_workforce_task_runtime,
@@ -217,10 +225,113 @@ def _workforce_runtime_with_worker_tools(*tool_names: str) -> WorkforceTaskRunti
 
 
 @pytest.mark.asyncio
-async def test_create_workforce_run_creates_task_run_and_starts_turn(
+@pytest.mark.parametrize("shared", [False, True])
+async def test_create_workforce_run_forwards_the_caller_timezone(
+    db_session: Session,
+    shared: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opening turn starts inside task creation, so the zone has to ride
+    the create request; there is no chat frame to carry it."""
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "tz-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, _create_agent(db_session, user, "Analyst"))
+    db_session.commit()
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="how many shifts do we have on tomorrow?",
+        timezone="Australia/Melbourne",
+    )
+    if shared:
+        assert result.background_task is None
+        command = (
+            db_session.query(TaskExecutionCommand)
+            .filter_by(task_id=result.task.id)
+            .one()
+        )
+        assert command.status == "pending"
+        assert not scheduled
+    else:
+        await result.background_task
+
+    if shared:
+        assert command.payload["timezone"] == "Australia/Melbourne"
+    else:
+        assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_sends_no_context_without_a_timezone(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "no-tz-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, _create_agent(db_session, user, "Analyst"))
+    db_session.commit()
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="hello",
+    )
+    await result.background_task
+
+    assert scheduled["context"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_treats_a_blank_timezone_as_absent(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "blank-tz-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, _create_agent(db_session, user, "Analyst"))
+    db_session.commit()
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="hello",
+        timezone="   ",
+    )
+    await result.background_task
+
+    assert scheduled["context"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_create_workforce_run_creates_task_run_and_starts_turn(
+    db_session: Session,
+    shared: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
     scheduled = _patch_schedule_bg(monkeypatch)
 
     user = _create_user(db_session, "owner")
@@ -245,7 +356,17 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
         message="Coordinate a launch brief",
         selected_file_ids=["file-1"],
     )
-    await result.background_task
+    if shared:
+        assert result.background_task is None
+        command = (
+            db_session.query(TaskExecutionCommand)
+            .filter_by(task_id=result.task.id)
+            .one()
+        )
+        assert command.status == "pending"
+        assert not scheduled
+    else:
+        await result.background_task
     assert not hasattr(result.task, "_sa_instance_state")
     assert not hasattr(result.workforce_run, "_sa_instance_state")
 
@@ -257,31 +378,562 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
     )
     db_session.refresh(uploaded_file)
 
-    assert task.status == TaskStatus.RUNNING
+    assert task.status == (TaskStatus.PENDING if shared else TaskStatus.RUNNING)
     assert task.agent_id == manager.id
     assert result.task.agent_id == manager.id
-    assert result.task.run_id == task.run_id
+    assert result.task.run_id == (command.target_run_id if shared else task.run_id)
     assert result.task.state_version == task.state_version
     assert result.task.control_state == task.control_state
     assert task.execution_mode == "think"
-    assert task.input == "Coordinate a launch brief"
+    assert task.input == (None if shared else "Coordinate a launch brief")
     assert task.agent_config["workforce_id"] == workforce.id
     assert task.agent_config["workforce_run_id"] == workforce_run.id
     assert task.agent_config["selected_file_ids"] == ["file-1"]
     assert task.agent_config["workforce_snapshot"]["manager"]["agent_id"] == manager.id
     assert task.connector_runtime_selected_refs == []
     assert workforce_run.task_id == task.id
-    assert workforce_run.status == "running"
+    assert workforce_run.status == ("pending" if shared else "running")
     assert workforce_run.is_preview is False
     assert uploaded_file.task_id == task.id
-    assert scheduled["task_id"] == task.id
-    assert scheduled["payload"].transcript_message == "Coordinate a launch brief"
+    if shared:
+        assert task.run_id is None
+        assert result.task.run_id is not None
+        assert task.runner_id is None
+        assert command.payload["message"] == "Coordinate a launch brief"
+        assert command.payload["file_ids"] == ["file-1"]
+    else:
+        assert scheduled["task_id"] == task.id
+        assert scheduled["payload"].transcript_message == "Coordinate a launch brief"
     assert (
         db_session.query(TaskChatMessage)
         .filter(TaskChatMessage.task_id == task.id, TaskChatMessage.role == "user")
         .count()
         == 1
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_create_preview_workforce_run_forwards_the_caller_timezone(
+    db_session: Session,
+    shared: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "preview-tz-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": "Analyst",
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="how many shifts do we have on tomorrow?",
+        timezone="Australia/Melbourne",
+    )
+    if shared:
+        assert result.background_task is None
+        command = (
+            db_session.query(TaskExecutionCommand)
+            .filter_by(task_id=result.task.id)
+            .one()
+        )
+        assert command.status == "pending"
+        assert not scheduled
+    else:
+        await result.background_task
+
+    if shared:
+        assert command.payload["timezone"] == "Australia/Melbourne"
+    else:
+        assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_sends_no_context_without_a_timezone(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "preview-no-tz-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": "Analyst",
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="hello",
+    )
+    await result.background_task
+
+    assert scheduled["context"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_never_persists_a_workforce(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Builder "test before save": manager + inline workers, no Workforce row."""
+
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "draft-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description="Coordinates the launch",
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": "Analyst",
+                "assignment_instructions": "Collect evidence and cite sources.",
+            }
+        ],
+        message="Draft a launch brief",
+    )
+    await result.background_task
+
+    assert db_session.query(Workforce).count() == 0
+
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
+    workforce_run = (
+        db_session.query(WorkforceRun)
+        .filter(WorkforceRun.id == int(result.workforce_run.id))
+        .one()
+    )
+
+    assert workforce_run.workforce_id is None
+    assert workforce_run.is_preview is True
+    assert task.is_visible is False
+    assert task.status == TaskStatus.RUNNING
+    assert task.agent_id == manager.id
+    assert task.agent_config["workforce_id"] is None
+    assert task.agent_config["workforce_run_id"] == workforce_run.id
+    snapshot = task.agent_config["workforce_snapshot"]
+    assert snapshot["workforce"]["id"] is None
+    assert snapshot["workforce"]["name"] == "Launch Team"
+    assert snapshot["manager"]["agent_id"] == manager.id
+    assert snapshot["workers"][0]["agent_id"] == worker_agent.id
+    assert snapshot["workers"][0]["alias"] == "Analyst"
+    assert scheduled["task_id"] == task.id
+
+    # The manager can actually delegate: tool-override resolution works from
+    # the run's own snapshot even though workforce_id is None.
+    runtime = resolve_workforce_task_runtime(db_session, task)
+    assert runtime is not None
+    assert runtime.allowed_agent_ids == [worker_agent.id]
+
+    # Turn-gating on a later message must not try to load a nonexistent
+    # Workforce by a None id.
+    ensure_workforce_turn_allowed(
+        db_session,
+        task_id=int(task.id),
+        task_owner_user_id=int(user.id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_requires_at_least_one_worker(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "no-worker-owner")
+    manager = _create_agent(db_session, user, "Solo Manager")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            db_session,
+            user_id=user.id,
+            name="Solo Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_unpublished_manager(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "unpublished-owner")
+    manager = _create_agent(db_session, user, "Draft Manager", status=AgentStatus.DRAFT)
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            db_session,
+            user_id=user.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": worker_agent.id,
+                    "alias": None,
+                    "assignment_instructions": "Do the work.",
+                }
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_duplicate_worker_agent(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "duplicate-worker-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            db_session,
+            user_id=user.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": worker_agent.id,
+                    "alias": "First",
+                    "assignment_instructions": "Do the work.",
+                },
+                {
+                    "agent_id": worker_agent.id,
+                    "alias": "Second",
+                    "assignment_instructions": "Do it again.",
+                },
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_manager_as_worker(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "manager-also-worker-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            db_session,
+            user_id=user.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": manager.id,
+                    "alias": None,
+                    "assignment_instructions": "Do the work.",
+                }
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_excludes_disabled_workers(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker unchecked in the builder must not actually run in the preview,
+    matching ``validate_workforce_for_run``'s ``enabled_workers`` filtering."""
+    _patch_schedule_bg(monkeypatch)
+    user = _create_user(db_session, "disabled-worker-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    active_worker = _create_agent(db_session, user, "Active Analyst")
+    disabled_worker = _create_agent(db_session, user, "Disabled Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": disabled_worker.id,
+                "enabled": False,
+                "assignment_instructions": "Should never run.",
+            },
+            {
+                "agent_id": active_worker.id,
+                "assignment_instructions": "Collect evidence and cite sources.",
+            },
+        ],
+        message="Draft a launch brief",
+    )
+    await result.background_task
+
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
+    snapshot = task.agent_config["workforce_snapshot"]
+    snapshot_agent_ids = [worker["agent_id"] for worker in snapshot["workers"]]
+    assert snapshot_agent_ids == [active_worker.id]
+
+    runtime = resolve_workforce_task_runtime(db_session, task)
+    assert runtime is not None
+    assert runtime.allowed_agent_ids == [active_worker.id]
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_sorts_workers_by_sort_order(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker order in the snapshot/manager prompt must match sort_order, not
+    request-array order, matching the persisted path's ``_sorted_workers``."""
+    _patch_schedule_bg(monkeypatch)
+    user = _create_user(db_session, "sort-order-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    second_worker = _create_agent(db_session, user, "Second Analyst")
+    first_worker = _create_agent(db_session, user, "First Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        # Requested in reverse of the intended sort_order.
+        workers=[
+            {
+                "agent_id": second_worker.id,
+                "sort_order": 2,
+                "assignment_instructions": "Runs second.",
+            },
+            {
+                "agent_id": first_worker.id,
+                "sort_order": 1,
+                "assignment_instructions": "Runs first.",
+            },
+        ],
+        message="Draft a launch brief",
+    )
+    await result.background_task
+
+    task = db_session.query(Task).filter(Task.id == int(result.task.id)).one()
+    snapshot = task.agent_config["workforce_snapshot"]
+    snapshot_agent_ids = [worker["agent_id"] for worker in snapshot["workers"]]
+    assert snapshot_agent_ids == [first_worker.id, second_worker.id]
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_boolean_worker_agent_id(
+    db_session: Session,
+) -> None:
+    """bool is an int subclass in Python; a worker's agent_id must reject it."""
+    user = _create_user(db_session, "boolean-worker-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            db_session,
+            user_id=user.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": True,
+                    "alias": None,
+                    "assignment_instructions": "Do the work.",
+                }
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_rejects_admin_using_anothers_private_agent(
+    db_session: Session,
+) -> None:
+    """An admin must not be able to preview-run (i.e. actually execute) an
+    agent they don't own, even though ``ensure_agent_access`` (used for
+    agent *selection*) grants admins a bypass. The preview run path must
+    enforce the persisted run path's strict ownership instead."""
+    owner = _create_user(db_session, "private-agent-owner")
+    admin = _create_user(db_session, "unrelated-admin", is_admin=True)
+    manager = _create_agent(db_session, admin, "Admin Manager")
+    private_worker = _create_agent(db_session, owner, "Owner's Private Analyst")
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as excinfo:
+        await create_preview_workforce_run(
+            db_session,
+            user_id=admin.id,
+            name="Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": private_worker.id,
+                    "alias": None,
+                    "assignment_instructions": "Do the work.",
+                }
+            ],
+            message="Hello",
+        )
+    assert excinfo.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_honors_custom_run_scope_policy(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A custom ``WorkforcePolicy`` (e.g. team-shared execution) must apply
+    identically to preview and saved runs. The preview path checks agent
+    access through the same ``is_agent_in_workforce_run_scope`` hook as the
+    persisted path -- passing ``workforce=None`` -- instead of hardcoding the
+    default ownership rule, so a policy that widens (or narrows) run scope
+    isn't silently bypassed for one path but not the other."""
+
+    class TeamScopePolicy(WorkforcePolicy):
+        def is_agent_in_workforce_run_scope(
+            self,
+            db: Session,
+            user: User,
+            workforce: Workforce | None,
+            agent: Agent,
+        ) -> bool:
+            del db, user, workforce, agent
+            return True
+
+    _patch_schedule_bg(monkeypatch)
+    set_workforce_policy(TeamScopePolicy())
+
+    owner = _create_user(db_session, "team-scope-owner")
+    runner = _create_user(db_session, "team-scope-runner")
+    manager = _create_agent(db_session, owner, "Owner's Manager")
+    worker_agent = _create_agent(db_session, owner, "Owner's Analyst")
+    db_session.commit()
+
+    # `runner` doesn't own either agent, but the installed policy grants
+    # cross-user run scope -- must not 403 like the default policy would.
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=runner.id,
+        name="Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": None,
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="Hello",
+    )
+    await result.background_task
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_invokes_policy_run_hooks(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """before_workforce_run / after_workforce_run_created must fire for
+    preview runs too (with workforce=None) -- they're the extension point a
+    custom WorkforcePolicy would use for quota gating, audit logging, or
+    billing side-effects, and preview runs execute real agents and consume
+    real spend just like a saved run."""
+
+    _patch_schedule_bg(monkeypatch)
+    calls: list[tuple[str, Workforce | None]] = []
+
+    class AuditingPolicy(WorkforcePolicy):
+        def before_workforce_run(
+            self, db: Session, user: User, workforce: Workforce | None
+        ) -> None:
+            del db, user
+            calls.append(("before", workforce))
+
+        def after_workforce_run_created(
+            self,
+            db: Session,
+            user: User,
+            workforce: Workforce | None,
+            run: Any,
+            task: Any,
+        ) -> None:
+            del db, user, run, task
+            calls.append(("after", workforce))
+
+    set_workforce_policy(AuditingPolicy())
+
+    user = _create_user(db_session, "audited-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": None,
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="Hello",
+    )
+    await result.background_task
+
+    assert calls == [("before", None), ("after", None)]
 
 
 @pytest.mark.asyncio
@@ -299,11 +951,16 @@ async def test_create_workforce_run_releases_connection_before_worker_transactio
     db.commit()
 
     checked_out: list[int] = []
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
     original = workforce_runs_module._create_claimed_workforce_run_isolated
 
     def observed(*args: Any, **kwargs: Any):
         checked_out.append(engine.pool.checkedout())
-        time.sleep(0.05)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "workforce transaction was never released"
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -312,32 +969,89 @@ async def test_create_workforce_run_releases_connection_before_worker_transactio
         observed,
     )
 
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
-
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        result = await create_workforce_run(
+    startup = asyncio.create_task(
+        create_workforce_run(
             db,
             user,
             workforce,
             message="Coordinate a launch brief",
         )
-        await result.background_task
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not startup.done()
+        assert checked_out == [0]
     finally:
-        ticker_stop.set()
-        await ticker_task
+        release.set()
+        result = await asyncio.wait_for(startup, timeout=30)
+    await result.background_task
 
     assert result.task.status == TaskStatus.RUNNING
     assert result.workforce_run.status == "running"
     assert checked_out == [0]
-    assert ticks >= 3, "workforce turn startup blocked the asyncio event loop"
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_releases_connection_before_worker_transaction(
+    single_connection_workforce_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same pool-exhaustion guard as the persisted path (issue #889), for preview."""
+    engine, db = single_connection_workforce_db
+    _patch_schedule_bg(monkeypatch)
+    user = _create_user(db, "single-pool-preview-owner")
+    manager = _create_agent(db, user, "Draft Manager")
+    worker_agent = _create_agent(db, user, "Draft Analyst")
+    db.commit()
+
+    checked_out: list[int] = []
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
+    original = workforce_runs_module._create_claimed_preview_run_isolated
+
+    def observed(*args: Any, **kwargs: Any):
+        checked_out.append(engine.pool.checkedout())
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "workforce transaction was never released"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        workforce_runs_module,
+        "_create_claimed_preview_run_isolated",
+        observed,
+    )
+
+    startup = asyncio.create_task(
+        create_preview_workforce_run(
+            db,
+            user_id=user.id,
+            name="Launch Team",
+            description=None,
+            manager_agent_id=manager.id,
+            workers=[
+                {
+                    "agent_id": worker_agent.id,
+                    "alias": None,
+                    "assignment_instructions": "Collect evidence and cite sources.",
+                }
+            ],
+            message="Draft a launch brief",
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not startup.done()
+        assert checked_out == [0]
+    finally:
+        release.set()
+        result = await asyncio.wait_for(startup, timeout=30)
+    await result.background_task
+
+    assert result.task.status == TaskStatus.RUNNING
+    assert result.workforce_run.status == "running"
+    assert checked_out == [0]
 
 
 @pytest.mark.asyncio
@@ -451,7 +1165,7 @@ async def test_create_workforce_run_claim_timeout_rolls_back_created_records(
 
     monkeypatch.setattr(
         task_orchestrator_module,
-        "_persist_claimed_turn_no_commit",
+        "_persist_accepted_turn_no_commit",
         MagicMock(side_effect=synthetic_timeout),
     )
     monkeypatch.setattr(
@@ -731,6 +1445,77 @@ def test_sync_workforce_run_status_tracks_task_lifecycle(db_session: Session) ->
     assert run.completed_at is not None
 
 
+def test_sync_workforce_run_status_bumps_last_activity_at_on_every_real_transition(
+    db_session: Session,
+) -> None:
+    """PR #1060 review round 8, F-NEW-1: the preview-run reaper keys
+    staleness off last_activity_at, not created_at, specifically because
+    created_at stays fixed for a run's whole lifetime while a multi-turn
+    conversation keeps transitioning status. This pins the mechanism the
+    reaper trusts: each real transition (a status/completed_at change, not a
+    no-op resync) must advance last_activity_at, simulating the
+    completed -> running -> completed shape of successive turns."""
+    user = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    task = Task(
+        user_id=user.id,
+        title="Workforce task",
+        description="Run workforce",
+        status=TaskStatus.PENDING,
+        agent_id=manager.id,
+        agent_config={},
+    )
+    db_session.add(task)
+    db_session.flush()
+    # Naive, matching what SQLite round-trips a DateTime(timezone=True)
+    # column as -- comparisons below stay in this same naive space
+    # throughout, rather than mixing it with datetime.now(timezone.utc).
+    old_activity = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=3)
+    run = WorkforceRun(
+        workforce_id=workforce.id,
+        task_id=task.id,
+        user_id=user.id,
+        status="pending",
+        snapshot={"version": 1},
+    )
+    db_session.add(run)
+    db_session.flush()
+    run.last_activity_at = old_activity
+    task.agent_config = {"workforce_run_id": run.id}
+    db_session.commit()
+
+    # Turn 1 starts.
+    assert sync_workforce_run_status(db_session, task, TaskStatus.RUNNING) is True
+    db_session.commit()
+    db_session.refresh(run)
+    turn_1_start_activity = run.last_activity_at
+    assert turn_1_start_activity is not None
+    assert turn_1_start_activity > old_activity
+
+    # Turn 1 completes.
+    assert sync_workforce_run_status(db_session, task, TaskStatus.COMPLETED) is True
+    db_session.commit()
+    db_session.refresh(run)
+    assert run.last_activity_at >= turn_1_start_activity
+
+    # A second sync call with the SAME status is a no-op (already correct):
+    # must not manufacture activity that didn't happen.
+    turn_1_complete_activity = run.last_activity_at
+    assert sync_workforce_run_status(db_session, task, TaskStatus.COMPLETED) is False
+    db_session.commit()
+    db_session.refresh(run)
+    assert run.last_activity_at == turn_1_complete_activity
+
+    # Turn 2 starts -- the exact transition the reaper needs to see as fresh
+    # activity even though the run's created_at (unset here, but fixed at
+    # row-creation time in production) never changes.
+    assert sync_workforce_run_status(db_session, task, TaskStatus.RUNNING) is True
+    db_session.commit()
+    db_session.refresh(run)
+    assert run.last_activity_at >= turn_1_complete_activity
+
+
 def test_release_task_lease_with_workforce_sync_marks_run_failed(
     db_session: Session,
 ) -> None:
@@ -811,14 +1596,15 @@ def test_release_current_runner_task_lease_with_workforce_sync_pauses_run(
     lease = acquire_task_lease(db_session, int(task.id))
     assert lease is not None
 
-    assert (
-        release_current_runner_task_lease_with_workforce_sync(
-            db_session,
-            int(task.id),
-            status=TaskStatus.WAITING_FOR_USER,
+    with bind_task_lease_context(lease):
+        assert (
+            release_current_runner_task_lease_with_workforce_sync(
+                db_session,
+                int(task.id),
+                status=TaskStatus.WAITING_FOR_USER,
+            )
+            is True
         )
-        is True
-    )
     db_session.refresh(task)
     db_session.refresh(run)
 
@@ -924,7 +1710,7 @@ async def test_verified_workforce_run_scope_loads_manager_config(
             self,
             db: Session,
             user: User,
-            workforce: Workforce,
+            workforce: Workforce | None,
             agent: Agent,
         ) -> bool:
             del db, user, workforce, agent
@@ -963,7 +1749,10 @@ async def test_verified_workforce_run_scope_loads_manager_config(
 
     default_llm = MagicMock()
     default_llm.model_name = "default-model"
-    with patch("xagent.web.api.chat.create_default_llm", return_value=default_llm):
+    with patch(
+        "xagent.web.services.agent_service_manager.create_default_llm",
+        return_value=default_llm,
+    ):
         runtime_config = AgentServiceManager()._resolve_task_runtime_config(
             task_id=int(result.task.id),
             task=task,
@@ -1062,3 +1851,84 @@ def test_workforce_manager_with_tool_categories_keeps_categories_and_workers() -
             _mock_tool("agent_99", "agent"),
         ]
     ) == frozenset({"browser_use", "agent_1"})
+
+
+# ===== Generated-manager agent run-access asymmetry (#1060 round-4 review) =====
+
+
+def _create_generated_manager_agent(db: Session, user: User, name: str) -> Agent:
+    """A ``create_workforce_from_prompt``-style auto-generated manager agent."""
+    from xagent.web.models.agent import AgentOrigin
+
+    agent = Agent(
+        user_id=user.id,
+        name=name,
+        description=f"{name} description",
+        instructions=f"{name} instructions",
+        execution_mode="think",
+        models={"general": "test-model"},
+        knowledge_bases=[],
+        skills=[],
+        tool_categories=[],
+        suggested_prompts=[],
+        status=AgentStatus.PUBLISHED,
+        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+    )
+    db.add(agent)
+    db.flush()
+    return agent
+
+
+def test_run_allows_a_workforces_own_generated_manager(db_session: Session) -> None:
+    """The AI-prompt creation flow's manager legitimately IS generated -- must still run."""
+    from xagent.web.services.workforce_snapshot import validate_workforce_for_run
+
+    user = _create_user(db_session, "prompt-owner")
+    manager = _create_generated_manager_agent(db_session, user, "Auto Manager")
+    worker = _create_agent(db_session, user, "Worker")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, worker)
+
+    manager_agent, enabled_workers = validate_workforce_for_run(
+        db_session, user, workforce
+    )
+
+    assert manager_agent.id == manager.id
+    assert [w.agent_id for w in enabled_workers] == [worker.id]
+
+
+def test_run_rejects_a_foreign_generated_manager_agent_used_as_worker(
+    db_session: Session,
+) -> None:
+    """Defence-in-depth: a generated manager agent smuggled in as a worker
+    (unreachable via create_workforce_worker's own check today, but the run
+    path should not silently trust it either) must not be allowed to run.
+    """
+    from xagent.web.models.workforce import WorkforceAgent
+    from xagent.web.services.workforce_snapshot import validate_workforce_for_run
+
+    user = _create_user(db_session, "victim-owner")
+    manager = _create_agent(db_session, user, "Real Manager")
+    workforce = _create_workforce(db_session, user, manager)
+
+    foreign_generated_manager = _create_generated_manager_agent(
+        db_session, user, "Someone Else's Auto Manager"
+    )
+    # Bypasses create_workforce_worker's ensure_agent_access gate on purpose,
+    # to simulate the row existing despite that (the scenario the run-time
+    # check now also guards against).
+    db_session.add(
+        WorkforceAgent(
+            workforce_id=workforce.id,
+            agent_id=foreign_generated_manager.id,
+            alias="Smuggled Worker",
+            assignment_instructions="Should never run",
+            enabled=True,
+            sort_order=1,
+        )
+    )
+    db_session.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_workforce_for_run(db_session, user, workforce)
+    assert exc_info.value.status_code == 404

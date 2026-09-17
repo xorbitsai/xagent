@@ -172,7 +172,9 @@ class ZhipuLLM(BaseLLM):
         # Prepare the completion parameters
         completion_params = {
             "model": self._model_name,
-            "messages": self._sanitize_unicode_content(messages),
+            "messages": self._sanitize_unicode_content(
+                self._strip_internal_message_keys(messages)
+            ),
             "max_tokens": max_tokens or self.default_max_tokens,
             "stream": False,  # We handle streaming separately if needed
             **kwargs,
@@ -445,7 +447,9 @@ class ZhipuLLM(BaseLLM):
         # Prepare the completion parameters
         completion_params = {
             "model": self._model_name,
-            "messages": self._sanitize_unicode_content(messages),
+            "messages": self._sanitize_unicode_content(
+                self._strip_internal_message_keys(messages)
+            ),
             "max_tokens": max_tokens or self.default_max_tokens,
             "stream": True,  # Enable streaming
             **kwargs,
@@ -816,7 +820,9 @@ class ZhipuLLM(BaseLLM):
         # Prepare the completion parameters
         completion_params = {
             "model": self._model_name,
-            "messages": self._sanitize_unicode_content(messages),
+            "messages": self._sanitize_unicode_content(
+                self._strip_internal_message_keys(messages)
+            ),
             "temperature": temperature or self.default_temperature,
             "max_tokens": max_tokens or self.default_max_tokens,
             "stream": False,  # We handle streaming separately if needed

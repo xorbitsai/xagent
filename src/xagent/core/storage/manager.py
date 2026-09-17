@@ -159,6 +159,12 @@ def _get_adhoc_engine():  # type: ignore[no-untyped-def]
                 engine = create_engine(
                     ensure_sqlite_parent_directory(database_url),
                     connect_args={"check_same_thread": False},
+                    # Same database as the shared web engine (models/database.py),
+                    # so a commit failure here can bind the same
+                    # credential-bearing columns (OAuth tokens, password
+                    # hashes) as a query parameter -- hidden for the same
+                    # reason.
+                    hide_parameters=True,
                 )
                 # WAL + busy_timeout so concurrent writes wait for the lock
                 # instead of failing with "database is locked".
@@ -169,7 +175,9 @@ def _get_adhoc_engine():  # type: ignore[no-untyped-def]
                 # pool in the same process: worst case per process is
                 # 2 x (pool_size + max_overflow) against the database's
                 # max_connections (see example.env).
-                engine = create_engine(database_url, **get_db_pool_kwargs())
+                engine = create_engine(
+                    database_url, hide_parameters=True, **get_db_pool_kwargs()
+                )
             Base.metadata.create_all(engine)
             _adhoc_engine = engine
             _adhoc_engine_url = database_url

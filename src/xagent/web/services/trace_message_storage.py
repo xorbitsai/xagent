@@ -58,6 +58,102 @@ class BlobCandidate:
 
 
 @dataclass(frozen=True)
+class CanonicalJSON:
+    """Immutable candidate payload, retained until metadata filters out hits."""
+
+    encoded: str
+
+
+@dataclass(frozen=True)
+class PreparedJSON:
+    """Owned JSON bind value encoded before opening the async transaction."""
+
+    encoded: str
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> PreparedJSON:
+        return self
+
+
+def trace_json_dumps(value: Any) -> str:
+    return value.encoded if isinstance(value, PreparedJSON) else json.dumps(value)
+
+
+@dataclass(frozen=True)
+class PreparedCheckpoint:
+    data: Any
+    messages: dict[str, BlobCandidate]
+    blobs: dict[tuple[str, str], BlobCandidate]
+
+
+def prepare_checkpoint_data(task_id: int, data: Any) -> PreparedCheckpoint:
+    """Pure preparation: never accepts a Session or touches the database."""
+    encoded = copy.deepcopy(data)
+    messages: dict[str, BlobCandidate] = {}
+    blobs: dict[tuple[str, str], BlobCandidate] = {}
+    if _resolve_use_v2(None):
+        payloads = _find_v2_encodable_payloads(encoded)
+        for payload in payloads:
+            if payload.kind == "messages":
+                payload.parent[payload.kind] = _encode_messages_payload(
+                    payload.value,
+                    task_id=task_id,
+                    message_blobs=messages,
+                    canonical=True,
+                )
+            elif payload.kind == "tool_ledger":
+                payload.parent[payload.kind] = _encode_ledger_payload(
+                    payload.value,
+                    task_id=task_id,
+                    blob_candidates=blobs,
+                    canonical=True,
+                )
+            else:
+                payload.parent[payload.kind] = _encode_blob_ref_payload(
+                    payload.value,
+                    task_id=task_id,
+                    blob_candidates=blobs,
+                    canonical=True,
+                    kind=CONTEXT_SYSTEM_PROMPT_KIND
+                    if payload.kind == "system_prompt"
+                    else CONTEXT_METADATA_KIND,
+                )
+    else:
+        if get_checkpoint_messages_storage_state(encoded) == "inline":
+            encoded["snapshot"]["context"]["messages"] = _encode_messages_payload(
+                _get_checkpoint_messages_payload(encoded),
+                task_id=task_id,
+                message_blobs=messages,
+                canonical=True,
+            )
+        for field, value in _checkpoint_blob_fields_to_encode(encoded):
+            _set_nested(
+                encoded,
+                field.path,
+                _encode_blob_ref_payload(
+                    value,
+                    kind=field.kind,
+                    task_id=task_id,
+                    blob_candidates=blobs,
+                    canonical=True,
+                ),
+            )
+    return PreparedCheckpoint(encoded, messages, blobs)
+
+
+def store_prepared_checkpoint(
+    db: Session, *, task_id: int, prepared: PreparedCheckpoint
+) -> Any:
+    execution_id = checkpoint_execution_id(prepared.data)
+    _upsert_message_blobs(
+        db, task_id=task_id, execution_id=execution_id, blobs_by_hash=prepared.messages
+    )
+    _upsert_checkpoint_blobs(
+        db, task_id=task_id, execution_id=execution_id, blobs_by_ref=prepared.blobs
+    )
+    return prepared.data
+
+
+@dataclass(frozen=True)
 class TraceBlobLookup:
     message_data_by_hash: dict[str, Any]
     checkpoint_data_by_ref: dict[tuple[str, str], Any]
@@ -270,6 +366,7 @@ def _encode_messages_payload(
     *,
     task_id: int,
     message_blobs: dict[str, BlobCandidate],
+    canonical: bool = False,
 ) -> dict[str, Any]:
     refs: list[str] = []
     for message in messages:
@@ -278,10 +375,11 @@ def _encode_messages_payload(
         _remember_blob_candidate(
             message_blobs,
             blob_hash=message_hash,
-            # Parse the canonical bytes back so the candidate owns an
-            # independent copy: the snapshot tree may alias these objects
-            # and must never mutate what gets persisted.
-            data=json.loads(message_payload),
+            # Own the payload independently of aliases in the snapshot. Async
+            # candidates retain canonical JSON without decoding/re-encoding.
+            data=CanonicalJSON(message_payload.decode("utf-8"))
+            if canonical
+            else json.loads(message_payload),
             payload_bytes=len(message_payload),
             collision_message=(
                 f"trace message blob hash collision for task {task_id}: {message_hash}"
@@ -302,13 +400,16 @@ def _encode_blob_ref_payload(
     kind: str,
     task_id: int,
     blob_candidates: dict[tuple[str, str], BlobCandidate],
+    canonical: bool = False,
 ) -> dict[str, Any]:
     blob_payload = canonical_json_bytes(value)
     blob_hash = canonical_json_hash_from_bytes(blob_payload)
     _remember_blob_candidate(
         blob_candidates,
         blob_hash=(kind, blob_hash),
-        data=json.loads(blob_payload),
+        data=CanonicalJSON(blob_payload.decode("utf-8"))
+        if canonical
+        else json.loads(blob_payload),
         payload_bytes=len(blob_payload),
         collision_message=(
             f"trace checkpoint blob hash collision for task {task_id}: "
@@ -327,6 +428,7 @@ def _encode_ledger_payload(
     *,
     task_id: int,
     blob_candidates: dict[tuple[str, str], BlobCandidate],
+    canonical: bool = False,
 ) -> dict[str, Any]:
     records: list[list[str]] = []
     for key, record in ledger.items():
@@ -335,7 +437,9 @@ def _encode_ledger_payload(
         _remember_blob_candidate(
             blob_candidates,
             blob_hash=(TOOL_LEDGER_RECORD_KIND, record_hash),
-            data=json.loads(record_payload),
+            data=CanonicalJSON(record_payload.decode("utf-8"))
+            if canonical
+            else json.loads(record_payload),
             payload_bytes=len(record_payload),
             collision_message=(
                 f"trace checkpoint blob hash collision for task {task_id}: "
@@ -1281,6 +1385,14 @@ def _pending_message_hashes(
     return pending_hashes
 
 
+def _materialize_blob_data(data: Any) -> Any:
+    # Called only after PostgreSQL metadata filtering. Wrapping the worker's
+    # canonical string is constant-time; no bulk JSON work runs on the loop.
+    if isinstance(data, CanonicalJSON):
+        return PreparedJSON(data.encoded)
+    return copy.deepcopy(data)
+
+
 def _upsert_message_blobs(
     db: Session,
     *,
@@ -1300,6 +1412,21 @@ def _upsert_message_blobs(
     candidates_to_insert = {
         message_hash: blobs_by_hash[message_hash] for message_hash in hashes_to_query
     }
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        # Most checkpoint messages already exist. Read only their metadata
+        # before copying/encoding payloads for INSERT. Keep ON CONFLICT and
+        # post-insert validation for misses: another writer can win that race.
+        # Do not use a cross-transaction cache, or pre-read on SQLite where a
+        # read snapshot can make the subsequent write-lock upgrade fail.
+        existing = _existing_message_hashes(
+            db, task_id=task_id, blobs_by_hash=candidates_to_insert
+        )
+        candidates_to_insert = {
+            key: value
+            for key, value in candidates_to_insert.items()
+            if key not in existing
+        }
     if _insert_blob_rows_on_conflict_do_nothing(
         db,
         model=TraceMessageBlob,
@@ -1308,7 +1435,7 @@ def _upsert_message_blobs(
                 "task_id": task_id,
                 "execution_id": execution_id,
                 "message_hash": message_hash,
-                "message_data": copy.deepcopy(candidate.data),
+                "message_data": _materialize_blob_data(candidate.data),
                 "message_bytes": candidate.payload_bytes,
             }
             for message_hash, candidate in candidates_to_insert.items()
@@ -1351,7 +1478,7 @@ def _upsert_message_blobs(
                 task_id=task_id,
                 execution_id=execution_id,
                 message_hash=message_hash,
-                message_data=copy.deepcopy(candidate.data),
+                message_data=_materialize_blob_data(candidate.data),
                 message_bytes=candidate.payload_bytes,
             )
         )
@@ -1363,8 +1490,24 @@ def _validate_message_blobs(
     task_id: int,
     blobs_by_hash: dict[str, BlobCandidate],
 ) -> None:
+    found = _existing_message_hashes(db, task_id=task_id, blobs_by_hash=blobs_by_hash)
+    missing = set(blobs_by_hash) - found
+    if missing:
+        raise RuntimeError(
+            f"trace message blob upsert did not persist {len(missing)} row(s) "
+            f"for task {task_id}."
+        )
+
+
+def _existing_message_hashes(
+    db: Session,
+    *,
+    task_id: int,
+    blobs_by_hash: dict[str, BlobCandidate],
+) -> set[str]:
+    """Find stored candidates, preserving the existing byte-count check."""
     if not blobs_by_hash:
-        return
+        return set()
 
     found: set[str] = set()
     chunk_size = _sql_in_clause_chunk_size(db, reserved_binds=1)
@@ -1387,12 +1530,7 @@ def _validate_message_blobs(
                 )
             found.add(message_hash)
 
-    missing = set(blobs_by_hash) - found
-    if missing:
-        raise RuntimeError(
-            f"trace message blob upsert did not persist {len(missing)} row(s) "
-            f"for task {task_id}."
-        )
+    return found
 
 
 def _pending_checkpoint_blob_refs(
@@ -1442,6 +1580,18 @@ def _upsert_checkpoint_blobs(
     candidates_to_insert = {
         blob_ref: blobs_by_ref[blob_ref] for blob_ref in refs_to_query
     }
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        # As with messages, only new blobs need payload copies and INSERTs.
+        # The lookup is task- and kind-scoped, and validates existing sizes.
+        existing = _existing_checkpoint_blob_refs(
+            db, task_id=task_id, blobs_by_ref=candidates_to_insert
+        )
+        candidates_to_insert = {
+            key: value
+            for key, value in candidates_to_insert.items()
+            if key not in existing
+        }
     if _insert_blob_rows_on_conflict_do_nothing(
         db,
         model=TraceCheckpointBlob,
@@ -1451,7 +1601,7 @@ def _upsert_checkpoint_blobs(
                 "execution_id": execution_id,
                 "blob_kind": blob_kind,
                 "blob_hash": blob_hash,
-                "blob_data": copy.deepcopy(candidate.data),
+                "blob_data": _materialize_blob_data(candidate.data),
                 "blob_bytes": candidate.payload_bytes,
             }
             for (blob_kind, blob_hash), candidate in candidates_to_insert.items()
@@ -1509,7 +1659,7 @@ def _upsert_checkpoint_blobs(
                 execution_id=execution_id,
                 blob_kind=blob_kind,
                 blob_hash=blob_hash,
-                blob_data=copy.deepcopy(candidate.data),
+                blob_data=_materialize_blob_data(candidate.data),
                 blob_bytes=candidate.payload_bytes,
             )
         )
@@ -1521,8 +1671,26 @@ def _validate_checkpoint_blobs(
     task_id: int,
     blobs_by_ref: dict[tuple[str, str], BlobCandidate],
 ) -> None:
+    found = _existing_checkpoint_blob_refs(
+        db, task_id=task_id, blobs_by_ref=blobs_by_ref
+    )
+    missing = set(blobs_by_ref) - found
+    if missing:
+        raise RuntimeError(
+            f"trace checkpoint blob upsert did not persist {len(missing)} row(s) "
+            f"for task {task_id}."
+        )
+
+
+def _existing_checkpoint_blob_refs(
+    db: Session,
+    *,
+    task_id: int,
+    blobs_by_ref: dict[tuple[str, str], BlobCandidate],
+) -> set[tuple[str, str]]:
+    """Find stored candidates without loading their JSON payloads."""
     if not blobs_by_ref:
-        return
+        return set()
 
     found: set[tuple[str, str]] = set()
     refs_by_kind: dict[str, set[str]] = {}
@@ -1555,9 +1723,4 @@ def _validate_checkpoint_blobs(
                     )
                 found.add(blob_ref)
 
-    missing = set(blobs_by_ref) - found
-    if missing:
-        raise RuntimeError(
-            f"trace checkpoint blob upsert did not persist {len(missing)} row(s) "
-            f"for task {task_id}."
-        )
+    return found

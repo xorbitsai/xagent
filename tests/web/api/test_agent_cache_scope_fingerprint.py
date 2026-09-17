@@ -23,16 +23,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
+    ExecutionScopeAuthorityError,
     ExecutionScopeContext,
     scope_fingerprint,
-    set_execution_scope_resolver,
+    set_execution_scope_snapshot_loader,
 )
-from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.agent_service_manager import AgentServiceManager
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -42,13 +44,6 @@ from xagent.web.services.task_setup_snapshot import (
 
 SCOPE_A = ExecutionScope(sandbox_key_suffix="tenant-a")
 SCOPE_B = ExecutionScope(sandbox_key_suffix="tenant-b")
-
-
-@pytest.fixture(autouse=True)
-def _clear_resolver():
-    set_execution_scope_resolver(None)
-    yield
-    set_execution_scope_resolver(None)
 
 
 def _make_user() -> User:
@@ -120,16 +115,19 @@ def _common_patches(
     return [
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
         patch(
-            "xagent.web.api.chat.create_default_tools",
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
             new=AsyncMock(return_value=([], MagicMock())),
         ),
         patch(
             "xagent.web.sandbox_manager.get_sandbox_manager",
             return_value=sandbox_manager,
         ),
-        patch("xagent.web.api.chat.AgentService"),
+        patch("xagent.web.services.agent_service_manager.AgentService"),
     ]
 
 
@@ -144,7 +142,7 @@ async def _call(manager: AgentServiceManager, **kwargs: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_scope_change_between_turns_evicts_and_rebuilds() -> None:
-    set_execution_scope_resolver(lambda task_id: SCOPE_B)
+    register_scope_resolver(lambda task_id: SCOPE_B)
     manager = AgentServiceManager()
     stale_agent = MagicMock()
     manager._agents[42] = stale_agent
@@ -171,11 +169,50 @@ async def test_scope_change_between_turns_evicts_and_rebuilds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_isolate_external_dirs_only_change_evicts_and_rebuilds() -> None:
+    """(#296) isolate_external_dirs is baked into the
+    cached AgentService's allowed_external_dirs at build time, not read
+    fresh -- an isolate_external_dirs-only change (same sandbox suffix,
+    workspace segments, mount, memory dimensions) must still evict the
+    cache, or the stale allowed-dirs list keeps being enforced."""
+    scope_shared = ExecutionScope(sandbox_key_suffix="tenant-a")
+    scope_isolated = ExecutionScope(
+        sandbox_key_suffix="tenant-a", isolate_external_dirs=True
+    )
+    assert scope_fingerprint(scope_shared) != scope_fingerprint(scope_isolated)
+
+    register_scope_resolver(
+        lambda task_id: scope_isolated,
+    )
+    manager = AgentServiceManager()
+    stale_agent = MagicMock()
+    manager._agents[42] = stale_agent
+    manager._agent_owner_ids[42] = 1
+    manager._agent_sandbox_keys[42] = "user:1:tenant-a"
+    manager._agent_scope_fingerprints[42] = scope_fingerprint(scope_shared)
+
+    with ExitStack() as stack:
+        for p in _common_patches(manager):
+            stack.enter_context(p)
+        await _call(
+            manager,
+            db=_build_db_mock(_make_task_row()),
+            user=_make_user(),
+            task_setup_snapshot=_build_snapshot(),
+        )
+
+    assert manager._agents.get(42) is not stale_agent
+    assert manager._agent_scope_fingerprints.get(42) == scope_fingerprint(
+        scope_isolated
+    )
+
+
+@pytest.mark.asyncio
 async def test_scope_flap_is_logged_as_probable_resolver_bug(caplog) -> None:
     """A -> B -> A: the resolver returning the fingerprint that a previous
     rebuild evicted means it flaps between values — every turn would evict
     and rebuild, silently defeating the cache."""
-    set_execution_scope_resolver(lambda task_id: SCOPE_A)
+    register_scope_resolver(lambda task_id: SCOPE_A)
     manager = AgentServiceManager()
     manager._agents[42] = MagicMock()
     manager._agent_owner_ids[42] = 1
@@ -211,7 +248,7 @@ async def test_multi_scope_cycle_is_also_flagged_as_resolver_bug(caplog) -> None
     def cycling_resolver(task_id):
         return cycle[turn["n"] % len(cycle)]
 
-    set_execution_scope_resolver(cycling_resolver)
+    register_scope_resolver(cycling_resolver)
     manager = AgentServiceManager()
 
     with ExitStack() as stack:
@@ -241,7 +278,7 @@ async def test_activated_turn_scope_is_reused_without_re_resolving() -> None:
         resolver_calls.append(task_id)
         return SCOPE_A
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
     manager = AgentServiceManager()
 
     with ExitStack() as stack:
@@ -284,8 +321,8 @@ async def test_unscoped_cached_agent_is_reused_without_eviction() -> None:
 async def test_stable_scope_does_not_evict_between_turns() -> None:
     """An idempotent resolver returning an equal scope every turn keeps the
     cache warm — equality is by fingerprint value, not object identity."""
-    set_execution_scope_resolver(
-        lambda task_id: ExecutionScope(sandbox_key_suffix="tenant-a")
+    register_scope_resolver(
+        lambda task_id: ExecutionScope(sandbox_key_suffix="tenant-a"),
     )
     manager = AgentServiceManager()
     cached_agent = MagicMock()
@@ -305,12 +342,82 @@ async def test_stable_scope_does_not_evict_between_turns() -> None:
     assert result is cached_agent
 
 
+class _ScopeTrackingToolConfig:
+    """Minimal ``WebToolConfig`` stand-in: records every scope it is handed
+    without exercising the real swap/cache-drop logic (that logic is pinned
+    separately in ``tests/web/tools/test_web_tool_config_session_factory.py``).
+    """
+
+    def __init__(self, scope: ExecutionScope) -> None:
+        self.scope = scope
+        self.set_calls: list[ExecutionScope] = []
+
+    def set_execution_scope(self, scope: ExecutionScope) -> bool:
+        self.set_calls.append(scope)
+        self.scope = scope
+        return True
+
+
+class _CachedAgentWithToolConfig:
+    def __init__(self, tool_config: _ScopeTrackingToolConfig) -> None:
+        self.tool_config = tool_config
+        self.invalidate_calls = 0
+
+    def invalidate_tools(self) -> None:
+        self.invalidate_calls += 1
+
+    def cleanup_workspace(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_cached_agent_service_is_resynced_with_the_turn_execution_scope() -> None:
+    """A same-fingerprint scope change keeps the cached AgentService (no
+    rebuild), but the resolved scope for THIS turn must still reach the
+    cached tool config -- otherwise a resolver that hands back a scope
+    object carrying turn-varying data outside the namespace fingerprint
+    (here: ``strict_memory_isolation``, which ``scope_fingerprint`` doesn't
+    cover) would leave the OAuth resolver hook reading the first turn's
+    scope object forever.
+
+    Also covers the ``connector_runtime_turn_id=None`` case: unlike
+    ``_sync_connector_runtime_turn``, the execution-scope resync must not be
+    gated on a turn id being present.
+    """
+    tool_config = _ScopeTrackingToolConfig(SCOPE_A)
+    cached_agent = _CachedAgentWithToolConfig(tool_config)
+    manager = AgentServiceManager()
+    manager._agents[42] = cached_agent
+    manager._agent_owner_ids[42] = 1
+    manager._agent_scope_fingerprints[42] = scope_fingerprint(SCOPE_A)
+
+    scope_b = ExecutionScope(
+        sandbox_key_suffix="tenant-a", strict_memory_isolation=True
+    )
+    assert scope_fingerprint(scope_b) == scope_fingerprint(SCOPE_A)
+    assert scope_b != SCOPE_A
+
+    result = await manager.get_agent_for_task(
+        task_id=42,
+        db=_build_db_mock(_make_task_row()),
+        user=_make_user(),
+        task_setup_snapshot=_build_snapshot(),
+        connector_runtime_turn_id=None,
+        resolved_execution_scope=scope_b,
+    )
+
+    assert result is cached_agent
+    assert tool_config.scope is scope_b
+    assert tool_config.set_calls == [scope_b]
+    assert cached_agent.invalidate_calls == 1
+
+
 @pytest.mark.asyncio
 async def test_resolver_scope_reaches_sandbox_key_on_build() -> None:
     """End-to-end through the resolver path: a fresh build under a scoped
     resolver acquires the scoped container family and records the
     scope-suffixed key for execution-time attach."""
-    set_execution_scope_resolver(lambda task_id: SCOPE_A)
+    register_scope_resolver(lambda task_id: SCOPE_A)
     manager = AgentServiceManager()
     fake_sandbox_manager = MagicMock()
     fake_sandbox_manager.get_or_create_lease_provider = AsyncMock(
@@ -344,7 +451,7 @@ async def test_resolver_scope_reaches_workspace_paths_on_build() -> None:
     from xagent.core.workspace import scoped_user_root
 
     scope = ExecutionScope(workspace_segments=("tenant-a",))
-    set_execution_scope_resolver(lambda task_id: scope)
+    register_scope_resolver(lambda task_id: scope)
     manager = AgentServiceManager()
 
     with ExitStack() as stack:
@@ -353,7 +460,7 @@ async def test_resolver_scope_reaches_workspace_paths_on_build() -> None:
         for p in _common_patches(manager)[:-1]:
             stack.enter_context(p)
         agent_service_mock = stack.enter_context(
-            patch("xagent.web.api.chat.AgentService")
+            patch("xagent.web.services.agent_service_manager.AgentService")
         )
         await _call(
             manager,
@@ -385,7 +492,7 @@ async def test_unscoped_build_uses_legacy_workspace_base_dir() -> None:
         for p in _common_patches(manager)[:-1]:
             stack.enter_context(p)
         agent_service_mock = stack.enter_context(
-            patch("xagent.web.api.chat.AgentService")
+            patch("xagent.web.services.agent_service_manager.AgentService")
         )
         await _call(
             manager,
@@ -422,3 +529,32 @@ async def test_unscoped_build_records_legacy_key() -> None:
     assert lifecycle_args == ("user", "1")
     assert manager._agent_sandbox_keys.get(42) == "user:1"
     assert manager._agent_scope_fingerprints.get(42) is None
+
+
+@pytest.mark.asyncio
+async def test_turn_face_authority_mismatch_fails_the_turn() -> None:
+    """``get_agent_for_task`` is a turn-face consumer of
+    ``resolve_execution_scope``: unlike the off-turn consumers
+    (``ManagedFileRef``'s construction, the pause/resume handlers), a
+    namespace-affecting authority mismatch here must propagate and fail the
+    turn rather than being downgraded to a warning.
+    ``websocket._scope_segments_for_task`` is off-turn and still resolves
+    fail-closed, so what decides this is whether a namespace is being chosen
+    for new bytes, not whether a turn is running."""
+    register_scope_resolver(
+        lambda task_id: ExecutionScope(sandbox_key_suffix="from-resolver"),
+    )
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(sandbox_key_suffix="from-snapshot")
+    )
+    manager = AgentServiceManager()
+    manager._default_llm = MagicMock()
+
+    with pytest.raises(ExecutionScopeAuthorityError):
+        await manager.get_agent_for_task(
+            task_id=42,
+            db=None,
+            user=_make_user(),
+            task_owner_user_id=1,
+            task_setup_snapshot=_build_snapshot(),
+        )

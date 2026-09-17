@@ -1,12 +1,15 @@
 from datetime import datetime
-from typing import Any, List
+from typing import Any
 
 from pydantic import BaseModel, field_validator
 
 
 class UserResponse(BaseModel):
+    """Administrative account data with separate identity and display fields."""
+
     id: int
     username: str
+    email: str | None = None
     is_admin: bool
     created_at: str
     updated_at: str
@@ -25,7 +28,7 @@ class UserResponse(BaseModel):
 
 
 class UserListResponse(BaseModel):
-    users: List[UserResponse]
+    users: list[UserResponse]
     total: int
     page: int
     size: int

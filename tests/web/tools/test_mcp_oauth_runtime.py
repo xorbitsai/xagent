@@ -167,7 +167,7 @@ def _assert_unavailable_runtime_config(
     assert config["config"]["diagnostic"] == diagnostic
     assert config["config"]["failure_code"] == "oauth_token_required"
     assert config["user_id"] == str(server.user_mcpservers[0].user_id)
-    assert config["allow_users"] == [str(server.user_mcpservers[0].user_id)]
+    assert "allow_users" not in config
     assert "runtime_input_schema" not in config
     assert "runtime_bindings" not in config
     assert "allow_delegated_authorization" not in config

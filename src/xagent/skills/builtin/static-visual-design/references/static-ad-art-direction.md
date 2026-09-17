@@ -44,11 +44,11 @@ devices from the same brief:
 - **Let a brand asset act.** Give the mascot, logo form, or brand color a
   role in the story instead of a corner placement.
 
-For one brief, generate more device candidates than direction slots — five to
-eight sketches for a set of three — then keep the ones that dramatize
-genuinely different propositions and discard any that merely decorate. A kept
-direction states its device in one sentence, such as "the 1.4M milestone
-staged as a rally the viewer is invited to join." Every device must still
+For one brief, write more device candidates than direction slots — five to
+eight one-sentence sketches for a set of three, none of them rendered — then
+keep the ones that dramatize genuinely different propositions and discard any
+that merely decorate. A kept direction states its device in one sentence, such
+as "the 1.4M milestone staged as a rally the viewer is invited to join." Every device must still
 pass the competitor-substitution test and carry verified claims only.
 
 ## Choose a communication structure
@@ -261,8 +261,8 @@ data streams, glowing faces, or orbiting dots.
 
 ## Review like a creative director
 
-Automatic rejection overrides subjective scoring. Reject a candidate when it
-has any of these failures:
+Automatic rejection overrides subjective scoring. Reject a candidate when it has
+any of these failures, within the limits the main skill sets on repairs:
 
 - more than one ad, a contact sheet, multiple panels, or presentation mockups
   when one asset was requested;
@@ -297,7 +297,16 @@ Use `edit_image` only for a localized defect on an otherwise strong,
 single-canvas composition: a small crop issue, one contained object problem, a
 minor color imbalance, or removable artifact.
 
-Regenerate from the locked design specification when the failure is structural:
-contact-sheet output, duplicated layout, wrong hierarchy, excessive copy,
-generic concept, wrong focal subject, incoherent visual metaphor, or multiple
-text errors. Editing a structurally wrong image usually compounds the failure.
+While the repair budget lasts, regenerate from the locked design specification
+when the failure is structural: contact-sheet output, duplicated layout, wrong
+hierarchy, excessive copy, generic concept, wrong focal subject, incoherent
+visual metaphor, or multiple text errors. Editing a structurally wrong image
+usually compounds the failure.
+
+Every rejection in this document is a quality failure by the main skill's
+definitions, and so is every edit-or-regenerate decision here: each one describes
+a candidate that exists and is wrong. They are therefore subordinate to that
+skill's repair budget — edits count against it just as regenerations do, and once
+it is spent, none of them justifies another render. Deliver the best candidate and
+name the defects instead. Only a required asset with no candidate at all is
+coverage, and the main skill governs that.

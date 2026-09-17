@@ -264,3 +264,6 @@ fenixaos_web.db
 
 # Per-developer local frontend env
 frontend/.env.local
+
+# Database dumps written by the docker/README.md backup steps
+/backup.sql

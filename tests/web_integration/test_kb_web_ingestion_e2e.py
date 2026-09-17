@@ -376,7 +376,7 @@ class TestKBWebIngestionE2E:
         auth_headers: dict[str, str],
         mock_web_rag_pipeline: None,
     ):
-        """Test handling when crawler returns no results."""
+        """A crawl that ingested nothing publishes no KB, so it reports an error."""
         collection_name = "e2e_empty_test"
         url = "https://example.com/empty"
 
@@ -399,7 +399,7 @@ class TestKBWebIngestionE2E:
                 headers=auth_headers,
             )
 
-            assert response.status_code == 200
+            assert response.status_code == 500
             result = response.json()
-            # Should handle gracefully
-            assert result["status"] in ["success", "error"]
+            assert result["status"] == "error"
+            assert "No pages were ingested" in result["message"]

@@ -1,11 +1,13 @@
 const COMPACTABLE_CHANNEL_TERMS: Record<string, string[]> = {
   telegram: ["telegram"],
   feishu: ["feishu", "lark", "飞书"],
+  slack: ["slack"],
 }
 
 const CHANNEL_TYPE_LABELS: Record<string, string> = {
   telegram: "Telegram",
   feishu: "Feishu",
+  slack: "Slack",
 }
 
 const CHANNEL_TERM_SEPARATOR_PATTERN = "[\\s\\-_:·|]"

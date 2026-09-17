@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -62,6 +63,29 @@ class TestDeepSeekLLM:
             DeepSeekLLM(model_name="deepseek-reasoner", api_key="test-api-key")
         with pytest.raises(ValueError, match="Unsupported DeepSeek model"):
             DeepSeekLLM(model_name="not-a-deepseek-model", api_key="test-api-key")
+
+    @pytest.mark.asyncio
+    async def test_stable_flash_name_is_forwarded_to_direct_api(self, mocker):
+        message = SimpleNamespace(content="ok", tool_calls=None, reasoning_content=None)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=None,
+            model_dump=lambda: {"id": "deepseek-stable-flash"},
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = DeepSeekLLM(model_name="deepseek-flash", api_key="test-api-key")
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert result["content"] == "ok"
+        assert mock_client.chat.completions.create.call_args.kwargs["model"] == (
+            "deepseek-flash"
+        )
 
     def test_structured_output_capabilities(self, llm):
         assert llm.supports_json_schema_response_format is False
@@ -736,6 +760,73 @@ class TestDeepSeekLLM:
         assert call_messages[0]["reasoning_content"] == ""
 
     @pytest.mark.asyncio
+    async def test_replay_logs_info_summary_of_capture_vs_fallback_counts(
+        self, llm, mock_chat_completion, mocker, caplog
+    ):
+        """Design §6's second default observation: one INFO summary per
+        request counting how many assistant tool-call messages replayed
+        real captured reasoning content versus how many hit the
+        empty-string fallback. Two of the three tool-call messages below
+        carry captured provider state; the third does not.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        def _assistant_tool_call_message(call_id, *, reasoning_content=None):
+            message = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            }
+            if reasoning_content is not None:
+                message[PROVIDER_STATE_METADATA_KEY] = {
+                    DEEPSEEK_PROVIDER_STATE_NAMESPACE: {
+                        DEEPSEEK_REASONING_CONTENT_STATE_KEY: reasoning_content
+                    }
+                }
+            return message
+
+        messages = [
+            {"role": "user", "content": "Search xagent"},
+            _assistant_tool_call_message("call_1", reasoning_content="first thought"),
+            {"role": "tool", "tool_call_id": "call_1", "content": "result 1"},
+            _assistant_tool_call_message("call_2", reasoning_content="second thought"),
+            {"role": "tool", "tool_call_id": "call_2", "content": "result 2"},
+            _assistant_tool_call_message("call_3"),
+            {"role": "tool", "tool_call_id": "call_3", "content": "result 3"},
+        ]
+
+        with caplog.at_level(
+            logging.INFO,
+            logger="xagent.core.model.chat.basic.deepseek_tool_protocol",
+        ):
+            await llm.chat(messages)
+
+        summaries = [
+            record.getMessage()
+            for record in caplog.records
+            if "reasoning replay" in record.getMessage()
+        ]
+        assert len(summaries) == 1
+        summary = summaries[0]
+        assert llm.model_name in summary
+        assert "2 assistant message(s) replayed captured reasoning content" in summary
+        assert "1 used the empty-string fallback" in summary
+        # Only counts and the model name are logged, never the captured text.
+        assert "first thought" not in summary
+        assert "second thought" not in summary
+
+    @pytest.mark.asyncio
     async def test_final_answer_call_replays_empty_reasoning_content_without_tools(
         self, llm, mock_chat_completion, mocker
     ):
@@ -840,15 +931,31 @@ class TestDeepSeekLLM:
         token_chunks = [chunk for chunk in chunks if chunk.type == ChunkType.TOKEN]
         assert [chunk.delta for chunk in token_chunks] == ["Final answer"]
         assert token_chunks[0].raw["reasoning_content"] == "Think first."
+        # Covers the provider-state branch of ``_attach_reasoning_content_to_raw``
+        # (deepseek.py), which the assertions above never exercised: they only
+        # checked the mirrored ``reasoning_content`` field the base class also
+        # sets, not the ``_xagent_provider_state`` marker DeepSeek's own
+        # streaming override adds on top of it.
+        assert token_chunks[0].raw[PROVIDER_STATE_METADATA_KEY] == {
+            DEEPSEEK_PROVIDER_STATE_NAMESPACE: {
+                DEEPSEEK_REASONING_CONTENT_STATE_KEY: "Think first."
+            }
+        }
 
         end_chunk = next(chunk for chunk in chunks if chunk.type == ChunkType.END)
         assert end_chunk.raw["reasoning_content"] == "Think first."
+        assert end_chunk.raw[PROVIDER_STATE_METADATA_KEY] == {
+            DEEPSEEK_PROVIDER_STATE_NAMESPACE: {
+                DEEPSEEK_REASONING_CONTENT_STATE_KEY: "Think first."
+            }
+        }
 
     @pytest.mark.asyncio
-    async def test_list_available_models_returns_curated_v4_models(self):
+    async def test_list_available_models_returns_curated_models(self):
         models = await DeepSeekLLM.list_available_models("test-api-key")
 
         assert [model["id"] for model in models] == [
+            "deepseek-flash",
             "deepseek-v4-flash",
             "deepseek-v4-pro",
         ]

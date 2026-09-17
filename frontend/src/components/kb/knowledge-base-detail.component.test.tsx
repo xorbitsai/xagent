@@ -19,7 +19,7 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
-vi.mock("sonner", () => ({
+vi.mock("@/components/ui/sonner", () => ({
   toast: {
     error: toastErrorMock,
     success: vi.fn(),

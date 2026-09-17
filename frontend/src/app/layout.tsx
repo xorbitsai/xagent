@@ -1,23 +1,36 @@
 import type { Metadata } from "next";
-import type { CSSProperties } from "react";
+import React, { type CSSProperties } from "react";
 import "./globals.css";
-import { AuthProvider } from "@/contexts/auth-context";
 import { ThemeProvider } from "@/contexts/theme-context";
-import { AuthGuard } from "@/components/auth/auth-guard";
-import { LayoutContent } from "@/components/layout/layout-content";
-import { getBrandingFromEnv } from "@/lib/branding";
+import { ApplicationShell } from "@/components/layout/application-shell";
+import { getBrandingFromEnv, resolveMetadataBase } from "@/lib/branding";
 import { I18nProvider } from "@/contexts/i18n-context";
 import { getThemeFromEnv, themes } from "@/lib/theme";
 import { Toaster } from "@/components/ui/sonner";
-import { McpAppsProvider } from "@/contexts/mcp-apps-context";
-import { VoiceInputController } from "@/components/voice-input-controller";
-import { TaskErrorController } from "@/components/task-error-controller";
 
 const branding = getBrandingFromEnv();
 
 export const metadata: Metadata = {
+  metadataBase: resolveMetadataBase(branding.siteUrl),
   title: branding.appName,
   description: branding.description,
+  applicationName: branding.appName,
+  openGraph: {
+    siteName: branding.appName,
+    title: branding.appName,
+    description: branding.description,
+    type: "website",
+    url: "/",
+    images: [
+      {
+        url: branding.logoPath,
+        alt: branding.logoAlt,
+        width: 300,
+        height: 300,
+        type: "image/png",
+      },
+    ],
+  },
   icons: {
     icon: branding.logoPath,
     apple: branding.logoPath,
@@ -117,16 +130,8 @@ export default function RootLayout({
       >
         <I18nProvider initialLocale={initialLocale}>
           <ThemeProvider>
-            <AuthProvider>
-              <McpAppsProvider>
-                <AuthGuard>
-                  <LayoutContent>{children}</LayoutContent>
-                  <VoiceInputController />
-                  <TaskErrorController />
-                  <Toaster />
-                </AuthGuard>
-              </McpAppsProvider>
-            </AuthProvider>
+            <ApplicationShell>{children}</ApplicationShell>
+            <Toaster />
           </ThemeProvider>
         </I18nProvider>
       </body>

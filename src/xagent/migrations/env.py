@@ -29,8 +29,20 @@ config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
+#
+# This branch only runs when alembic is driven from a config *file*: the
+# standalone `alembic upgrade head` CLI and tests/migrations/ (which build
+# their Config from alembic.ini). Normal app startup goes through
+# xagent.db.config.create_alembic_config(), which builds an in-memory Config
+# with no filename, so config.config_file_name is None there and this branch
+# is skipped -- production is not affected either way.
+# ``disable_existing_loggers`` defaults to True, which would disable every
+# already-registered logger not explicitly listed in alembic.ini's
+# [loggers] section (root/sqlalchemy/alembic) for the rest of the process.
+# That's what was poisoning the test suite: migration tests ran fileConfig
+# and disabled loggers that later tests then asserted against.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Use our models' MetaData for autogenerate support
 target_metadata = Base.metadata

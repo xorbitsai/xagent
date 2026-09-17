@@ -14,6 +14,47 @@ features:
   - 读取并摘要新邮件和未读邮件线程，并附优先级标签
   - 以您的语气起草回复——保存为草稿，未经批准不会发送
   - 标记敏感或高风险邮件，提醒您亲自处理
+sample_prompts:
+  en:
+  - title: Prioritise my inbox
+    prompt: Read and summarise my new and unread email threads with priority labels, flagging sensitive or high-stakes messages for my attention.
+    highlights: []
+  - title: Draft replies
+    prompt: 'Draft replies to threads in my voice and save them to Drafts — never send without my approval.'
+    highlights:
+    - threads
+  zh:
+  - title: 整理我的收件箱
+    prompt: 阅读并总结我新收到的未读邮件线程，标注优先级，并标记需要我关注的敏感或重要邮件。
+    highlights: []
+  - title: 起草回复
+    prompt: 以我的语气为 邮件线程 起草回复，保存到草稿箱——未经批准绝不发送。
+    highlights:
+    - 邮件线程
+persona:
+  name: Ellie
+  role:
+    en: Inbox Manager
+    zh: 收件箱管理专员
+  avatar: /marketplace/avatars/ellie.png
+  intro:
+    en: |-
+      Hi there — I'm Ellie, your Inbox Manager.
+
+      I summarise new and unread mail with priority labels and draft replies in your voice for approval.
+    zh: |-
+      你好，我是 Ellie，你的收件箱管理专员。
+
+      我会给新邮件和未读邮件打上优先级标签并汇总摘要，再用你的语气起草回复，等你审批。
+  kickoff_questions:
+    en:
+    - Which Gmail labels should I watch — the whole inbox, or just Primary?
+    - What counts as "needs you today" — a customer, your manager, anything with a deadline?
+    - Should I draft replies to everything that needs one, or only the threads you flag?
+    zh:
+    - 我该盯哪些 Gmail 标签——整个收件箱，还是只看主要邮件？
+    - 什么样的邮件算"今天必须处理"——客户来信、你的上级，还是任何有截止日期的事？
+    - 所有需要回复的邮件都起草，还是只处理你标记出来的？
 connections:
 - name: Gmail
   logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64

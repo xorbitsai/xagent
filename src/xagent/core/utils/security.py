@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import re
 import socket
+import ssl
 from dataclasses import dataclass
 from typing import Mapping
 from urllib.parse import (
@@ -28,13 +29,169 @@ SENSITIVE_QUERY_KEYS = {
 }
 
 URL_PATTERN = re.compile(r"https?://[^\s\"'>]+")
-ASSIGNMENT_SECRET_PATTERN = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|token|password|secret|key)=([^&\s]+)"
+# Every ``identifier=`` in the text; ``_is_credential_key`` decides which
+# identifiers name a secret. Only a credential's value is consumed
+# (``_ASSIGNMENT_VALUE_PATTERN``: up to ``&`` or whitespace). After any other
+# identifier the scan resumes right behind its ``=``, so a credential that
+# follows it without a space (``host=db;password=...``) is still judged on
+# its own. The regex itself stays linear: a single identifier run followed
+# by ``=``, anchored on a non-identifier boundary, so a long run of
+# ``a_a_a_...`` without ``=`` fails once per run instead of re-trying every
+# segment split (a nested ``(prefix_)*word`` quantifier did that and took
+# seconds on a 20 kB hostile message).
+ASSIGNMENT_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z0-9_-]+)=")
+_ASSIGNMENT_VALUE_PATTERN = re.compile(r"[^&\s]+")
+# A credential word may sit behind an identifier prefix (``MCP_API_KEY=``,
+# ``SERVICE_ACCESS_TOKEN=``, ``DB_PASSWORD=``), so a key is a credential when it
+# ends in one of these words and the word is the whole key or is joined to
+# the prefix by ``_``/``-``. ``key`` itself is included: ``SECRET_KEY=``,
+# ``AWS_SECRET_ACCESS_KEY=``, ``STRIPE_KEY=`` and ``PRIVATE_KEY=`` are all
+# credentials, and an unknown ``*_key`` or ``*_token`` is treated as one (fail
+# closed). A per-suffix qualifier below keeps a key readable only when the
+# rest of the prefix carries no credential word, because this text also
+# reaches user- and model-facing error messages: ``next_token=`` stays
+# readable, ``secret_next_token=`` does not.
+_CREDENTIAL_KEY_SUFFIXES = (
+    "api_key",
+    "api-key",
+    "apikey",
+    "access_token",
+    "access-token",
+    "accesstoken",
+    "token",
+    "password",
+    "secret",
+    "key",
 )
-BEARER_PATTERN = re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)")
+_NON_CREDENTIAL_KEY_QUALIFIERS = frozenset(
+    {
+        "primary",
+        "foreign",
+        "unique",
+        "composite",
+        "index",
+        "sort",
+        "partition",
+        "range",
+        "hash",
+        "lookup",
+        "cache",
+        "routing",
+        "idempotency",
+        "public",
+        "object",
+        "s3",
+    }
+)
+# ``*_token`` names that mark a position or a request, not access: paging
+# cursors (``next_token``, ``page_token``, ``continuation_token``, ...) and a
+# client-chosen de-duplication id (``idempotency_token``). Kept apart from
+# the ``key`` list: ``public_token`` is exchanged for an access token, and
+# ``s3_token`` / ``cache_token`` may be credentials.
+# ``page_token`` is ambiguous: some code also names a Facebook Page access
+# token that way. The name alone cannot tell them apart (#2356).
+_NON_CREDENTIAL_TOKEN_QUALIFIERS = frozenset(
+    {"idempotency", "next", "page", "continuation", "cursor", "sync", "pagination"}
+)
+# Credential words that make a key a credential wherever they sit in its
+# prefix, not only in the segment next to the suffix: ``secret_next_token``
+# is a secret however structural its last qualifier reads. The
+# single-segment credential suffixes are reused verbatim (a prefix segment
+# can only ever equal one of those), plus the words that appear only as a
+# qualifier and never as a suffix of their own.
+_CREDENTIAL_PREFIX_WORDS = frozenset(
+    {
+        suffix
+        for suffix in _CREDENTIAL_KEY_SUFFIXES
+        if "_" not in suffix and "-" not in suffix
+    }
+    | {
+        "access",
+        "auth",
+        "bearer",
+        "client",
+        "oauth",
+        "private",
+        "refresh",
+        "session",
+        "signing",
+    }
+)
+# The qualifier is the ``_``/``-`` segment just before the suffix
+# (``next_page_token`` -> ``page``). Every other suffix (``api_key``,
+# ``access_token``, ``password``, ``secret`` and their spellings) has no
+# exemption, so ``page_access_token=`` stays masked. The exemption below
+# only applies when that segment is joined to the suffix with ``_``; a
+# hyphen join (``next-token=``, ``cache-key=``) is treated as a credential
+# and masked. It also requires the *whole* prefix to be free of credential
+# words (``_CREDENTIAL_PREFIX_WORDS``), so ``secret_next_token`` is masked
+# even though its qualifier is ``next``.
+_NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX = {
+    "key": _NON_CREDENTIAL_KEY_QUALIFIERS,
+    "token": _NON_CREDENTIAL_TOKEN_QUALIFIERS,
+}
+
+
+def _is_credential_key(key: str) -> bool:
+    lowered = key.lower()
+    for suffix in _CREDENTIAL_KEY_SUFFIXES:
+        if not lowered.endswith(suffix):
+            continue
+        prefix = lowered[: -len(suffix)]
+        if prefix.strip("-") == "":
+            # Bare word, or a CLI-style flag such as ``--api-key=``.
+            return True
+        if prefix[-1] not in "_-":
+            # ``monkey=`` / ``hotkey=`` / ``mytoken=``: the credential word is
+            # not a separate segment of the identifier.
+            continue
+        # The exemption only reads as a deliberate structural-field name
+        # when the qualifier is joined to the suffix by ``_``
+        # (``primary_key=``, ``next_token=``). A hyphen join is treated as
+        # a credential name: ``cache-key=`` / ``next-token=`` are masked;
+        # only the underscore-joined spelling is exempt, and only when the
+        # whole prefix is also free of credential words
+        # (``_CREDENTIAL_PREFIX_WORDS``): ``secret_next_token=`` stays
+        # masked even though its last qualifier is ``next``.
+        exempt = _NON_CREDENTIAL_QUALIFIERS_BY_SUFFIX.get(suffix)
+        if exempt is not None and prefix[-1] == "_":
+            segments = re.split(r"[_-]", prefix.rstrip("_-"))
+            if not _CREDENTIAL_PREFIX_WORDS.intersection(segments) and (
+                segments[-1] in exempt
+            ):
+                return False
+        return True
+    return False
+
+
+def _redact_assignments(text: str) -> str:
+    # Values are read only for credentials and never overlap, and finditer
+    # tries each position once, so every character is examined a constant
+    # number of times however many ``identifier=`` runs the text holds.
+    parts: list[str] = []
+    copied = 0
+    for match in ASSIGNMENT_PATTERN.finditer(text):
+        if match.start() < copied or not _is_credential_key(match.group(1)):
+            # Inside a value already masked, or not a credential: leave the
+            # text as it is and keep scanning right after this ``=``.
+            continue
+        value = _ASSIGNMENT_VALUE_PATTERN.match(text, match.end())
+        if value is None:
+            continue
+        parts.append(text[copied : match.end()])
+        parts.append(_mask_secret(value.group(0)))
+        copied = value.end()
+    parts.append(text[copied:])
+    return "".join(parts)
+
+
+AUTH_HEADER_PATTERN = re.compile(
+    r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)([^\s,;]+)"
+)
 HEADER_KEY_PATTERNS = [
     re.compile(r"(?i)(x-goog-api-key\s*[:=]\s*)([^\s,;]+)"),
     re.compile(r"(?i)(x-api-key\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(x-shopify-access-token\s*[:=]\s*)([^\s,;]+)"),
 ]
 
 
@@ -77,6 +234,28 @@ def reject_private_network_host(hostname: str) -> None:
         or not address.is_global
     ):
         raise PrivateNetworkHostError("Host must not resolve to a private network.")
+
+
+def build_ca_bundle_ssl_context() -> ssl.SSLContext:
+    """Return an SSL context that still honors ``SSL_CERT_FILE``/``SSL_CERT_DIR``
+    on a transport pinned to ``trust_env=False``.
+
+    ``httpx.create_ssl_context()`` only reads ``SSL_CERT_FILE``/
+    ``SSL_CERT_DIR`` when ``trust_env`` is true, since both env var lookups
+    are gated behind that same flag. ``_PinnedA2ATransport`` and
+    ``SafeOAuthAsyncHTTPTransport`` set ``trust_env=False`` on their inner
+    ``httpx.AsyncHTTPTransport`` -- not to affect proxy handling (transport-
+    level ``trust_env`` has no effect there; proxy-env fallback is gated at
+    the ``httpx.AsyncClient`` level via ``allow_env_proxies = trust_env and
+    transport is None``, which is already ``False`` once an explicit
+    ``transport=`` is passed) but because it also feeds
+    ``create_ssl_context()`` internally, and ``verify=True`` there would
+    otherwise silently skip a private/internal CA bundle configured via
+    those env vars. Build that context explicitly here, with
+    ``trust_env=True``, and pass it as ``verify=`` instead.
+    """
+
+    return httpx.create_ssl_context(trust_env=True)
 
 
 async def validate_public_http_url(url: str) -> list[str]:
@@ -254,35 +433,83 @@ def _mask_secret(value: str) -> str:
     return "***" + value[-tail_len:]
 
 
-def redact_url_credentials_for_logging(url: str) -> str:
-    """Redact sensitive query credentials from a URL."""
+_USERINFO_PREFIX_PATTERN = re.compile(r"://[^/\s@]*@")
+
+
+def host_matches_suffix(hostname: str, suffix: str) -> bool:
+    """Return whether ``hostname`` is ``suffix`` or one of its subdomains."""
+    hostname = hostname.lower()
+    suffix = suffix.lower()
+    return hostname == suffix or hostname.endswith(f".{suffix}")
+
+
+def redact_url_credentials_for_logging(
+    url: str, *, redact_all_query_values: bool = False
+) -> str:
+    """Redact sensitive query credentials and any embedded userinfo from a
+    URL (e.g. a proxy URL's "user:pass@host", the single most common place
+    a URL carries a credential -- a query-string-only check would silently
+    pass it through unchanged).
+
+    ``redact_all_query_values`` is for callers that accept arbitrary query
+    parameters and therefore cannot know which values are credentials. The
+    default remains selective because many existing diagnostic call sites
+    intentionally retain ordinary query values. See issue #2356 for the
+    broader, repository-wide limits of keyword-based secret redaction.
+    """
     if not url:
         return url
 
     try:
         parsed = urlsplit(url)
     except ValueError:
-        return url
+        # Malformed enough that urlsplit itself can't parse it (e.g. an
+        # unclosed IPv6 bracket) -- fall back to a structure-agnostic scan
+        # for a "user:pass@" prefix. Returning the input unchanged here
+        # would be worse than not redacting at all: it would silently
+        # leak a credential through the one code path meant to catch it.
+        return _USERINFO_PREFIX_PATTERN.sub("://***@", url)
 
+    has_userinfo = parsed.username is not None or parsed.password is not None
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
-    if not query_items:
+    if not query_items and not has_userinfo:
         return url
 
     redacted_items: list[tuple[str, str]] = []
     for key, value in query_items:
-        if key.lower() in SENSITIVE_QUERY_KEYS and value:
+        if value and (redact_all_query_values or key.lower() in SENSITIVE_QUERY_KEYS):
             redacted_items.append((key, _mask_secret(value)))
         else:
             redacted_items.append((key, value))
-
     redacted_query = urlencode(redacted_items, doseq=True)
+
+    netloc = parsed.netloc
+    if has_userinfo:
+        # Split the raw netloc on its last "@" rather than rebuilding
+        # "host[:port]" from parsed.hostname/.port: those properties
+        # lowercase the host and strip IPv6 brackets, which would make
+        # this the only place in the URL that silently changes casing or
+        # produces an ambiguous bracket-less "host:port"-looking string
+        # for an IPv6 literal -- and .port can raise for a malformed tail
+        # after "@" anyway, which this sidesteps entirely.
+        netloc = "***@" + parsed.netloc.rsplit("@", 1)[-1]
+
     return urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, redacted_query, parsed.fragment)
+        (parsed.scheme, netloc, parsed.path, redacted_query, parsed.fragment)
     )
 
 
 def redact_sensitive_text(text: str) -> str:
-    """Redact common key/token patterns from arbitrary text."""
+    """Redact common key/token patterns from arbitrary text.
+
+    Recognition is by keyword and shape, so it is not exhaustive: it covers
+    ``http(s)://`` URLs (``redact_url_credentials_for_logging``),
+    ``identifier=value`` assignments whose identifier ``_is_credential_key``
+    accepts, and the header shapes in ``AUTH_HEADER_PATTERN`` and
+    ``HEADER_KEY_PATTERNS``. Shapes it is known to miss are listed in
+    #2356, and secrets in URL path segments in #2272; add a pattern here
+    when a new one turns up.
+    """
     if not text:
         return text
 
@@ -290,11 +517,8 @@ def redact_sensitive_text(text: str) -> str:
         lambda match: redact_url_credentials_for_logging(match.group(0)),
         text,
     )
-    redacted = ASSIGNMENT_SECRET_PATTERN.sub(
-        lambda match: f"{match.group(1)}={_mask_secret(match.group(2))}",
-        redacted,
-    )
-    redacted = BEARER_PATTERN.sub(
+    redacted = _redact_assignments(redacted)
+    redacted = AUTH_HEADER_PATTERN.sub(
         lambda match: f"{match.group(1)}{_mask_secret(match.group(2))}",
         redacted,
     )

@@ -861,7 +861,10 @@ export function ModelManagementDialog({
               <DialogDescription className="text-left">{t('models.dialog.connect.description')}</DialogDescription>
             </DialogHeader>
 
+            {/* The step bodies have no padding of their own, so they need the
+                gap the stepper's dropped `mb-6` used to provide. */}
             <Stepper
+              contentClassName="pt-6"
               steps={[
                 {
                   label: t('models.dialog.connect.step1'),

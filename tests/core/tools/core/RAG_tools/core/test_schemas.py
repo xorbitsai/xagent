@@ -1,5 +1,6 @@
 """Tests for core data schemas."""
 
+import json
 from datetime import datetime
 
 import pytest
@@ -23,6 +24,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IndexOperation,
     IndexStatus,
     IndexType,
+    IngestionConfig,
     ParseDocumentRequest,
     ParseDocumentResponse,
     ParsedParagraph,
@@ -1432,6 +1434,65 @@ class TestCollectionInfo:
         assert storage_data["documents"] == 5
         assert storage_data["processed_documents"] == 3
         assert storage_data["ingestion_config"] == ""
+
+    def test_collection_info_to_storage_serializes_any_non_null_ingestion_config(self):
+        """A non-null ingestion_config must not break to_storage().
+
+        Regression test for a production incident: model_dump() leaves these
+        enum fields as ParseMethod/ChunkStrategy instances, and a plain Enum
+        (not mixed with str) raises "Object of type ParseMethod is not JSON
+        serializable" from the json.dumps() call below, aborting collection
+        save/rebuild for any collection with a non-null ingestion_config -
+        including one holding only default field values.
+        """
+        collection = CollectionInfo(
+            name="test_collection",
+            ingestion_config=IngestionConfig(
+                parse_method=ParseMethod.PYMUPDF,
+                chunk_strategy=ChunkStrategy.MARKDOWN,
+            ),
+        )
+
+        storage_data = collection.to_storage()
+
+        assert isinstance(storage_data["ingestion_config"], str)
+        stored_config = json.loads(storage_data["ingestion_config"])
+        assert stored_config["parse_method"] == "pymupdf"
+        assert stored_config["chunk_strategy"] == "markdown"
+
+        # The write is only useful if reading it back reconstructs the same
+        # enum-bearing config, not just valid-looking JSON.
+        assert (
+            CollectionInfo.from_storage(storage_data).ingestion_config
+            == collection.ingestion_config
+        )
+
+    def test_collection_info_to_storage_serializes_non_json_native_extra_metadata(self):
+        """extra_metadata is a caller-supplied, untyped dict; a non-JSON-native
+        value in it (e.g. an Enum) must not break to_storage().
+
+        Regression test: extra_metadata was serialized with a plain
+        json.dumps(data["extra_metadata"]) call, so any caller-supplied value
+        without a native JSON representation raised the same
+        "Object of type X is not JSON serializable" TypeError that
+        ingestion_config raised before it was fixed.
+        """
+        collection = CollectionInfo(
+            name="test_collection",
+            extra_metadata={"source_parse_method": ParseMethod.PYMUPDF},
+        )
+
+        storage_data = collection.to_storage()
+
+        assert isinstance(storage_data["extra_metadata"], str)
+        stored_metadata = json.loads(storage_data["extra_metadata"])
+        assert stored_metadata["source_parse_method"] == "pymupdf"
+
+        # The write is only useful if reading it back reconstructs the same
+        # dict, not just valid-looking JSON.
+        assert CollectionInfo.from_storage(storage_data).extra_metadata == {
+            "source_parse_method": "pymupdf"
+        }
 
     def test_collection_info_immutability_by_default(self):
         """Test that CollectionInfo is immutable by default after creation."""

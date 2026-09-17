@@ -6,13 +6,19 @@ This allows different contexts (web, standalone) to provide configuration
 to the ToolFactory in a unified way.
 """
 
+import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypeVar
 
 from ..... import config as _root_config
+
+ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON = (
+    "actor_stdio_session_runtime_unavailable"
+)
+ACTOR_STDIO_SHADOWED_REASON = "actor_stdio_shadowed_by_visible_connection"
 
 
 class MCPFailurePolicy(str, Enum):
@@ -22,8 +28,50 @@ class MCPFailurePolicy(str, Enum):
     STRICT = "strict"
 
 
+class ToolFactoryRuntimeSessionBoundaryError(RuntimeError):
+    """Tool construction cannot safely detach its database resources."""
+
+    def __init__(
+        self, message: str = "Tool runtime cleanup could not be completed."
+    ) -> None:
+        super().__init__(message)
+
+
+_CleanupResultT = TypeVar("_CleanupResultT")
+
+
+async def run_with_tool_runtime_cleanup(
+    body: Callable[[], Awaitable[_CleanupResultT]],
+    cleanup: Callable[[], None],
+    *,
+    logger: logging.Logger,
+    cleanup_error_message: str = (
+        "Tool runtime cleanup failed after the primary operation failed"
+    ),
+) -> _CleanupResultT:
+    """Run cleanup without allowing it to replace an active primary failure."""
+    primary_error: BaseException | None = None
+    try:
+        return await body()
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            cleanup()
+        except BaseException as cleanup_error:
+            if primary_error is not None:
+                logger.error(cleanup_error_message, exc_info=True)
+            elif isinstance(cleanup_error, Exception):
+                raise ToolFactoryRuntimeSessionBoundaryError() from cleanup_error
+            else:
+                raise
+
+
 _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     {
+        ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+        ACTOR_STDIO_SHADOWED_REASON,
         "adapter_construction",
         "authorization_required",
         "catalog_app_not_found",
@@ -166,6 +214,22 @@ def normalize_tool_allowlist(value: Any) -> Optional[List[str]]:
 class BaseToolConfig(ABC):
     """Abstract base class for tool configuration."""
 
+    def set_task_runtime_contribution(self, contribution: Any) -> None:
+        """Attach a detached task-runtime contribution to this factory run."""
+
+    def get_task_runtime_contribution(self) -> Any:
+        """Return the detached task-runtime contribution for this factory run."""
+
+        return None
+
+    def set_task_runtime_workspace(self, workspace: Any) -> None:
+        """Retain a workspace shared by task-runtime and sandbox setup."""
+
+    def get_task_runtime_workspace(self) -> Any:
+        """Return a workspace prepared by the task runtime, when present."""
+
+        return None
+
     @abstractmethod
     def get_workspace_config(self) -> Optional[Dict[str, Any]]:
         """Get workspace configuration."""
@@ -208,6 +272,16 @@ class BaseToolConfig(ABC):
         """Get MCP server configurations."""
         pass
 
+    def get_actor_mcp_stdio_session_identities(self) -> Dict[str, Any]:
+        """Return host-only session identities keyed by exact MCP server name."""
+
+        return {}
+
+    def get_actor_mcp_stdio_session_consumer(self) -> Any:
+        """Return the optional host-side execution-scoped stdio consumer."""
+
+        return None
+
     def get_mcp_failure_policy(self) -> MCPFailurePolicy:
         """Return the MCP setup failure policy for this execution."""
         return MCPFailurePolicy.BEST_EFFORT
@@ -226,6 +300,17 @@ class BaseToolConfig(ABC):
         it re-acquires a connection on its next query. Default: no-op for
         configs without a DB session.
         """
+
+    def get_browser_locale(self) -> Optional[str]:
+        """Locale for browser automation sessions this config's tasks create.
+
+        ``None`` means "no request-derived locale available" -- the browser
+        tool then falls back to its own deployment default (see
+        ``get_browser_tool_default_locale`` in config.py) rather than a
+        single language being hardcoded for every task regardless of who
+        asked.
+        """
+        return None
 
     @abstractmethod
     def get_file_tools_enabled(self) -> bool:
@@ -264,6 +349,23 @@ class BaseToolConfig(ABC):
     def get_allowed_collections(self) -> Optional[List[str]]:
         """Get allowed knowledge base collections. None means all collections are allowed."""
         pass
+
+    def get_agent_creator_user_id(self) -> Optional[int]:
+        """Get the governing agent's creator, for the knowledge-base seam.
+
+        Fail-closed default for every config that is not web-backed: without
+        a governing team there is no creator exemption to resolve, so
+        ``None`` is always correct here, not merely convenient.
+        """
+        return None
+
+    def get_declared_knowledge_bases(self) -> Optional[List[str]]:
+        """Get the governing agent's stored knowledge-base declaration.
+
+        Fail-closed default for every config that is not web-backed: see
+        ``get_agent_creator_user_id``.
+        """
+        return None
 
     @abstractmethod
     def get_allowed_skills(self) -> Optional[List[str]]:
@@ -362,6 +464,15 @@ class BaseToolConfig(ABC):
     def get_agent_call_stack(self) -> List[int]:
         """Get active agent delegation call stack for recursion prevention."""
         return []
+
+    def get_voice(self) -> Optional[str]:
+        """The already-resolved onboarding output-voice preference (see
+        core.agent.voice_policy.apply_output_voice), or None. Threaded into
+        a delegated AgentTool's own system prompt and into any further
+        tool set it builds for a grandchild delegation, so a task's chosen
+        voice reaches every agent this user talks to - not just the
+        top-level one - without core importing a web route module."""
+        return None
 
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools."""

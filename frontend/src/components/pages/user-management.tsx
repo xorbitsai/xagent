@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
+import { toast } from "@/components/ui/sonner";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { Trash2, Users, Search, ChevronLeft, ChevronRight, ArrowLeft } from "lucide-react";
@@ -14,10 +15,12 @@ import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import Link from "next/link";
 import { useI18n } from "@/contexts/i18n-context";
+import { userDisplayLabel } from "@/lib/user-display";
 
 interface User {
   id: number;
   username: string;
+  email: string | null;
   is_admin: boolean;
   created_at: string;
   updated_at: string;
@@ -75,7 +78,7 @@ export default function UserManagement() {
     }
   };
 
-  const deleteUser = async (userId: number, username: string) => {
+  const deleteUser = async (userId: number, userLabel: string) => {
     try {
       const response = await apiRequest(`${getApiUrl()}/api/admin/users/${userId}`, {
         method: "DELETE",
@@ -86,13 +89,13 @@ export default function UserManagement() {
         throw new Error(errorData.detail || "Failed to delete user");
       }
 
-      alert(`${t('userManagement.list.alerts.delete_success_prefix')}${username}${t('userManagement.list.alerts.delete_success_suffix')}`);
+      toast.success(`${t('userManagement.list.alerts.delete_success_prefix')}${userLabel}${t('userManagement.list.alerts.delete_success_suffix')}`);
 
       // Refresh users list
       fetchUsers();
     } catch (error: any) {
       console.error("Error deleting user:", error);
-      alert(`${t('userManagement.list.alerts.delete_failed_prefix')}${error.message || t('userManagement.list.alerts.delete_failed_suffix')}`);
+      toast.error(`${t('userManagement.list.alerts.delete_failed_prefix')}${error.message || t('userManagement.list.alerts.delete_failed_suffix')}`);
     }
   };
 
@@ -175,7 +178,7 @@ export default function UserManagement() {
                   <TableHeader>
                     <TableRow>
                       <TableHead>{t('userManagement.list.table.id')}</TableHead>
-                      <TableHead>{t('userManagement.list.table.username')}</TableHead>
+                      <TableHead>{t('userManagement.list.table.account')}</TableHead>
                       <TableHead>{t('userManagement.list.table.role')}</TableHead>
                       <TableHead>{t('userManagement.list.table.created_at')}</TableHead>
                       <TableHead>{t('userManagement.list.table.updated_at')}</TableHead>
@@ -188,7 +191,7 @@ export default function UserManagement() {
                         <TableCell className="font-medium">
                           {userItem.id}
                         </TableCell>
-                        <TableCell>{userItem.username}</TableCell>
+                        <TableCell>{userDisplayLabel(userItem, `#${userItem.id}`)}</TableCell>
                         <TableCell>
                           {userItem.is_admin ? (
                             <Badge variant="default">{t('userManagement.list.table.admin')}</Badge>
@@ -218,13 +221,13 @@ export default function UserManagement() {
                                 <AlertDialogHeader>
                                   <AlertDialogTitle>{t('userManagement.list.table.delete_confirm_title')}</AlertDialogTitle>
                                   <AlertDialogDescription>
-                                    {`${t('userManagement.list.table.delete_confirm_description_prefix')}${userItem.username}${t('userManagement.list.table.delete_confirm_description_suffix')}`}
+                                    {`${t('userManagement.list.table.delete_confirm_description_prefix')}${userDisplayLabel(userItem, `#${userItem.id}`)}${t('userManagement.list.table.delete_confirm_description_suffix')}`}
                                   </AlertDialogDescription>
                                 </AlertDialogHeader>
                                 <AlertDialogFooter>
                                   <AlertDialogCancel>{t('userManagement.list.table.cancel')}</AlertDialogCancel>
                                   <AlertDialogAction
-                                    onClick={() => deleteUser(userItem.id, userItem.username)}
+                                    onClick={() => deleteUser(userItem.id, userDisplayLabel(userItem, `#${userItem.id}`))}
                                     className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
                                   >
                                     {t('userManagement.list.table.confirm_delete')}

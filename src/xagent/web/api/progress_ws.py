@@ -17,9 +17,12 @@ from ...core.tools.core.RAG_tools.progress import (
     get_progress_manager,
     progress_broadcaster,
 )
-from ..auth_dependencies import get_current_user, get_user_from_websocket_token
-from ..models.database import get_db
+from ..auth_dependencies import get_current_user
 from ..models.user import User
+from .websocket_auth import (
+    _WebSocketAuthenticationTerminated,
+    get_authenticated_user,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +43,10 @@ async def progress_websocket_endpoint(
     """WebSocket endpoint for real-time progress monitoring."""
     try:
         # Verify token and get user
-        db_gen = get_db()
-        db = next(db_gen)
         try:
-            user = get_user_from_websocket_token(token, db)
-        finally:
-            db.close()
+            user = await get_authenticated_user(websocket, token)
+        except _WebSocketAuthenticationTerminated:
+            return
 
         if not user:
             # Token validation failed but didn't raise exception

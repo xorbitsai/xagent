@@ -6,7 +6,12 @@ import logging
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..file_ref import build_workspace_file_ref, guess_mime_type
+from ..artifact_validation.defaults import default_registry
+from ..file_ref import (
+    build_workspace_file_ref,
+    guess_mime_type,
+    is_sandbox_local_file_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +21,7 @@ GENERATED_ARTIFACT_EXTENSIONS = {
     ".gif",
     ".jpeg",
     ".jpg",
+    ".m4v",
     ".mov",
     ".mp4",
     ".mpeg",
@@ -28,7 +34,7 @@ GENERATED_ARTIFACT_EXTENSIONS = {
     ".webm",
     ".xls",
     ".xlsx",
-}
+} | set(default_registry().extensions)
 SAFE_FILE_REF_KEYS = {
     "download_url",
     "file_id",
@@ -39,15 +45,38 @@ SAFE_FILE_REF_KEYS = {
     "preview_url",
     "relative_path",
     "size",
+    "validation",
 }
+# Every media tool returns its artifact as <kind>_path alongside file_id/file_ref.
+# Missing keys were redacted only by coincidence: file_ref.file_path registers the
+# same string, which stops holding when building the FileRef fails.
 LOCAL_PATH_KEYS = {
     "absolute_path",
+    "audio_path",
     "file_path",
     "image_path",
     "local_path",
     "output_dir",
     "output_path",
+    "transcription_path",
+    "video_path",
 }
+# Dropped from the model-facing observation only, never from the tool result, and
+# only at the top level. Keep out anything the model still acts on: last_frame_url
+# is an input to the next generate_video call and has no artifact of its own.
+_OBSERVATION_EXCLUDED_KEYS = {
+    "artifacts",
+    "generated_files",
+    "raw_response",
+    "request_id",
+    "saved_to_workspace",
+    "task_metric",
+    "usage",
+    "video_url",
+}
+# Without artifact lines the URLs and filenames are the model's only handle on the
+# result, so the failure path only sheds the unbounded provider payload.
+_UNBOUNDED_PAYLOAD_KEYS = {"raw_response"}
 
 GeneratedArtifactSnapshot = dict[Path, tuple[int, int]]
 
@@ -56,7 +85,7 @@ def artifact_type_for_filename(filename: str) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"}:
         return "image"
-    if suffix in {".mp4", ".mov", ".mpeg", ".mpg", ".webm"}:
+    if suffix in {".mp4", ".m4v", ".mov", ".mpeg", ".mpg", ".webm"}:
         return "video"
     # Only OOXML .pptx maps to ``presentation`` — the frontend's inline
     # ``PptxPreviewRenderer`` (pptxviewjs) cannot render legacy binary
@@ -73,7 +102,7 @@ def artifact_type_for_filename(filename: str) -> str:
     return "file"
 
 
-def build_inline_artifact(file_ref: dict[str, Any]) -> dict[str, str]:
+def build_inline_artifact(file_ref: dict[str, Any]) -> dict[str, Any]:
     filename = str(file_ref.get("filename") or "artifact")
     return {
         "type": artifact_type_for_filename(filename),
@@ -81,12 +110,13 @@ def build_inline_artifact(file_ref: dict[str, Any]) -> dict[str, str]:
         "filename": filename,
         "mime_type": str(file_ref.get("mime_type") or guess_mime_type(filename)),
         "display": "inline",
+        **({"validation": file_ref["validation"]} if "validation" in file_ref else {}),
     }
 
 
 def markdown_reference_for_artifact(artifact: dict[str, Any]) -> str | None:
     file_id = artifact.get("file_id")
-    if not file_id:
+    if not file_id or is_sandbox_local_file_id(file_id):
         return None
 
     filename = str(artifact.get("filename") or "artifact")
@@ -108,24 +138,32 @@ def format_tool_result_for_observation(tool_name: str, result: Any) -> str:
     if not isinstance(result, dict):
         return str(result)
 
-    artifacts = result.get("artifacts")
-    if not isinstance(artifacts, list) or not artifacts:
-        return str(result)
-
     sanitized = sanitize_file_refs_for_observation(result)
 
-    artifact_lines = _format_artifact_lines(artifacts)
+    artifacts = result.get("artifacts")
+    artifact_lines = (
+        _format_artifact_lines(artifacts) if isinstance(artifacts, list) else []
+    )
     if not artifact_lines:
-        return str(sanitized)
+        # A failed download still reports through this path, so it has to be
+        # redacted too — it carries the same signed URLs and provider payloads.
+        return str(_observation_metadata(sanitized, _UNBOUNDED_PAYLOAD_KEYS))
 
+    metadata = _observation_metadata(sanitized, _OBSERVATION_EXCLUDED_KEYS)
     return (
-        f"Tool '{tool_name}' produced displayable artifact(s):\n"
+        f"Tool '{tool_name}' produced artifact(s); check validation before delivery:\n"
         + "\n".join(artifact_lines)
         + "\nUse the Markdown/chat form in assistant messages. "
         + "When writing HTML for Xagent preview, reference the same file_id "
-        + "through the file preview service instead of local filesystem paths. "
-        + f"Sanitized result metadata: {sanitized}"
+        + "through the file preview service instead of local filesystem paths."
+        + (f" Sanitized result metadata: {metadata}" if metadata else "")
     )
+
+
+def _observation_metadata(
+    sanitized: dict[str, Any], excluded: set[str]
+) -> dict[str, Any]:
+    return {key: value for key, value in sanitized.items() if key not in excluded}
 
 
 def _format_artifact_lines(artifacts: list[Any]) -> list[str]:
@@ -139,6 +177,17 @@ def _format_artifact_lines(artifacts: list[Any]) -> list[str]:
         filename = artifact.get("filename") or "generated image"
         markdown_ref = markdown_reference_for_artifact(artifact)
         if not markdown_ref:
+            lines.append(
+                "\n".join(
+                    [
+                        f"- {filename}",
+                        "  file_id: unavailable, registration did not complete",
+                        "  The tool reported a written file; this does not establish readability. No file_id "
+                        "can be obtained for it in this task; say so plainly "
+                        "and never rewrite the file to try to mint one.",
+                    ]
+                )
+            )
             continue
         artifact_type = str(artifact.get("type") or "").lower()
         markdown_label = (
@@ -154,6 +203,33 @@ def _format_artifact_lines(artifacts: list[Any]) -> list[str]:
                 ]
             )
         )
+        validation = artifact.get("validation")
+        if not isinstance(validation, dict):
+            lines.append(
+                "  Validation: NOT RUN. No validation report was produced for this file."
+            )
+            continue
+        status = validation.get("status", "unchecked")
+        if status == "invalid":
+            lines.append(
+                "  Validation: INVALID. Repair and recheck, or report failure; do not claim a usable deliverable."
+            )
+        elif status == "valid":
+            lines.append(
+                "  Validation: format readable; content correctness is not checked."
+            )
+        else:
+            lines.append(
+                "  Validation: UNCHECKED. Do not claim this file passed validation."
+            )
+            checks = validation.get("checks")
+            if isinstance(checks, list):
+                for check in checks:
+                    if isinstance(check, dict) and check.get("status") == "unchecked":
+                        message = check.get("message")
+                        if isinstance(message, str) and message.strip():
+                            lines.append(f"  Validation reason: {message}")
+                            break
     return lines
 
 
@@ -184,9 +260,23 @@ def _sanitize_tool_result_value(value: Any, known_paths: dict[str, str]) -> Any:
     }
 
 
+# A sandbox id resolves nowhere outside the runner that minted it, so every key
+# asserting a fetchable file would hand the model a link that 404s.
+_UNRESOLVABLE_FILE_REF_KEYS = {
+    "download_url",
+    "file_id",
+    "markdown_link",
+    "markdown_ref",
+    "preview_url",
+}
+
+
 def _safe_tool_result_items(value: dict[str, Any]) -> Iterable[tuple[str, Any]]:
     if _is_file_ref_like(value):
-        return ((key, value[key]) for key in SAFE_FILE_REF_KEYS if key in value)
+        keys = SAFE_FILE_REF_KEYS
+        if is_sandbox_local_file_id(value.get("file_id")):
+            keys = keys - _UNRESOLVABLE_FILE_REF_KEYS
+        return ((key, value[key]) for key in keys if key in value)
     return ((key, item) for key, item in value.items() if key not in LOCAL_PATH_KEYS)
 
 
@@ -244,7 +334,7 @@ def build_generated_file_metadata(
     file_paths: Iterable[str | Path],
 ) -> dict[str, list[Any]]:
     file_refs: list[dict[str, Any]] = []
-    artifacts: list[dict[str, str]] = []
+    artifacts: list[dict[str, Any]] = []
     generated_files: list[str] = []
 
     for file_path in sorted({Path(path).resolve() for path in file_paths}):
@@ -254,7 +344,7 @@ def build_generated_file_metadata(
             continue
         try:
             file_ref = build_workspace_file_ref(
-                workspace=workspace, file_path=file_path
+                workspace=workspace, file_path=file_path, validate=True
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

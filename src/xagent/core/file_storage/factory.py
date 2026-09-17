@@ -15,10 +15,15 @@ from .keys import build_user_key_prefix
 from .scoped import ScopedFileStorage
 from .storage import FsspecFileStorage
 
+# Use modest standard retries for transient failures because s3fs adds retry
+# layers around writes/range reads; timeouts are per attempt, not a total deadline.
 _DEFAULT_S3_CONFIG_KWARGS = {
     "connect_timeout": 3,
     "read_timeout": 10,
-    "retries": {"max_attempts": 1},
+    "retries": {
+        "mode": "standard",
+        "total_max_attempts": 3,
+    },
 }
 
 

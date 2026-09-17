@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import io
+import ssl
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -296,3 +297,43 @@ async def test_download_web_asset_rejects_invalid_declared_length(
     assert result["success"] is False
     assert result["error"] == f"Invalid remote asset content length: {declared_length}"
     assert list(workspace.output_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_download_disables_trust_env_but_honors_explicit_proxy(
+    workspace: TaskWorkspace,
+) -> None:
+    # httpx.AsyncClient defaults to trust_env=True, which falls back to the
+    # OS's own proxy configuration (getproxies_macosx_sysconf()/
+    # getproxies_registry()) once no HTTP(S)_PROXY env var is set --
+    # reopening the DNS-rebinding TOCTOU window get_trusted_proxy_url()
+    # exists to close. trust_env=False must be set explicitly, while the
+    # proxy this connector *does* trust must still be passed through.
+    content = _png_bytes()
+    response = httpx.Response(
+        200,
+        content=content,
+        headers={"content-type": "image/png", "content-length": str(len(content))},
+        request=httpx.Request("GET", "https://brand.example/logo.png"),
+    )
+    tool = DownloadWebAssetTool(workspace)
+
+    with (
+        patch(
+            "xagent.core.tools.adapters.vibe.download_web_asset.get_trusted_proxy_url",
+            return_value="http://trusted-proxy.internal:8080",
+        ),
+        patch(
+            "xagent.core.tools.adapters.vibe.download_web_asset.httpx.AsyncClient"
+        ) as async_client,
+    ):
+        client = async_client.return_value.__aenter__.return_value
+        client.stream = Mock(return_value=_ResponseContext(response))
+        result = await tool.run_json_async({"url": "https://brand.example/logo.png"})
+
+    assert result["success"] is True
+    async_client.assert_called_once()
+    client_kwargs = async_client.call_args.kwargs
+    assert client_kwargs["proxy"] == "http://trusted-proxy.internal:8080"
+    assert client_kwargs["trust_env"] is False
+    assert isinstance(client_kwargs["verify"], ssl.SSLContext)

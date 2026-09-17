@@ -18,6 +18,7 @@ from ....workspace import TaskWorkspace
 from ...core.web_content import (
     DEFAULT_MAX_CONTENT_BYTES,
     DEFAULT_USER_AGENT,
+    build_isolated_httpx_client_kwargs,
     get_trusted_proxy_url,
 )
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
@@ -128,10 +129,8 @@ class DownloadWebAssetTool(AbstractBaseTool):
             ).model_dump()
 
     async def _download(self, url: str) -> tuple[bytes, str, str]:
-        client_kwargs: dict[str, Any] = {}
         proxy_url = get_trusted_proxy_url()
-        if proxy_url:
-            client_kwargs["proxy"] = proxy_url
+        client_kwargs = build_isolated_httpx_client_kwargs(proxy_url)
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             response = await fetch_public_http_bytes(

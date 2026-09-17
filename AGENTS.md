@@ -36,6 +36,7 @@ Xagent has one main entrypoint:
 - `runtime.py` - Cross-cutting pattern services: LLM calls, tool calls, tracing, checkpoints, outbound messages, and context compaction.
 - `context/` - Message and execution context management.
 - `pattern/` - Execution patterns: `single_call`, ReAct, DAG plan-execute, and auto routing.
+- `builtin/` - Restricted specs, registry, and executor for code-defined internal agents.
 - `checkpoint.py` - Trace-backed checkpoint persistence for resumable executions.
 
 There is no v1/v2 runtime switch. Do not add new code under `agent_v2` or `agent_runtime`; both concepts have been collapsed into `core.agent`.

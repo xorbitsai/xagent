@@ -4,22 +4,101 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    # Direct dependencies of the jobs below, not a transitive closure. A
+    # module reached only through another module on this list is not here,
+    # and adding one is a deliberate act -- the two lists are maintained by
+    # hand and must stay line-for-line mirrors of each other.
     paths:
       - 'src/xagent/migrations/**'
       - 'tests/migrations/**'
+      - 'tests/alembic/**'
       - '.github/workflows/test-migrations.yml'
       - 'src/xagent/db/**'
+      - 'src/xagent/web/models/generation.py'
+      - 'src/xagent/web/models/mcp.py'
+      - 'src/xagent/web/models/public_mcp.py'
+      - 'src/xagent/web/models/mcp_oauth.py'
+      - 'src/xagent/web/api/mcp.py'
+      - 'tests/web/api/test_mcp_oauth_lifecycle_postgresql.py'
       - 'src/xagent/web/services/gmail_provisioning.py'
       - 'tests/web/services/test_gmail_provisioning.py'
       - 'src/xagent/web/services/agent_management.py'
       - 'src/xagent/web/services/api_keys.py'
       - 'tests/web/services/test_runtime_key_transition_postgres.py'
+      - 'src/xagent/web/api/auth.py'
+      - 'tests/web/services/test_user_preferences_lock_postgres.py'
+      - 'src/xagent/web/services/task_start_protocol.py'
+      - 'tests/web/services/test_task_start_protocol.py'
+      - 'src/xagent/web/services/task_start_consumer.py'
+      - 'src/xagent/web/services/task_orchestrator.py'
+      - 'tests/web/services/test_shared_execution_postgresql.py'
+      - 'src/xagent/web/services/task_coordinator_runtime.py'
+      - 'src/xagent/web/services/task_coordinator_service.py'
+      - 'tests/web/services/test_task_coordinator_commands.py'
+      - 'tests/web/services/test_shared_channel_execution.py'
+      - 'src/xagent/web/services/shared_channel_execution.py'
+      - 'src/xagent/web/services/channel_runtime.py'
+      - 'src/xagent/web/services/task_command_transport.py'
+      - 'tests/web/services/test_task_command_transport.py'
+      - 'src/xagent/web/models/task.py'
+      - 'tests/web/services/task_status_storage_shared.py'
+      - 'tests/web/services/test_task_status_storage_postgresql.py'
+      - 'tests/web/services/test_task_status_enum_drift.py'
+      - 'src/xagent/web/api/monitor.py'
+      - 'tests/web/api/test_monitor_postgresql.py'
+      - 'tests/web/api/monitor_daily_window_shared.py'
+      - 'src/xagent/web/services/task_interaction_staging.py'
+      - 'tests/web/services/test_interaction_staging_postgresql.py'
+      - 'src/xagent/web/services/task_interaction_service.py'
+      - 'tests/web/services/test_task_interaction_service_postgresql.py'
+      - 'tests/web/services/task_interaction_schema_shared.py'
+      - 'src/xagent/web/models/task_interaction.py'
+      - 'src/xagent/web/services/task_interaction_schema.py'
+      - 'src/xagent/core/agent/checkpoint.py'
+      - 'src/xagent/web/services/task_lease_service.py'
+      - 'tests/web/services/test_task_lease_heartbeat_batch.py'
+      - 'tests/web/services/test_task_settlement_locking.py'
+      - 'tests/web/services/test_task_execution_event_store.py'
+      - 'src/xagent/web/services/chat_history_service.py'
+      - 'src/xagent/web/services/ops_signals.py'
+      - 'src/xagent/core/tools/adapters/vibe/ask_user_tool.py'
+      - 'src/xagent/web/models/database.py'
+      - 'src/xagent/web/services/task_interaction_close.py'
+      - 'tests/web/services/test_supersede_savepoint_postgresql.py'
+      - 'tests/web/services/test_task_interaction_close_postgresql.py'
+      - 'src/xagent/web/models/chat_message.py'
+      - 'src/xagent/web/models/user.py'
+      - 'src/xagent/web/models/user_oauth.py'
+      - 'tests/web/test_user_oauth_actor_ownership.py'
+      - 'tests/web/test_trusted_actor_oauth_postgresql.py'
+      - 'tests/shared/postgres_disposable.py'
+      - 'tests/web/services/checkpoint_anchor_shared.py'
+      - 'tests/web/api/test_custom_api_edit_lock_postgresql.py'
+      - 'src/xagent/web/api/custom_api.py'
+      - 'src/xagent/web/services/connector_team_scope.py'
+      - 'src/xagent/web/models/custom_api.py'
+      - 'tests/web/api/test_mcp_server_edit_lock_postgresql.py'
+      - 'src/xagent/web/api/mcp.py'
+      - 'src/xagent/core/tools/core/mcp/model.py'
+      - 'tests/web/services/test_connector_hook_session_boundary.py'
+      - 'src/xagent/web/services/trace_message_storage.py'
+      - 'tests/web/services/test_trace_blob_upsert_postgresql.py'
+      - 'src/xagent/web/services/trace_database.py'
+      - 'src/xagent/web/services/trace_event_staging.py'
+      - 'src/xagent/config.py'
+      - 'src/xagent/web/services/trace_handlers.py'
+      - 'tests/web/services/test_trace_database_postgresql.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
   # are never reported on a merge group, its entries time out, and every merge
   # stalls. Harmless before a queue exists -- merge_group simply never fires.
   merge_group:
+
+env:
+  # Same version docker/Dockerfile.backend and docker/Dockerfile.sandbox pin.
+  # Declared once here so the two install steps below cannot drift apart.
+  UV_VERSION: "0.11.10"
 
 jobs:
   detect-migration-changes:
@@ -30,7 +109,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -49,16 +128,90 @@ jobs:
           # migration, and that over-triggering is load-bearing today -- it is
           # what catches a migration that landed on main but is absent from
           # this branch. Do not "fix" it to merge-base while that matters.
+          #
+          # Line-for-line mirror of on.push.paths above; same scope caveat
+          # (direct dependencies, not a transitive closure). Changing one
+          # list without the other silently disables half the trigger.
           RELEVANT_PATHS=(
             src/xagent/migrations
             tests/migrations
+            tests/alembic
             .github/workflows/test-migrations.yml
             src/xagent/db
+            src/xagent/web/models/generation.py
+            src/xagent/web/models/mcp.py
+            src/xagent/web/models/public_mcp.py
+            src/xagent/web/models/mcp_oauth.py
+            src/xagent/web/api/mcp.py
+            tests/web/api/test_mcp_oauth_lifecycle_postgresql.py
             src/xagent/web/services/gmail_provisioning.py
             tests/web/services/test_gmail_provisioning.py
             src/xagent/web/services/agent_management.py
             src/xagent/web/services/api_keys.py
             tests/web/services/test_runtime_key_transition_postgres.py
+            src/xagent/web/api/auth.py
+            tests/web/services/test_user_preferences_lock_postgres.py
+            src/xagent/web/services/task_start_protocol.py
+            tests/web/services/test_task_start_protocol.py
+            src/xagent/web/services/task_start_consumer.py
+            src/xagent/web/services/task_orchestrator.py
+            tests/web/services/test_shared_execution_postgresql.py
+            src/xagent/web/services/task_coordinator_runtime.py
+            src/xagent/web/services/task_coordinator_service.py
+            tests/web/services/test_task_coordinator_commands.py
+            tests/web/services/test_shared_channel_execution.py
+            src/xagent/web/services/shared_channel_execution.py
+            src/xagent/web/services/channel_runtime.py
+            src/xagent/web/services/task_command_transport.py
+            tests/web/services/test_task_command_transport.py
+            src/xagent/web/models/task.py
+            tests/web/services/task_status_storage_shared.py
+            tests/web/services/test_task_status_storage_postgresql.py
+            tests/web/services/test_task_status_enum_drift.py
+            src/xagent/web/api/monitor.py
+            tests/web/api/test_monitor_postgresql.py
+            tests/web/api/monitor_daily_window_shared.py
+            src/xagent/web/services/task_interaction_staging.py
+            tests/web/services/test_interaction_staging_postgresql.py
+            src/xagent/web/services/task_interaction_service.py
+            tests/web/services/test_task_interaction_service_postgresql.py
+            tests/web/services/task_interaction_schema_shared.py
+            src/xagent/web/models/task_interaction.py
+            src/xagent/web/services/task_interaction_schema.py
+            src/xagent/core/agent/checkpoint.py
+            src/xagent/web/services/task_lease_service.py
+            tests/web/services/test_task_lease_heartbeat_batch.py
+            tests/web/services/test_task_settlement_locking.py
+            tests/web/services/test_task_execution_event_store.py
+            src/xagent/web/services/chat_history_service.py
+            src/xagent/web/services/ops_signals.py
+            src/xagent/core/tools/adapters/vibe/ask_user_tool.py
+            src/xagent/web/models/database.py
+            src/xagent/web/services/task_interaction_close.py
+            tests/web/services/test_supersede_savepoint_postgresql.py
+            tests/web/services/test_task_interaction_close_postgresql.py
+            src/xagent/web/models/chat_message.py
+            src/xagent/web/models/user.py
+            src/xagent/web/models/user_oauth.py
+            tests/web/test_user_oauth_actor_ownership.py
+            tests/web/test_trusted_actor_oauth_postgresql.py
+            tests/shared/postgres_disposable.py
+            tests/web/services/checkpoint_anchor_shared.py
+            tests/web/api/test_custom_api_edit_lock_postgresql.py
+            src/xagent/web/api/custom_api.py
+            src/xagent/web/services/connector_team_scope.py
+            src/xagent/web/models/custom_api.py
+            tests/web/api/test_mcp_server_edit_lock_postgresql.py
+            src/xagent/web/api/mcp.py
+            src/xagent/core/tools/core/mcp/model.py
+            tests/web/services/test_connector_hook_session_boundary.py
+            src/xagent/web/services/trace_message_storage.py
+            tests/web/services/test_trace_blob_upsert_postgresql.py
+            src/xagent/web/services/trace_database.py
+            src/xagent/web/services/trace_event_staging.py
+            src/xagent/config.py
+            src/xagent/web/services/trace_handlers.py
+            tests/web/services/test_trace_database_postgresql.py
           )
 
           case "$EVENT_NAME" in
@@ -96,21 +249,43 @@ jobs:
 
       - name: Checkout code
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[all]"
-          pip install pytest pytest-mock
+          # Install from uv.lock, the same resolution every other job uses.
+          # A plain "pip install -e .[all]" re-resolves the whole graph from
+          # PyPI on every run, so an upper bound added anywhere in pyproject
+          # -- or any upstream release -- can make the resolver backtrack
+          # until it gives up, turning this workflow red on changes that have
+          # nothing to do with it. Putting the environment on PATH keeps the
+          # test steps below unchanged and leaves no call site able to fall
+          # back to the system interpreter.
+          #
+          # --locked is what turns that into a guarantee. A bare "uv sync"
+          # rewrites uv.lock as soon as project metadata has drifted from it,
+          # which puts the independent resolution straight back; --locked
+          # fails the job instead and names the stale lock.
+          #
+          # Pinning uv is the other half of that guarantee: a floating uv can
+          # ship a lock-format change that makes --locked fail on uv's release
+          # schedule rather than on anything in this repository.
+          #
+          # Only the test group is installed. The dev group adds pre-commit,
+          # ruff, flake8, mypy and the type stubs, and no step in either
+          # migration job runs any of them. alembic comes from the project
+          # dependencies and pytest from the test group, so both jobs still
+          # have everything they invoke.
+          python -m pip install "uv==${UV_VERSION}"
+          uv sync --locked --all-extras --no-default-groups --group test
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Test migration upgrade
         if: needs.detect-migration-changes.outputs.should-test == 'true'
@@ -139,7 +314,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-bookworm
+        image: postgres:17-bookworm
         env:
           POSTGRES_USER: xagent
           POSTGRES_PASSWORD: xagent
@@ -159,21 +334,43 @@ jobs:
 
       - name: Checkout code
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         if: needs.detect-migration-changes.outputs.should-test == 'true'
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[all]"
-          pip install pytest pytest-mock
+          # Install from uv.lock, the same resolution every other job uses.
+          # A plain "pip install -e .[all]" re-resolves the whole graph from
+          # PyPI on every run, so an upper bound added anywhere in pyproject
+          # -- or any upstream release -- can make the resolver backtrack
+          # until it gives up, turning this workflow red on changes that have
+          # nothing to do with it. Putting the environment on PATH keeps the
+          # test steps below unchanged and leaves no call site able to fall
+          # back to the system interpreter.
+          #
+          # --locked is what turns that into a guarantee. A bare "uv sync"
+          # rewrites uv.lock as soon as project metadata has drifted from it,
+          # which puts the independent resolution straight back; --locked
+          # fails the job instead and names the stale lock.
+          #
+          # Pinning uv is the other half of that guarantee: a floating uv can
+          # ship a lock-format change that makes --locked fail on uv's release
+          # schedule rather than on anything in this repository.
+          #
+          # Only the test group is installed. The dev group adds pre-commit,
+          # ruff, flake8, mypy and the type stubs, and no step in either
+          # migration job runs any of them. alembic comes from the project
+          # dependencies and pytest from the test group, so both jobs still
+          # have everything they invoke.
+          python -m pip install "uv==${UV_VERSION}"
+          uv sync --locked --all-extras --no-default-groups --group test
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Test migration upgrade
         if: needs.detect-migration-changes.outputs.should-test == 'true'
@@ -203,11 +400,49 @@ jobs:
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
-      - name: Test Gmail provisioning row-lock contention (Postgres-only)
+      # Any new migration test file with postgresql-marked tests must be
+      # added to this list -- the fast job deselects the marker and
+      # provisions no database, so an unlisted file's postgres tests run
+      # nowhere.
+      - name: Test owner-aware OAuth migrations (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          pip install pytest-asyncio
-          pytest tests/web/services/test_gmail_provisioning.py -k contend -q
+          pytest tests/migrations/test_migration_integration.py -m postgresql -q
+        env:
+          DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test MCP lifecycle generation migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_20260902_add_mcp_lifecycle_generations.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test shared execution foundations (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_shared_execution_foundations.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test MCP OAuth lifecycle fencing (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_mcp_oauth_lifecycle_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test trusted actor OAuth concurrency (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/test_trusted_actor_oauth_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test Gmail provisioning Postgres-only behavior
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_gmail_provisioning.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
@@ -215,6 +450,163 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_runtime_key_transition_postgres.py -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test preferences update locking (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_user_preferences_lock_postgres.py -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test heartbeat and settlement lock isolation (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_lease_heartbeat_batch.py tests/web/services/test_task_settlement_locking.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task command staging concurrency (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_command_transport.py tests/web/services/test_task_start_protocol.py tests/web/services/test_shared_execution_postgresql.py tests/web/services/test_task_coordinator_commands.py tests/web/services/test_shared_channel_execution.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task status storage semantics (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_status_storage_postgresql.py -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # -m postgresql because this file is mixed: the PostgreSQL cells need a
+      # live server, and the non-PostgreSQL cells pin the check being skipped
+      # outright and already run in the ordinary suite. Each PostgreSQL cell
+      # creates and drops its own disposable database, so this step has no
+      # ordering dependency on the others -- and dropping/recreating the
+      # taskstatus type, which several of the cells do, never reaches the
+      # base database this URL names.
+      - name: Test taskstatus enum drift startup guard (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_status_enum_drift.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test taskstatus enum repair migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_20260901_add_task_status_waiting_for_user_enum_label.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task_interaction_requests migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/alembic/test_20260809_add_task_interaction_requests.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task_interaction_requests create_all/migration parity (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_task_interaction_requests_schema_parity.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test monitoring JSON extraction (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_monitor_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test interaction staging primitives (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_interaction_staging_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task_interaction_protocol_version migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/alembic/test_20260810_add_task_interaction_protocol_version.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task_interaction_protocol_version create_all/migration parity (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_task_interaction_protocol_version_parity.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test interaction lifecycle service compatibility view (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_interaction_service_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # The json -> jsonb conversion and its row cleanup only exist on
+      # PostgreSQL; the SQLite half of this file pins a no-op and runs in the
+      # ordinary suite.
+      - name: Test trace payload json to jsonb migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_20260813_trace_json_columns_to_jsonb.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test legacy resume interaction close rowcount grid (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_interaction_close_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # This step's fixture creates and drops its own disposable schema (see
+      # test_supersede_savepoint_postgresql.py), so it has no ordering
+      # dependency on the other steps in this job.
+      - name: Test legacy-question supersede savepoint isolation (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_supersede_savepoint_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test Custom API edit row lock (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_custom_api_edit_lock_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test MCP server edit row lock (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_mcp_server_edit_lock_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # -m postgresql because this file is mixed: the PostgreSQL cells need a
+      # live server, and the SQLite cells pin the same grid on the default
+      # backend and already run in the ordinary suite.
+      - name: Test connector hook session boundary (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_connector_hook_session_boundary.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test checkpoint blob upserts (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_trace_blob_upsert_postgresql.py -m postgresql -q
+          pytest tests/web/services/test_trace_database_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

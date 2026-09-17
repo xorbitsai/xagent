@@ -1,10 +1,9 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
-import { apiRequest } from "@/lib/api-wrapper"
-import { getApiUrl, getFilePublicPreviewUrl } from "@/lib/utils"
+import { useFileAccess } from "@/contexts/file-access-context"
 
 interface PptxPreviewRendererProps {
   /**
@@ -84,28 +83,30 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
   const [pdfUrl, setPdfUrl] = useState<string | null>(null)
   const [pdfChecked, setPdfChecked] = useState<boolean>(!fileId)
   const { t } = useI18n()
+  const fileAccess = useFileAccess()
 
   // Probe the server-rendered PDF endpoint. If it 200s, use the PDF in an
   // iframe (high fidelity). If it 503s — LibreOffice not on PATH server-side
   // — silently fall back to the canvas renderer. Any other error also falls
   // back, so the UX never regresses below today's behaviour.
   useEffect(() => {
+    const pdfPreviewUrl = fileAccess.pdfPreviewUrl
     // Reset PDF/error state whenever fileId changes (including going to
     // null).  Placed before the `!fileId` guard so switching from a
     // PDF-backed file to a raw/base64-only source (fileId → undefined)
     // doesn't inherit stale pdfUrl, pdfChecked, or error state.
     // Per PR #542 review (rogercloud).
     setPdfUrl(null)
-    setPdfChecked(!fileId)
+    setPdfChecked(!fileId || !pdfPreviewUrl)
     setError(null)
-    if (!fileId) return
+    if (!fileId || !pdfPreviewUrl) return
     setIsLoading(true)
     let cancelled = false
     let objectUrl: string | null = null
     ;(async () => {
       try {
-        const res = await apiRequest(
-          `${getApiUrl()}/api/files/preview-pdf/${encodeURIComponent(fileId)}`,
+        const res = await fileAccess.request(
+          pdfPreviewUrl(fileId),
           { cache: "no-cache" },
         )
         if (cancelled) return
@@ -126,7 +127,7 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
       cancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [fileId])
+  }, [fileAccess, fileId])
 
   // Size the canvas backing store to the container before each render.
   // pptxviewjs uses the canvas's pixel dimensions to lay out slides in
@@ -195,8 +196,8 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
         // blank canvas and no message (regression flagged in PR #542 review).
         setIsLoading(true)
         try {
-          const res = await apiRequest(
-            getFilePublicPreviewUrl(fileId, getApiUrl()),
+          const res = await fileAccess.request(
+            fileAccess.inlinePreviewUrl(fileId),
             { cache: "no-cache" },
           )
           if (cancelled) return
@@ -303,7 +304,7 @@ export function PptxPreviewRenderer({ base64Content, fileId }: PptxPreviewRender
         viewerRef.current = null
       }
     }
-  }, [base64Content, syncCanvasSize, t, pdfUrl, pdfChecked, fileId])
+  }, [base64Content, fileAccess, syncCanvasSize, t, pdfUrl, pdfChecked, fileId])
 
   // Re-render the current slide when the container is resized.
   useEffect(() => {

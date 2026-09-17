@@ -62,31 +62,36 @@ class WorkforcePolicy:
         return None
 
     def before_workforce_run(
-        self, db: Session, user: User, workforce: Workforce
+        self, db: Session, user: User, workforce: Workforce | None
     ) -> None:
+        """``workforce`` is ``None`` for an unsaved draft's preview run."""
         del db, user, workforce
 
     def is_agent_in_workforce_run_scope(
         self,
         db: Session,
         user: User,
-        workforce: Workforce,
+        workforce: Workforce | None,
         agent: Agent,
     ) -> bool:
+        """``workforce`` is ``None`` for an unsaved draft's preview run --
+        there is no persisted owner to check, so the draft is scoped to the
+        requesting user by construction and only agent ownership applies.
+        """
+        if workforce is not None and int(workforce.owner_user_id) != int(user.id):
+            return False
         scope = get_agent_team_scope(db, int(user.id))
-        return bool(
-            int(workforce.owner_user_id) == int(user.id)
-            and owns_agent(agent, int(user.id), scope)
-        )
+        return owns_agent(agent, int(user.id), scope)
 
     def after_workforce_run_created(
         self,
         db: Session,
         user: User,
-        workforce: Workforce,
+        workforce: Workforce | None,
         run: Any,
         task: Any,
     ) -> None:
+        """``workforce`` is ``None`` for an unsaved draft's preview run."""
         del db, user, workforce, run, task
 
     def record_workforce_event(
@@ -242,6 +247,17 @@ def ensure_workforce_agent_run_access(
     workforce: Workforce,
 ) -> Agent:
     if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    # A workforce-generated manager agent (create_workforce_from_prompt) is
+    # only ever legitimate as its own workforce's manager. Selecting one
+    # elsewhere is already rejected by ensure_agent_access/
+    # _ensure_preview_agent_run_access at creation/preview time, and
+    # Agent.origin is immutable after that -- so this is unreachable via any
+    # known path today, but closes the same gap defensively at run time too,
+    # matching the preview path's check (workforce_snapshot.py).
+    if is_workforce_generated_manager_agent(agent) and int(agent.id) != int(
+        workforce.manager_agent_id
+    ):
         raise HTTPException(status_code=404, detail="Agent not found")
     if agent.status != AgentStatus.PUBLISHED:
         raise HTTPException(

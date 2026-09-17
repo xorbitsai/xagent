@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import case, func
+from sqlalchemy.orm import Session, contains_eager, selectinload
 
 from xagent.web.models.task import Task, TaskStatus
 
 from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from .task_lease_service import (
     TaskLease,
+    lock_task_lease_for_settlement_no_commit,
     release_current_runner_task_lease,
     release_task_lease,
+    task_lease_attempt_predicate,
 )
 from .workforce_snapshot import (
     WORKFORCE_CONFIG_FINGERPRINT_VERSION,
@@ -192,6 +195,15 @@ def ensure_workforce_turn_allowed(
       not exist (or belongs to another task/user). The runtime resolver
       would silently degrade such a task to a bare manager agent with zero
       delegation ability; fail loudly instead of executing it.
+    - ``workforce_run_not_active``: the run was cancelled by the archive path
+      or the stale-preview-run reaper. Flipping the status column to
+      ``cancelled`` alone enforces nothing without this check -- a RESUME (or
+      any other new turn) on an already-cancelled run would otherwise
+      proceed. Checked as ``status == "cancelled"`` specifically, not
+      "not active": this guard runs before the run is re-synced to
+      ``running`` for the turn being claimed, so ``completed``/``failed`` (a
+      normal in-progress conversation's resting state between turns) must
+      stay allowed.
 
     No-op for non-workforce tasks and for runs whose snapshot predates the
     fingerprint (backwards compatibility). Preview runs skip the fingerprint
@@ -227,9 +239,48 @@ def ensure_workforce_turn_allowed(
     if run is None:
         raise WorkforceTurnRejectedError("workforce_run_not_found")
 
+    # A run cancelled by the archive path or the stale-preview-run reaper
+    # (see cancel_active_workforce_runs / reap_stale_preview_workforce_runs)
+    # flips WorkforceRun.status to "cancelled" but has no other enforcement:
+    # neither is a PAUSE dispatch guaranteed to land, nor does any other
+    # turn-entry check inspect this status. Without this, a RESUME (or any
+    # new turn) on an already-"cancelled" run would proceed indefinitely.
+    #
+    # This must check for "cancelled" specifically, NOT "not an active
+    # status": this guard runs BEFORE sync_workforce_run_status projects the
+    # claimed Task's RUNNING status onto the run (see the caller,
+    # _begin_turn_atomic's ensure_workforce_turn_allowed call, which precedes
+    # its own sync_workforce_run_status(..., RUNNING) a few lines later) --
+    # so at this point a perfectly normal in-progress conversation's run sits
+    # at "completed" (or "failed") from the PREVIOUS turn, exactly the
+    # statuses TaskTurnOrchestrator's _APPENDABLE_STATUSES allows a new turn
+    # to resume from. Rejecting "not active" here would reject every
+    # second-and-later message in every workforce conversation.
+    #
+    # Ephemeral preview runs (test-before-save in the builder) have no
+    # persisted Workforce to check archive/drift against -- the snapshot on
+    # the run row is the only source of truth for their whole lifetime, so
+    # the cancelled-check is their only enforcement and must apply here,
+    # before the early return.
+    if run.workforce_id is None:
+        if run.status == "cancelled":
+            raise WorkforceTurnRejectedError("workforce_run_not_active")
+        return
+
     workforce = _load_workforce_for_fingerprint(db, int(run.workforce_id))
     if workforce is None or workforce.status == "archived":
         raise WorkforceTurnRejectedError("workforce_archived")
+
+    # Checked after the archive check (not before): the archive endpoint
+    # cancels every in-flight run in the SAME transaction it flips
+    # Workforce.status to "archived", so a run cancelled that way already
+    # got the more specific, established "workforce_archived" reason above.
+    # This catches the other way a real (non-preview) run ends up
+    # "cancelled" while its workforce stays active: the stale-preview-run
+    # reaper also reaps edit-mode preview runs of an already-saved,
+    # still-active workforce (see reap_stale_preview_workforce_runs).
+    if run.status == "cancelled":
+        raise WorkforceTurnRejectedError("workforce_run_not_active")
 
     if bool(run.is_preview):
         return
@@ -257,6 +308,37 @@ class WorkforceRunPauseTarget:
 
     run_id: int
     task_id: int
+    # WorkforceRun.user_id is nullable=False, so the owner is always
+    # available here -- carried per-target (rather than a single shared
+    # value on the dispatch call) since a reap sweep's targets can span
+    # multiple owners, unlike a single archive's batch.
+    actor_user_id: int
+
+
+def _cancel_workforce_run_rows(
+    runs: list[WorkforceRun],
+) -> list[WorkforceRunPauseTarget]:
+    """Flip a batch of already-loaded runs to terminal ``cancelled`` in-place.
+
+    Shared by the workforce-archive cancel path and the stale-preview-run
+    reaper below; callers differ only in how ``runs`` was selected and
+    whether they commit inline or hand the transaction to their own caller.
+    """
+    pause_targets: list[WorkforceRunPauseTarget] = []
+    for run in runs:
+        task = run.task
+        if task is not None and task.status == TaskStatus.RUNNING:
+            pause_targets.append(
+                WorkforceRunPauseTarget(
+                    run_id=int(run.id),
+                    task_id=int(task.id),
+                    actor_user_id=int(run.user_id),
+                )
+            )
+        setattr(run, "status", "cancelled")
+        if run.completed_at is None:
+            setattr(run, "completed_at", datetime.now(timezone.utc))
+    return pause_targets
 
 
 def cancel_active_workforce_runs(
@@ -287,33 +369,125 @@ def cancel_active_workforce_runs(
         )
         .all()
     )
+    return _cancel_workforce_run_rows(runs)
 
-    pause_targets: list[WorkforceRunPauseTarget] = []
-    for run in runs:
-        task = run.task
-        if task is not None and task.status == TaskStatus.RUNNING:
-            pause_targets.append(
-                WorkforceRunPauseTarget(run_id=int(run.id), task_id=int(task.id))
-            )
-        setattr(run, "status", "cancelled")
-        if run.completed_at is None:
-            setattr(run, "completed_at", datetime.now(timezone.utc))
+
+def reap_stale_preview_workforce_runs(
+    db: Session,
+    *,
+    stale_after_seconds: int | None = None,
+    limit: int = 100,
+) -> list[WorkforceRunPauseTarget]:
+    """Cancel abandoned workforce-builder preview runs.
+
+    Preview runs (``is_preview IS TRUE``, the builder's "test before save")
+    are invisible to archiving and :func:`cancel_active_workforce_runs`
+    either way: a create-mode draft has no saved Workforce at all
+    (``workforce_id IS NULL``), and an edit-mode preview against an
+    already-saved workforce has a real ``workforce_id`` but is still not a
+    normal run the archive-cancel query selects -- filtering on
+    ``workforce_id IS NULL`` alone would only reap the former and leave the
+    latter (arguably the more common case, since editing an existing
+    workforce is the primary post-launch workflow) with no cleanup path at
+    all. The frontend clears its own reference whenever the draft changes,
+    but that is a client-side signal only -- a closed tab, crashed browser,
+    or network drop leaves the run (and its hidden Task) active server-side
+    with no owner left to invalidate it. This is the server-side backstop: a
+    scheduled sweep, mirroring
+    :func:`~.background_jobs.requeue_stale_background_jobs`, that reaps rows
+    still non-terminal past ``stale_after_seconds``.
+
+    Unlike :func:`cancel_active_workforce_runs`, this commits its own
+    cancellations -- it is the only state change in its transaction (no
+    sibling archive flip to stay atomic with) -- and returns pause targets
+    for the caller to dispatch PAUSE to, same as the archive path.
+    """
+    from ...config import get_workforce_preview_run_stale_seconds
+
+    stale_seconds = (
+        stale_after_seconds
+        if stale_after_seconds is not None
+        else get_workforce_preview_run_stale_seconds()
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+    # last_activity_at is bumped by sync_workforce_run_status on every turn
+    # (PR review round 8, F-NEW-1); created_at alone stays fixed for the run's
+    # whole lifetime, so keying staleness off it could reap a conversation
+    # that's genuinely still going. Falls back to created_at for the (should
+    # be unreachable given the column's server_default) case a row's
+    # last_activity_at is somehow NULL, rather than never reaping it at all.
+    run_activity_marker = func.coalesce(
+        WorkforceRun.last_activity_at, WorkforceRun.created_at
+    )
+    # sync_workforce_run_status only bumps last_activity_at at turn
+    # boundaries (start/end), so a single turn that runs longer than the
+    # stale window on its own -- e.g. one long tool-heavy execution -- would
+    # otherwise still look stale mid-execution. Task.last_heartbeat_at is
+    # refreshed roughly every ~20s for the whole duration of an active
+    # execution (task_lease_service's heartbeat loop) and is the more direct
+    # "is this actually still running right now" signal, so the newer of the
+    # two is what staleness is keyed off (self-review finding after round 8).
+    # A CASE expression, not func.max()/func.greatest(): SQLite's multi-arg
+    # max() returns NULL if *any* argument is NULL (unlike Postgres'
+    # GREATEST, which ignores NULLs), and Postgres has no scalar 2-arg
+    # max() at all -- this codebase supports both, so neither is portable
+    # here.
+    activity_marker = case(
+        (run_activity_marker.is_(None), Task.last_heartbeat_at),
+        (Task.last_heartbeat_at.is_(None), run_activity_marker),
+        (run_activity_marker >= Task.last_heartbeat_at, run_activity_marker),
+        else_=Task.last_heartbeat_at,
+    )
+
+    runs = (
+        db.query(WorkforceRun)
+        .outerjoin(Task, WorkforceRun.task_id == Task.id)
+        .options(contains_eager(WorkforceRun.task))
+        .filter(
+            WorkforceRun.is_preview.is_(True),
+            WorkforceRun.status.in_(ACTIVE_WORKFORCE_RUN_STATUSES),
+            # NULL-safe on its own: coalesce(NULL, NULL) <= cutoff is UNKNOWN,
+            # which the WHERE clause already excludes -- an explicit not-null
+            # guard on created_at specifically would be checking the wrong
+            # column now that the comparison runs against activity_marker,
+            # not created_at directly (self-review finding after round 8).
+            activity_marker <= cutoff,
+        )
+        .order_by(activity_marker.asc())
+        .limit(max(1, min(limit, 500)))
+        .all()
+    )
+    if not runs:
+        return []
+
+    pause_targets = _cancel_workforce_run_rows(runs)
+    db.commit()
     return pause_targets
 
 
 async def pause_workforce_tasks_after_archive(
     pause_targets: list[WorkforceRunPauseTarget],
     *,
-    workforce_id: int,
-    actor_user_id: int | None,
+    reason: str = "archive",
 ) -> None:
-    """Best-effort PAUSE dispatch for tasks left running by an archive.
+    """Best-effort PAUSE dispatch for tasks left running by a cancellation.
 
-    Runs AFTER the caller committed the archive/cancel transaction, on its
-    own short-lived sessions, so the durable enqueue's internal commit can
-    never leak a partial archive state. A failed pause is logged and skipped:
-    the run is already terminal and the turn-entry guard blocks new turns,
-    so the orphaned execution can only run its current turn to completion.
+    Runs AFTER the caller committed its cancel transaction (archive flip,
+    or the stale-preview-run reaper's own commit), on its own short-lived
+    sessions, so the durable enqueue's internal commit can never leak a
+    partial state from the caller's transaction. A failed pause is logged
+    and skipped: the run is already terminal and the turn-entry guard blocks
+    new turns, so the orphaned execution can only run its current turn to
+    completion.
+
+    Each target's own ``actor_user_id`` (the run's owner) is used for the
+    dispatched command, not a single shared actor for the whole batch -- a
+    reap sweep's targets can span multiple owners, unlike a single archive.
+
+    ``reason`` is a short label (e.g. ``"archive"``, ``"preview-reap"``)
+    distinguishing why the cancellation happened, used only for the log
+    message -- deliberately NOT part of the command id (see below), so it
+    has no effect on dispatch behavior.
     """
     if not pause_targets:
         return
@@ -332,12 +506,21 @@ async def pause_workforce_tasks_after_archive(
                 enqueued = enqueue_task_command(
                     command_db,
                     task_id=target.task_id,
-                    actor_user_id=actor_user_id,
-                    command_id=f"workforce-archive-{target.run_id}",
+                    actor_user_id=target.actor_user_id,
+                    # Keyed on run_id alone (not reason): the archive path
+                    # (cancel_active_workforce_runs) and the reap sweep
+                    # (reap_stale_preview_workforce_runs, which can now also
+                    # select an edit-mode preview run of an already-saved
+                    # workforce) can race and both select the SAME run for
+                    # cancellation. enqueue_task_command's (task_id,
+                    # command_id) dedup only catches that if both call sites
+                    # produce the identical id -- embedding `reason` would
+                    # defeat the exact idempotency protection this is for.
+                    command_id=f"workforce-pause-{target.run_id}",
                     kind=TaskCommandKind.PAUSE,
                     payload={},
                 )
-            from ..api.websocket import execute_durable_task_command
+            from .task_command_execution import execute_durable_task_command
 
             await dispatch_task_command_promptly(
                 execute_durable_task_command,
@@ -345,9 +528,10 @@ async def pause_workforce_tasks_after_archive(
             )
         except Exception:
             logger.warning(
-                "Failed to pause running task %s while archiving workforce %s",
+                "Failed to pause running task %s (workforce run %s, %s)",
                 target.task_id,
-                workforce_id,
+                target.run_id,
+                reason,
                 exc_info=True,
             )
 
@@ -415,6 +599,16 @@ def sync_workforce_run_status(
         setattr(run, "completed_at", None)
         changed = True
 
+    if changed:
+        # Explicit, not just relying on the column's own onupdate=func.now():
+        # this is the one signal the preview-run reaper trusts to tell a
+        # conversation that's genuinely still going from one that's simply
+        # been open a long time (PR review round 8, F-NEW-1). Only bumped
+        # alongside a real transition, so a no-op sync call (status/
+        # completed_at already correct) doesn't manufacture activity that
+        # didn't happen.
+        setattr(run, "last_activity_at", datetime.now(timezone.utc))
+
     return changed
 
 
@@ -462,8 +656,10 @@ def _sync_workforce_run_status_for_task_id(
     if task_lease is not None:
         if task_lease.task_id != int(task_id) or task_lease.run_id is None:
             return False
+        lock_task_lease_for_settlement_no_commit(db, task_lease)
         task_query = task_query.filter(
             Task.runner_id == task_lease.runner_id,
+            task_lease_attempt_predicate(task_lease),
             Task.run_id == task_lease.run_id,
         )
     task = task_query.with_for_update().first()

@@ -1,8 +1,63 @@
 from __future__ import annotations
 
+import ast
+import re
+import subprocess
+import tomllib
 from pathlib import Path
+from typing import Any, cast
+
+import yaml
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_postgresql_dependency_groups_include_async_trace_driver():
+    """Default-on async writes need Psycopg 3 in image, CI and documented extras."""
+    project = tomllib.loads(read_repo_file("pyproject.toml"))
+    install_sets = [
+        project["dependency-groups"][group] for group in ("backend-image", "test")
+    ] + [
+        project["project"]["optional-dependencies"][extra]
+        for extra in ("postgresql", "all")
+    ]
+    for install_set in install_sets:
+        requirements = {
+            Requirement(item).name for item in install_set if isinstance(item, str)
+        }
+        assert {"psycopg2-binary", "psycopg"} <= requirements
+
+
+# Distribution names and import names are separate interfaces. Keep the mapping
+# explicit so packages such as pydantic-settings are checked without guessing
+# their import name from punctuation.
+SANDBOX_DISTRIBUTION_IMPORTS = {
+    "pydantic": "pydantic",
+    "pydantic-settings": "pydantic_settings",
+    "cloudpickle": "cloudpickle",
+    "mcp": "mcp",
+    "pandas": "pandas",
+    "numpy": "numpy",
+    "matplotlib": "matplotlib",
+    "openpyxl": "openpyxl",
+    "python-docx": "docx",
+    "fsspec": "fsspec",
+}
+SANDBOX_DIRECT_REQUIREMENTS = {
+    "pydantic": "pydantic>=2.11.7",
+    "pydantic-settings": "pydantic-settings",
+    "cloudpickle": "cloudpickle>=3.0.0",
+    "mcp": "mcp>=1.12.4,<2",
+    "pandas": "pandas>=1.3.0",
+    "numpy": "numpy>=1.21.0",
+    "matplotlib": "matplotlib>=3.5.0",
+    "openpyxl": "openpyxl>=3.1.0",
+    "python-docx": "python-docx>=1.1.0",
+    "fsspec": "fsspec>=2024.0.0",
+}
 
 
 def read_workflow(name: str) -> str:
@@ -176,6 +231,49 @@ def test_backend_runtime_keeps_uv_binaries() -> None:
     assert dockerfile.count("COPY --from=uv /uv /uvx /usr/local/bin/") == 2
 
 
+def test_backend_dockerfile_installs_docker_cli_without_the_daemon() -> None:
+    """docker.io ships an engine + containerd + runc that a daemonless
+    container never uses, but /usr/bin/docker must survive the swap:
+    command_policy.py gates the agent shell by path, not by an allowlist.
+    See https://github.com/xorbitsai/xagent/pull/1807
+    """
+
+    dockerfile = read_repo_file("docker/Dockerfile.backend")
+
+    # `runtime` is FROM runtime-base and copies no apt layer out of the build
+    # stages, so an install that drifted into backend-base would ship an image
+    # with no /usr/bin/docker at all.
+    runtime_base = dockerfile.split(
+        "FROM python:${PYTHON_VERSION}-bookworm AS runtime-base\n", maxsplit=1
+    )[1].split("\nFROM ", maxsplit=1)[0]
+    block = next(
+        chunk for chunk in runtime_base.split("\n\n") if "docker-ce-cli" in chunk
+    )
+    install = "\n".join(line for line in block.splitlines() if not line.startswith("#"))
+
+    # Hardcoding an arch here would break the arm64 image (docker-publish.yml
+    # publishes amd64 + arm64); --no-install-recommends keeps
+    # docker-buildx-plugin/docker-compose-plugin out.
+    assert (
+        "arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg"
+        in install
+    )
+    assert "--no-install-recommends docker-ce-cli \\" in install
+    for daemon_package in ("docker.io", "docker-ce ", "containerd", "runc"):
+        assert daemon_package not in install
+
+    # The key and source list must be dropped by the same layer that added
+    # them, or download.docker.com stays resolvable in the running container.
+    assert (
+        "rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/docker.list"
+        " /usr/share/keyrings/docker.gpg" in install
+    )
+    # Smoke-tested during the build so a broken swap fails on both published
+    # architectures instead of shipping.
+    assert "test -x /usr/bin/docker \\" in install
+    assert "! command -v dockerd \\" in install
+
+
 def test_backend_package_version_is_vcs_based_for_normal_builds() -> None:
     pyproject = read_repo_file("pyproject.toml")
 
@@ -209,9 +307,307 @@ def test_docker_workflows_pass_package_version_to_backend_build() -> None:
     )
 
 
-def test_docker_readme_documents_lockfile_requirement() -> None:
+def test_docker_readme_documents_backend_and_sandbox_lockfile_requirements() -> None:
     readme = read_repo_file("docker/README.md")
 
     assert "`uv.lock` during the Docker build" in readme
     assert "uv sync --locked" in readme
+    assert "`[dependency-groups].sandbox`" in readme
+    assert "docker/Dockerfile.sandbox" in readme
     assert "uv.lock` is not copied" not in readme
+
+
+def test_sandbox_image_dependencies_are_a_dedicated_locked_group() -> None:
+    pyproject = tomllib.loads(read_repo_file("pyproject.toml"))
+
+    assert pyproject["dependency-groups"]["sandbox"] == list(
+        SANDBOX_DIRECT_REQUIREMENTS.values()
+    )
+
+
+def test_sandbox_group_covers_runtime_requirements_with_compatible_lock() -> None:
+    runtime_constants = {
+        "src/xagent/core/tools/adapters/vibe/sandboxed_tool/"
+        "sandboxed_tool_wrapper.py": "SANDBOX_BASE_DEPENDENCIES",
+        "src/xagent/core/tools/adapters/vibe/sandboxed_tool/"
+        "sandboxed_mcp_tool_helper.py": "_MCP_SANDBOX_EXTRA_PACKAGES",
+    }
+    runtime_requirements: list[str] = []
+    for path, constant_name in runtime_constants.items():
+        module = ast.parse(read_repo_file(path))
+        assignment = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == constant_name
+                for target in node.targets
+            )
+        )
+        runtime_requirements.extend(ast.literal_eval(assignment.value))
+
+    pyproject = tomllib.loads(read_repo_file("pyproject.toml"))
+    sandbox_requirements = {
+        canonicalize_name(requirement.name): requirement
+        for raw_requirement in pyproject["dependency-groups"]["sandbox"]
+        if (requirement := Requirement(raw_requirement))
+    }
+    lock = tomllib.loads(read_repo_file("uv.lock"))
+    locked_versions = {
+        canonicalize_name(package["name"]): Version(package["version"])
+        for package in lock["package"]
+        if "version" in package
+    }
+
+    for raw_requirement in runtime_requirements:
+        runtime_requirement = Requirement(raw_requirement)
+        name = canonicalize_name(runtime_requirement.name)
+        assert name in sandbox_requirements
+        assert locked_versions[name] in runtime_requirement.specifier
+
+
+def test_backend_mcp_dependency_excludes_2x() -> None:
+    # Companion to test_sandbox_group_covers_runtime_requirements_with_compatible_lock
+    # above, which only guards the sandbox group's mcp bound: mcp 2.0 removed
+    # mcp.client.streamable_http.streamablehttp_client, which the backend's own
+    # sessions.py imports eagerly, so [project].dependencies must independently
+    # keep mcp below 2.x even if that guard alone were ever satisfied.
+    pyproject = tomllib.loads(read_repo_file("pyproject.toml"))
+    backend_requirements = {
+        canonicalize_name((requirement := Requirement(raw)).name): requirement
+        for raw in pyproject["project"]["dependencies"]
+    }
+
+    mcp_requirement = backend_requirements[canonicalize_name("mcp")]
+    assert Version("2.0.0") not in mcp_requirement.specifier
+
+
+def test_sandbox_dockerfile_installs_locked_group_and_smoke_tests_imports() -> None:
+    dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+
+    assert "FROM python:3.11-slim AS sandbox-requirements" in dockerfile
+    assert "COPY pyproject.toml uv.lock ./" in dockerfile
+    assert (
+        "uv export --quiet --locked --only-group sandbox --no-emit-project"
+        in dockerfile
+    )
+    assert "FROM node:22-slim AS sandbox" in dockerfile
+    runtime_stage = dockerfile.split("FROM node:22-slim AS sandbox\n", maxsplit=1)[1]
+    assert "COPY pyproject.toml uv.lock ./" not in runtime_stage
+    assert "COPY --from=sandbox-requirements /sandbox-requirements.txt" in runtime_stage
+    assert "uv pip install --system --break-system-packages" in runtime_stage
+    assert "docker/sandbox-requirements.txt" not in dockerfile
+    assert not (ROOT / "docker" / "sandbox-requirements.txt").exists()
+    assert "USER sandbox" in runtime_stage
+
+
+def test_sandbox_runtime_keeps_and_smoke_tests_uvx() -> None:
+    dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+    runtime_stage = dockerfile.split("FROM node:22-slim AS sandbox\n", maxsplit=1)[1]
+
+    assert "COPY --from=uv /uv /uvx /usr/local/bin/" in runtime_stage
+    assert "uvx --version" in runtime_stage
+
+
+def test_sandbox_export_is_locked_without_managed_python_downloads() -> None:
+    dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+    requirements_stage = dockerfile.split(
+        "FROM python:3.11-slim AS sandbox-requirements\n", maxsplit=1
+    )[1].split("FROM node:22-slim AS sandbox\n", maxsplit=1)[0]
+
+    assert "ENV UV_PYTHON_DOWNLOADS=0" in requirements_stage
+    assert "uv export --quiet --locked --only-group sandbox --no-emit-project" in (
+        requirements_stage
+    )
+
+
+def test_chrome_devtools_mcp_pin_matches_across_dockerfiles_and_registry() -> None:
+    # builtin_mcp_registry.py is the single source of truth for the version
+    # end users' MCP calls actually run; both Dockerfiles independently warm
+    # an npx cache for "the same" pin so npx resolves offline instead of
+    # hitting the npm registry on every sandboxed/backend-hosted launch (see
+    # Dockerfile.sandbox's INSTALL_CHROME block and its npx warm-up comment).
+    # A version bumped in the registry but missed in either warm-up command
+    # would silently leave that path's cache cold for the *new* version
+    # while still reporting success, not fail loudly -- this pins all three
+    # together so a future bump can't drift one file behind the others.
+    registry = read_repo_file("src/xagent/web/builtin_mcp_registry.py")
+    # findall, not search: if the registry ever grows a second quoted pin
+    # (e.g. a stale one left in a comment), a single search silently checks
+    # only whichever occurrence comes first -- require there to be exactly
+    # one so a duplicate/ambiguous pin fails loudly instead of passing on
+    # a coin flip of match order.
+    registry_pins = set(re.findall(r'"chrome-devtools-mcp@([\w.\-]+)"', registry))
+    assert registry_pins, "chrome-devtools-mcp pin not found in builtin_mcp_registry.py"
+    assert len(registry_pins) == 1, (
+        f"builtin_mcp_registry.py has ambiguous chrome-devtools-mcp pins: "
+        f"{sorted(registry_pins)} -- expected exactly one"
+    )
+    (pinned_version,) = registry_pins
+
+    controller = read_repo_file(
+        "src/xagent/core/tools/adapters/vibe/sandboxed_tool/chrome_daemon_runner.py"
+    )
+    controller_pins = set(
+        re.findall(
+            r'CHROME_DEVTOOLS_PACKAGE = "chrome-devtools-mcp@([\w.\-]+)"', controller
+        )
+    )
+    assert controller_pins == {pinned_version}, (
+        "the sandbox Chrome daemon controller must use the registry's exact pin"
+    )
+
+    for dockerfile_path in ("docker/Dockerfile.backend", "docker/Dockerfile.sandbox"):
+        dockerfile = read_repo_file(dockerfile_path)
+
+        # Extracts just the version each Dockerfile's own npx warm-up
+        # command resolves against, rather than requiring an
+        # exact-substring match of the whole npx invocation -- a future
+        # edit that legitimately reorders or adds flags around the same
+        # pinned version shouldn't fail this test, only an actual version
+        # mismatch should. findall (not search) for the same
+        # duplicate-match reason as the registry side above.
+        dockerfile_pins = set(
+            re.findall(r"npx\b[^\n]*\bchrome-devtools-mcp@([\w.\-]+)", dockerfile)
+        )
+        assert dockerfile_pins, (
+            f"{dockerfile_path} has no npx chrome-devtools-mcp warm-up command"
+        )
+        assert len(dockerfile_pins) == 1, (
+            f"{dockerfile_path} has ambiguous chrome-devtools-mcp npx pins: "
+            f"{sorted(dockerfile_pins)} -- expected exactly one"
+        )
+        (dockerfile_version,) = dockerfile_pins
+        assert dockerfile_version == pinned_version, (
+            f"{dockerfile_path} warms the npx cache for "
+            f"chrome-devtools-mcp@{dockerfile_version}, but "
+            f"builtin_mcp_registry.py pins chrome-devtools-mcp@{pinned_version} -- "
+            "update the warm-up command to match"
+        )
+
+    # A pinned version string surviving unchanged doesn't prove the browser
+    # install itself survived -- guard against the case this PR actually
+    # fixes (chrome-devtools-mcp launched with no Chrome to find) being
+    # silently reintroduced by a future edit that deletes the install
+    # block while leaving the (now-misleading) npx warm-up line intact.
+    sandbox_dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+    assert "ARG INSTALL_CHROME" in sandbox_dockerfile, (
+        "Dockerfile.sandbox is missing its Chrome/Chromium install gate "
+        "(ARG INSTALL_CHROME) -- without it, sandboxed chrome-devtools-mcp "
+        "calls fail with 'Could not find Google Chrome executable'"
+    )
+    assert "/opt/google/chrome/chrome" in sandbox_dockerfile, (
+        "Dockerfile.sandbox is missing the /opt/google/chrome/chrome "
+        "resolver-path existence check -- without it, a broken Chrome/"
+        "Chromium install can silently ship instead of failing the build"
+    )
+
+
+def test_sandbox_npm_cache_is_owned_by_the_boxlite_runtime_user() -> None:
+    dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+
+    assert "ENV NPM_CONFIG_CACHE=/opt/npm-cache" in dockerfile
+    assert 'chmod 0755 "$NPM_CONFIG_CACHE"' in dockerfile
+    assert 'chown -R 1100:1010 "$NPM_CONFIG_CACHE"' in dockerfile
+    assert (
+        "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1 NPM_CONFIG_OFFLINE=true" in dockerfile
+    )
+    assert "npx -y --offline chrome-devtools-mcp@1.6.0 --help" in dockerfile
+
+
+def test_sandbox_uv_install_uses_buildkit_cache() -> None:
+    dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+    runtime_stage = dockerfile.split("FROM node:22-slim AS sandbox\n", maxsplit=1)[1]
+
+    assert "--mount=type=cache,target=/root/.cache/uv" in runtime_stage
+    assert "--no-cache" not in runtime_stage
+
+
+def test_sandbox_direct_distributions_have_explicit_smoke_imports() -> None:
+    pyproject = tomllib.loads(read_repo_file("pyproject.toml"))
+    direct_requirements = pyproject["dependency-groups"]["sandbox"]
+    dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+    runtime_stage = dockerfile.split("FROM node:22-slim AS sandbox\n", maxsplit=1)[1]
+    smoke_command = re.search(r'python -c "([^"]+)"', runtime_stage)
+
+    assert SANDBOX_DIRECT_REQUIREMENTS.keys() == SANDBOX_DISTRIBUTION_IMPORTS.keys()
+    assert direct_requirements == list(SANDBOX_DIRECT_REQUIREMENTS.values())
+    assert smoke_command is not None
+    imported_modules = {
+        alias.name
+        for node in ast.walk(ast.parse(smoke_command.group(1)))
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert imported_modules == set(SANDBOX_DISTRIBUTION_IMPORTS.values())
+
+
+def test_uv_export_locked_sandbox_group_contains_direct_distributions() -> None:
+    result = subprocess.run(
+        [
+            "uv",
+            "export",
+            "--quiet",
+            "--locked",
+            "--only-group",
+            "sandbox",
+            "--no-emit-project",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    for distribution in SANDBOX_DISTRIBUTION_IMPORTS:
+        assert re.search(rf"^{re.escape(distribution)}==", result.stdout, re.MULTILINE)
+
+
+def sandbox_publish_step(name: str) -> dict[str, Any]:
+    workflow = yaml.safe_load(read_workflow("sandbox-publish.yml"))
+    for step in workflow["jobs"]["build-and-push"]["steps"]:
+        if step.get("name") == name:
+            return cast(dict[str, Any], step)
+    raise AssertionError(f"sandbox-publish.yml has no step named {name!r}")
+
+
+def test_sandbox_hub_description_step_is_sha_pinned_to_the_sandbox_repository() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    assert step["uses"] == (
+        "peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa"
+    )
+    assert step["with"]["repository"] == "${{ env.SANDBOX_IMAGE }}"
+    assert step["with"]["readme-filepath"] == "./docker/README.sandbox.md"
+    assert step["with"]["username"] == "${{ secrets.DOCKERHUB_USERNAME }}"
+    assert step["with"]["password"] == "${{ secrets.DOCKERHUB_PASSWORD }}"
+
+
+# WHY: the Hub description is repository-global, not tag-scoped, so a
+# push_to_dockerhub=false dry run must not reach it.
+def test_sandbox_hub_description_gate_equals_the_image_push_gate() -> None:
+    description = sandbox_publish_step("Update Docker Hub repository description")
+    build = sandbox_publish_step("Build and push sandbox image")
+
+    assert description["if"] == build["with"]["push"]
+    assert "push_to_dockerhub == 'true'" in description["if"]
+
+
+def test_sandbox_hub_description_failure_does_not_fail_the_release() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    assert step["continue-on-error"] is True
+
+
+# WHY: the action truncates an oversized readme or short description and only
+# warns, so drift past a Hub limit ships silently with the run still green.
+def test_sandbox_hub_description_inputs_fit_docker_hub_limits() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    readme = ROOT / step["with"]["readme-filepath"]
+    assert readme.is_file()
+    assert len(readme.read_bytes()) <= 25_000
+
+    short_description = step["with"]["short-description"]
+    assert short_description
+    assert len(short_description.encode("utf-8")) <= 100

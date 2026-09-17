@@ -5,11 +5,16 @@ Template Manager - Manages the scanning and retrieval of templates
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# Mirrors xagent.web.models.agent.ExecutionMode's values. Not imported
+# directly to avoid pulling the SQLAlchemy-backed web.models layer into
+# this DB-agnostic YAML loader for one small, stable set of literals.
+_VALID_EXECUTION_MODES = frozenset({"flash", "balanced", "think", "auto"})
 
 
 class TemplateManager:
@@ -81,7 +86,54 @@ class TemplateManager:
             except Exception as e:
                 logger.error(f"  ✗ Error loading {yaml_file.name}: {e}", exc_info=True)
 
+        self._warn_on_dangling_workforce_references()
+
         logger.info(f"Total templates loaded: {len(self._templates_cache)}")
+
+    def _warn_on_dangling_workforce_references(self) -> None:
+        """A workforce template's `workforce_config.agents[].template_id`
+        values are only checked at parse time for being non-empty strings
+        (per-file validation can't know about other files yet, and can't
+        know the referenced template's own `type`). Once every template is
+        loaded, cross-check each one against the full cache so a typo'd or
+        wrongly-typed reference is logged loudly at startup instead of only
+        surfacing as a 400 the first time a user clicks "Use" on that
+        template. Logged at `warning`, not `error`: this is a template
+        authoring problem the process can fully continue past, not a
+        request-time failure.
+        """
+        for template in self._templates_cache.values():
+            if template.get("type") != "workforce":
+                continue
+            workforce_config = template.get("workforce_config") or {}
+            for agent in workforce_config.get("agents") or []:
+                referenced_id = agent.get("template_id")
+                if not referenced_id:
+                    continue
+                referenced_template = self._templates_cache.get(referenced_id)
+                if referenced_template is None:
+                    logger.warning(
+                        "Workforce template %r references unknown template_id "
+                        "%r in workforce_config.agents - instantiating it will "
+                        "fail until this is fixed",
+                        template.get("id"),
+                        referenced_id,
+                    )
+                elif referenced_template.get("type", "agent") != "agent":
+                    # A worker must resolve to a single-agent template - see
+                    # the matching runtime guard in
+                    # workforce_creator._get_or_create_quick_access_worker_agent,
+                    # which would otherwise try to read a null agent_config
+                    # off the referenced (workforce-type) template.
+                    logger.warning(
+                        "Workforce template %r references template_id %r in "
+                        "workforce_config.agents, but that template's type is "
+                        "%r, not 'agent' - instantiating it will fail until "
+                        "this is fixed",
+                        template.get("id"),
+                        referenced_id,
+                        referenced_template.get("type"),
+                    )
 
     def _parse_yaml_file(self, yaml_file: Path) -> Dict[str, Any]:
         """Parse a single YAML file"""
@@ -94,6 +146,15 @@ class TemplateManager:
             if field not in data:
                 raise ValueError(f"Missing required field: {field}")
 
+        # `name` must be a real string (not just present): it is backfilled
+        # into persona.role.en below, where a non-string would otherwise
+        # surface as a pydantic ValidationError - a 500 on the whole list
+        # endpoint - the first time a response is built from it.
+        name = data["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("'name' must be a non-empty string")
+        data["name"] = name.strip()
+
         # Validate descriptions contains English
         descriptions = data.get("descriptions", {})
         if not isinstance(descriptions, dict):
@@ -105,14 +166,28 @@ class TemplateManager:
         if "agent_config" not in data:
             data["agent_config"] = {}
 
-        # Set default values
-        data.setdefault("tags", [])
-        data.setdefault("features", [])
+        # Set default values. tags/features/sample_prompts are per-locale
+        # dicts (like descriptions), so their "not authored" default must be
+        # {} not [] - get_localized_value falls back to [] per-call anyway,
+        # but a [] here would silently bypass localization if ever read
+        # directly instead of through get_localized_value.
+        data.setdefault("tags", {})
+        data.setdefault("features", {})
         data.setdefault("connections", [])
         data.setdefault("setup_time", "5 min setup")
         data.setdefault("author", "Xagent")
         data.setdefault("version", "1.0")
         data.setdefault("featured", False)
+        data.setdefault("sample_prompts", {})
+        self._validate_sample_prompts(data["sample_prompts"])
+        data.setdefault("persona", None)
+        self._validate_persona(data["persona"])
+        if data["persona"] is not None:
+            # See _validate_persona's docstring: role.en is the one persona
+            # field allowed to be authored blank, precisely because this
+            # fallback exists - avoids 17+ templates each repeating their
+            # own top-level `name` verbatim under persona.role.en.
+            data["persona"]["role"].setdefault("en", data["name"])
 
         # agent_config default values
         agent_config = data["agent_config"]
@@ -121,35 +196,386 @@ class TemplateManager:
         agent_config.setdefault("tool_categories", [])
         agent_config.setdefault("execution_mode", "balanced")
 
+        # type distinguishes a single-agent template (default) from a
+        # workforce template, which is instantiated as a manager agent plus
+        # N worker agents rather than a single agent.
+        data.setdefault("type", "agent")
+        if data["type"] not in ("agent", "workforce"):
+            raise ValueError(
+                f"'type' must be 'agent' or 'workforce', got {data['type']!r}"
+            )
+        data.setdefault("workforce_config", None)
+        if data["type"] == "workforce":
+            self._validate_workforce_config(data["workforce_config"])
+            # A workforce card renders from workforce_config, not a persona
+            # (see _validate_persona's docstring) - authoring one anyway
+            # would be validated, backfilled, and served, silently
+            # contradicting that contract, so reject it here where `type`
+            # is finally known.
+            if data["persona"] is not None:
+                raise ValueError(
+                    "'persona' is only supported on agent-type templates - "
+                    "a workforce template's card renders from "
+                    "workforce_config instead"
+                )
+
         return data
 
+    @staticmethod
+    def _require_string(
+        container: Dict[str, Any], key: str, *, path: str, required: bool = True
+    ) -> None:
+        """Enforce that `container[key]` is a real (optionally absent)
+        string, and write the stripped value back in place.
+
+        Strict `isinstance` rather than `str(...)` coercion: a list/dict/int
+        that YAML happened to parse for one of these fields used to slip
+        through load-time validation and only surface downstream - as a
+        garbage prompt or template id, or as an `AttributeError` → 500 when
+        `normalize_text(...).strip()` hit a non-string `description`/`alias`.
+        Writing the stripped value back also keeps the duplicate-check and
+        the runtime lookup seeing the same `template_id` - previously a
+        template id with surrounding whitespace was stripped for the
+        duplicate check but looked up raw, guaranteeing a "references an
+        unknown template" 400 at use time.
+        """
+        value = container.get(key)
+        if value is None and not required:
+            return
+        if not isinstance(value, str) or not value.strip():
+            requirement = "a non-empty string" if required else "a string or omitted"
+            raise ValueError(f"'{path}.{key}' must be {requirement}")
+        container[key] = value.strip()
+
+    def _validate_workforce_config(self, workforce_config: Any) -> None:
+        """Validate the shape of `workforce_config` for a workforce-type
+        template, normalizing (stripping) its string fields in place. A
+        workforce template is instantiated as a fresh manager agent
+        (defined inline via `manager.instructions`) plus one worker agent
+        per `agents[]` entry, each reused/created from an existing template
+        id (`agents[].template_id`) - see `create_workforce_from_template`
+        in `xagent.web.services.workforce_creator`.
+        """
+        if not isinstance(workforce_config, dict):
+            raise ValueError(
+                "'workforce_config' is required and must be a mapping when 'type' is 'workforce'"
+            )
+
+        manager = workforce_config.get("manager")
+        if not isinstance(manager, dict):
+            raise ValueError("'workforce_config.manager' must be a mapping")
+        manager_path = "workforce_config.manager"
+        self._require_string(manager, "instructions", path=manager_path)
+        self._require_string(manager, "name", path=manager_path)
+        self._require_string(manager, "description", path=manager_path, required=False)
+        execution_mode = manager.get("execution_mode")
+        if execution_mode is not None and execution_mode not in _VALID_EXECUTION_MODES:
+            # Passed straight into AgentStore.add_agent with no further
+            # validation - a typo here would only surface as a broken
+            # manager agent at instantiation time, out of step with how
+            # carefully the rest of workforce_config is checked at load
+            # time.
+            raise ValueError(
+                "'workforce_config.manager.execution_mode' must be one of "
+                f"{sorted(_VALID_EXECUTION_MODES)}, got {execution_mode!r}"
+            )
+        for list_field in ("tool_categories", "skills"):
+            value = manager.get(list_field)
+            if value is not None and (
+                not isinstance(value, list)
+                or not all(isinstance(v, str) for v in value)
+            ):
+                raise ValueError(
+                    f"'workforce_config.manager.{list_field}' must be a list of strings"
+                )
+
+        agents = workforce_config.get("agents")
+        if not isinstance(agents, list) or not agents:
+            raise ValueError("'workforce_config.agents' must be a non-empty list")
+        seen_template_ids: set[str] = set()
+        for index, agent in enumerate(agents):
+            if not isinstance(agent, dict):
+                raise ValueError(
+                    f"'workforce_config.agents[{index}]' must be a mapping"
+                )
+            agent_path = f"workforce_config.agents[{index}]"
+            self._require_string(agent, "template_id", path=agent_path)
+            self._require_string(agent, "assignment_instructions", path=agent_path)
+            self._require_string(agent, "alias", path=agent_path, required=False)
+            # Required so every worker has a stable display name - the
+            # card's agent-count badge used to silently omit a nameless
+            # worker rather than surface the gap, undercounting.
+            self._require_string(agent, "name", path=agent_path)
+
+            template_id = agent["template_id"]
+            if template_id in seen_template_ids:
+                # Two agents[] entries resolving to the same quick-access
+                # worker agent make the template permanently unusable: the
+                # second create_workforce_worker() call 409s on the
+                # (workforce_id, agent_id) unique constraint every time this
+                # template is instantiated.
+                raise ValueError(
+                    f"'workforce_config.agents' has a duplicate template_id: "
+                    f"{template_id!r}"
+                )
+            seen_template_ids.add(template_id)
+
+    def _validate_sample_prompts(self, sample_prompts: Any) -> None:
+        """Validate the (optional) sample_prompts shape at parse time, the
+        same way `descriptions` is validated above. Without this, a
+        malformed entry only surfaces as an uncaught pydantic
+        ValidationError deep inside the TemplateInfo response model,
+        which would take down GET /api/templates/ - and therefore the
+        whole template list - for every user, not just break this one
+        template.
+        """
+        if not sample_prompts:
+            return
+        if not isinstance(sample_prompts, dict):
+            raise ValueError(
+                "'sample_prompts' must be a dict keyed by locale (e.g. "
+                "{'en': [...], 'zh': [...]}), not a flat list - a flat list "
+                "would silently bypass per-locale resolution"
+            )
+        for locale, prompts in sample_prompts.items():
+            if not isinstance(prompts, list):
+                raise ValueError(f"'sample_prompts.{locale}' must be a list")
+            for index, prompt in enumerate(prompts):
+                if not isinstance(prompt, dict):
+                    raise ValueError(
+                        f"'sample_prompts.{locale}[{index}]' must be a mapping"
+                    )
+                title = prompt.get("title")
+                if not isinstance(title, str) or not title:
+                    raise ValueError(
+                        f"'sample_prompts.{locale}[{index}].title' must be a non-empty string"
+                    )
+                prompt_text = prompt.get("prompt")
+                if not isinstance(prompt_text, str) or not prompt_text:
+                    raise ValueError(
+                        f"'sample_prompts.{locale}[{index}].prompt' must be a non-empty string"
+                    )
+                highlights = prompt.get("highlights", [])
+                if not isinstance(highlights, list) or not all(
+                    isinstance(h, str) for h in highlights
+                ):
+                    raise ValueError(
+                        f"'sample_prompts.{locale}[{index}].highlights' must be a list of strings"
+                    )
+
+    # The only keys _validate_persona recognizes. Enforced explicitly (not
+    # just "known keys are well-formed") so a typo'd or misspelled key
+    # (`avator`, `kickoff_question`) is rejected at load time instead of
+    # silently parsing as an absent field - see the docstring below.
+    _PERSONA_KEYS = frozenset({"name", "role", "avatar", "intro", "kickoff_questions"})
+
+    def _validate_persona(self, persona: Any) -> None:
+        """Validate and normalize (strip values in place) the optional
+        `persona` block - the "AI Team Marketplace" card content (display
+        name, avatar, and the chat-opening intro/questions a Hire flow
+        seeds). `None` (the default) means the template shows up in the
+        marketplace with no persona treatment, e.g. a workforce-type
+        template's card is rendered from `workforce_config` instead.
+
+        `role`, `intro`, and `kickoff_questions` are locale-keyed the same
+        {'en': ..., 'zh': ...} shape as `descriptions` / `sample_prompts`
+        above, validated the same way so a malformed entry (including an
+        unrecognized key - a real risk given how similar this shape is to
+        its four siblings) fails that template's load - `reload()` logs
+        the error and skips the file - rather than surfacing as a 500 the
+        first time `TemplateInfo`/`PersonaInfo` tries to build a
+        response from it. `name` is deliberately a flat string, not
+        locale-keyed: it is a proper noun (the teammate's given name,
+        "Maya"), the same in every locale.
+
+        `role` and `intro`/`kickoff_questions` are deliberately NOT
+        symmetric, despite the shared shape: `role.en` may be omitted here
+        because `_parse_yaml_file` backfills it from the template's own
+        top-level `name` immediately after this returns, so there is
+        always a sensible non-blank value to localize. `intro` and
+        `kickoff_questions` have no such fallback - a blank opening
+        message is worse than refusing to load, so each requires an 'en'
+        entry the moment it is authored at all, rather than silently
+        resolving to "" for an English requester via
+        `get_localized_value`'s fallback-to-'en' behavior.
+        """
+        if persona is None:
+            return
+        if not isinstance(persona, dict):
+            raise ValueError("'persona' must be a mapping or omitted")
+
+        unknown_keys = set(persona) - self._PERSONA_KEYS
+        if unknown_keys:
+            raise ValueError(
+                f"'persona' has unknown key(s) {sorted(unknown_keys)} - "
+                f"expected only {sorted(self._PERSONA_KEYS)}"
+            )
+
+        self._require_string(persona, "name", path="persona")
+
+        self._validate_locale_map(
+            persona,
+            "role",
+            require_en=False,
+            flat_shape="a flat string",
+            value_requirement="a non-empty string",
+            coerce_value=self._coerce_stripped_string,
+        )
+
+        self._require_string(persona, "avatar", path="persona", required=False)
+        persona.setdefault("avatar", None)
+        avatar = persona["avatar"]
+        if avatar is not None and not avatar.startswith("/"):
+            # PersonaInfo.avatar's documented contract: an app-relative path
+            # served from the frontend's own static assets, never an
+            # external hotlink (which could rot, leak requests to a third
+            # party, or bypass the committed-file invariant test).
+            raise ValueError(
+                "'persona.avatar' must be an app-relative path starting "
+                "with '/' (e.g. '/marketplace/avatars/maya.png'), not an "
+                "external URL"
+            )
+
+        self._validate_locale_map(
+            persona,
+            "intro",
+            require_en=True,
+            flat_shape="a flat string",
+            value_requirement="a non-empty string",
+            coerce_value=self._coerce_stripped_string,
+        )
+
+        self._validate_locale_map(
+            persona,
+            "kickoff_questions",
+            require_en=True,
+            flat_shape="a flat list",
+            value_requirement="a non-empty list of non-empty strings",
+            coerce_value=self._coerce_stripped_string_list,
+        )
+
+    @staticmethod
+    def _coerce_stripped_string(value: Any) -> Optional[str]:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    @staticmethod
+    def _coerce_stripped_string_list(value: Any) -> Optional[List[str]]:
+        # An empty list is rejected, not vacuously accepted: an authored
+        # `kickoff_questions.<locale>: []` is the same blank-content
+        # mistake the require_en check guards against - "no questions"
+        # is expressed by omitting the locale (or the field) entirely.
+        if (
+            isinstance(value, list)
+            and value
+            and all(isinstance(item, str) and item.strip() for item in value)
+        ):
+            return [item.strip() for item in value]
+        return None
+
+    @staticmethod
+    def _validate_locale_map(
+        container: Dict[str, Any],
+        key: str,
+        *,
+        require_en: bool,
+        flat_shape: str,
+        value_requirement: str,
+        coerce_value: Callable[[Any], Optional[Any]],
+    ) -> None:
+        """Validate and normalize one locale-keyed persona field in place.
+
+        The three call sites (`role`, `intro`, `kickoff_questions`) share
+        every rule except two: whether 'en' is required when the field is
+        authored (`role` is exempt - `_parse_yaml_file` backfills role.en
+        from the template's `name`), and what a locale's value looks like
+        (`coerce_value` returns the normalized value, or None to reject).
+
+        Only an explicit `null` (or an absent key) means "not provided" -
+        an `or {}` null-check would also swallow falsy junk like
+        `role: ""` or `kickoff_questions: []` that must fail the shape
+        check instead.
+        """
+        values = container.get(key)
+        if values is None:
+            values = {}
+        container[key] = values
+        if not isinstance(values, dict):
+            raise ValueError(
+                f"'persona.{key}' must be a dict keyed by locale (e.g. "
+                f"{{'en': ..., 'zh': ...}}), not {flat_shape}"
+            )
+        if require_en and values and "en" not in values:
+            # Without 'en', get_localized_value's fallback-to-'en' would
+            # resolve to blank for an English requester - silently seeding
+            # an empty opening message instead of failing loudly here.
+            raise ValueError(
+                f"'persona.{key}' must contain at least an 'en' key when "
+                "authored - unlike persona.role, there is no template "
+                "field to fall back to"
+            )
+        for locale, value in values.items():
+            if not isinstance(locale, str) or not locale.strip():
+                # YAML happily parses `true:` or `2026:` as non-string
+                # keys; get_localized_value would never match them, so
+                # they are dead content at best and confusing at worst.
+                raise ValueError(
+                    f"'persona.{key}' locale keys must be non-empty "
+                    f"strings, got {locale!r}"
+                )
+            coerced = coerce_value(value)
+            if coerced is None:
+                raise ValueError(
+                    f"'persona.{key}.{locale}' must be {value_requirement}"
+                )
+            values[locale] = coerced
+
     def _enrich_template(self, template: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge connections into agent_config.tool_categories"""
+        """Merge connections into agent_config.tool_categories.
+
+        `agent_config` is only meaningful for an 'agent'-type template; a
+        'workforce'-type template's real configuration lives in
+        `workforce_config` instead (its own top-level `agent_config` is an
+        unused parse-time placeholder - see `_parse_yaml_file`). Nulling it
+        out here, rather than in each caller, is deliberate: every consumer
+        of a template dict (the Templates API, the home page feed, the
+        /task quick-access resolver, the v1 SDK API, and anything added
+        later) reads this same enriched dict, and a non-agent template
+        must fail safe by construction rather than by every caller
+        remembering to check `type` first - a workforce template's
+        `agent_config` used to leak real (if useless) `instructions`/
+        `tool_categories` here, which is exactly what silently produced a
+        published, empty-instruction agent on every un-gated path.
+        """
         connections = template.get("connections", [])
+        template_type = template.get("type", "agent")
 
-        # The agent_config could be an AgentConfig pydantic model or a dict
-        agent_config = template.get("agent_config", {})
+        agent_config_dict: Optional[Dict[str, Any]] = None
+        if template_type == "agent":
+            # The agent_config could be an AgentConfig pydantic model or a dict
+            agent_config = template.get("agent_config", {})
 
-        if hasattr(agent_config, "model_dump"):
-            agent_config_dict = agent_config.model_dump()
-        elif hasattr(agent_config, "dict"):
-            agent_config_dict = agent_config.dict()
-        else:
-            agent_config_dict = dict(agent_config)
+            if hasattr(agent_config, "model_dump"):
+                agent_config_dict = agent_config.model_dump()
+            elif hasattr(agent_config, "dict"):
+                agent_config_dict = agent_config.dict()
+            else:
+                agent_config_dict = dict(agent_config)
 
-        tool_categories = agent_config_dict.get("tool_categories", [])
-        if not isinstance(tool_categories, list):
-            tool_categories = list(tool_categories) if tool_categories else []
+            tool_categories = agent_config_dict.get("tool_categories", [])
+            if not isinstance(tool_categories, list):
+                tool_categories = list(tool_categories) if tool_categories else []
 
-        for conn in connections:
-            conn_name = conn.get("name") if isinstance(conn, dict) else conn
-            if not conn_name:
-                continue
-            mcp_category = f"mcp:{conn_name}"
-            if mcp_category not in tool_categories:
-                tool_categories.append(mcp_category)
+            for conn in connections:
+                conn_name = conn.get("name") if isinstance(conn, dict) else conn
+                if not conn_name:
+                    continue
+                mcp_category = f"mcp:{conn_name}"
+                if mcp_category not in tool_categories:
+                    tool_categories.append(mcp_category)
 
-        agent_config_dict["tool_categories"] = tool_categories
+            agent_config_dict["tool_categories"] = tool_categories
 
         return {
             "id": template["id"],
@@ -157,13 +583,17 @@ class TemplateManager:
             "category": template.get("category", ""),
             "featured": template.get("featured", False),
             "descriptions": template.get("descriptions", {}),
-            "features": template.get("features", []),
+            "features": template.get("features", {}),
+            "sample_prompts": template.get("sample_prompts", {}),
+            "persona": template.get("persona"),
             "connections": connections,
             "setup_time": template.get("setup_time", "5 min setup"),
-            "tags": template.get("tags", []),
+            "tags": template.get("tags", {}),
             "author": template.get("author", ""),
             "version": template.get("version", ""),
             "agent_config": agent_config_dict,
+            "type": template_type,
+            "workforce_config": template.get("workforce_config"),
         }
 
     async def list_templates(self) -> List[Dict]:

@@ -105,10 +105,10 @@ class TestKbAccessControlContract:
         assert resp.status_code == 404
         assert "not found" in resp.json()["detail"].lower()
 
-    def test_rename_target_name_taken_by_other_tenant_returns_403(
+    def test_rename_target_name_taken_by_other_tenant_returns_409(
         self, client: TestClient, tmp_path: Path
     ) -> None:
-        """Renaming into a name that exists on another tenant is forbidden."""
+        """Renaming into a taken name is a naming conflict, not an access violation."""
         t1 = _register_and_login(client, "ac_rn_t1", "pw-r1-", "ac_rn_t1@example.com")
         t2 = _register_and_login(client, "ac_rn_t2", "pw-r2-", "ac_rn_t2@example.com")
 
@@ -124,13 +124,42 @@ class TestKbAccessControlContract:
             data={"new_name": coll_b},
             headers={"Authorization": f"Bearer {t1}"},
         )
-        assert resp.status_code == 403
-        assert "Access denied" in resp.json()["detail"]
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert "name unavailable" in detail
+        assert "Access denied" not in detail
+
+    def test_rename_onto_own_collection_names_it(
+        self, client: TestClient, tmp_path: Path
+    ) -> None:
+        """A caller's own collection is named outright: they can act on it.
+
+        Only the cross-tenant branch above has to stay vague about ownership.
+        """
+        token = _register_and_login(
+            client, "ac_rn_own", "pw-ro-", "ac_rn_own@example.com"
+        )
+
+        coll_a = "ac_rename_own_source"
+        coll_b = "ac_rename_own_target"
+        _ingest_txt(client, token, coll_a, _write_sample_txt(tmp_path / "own_a.txt"))
+        _ingest_txt(client, token, coll_b, _write_sample_txt(tmp_path / "own_b.txt"))
+
+        resp = client.put(
+            f"/api/kb/collections/{coll_a}",
+            data={"new_name": coll_b},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"] == f"Target collection already exists: {coll_b}"
 
     def test_documents_check_cross_tenant_returns_403(
         self, client: TestClient, tmp_path: Path
     ) -> None:
-        """Duplicate-check on another tenant's collection name is forbidden."""
+        """Duplicate-check is read-only, so a foreign collection is a denial.
+
+        It creates nothing, so it must not answer with a naming-conflict status.
+        """
         t1 = _register_and_login(client, "ac_chk_t1", "pw-c1-", "ac_chk_t1@example.com")
         t2 = _register_and_login(client, "ac_chk_t2", "pw-c2-", "ac_chk_t2@example.com")
 
@@ -149,7 +178,14 @@ class TestKbAccessControlContract:
     def test_save_collection_config_cross_tenant_returns_403(
         self, client: TestClient, tmp_path: Path
     ) -> None:
-        """Saving config against another tenant's collection name is forbidden."""
+        """Config saves stay a denial: the body is settings, with no name field.
+
+        The other ``allow_create=True`` callers answer 409 because the user just
+        typed the name and can type another. This one is reached from the settings
+        panel of a knowledge base the caller already sees, so a foreign name is an
+        access attempt -- and "pick a different name" would point at an input the
+        form does not have. Hence ``taken_name_is_conflict=False``.
+        """
         t1 = _register_and_login(client, "ac_cfg_t1", "pw-g1-", "ac_cfg_t1@example.com")
         t2 = _register_and_login(client, "ac_cfg_t2", "pw-g2-", "ac_cfg_t2@example.com")
 
@@ -162,5 +198,80 @@ class TestKbAccessControlContract:
             json={"embedding_model_id": "text-embedding-v4"},
             headers={"Authorization": f"Bearer {t2}"},
         )
-        assert resp.status_code == 403
-        assert "Access denied" in resp.json()["detail"]
+        assert resp.status_code == 403, resp.text
+        detail = resp.json()["detail"]
+        assert "Access denied" in detail
+        # Still no name-picking advice, and still no owner id.
+        assert "different name" not in detail
+        assert "user_" not in detail
+
+    @pytest.mark.parametrize(
+        "slug, path, style",
+        [
+            ("f", "/api/kb/ingest", "file"),
+            ("fj", "/api/kb/ingest/jobs", "file"),
+            ("w", "/api/kb/ingest-web", "web"),
+            ("wj", "/api/kb/ingest-web/jobs", "web"),
+            ("c", "/api/kb/ingest-cloud", "cloud"),
+        ],
+    )
+    def test_ingest_into_name_taken_by_other_tenant_returns_409(
+        self, client: TestClient, tmp_path: Path, slug: str, path: str, style: str
+    ) -> None:
+        """The path from #1139: creating a knowledge base by importing content.
+
+        Every ingest entry point takes ``allow_create=True``, and the creation
+        dialog drives all of them, so each must report a taken name as a conflict
+        rather than accuse the caller of an access violation.
+        """
+        t1 = _register_and_login(
+            client, f"ac_ing_{slug}_t1", "pw-i1-", f"ac_ing_{slug}_t1@example.com"
+        )
+        t2 = _register_and_login(
+            client, f"ac_ing_{slug}_t2", "pw-i2-", f"ac_ing_{slug}_t2@example.com"
+        )
+
+        coll = f"ac_ingest_foreign_coll_{slug}"
+        sample = _write_sample_txt(tmp_path / "ac_ing.txt")
+        _ingest_txt(client, t1, coll, sample)
+
+        headers = {"Authorization": f"Bearer {t2}"}
+        if style == "file":
+            with open(sample, "rb") as handle:
+                resp = client.post(
+                    path,
+                    files={"file": (sample.name, handle, "text/plain")},
+                    data={"collection": coll},
+                    headers=headers,
+                )
+        elif style == "web":
+            resp = client.post(
+                path,
+                data={"collection": coll, "start_url": "https://example.com/docs"},
+                headers=headers,
+            )
+        else:
+            resp = client.post(
+                path,
+                json={
+                    "collection": coll,
+                    "files": [
+                        {
+                            "provider": "google_drive",
+                            "fileId": "file-1",
+                            "fileName": "alpha.pdf",
+                        }
+                    ],
+                },
+                headers=headers,
+            )
+
+        # Status first: a success body here is a bare list on some endpoints, so
+        # indexing "detail" would raise TypeError instead of naming the mismatch.
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert "name unavailable" in detail
+        assert "Access denied" not in detail
+        # Wording only: it does not name an owner. See the note above -- the
+        # status code itself is what discloses that the name exists.
+        assert "already exists" not in detail

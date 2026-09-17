@@ -1,3 +1,7 @@
+import { classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import type { ClientErrorCode } from "@/lib/client-errors"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+
 export interface PublicChatUploadedFile {
   file_id: string
   name?: string
@@ -12,13 +16,17 @@ interface UploadPublicChatFileOptions {
   taskType: string
   taskId?: number | string | null
   fallbackError: string
+  formatError?: (code: ClientErrorCode) => string
 }
 
-interface PublicChatUploadResponse {
-  success?: boolean
-  file_id?: unknown
-  detail?: unknown
-  message?: unknown
+export class PublicChatUploadError extends Error {
+  readonly errorCode: ClientErrorCode
+
+  constructor(message: string, errorCode: ClientErrorCode) {
+    super(message)
+    this.name = "PublicChatUploadError"
+    this.errorCode = errorCode
+  }
 }
 
 export async function uploadPublicChatFile({
@@ -28,6 +36,7 @@ export async function uploadPublicChatFile({
   taskType,
   taskId,
   fallbackError,
+  formatError,
 }: UploadPublicChatFileOptions): Promise<PublicChatUploadedFile> {
   const formData = new FormData()
   formData.append("file", file)
@@ -41,16 +50,15 @@ export async function uploadPublicChatFile({
     headers: { "Authorization": `Bearer ${accessToken}` },
     body: formData,
   })
-  const data = await response.json().catch(() => null) as PublicChatUploadResponse | null
-  const fileId = typeof data?.file_id === "string" ? data.file_id : null
+  const parsed = await parseApiResponse(response)
+  const data = isJsonRecord(parsed.data) ? parsed.data : null
+  const fileId = normalizeUploadFileIds([data?.file_id], 1)?.[0] ?? null
 
   if (!response.ok || data?.success !== true || !fileId) {
-    const backendMessage = typeof data?.detail === "string"
-      ? data.detail
-      : typeof data?.message === "string"
-        ? data.message
-        : null
-    throw new Error(backendMessage || fallbackError)
+    const classified = classifyUploadError(response, parsed)
+    const message = formatError?.(classified.errorCode)
+      || (classified.errorCode === "upload_failed" ? fallbackError : classified.message)
+    throw new PublicChatUploadError(message, classified.errorCode)
   }
 
   return {

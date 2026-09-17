@@ -188,27 +188,42 @@ async def test_await_task_settlement_returns_late_result_and_cancellation() -> N
 
 
 @pytest.mark.asyncio
-async def test_await_task_settlement_preserves_child_process_control_after_caller_cancelled() -> (
-    None
-):
+async def test_await_task_settlement_preserves_child_process_control_after_caller_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A raw child control signal must not be rewritten as caller cancellation."""
 
     class WorkerShutdown(BaseException):
         pass
 
+    entered = asyncio.Event()
+    cancellation_processed = asyncio.Event()
+    shield = asyncio.shield
+
+    def observe_shield(task):
+        if task is child:
+            if entered.is_set():
+                cancellation_processed.set()
+            else:
+                entered.set()
+        return shield(task)
+
+    monkeypatch.setattr(asyncio, "shield", observe_shield)
     child: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     waiter = asyncio.create_task(await_task_settlement(child))  # type: ignore[arg-type]
-    await asyncio.sleep(0)
-    waiter.cancel()
-    await asyncio.sleep(0)
-
-    shutdown = WorkerShutdown("controlled test shutdown")
-    child.set_exception(shutdown)
-
-    with pytest.raises(WorkerShutdown) as exc_info:
-        await asyncio.wait_for(waiter, timeout=1)
-
-    assert exc_info.value is shutdown
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=30)
+        waiter.cancel()
+        await asyncio.wait_for(cancellation_processed.wait(), timeout=30)
+        shutdown = WorkerShutdown("controlled test shutdown")
+        child.set_exception(shutdown)
+        with pytest.raises(WorkerShutdown) as exc_info:
+            await asyncio.wait_for(waiter, timeout=30)
+        assert exc_info.value is shutdown
+    finally:
+        if not child.done():
+            child.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
 
 
 @pytest.mark.asyncio

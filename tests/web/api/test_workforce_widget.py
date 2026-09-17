@@ -13,23 +13,28 @@ Builds on the share-link channel patterns (#947).
 from __future__ import annotations
 
 import io
-from types import SimpleNamespace
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from xagent.core.execution_scope import EXECUTION_SCOPE_AGENT_CONFIG_KEY
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceRun
-from xagent.web.services import workforce_runs as workforce_runs_service
+from xagent.web.services.task_runtime import SELECTED_FILE_IDS_AGENT_CONFIG_KEY
 
 from .conftest import (
     _admin_headers,
     _direct_db_session,
     _register_second_user,
     client,
+    patch_schedule_bg,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -147,15 +152,6 @@ def _authenticate_widget_guest_by_key(
     )
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
-
-
-def _stub_begin_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _stub(**_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(background_task=None)
-
-    monkeypatch.setattr(
-        workforce_runs_service.TaskTurnOrchestrator, "begin_turn", _stub
-    )
 
 
 # ===== Widget management endpoints =====
@@ -563,13 +559,55 @@ def test_disabled_widget_invalidates_existing_guest_tokens() -> None:
 # ===== Guest task creation → create_workforce_run =====
 
 
+def test_widget_task_create_forwards_timezone_to_the_opening_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widget opening turn starts inside this request and never reaches the
+    websocket chat frame, so the zone has to travel on the create body."""
+    workforce_id = _create_workforce("Widget Timezone Workforce")
+    key = _enable_widget(workforce_id)
+    guest_headers = _authenticate_widget_guest_by_key(key)
+    scheduled = patch_schedule_bg(monkeypatch)
+
+    response = client.post(
+        "/api/widget/chat/task/create",
+        headers=guest_headers,
+        json={
+            "title": "how many shifts do we have on tomorrow?",
+            "description": "how many shifts do we have on tomorrow?",
+            "timezone": "Australia/Melbourne",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+
+
+def test_widget_task_create_without_timezone_sends_no_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workforce_id = _create_workforce("Widget No Timezone Workforce")
+    key = _enable_widget(workforce_id)
+    guest_headers = _authenticate_widget_guest_by_key(key)
+    scheduled = patch_schedule_bg(monkeypatch)
+
+    response = client.post(
+        "/api/widget/chat/task/create",
+        headers=guest_headers,
+        json={"title": "hello", "description": "hello"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert scheduled["context"] is None
+
+
 def test_widget_task_create_starts_workforce_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     workforce_id = _create_workforce("Guest Run Widget Workforce")
     key = _enable_widget(workforce_id)
     guest_headers = _authenticate_widget_guest_by_key(key)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     response = client.post(
         "/api/widget/chat/task/create",
@@ -587,8 +625,14 @@ def test_widget_task_create_starts_workforce_run(
         assert int(task.user_id) == _user_id()
         assert task.channel_id is None
         assert task.agent_config.get("auth_mode") == "widget"
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
         assert int(task.agent_config.get("widget_workforce_id")) == workforce_id
         assert task.agent_config.get("guest_id") == "guest_test"
+        # The server-observed creator IP is stamped on the workforce path too
+        # (#1108): it is the widget run quota's per-abuser key, and a future
+        # snapshot key collision in _merge_agent_config would silently drop it,
+        # degrading the sub-quota to entity-only. Regression-lock it here.
+        assert task.agent_config.get("widget_client_ip") == "testclient"
 
         run = db.query(WorkforceRun).filter(WorkforceRun.task_id == task_id).one()
         assert int(run.workforce_id) == workforce_id
@@ -611,7 +655,7 @@ def test_widget_task_create_rejects_foreign_agent_id(
     workforce_id = _create_workforce("Foreign Agent Widget Workforce")
     key = _enable_widget(workforce_id)
     guest_headers = _authenticate_widget_guest_by_key(key)
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
 
     foreign_agent_id = _create_published_agent(_user_id(), "Foreign Agent")
     response = client.post(
@@ -626,7 +670,107 @@ def test_widget_task_create_rejects_foreign_agent_id(
     assert response.status_code == 403, response.text
 
 
+def test_widget_task_create_discards_forged_agent_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_create_workforce_widget_chat_task`` never reads
+    ``TaskCreateRequest.agent_config`` -- ``create_workforce_run`` only sees
+    the handler's own ``extra_agent_config`` (``auth_mode``,
+    ``widget_workforce_id``, ``guest_id``). A forged reserved key in the
+    request body must not survive into the persisted config, and neither
+    should an ordinary client key."""
+    workforce_id = _create_workforce("Forged Config Widget Workforce")
+    key = _enable_widget(workforce_id)
+    guest_headers = _authenticate_widget_guest_by_key(key)
+    patch_schedule_bg(monkeypatch)
+
+    response = client.post(
+        "/api/widget/chat/task/create",
+        headers=guest_headers,
+        json={
+            "title": "forged",
+            "description": "forged",
+            "agent_config": {
+                EXECUTION_SCOPE_AGENT_CONFIG_KEY: {
+                    "sandbox_key_suffix": "victim",
+                    "workspace_segments": ["victim"],
+                    "memory_dimensions": {"tenant": "victim"},
+                },
+                SELECTED_FILE_IDS_AGENT_CONFIG_KEY: ["victim-file-id"],
+                "keep_me": "client value",
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    task_id = int(response.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert EXECUTION_SCOPE_AGENT_CONFIG_KEY not in task.agent_config
+        assert SELECTED_FILE_IDS_AGENT_CONFIG_KEY not in task.agent_config
+        assert "keep_me" not in task.agent_config
+        assert task.agent_config.get("auth_mode") == "widget"
+        assert int(task.agent_config.get("widget_workforce_id")) == workforce_id
+    finally:
+        db.close()
+
+
 # ===== Task-less opening-message upload =====
+
+
+def test_workforce_widget_first_turn_attachments_reach_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    workforce_id = _create_workforce("First Turn Widget File Workforce")
+    key = _enable_widget(workforce_id)
+    guest_headers = _authenticate_widget_guest_by_key(key)
+    patch_schedule_bg(monkeypatch)
+
+    upload = client.post(
+        "/api/widget/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task"},
+        files={"file": ("brief.txt", io.BytesIO(b"widget brief"), "text/plain")},
+    )
+    assert upload.status_code == 200, upload.text
+    file_id = upload.json()["file_id"]
+
+    created = client.post(
+        "/api/widget/chat/task/create",
+        headers=guest_headers,
+        json={
+            "title": "summarize",
+            "description": "summarize this",
+            "files": [file_id],
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        bound = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert bound.task_id == task_id
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
+
+        workspace = TaskWorkspace(
+            id="agent_1_widget_first_turn",
+            base_dir=str(tmp_path / "workspaces"),
+            allowed_external_dirs=[str(Path(bound.storage_path).parent)],
+            db_task_id=task_id,
+        )
+        workspace.owner_user_id = int(task.user_id)
+        workspace.file_operation_access_version = 1
+        monkeypatch.setattr(
+            "xagent.core.storage.manager.create_db_session",
+            _direct_db_session,
+        )
+        assert WorkspaceFileOperations(workspace).read_file(file_id) == "widget brief"
+    finally:
+        db.close()
 
 
 def test_taskless_widget_upload_enforces_file_count_cap() -> None:
@@ -651,6 +795,35 @@ def test_taskless_widget_upload_enforces_file_count_cap() -> None:
     )
     assert rejected.status_code == 422, rejected.text
     assert str(MAX_TASKLESS_SHARE_UPLOAD_FILES) in rejected.json()["detail"]
+
+
+def test_taskless_widget_upload_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The widget upload path carries its own throttle (#973): keyed per
+    widget entity + caller IP — NOT the client-supplied widget guest_id, so
+    rotating the guest must not reset the budget."""
+    from xagent.web.services.share_rate_limit import reset_share_rate_limiter
+
+    workforce_id = _create_workforce("Widget Upload RL Workforce")
+    key = _enable_widget(workforce_id)
+
+    monkeypatch.setenv("XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT", "1/minute")
+    reset_share_rate_limiter()
+
+    def _upload(headers: dict[str, str]) -> Any:
+        return client.post(
+            "/api/widget/files/upload",
+            headers=headers,
+            data={"task_type": "task"},
+            files=[("files", ("f.txt", io.BytesIO(b"x"), "text/plain"))],
+        )
+
+    first = _upload(_authenticate_widget_guest_by_key(key, guest_id="g-one"))
+    assert first.status_code == 200, first.text
+    # Rotating the (client-supplied) guest_id must not escape the budget.
+    second = _upload(_authenticate_widget_guest_by_key(key, guest_id="g-two"))
+    assert second.status_code == 429, second.text
 
 
 def test_agent_widget_taskless_upload_still_requires_task_id() -> None:
@@ -696,7 +869,7 @@ def test_widget_task_access_scoped_to_guest_and_workforce(
     guest of the same workforce, or any guest of a different workforce, is
     rejected (guest_id + widget_workforce_id scoping in
     ``_get_task_for_workforce_widget_context``)."""
-    _stub_begin_turn(monkeypatch)
+    patch_schedule_bg(monkeypatch)
     wf_a = _create_workforce("Scope Widget A")
     key_a = _enable_widget(wf_a)
     wf_b = _create_workforce("Scope Widget B")

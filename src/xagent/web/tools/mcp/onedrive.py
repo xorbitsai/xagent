@@ -1,14 +1,20 @@
 import base64
 import json
 import logging
+import math
+import mimetypes
 import os
+import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import allowed_dirs_from_env, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("onedrive-mcp")
@@ -19,10 +25,250 @@ mcp = FastMCP("onedrive-mcp")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
+# Sized for a single binary PUT of up to a few megabytes over a slow link,
+# not just a small JSON Graph call -- DEFAULT_TIMEOUT_SECONDS' 30s is
+# realistic for the API calls elsewhere in this module but can legitimately
+# be too short for a multi-megabyte binary transfer. Used for both the
+# simple-PUT branch (up to _SIMPLE_UPLOAD_MAX_BYTES) and each chunk of the
+# resumable upload-session path.
+_BINARY_UPLOAD_TIMEOUT_SECONDS = 120
+# Microsoft's own docs disagree on the simple content PUT's real limit:
+# the OneDrive API concepts page ("Uploading files") says simple upload is
+# "available for items with less than 4 MB of content", while the Graph
+# v1.0 API reference for the same endpoint (driveitem-put-content) says it
+# "supports files up to 250 MB in size". Rather than trying to resolve
+# which page is authoritative, this deliberately keeps the smaller, more
+# conservative bound -- some Graph deployments enforce it as the decimal
+# 4,000,000 bytes rather than 4 MiB (4,194,304 bytes), so the decimal
+# figure is used here too. This means a file anywhere in the 4MB-250MB gap
+# always takes the resumable upload-session path instead of ever risking a
+# rejection at the simple-PUT boundary; the only cost of guessing wrong
+# this way is an unnecessary chunked upload, never a failed one.
+_SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
+# Chunk size for the upload-session path. Must be a multiple of 320 KiB
+# (327,680 bytes) per Graph's requirement for every non-final chunk; 5 MiB
+# is exactly 16 * 320 KiB.
+_UPLOAD_SESSION_CHUNK_SIZE = 5 * 1024 * 1024
+_UPLOAD_FRAGMENT_MAX_ATTEMPTS = 3
+_UPLOAD_RECONCILE_MAX_ATTEMPTS = 3
+# Destination metadata can lag behind a committed final fragment. Keep this
+# confirmation budget separate from fragment/status retries so an ambiguous
+# completion can wait up to 45 seconds (1+2+4+8+10+10+10) for QuickXorHash
+# without weakening the exact-content check or making ordinary chunks slower.
+_UPLOAD_COMPLETION_MAX_ATTEMPTS = 8
+# Forward progress resets the consecutive-failure counter, so keep a separate
+# cap on recovery cycles within one buffered fragment to prevent a server that
+# advances by tiny ranges from extending a synchronous call without bound.
+_UPLOAD_CHUNK_MAX_RECOVERY_CYCLES = 12
+_UPLOAD_RETRY_BASE_SECONDS = 1.0
+_UPLOAD_RETRY_MAX_SECONDS = 10.0
+# Not a Graph API limit (OneDrive itself supports files far larger than
+# this via the resumable upload session) -- a guard-rail against a
+# mistargeted file (a generated artifact pointed at the wrong path, an
+# entire log directory, etc.) tying up a chunked upload for a long time
+# with no feedback until it eventually finishes or fails. Unlike gmail.py's
+# _MAX_ATTACHMENT_BYTES (a real derivation of Gmail's documented 25MB
+# message-size limit), this is a deliberately arbitrary product choice, not
+# a limit either this module or Graph actually enforces elsewhere.
+_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"
+
+
+class _UploadError(RuntimeError):
+    """Upload failure whose message is safe to expose to the caller."""
+
+
+class _GraphRequestError(RuntimeError):
+    """Graph HTTP failure that retains its status without response parsing."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _QuickXorHash:
+    """Streaming implementation of OneDrive's 160-bit QuickXorHash."""
+
+    _WIDTH_BITS = 160
+    _DIGEST_BYTES = _WIDTH_BITS // 8
+    # rotate(byte, index * 11) repeats after 160 input bytes because 11
+    # and 160 are coprime. This is distinct from the 20-byte digest width.
+    _INPUT_PERIOD_BYTES = _WIDTH_BITS
+    _MASK = (1 << _WIDTH_BITS) - 1
+
+    def __init__(self) -> None:
+        self._column_xor = 0
+        self._tail = b""
+        self._length = 0
+
+    def update(self, data: bytes | bytearray) -> None:
+        """Add bytes while reducing full 160-byte periods in C-sized blocks."""
+        self._length += len(data)
+        if self._tail:
+            needed = self._INPUT_PERIOD_BYTES - len(self._tail)
+            if len(data) < needed:
+                self._tail += bytes(data)
+                return
+            self._column_xor ^= int.from_bytes(
+                self._tail + bytes(data[:needed]), "little"
+            )
+            data = data[needed:]
+            self._tail = b""
+
+        full_length = len(data) - (len(data) % self._INPUT_PERIOD_BYTES)
+        view = memoryview(data)
+        for offset in range(0, full_length, self._INPUT_PERIOD_BYTES):
+            self._column_xor ^= int.from_bytes(
+                view[offset : offset + self._INPUT_PERIOD_BYTES], "little"
+            )
+        self._tail = bytes(view[full_length:])
+
+    def base64_digest(self) -> str:
+        """Return the Base64 value exposed as ``file.hashes.quickXorHash``."""
+        columns = self._column_xor
+        if self._tail:
+            columns ^= int.from_bytes(self._tail, "little")
+
+        value = 0
+        for index, byte in enumerate(
+            columns.to_bytes(self._INPUT_PERIOD_BYTES, "little")
+        ):
+            shift = (index * 11) % self._WIDTH_BITS
+            rotated = (
+                byte
+                if shift == 0
+                else ((byte << shift) | (byte >> (self._WIDTH_BITS - shift)))
+            )
+            value ^= rotated & self._MASK
+
+        digest = bytearray(value.to_bytes(self._DIGEST_BYTES, "little"))
+        for index, byte in enumerate(self._length.to_bytes(8, "little")):
+            digest[self._DIGEST_BYTES - 8 + index] ^= byte
+        return base64.b64encode(digest).decode("ascii")
+
+
+# stdlib mimetypes.guess_type() only recognizes these extensions when a
+# system mime.types file happens to be installed (e.g. Apache's, common on
+# a dev laptop) -- on a minimal/slim host with no such file (a stripped-down
+# container image, verified directly: MimeTypes(filenames=()) returns
+# (None, None) for every one of these), it silently can't identify them at
+# all. Checked before falling back to mimetypes.guess_type() wherever this
+# module resolves a *real* mime type (i.e. for onedrive_upload_file's
+# Content-Type header, never for the binary/text guard below -- see
+# _name_looks_binary's own docstring for why that guard doesn't use
+# mimetypes at all), so a real .xlsx/.docx/etc. doesn't get mislabeled
+# "application/octet-stream" just because the host is missing a file this
+# module has no control over.
+_MIME_TYPE_OVERRIDES = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".epub": "application/epub+zip",
+}
+
+
+def _guess_mime_type(name: str) -> str | None:
+    """Guess ``name``'s real mime type for actual Content-Type resolution:
+    _MIME_TYPE_OVERRIDES first, for the formats stdlib mimetypes can't
+    reliably identify on its own, then stdlib itself.
+
+    Only the type element of mimetypes.guess_type()'s result is normally
+    usable directly -- but when it also reports a non-None *encoding*
+    (e.g. "gzip" for ".gz", "compress" for ".Z"), the type element
+    describes the *decompressed* content, not what's actually going out
+    over the wire: mimetypes.guess_type("report.pdf.gz") returns
+    ("application/pdf", "gzip"), and blindly using "application/pdf" as
+    Content-Type would tell any client trusting that header to parse a raw
+    gzip stream as an uncompressed PDF. Falls back to the standard
+    encoding-to-mimetype mapping in that case instead.
+    """
+    suffix = Path(name).suffix.lower()
+    override = _MIME_TYPE_OVERRIDES.get(suffix)
+    if override is not None:
+        return override
+    guessed_type, guessed_encoding = mimetypes.guess_type(name)
+    if guessed_encoding is not None:
+        return {
+            "gzip": "application/gzip",
+            "bzip2": "application/x-bzip2",
+            "xz": "application/x-xz",
+            "compress": "application/x-compress",
+        }.get(guessed_encoding, "application/octet-stream")
+    return guessed_type
+
+
+def _split_stem_suffix(base: str) -> tuple[str, str]:
+    """Like Path(base).stem/.suffix, except a name that's *entirely* a
+    leading dot plus extension (e.g. ".pdf") is treated as having that
+    extension. pathlib's own split refuses to do this -- it follows the
+    Unix dotfile convention where a single leading dot with nothing before
+    it never counts as an extension separator, leaving Path(".pdf").suffix
+    empty -- but silently losing the extension here would let a name like
+    that slip past _name_looks_binary's guard as "extensionless" (accepted)
+    when it's actually naming a real binary format. Only that narrow shape
+    is special-cased; e.g. "..pdf" or "..." already split the way we want
+    via plain pathlib and are left alone.
+    """
+    suffix = Path(base).suffix
+    if not suffix and base.startswith(".") and base.count(".") == 1 and len(base) > 1:
+        return "", base
+    return Path(base).stem, suffix
+
+
+# Stable text-extension allowlist shared in shape with the Google Drive
+# guard. Host MIME databases vary, so they cannot safely decide whether the
+# text-only tool may use a filename. Unknown extensions are rejected; names
+# without an extension remain valid for files such as README and Dockerfile.
+# Ambiguous but commonly textual source extensions such as .ts and .bat are
+# allowed, while formats with common binary variants such as .crt and .plist
+# are not.
+_KNOWN_TEXT_EXTENSIONS = {
+    # plain text / docs / dotfiles
+    ".txt", ".md", ".markdown", ".mdx", ".rst", ".adoc", ".rtf", ".log",
+    ".lock", ".gitignore", ".gitattributes", ".editorconfig",
+    ".dockerignore", ".env", ".ini", ".cfg", ".conf", ".properties",
+    ".toml",
+    # structured/data formats
+    ".json", ".json5", ".xml", ".yaml", ".yml", ".csv", ".tsv", ".dtd",
+    ".xsd", ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift",
+    ".avsc", ".ipynb", ".jsonl", ".ndjson", ".geojson",
+    # web
+    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".vue", ".svelte", ".astro",
+    # source code
+    ".py", ".rb", ".php", ".java", ".c", ".h", ".cpp", ".hpp", ".cc",
+    ".cxx", ".cs", ".m", ".mm", ".go", ".rs", ".swift", ".kt", ".kts",
+    ".scala", ".groovy", ".lua", ".r", ".jl", ".pl", ".pm", ".hs", ".fs",
+    ".fsx", ".ml", ".mli", ".clj", ".cljs", ".erl", ".ex", ".exs", ".nim",
+    ".zig", ".v", ".d", ".dart", ".elm", ".cr", ".tcl", ".scm", ".sc",
+    ".rkt", ".lisp", ".el", ".asm", ".s", ".pas", ".f90", ".for", ".vb",
+    ".vbs", ".cabal", ".nix",
+    # shell / scripting / templates
+    ".sh", ".bash", ".zsh", ".csh", ".ksh", ".fish",
+    ".ps1", ".bat", ".cmd", ".awk", ".sed", ".sql", ".j2", ".tpl", ".srt",
+    # build / infra
+    ".tex", ".latex", ".bib", ".cls", ".sty", ".diff", ".patch",
+    ".hcl", ".tf", ".tfvars", ".gradle", ".dockerfile", ".cmake",
+    # misc
+    ".pem", ".po",
+}  # fmt: skip
 
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
+
+
+def _caller_safe_drive_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Copy a driveItem without Graph's short-lived preauthenticated URL."""
+    safe_item = dict(item)
+    safe_item.pop("@microsoft.graph.downloadUrl", None)
+    return safe_item
 
 
 def _error(message: str, *, details: Any = None) -> str:
@@ -47,6 +293,252 @@ def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str
     return headers
 
 
+def _raise_upload_status(response: Any) -> None:
+    """Raise a credential-safe error for a rejected upload fragment.
+
+    Upload-session URLs are preauthenticated secrets. An intermediary can
+    echo them into an error body with arbitrary escaping, so no part of the
+    response body is forwarded to the caller or logs.
+    """
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        status_code = getattr(response, "status_code", "unknown")
+        raise _UploadError(
+            f"OneDrive upload fragment failed with HTTP {status_code}"
+        ) from exc
+
+
+def _safe_upload_error_message(exc: BaseException) -> str:
+    """Describe an upload failure without copying a request URL from it."""
+    if isinstance(exc, _UploadError):
+        status_code = _upload_status_code(exc)
+        message = str(exc)
+        if status_code is not None and "HTTP" not in message:
+            return f"{message} (last HTTP status {status_code})"
+        return message
+    cause = _request_error_cause(exc)
+    if isinstance(cause, requests.Timeout):
+        return "OneDrive upload fragment timed out"
+    if isinstance(cause, requests.ConnectionError):
+        return "OneDrive upload fragment connection failed"
+    if isinstance(cause, requests.RequestException):
+        return "OneDrive upload fragment request failed"
+    return f"OneDrive upload failed ({type(exc).__name__})"
+
+
+def _request_error_cause(exc: BaseException) -> BaseException:
+    """Unwrap nested safe errors to their underlying requests exception."""
+    cause = exc
+    seen: set[int] = set()
+    while cause.__cause__ is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        cause = cause.__cause__
+    return cause
+
+
+def _is_retriable_upload_error(exc: BaseException) -> bool:
+    """Whether ``exc`` might succeed on another bounded fragment attempt.
+
+    A network-level failure (no response was ever received) and Graph's
+    documented retriable statuses (429 and any 5xx) are retriable. The
+    HTTPError behind an _UploadError is recovered through ``__cause__``.
+    """
+    status_code = _upload_status_code(exc)
+    if status_code is not None:
+        return status_code == 429 or 500 <= status_code < 600
+    cause = _request_error_cause(exc)
+    return isinstance(cause, (requests.ConnectionError, requests.Timeout))
+
+
+def _retry_delay(headers: Any, retry_number: int) -> float:
+    """Return a bounded seconds/HTTP-date Retry-After or exponential delay."""
+    headers = headers or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            retry_seconds = float(retry_after)
+            if math.isfinite(retry_seconds):
+                return min(max(retry_seconds, 0.0), _UPLOAD_RETRY_MAX_SECONDS)
+        except (TypeError, ValueError):
+            pass
+        try:
+            retry_at = parsedate_to_datetime(str(retry_after))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            retry_seconds = retry_at.timestamp() - time.time()
+            if math.isfinite(retry_seconds):
+                return min(max(retry_seconds, 0.0), _UPLOAD_RETRY_MAX_SECONDS)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    exponential_delay = _UPLOAD_RETRY_BASE_SECONDS * (2.0 ** (retry_number - 1))
+    return min(exponential_delay, _UPLOAD_RETRY_MAX_SECONDS)
+
+
+def _upload_retry_delay(exc: BaseException, retry_number: int) -> float:
+    """Return a retry delay from an upload exception."""
+    cause = _request_error_cause(exc)
+    response = getattr(cause, "response", None)
+    return _retry_delay(getattr(response, "headers", None), retry_number)
+
+
+def _upload_status_code(exc: BaseException) -> int | None:
+    """Return an HTTP status from a credential-safe upload error."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status_code = getattr(current, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+        current = current.__cause__
+    cause = _request_error_cause(exc)
+    status_code = getattr(getattr(cause, "response", None), "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def _next_expected_upload_offset(payload: Any, total: int) -> int:
+    """Parse the first missing offset from an upload-session status payload."""
+    try:
+        ranges = payload["nextExpectedRanges"]
+        if not isinstance(ranges, list):
+            raise TypeError("nextExpectedRanges must be a list")
+        offsets = [int(value.split("-", 1)[0]) for value in ranges]
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise _UploadError("OneDrive returned invalid upload-session progress") from exc
+    if not offsets:
+        return total
+    if any(offset < 0 or offset > total for offset in offsets):
+        raise _UploadError("OneDrive returned invalid upload-session progress")
+    return min(offsets)
+
+
+def _current_upload_item(remote_path: str) -> dict[str, Any] | None:
+    """Read destination metadata, treating an absent item as no baseline."""
+    try:
+        item = _graph_request(
+            "GET",
+            _item_path(remote_path),
+            params={"$select": "id,name,size,file"},
+        )
+    except (RuntimeError, ValueError, requests.RequestException) as exc:
+        if _upload_status_code(exc) == 404:
+            return None
+        raise _UploadError("Could not inspect the OneDrive upload target") from exc
+    return item if isinstance(item, dict) and item.get("id") else None
+
+
+def _completed_upload_item(
+    remote_path: str,
+    total: int,
+    expected_final_quickxor_hash: str,
+) -> dict[str, Any]:
+    """Bind ambiguous completion to the exact uploaded bytes via QuickXorHash."""
+    last_error: BaseException | None = None
+    for attempt in range(1, _UPLOAD_COMPLETION_MAX_ATTEMPTS + 1):
+        try:
+            item = _current_upload_item(remote_path)
+            file_facet = item.get("file") if isinstance(item, dict) else None
+            hashes = file_facet.get("hashes") if isinstance(file_facet, dict) else None
+            remote_hash = (
+                hashes.get("quickXorHash") if isinstance(hashes, dict) else None
+            )
+            if (
+                isinstance(item, dict)
+                and item.get("id")
+                and item.get("size") == total
+                and remote_hash == expected_final_quickxor_hash
+            ):
+                return item
+            last_error = _UploadError(
+                "OneDrive upload completed ambiguously and could not be confirmed"
+            )
+        except Exception as exc:
+            last_error = exc
+            if not _is_retriable_upload_error(exc):
+                break
+        if attempt < _UPLOAD_COMPLETION_MAX_ATTEMPTS:
+            time.sleep(_upload_retry_delay(last_error, attempt))
+    raise _UploadError(
+        "OneDrive upload completed ambiguously and could not be confirmed"
+    ) from last_error
+
+
+def _reconcile_upload_progress(
+    http: requests.Session,
+    upload_url: str,
+    remote_path: str,
+    start: int,
+    end: int,
+    total: int,
+    expected_final_quickxor_hash: str,
+) -> tuple[int, dict[str, Any] | None]:
+    """Return the first missing byte offset, plus a confirmed final item."""
+    last_error: BaseException | None = None
+    completed = False
+    for attempt in range(1, _UPLOAD_RECONCILE_MAX_ATTEMPTS + 1):
+        try:
+            response = http.get(upload_url, timeout=DEFAULT_TIMEOUT_SECONDS)
+            if response.status_code == 404:
+                if end == total:
+                    completed = True
+                    break
+                raise _UploadError(
+                    "OneDrive upload session disappeared before completion"
+                )
+            _raise_upload_status(response)
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise _UploadError(
+                    "OneDrive returned invalid upload-session progress"
+                ) from exc
+            if (
+                isinstance(payload, dict)
+                and payload.get("id")
+                and "nextExpectedRanges" not in payload
+            ):
+                if end < total:
+                    raise _UploadError(
+                        "OneDrive reported completion before the local final fragment"
+                    )
+                completed = True
+                break
+            next_offset = _next_expected_upload_offset(payload, total)
+            if next_offset < start:
+                raise _UploadError(
+                    "OneDrive returned inconsistent upload-session progress"
+                )
+            if next_offset > end:
+                raise _UploadError(
+                    "OneDrive returned progress beyond the submitted fragment"
+                )
+            if next_offset == total and end < total:
+                raise _UploadError(
+                    "OneDrive reported completion before the local final fragment"
+                )
+            if next_offset < end:
+                return next_offset, None
+            if end == total:
+                completed = True
+                break
+            return next_offset, None
+        except Exception as exc:
+            last_error = exc
+            if not _is_retriable_upload_error(exc):
+                raise
+            if attempt == _UPLOAD_RECONCILE_MAX_ATTEMPTS:
+                break
+            time.sleep(_upload_retry_delay(exc, attempt))
+    if completed:
+        return total, _completed_upload_item(
+            remote_path, total, expected_final_quickxor_hash
+        )
+    raise _UploadError(
+        "Could not determine OneDrive upload-session progress"
+    ) from last_error
+
+
 def _graph_request(
     method: str,
     path: str,
@@ -56,6 +548,7 @@ def _graph_request(
     data: bytes | None = None,
     extra_headers: dict[str, str] | None = None,
     raw: bool = False,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
     response = requests.request(
         method=method,
@@ -64,7 +557,7 @@ def _graph_request(
         params=params,
         json=body,
         data=data,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     try:
         response.raise_for_status()
@@ -73,7 +566,7 @@ def _graph_request(
         message = str(exc)
         if response_text:
             message = f"{message} - {response_text}"
-        raise RuntimeError(message) from exc
+        raise _GraphRequestError(message, response.status_code) from exc
 
     if raw:
         return response.content
@@ -83,10 +576,30 @@ def _graph_request(
 
 
 def _normalize_path(path: str | None) -> str | None:
+    """Normalize a Drive-relative path for use in a root:/{path}: request
+    URL, rejecting any "." or ".." segment outright rather than trying to
+    resolve it.
+
+    This isn't a filesystem path -- it's spliced directly into the request
+    URL below -- but standard HTTP client URL normalization still applies
+    to it: verified directly that requests' own PreparedRequest collapses
+    ".." segments the same way a browser would (e.g.
+    "/me/drive/root:/../../etc/x:/content" becomes "/me/etc/x:/content"),
+    which can walk the request entirely out of "/me/drive/root:/" and onto
+    a different, unrelated Graph API endpoint under the same OAuth token --
+    not merely "the wrong file within Drive." A caller-supplied path with a
+    dot-segment is refused rather than silently normalized away.
+    """
     if path is None:
         return None
     value = path.strip().strip("/")
-    return value or None
+    if not value:
+        return None
+    if "\\" in value:
+        raise ValueError("path must use '/' separators and must not contain '\\'")
+    if any(segment in (".", "..") for segment in value.split("/")):
+        raise ValueError(f"path must not contain '.' or '..' segments: {path!r}")
+    return value
 
 
 def _item_path(base_path: str | None) -> str:
@@ -103,10 +616,17 @@ def _children_path(folder_path: str | None) -> str:
     return f"/me/drive/root:/{quote(normalized, safe='/')}:/children"
 
 
-def _content_path(file_path: str) -> str:
+def _content_path(file_path: str, *, field_name: str = "file_path") -> str:
+    stripped_path = file_path.strip()
+    if stripped_path.endswith("/"):
+        raise ValueError(
+            f"{field_name} must include a filename, not end with a folder separator"
+        )
+    if Path(stripped_path).name.endswith("."):
+        raise ValueError(f"{field_name} filename must not end with a period")
     normalized = _normalize_path(file_path)
     if not normalized:
-        raise ValueError("file_path is required")
+        raise ValueError(f"{field_name} is required")
     return f"/me/drive/root:/{quote(normalized, safe='/')}:/content"
 
 
@@ -115,6 +635,361 @@ def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
         return content.decode("utf-8"), None
     except UnicodeDecodeError:
         return None, base64.b64encode(content).decode("ascii")
+
+
+def _name_looks_binary(name: str) -> bool:
+    """Whether ``name``'s extension is NOT a recognized text format.
+
+    Default-deny: an extension is only accepted if it's in
+    _KNOWN_TEXT_EXTENSIONS. A name with no extension at all (e.g.
+    "Dockerfile", "README") is accepted too -- the absence of an extension
+    isn't evidence of binary intent the way an unrecognized one is.
+
+    Uses _split_stem_suffix rather than plain ``Path.suffix`` for the same
+    reason google_drive.py's equivalent does: a name that's *entirely* a
+    leading dot plus extension (e.g. ".pdf") has an empty ``Path(...).suffix``
+    per pathlib's dotfile convention, which would make this function treat
+    it as extensionless (accepted) -- exactly the kind of mislabeling this
+    guard exists to catch, just via a name pathlib refuses to split.
+    """
+    suffix = _split_stem_suffix(Path(name.strip()).name)[1].lower()
+    return bool(suffix) and suffix not in _KNOWN_TEXT_EXTENSIONS
+
+
+def _resolve_upload_file_path(local_file_path: str) -> Path:
+    """Restrict onedrive_upload_file to files under an allowlisted
+    directory, mirroring the equivalent defenses used by other local-file
+    upload tools.
+
+    Containment is checked before existence, so a path that is both
+    outside the allowlist and nonexistent reports the allowlist message,
+    not "not found" -- the latter would leak whether that host path
+    exists at all to a caller who has no business finding out.
+    """
+    try:
+        candidate_path = Path(local_file_path).expanduser()
+        if not candidate_path.is_absolute():
+            candidate_path = Path.cwd() / candidate_path
+        local_path = candidate_path.resolve()
+        if candidate_path.is_symlink():
+            local_path = candidate_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        logger.warning(
+            "Could not resolve OneDrive upload path %r: %s", local_file_path, exc
+        )
+        raise ValueError("Could not resolve local_file_path") from exc
+
+    try:
+        allowed_dirs = allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
+    except ValueError as exc:
+        logger.warning("Invalid OneDrive upload directory configuration: %s", exc)
+        raise ValueError("Upload directory configuration is invalid") from None
+    if not any(local_path.is_relative_to(d) for d in allowed_dirs):
+        logger.warning(
+            "Rejected onedrive_upload_file path %s outside allowed directories: %s",
+            local_path,
+            ", ".join(str(path) for path in allowed_dirs),
+        )
+        raise PermissionError(
+            "local_file_path is outside the allowed upload directories; ask the "
+            "user for a file inside the task workspace or another allowed "
+            "location"
+        )
+
+    if local_path.exists() and not local_path.is_file():
+        # Distinguish "not a regular file" (a directory, a device node,
+        # etc.) from "does not exist" -- both used to raise the same
+        # FileNotFoundError, which reads as "retry, it'll show up" to a
+        # caller/agent even though a directory will never become a file.
+        raise ValueError("The given path is not a regular file")
+    if not local_path.is_file():
+        raise FileNotFoundError("File not found at the given path")
+    return local_path
+
+
+def _upload_large_file_content(
+    remote_path: str, fh: Any, total: int, mime_type: str
+) -> dict[str, Any]:
+    """Upload the next ``total`` bytes readable from ``fh`` (too large for
+    the simple content PUT) via Graph's upload-session API, in 320 KiB-
+    aligned chunks read straight off disk -- never materializing more than
+    one chunk of the file in memory at a time, unlike holding the whole
+    file as a single ``bytes`` object would.
+
+    Transient fragment failures are retried with bounded backoff on the same
+    session. Cross-call resume state is not persisted, so an exhausted or
+    non-retriable failure cancels the session before returning an error.
+    """
+    if total <= 0:
+        # Not reachable through onedrive_upload_file today (it rejects an
+        # empty file before choosing a path, and anything <= 0 bytes would
+        # take the simple-PUT branch regardless) -- guarded directly here
+        # too since `for start in range(0, 0, chunk_size)` would otherwise
+        # silently skip the whole loop and return the empty `result` this
+        # function initializes below, bypassing the "did OneDrive actually
+        # confirm this" check that only runs inside the loop.
+        raise ValueError(f"total must be positive, got {total}")
+    try:
+        session = _graph_request(
+            "POST",
+            f"{_item_path(remote_path)}/createUploadSession",
+            body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+        )
+    except (RuntimeError, requests.RequestException) as exc:
+        raise _UploadError("Could not create OneDrive upload session") from exc
+    upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
+    if not isinstance(upload_url, str) or not upload_url:
+        raise RuntimeError("OneDrive did not return an upload session URL")
+
+    # One Session for every chunk of this upload -- a fresh top-level
+    # requests.put() per chunk would pay a new TCP+TLS handshake each time,
+    # which adds up over the ~100 requests a 500MB upload needs.
+    with requests.Session() as http:
+        result: dict[str, Any] = {}
+        quickxor_hash = _QuickXorHash()
+
+        def refill_fragment(
+            chunk: bytearray, fragment_start: int, next_offset: int
+        ) -> int:
+            """Drop an accepted prefix and refill a non-final fragment.
+
+            Graph can report an arbitrary missing-byte offset. Sending only
+            the old fragment's suffix could make a non-final PUT shorter than
+            the required 320 KiB multiple, so extend it back to the configured
+            chunk size while keeping only one fragment buffer resident.
+            """
+            accepted_size = next_offset - fragment_start
+            del chunk[:accepted_size]
+            new_end = min(next_offset + _UPLOAD_SESSION_CHUNK_SIZE, total)
+            extra_size = new_end - next_offset - len(chunk)
+            if extra_size:
+                extra = fh.read(extra_size)
+                if len(extra) != extra_size:
+                    raise _UploadError(
+                        f"expected to read {extra_size} bytes at offset "
+                        f"{next_offset + len(chunk)} but got {len(extra)} -- the "
+                        "local file may have changed size during upload"
+                    )
+                quickxor_hash.update(extra)
+                chunk.extend(extra)
+                if new_end == total and fh.read(1):
+                    raise _UploadError(
+                        "the local file may have changed size during upload"
+                    )
+            return new_end
+
+        try:
+            start = 0
+            while start < total:
+                end = min(start + _UPLOAD_SESSION_CHUNK_SIZE, total)
+                expected_size = end - start
+                chunk = bytearray(fh.read(expected_size))
+                if len(chunk) != expected_size:
+                    # A short read here means the local file shrank out from
+                    # under this upload (a concurrent rewrite/truncation, or
+                    # an unusual filesystem) -- sending Content-Length/
+                    # Content-Range computed from the size we *expected*
+                    # rather than what we actually read would either hang
+                    # waiting for bytes that never arrive or desynchronize
+                    # every later chunk's byte-range accounting. Fail loudly
+                    # instead.
+                    raise _UploadError(
+                        f"expected to read {expected_size} bytes at offset "
+                        f"{start} but got {len(chunk)} -- the local file "
+                        "may have changed size during upload"
+                    )
+                # Hash each byte once when it is first read. Fragment retries
+                # reuse ``chunk`` and therefore cannot double-count it.
+                quickxor_hash.update(chunk)
+                # Detect growth after the caller's fstat snapshot before a
+                # truncated final item is committed. Keeping this as a
+                # separate read preserves the one-chunk memory bound.
+                if end == total and fh.read(1):
+                    raise _UploadError(
+                        "the local file may have changed size during upload"
+                    )
+                fragment_start = start
+                # The upload session URL is itself pre-authenticated (a
+                # token in its query string) -- Microsoft's own docs for
+                # createUploadSession confirm this explicitly: "If you
+                # include the Authorization header when issuing the PUT
+                # call, it might result in an HTTP 401 Unauthorized
+                # response. ... Don't include it when issuing the PUT
+                # call." So this goes straight through the plain Session
+                # rather than _graph_request (which always attaches one).
+                # Graph's docs don't confirm Content-Type is honored on a
+                # chunk PUT the way it is on the simple-PUT endpoint (only
+                # Content-Length/Content-Range are documented there), but
+                # sending it costs nothing and is the closest available
+                # lever to the simple path's behavior.
+                consecutive_failures = 0
+                recovery_cycles = 0
+                response: Any | None = None
+                while True:
+                    upload_error: BaseException | None = None
+                    try:
+                        response = http.put(
+                            upload_url,
+                            data=chunk,
+                            headers={
+                                "Content-Range": (
+                                    f"bytes {fragment_start}-{end - 1}/{total}"
+                                ),
+                                "Content-Type": mime_type,
+                            },
+                            timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
+                        )
+                        _raise_upload_status(response)
+                        if response.status_code in (200, 201):
+                            if end < total:
+                                raise _UploadError(
+                                    "OneDrive reported completion before the local "
+                                    "final fragment"
+                                )
+                            break
+                        if end < total and response.status_code == 202:
+                            break
+                    except Exception as exc:
+                        status_code = _upload_status_code(exc)
+                        if not (
+                            _is_retriable_upload_error(exc)
+                            or status_code in (404, 409, 416)
+                        ):
+                            raise
+                        upload_error = exc
+
+                    recovery_cycles += 1
+                    try:
+                        next_offset, completed_item = _reconcile_upload_progress(
+                            http,
+                            upload_url,
+                            remote_path,
+                            fragment_start,
+                            end,
+                            total,
+                            quickxor_hash.base64_digest(),
+                        )
+                    except Exception as reconcile_error:
+                        if not _is_retriable_upload_error(reconcile_error):
+                            raise
+                        consecutive_failures += 1
+                        if consecutive_failures >= _UPLOAD_FRAGMENT_MAX_ATTEMPTS:
+                            raise _UploadError(
+                                "Could not determine OneDrive upload-session progress"
+                            ) from reconcile_error
+                        delay = _upload_retry_delay(
+                            reconcile_error, consecutive_failures
+                        )
+                    else:
+                        if completed_item is not None:
+                            result = completed_item
+                            break
+                        if next_offset == end:
+                            break
+                        if next_offset > fragment_start:
+                            end = refill_fragment(chunk, fragment_start, next_offset)
+                            fragment_start = next_offset
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+                            if consecutive_failures >= _UPLOAD_FRAGMENT_MAX_ATTEMPTS:
+                                raise _UploadError(
+                                    "OneDrive upload fragment made no forward progress"
+                                ) from upload_error
+                        retry_number = max(consecutive_failures, 1)
+                        delay = (
+                            _upload_retry_delay(upload_error, retry_number)
+                            if upload_error is not None
+                            else _retry_delay(
+                                getattr(response, "headers", None), retry_number
+                            )
+                        )
+
+                    if recovery_cycles >= _UPLOAD_CHUNK_MAX_RECOVERY_CYCLES:
+                        raise _UploadError(
+                            "OneDrive upload fragment exceeded its recovery budget"
+                        ) from upload_error
+                    logger.warning(
+                        "Retrying OneDrive upload fragment after reconciliation "
+                        "(recovery cycle %s/%s, delay %.1fs)",
+                        recovery_cycles,
+                        _UPLOAD_CHUNK_MAX_RECOVERY_CYCLES,
+                        delay,
+                    )
+                    time.sleep(delay)
+                # Only the final chunk's response carries the completed
+                # item; Graph's intermediate (202) responses return upload-
+                # progress info, not the item -- checked explicitly
+                # (end == total) rather than "the last response that
+                # happened to have a body", which would silently pick up an
+                # unrelated intermediate body if Graph's progress responses
+                # ever started including one.
+                if end == total:
+                    if result.get("id"):
+                        break
+                    if response is None:
+                        raise _UploadError(
+                            "OneDrive did not return a final upload response"
+                        )
+                    try:
+                        final_item = response.json() if response.content else {}
+                    except ValueError:
+                        final_item = {}
+                    if isinstance(final_item, dict) and final_item.get("id"):
+                        result = final_item
+                        break
+
+                    # A 200/201 final PUT can still lose or omit its JSON
+                    # driveItem response. Bind destination metadata to the
+                    # exact local bytes before reporting success.
+                    result = _completed_upload_item(
+                        remote_path,
+                        total,
+                        quickxor_hash.base64_digest(),
+                    )
+                    break
+                start = end
+        except Exception as exc:
+            cause = _request_error_cause(exc)
+            if isinstance(exc, _UploadError) or isinstance(
+                cause, requests.RequestException
+            ):
+                logger.error(
+                    "OneDrive large-file upload failed: %s",
+                    _safe_upload_error_message(exc),
+                )
+            else:
+                logger.exception(
+                    "Unexpected OneDrive large-file upload failure (%s)",
+                    type(exc).__name__,
+                )
+            # No cross-call resume state is persisted. Once bounded retries
+            # are exhausted, cancel the unusable session instead of leaving
+            # partial data until its provider-defined expiration time.
+            try:
+                cancel_response = http.delete(
+                    upload_url, timeout=DEFAULT_TIMEOUT_SECONDS
+                )
+            except Exception as cleanup_exc:
+                # Never log cleanup exception text: requests exceptions can
+                # contain the preauthenticated upload URL.
+                logger.warning(
+                    "Failed to cancel abandoned OneDrive upload session (%s)",
+                    type(cleanup_exc).__name__,
+                )
+            else:
+                if (
+                    not (200 <= cancel_response.status_code < 300)
+                    and cancel_response.status_code != 404
+                ):
+                    logger.warning(
+                        "OneDrive upload session cancellation returned HTTP %s "
+                        "instead of success",
+                        cancel_response.status_code,
+                    )
+            raise RuntimeError(_safe_upload_error_message(exc)) from None
+
+    return result
 
 
 @mcp.tool()
@@ -172,13 +1047,13 @@ def onedrive_get_item(path: str | None = None, item_id: str | None = None) -> st
         if item_id:
             result = _graph_request(
                 "GET",
-                f"/me/drive/items/{quote(item_id, safe='')}",
+                f"/me/drive/items/{url_path_id(item_id, 'item_id')}",
             )
         elif path:
             result = _graph_request("GET", _item_path(path))
         else:
             raise ValueError("either path or item_id is required")
-        return _success(item=result)
+        return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error getting OneDrive item: %s", e)
         return _error(str(e))
@@ -206,17 +1081,150 @@ def onedrive_upload_text_file(
     file_path: str,
     content: str,
 ) -> str:
-    """Upload or overwrite a UTF-8 text file in OneDrive by path."""
+    """
+    Upload or overwrite a UTF-8 text file in OneDrive by path.
+
+    content is always treated as text (it is UTF-8 encoded before upload)
+    -- this tool cannot create a real PDF, image, or Office-format binary;
+    naming the target "report.pdf" would produce a file with that name but
+    plain-text content, not an actual PDF. To upload an already-generated
+    local file's real bytes (a PDF, image, .docx, etc.), use
+    onedrive_upload_file with that file's path instead.
+    """
     try:
+        if _name_looks_binary(file_path):
+            return _error(
+                f"'{file_path}' looks like a binary file, but "
+                "onedrive_upload_text_file only writes text content -- "
+                "uploading it here would produce a mislabeled text file, "
+                "not real binary data. If you already have this file on "
+                "disk (e.g. as a task output), use onedrive_upload_file "
+                "with its local path to upload the real binary content "
+                "instead."
+            )
         result = _graph_request(
             "PUT",
             _content_path(file_path),
             extra_headers={"Content-Type": "text/plain; charset=utf-8"},
             data=content.encode("utf-8"),
         )
-        return _success(item=result)
+        if not isinstance(result, dict) or not result.get("id"):
+            raise RuntimeError("OneDrive did not confirm the upload completed")
+        return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error uploading OneDrive text file %s: %s", file_path, e)
+        return _error(str(e))
+
+
+@mcp.tool()
+def onedrive_upload_file(
+    local_file_path: str, remote_path: str = "", mime_type: str = ""
+) -> str:
+    """
+    Upload a local file's real bytes to OneDrive -- use this (not
+    onedrive_upload_text_file) for a PDF, image, Office document, or any
+    other binary content, including a file this agent already generated
+    into the task workspace (e.g. an exported PDF report).
+
+    local_file_path: path to a file already on disk, e.g. something written to
+    the task workspace. Must be inside an allowed directory (automatically
+    scoped to the current task workspace). When no allowlist is configured,
+    the process working directory is used as a fallback, so this is not an
+    absolute guarantee against access to host files. Pass an absolute path;
+    a relative path resolves against this process's working directory.
+    remote_path: the OneDrive path to upload to (e.g. "Documents/report.pdf"),
+    overwriting any existing file there; defaults to the local file's own
+    name at the OneDrive root.
+    mime_type: defaults to a guess from the remote filename, then the local
+    filename, falling back to "application/octet-stream". It is sent on both
+    simple uploads and upload-session chunks.
+
+    Empty files are rejected. Files over 2 GiB are also rejected as a
+    guard-rail against a mistargeted upload, not as a OneDrive/Graph limit.
+    """
+    try:
+        local_path = _resolve_upload_file_path(local_file_path)
+        resolved_remote_path = remote_path.strip() or local_path.name
+        content_path = _content_path(resolved_remote_path, field_name="remote_path")
+        resolved_mime_type = mime_type.strip() or _guess_mime_type(resolved_remote_path)
+        if resolved_mime_type is None:
+            resolved_mime_type = (
+                _guess_mime_type(local_path.name) or "application/octet-stream"
+            )
+
+        # Read from one open handle throughout -- the size check, the small-
+        # file read, and the large-file chunk reads all use this same fh
+        # rather than each re-opening/re-stat'ing the file. For a file over
+        # _SIMPLE_UPLOAD_MAX_BYTES, _upload_large_file_content reads it
+        # chunk-by-chunk straight off this handle rather than this function
+        # first loading the whole file into memory -- the resumable upload-
+        # session path exists specifically so a large file's memory
+        # footprint stays bounded to one chunk at a time.
+        # A fresh by-path open, not the same descriptor
+        # _resolve_upload_file_path used for its allowlist check -- a
+        # symlink swapped in during that window wouldn't be caught.
+        # Accepted risk: holding a file descriptor open across the whole
+        # allowlist resolution isn't worth it for a local, non-shared task
+        # workspace (same tradeoff google_drive_upload_file makes).
+        try:
+            fh_ctx = local_path.open("rb")
+        except OSError as e:
+            # str(OSError) embeds the absolute path (e.g. "[Errno 13]
+            # Permission denied: '/full/host/path'") -- the same detail
+            # _resolve_upload_file_path's own error deliberately scrubs. A
+            # permission error or a TOCTOU race (the allowlist-checked path
+            # got swapped/removed between the check and this open) would
+            # otherwise leak it straight into the caller/LLM-facing message
+            # through the generic `except Exception` below.
+            logger.warning("Failed to open upload file %s: %s", local_path, e)
+            raise ValueError("Could not read the file at the given path") from e
+        with fh_ctx as fh:
+            file_size = os.fstat(fh.fileno()).st_size
+            if file_size == 0:
+                # A deliberate product choice, not an API constraint: Graph
+                # itself accepts a 0-byte file. An agent uploading an empty
+                # file is almost always a symptom of an upstream mistake
+                # (e.g. a generation step that silently produced nothing),
+                # so this is rejected here rather than silently creating a
+                # placeholder-empty item on OneDrive.
+                raise ValueError(f"File is empty: {local_file_path}")
+            if file_size > _MAX_UPLOAD_BYTES:
+                raise ValueError(
+                    f"File is {file_size} bytes, over the "
+                    f"{_MAX_UPLOAD_BYTES // (1024 * 1024 * 1024)} GiB limit for "
+                    "onedrive_upload_file"
+                )
+
+            if file_size <= _SIMPLE_UPLOAD_MAX_BYTES:
+                # Bound the read even if another process appends after fstat.
+                content = fh.read(_SIMPLE_UPLOAD_MAX_BYTES + 1)
+                if not content:
+                    raise ValueError(f"File is empty: {local_file_path}")
+                if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
+                    raise RuntimeError("the local file grew during upload")
+                result = _graph_request(
+                    "PUT",
+                    content_path,
+                    extra_headers={"Content-Type": resolved_mime_type},
+                    data=content,
+                    timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
+                )
+            else:
+                result = _upload_large_file_content(
+                    resolved_remote_path, fh, file_size, resolved_mime_type
+                )
+
+        if not isinstance(result, dict) or not result.get("id"):
+            raise RuntimeError("OneDrive did not confirm the upload completed")
+
+        return _success(item=_caller_safe_drive_item(result))
+    except Exception as e:
+        if isinstance(e, (OSError, ValueError, RuntimeError)):
+            logger.error("Error uploading OneDrive file %s: %s", local_file_path, e)
+        else:
+            logger.exception(
+                "Unexpected error uploading OneDrive file %s", local_file_path
+            )
         return _error(str(e))
 
 
@@ -256,7 +1264,7 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
             raise ValueError("new_name is required")
         result = _graph_request(
             "PATCH",
-            f"/me/drive/items/{quote(item_id, safe='')}",
+            f"/me/drive/items/{url_path_id(item_id, 'item_id')}",
             body={"name": new_name},
         )
         return _success(item=result)
@@ -269,7 +1277,10 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
 def onedrive_delete_item(item_id: str) -> str:
     """Delete a OneDrive file or folder by item_id."""
     try:
-        _graph_request("DELETE", f"/me/drive/items/{quote(item_id, safe='')}")
+        _graph_request(
+            "DELETE",
+            f"/me/drive/items/{url_path_id(item_id, 'item_id')}",
+        )
         return _success(message="Item deleted successfully")
     except Exception as e:
         logger.error("Error deleting OneDrive item %s: %s", item_id, e)

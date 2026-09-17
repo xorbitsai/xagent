@@ -6,6 +6,10 @@ const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const toastWarningMock = vi.hoisted(() => vi.fn())
 const toastSuccessMock = vi.hoisted(() => vi.fn())
+const authMock = vi.hoisted(() => ({
+  user: { id: 1, is_admin: false },
+  inTeam: true,
+}))
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
@@ -25,6 +29,9 @@ vi.mock("@/contexts/i18n-context", () => ({
       if (vars?.name) {
         return `${key}:${vars.name}`
       }
+      if (vars?.owners) {
+        return `${key}:${vars.owners}`
+      }
 
       return key
     },
@@ -32,10 +39,7 @@ vi.mock("@/contexts/i18n-context", () => ({
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
-  useAuth: () => ({
-    user: { id: 1, is_admin: false },
-    inTeam: true,
-  }),
+  useAuth: () => authMock,
 }))
 
 vi.mock("sonner", () => ({
@@ -137,6 +141,7 @@ const ONE_COLLECTION = {
 
 describe("KnowledgeBasePage", () => {
   beforeEach(() => {
+    authMock.user.is_admin = false
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
     toastWarningMock.mockReset()
@@ -145,6 +150,61 @@ describe("KnowledgeBasePage", () => {
 
   afterEach(() => {
     cleanup()
+  })
+
+  it("shows owner email instead of an opaque username to administrators", async () => {
+    authMock.user.is_admin = true
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/kb/collections") {
+        return Promise.resolve(createJsonResponse({
+          collections: [{
+            ...ONE_COLLECTION.collections[0],
+            owners: [2],
+          }],
+        }))
+      }
+      if (url.startsWith("http://api.local/api/admin/users?")) {
+        return Promise.resolve(createJsonResponse({
+          users: [{
+            id: 2,
+            username: "acct_0123456789abcdef0123456789abcdef",
+            email: "owner@example.com",
+          }],
+          pages: 1,
+        }))
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    render(<KnowledgeBasePage />)
+
+    expect(await screen.findByText("kb.card.ownerLabel:owner@example.com")).toBeInTheDocument()
+    expect(screen.queryByText(/acct_0123456789abcdef/)).not.toBeInTheDocument()
+  })
+
+  it("formats an incomplete owner fallback with the account ID convention", async () => {
+    authMock.user.is_admin = true
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/kb/collections") {
+        return Promise.resolve(createJsonResponse({
+          collections: [{
+            ...ONE_COLLECTION.collections[0],
+            owners: [2],
+          }],
+        }))
+      }
+      if (url.startsWith("http://api.local/api/admin/users?")) {
+        return Promise.resolve(createJsonResponse({
+          users: [{ id: 2, username: "", email: null }],
+          pages: 1,
+        }))
+      }
+      return Promise.resolve(createStatusResponse(404, { detail: "not found" }))
+    })
+
+    render(<KnowledgeBasePage />)
+
+    expect(await screen.findByText("kb.card.ownerLabel:#2")).toBeInTheDocument()
   })
 
   it("shows the collection delete action in the detail sheet flow", async () => {

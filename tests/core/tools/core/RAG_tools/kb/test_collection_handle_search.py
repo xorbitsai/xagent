@@ -176,6 +176,32 @@ def test_search_sparse_fts_hit_scores_normalized():
     assert resp.results[0].score == pytest.approx(0.75)  # 3/(1+3)
 
 
+def _sparse_handle_with_rows(rows):
+    handle, _, store, _ = _make_handle()
+    store.open_embeddings_table.return_value = (MagicMock(), "embeddings_model-x")
+    store.create_index.return_value = _index_result()
+    store.build_filter_expression.return_value = None
+    fts_table = store.open_embeddings_table.return_value[0]
+    fts_table.search.return_value.limit.return_value.to_pandas.return_value = rows
+    return handle, fts_table
+
+
+def test_search_sparse_searches_terms_not_the_raw_query():
+    """The raw string would match every chunk that contains whitespace."""
+    handle, fts_table = _sparse_handle_with_rows(pd.DataFrame())
+    handle.search_sparse("model-x", "click Save 按钮", top_k=3)
+    built = fts_table.search.call_args.args[0]
+    assert [match.query for _, match in built.queries] == ["click", "Save", "按钮"]
+
+
+def test_search_sparse_skips_fts_when_query_has_no_terms(monkeypatch):
+    handle, fts_table = _sparse_handle_with_rows(pd.DataFrame())
+    monkeypatch.setattr(type(handle), "_substring_fallback", lambda self, **kwargs: [])
+    resp = handle.search_sparse("model-x", "  ,. ", top_k=3)
+    fts_table.search.assert_not_called()
+    assert resp.results == []
+
+
 # ---------------------------------------------------------------------------
 # Hybrid search tests
 # ---------------------------------------------------------------------------

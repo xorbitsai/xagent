@@ -128,15 +128,21 @@ class TriggerProvider(Protocol):
         """
         ...
 
-    async def unregister(self, db: Session, trigger: AgentTrigger, config: Any) -> None:
-        """Tear down the delivery binding described by ``config``.
+    async def unregister(
+        self,
+        db: Session,
+        trigger: AgentTrigger,
+        config: Any,
+        *,
+        resource_id: str | None = None,
+    ) -> None:
+        """Tear down the delivery binding described by its prior snapshot.
 
-        Trigger CRUD dispatches this with the trigger's previous config when
-        a previously-enabled binding is disabled, changed, or deleted. The
-        trigger row may already hold a different binding or no longer exist,
-        so implementations must resolve the binding from ``config`` alone
-        and tolerate bindings still referenced by other triggers
-        (reference-counted teardown).
+        Trigger CRUD dispatches this with the trigger's previous config and
+        resource identity when a previously-enabled binding is disabled,
+        changed, or deleted. The trigger row may already hold a different
+        binding or no longer exist, so implementations must use this snapshot
+        and tolerate bindings still referenced by other triggers.
         """
         ...
 

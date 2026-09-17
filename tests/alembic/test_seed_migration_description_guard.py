@@ -27,7 +27,7 @@ VERSIONS_DIR = Path(__file__).parent.parent.parent / "src/xagent/migrations/vers
 
 
 def _parse(path: Path) -> ast.Module:
-    return ast.parse(path.read_text(), filename=str(path))
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 
 def _module_app_id(tree: ast.Module) -> str | None:

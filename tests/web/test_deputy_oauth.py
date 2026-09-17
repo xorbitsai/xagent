@@ -96,10 +96,7 @@ def db_session(tmp_path):
         PublicMCPApp(
             app_id="deputy",
             name="Deputy",
-            description=(
-                "Connect to Deputy to look up employees, view rosters/shifts, "
-                "and read timesheets."
-            ),
+            description="Deputy connector",
             transport="oauth",
             provider_name="deputy",
             category="Scheduling",

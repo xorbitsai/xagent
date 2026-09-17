@@ -12,7 +12,10 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-from xagent.migrations.seed_helpers import delete_unmodified_seeded_rows
+from xagent.migrations.seed_helpers import (
+    OAUTH_PROVIDER_SEED_MATCH_COLUMNS,
+    delete_unmodified_seeded_rows,
+)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260526_seed_builtin_microsoft_graph_mcp_apps"
@@ -76,6 +79,14 @@ def _microsoft_provider_row() -> dict[str, object]:
 
 
 def _microsoft_app_rows() -> list[dict[str, object]]:
+    # launch_config.command is "python" here (not the original "uv") to match
+    # what 20260715_normalize_builtin_mcp_launch.py's irreversible normalization
+    # leaves behind - see that migration's CANONICAL_EXECUTION_FIELDS comment.
+    # This narrows a downgrade-cleanup window in the other direction: a DB
+    # seeded by this migration but downgraded *before* 20260715 ever ran will
+    # now look "operator-modified" (command still "uv") and be preserved
+    # instead of removed. That fails safe (no data loss, just a stale row)
+    # and is a narrow, non-standard ordering to hit in practice.
     return [
         {
             "app_id": "teams",
@@ -201,12 +212,12 @@ def downgrade() -> None:
 
     # Only delete the provider row when it still matches the static shape this
     # migration seeded, so an admin-created/edited "microsoft" provider (via
-    # POST /admin/mcp/providers) is preserved. client_id/client_secret are
-    # env-dependent and intentionally not part of the guard.
+    # POST /admin/mcp/providers) is preserved. client_id/client_secret/
+    # redirect_uri are env-dependent and intentionally not part of the guard.
     delete_unmodified_seeded_rows(
         bind,
         FULL_OAUTH_PROVIDERS_TABLE,
         [_microsoft_provider_row()],
-        match_columns=("name", "auth_url", "token_url"),
+        match_columns=OAUTH_PROVIDER_SEED_MATCH_COLUMNS,
         id_column="provider_name",
     )

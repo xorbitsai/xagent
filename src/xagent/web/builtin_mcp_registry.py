@@ -733,6 +733,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "sharepoint",
+            "name": "SharePoint",
+            "description": "Connect to SharePoint to search sites, browse and manage document libraries, and read and write list items.",
+            "icon": "https://www.google.com/s2/favicons?domain=sharepoint.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "microsoft",
+            "category": "Storage",
+            "oauth_scopes": ["Sites.ReadWrite.All"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.sharepoint"],
+                "env_mapping": {"AUTH_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "facebook",
             "name": "Facebook Pages",
             "description": "Connect to Facebook Pages to discover managed pages and publish page posts.",

@@ -394,6 +394,19 @@ def test_full_upgrade_downgrade_chain_with_description_migration_removes_row(
             migration.upgrade()
             description_migration.upgrade()
             description_migration.downgrade()
+
+            # Confirms the actual mechanism this test guards against, not
+            # just the final outcome: at this point description_migration's
+            # own downgrade() must have already reverted the row's
+            # description back to the pre-write-tools text -- this is the
+            # exact state migration.downgrade()'s guard has to recognize
+            # as "not customized" (via _ORIGINAL_DEPUTY_DESCRIPTION) for
+            # the final assertions below to mean what they claim.
+            description = connection.execute(
+                text("SELECT description FROM public_mcp_apps WHERE app_id='deputy'")
+            ).scalar()
+            assert description == migration._ORIGINAL_DEPUTY_DESCRIPTION
+
             migration.downgrade()
 
         assert "deputy" not in _app_ids(connection)

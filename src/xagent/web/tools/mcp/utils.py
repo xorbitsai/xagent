@@ -260,8 +260,17 @@ def success_with_capped_dict(
 
     if len(response) > max_output_length:
         compact_data: dict[str, Any] = {}
-        if isinstance(data.get("id"), (str, int, float, bool)):
-            compact_data["id"] = data["id"]
+        # Checked in this order, first match wins: different connectors'
+        # APIs spell their identity field differently (Salesforce/HubSpot:
+        # "id"; Deputy: "Id"; MYOB: "Uid") -- without checking the
+        # capitalized variants too, a record that's otherwise unrecoverable
+        # after truncation would lose even its id just because the field
+        # isn't spelled exactly "id", leaving a caller with no way to look
+        # the record back up.
+        for id_key in ("id", "Id", "ID", "Uid", "UID"):
+            if isinstance(data.get(id_key), (str, int, float, bool)):
+                compact_data[id_key] = data[id_key]
+                break
         candidates = (
             _build(compact_data, True, with_extras=False),
             _build({}, True, with_extras=False),

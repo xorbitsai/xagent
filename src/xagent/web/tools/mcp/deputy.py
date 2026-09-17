@@ -292,6 +292,29 @@ def deputy_get_resource(resource: str, resource_id: str) -> str:
 
 
 @mcp.tool()
+def deputy_resource_info(resource: str) -> str:
+    """
+    Get the field list, types, and associations Deputy defines for a
+    resource type (GET /resource/{resource}/INFO). Use this before
+    deputy_create_resource/deputy_update_resource to learn what fields
+    Deputy expects -- especially for the first record of a type, when
+    there's no existing record yet for deputy_get_resource/
+    deputy_list_resource/deputy_query_resource to show you.
+    resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
+    "Timesheet", or "Leave".
+    """
+    try:
+        safe_resource = url_path_id(resource, "resource")
+        result = _request("GET", f"/resource/{safe_resource}/INFO")
+        return _record_response(resource, result, field_name="info")
+    except Exception as e:
+        logger.error(
+            f"Error fetching Deputy resource info for {resource}: {e}", exc_info=True
+        )
+        return _error(str(e))
+
+
+@mcp.tool()
 def deputy_query_resource(
     resource: str,
     search: dict[str, Any] | None = None,
@@ -348,15 +371,14 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     "Timesheet", or "Leave".
     data: field name -> value pairs for the new record. For "Employee",
     Deputy's V1 schema requires "Company", "FirstName", "LastName",
-    "DisplayName", "Active", "Contact", and "Role" -- there is no
-    "Email" field. "Company"/"Contact"/"Role" are ids referencing
-    existing Company/Contact/EmployeeRole records, not literal values;
-    look up a valid id first (e.g. via deputy_list_resource("Company"))
-    rather than guessing one.
-    Use deputy_list_resource or deputy_query_resource on an existing record
-    of the same type first to learn which field names Deputy expects for
-    other resource types -- deputy_get_resource needs an id, which isn't
-    available yet when creating the first record of a type.
+    "DisplayName", "Active", "Contact", "Role", and "AllowAppraisal" --
+    there is no "Email" field. "Company"/"Contact"/"Role" are ids
+    referencing existing Company/Contact/EmployeeRole records, not
+    literal values; look up a valid id first (e.g. via
+    deputy_list_resource("Company")) rather than guessing one.
+    Use deputy_resource_info first to learn Deputy's required/optional
+    fields for other resource types -- deputy_get_resource needs an id,
+    which isn't available yet when creating the first record of a type.
     This is not idempotent: retrying after a timeout or connection error
     can create a duplicate record. Use deputy_query_resource to check
     whether the record already exists before retrying a failed call.
@@ -374,6 +396,27 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
             return _error("No data provided to create record")
         safe_resource = url_path_id(resource, "resource")
         result = _request("POST", f"/resource/{safe_resource}", json_data=create_data)
+        # An empty {} (a 204, or a 200 with no body -- both normalized by
+        # _request) is a genuine "we don't know" for a create: unlike a
+        # get/list, an empty response here isn't a valid "no data" result,
+        # but it's also not necessarily a failure -- Deputy already
+        # returned a non-error status, so the record may well exist with
+        # no id available to confirm it or retry safely against. A flat
+        # `_error` here would be misleading (it reads as "nothing
+        # happened, safe to retry"), which is exactly the wrong signal
+        # for a non-idempotent write -- so this stays a success, with an
+        # explicit warning instead of a silent, confident-looking blank
+        # record.
+        if isinstance(result, dict) and not result:
+            return _success(
+                record={},
+                warning=(
+                    f"Deputy returned no content for this {resource} create -- "
+                    "the record may or may not have been created, and its id "
+                    "is unknown. Use deputy_query_resource to check before "
+                    "retrying."
+                ),
+            )
         return _record_response(resource, result)
     except Exception as e:
         logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
@@ -399,7 +442,21 @@ def deputy_update_resource(
     deactivate an Employee.
     """
     try:
-        if not data:
+        # "Id" is identified by resource_id/the URL, not data: the URL's
+        # resource_id is what actually identifies the record being
+        # written, and letting a caller-supplied "Id" in data silently
+        # ride along in the body would decouple what the body claims to
+        # be from what the URL targets, for no legitimate reason a
+        # partial update would ever need. Dropped unconditionally rather
+        # than only re-asserted from the fetched record (which would
+        # leave a caller-supplied Id unprotected whenever the fetched
+        # record happens to lack an "Id" key) -- matches
+        # deputy_create_resource's own protection. Stripped before the
+        # empty-data check so a data={"Id": ...}-only call is correctly
+        # rejected as no real change requested, not turned into a
+        # needless no-op GET+POST round trip.
+        update_data = {k: v for k, v in data.items() if k != "Id"}
+        if not update_data:
             return _error("No data provided to update")
         safe_resource = url_path_id(resource, "resource")
         safe_resource_id = url_path_id(resource_id, "resource_id")
@@ -408,9 +465,9 @@ def deputy_update_resource(
         # support (Deputy's own V2 employee endpoint exists specifically
         # to add that for Employee; V1 has no equivalent for other
         # resource types) -- so fetch the current record and merge
-        # `data` into it before writing the full object back, rather
-        # than sending `data` alone. This is a GET-then-POST with no
-        # retry: a concurrent edit landing between the two is a
+        # `update_data` into it before writing the full object back,
+        # rather than sending `update_data` alone. This is a GET-then-POST
+        # with no retry: a concurrent edit landing between the two is a
         # lost-update race this function doesn't detect or retry on.
         # Not unique to this connector (myob.py's own generic full-object
         # update has the same tradeoff), so left as a known limitation
@@ -419,24 +476,17 @@ def deputy_update_resource(
         # Both checks needed, not just one: `not current` alone lets a
         # truthy non-dict (e.g. a bare list) through to the dict-spread
         # below; `isinstance` alone lets an empty {} through -- _request
-        # returns {} on a 204/empty response, and {**{}, **data} would
-        # otherwise silently POST only the caller's partial fields as if
-        # they were the whole record, wiping every other field Deputy has
-        # for it. Matches myob.py's _update_resource, which guards the
-        # same way for the same reason.
+        # returns {} on a 204/empty response, and {**{}, **update_data}
+        # would otherwise silently POST only the caller's partial fields
+        # as if they were the whole record, wiping every other field
+        # Deputy has for it. Matches myob.py's _update_resource, which
+        # guards the same way for the same reason.
         if not current or not isinstance(current, dict):
-            return _error(f"Deputy returned an unexpected response for {resource}")
-        # data wins over current for every other field, but not "Id":
-        # the URL's resource_id is what actually identifies the record
-        # being written, and letting a caller-supplied "Id" in data
-        # silently ride along in the body would decouple what the body
-        # claims to be from what the URL targets, for no legitimate
-        # reason a partial update would ever need.
-        merged = {
-            **current,
-            **data,
-            **({"Id": current["Id"]} if "Id" in current else {}),
-        }
+            return _error(
+                f"Deputy returned no existing record to update for {resource}"
+                f" {resource_id}"
+            )
+        merged = {**current, **update_data}
         result = _request(
             "POST",
             f"/resource/{safe_resource}/{safe_resource_id}",

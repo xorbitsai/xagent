@@ -1838,7 +1838,7 @@ def get_tool_max_output_length() -> int:
         try:
             return int(env_str)
         except ValueError:
-            logger.warning("Invalid TOOL_MAX_OUTPUT_LENGTH value: {env_str}")
+            logger.warning(f"Invalid TOOL_MAX_OUTPUT_LENGTH value: {env_str}")
     return 50 * 1024
 
 
@@ -1898,7 +1898,7 @@ def get_tool_max_recursion_depth() -> int:
         try:
             return int(env_str)
         except ValueError:
-            logger.warning("Invalid TOOL_MAX_RECURSION_DEPTH value: {env_str}")
+            logger.warning(f"Invalid TOOL_MAX_RECURSION_DEPTH value: {env_str}")
     return 20
 
 
@@ -1918,7 +1918,7 @@ def get_tool_max_field_count() -> int:
         try:
             return int(env_str)
         except ValueError:
-            logger.warning("Invalid TOOL_MAX_FIELDS value: {env_str}")
+            logger.warning(f"Invalid TOOL_MAX_FIELD_COUNT value: {env_str}")
     return 1000
 
 
@@ -1943,7 +1943,7 @@ def get_tool_max_structured_truncate_input_chars() -> int:
             return int(env_str)
         except ValueError:
             logger.warning(
-                "Invalid TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS value: {env_str}"
+                f"Invalid TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS value: {env_str}"
             )
     return 10_000_000
 

@@ -482,6 +482,15 @@ class ToolConfig(BaseToolConfig):
             )
         except (TypeError, ValueError):
             pass
+        self._custom_max_structured_truncate_input_chars: int | None = None
+        try:
+            self._custom_max_structured_truncate_input_chars = int(
+                config_dict.get(  # type: ignore[arg-type]
+                    "max_structured_truncate_input_chars"
+                )
+            )
+        except (TypeError, ValueError):
+            pass
 
         self.workspace_config: Optional[Dict[str, Any]] = workspace_config
         self.vision_model: Optional[Any] = (
@@ -689,6 +698,11 @@ class ToolConfig(BaseToolConfig):
         if self._custom_max_recursion_depth is not None:
             return self._custom_max_recursion_depth
         return super().get_max_recursion_depth()
+
+    def get_max_structured_truncate_input_chars(self) -> int:
+        if self._custom_max_structured_truncate_input_chars is not None:
+            return self._custom_max_structured_truncate_input_chars
+        return super().get_max_structured_truncate_input_chars()
 
     def get_db(self) -> Optional[Any]:
         """ToolConfig (standalone) does not have database access."""

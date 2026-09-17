@@ -989,3 +989,55 @@ def test_json_truncation_compact_log_reflects_field_cap(caplog):
     assert not any("no items dropped" in record.message for record in caplog.records), (
         "log claims nothing was dropped, but max_fields capping dropped 490 items"
     )
+
+
+def test_json_truncation_compact_log_says_no_items_dropped_when_true(caplog):
+    """The positive case for the log-gating fix above: when nothing was
+    actually capped/sanitized, the log must still say "no items dropped" -
+    a mutant that always reports "structure modified" (e.g. by hardcoding
+    the capped_anything flag to True) would defeat the point of gating the
+    message at all, but would slip through if only the negative case above
+    were tested."""
+    import logging
+
+    data = {"data": list(range(50))}
+    payload = json.dumps(data, indent=4)  # oversized only due to whitespace
+    filter = _create_filter(
+        max_chars=len(json.dumps(data, separators=(",", ":"))) + 5, max_fields=1000
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = filter.filter(payload, "test_tool")
+
+    assert json.loads(result)["data"] == list(range(50))  # nothing dropped
+    assert any("no items dropped" in record.message for record in caplog.records)
+    assert not any("structure modified" in record.message for record in caplog.records)
+
+
+def test_json_truncation_candidate_retry_composes_with_field_capping():
+    """A gap found via review: no existing test combined the candidate-retry
+    loop (added to fix the "top-ranked candidate can't absorb the overflow"
+    bug) with a candidate that was *already* field-capped by max_fields
+    (added to fix the max_fields-bypass bug) - each was tested in isolation,
+    but not together. `list_a` (400 items) outranks `list_b` (5 items) by
+    item count and gets field-capped to 10+marker first; at this budget,
+    even emptying `list_a` entirely still can't fit (list_b's own bulk
+    dominates), so the retry loop must fall through and trim `list_b`
+    instead - while `list_a` stays at its already-capped form, correctly
+    reporting the true original count (390 more, not just whatever the
+    char-budget trim alone would have implied)."""
+    data = {"list_a": list(range(400)), "list_b": ["y" * 300 for _ in range(5)]}
+    payload = json.dumps(data)
+    filter = _create_filter(max_chars=1000, max_fields=10)
+
+    result = filter.filter(payload, "test_tool")
+    parsed = json.loads(result)
+
+    assert len(result) <= 1000
+    # list_a: unchanged from its field-capped form (the retry loop tried it,
+    # found it couldn't absorb enough, and moved on without mutating it).
+    assert parsed["list_a"] == list(range(10)) + [
+        TRUNCATED_ITEMS_TEMPLATE.format(count=390)
+    ]
+    # list_b: the candidate that actually got char-budget trimmed.
+    assert 0 < len(parsed["list_b"]) < 5

@@ -6,9 +6,11 @@ Provides multi-layered output limiting for all tools to prevent excessive output
 This module implements a three-pronged approach to control tool output size:
 1. Per-string length limit: Truncates individual string values. When a
    too-long string is itself JSON, this first tries structure-aware
-   trimming (drop items from its largest data-bearing list, enforcing the
-   same field-count cap as #2) so the result stays valid JSON, falling
-   back to a raw character slice only when that isn't achievable.
+   trimming (rank candidate lists by how much dropping trailing items
+   from each would help, and try them in that order until one actually
+   brings the payload under budget, enforcing the same field-count cap
+   as #2) so the result stays valid JSON, falling back to a raw
+   character slice only when no candidate can be trimmed to fit.
 2. Field count limit: Limits the number of items in dicts/lists
 3. Recursion depth limit: Prevents excessively deep nesting
 
@@ -377,11 +379,11 @@ class OutputValueFilter:
                 # marker was already ruled out above, since dropping a
                 # roughly constant-size marker for the last couple of items
                 # can *shrink* the output, which would otherwise break that
-                # monotonicity.) A candidate that still contains a
-                # non-finite float makes _safe_compact_dumps return None,
-                # which is treated the same as "too long" - once a kept
-                # prefix reaches that item, every longer prefix keeps it too,
-                # so this stays monotonic as well.
+                # monotonicity.) _safe_compact_dumps returning None here is
+                # just a defensive fallback at this point - _cap_max_fields
+                # already sanitized every non-finite float in the whole
+                # structure before this loop ever runs, so no candidate
+                # should actually trigger it in practice.
                 lo, hi = 0, total - 1
                 best_serialized: str | None = None
                 best_kept = 0
@@ -523,10 +525,21 @@ class OutputValueFilter:
         return node
 
     # Cap on how many ranked candidates _try_json_truncate will try binary
-    # search on before giving up. Bounds worst-case cost for a structure with
-    # many small qualifying lists, at the price of not exhaustively trying
-    # every last low-ranked candidate.
-    _MAX_TRIM_CANDIDATES_TO_TRY = 10
+    # search on before giving up. This is a bounded heuristic, not a full
+    # fix: it only raises the number of similarly-ranked-but-untrimmable
+    # candidates needed to reproduce the "gives up even though a lower-
+    # ranked candidate could have been trimmed" failure mode, it doesn't
+    # eliminate it (a structure with more than this many individually-
+    # insufficient qualifying lists can still fall back to a raw slice
+    # unnecessarily). Kept low - covering a handful of sibling candidates,
+    # which is the realistic shape this was written for (e.g. two or three
+    # top-level lists in an envelope) - because each extra candidate tried
+    # costs a full binary search that re-serializes the whole document per
+    # step; measured ~5-7x worst-case slowdown at the previous value (10)
+    # for a payload with many similarly-ranked, individually-insufficient
+    # lists, on top of _try_json_truncate already running synchronously on
+    # the async tool-call path (see output_filter_wrapper.py).
+    _MAX_TRIM_CANDIDATES_TO_TRY = 3
 
     @classmethod
     def _find_trim_candidates(cls, obj: Any) -> list[list]:

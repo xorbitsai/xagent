@@ -733,6 +733,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "excel",
+            "name": "Excel",
+            "description": "Connect to Excel to read and write worksheets, cell ranges, and tables in workbooks stored on OneDrive or SharePoint.",
+            "icon": "https://www.google.com/s2/favicons?domain=office.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "microsoft",
+            "category": "Productivity",
+            "oauth_scopes": ["Files.ReadWrite"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.excel"],
+                "env_mapping": {"AUTH_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "facebook",
             "name": "Facebook Pages",
             "description": "Connect to Facebook Pages to discover managed pages and publish page posts.",

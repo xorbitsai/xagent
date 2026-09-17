@@ -3653,6 +3653,7 @@ def test_update_event_collects_distinct_conflicts_from_both_delta_segments(
         "Early conflict",
         "Late conflict",
     ]
+    assert "+00:00" in result["message"]
     assert find_conflicts.call_count == 3
     assert find_conflicts.call_args_list[1].args[0:3] == (
         "2026-08-27T09:00:00",

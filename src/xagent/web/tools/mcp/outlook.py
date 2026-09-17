@@ -1323,19 +1323,25 @@ def outlook_update_event(
                     str(pending_scope_error),
                     details={"unchecked_attendees": unchecked_attendees},
                 )
+            response_start = _offset_datetime_string(
+                query_start, availability_timezone, allow_windows_names=True
+            )
+            response_end = _offset_datetime_string(
+                query_end, availability_timezone, allow_windows_names=True
+            )
             if all_conflicts:
                 return _conflict_response(
                     all_conflicts,
                     unchecked_attendees,
-                    query_start,
-                    query_end,
+                    response_start,
+                    response_end,
                     check_error=check_error,
                 )
             if check_error or unchecked_attendees:
                 return _incomplete_check_response(
                     unchecked_attendees,
-                    query_start,
-                    query_end,
+                    response_start,
+                    response_end,
                     message=check_error,
                 )
 

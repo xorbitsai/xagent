@@ -137,6 +137,27 @@ def test_upgrade_inserts_meta_provider_and_public_apps(tmp_path):
     }
 
 
+def test_upgrade_is_idempotent(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.upgrade()  # second run must not raise or duplicate
+        app_count = connection.execute(
+            text(
+                "SELECT COUNT(*) FROM public_mcp_apps"
+                " WHERE app_id IN ('facebook', 'instagram')"
+            )
+        ).scalar()
+        assert app_count == 2
+        provider_count = connection.execute(
+            text("SELECT COUNT(*) FROM oauth_providers WHERE provider_name='meta'")
+        ).scalar()
+        assert provider_count == 1
+
+
 def test_downgrade_cleans_up_after_descendant_normalization_migration(tmp_path):
     """20260715_normalize_builtin_mcp_launch runs after this migration and
     unconditionally rewrites facebook/instagram's launch_config (its own

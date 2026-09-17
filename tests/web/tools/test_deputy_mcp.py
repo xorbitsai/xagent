@@ -617,6 +617,34 @@ def test_create_resource_rejects_empty_data_without_calling_api(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_create_resource_strips_caller_supplied_id(monkeypatch):
+    """ "Id" is server-assigned on create; a caller-supplied value must not
+    be forwarded, since whether Deputy would honor, ignore, or reject a
+    client-chosen id is undocumented."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"Id": 123, "FirstName": "Peter"})
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    deputy.deputy_create_resource("Employee", {"Id": 999, "FirstName": "Peter"})
+
+    assert mock_request.call_args.kwargs["json"] == {"FirstName": "Peter"}
+
+
+def test_create_resource_rejects_id_only_data_without_calling_api(monkeypatch):
+    """An "Id"-only data dict has nothing left to create once "Id" is
+    stripped -- must be rejected the same as genuinely empty data, not
+    silently posted as an empty body."""
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Employee", {"Id": 999}))
+
+    assert result["status"] == "error"
+    assert "No data provided" in result["message"]
+    mock_request.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # deputy_update_resource
 # ---------------------------------------------------------------------------

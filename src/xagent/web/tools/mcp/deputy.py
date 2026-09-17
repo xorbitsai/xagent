@@ -362,10 +362,18 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     whether the record already exists before retrying a failed call.
     """
     try:
-        if not data:
+        # "Id" is server-assigned on create; dropping any caller-supplied
+        # value rather than forwarding it removes any ambiguity about
+        # whether Deputy would honor, ignore, or reject a client-chosen
+        # id (undocumented), matching deputy_update_resource's own
+        # protection of "Id" against caller override. Stripped before the
+        # empty-data check so a data={"Id": ...}-only call is correctly
+        # rejected as no real data provided, not silently posted empty.
+        create_data = {k: v for k, v in data.items() if k != "Id"}
+        if not create_data:
             return _error("No data provided to create record")
         safe_resource = url_path_id(resource, "resource")
-        result = _request("POST", f"/resource/{safe_resource}", json_data=data)
+        result = _request("POST", f"/resource/{safe_resource}", json_data=create_data)
         return _record_response(resource, result)
     except Exception as e:
         logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
@@ -377,20 +385,13 @@ def deputy_update_resource(
     resource: str, resource_id: str, data: dict[str, Any]
 ) -> str:
     """
-    Update an existing record. Only the fields provided are changed,
-    absent a concurrent edit landing in between (see below).
-    Deputy's V1 Resource API requires the complete object on
-    POST /resource/{resource}/{id} -- it has no partial-update support
-    (Deputy's own V2 employee endpoint exists specifically to add that
-    for Employee; V1 has no equivalent for other resource types) -- so
-    this fetches the current record first and merges `data` into it
-    before writing the full object back, rather than sending `data` alone.
-    This is a GET-then-POST with no retry: a concurrent edit landing
-    between the two (another tool call, or a change made directly in
-    Deputy) is a lost-update race -- this function doesn't detect or
-    retry on that, it just writes the merged result. Not unique to this
-    connector (myob.py's own generic-full-object update has the same
-    tradeoff), so left as a known limitation rather than solved here.
+    Update an existing record. Only the fields provided are changed --
+    internally this reads the current record and writes the merged
+    result back, since Deputy has no partial-update support here (see
+    deputy_get_resource first if you need to know a field's current
+    value). A concurrent edit to the same record landing while this
+    runs (elsewhere, or another call) can be silently overwritten;
+    there is no conflict detection or retry.
     resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
     "Timesheet", or "Leave".
     resource_id: the record's numeric id, as a string (e.g. "123").
@@ -402,6 +403,18 @@ def deputy_update_resource(
             return _error("No data provided to update")
         safe_resource = url_path_id(resource, "resource")
         safe_resource_id = url_path_id(resource_id, "resource_id")
+        # Deputy's V1 Resource API requires the complete object on
+        # POST /resource/{resource}/{id} -- it has no partial-update
+        # support (Deputy's own V2 employee endpoint exists specifically
+        # to add that for Employee; V1 has no equivalent for other
+        # resource types) -- so fetch the current record and merge
+        # `data` into it before writing the full object back, rather
+        # than sending `data` alone. This is a GET-then-POST with no
+        # retry: a concurrent edit landing between the two is a
+        # lost-update race this function doesn't detect or retry on.
+        # Not unique to this connector (myob.py's own generic full-object
+        # update has the same tradeoff), so left as a known limitation
+        # rather than solved here.
         current = _request("GET", f"/resource/{safe_resource}/{safe_resource_id}")
         # Both checks needed, not just one: `not current` alone lets a
         # truthy non-dict (e.g. a bare list) through to the dict-spread

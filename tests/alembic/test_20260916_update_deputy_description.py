@@ -258,4 +258,4 @@ def test_down_revision_matches_current_head():
     confusing multiple-heads error from `alembic heads`."""
     migration = _load_migration_module()
 
-    assert migration.down_revision == "20260911_global_memory_authority"
+    assert migration.down_revision == "20260916_merge_delivery_memory"

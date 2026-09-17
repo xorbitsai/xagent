@@ -13,11 +13,14 @@ it directly.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Iterable, Sequence
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 from sqlalchemy.sql.expression import TableClause
+
+logger = logging.getLogger(__name__)
 
 # Every public_mcp_apps field a pre-existing row can plausibly differ on from
 # the migration's seed snapshot, including the two JSON-typed columns
@@ -30,7 +33,13 @@ from sqlalchemy.sql.expression import TableClause
 # caller's ``table`` declaring these two columns with ``sa.JSON`` (as every
 # current caller does); see the function docstring below for what happens
 # if a future caller's table does not.
-DEFAULT_SEED_MATCH_COLUMNS: tuple[str, ...] = (
+#
+# This default is specific to public_mcp_apps (every current caller deletes
+# from that table). A future caller for a different table must pass its own
+# ``match_columns`` explicitly rather than rely on this default - if that
+# table happens to also have same-named columns, they would be compared
+# against unrelated seed data.
+PUBLIC_MCP_APPS_SEED_MATCH_COLUMNS: tuple[str, ...] = (
     "name",
     "description",
     "transport",
@@ -42,12 +51,26 @@ DEFAULT_SEED_MATCH_COLUMNS: tuple[str, ...] = (
     "launch_config",
 )
 
+# The static (non-env-dependent) oauth_providers fields every current built-in
+# provider seed migration matches on when guarding its provider-row downgrade
+# delete. client_id/client_secret/redirect_uri are env-dependent and
+# deliberately excluded.
+OAUTH_PROVIDER_SEED_MATCH_COLUMNS: tuple[str, ...] = (
+    "name",
+    "auth_url",
+    "token_url",
+    "userinfo_url",
+    "user_id_path",
+    "email_path",
+    "default_scopes",
+)
+
 
 def delete_unmodified_seeded_rows(
     bind: Connection,
     table: TableClause,
     seed_rows: Iterable[dict[str, Any]],
-    match_columns: Sequence[str] = DEFAULT_SEED_MATCH_COLUMNS,
+    match_columns: Sequence[str] = PUBLIC_MCP_APPS_SEED_MATCH_COLUMNS,
     id_column: str = "app_id",
 ) -> None:
     """Delete rows a migration seeded, but only the ones that still match its
@@ -101,6 +124,13 @@ def delete_unmodified_seeded_rows(
         column for column in match_columns if column in existing_columns
     ]
     if match_columns and not columns_to_match:
+        logger.warning(
+            "delete_unmodified_seeded_rows: none of match_columns %s exist on "
+            "%s; preserving all seed rows for this downgrade since provenance "
+            "cannot be verified",
+            list(match_columns),
+            table.name,
+        )
         return
 
     def _column(name: str) -> Any:
@@ -116,7 +146,14 @@ def delete_unmodified_seeded_rows(
 
     for row in seed_rows:
         if id_column not in row:
+            logger.warning(
+                "delete_unmodified_seeded_rows: skipping a seed row for %s "
+                "missing id_column %r",
+                table.name,
+                id_column,
+            )
             continue
+        row_id = row[id_column]
         if match_column_refs and not any(
             column in row for column, _ in match_column_refs
         ):
@@ -124,26 +161,45 @@ def delete_unmodified_seeded_rows(
             # provenance with, so (symmetrically with the schema-side check
             # above) refuse to delete rather than falling back to matching on
             # id_column alone.
+            logger.warning(
+                "delete_unmodified_seeded_rows: preserving %s row %s=%r; seed "
+                "row supplies none of match_columns %s",
+                table.name,
+                id_column,
+                row_id,
+                columns_to_match,
+            )
             continue
 
-        delete_conditions = [id_col == row[id_column]]
+        delete_conditions = [id_col == row_id]
 
         if match_column_refs:
             candidate = (
                 bind.execute(
                     sa.select(*(ref for _, ref in match_column_refs))
                     .select_from(table)
-                    .where(id_col == row[id_column])
+                    .where(id_col == row_id)
                 )
                 .mappings()
                 .first()
             )
             if candidate is None:
                 continue
-            if any(
-                column in row and candidate[column] != row[column]
+            mismatched_columns = [
+                column
                 for column, _ in match_column_refs
-            ):
+                if column in row and candidate[column] != row[column]
+            ]
+            if mismatched_columns:
+                logger.info(
+                    "delete_unmodified_seeded_rows: preserving %s row %s=%r; "
+                    "current value differs from the seed snapshot on %s "
+                    "(likely operator-modified)",
+                    table.name,
+                    id_column,
+                    row_id,
+                    mismatched_columns,
+                )
                 continue
             delete_conditions.extend(
                 ref == row[column]

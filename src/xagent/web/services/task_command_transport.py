@@ -43,6 +43,7 @@ from .task_command_terminal_events import (
     stage_terminal_event,
     terminal_event_draft_for_error,
 )
+from .task_execution_host import consumes_task_commands
 from .task_lease_service import get_runner_id
 
 logger = logging.getLogger(__name__)
@@ -752,6 +753,8 @@ def claim_task_command(
 ) -> ClaimedTaskCommand | None:
     """Atomically claim the oldest eligible command for this worker."""
 
+    if not consumes_task_commands():
+        return None
     resolved_runner_id = runner_id or get_runner_id()
     candidate = _claimable_query(
         db,
@@ -1479,6 +1482,10 @@ async def dispatch_task_command_promptly(
     to accept the next pause/message command instead of blocking behind it.
     """
 
+    if not consumes_task_commands():
+        notify_task_command_dispatcher()
+        return
+
     task = asyncio.get_running_loop().create_task(
         dispatch_one_task_command(executor, command_db_id=command_db_id)
     )
@@ -1557,8 +1564,12 @@ async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
         await asyncio.gather(*workers, return_exceptions=True)
 
 
-def start_task_command_dispatcher(executor: CommandExecutor) -> asyncio.Task[Any]:
+def start_task_command_dispatcher(
+    executor: CommandExecutor,
+) -> asyncio.Task[Any] | None:
     global _dispatcher_task
+    if not consumes_task_commands():
+        return None
     if _dispatcher_task is not None and not _dispatcher_task.done():
         return _dispatcher_task
     _dispatcher_task = asyncio.create_task(run_task_command_dispatcher(executor))

@@ -26,9 +26,10 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
-    get_sandbox_namespace,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
+    get_sandbox_worker_id,
+    get_sandbox_worker_namespace,
     get_storage_root,
     get_uploads_dir,
 )
@@ -2784,8 +2785,8 @@ def _create_boxlite_service() -> Optional[SandboxService]:
 
     from .sandbox_store import DBBoxliteStore
 
-    store = DBBoxliteStore()
-    # Get home directory
+    worker_id = get_sandbox_worker_id()
+    store = DBBoxliteStore(namespace=worker_id)
     home_dir = get_boxlite_home_dir()
 
     service = None
@@ -2804,7 +2805,7 @@ def _create_boxlite_service() -> Optional[SandboxService]:
 
 def _create_docker_service() -> Optional[SandboxService]:
     """Create Docker sandbox service."""
-    namespace = get_sandbox_namespace()
+    namespace = get_sandbox_worker_namespace()
     if namespace is None:
         # Fatal, not a degraded start: without a stable per-deployment
         # namespace, a backend on a shared Docker daemon can discover and
@@ -2826,7 +2827,7 @@ def _create_docker_service() -> Optional[SandboxService]:
 
     from .sandbox_store import DBDockerStore
 
-    store = DBDockerStore()
+    store = DBDockerStore(namespace=namespace if get_sandbox_worker_id() else None)
 
     try:
         service = DockerSandboxService(store=store, namespace=namespace)

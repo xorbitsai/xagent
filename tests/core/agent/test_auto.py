@@ -2537,3 +2537,27 @@ def test_auto_child_runtime_forwards_dag_turn_resolution() -> None:
     # with a default is what hides a raising property, so the assertion has
     # to go through the same access to catch a regression.
     assert getattr(step_runtime, "active_turn_id", None) == "turn-42"
+
+
+def test_routing_prompt_is_rebuilt_with_the_marker_on_every_parse_retry() -> None:
+    """The marker is read inside the retry loop, not hoisted above it.
+
+    A compaction between two parse attempts must reach the second prompt.
+    Hoisting the read is the cheap "optimization" that would drop it silently,
+    so the source position is asserted rather than left to a comment.
+    """
+    source = inspect.getsource(AutoPattern._decide)
+    loop_body = source.split("while attempt < MAX_DECISION_PARSE_ATTEMPTS:", 1)[1]
+    assert "evidence_state=tool_evidence_state(context)" in loop_body
+
+
+def test_the_routing_prompt_has_no_second_default_for_the_marker() -> None:
+    """The read function holds the default, so the prompt builder must not.
+
+    Two holders of the same default drift: a caller that forgets to pass the
+    state renders main's wording on a run that really did lose observations.
+    """
+    parameter = inspect.signature(AutoPattern._decision_prompt).parameters[
+        "evidence_state"
+    ]
+    assert parameter.default is inspect.Parameter.empty

@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_default_task_execution_mode,
+    get_shared_task_execution_enabled,
 )
 from ...core.agent.checkpoint import (
     CheckpointReadError,
@@ -2639,6 +2640,20 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
             logger.info("Agent supports pause_execution, calling it...")
             pause_result = await agent_service.pause_execution()
             if pause_result is False:
+                running = (
+                    task_execution_service.background_task_manager.running_tasks.get(
+                        task_id
+                    )
+                )
+                if (
+                    get_shared_task_execution_enabled()
+                    and task_fields.status == TaskStatus.RUNNING
+                    and running is not None
+                    and not running.done()
+                ):
+                    # START registers its outer handle before AgentRunner is
+                    # ready. Preserve a queued pause through that startup gap.
+                    raise TaskCommandDeferred("Task execution is still starting")
                 # ``pause_execution`` reports on the live run only, so it says
                 # "no" both for a task that is already paused and for one that
                 # is not running at all. Those read very differently to a user,
@@ -2721,6 +2736,8 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                 "message": client_safe_error_message(e),
             },
         )
+    except TaskCommandDeferred:
+        raise
     except RuntimeError as e:
         logger.error("Runtime error pausing task %s: %s", task_id, e, exc_info=True)
         await reply(

@@ -26,6 +26,7 @@ from xagent.core.agent.clarification import (
     ClarificationDraft,
     draft_from_waiting_request,
 )
+from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -6801,3 +6802,109 @@ async def test_language_nudge_keeps_the_validated_plan_on_invalid_retry_plan() -
     assert llm.calls == 2
     assert [step.id for step in plan.steps] == ["rewrite"]
     assert plan.steps[0].task.startswith("重写")
+
+
+def _assessment_pattern() -> DAGPattern:
+    return DAGPattern(lambda **_: build_plan(PlanStep(id="answer", task="Answer")))
+
+
+def test_completion_assessment_never_sees_the_compaction_summary() -> None:
+    """Why this prompt needs its own sentence: the summary is filtered out.
+
+    The payload keeps only user, assistant and tool roles; a summary is system.
+    Widen that filter and this cell goes red, which is the signal to revisit.
+    """
+    pattern = _assessment_pattern()
+    context = ContextManager().create_context(execution_id="dag-summary")
+    context.add_user_message("Build a KPI report")
+    context.add_system_message(
+        "Compacted conversation summary: DAG_SUMMARY_MARKER",
+        metadata={"compacted_context": True},
+    )
+
+    messages = pattern._completion_assessment_messages(context)
+
+    assert "DAG_SUMMARY_MARKER" not in "\n".join(
+        str(message["content"]) for message in messages
+    )
+
+
+def test_a_step_compaction_does_not_change_what_the_assessment_is_handed() -> None:
+    """A step's own loss stays in that step; nothing is taken from the root.
+
+    A child copies the message list and both compaction paths rebind that copy
+    rather than mutating the root's, so the assessment payload is byte-for-byte
+    the same before and after. This is why the marker is not propagated upward:
+    doing so would make this call describe intact material as having lost
+    something.
+    """
+    pattern = _assessment_pattern()
+    root = ContextManager().create_context(execution_id="dag-step-loss")
+    root.add_user_message("Build a KPI report")
+    for index in range(6):
+        root.add_tool_result(
+            tool_call_id=f"root-{index}",
+            tool_name="list_clients",
+            result={"success": True, "rows": ["ROOT_ROW"] * 20},
+        )
+    before = json.dumps(pattern._completion_assessment_messages(root))
+
+    child = root.create_child_context()
+    for index in range(6):
+        child.add_tool_result(
+            tool_call_id=f"child-{index}",
+            tool_name="list_shifts",
+            result={"success": True, "rows": ["CHILD_ROW"] * 20},
+        )
+    child.compact_config.max_messages = 1
+    child.compact_config.threshold = 100
+    child_messages_before = len(child.messages)
+    compact_result = child.compact_if_needed()
+
+    assert compact_result.metadata["dropped_tool_result_count"] > 0
+    assert len(child.messages) < child_messages_before
+    after = json.dumps(pattern._completion_assessment_messages(root))
+    assert before == after
+    assert "ROOT_ROW" in after
+    assert "CHILD_ROW" not in after
+
+
+@pytest.mark.parametrize("state", ["intact", "removed", "unknown"])
+def test_a_restored_step_context_keeps_the_marker(state: str) -> None:
+    """Pausing inside a step and resuming must not forget what it lost.
+
+    Resuming runs ``_refresh_restored_step_runtime_metadata`` over the context
+    read back from the checkpoint, so that call is part of the round trip and
+    is made here. Today it touches one named key; that it is selective rather
+    than a wholesale refresh is what keeps the marker alive, and "today it is
+    selective" is a fact nothing else holds in place. For the unknown state
+    this also proves the refresh does not backfill an absent key -- a refresh
+    that turned into a wholesale overlay would fill it in and erase the third
+    state on the very first resume.
+    """
+    root = ContextManager().create_context(execution_id="dag-step-resume")
+    root.add_user_message("Build a KPI report")
+    child = root.create_child_context()
+    key = execution_module.TOOL_EVIDENCE_REMOVED_METADATA_KEY
+    if state == "unknown":
+        child.metadata.pop(key, None)
+    else:
+        child.metadata[key] = state == "removed"
+
+    restored = ExecutionContext.from_dict(json.loads(json.dumps(child.to_dict())))
+    assert execution_module.tool_evidence_state(restored) == state
+
+    DAGPattern._refresh_restored_step_runtime_metadata(restored, root)
+
+    if state == "unknown":
+        # The stored shape, not only what the reader returns: a refresh that
+        # backfilled the key would still read "unknown" if the reader alone
+        # were checked with a naive default, which is why the raw dict is
+        # asserted directly.
+        assert key not in restored.metadata
+    else:
+        # The stored value, not only what the reader returns: a refresh that
+        # wiped the key would still read removed, because a missing key does
+        # not read as intact.
+        assert restored.metadata[key] is (state == "removed")
+    assert execution_module.tool_evidence_state(restored) == state

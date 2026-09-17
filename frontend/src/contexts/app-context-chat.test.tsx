@@ -574,6 +574,46 @@ describe("AppProvider websocket message routing", () => {
     localStorage.clear()
   })
 
+  it.each([
+    ["a reconnect to the same task", (send: (m: Record<string, unknown>) => void) => {
+      act(() => { webSocketOptions.current?.onConnect?.() })
+    }],
+    ["any other transcript clear", (send: (m: Record<string, unknown>) => void, clear: () => void) => {
+      clear()
+    }],
+  ])("replays the answer bubble after %s", (_label, clearTranscript) => {
+    let appDispatch: ((action: { type: string }) => void) | null = null
+    function DispatchProbe() {
+      appDispatch = useApp().dispatch as never
+      return null
+    }
+    render(<AppProvider token="token"><SeedRunningTask /><DispatchProbe /><StateProbe /></AppProvider>)
+    const raw = (message: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message,
+      } as never)
+    })
+    // A turn whose final answer never opened a stream carries no
+    // stream_message_id, so its replay has only content-identity to match on.
+    const aiMessage = {
+      type: "trace_event", event_type: "ai_message", stream_run_id: "run-1", stream_attempt_id: "a1",
+      data: { event_id: "answer-1", data: { status: "completed", content: "PROD ANSWER", pattern: "react", execution_id: "x1" } },
+    }
+    act(() => { webSocketOptions.current?.onConnect?.() })
+    raw({ type: "task_started", run_id: "run-1", state_version: 1, status: "running", control_state: "running" })
+    raw(aiMessage)
+    expect(screen.getByTestId("messages").textContent).toContain("PROD ANSWER")
+
+    act(() => {
+      clearTranscript(raw, () => appDispatch?.({ type: "CLEAR_MESSAGES" }))
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain("PROD ANSWER")
+
+    raw(aiMessage)
+    raw({ type: "trace_event", event_type: "historical_data_complete", data: { event_id: "h-done", data: {} } })
+    expect(screen.getByTestId("messages").textContent).toContain("PROD ANSWER")
+  })
+
   it.each([false, true])("rejects an initial shared delta and accepts a complete replacement (wrapped=%s)", (wrapped) => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (eventType: string, data: Record<string, unknown>) => act(() => {

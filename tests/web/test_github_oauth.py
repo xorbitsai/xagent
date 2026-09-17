@@ -1322,3 +1322,502 @@ async def test_github_refresh_deletes_connection_on_200_bad_refresh_token(
     with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
     assert oauth_account.access_token == "old-token"
+
+
+def _add_github_provider_row(db) -> None:
+    db.add(
+        OAuthProvider(
+            provider_name="github",
+            name="GitHub",
+            client_id=encrypt_value("github-client-id"),
+            client_secret=encrypt_value("github-client-secret"),
+            auth_url="https://github.com/login/oauth/authorize",
+            token_url="https://github.com/login/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/github/callback",
+            userinfo_url="https://api.github.com/user",
+            user_id_path="id",
+            email_path="login",
+            default_scopes=["read:user"],
+        )
+    )
+    db.commit()
+
+
+def test_revoke_builtin_oauth_grant_deletes_github_grant_with_decrypted_secret(
+    db_session, monkeypatch
+):
+    """GitHub silently 302s through an existing grant instead of showing its
+    consent screen again -- deleting the grant on disconnect is what makes
+    the next connect re-prompt. The stored client_id/client_secret are
+    encrypted at rest, so this must decrypt them (like generic_oauth_login/
+    generic_oauth_callback do for this same row) rather than send the raw
+    ciphertext to GitHub's Basic Auth header."""
+    db, _user = db_session
+    _add_github_provider_row(db)
+
+    delete = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    auth_api.revoke_builtin_oauth_grant(
+        db,
+        provider="github",
+        access_token="live-access-token",
+        provider_user_id="42",
+    )
+
+    delete.assert_called_once()
+    args, kwargs = delete.call_args
+    assert args[0] == "https://api.github.com/applications/github-client-id/grant"
+    assert kwargs["auth"] == ("github-client-id", "github-client-secret")
+    assert kwargs["json"] == {"access_token": "live-access-token"}
+
+
+def test_revoke_builtin_oauth_grant_ignores_non_github_providers(
+    db_session, monkeypatch
+):
+    """Only GitHub needs this today; every other provider is a no-op and
+    must not even query the database, let alone call out to it."""
+    db, _user = db_session
+
+    class ExplodingQuery:
+        def query(self, *args, **kwargs):
+            raise AssertionError("non-github provider must not query the database")
+
+    delete = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    auth_api.revoke_builtin_oauth_grant(
+        ExplodingQuery(), provider="slack", access_token="tok", provider_user_id="99"
+    )
+
+    delete.assert_not_called()
+
+
+def test_revoke_builtin_oauth_grant_swallows_network_failure(
+    db_session, monkeypatch, caplog
+):
+    """Called only after the local disconnect has already committed -- a
+    dead network or an unreachable GitHub must not surface as a failed
+    disconnect. Also pins the credential-leak concern this whole logging
+    shape exists for: the failure must still be logged (so this isn't
+    silently doing nothing), but never with the actual token/secret in it."""
+    db, _user = db_session
+    _add_github_provider_row(db)
+
+    delete = Mock(side_effect=auth_api.requests.ConnectionError("network down"))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    with caplog.at_level(logging.WARNING, logger=auth_api.logger.name):
+        auth_api.revoke_builtin_oauth_grant(
+            db,
+            provider="github",
+            access_token="the-live-access-token",
+            provider_user_id="42",
+        )
+
+    delete.assert_called_once()
+    logged_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "the-live-access-token" not in logged_text
+    assert "github-client-secret" not in logged_text
+    assert any("revocation" in msg.lower() for msg in logged_text.splitlines())
+
+
+def test_revoke_builtin_oauth_grant_treats_404_as_success_without_a_warning(
+    db_session, monkeypatch
+):
+    """GitHub answers 404 when the token or grant is already gone -- a
+    normal outcome of a stale disconnect retry, not an error to log loudly
+    or raise."""
+    db, _user = db_session
+    _add_github_provider_row(db)
+
+    delete = Mock(return_value=MockResponse(status_code=404))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+    warning = Mock()
+    monkeypatch.setattr(auth_api.logger, "warning", warning)
+
+    auth_api.revoke_builtin_oauth_grant(
+        db, provider="github", access_token="tok", provider_user_id="42"
+    )
+
+    delete.assert_called_once()
+    warning.assert_not_called()
+
+
+def test_revoke_builtin_oauth_grant_logs_422_as_a_real_failure(db_session, monkeypatch):
+    """422 is NOT the same outcome as 404/204: GitHub documents it for a
+    malformed request or an abuse/rate-limit block, neither of which means
+    the grant is actually gone. Silently bucketing it with "already revoked"
+    would hide a real, still-live grant behind a clean-looking disconnect."""
+    db, _user = db_session
+    _add_github_provider_row(db)
+
+    delete = Mock(return_value=MockResponse(status_code=422))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+    warning = Mock()
+    monkeypatch.setattr(auth_api.logger, "warning", warning)
+
+    auth_api.revoke_builtin_oauth_grant(
+        db, provider="github", access_token="tok", provider_user_id="42"
+    )
+
+    delete.assert_called_once()
+    warning.assert_called_once()
+
+
+def test_revoke_builtin_oauth_grant_is_noop_without_a_provider_row(
+    db_session, monkeypatch
+):
+    """No configured GitHub OAuthProvider row (e.g. the connector was never
+    set up) -- nothing to authenticate the revoke call with, so skip it."""
+    db, _user = db_session
+
+    delete = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    auth_api.revoke_builtin_oauth_grant(
+        db, provider="github", access_token="tok", provider_user_id="42"
+    )
+
+    delete.assert_not_called()
+
+
+def test_revoke_builtin_oauth_grant_skips_when_another_user_shares_the_account(
+    db_session, monkeypatch
+):
+    """The regression this finding is about: GitHub's grant-delete revokes
+    every token issued to that GitHub account for this app, not just the
+    disconnecting user's own token. A second XAgent user (or actor
+    namespace) still connected to the same upstream GitHub account must
+    keep working -- so the app-wide DELETE must not fire while that
+    reference still exists."""
+    db, user = db_session
+    _add_github_provider_row(db)
+    other_user = User(username="bob", password_hash="x", is_admin=False)
+    db.add(other_user)
+    db.flush()
+    db.add(
+        UserOAuth(
+            user_id=other_user.id,
+            provider="github",
+            provider_user_id="42",
+            access_token="bobs-still-live-token",
+        )
+    )
+    db.commit()
+
+    delete = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    auth_api.revoke_builtin_oauth_grant(
+        db, provider="github", access_token="alices-old-token", provider_user_id="42"
+    )
+
+    delete.assert_not_called()
+
+
+def test_resolve_builtin_oauth_revocation_decrypts_credentials(db_session):
+    """An async caller (mcp.py's disconnect endpoints) resolves this record
+    while still holding its transaction's locks, before ever touching the
+    network -- it must come back decrypted and ready to use, exactly like
+    revoke_builtin_oauth_grant's own resolution, carrying provider_user_id
+    through unchanged for the later reference check."""
+    db, _user = db_session
+    _add_github_provider_row(db)
+
+    resolved = auth_api.resolve_builtin_oauth_revocation(
+        db,
+        provider="github",
+        access_token="live-access-token",
+        provider_user_id="42",
+    )
+
+    assert resolved == auth_api.BuiltinOAuthRevocation(
+        provider="github",
+        access_token="live-access-token",
+        client_id="github-client-id",
+        client_secret="github-client-secret",
+        provider_user_id="42",
+    )
+
+
+def test_resolve_builtin_oauth_revocation_is_none_when_nothing_to_revoke(db_session):
+    """Every reason to skip revocation must come back as a plain ``None`` --
+    the async caller decides what to do with that, not this function."""
+    db, _user = db_session
+
+    assert (
+        auth_api.resolve_builtin_oauth_revocation(
+            db, provider="slack", access_token="tok", provider_user_id="42"
+        )
+        is None
+    )
+    assert (
+        auth_api.resolve_builtin_oauth_revocation(
+            db, provider="github", access_token="", provider_user_id="42"
+        )
+        is None
+    )
+    assert (
+        auth_api.resolve_builtin_oauth_revocation(
+            db, provider="github", access_token="tok", provider_user_id="42"
+        )
+        is None
+    )  # no OAuthProvider row seeded yet
+
+
+def test_resolve_builtin_oauth_revocation_warns_on_missing_provider_row(
+    db_session, monkeypatch
+):
+    """Every other skip reason logs (a network failure, an unexpected
+    status, a still-referenced sibling); silence here would hide a real
+    misconfiguration (the connector was never set up) behind an
+    indistinguishable "disconnect worked cleanly" outcome."""
+    db, _user = db_session
+    warning = Mock()
+    monkeypatch.setattr(auth_api.logger, "warning", warning)
+
+    auth_api.resolve_builtin_oauth_revocation(
+        db, provider="github", access_token="tok", provider_user_id="42"
+    )
+
+    warning.assert_called_once()
+
+
+def test_resolve_builtin_oauth_revocation_warns_on_unresolvable_secret(
+    db_session, monkeypatch
+):
+    """Same reasoning as the missing-provider-row case, for a
+    partially-configured provider row (e.g. only one of
+    GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET set)."""
+    db, _user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="github",
+            name="GitHub",
+            client_id="",
+            client_secret="",
+            auth_url="https://github.com/login/oauth/authorize",
+            token_url="https://github.com/login/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/github/callback",
+            userinfo_url="https://api.github.com/user",
+            user_id_path="id",
+            email_path="login",
+            default_scopes=["read:user"],
+        )
+    )
+    db.commit()
+    warning = Mock()
+    monkeypatch.setattr(auth_api.logger, "warning", warning)
+
+    result = auth_api.resolve_builtin_oauth_revocation(
+        db, provider="github", access_token="tok", provider_user_id="42"
+    )
+
+    assert result is None
+    warning.assert_called_once()
+
+
+def test_has_other_builtin_oauth_reference_true_for_a_live_sibling_row(db_session):
+    """Any current row -- any user, any owner namespace -- sharing the same
+    upstream (provider, provider_user_id) counts as a live reference."""
+    db, user = db_session
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="github",
+            provider_user_id="42",
+            resource_owner_key="actor:github",
+            access_token="actor-token",
+        )
+    )
+    db.commit()
+
+    assert (
+        auth_api.has_other_builtin_oauth_reference(
+            db, provider="github", provider_user_id="42"
+        )
+        is True
+    )
+
+
+def test_has_other_builtin_oauth_reference_false_without_a_sibling_row(db_session):
+    db, _user = db_session
+
+    assert (
+        auth_api.has_other_builtin_oauth_reference(
+            db, provider="github", provider_user_id="42"
+        )
+        is False
+    )
+
+
+def test_has_other_builtin_oauth_reference_false_when_id_is_unknown(db_session):
+    """No provider_user_id to check against can't prove anything either
+    way -- treated as "no known other reference" so a provider without a
+    stable upstream id still gets revoked, matching the pre-existing
+    behavior from before this reference check was added."""
+    db, _user = db_session
+
+    assert (
+        auth_api.has_other_builtin_oauth_reference(
+            db, provider="github", provider_user_id=None
+        )
+        is False
+    )
+
+
+def test_revoke_resolved_github_oauth_grant_calls_github_directly(monkeypatch):
+    """The database-free half of the split: given an already-resolved
+    record, it must call GitHub with exactly those credentials and never
+    touch a database."""
+    delete = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    auth_api.revoke_resolved_github_oauth_grant(
+        auth_api.BuiltinOAuthRevocation(
+            provider="github",
+            access_token="tok",
+            client_id="cid",
+            client_secret="secret",
+            provider_user_id="42",
+        )
+    )
+
+    delete.assert_called_once()
+    args, kwargs = delete.call_args
+    assert args[0] == "https://api.github.com/applications/cid/grant"
+    assert kwargs["auth"] == ("cid", "secret")
+    assert kwargs["json"] == {"access_token": "tok"}
+
+
+def test_revoke_builtin_oauth_grant_if_unreferenced_skips_with_a_live_sibling(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    other_user = User(username="bob", password_hash="x", is_admin=False)
+    db.add(other_user)
+    db.flush()
+    db.add(
+        UserOAuth(
+            user_id=other_user.id,
+            provider="github",
+            provider_user_id="42",
+            access_token="bobs-still-live-token",
+        )
+    )
+    db.commit()
+
+    delete = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    auth_api.revoke_builtin_oauth_grant_if_unreferenced(
+        db,
+        auth_api.BuiltinOAuthRevocation(
+            provider="github",
+            access_token="tok",
+            client_id="cid",
+            client_secret="secret",
+            provider_user_id="42",
+        ),
+    )
+
+    delete.assert_not_called()
+
+
+def test_revoke_builtin_oauth_grant_if_unreferenced_revokes_without_a_sibling(
+    db_session, monkeypatch
+):
+    db, _user = db_session
+
+    delete = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    auth_api.revoke_builtin_oauth_grant_if_unreferenced(
+        db,
+        auth_api.BuiltinOAuthRevocation(
+            provider="github",
+            access_token="tok",
+            client_id="cid",
+            client_secret="secret",
+            provider_user_id="42",
+        ),
+    )
+
+    delete.assert_called_once()
+
+
+def test_revoke_builtin_oauth_grant_if_unreferenced_rolls_back_a_failed_check():
+    """The reference check does real database work, unlike the pure network
+    call -- unlike revoke_resolved_github_oauth_grant, this function's own
+    "Never raises" promise depends on catching that failure itself, and on
+    rolling the session back first so a poisoned Postgres transaction
+    doesn't leak into whatever the caller does with `db` next."""
+
+    class FakeDB:
+        def __init__(self):
+            self.rolled_back = False
+
+        def query(self, *args, **kwargs):
+            raise RuntimeError("connection dropped")
+
+        def rollback(self):
+            self.rolled_back = True
+
+    db = FakeDB()
+
+    # Must not raise.
+    auth_api.revoke_builtin_oauth_grant_if_unreferenced(
+        db,
+        auth_api.BuiltinOAuthRevocation(
+            provider="github",
+            access_token="tok",
+            client_id="cid",
+            client_secret="secret",
+            provider_user_id="42",
+        ),
+    )
+
+    assert db.rolled_back is True
+
+
+def test_revoke_resolved_github_oauth_grant_swallows_a_non_request_exception(
+    monkeypatch,
+):
+    """ "Never raises" is a real contract other functions depend on, not
+    just a description of the common (requests.RequestException) case --
+    any exception from the network call must be swallowed the same way."""
+    monkeypatch.setattr(
+        auth_api.requests, "delete", Mock(side_effect=RuntimeError("boom"))
+    )
+
+    auth_api.revoke_resolved_github_oauth_grant(
+        auth_api.BuiltinOAuthRevocation(
+            provider="github",
+            access_token="tok",
+            client_id="cid",
+            client_secret="secret",
+            provider_user_id="42",
+        )
+    )
+
+
+def test_builtin_oauth_revocation_repr_redacts_the_secrets():
+    """The default NamedTuple repr would print access_token/client_secret
+    in plain text -- a stray logger.debug(revocation), or an uncaught
+    exception's traceback rendering it as a local variable, must not leak
+    either one."""
+    revocation = auth_api.BuiltinOAuthRevocation(
+        provider="github",
+        access_token="the-live-access-token",
+        client_id="github-client-id",
+        client_secret="the-live-client-secret",
+        provider_user_id="42",
+    )
+
+    text = repr(revocation)
+
+    assert "the-live-access-token" not in text
+    assert "the-live-client-secret" not in text
+    assert "github-client-id" in text  # not itself sensitive; keep it visible
+    assert "42" in text

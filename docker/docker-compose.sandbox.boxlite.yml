@@ -6,7 +6,16 @@ services:
       - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.7.0
       - SANDBOX_CPUS=1
       - SANDBOX_MEMORY=512
+      - XAGENT_SANDBOX_WORKER_ID=backend
       - BOXLITE_HOME_DIR=/root/.xagent/boxlite
     privileged: true
     devices:
       - /dev/kvm:/dev/kvm
+
+  worker:
+    environment:
+      - XAGENT_SANDBOX_WORKER_ID=celery-worker
+
+  scheduler:
+    environment:
+      - XAGENT_SANDBOX_WORKER_ID=scheduler

@@ -388,3 +388,26 @@ def test_cleanup_pages_past_retained_inputs(task_id):
     assert clean_finished_runtime_values(batch_size=2, after_id=cursor) is None
     with get_session_local()() as db:
         assert db.query(TaskRuntimeSecret).count() == 4
+
+
+@pytest.mark.parametrize(
+    "status", [TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER, TaskStatus.RUNNING]
+)
+def test_expired_values_fail_before_sweep_and_are_removed(task_id, monkeypatch, status):
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS", "60")
+    with get_session_local()() as db:
+        stage(db, task_id)
+        db.get(Task, task_id).status = status
+        db.query(TaskRuntimeSecret).one().created_at = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=61)
+        db.commit()
+    with get_session_local()() as db:
+        with pytest.raises(ConnectorRuntimeError) as error:
+            load_runtime_values(db, task=db.get(Task, task_id), required=True)
+        assert error.value.code == ERROR_RUNTIME_SECRET_UNAVAILABLE
+    clean_finished_runtime_values()
+    with get_session_local()() as db:
+        assert db.query(TaskRuntimeSecret).count() == 0

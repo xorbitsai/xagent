@@ -1,5 +1,13 @@
 # Deployment changes
 
+## LanceDB memory compatibility
+
+The declared LanceDB dependency range is the one in `pyproject.toml`; this
+section does not restate it. CI exercises three representatives of that range:
+the declared minimum, the version pinned in `uv.lock`, and the newest minor
+tested so far. It does not claim that every intervening release is tested
+individually.
+
 ## 2026-08-11 — New public-task File Operation isolation
 
 ### Deployment impact

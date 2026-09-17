@@ -365,3 +365,44 @@ async def test_reply_without_route_is_observable_without_publishing(
     assert "private reply content" not in caplog.text
     assert not bridge._acks
     await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_progress_requires_ack_and_stops_after_first_failure(bridge, monkeypatch):
+    from xagent.web.services import shared_channel_execution as shared
+
+    monkeypatch.setattr(module, "_reply_route", lambda *args: ("web", "origin"))
+    publish = AsyncMock(side_effect=TimeoutError())
+    monkeypatch.setattr(bridge, "_publish", publish)
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+    event = Mock()
+    event.to_dict.return_value = {"event": "progress"}
+    await forwarder.handle_event(event)
+    await forwarder.handle_event(event)
+    publish.assert_awaited_once()
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_platform_failure_returns_negative_ack(bridge, monkeypatch):
+    bridge.ready.set()
+    publish = AsyncMock()
+    monkeypatch.setattr(bridge, "_publish", publish)
+    token = bridge.register_origin(
+        42, "command", AsyncMock(side_effect=ValueError("platform failure"))
+    )
+    await bridge._deliver_reply(
+        {
+            "origin": token,
+            "task_id": 42,
+            "command_id": "command",
+            "delivery_id": "delivery",
+            "reply_host": "worker",
+            "message": {},
+        }
+    )
+    assert json.loads(publish.await_args.args[1])["delivered"] is False
+    await bridge.close()

@@ -474,6 +474,11 @@ def start_task_lease_recovery_task(
 ) -> asyncio.Task[Any] | None:
     """Start automatic expired task-lease recovery for this backend process."""
 
+    from .services.task_execution_host import consumes_task_commands
+
+    if not consumes_task_commands():
+        return None
+
     existing_task = cast(
         asyncio.Task[Any] | None,
         getattr(
@@ -1325,25 +1330,70 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     # channel ingress can create background execution work for this lifespan.
     from .services.task_execution import background_task_manager
 
-    background_task_manager.start_accepting()
+    if not get_shared_task_execution_enabled():
+        background_task_manager.start_accepting()
 
     start_file_storage_startup_sync_task(app_instance)
-    start_trigger_dispatcher_task(app_instance)
-    start_task_lease_recovery_task(app_instance)
+    if not get_shared_task_execution_enabled():
+        start_trigger_dispatcher_task(app_instance)
+        start_task_lease_recovery_task(app_instance)
     start_uploaded_file_recovery_task(app_instance)
     start_orphan_upload_gc_task(app_instance)
+
+
+async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
+    """Open shared ingress only after runtime resources and the bridge are ready."""
+    from .api.websocket import manager
+    from .services.task_command_execution import execute_durable_task_command
+    from .services.task_command_transport import (
+        start_task_command_dispatcher,
+        stop_task_command_dispatcher,
+    )
+    from .services.task_coordinator_runtime import close_task_coordinators
+    from .services.task_event_bridge import (
+        start_task_event_bridge,
+        stop_task_event_bridge,
+    )
+    from .services.task_execution import background_task_manager
+
+    global _task_command_dispatcher_task, _trigger_dispatcher_task
+    await start_task_event_bridge(
+        deliver=manager.deliver_shared_event,
+        stream_status=manager.shared_stream_status,
+    )
+    try:
+        manager.start_stream_reconciliation()
+        background_task_manager.start_accepting()
+        start_trigger_dispatcher_task(app_instance)
+        start_task_lease_recovery_task(app_instance)
+        _task_command_dispatcher_task = start_task_command_dispatcher(
+            execute_durable_task_command
+        )
+        app_instance.state.task_command_dispatcher_task = _task_command_dispatcher_task
+    except BaseException:
+        await stop_task_command_dispatcher()
+        await stop_task_lease_recovery_task(app_instance)
+        if _trigger_dispatcher_task is not None:
+            _trigger_dispatcher_task.cancel()
+            await asyncio.gather(_trigger_dispatcher_task, return_exceptions=True)
+            _trigger_dispatcher_task = None
+        await close_task_coordinators()
+        await background_task_manager.shutdown()
+        await manager.stop_stream_reconciliation()
+        await stop_task_event_bridge()
+        raise
 
 
 # initial database and skill manager
 @app.on_event("startup")
 async def startup_event() -> None:
     global _migration_task
+    from ..config import get_task_execution_role, validate_task_execution_host_config
+
+    validate_task_execution_host_config()
+    if get_task_execution_role() == "worker":
+        raise ValueError("Use python -m xagent.web.worker for the worker role")
     logger.info("Agent runtime configured: %s", get_agent_runtime())
-    if get_shared_task_execution_enabled():
-        raise RuntimeError(
-            "XAGENT_SHARED_TASK_EXECUTION_ENABLED must remain false: "
-            "shared worker and event bridge startup are not wired yet."
-        )
     validate_interaction_rollout_at_startup()
     await _initialize_database_and_admit_runtime(app)
 
@@ -1801,11 +1851,14 @@ async def startup_event() -> None:
     from .services.task_command_transport import start_task_command_dispatcher
 
     global _task_command_dispatcher_task
-    _task_command_dispatcher_task = start_task_command_dispatcher(
-        execute_durable_task_command
-    )
-    app.state.task_command_dispatcher_task = _task_command_dispatcher_task
-    logger.info("Started durable task command dispatcher")
+    if get_shared_task_execution_enabled():
+        await _start_shared_task_runtime(app)
+    else:
+        _task_command_dispatcher_task = start_task_command_dispatcher(
+            execute_durable_task_command
+        )
+        app.state.task_command_dispatcher_task = _task_command_dispatcher_task
+    logger.info("Task command dispatch configured")
 
     # Start configured chat channels.
     try:
@@ -1817,19 +1870,25 @@ async def startup_event() -> None:
         if telegram_channel.enabled:
             logger.info("Initializing Telegram channel manager...")
             app.state.telegram_task = asyncio.create_task(telegram_channel.start())
-            logger.info("Telegram channel background task created successfully")
+            logger.info(
+                "Telegram channel manager scheduled; connection status follows in manager logs"
+            )
 
         feishu_channel = get_feishu_channel()
         if feishu_channel.enabled:
             logger.info("Initializing Feishu channel manager...")
             app.state.feishu_task = asyncio.create_task(feishu_channel.start())
-            logger.info("Feishu channel background task created successfully")
+            logger.info(
+                "Feishu channel manager scheduled; connection status follows in manager logs"
+            )
 
         slack_channel = get_slack_channel()
         if slack_channel.enabled:
             logger.info("Initializing Slack channel manager...")
             app.state.slack_task = asyncio.create_task(slack_channel.start())
-            logger.info("Slack channel background task created successfully")
+            logger.info(
+                "Slack channel manager scheduled; connection status follows in manager logs"
+            )
     except Exception as e:
         logger.error(f"Failed to start chat channel managers: {e}", exc_info=True)
 
@@ -1917,12 +1976,14 @@ async def shutdown_event() -> None:
 
     # Shutdown chat channels before draining task finalizers.
     try:
-        if hasattr(app.state, "telegram_task"):
-            app.state.telegram_task.cancel()
-            logger.info("Cancelled Telegram polling task")
-        if hasattr(app.state, "slack_task"):
-            app.state.slack_task.cancel()
-            logger.info("Cancelled Slack manager task")
+        channel_tasks = [
+            task
+            for name in ("telegram_task", "feishu_task", "slack_task")
+            if (task := getattr(app.state, name, None)) is not None
+        ]
+        for task in channel_tasks:
+            task.cancel()
+        await asyncio.gather(*channel_tasks, return_exceptions=True)
 
         from .channels.feishu.bot import get_feishu_channel
         from .channels.slack.bot import get_slack_channel
@@ -1950,6 +2011,12 @@ async def shutdown_event() -> None:
     await close_task_coordinators()
     await background_task_manager.shutdown()
     await wait_for_heartbeat_manager_idle()
+    if get_shared_task_execution_enabled():
+        from .api.websocket import manager
+        from .services.task_event_bridge import stop_task_event_bridge
+
+        await manager.stop_stream_reconciliation()
+        await stop_task_event_bridge()
 
     from .services.trace_database import close_trace_database_runtime
 

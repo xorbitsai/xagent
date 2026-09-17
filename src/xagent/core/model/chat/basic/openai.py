@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -7,6 +8,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import openai
 from openai import AsyncOpenAI
 
+from ....runtime_performance import run_in_thread_with_telemetry
 from ....utils.security import redact_sensitive_text
 from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
@@ -363,6 +365,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
         # Initialize the async OpenAI client
         self._client: Optional[AsyncOpenAI] = None
+        self._client_init_task: asyncio.Task[None] | None = None
 
     @property
     def model_name(self) -> str:
@@ -388,6 +391,41 @@ class OpenAICompatibleLLM(BaseLLM):
     def _prepare_extra_body(self, extra_body: Dict[str, Any]) -> Dict[str, Any]:
         """Hook for OpenAI-compatible subclasses to customize extra_body."""
         return extra_body
+
+    async def _ensure_client_async(self) -> None:
+        """Keep per-client TLS/proxy setup off the event loop.
+
+        Share initialization between concurrent calls on this instance, but
+        never share clients across models or credentials. Drain construction
+        before propagating cancellation so a late worker cannot race close().
+        The synchronous hook remains overridable by Azure and other providers.
+        """
+        task = self._client_init_task
+        if task is None:
+            if self._client is not None:
+                return
+            task = asyncio.create_task(
+                run_in_thread_with_telemetry("model_client_init", self._ensure_client)
+            )
+            self._client_init_task = task
+
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            # Each caller cancellation interrupts its shielded wait, not the
+            # constructor. Re-shield until construction finishes, then re-raise.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    if task.cancelled():
+                        raise
+                    cancellation = exc
+            task.result()
+        finally:
+            if task.done() and self._client_init_task is task:
+                self._client_init_task = None
+            if cancellation is not None:
+                raise cancellation
 
     def _prepare_messages_for_request(
         self,
@@ -524,7 +562,7 @@ class OpenAICompatibleLLM(BaseLLM):
         Raises:
             RuntimeError: If the API call fails
         """
-        self._ensure_client()
+        await self._ensure_client_async()
         assert self._client is not None
 
         extra_body = self._prepare_extra_body(dict(kwargs.pop("extra_body", {}) or {}))
@@ -896,7 +934,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 f"Model {self._model_name} does not support vision capabilities"
             )
 
-        self._ensure_client()
+        await self._ensure_client_async()
         assert self._client is not None
 
         extra_body = self._prepare_extra_body(dict(kwargs.pop("extra_body", {}) or {}))
@@ -1142,7 +1180,7 @@ class OpenAICompatibleLLM(BaseLLM):
             RuntimeError: API call failed
             TimeoutError: First token timeout or token interval timeout
         """
-        self._ensure_client()
+        await self._ensure_client_async()
         assert self._client is not None
 
         extra_body = self._prepare_extra_body(dict(kwargs.pop("extra_body", {}) or {}))
@@ -1572,9 +1610,21 @@ class OpenAICompatibleLLM(BaseLLM):
 
     async def close(self) -> None:
         """Close the OpenAI client and cleanup resources."""
-        if self._client is not None:
-            await self._client.close()
-            self._client = None
+        try:
+            if self._client_init_task is not None:
+                try:
+                    await self._ensure_client_async()
+                except Exception as exc:
+                    # The requesting caller receives the construction error;
+                    # cleanup only owns any client that was actually created.
+                    logger.debug(
+                        "Client initialization failed during close (%s)",
+                        type(exc).__name__,
+                    )
+        finally:
+            if self._client is not None:
+                await self._client.close()
+                self._client = None
 
     async def __aenter__(self) -> "OpenAICompatibleLLM":
         """Async context manager entry."""

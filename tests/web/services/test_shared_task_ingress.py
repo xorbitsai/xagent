@@ -115,14 +115,14 @@ async def test_a2a_create_commits_start_without_local_execution(ingress):
 
 
 @pytest.mark.asyncio
-async def test_legacy_existing_execution_waits_for_exact_durable_run(ingress):
+async def test_legacy_existing_execution_returns_after_durable_acceptance(ingress):
     owner, _ = ingress
     with get_session_local()() as db:
         task = Task(user_id=owner, title="legacy", status=TaskStatus.PENDING)
         db.add(task)
         db.commit()
         task_id = task.id
-    pending = asyncio.create_task(
+    await asyncio.wait_for(
         task_start.execute_existing_task(
             task_id=task_id,
             task_owner_user_id=owner,
@@ -130,39 +130,17 @@ async def test_legacy_existing_execution_waits_for_exact_durable_run(ingress):
             task_description="saved",
             context={},
             actor_user_id=owner,
-        )
+        ),
+        5,
     )
-    try:
-
-        async def accepted():
-            while True:
-                if pending.done():
-                    pending.result()
-                with get_session_local()() as db:
-                    command = (
-                        db.query(TaskExecutionCommand)
-                        .filter_by(task_id=task_id)
-                        .first()
-                    )
-                    if command is not None:
-                        return command.target_run_id
-                await asyncio.sleep(0.01)
-
-        run_id = await asyncio.wait_for(accepted(), 5)
-        assert not pending.done()
-        with get_session_local()() as db:
-            task = db.get(Task, task_id)
-            assert task.run_id is None
-            assert task.runner_id is None
-            assert db.query(TaskChatMessage).count() == 0
-            task.run_id = run_id
-            task.status = TaskStatus.COMPLETED
-            task.control_state = "completed"
-            db.commit()
-        await asyncio.wait_for(pending, 5)
-    finally:
-        pending.cancel()
-        await asyncio.gather(pending, return_exceptions=True)
+    with get_session_local()() as db:
+        command = db.query(TaskExecutionCommand).filter_by(task_id=task_id).one()
+        assert command.target_run_id is not None
+        assert command.status == "pending"
+        task = db.get(Task, task_id)
+        assert task.run_id is None
+        assert task.runner_id is None
+        assert db.query(TaskChatMessage).count() == 0
 
 
 @pytest.mark.parametrize(

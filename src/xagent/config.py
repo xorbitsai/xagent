@@ -41,6 +41,9 @@ AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
+TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
+WORKER_COUNT = "XAGENT_WORKER_COUNT"
+CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
 TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
 # Public development fallback; runtime credential storage must reject it.
@@ -131,6 +134,8 @@ SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY = (
     "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY"
 )
 SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
+SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
+TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -768,8 +773,74 @@ def get_redis_url() -> str | None:
 
 
 def get_shared_task_execution_enabled() -> bool:
-    """Enable durable task handoff and the shared event bridge when explicitly configured."""
-    return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+    """Enable durable task handoff and the shared event bridge by default."""
+    return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, True)
+
+
+def get_task_execution_role() -> Literal["combined", "web", "worker"]:
+    """Get the process duties; combined hosts both ingress and execution."""
+    role = os.getenv(TASK_EXECUTION_ROLE, "combined").strip().lower()
+    if role == "combined":
+        return "combined"
+    if role == "web":
+        return "web"
+    if role == "worker":
+        return "worker"
+    raise ValueError(f"{TASK_EXECUTION_ROLE} must be combined, web or worker")
+
+
+def get_worker_count() -> int | None:
+    """Get the opt-in number of worker processes managed by the combined CLI."""
+    value = os.getenv(WORKER_COUNT)
+    if not value:
+        return None
+    try:
+        count = int(value)
+    except ValueError:
+        raise ValueError(f"{WORKER_COUNT} must be a positive integer") from None
+    if count <= 0:
+        raise ValueError(f"{WORKER_COUNT} must be a positive integer")
+    return count
+
+
+def get_channel_ingress_enabled() -> bool:
+    """Open bot connections only on the designated shared ingress host."""
+    if get_shared_task_execution_enabled() and get_task_execution_role() == "worker":
+        return False
+    return _get_bool_env(
+        CHANNEL_INGRESS_ENABLED, not get_shared_task_execution_enabled()
+    )
+
+
+def validate_task_execution_host_config() -> None:
+    """Reject incomplete shared deployments before accepting tasks."""
+    role = get_task_execution_role()
+    if not get_shared_task_execution_enabled():
+        if role != "combined":
+            raise ValueError(
+                f"{TASK_EXECUTION_ROLE}={role} requires {SHARED_TASK_EXECUTION_ENABLED}"
+            )
+        return
+    if not get_redis_url():
+        raise ValueError(f"{SHARED_TASK_EXECUTION_ENABLED} requires {REDIS_URL}")
+    get_task_runtime_secrets_ttl_seconds()
+    key = get_task_runtime_secrets_encryption_key()
+    if key is None:
+        raise ValueError(
+            "Shared task execution requires an explicit private common ENCRYPTION_KEY"
+        )
+    from cryptography.fernet import Fernet
+
+    Fernet(key.encode())
+    get_task_event_channel_prefix()
+
+
+def get_task_runtime_secrets_ttl_seconds() -> int:
+    """Maximum lifetime of accepted connector values; default one day."""
+    value = int(os.getenv(TASK_RUNTIME_SECRETS_TTL_SECONDS, "86400"))
+    if value <= 0:
+        raise ValueError(f"{TASK_RUNTIME_SECRETS_TTL_SECONDS} must be positive")
+    return value
 
 
 def get_task_runtime_secrets_encryption_key() -> str | None:
@@ -2969,16 +3040,49 @@ def get_sandbox_namespace() -> str | None:
     return raw
 
 
-def get_boxlite_home_dir() -> Path | None:
-    """Get the BoxLite home directory path.
+def get_sandbox_worker_id() -> str | None:
+    """Stable replica identity for shared sandbox ownership, never a process UUID.
 
-    Returns:
-        Path from BOXLITE_HOME_DIR env var, or None
+    Configure a distinct identity for each concurrently running execution host
+    and reuse it on restart. Legacy local execution keeps its existing scope.
+    """
+    if not get_shared_task_execution_enabled():
+        return None
+    worker_id = os.getenv(SANDBOX_WORKER_ID, "").strip()
+    if not worker_id:
+        raise ValueError(f"Shared sandbox execution requires {SANDBOX_WORKER_ID}")
+    validate_sandbox_namespace(worker_id)
+    return worker_id
+
+
+def get_sandbox_worker_namespace() -> str | None:
+    """Scope Docker containers and metadata to one stable execution host."""
+    namespace = get_sandbox_namespace()
+    if namespace is None:
+        return None
+    worker_id = get_sandbox_worker_id()
+    if worker_id is None:
+        return namespace
+    # Hash the pair to avoid ambiguous concatenations of deployment/replica ids.
+    import hashlib
+
+    suffix = hashlib.sha256(f"{namespace}\0{worker_id}".encode()).hexdigest()[:16]
+    return f"{namespace}-{suffix}"
+
+
+def get_boxlite_home_dir() -> Path | None:
+    """Get the BoxLite home, isolated by stable worker ID in shared mode.
+
+    Local execution preserves BoxLite's default when BOXLITE_HOME_DIR is unset.
+    Shared execution uses a worker subdirectory under the configured home or
+    the unified storage root's boxlite directory.
     """
     env_str = os.getenv(BOXLITE_HOME_DIR)
-    if env_str:
-        return Path(env_str)
-    return None
+    home_dir = Path(env_str) if env_str else None
+    worker_id = get_sandbox_worker_id()
+    if worker_id is not None:
+        return (home_dir or get_storage_root() / "boxlite") / worker_id
+    return home_dir
 
 
 def get_tool_max_output_length() -> int:

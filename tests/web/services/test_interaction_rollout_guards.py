@@ -651,11 +651,12 @@ def test_tw2c_get_interaction_rollout_policy_has_at_most_two_whitelisted_sites()
         assert site in _GET_POLICY_SITE_WHITELIST, f"unlisted call site: {site}"
 
 
-def test_tw2d_validate_interaction_rollout_at_startup_has_exactly_one_caller():
+def test_tw2d_validate_interaction_rollout_at_startup_runs_at_both_host_entries():
     hits = _count_calls("validate_interaction_rollout_at_startup")
-    assert len(hits) == 1, f"expected exactly 1 production caller, got: {hits}"
-    path, _ = hits[0]
-    assert path.name == "app.py"
+    assert sorted(path.relative_to(_src_root()).as_posix() for path, _ in hits) == [
+        "web/app.py",
+        "web/worker.py",
+    ]
 
 
 # ---------------------------------------------------------------------------

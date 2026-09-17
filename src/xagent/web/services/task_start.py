@@ -816,14 +816,13 @@ async def execute_existing_task(
     context: dict[str, Any],
     actor_user_id: int,
 ) -> None:
-    """Run the legacy command to completion without returning a task handle."""
+    """Submit shared execution, or await the legacy local execution handle."""
     from .task_execution_host import enqueues_task_turns
 
     if enqueues_task_turns():
-        from .task_completion import TaskRunChanged, wait_for_task_run
         from .task_existing_command import enqueue_existing_execution
 
-        run_id = await run_db_io_cancellation_safe(
+        await run_db_io_cancellation_safe(
             lambda: enqueue_existing_execution(
                 task_id=task_id,
                 task_owner_user_id=task_owner_user_id,
@@ -832,10 +831,8 @@ async def execute_existing_task(
                 actor_user_id=actor_user_id,
             )
         )
-        try:
-            await wait_for_task_run(task_id, run_id)
-        except TaskRunChanged as exc:
-            raise TaskTurnError("run_changed") from exc
+        # The WebSocket must keep receiving pause/resume commands while the
+        # worker executes. Completion arrives through the shared event bridge.
         return
     background_task = await TaskTurnOrchestrator.schedule_existing_task_execution(
         task_id=task_id,

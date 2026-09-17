@@ -13,11 +13,22 @@ import json
 import logging
 import secrets
 import shlex
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+    cast,
+)
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
@@ -57,6 +68,7 @@ from ..models.mcp_oauth import (
 )
 from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
+from ..models.user_oauth import UserOAuth
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
@@ -82,7 +94,15 @@ from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
     normalize_user_oauth_resource_owner_key,
+    scoped_user_oauth_query,
 )
+
+if TYPE_CHECKING:
+    # Type-checking only: a real module-level import here would be a
+    # circular import (auth.py itself defers its own imports of this module
+    # into function bodies for exactly this reason) -- every runtime use
+    # imports from .auth locally at the call site instead.
+    from .auth import BuiltinOAuthRevocation
 
 logger = logging.getLogger(__name__)
 
@@ -4526,6 +4546,55 @@ def _locked_catalog_app_for_server(
     return expected_app if owners == {app_id} else None
 
 
+def _snapshot_builtin_oauth_revocations(
+    db: Session, *, user_id: int, providers: Sequence[str]
+) -> "list[BuiltinOAuthRevocation]":
+    """Resolve provider-side revocation records for the builtin
+    ``UserOAuth`` rows ``delete_scoped_user_oauth_accounts`` is about to
+    delete for ``providers``.
+
+    Must run before that call -- it's a bulk SQL DELETE that never loads
+    rows into Python, so this is the only chance to read each row's
+    access_token and provider_user_id. Only reads the database (see
+    ``auth.resolve_builtin_oauth_revocation``), so it's safe to call while
+    still holding the disconnect transaction's locks; the caller revokes the
+    resolved credentials only after its own commit, and only once
+    ``auth.has_other_builtin_oauth_reference`` (checked at that later point,
+    not here) confirms no other local connection still needs the grant.
+    """
+    from .auth import resolve_builtin_oauth_revocation
+
+    if not providers:
+        return []
+    accounts = (
+        scoped_user_oauth_query(db, user_id=user_id, resource_owner_key=None)
+        .filter(UserOAuth.provider.in_(providers))
+        .all()
+    )
+    resolved = []
+    for account in accounts:
+        if not account.access_token:
+            continue
+        snapshot = resolve_builtin_oauth_revocation(
+            db,
+            provider=str(account.provider),
+            access_token=str(account.access_token),
+            # is not None, not a truthy check: an empty-string
+            # provider_user_id is still a real (if unlikely) identity value,
+            # and coercing it to None here would silently disable
+            # has_other_builtin_oauth_reference's cross-user protection --
+            # only an actual NULL column means "no known identity".
+            provider_user_id=(
+                str(account.provider_user_id)
+                if account.provider_user_id is not None
+                else None
+            ),
+        )
+        if snapshot is not None:
+            resolved.append(snapshot)
+    return resolved
+
+
 def _teardown_mcp_app_server_locally(
     server_id: int,
     *,
@@ -4535,7 +4604,7 @@ def _teardown_mcp_app_server_locally(
     expected_association_generation: UUID,
     current_user: User,
     db: Session,
-) -> tuple[int, list[_MCPOAuthGrantRevocationSnapshot]]:
+) -> "tuple[int, list[_MCPOAuthGrantRevocationSnapshot], list[BuiltinOAuthRevocation]]":
     """Own the local teardown transaction and report what still needs revoking.
 
     The caller pins both generations during preflight. This function owns the
@@ -4556,6 +4625,7 @@ def _teardown_mcp_app_server_locally(
     teardown after this function returns and needs the id to do it.
     """
     revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
+    builtin_oauth_revocations: "list[BuiltinOAuthRevocation]" = []
     try:
         with db.no_autoflush:
             user_id = int(current_user.id)
@@ -4675,6 +4745,11 @@ def _teardown_mcp_app_server_locally(
                 app_id, [provider, app_id]
             )
             if providers_to_delete:
+                builtin_oauth_revocations.extend(
+                    _snapshot_builtin_oauth_revocations(
+                        db, user_id=user_id, providers=providers_to_delete
+                    )
+                )
                 delete_scoped_user_oauth_accounts(
                     db,
                     user_id=user_id,
@@ -4699,6 +4774,11 @@ def _teardown_mcp_app_server_locally(
                     for other_server in other_servers
                 )
                 if not sibling_still_connected:
+                    builtin_oauth_revocations.extend(
+                        _snapshot_builtin_oauth_revocations(
+                            db, user_id=user_id, providers=[provider]
+                        )
+                    )
                     delete_scoped_user_oauth_accounts(
                         db,
                         user_id=user_id,
@@ -4780,7 +4860,7 @@ def _teardown_mcp_app_server_locally(
             detail="Failed to delete MCP server",
         ) from None
 
-    return user_id, revocations
+    return user_id, revocations, builtin_oauth_revocations
 
 
 async def teardown_mcp_app_server(
@@ -4822,7 +4902,7 @@ async def teardown_mcp_app_server(
     genuinely needs to await. It needs no ORM access and holds no database
     lock, and runs only after the commit above has released every lock.
     """
-    user_id, revocations = await asyncio.to_thread(
+    user_id, revocations, builtin_oauth_revocations = await asyncio.to_thread(
         _teardown_mcp_app_server_locally,
         server_id,
         app_id=app_id,
@@ -4842,6 +4922,14 @@ async def teardown_mcp_app_server(
                 "MCP OAuth token revocation failed after teardown for grant %s",
                 revocation.grant_id,
             )
+    if builtin_oauth_revocations:
+        from .auth import revoke_builtin_oauth_grants
+
+        await revoke_builtin_oauth_grants(
+            db,
+            builtin_oauth_revocations,
+            context=f"teardown for app {app_id!r}, server {server_id}",
+        )
     logger.info(
         "Completed app-scoped MCP teardown for app %r, server %s, user %s",
         app_id,
@@ -4942,6 +5030,7 @@ async def delete_mcp_server(
             )
 
         # If it's an OAuth server, also delete the corresponding OAuth tokens
+        builtin_oauth_revocations: "list[BuiltinOAuthRevocation]" = []
         if server.transport == "oauth":
             # Resolve by stable identity rather than by ``server.name``.
             # ``PublicMCPApp.name`` is mutable and carries no uniqueness
@@ -4971,6 +5060,11 @@ async def delete_mcp_server(
                     app_id, [provider, app_id]
                 )
                 if providers_to_delete:
+                    builtin_oauth_revocations.extend(
+                        _snapshot_builtin_oauth_revocations(
+                            db, user_id=int(user_id), providers=providers_to_delete
+                        )
+                    )
                     delete_scoped_user_oauth_accounts(
                         db,
                         user_id=int(user_id),
@@ -5005,6 +5099,11 @@ async def delete_mcp_server(
                         for other_server in other_servers
                     )
                     if not sibling_still_connected:
+                        builtin_oauth_revocations.extend(
+                            _snapshot_builtin_oauth_revocations(
+                                db, user_id=int(user_id), providers=[provider]
+                            )
+                        )
                         delete_scoped_user_oauth_accounts(
                             db,
                             user_id=int(user_id),
@@ -5077,6 +5176,15 @@ async def delete_mcp_server(
 
         for snapshot in grant_revocations:
             await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
+
+        if builtin_oauth_revocations:
+            from .auth import revoke_builtin_oauth_grants
+
+            await revoke_builtin_oauth_grants(
+                db,
+                builtin_oauth_revocations,
+                context=f"deleting MCP server {server_id}",
+            )
 
         if retained_team_server:
             logger.info(f"Kept shared MCP server '{server_name}' after team disconnect")

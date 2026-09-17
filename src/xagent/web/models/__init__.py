@@ -21,6 +21,7 @@ from .sandbox import DurableSandboxLifecycle, SandboxInfo, SandboxSnapshot
 from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
+from .task_channel_delivery import TaskChannelDelivery
 from .task_command import TaskExecutionCommand
 from .task_command_terminal_event import TaskCommandTerminalEvent
 from .task_execution_event import TaskExecutionEvent
@@ -46,6 +47,7 @@ from .user_oauth import UserOAuth
 from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, WorkforceRun
 
 __all__ = [
+    "TaskChannelDelivery",
     "Base",
     "ActorOAuthFlowState",
     "ActorMCPServerConnection",

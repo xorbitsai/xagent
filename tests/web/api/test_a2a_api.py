@@ -3371,7 +3371,8 @@ async def test_cancel_does_not_overwrite_a_concurrent_completion() -> None:
         db.close()
 
 
-def test_subscribe_stream_starts_with_wrapped_task_snapshot() -> None:
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_subscribe_stream_starts_with_wrapped_task_snapshot(method: str) -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -3392,7 +3393,8 @@ def test_subscribe_stream_starts_with_wrapped_task_snapshot() -> None:
     finally:
         db.close()
 
-    response = client.post(
+    response = client.request(
+        method,
         f"/api/a2a/agents/{agent_id}/tasks/{task_id}:subscribe",
         headers=_bearer(full_key),
     )

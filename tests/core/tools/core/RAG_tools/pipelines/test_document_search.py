@@ -488,10 +488,10 @@ def test_apply_rerank_dashscope_success(monkeypatch: pytest.MonkeyPatch) -> None
     )
 
 
-def test_apply_rerank_dashscope_failure_fallback_to_rrf(
+def test_apply_rerank_dashscope_failure_keeps_fused_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test DashScope rerank failure falls back to LanceDB RRF."""
+    """Test DashScope rerank failure returns the fused results untouched."""
     # Setup mock DashScope rerank that raises exception
     # Use RequestException to match actual DashScope API behavior
     mock_rerank = MagicMock()
@@ -531,8 +531,7 @@ def test_apply_rerank_dashscope_failure_fallback_to_rrf(
 
     # Need rerank_model_id set for _resolve_unified_rerank to not short-circuit
     cfg = SearchConfig(embedding_model_id="test-embed", rerank_model_id="qwen3-rerank")
-    monkeypatch.setenv("DASHSCOPE_RERANK_FALLBACK_TO_LANCEDB", "true")
-    monkeypatch.setenv("DASHSCOPE_RERANK_RRF_K", "60")
+    monkeypatch.setenv("DASHSCOPE_RERANK_ENABLED", "false")
 
     # Mock _resolve_unified_rerank to return our mock
     with patch(
@@ -543,46 +542,9 @@ def test_apply_rerank_dashscope_failure_fallback_to_rrf(
             results, "test query", cfg
         )
 
-    # Should fallback to RRF
-    assert used_rerank is True
-    assert len(reranked) == 2
-    assert len(warnings) > 0
-    assert any("rerank failed" in w and "RRF fallback" in w for w in warnings)
-    # RRF should reorder based on ranks (lower rank = better)
-    # Both results should be present
-    assert all(r.text in ["doc1", "doc2"] for r in reranked)
-
-
-def test_apply_rerank_rrf_fallback_no_scores(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Test RRF fallback fails gracefully when original scores missing."""
-    # Create results without original scores/ranks
-    results = [
-        SearchResult(
-            doc_id="d1",
-            chunk_id="c1",
-            text="doc1",
-            score=0.8,
-            parse_hash="ph1",
-            model_tag="m1",
-            created_at=datetime.now(timezone.utc),
-        ),
-    ]
-
-    cfg = SearchConfig(embedding_model_id="test-embed")
-    monkeypatch.setenv("DASHSCOPE_RERANK_FALLBACK_TO_LANCEDB", "true")
-    monkeypatch.delenv("DASHSCOPE_RERANK_ENABLED", raising=False)
-
-    # No DashScope rerank available, should try RRF but fail
-    reranked, used_rerank, warnings = _apply_rerank_if_needed(
-        results, "test query", cfg
-    )
-
     assert used_rerank is False
-    assert len(reranked) == 1
-    assert len(warnings) > 0
-    assert any("missing original" in w.lower() for w in warnings)
+    assert [r.text for r in reranked] == ["doc1", "doc2"]
+    assert warnings == ["MagicMock rerank failed: DashScope API error"]
 
 
 def test_apply_rerank_no_rerank_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -600,9 +562,7 @@ def test_apply_rerank_no_rerank_config(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
     cfg = SearchConfig(embedding_model_id="test-embed", rerank_model_id=None)
-    # Disable rerank and fallback to ensure no rerank is attempted
     monkeypatch.setenv("DASHSCOPE_RERANK_ENABLED", "false")
-    monkeypatch.setenv("DASHSCOPE_RERANK_FALLBACK_TO_LANCEDB", "false")
 
     reranked, used_rerank, warnings = _apply_rerank_if_needed(
         results, "test query", cfg
@@ -615,55 +575,38 @@ def test_apply_rerank_no_rerank_config(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(warnings) == 0
 
 
-def test_apply_rerank_rrf_fallback_with_scores(
+def test_apply_rerank_hybrid_passthrough_without_rerank_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test RRF fallback works correctly with original scores/ranks."""
-    # Create test results with original scores/ranks
+    """Without a rerank model, fused hybrid results are returned verbatim."""
+    now = datetime.now(timezone.utc)
     results = [
         SearchResult(
-            doc_id="d1",
-            chunk_id="c1",
-            text="doc1",
-            score=0.8,
-            parse_hash="ph1",
+            doc_id=f"d{i}",
+            chunk_id=f"c{i}",
+            text=f"doc{i}",
+            score=1.0 - i / 100,
+            parse_hash=f"ph{i}",
             model_tag="m1",
-            created_at=datetime.now(timezone.utc),
-            vector_score=0.8,
-            fts_score=0.7,
-            vector_rank=1,
-            fts_rank=2,
-        ),
-        SearchResult(
-            doc_id="d2",
-            chunk_id="c2",
-            text="doc2",
-            score=0.7,
-            parse_hash="ph2",
-            model_tag="m1",
-            created_at=datetime.now(timezone.utc),
-            vector_score=0.7,
-            fts_score=0.8,
-            vector_rank=2,
-            fts_rank=1,
-        ),
+            created_at=now,
+            vector_score=0.9 - i / 100,
+            fts_score=0.8 - i / 100,
+            vector_rank=i + 1,
+            fts_rank=10 - i,
+        )
+        for i in range(10)
     ]
 
-    cfg = SearchConfig(embedding_model_id="test-embed")
-    monkeypatch.setenv("DASHSCOPE_RERANK_FALLBACK_TO_LANCEDB", "true")
-    monkeypatch.setenv("DASHSCOPE_RERANK_RRF_K", "60")
-    monkeypatch.delenv("DASHSCOPE_RERANK_ENABLED", raising=False)
+    cfg = SearchConfig(embedding_model_id="test-embed", rerank_model_id=None)
+    monkeypatch.setenv("DASHSCOPE_RERANK_ENABLED", "false")
 
-    # No DashScope rerank, should use RRF
     reranked, used_rerank, warnings = _apply_rerank_if_needed(
         results, "test query", cfg
     )
 
-    assert used_rerank is True
-    assert len(reranked) == 2
-    # RRF should reorder based on ranks
-    # Both results should be present, order may vary based on RRF calculation
-    assert all(r.text in ["doc1", "doc2"] for r in reranked)
+    assert used_rerank is False
+    assert reranked == results
+    assert warnings == []
 
 
 def test_hybrid_partial_success_uses_warning_message(

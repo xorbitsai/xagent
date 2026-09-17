@@ -617,7 +617,7 @@ class SearchResult(BaseModel):
         None,
         description="Additional metadata for the chunk (page_number, section, source, etc.)",
     )
-    # Original scores and ranks for RRF fallback (optional, populated during hybrid search)
+    # Original scores and ranks from hybrid fusion (optional, populated during hybrid search)
     vector_score: Optional[float] = Field(
         None,
         description="Original vector search score (before rerank/fusion)",

@@ -377,13 +377,20 @@ def deputy_update_resource(
     resource: str, resource_id: str, data: dict[str, Any]
 ) -> str:
     """
-    Update an existing record. Only the fields provided are changed.
+    Update an existing record. Only the fields provided are changed,
+    absent a concurrent edit landing in between (see below).
     Deputy's V1 Resource API requires the complete object on
     POST /resource/{resource}/{id} -- it has no partial-update support
     (Deputy's own V2 employee endpoint exists specifically to add that
     for Employee; V1 has no equivalent for other resource types) -- so
     this fetches the current record first and merges `data` into it
     before writing the full object back, rather than sending `data` alone.
+    This is a GET-then-POST with no retry: a concurrent edit landing
+    between the two (another tool call, or a change made directly in
+    Deputy) is a lost-update race -- this function doesn't detect or
+    retry on that, it just writes the merged result. Not unique to this
+    connector (myob.py's own generic-full-object update has the same
+    tradeoff), so left as a known limitation rather than solved here.
     resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
     "Timesheet", or "Leave".
     resource_id: the record's numeric id, as a string (e.g. "123").
@@ -396,12 +403,31 @@ def deputy_update_resource(
         safe_resource = url_path_id(resource, "resource")
         safe_resource_id = url_path_id(resource_id, "resource_id")
         current = _request("GET", f"/resource/{safe_resource}/{safe_resource_id}")
-        if not isinstance(current, dict):
+        # Both checks needed, not just one: `not current` alone lets a
+        # truthy non-dict (e.g. a bare list) through to the dict-spread
+        # below; `isinstance` alone lets an empty {} through -- _request
+        # returns {} on a 204/empty response, and {**{}, **data} would
+        # otherwise silently POST only the caller's partial fields as if
+        # they were the whole record, wiping every other field Deputy has
+        # for it. Matches myob.py's _update_resource, which guards the
+        # same way for the same reason.
+        if not current or not isinstance(current, dict):
             return _error(f"Deputy returned an unexpected response for {resource}")
+        # data wins over current for every other field, but not "Id":
+        # the URL's resource_id is what actually identifies the record
+        # being written, and letting a caller-supplied "Id" in data
+        # silently ride along in the body would decouple what the body
+        # claims to be from what the URL targets, for no legitimate
+        # reason a partial update would ever need.
+        merged = {
+            **current,
+            **data,
+            **({"Id": current["Id"]} if "Id" in current else {}),
+        }
         result = _request(
             "POST",
             f"/resource/{safe_resource}/{safe_resource_id}",
-            json_data={**current, **data},
+            json_data=merged,
         )
         return _record_response(resource, result)
     except Exception as e:

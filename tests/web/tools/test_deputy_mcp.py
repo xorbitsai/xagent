@@ -661,6 +661,24 @@ def test_update_resource_merges_data_into_the_fetched_record(monkeypatch):
     }
 
 
+def test_update_resource_ignores_caller_supplied_id(monkeypatch):
+    """The URL's resource_id is what actually identifies the record being
+    written; a caller-supplied "Id" in data must not override the fetched
+    record's own Id and decouple the body from what the URL targets."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(json_data={"Id": 123, "Active": False}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+
+    post_call = mock_request.call_args_list[1]
+    assert post_call.kwargs["json"] == {"Id": 123, "Active": False}
+
+
 def test_update_resource_rejects_empty_data_without_calling_api(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(deputy.requests, "request", mock_request)

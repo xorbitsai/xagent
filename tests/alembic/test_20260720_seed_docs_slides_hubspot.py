@@ -23,6 +23,34 @@ def _load_migration_module():
     return module
 
 
+def _load_hubspot_marketing_scopes_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260810_add_hubspot_marketing_scopes.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_hubspot_marketing_scopes_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_hubspot_deals_write_scope_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260914_add_hubspot_deals_write_scope.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_hubspot_deals_write_scope_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -143,30 +171,42 @@ def test_upgrade_is_idempotent(tmp_path):
         assert provider_count == 1
 
 
-def test_seed_rows_match_registry(tmp_path):
-    """The migration snapshot and the runtime registry must define the same
-    rows (the migration is a frozen copy; this catches drift)."""
-    from xagent.web.builtin_mcp_registry import (
-        get_builtin_oauth_provider_rows,
-        get_builtin_public_mcp_app_rows,
-    )
+def test_downgrade_cleans_up_after_descendant_scope_migrations(tmp_path):
+    """20260810_add_hubspot_marketing_scopes and
+    20260914_add_hubspot_deals_write_scope both run after this migration and
+    expand hubspot's description/oauth_scopes -- unlike a normalization-style
+    migration, each of those DOES revert its change on its own downgrade
+    (guarded by an "only overwrite if unchanged" check). A downgrade chain
+    that runs both of those descendant migrations' downgrades (in reverse
+    revision order, as Alembic would) and then back through this migration
+    must still remove the seeded apps and provider, not preserve them as if
+    an operator had edited them.
 
+    (No test here asserts this migration's frozen snapshot equals the live
+    registry: like the microsoft/meta onedrive/facebook cases, a downstream
+    migration can own a reversible delta on a field this migration seeded, in
+    which case the frozen snapshot correctly stays at the *original* value
+    forever, matching what a full downgrade chain actually restores, not the
+    live registry's current value.)"""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
-
-    registry_apps = {
-        row["app_id"]: row
-        for row in get_builtin_public_mcp_app_rows()
-        if row["app_id"] in migration.NEW_APP_IDS
-    }
-    migration_apps = {row["app_id"]: row for row in migration._new_app_rows()}
-    assert migration_apps == registry_apps
-
-    registry_provider = next(
-        row
-        for row in get_builtin_oauth_provider_rows()
-        if row["provider_name"] == "hubspot"
-    )
-    assert migration._hubspot_provider_row() == registry_provider
+    marketing_scopes_migration = _load_hubspot_marketing_scopes_migration_module()
+    deals_write_scope_migration = _load_hubspot_deals_write_scope_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        with patch.object(marketing_scopes_migration, "op", _operations(connection)):
+            marketing_scopes_migration.upgrade()
+        with patch.object(deals_write_scope_migration, "op", _operations(connection)):
+            deals_write_scope_migration.upgrade()
+            deals_write_scope_migration.downgrade()
+        with patch.object(marketing_scopes_migration, "op", _operations(connection)):
+            marketing_scopes_migration.downgrade()
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert not {"google-docs", "google-slides", "hubspot"} & _app_ids(connection)
+        assert "hubspot" not in _provider_names(connection)
 
 
 def test_downgrade_removes_provider_and_apps(tmp_path):
@@ -179,6 +219,34 @@ def test_downgrade_removes_provider_and_apps(tmp_path):
             migration.downgrade()
         assert not {"google-docs", "google-slides", "hubspot"} & _app_ids(connection)
         assert "hubspot" not in _provider_names(connection)
+
+
+def test_downgrade_preserves_colliding_custom_app(tmp_path):
+    """An operator's custom app that reuses one of this migration's app_ids
+    (e.g. a hand-created "google-docs" connector with a different config) must
+    survive downgrade, since upgrade() itself no-ops on that collision."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport, provider_name)"
+                " VALUES ('google-docs', 'Custom Docs Bridge', 'stdio', NULL)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert "google-docs" in _app_ids(connection)
+        row = connection.execute(
+            text(
+                "SELECT name, transport FROM public_mcp_apps WHERE app_id='google-docs'"
+            )
+        ).first()
+        assert row[0] == "Custom Docs Bridge"
+        assert row[1] == "stdio"
+        assert not {"google-slides", "hubspot"} & _app_ids(connection)
 
 
 def test_downgrade_keeps_provider_when_custom_hubspot_app_exists(tmp_path):

@@ -1,4 +1,4 @@
-"""Tests for the Meta connector registry seed migration."""
+"""Tests for the Microsoft Graph MCP registry seed migration."""
 
 import importlib.util
 from pathlib import Path
@@ -12,10 +12,10 @@ from sqlalchemy import create_engine, text
 def _load_migration_module():
     migration_file = (
         Path(__file__).parent.parent.parent
-        / "src/xagent/migrations/versions/20260627_seed_meta_connectors.py"
+        / "src/xagent/migrations/versions/20260526_seed_builtin_microsoft_graph_mcp_apps.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "seed_meta_connectors_migration", migration_file
+        "seed_microsoft_graph_migration", migration_file
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -37,13 +37,13 @@ def _load_normalize_migration_module():
     return module
 
 
-def _load_facebook_scope_migration_module():
+def _load_onedrive_description_migration_module():
     migration_file = (
         Path(__file__).parent.parent.parent
-        / "src/xagent/migrations/versions/20260728_add_facebook_pages_read_user_content_scope.py"
+        / "src/xagent/migrations/versions/20260911_update_onedrive_description.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "add_facebook_pages_read_user_content_scope_migration", migration_file
+        "update_onedrive_description_migration", migration_file
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -52,8 +52,7 @@ def _load_facebook_scope_migration_module():
 
 
 def _operations(connection):
-    context = MigrationContext.configure(connection)
-    return Operations(context)
+    return Operations(MigrationContext.configure(connection))
 
 
 def _create_tables(connection):
@@ -62,14 +61,14 @@ def _create_tables(connection):
             """
             CREATE TABLE oauth_providers (
                 id INTEGER PRIMARY KEY,
-                provider_name VARCHAR(50) UNIQUE NOT NULL,
+                provider_name VARCHAR(50) NOT NULL UNIQUE,
                 name VARCHAR(100) NOT NULL,
                 client_id VARCHAR(500) NOT NULL,
                 client_secret VARCHAR(500) NOT NULL,
-                auth_url VARCHAR(1000) NOT NULL,
-                token_url VARCHAR(1000) NOT NULL,
-                redirect_uri VARCHAR(1000),
-                userinfo_url VARCHAR(1000),
+                auth_url VARCHAR(500) NOT NULL,
+                token_url VARCHAR(500) NOT NULL,
+                redirect_uri VARCHAR(500),
+                userinfo_url VARCHAR(500),
                 user_id_path VARCHAR(100),
                 email_path VARCHAR(100),
                 default_scopes JSON
@@ -82,11 +81,11 @@ def _create_tables(connection):
             """
             CREATE TABLE public_mcp_apps (
                 id INTEGER PRIMARY KEY,
-                app_id VARCHAR(100) UNIQUE NOT NULL,
+                app_id VARCHAR(100) NOT NULL UNIQUE,
                 name VARCHAR(200) NOT NULL,
                 description TEXT,
                 icon VARCHAR(1000),
-                transport VARCHAR(50) NOT NULL,
+                transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
                 provider_name VARCHAR(50),
                 category VARCHAR(100),
                 oauth_scopes JSON,
@@ -108,33 +107,25 @@ def _provider_names(connection):
     )
 
 
-def test_upgrade_inserts_meta_provider_and_public_apps(tmp_path):
+def test_upgrade_inserts_microsoft_provider_and_apps(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
-
     with engine.begin() as connection:
         _create_tables(connection)
-
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-            migration.upgrade()
+        assert "microsoft" in _provider_names(connection)
+        assert {"teams", "outlook", "onedrive"}.issubset(_app_ids(connection))
 
-        providers = connection.execute(
-            text("SELECT provider_name, name FROM oauth_providers")
-        ).fetchall()
-        apps = connection.execute(
-            text("SELECT app_id, provider_name, category FROM public_mcp_apps")
-        ).fetchall()
-
-    assert providers == [("meta", "Meta")]
-    assert {
-        (row.app_id, row.provider_name, row.category)
-        for row in apps
-        if row.app_id in {"facebook", "instagram"}
-    } == {
-        ("facebook", "meta", "Marketing"),
-        ("instagram", "meta", "Marketing"),
-    }
+        teams_row = connection.execute(
+            text(
+                "SELECT transport, provider_name, launch_config FROM public_mcp_apps"
+                " WHERE app_id='teams'"
+            )
+        ).first()
+        assert teams_row[0] == "oauth"
+        assert teams_row[1] == "microsoft"
+        assert "xagent.web.tools.mcp.teams" in str(teams_row[2])
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -148,30 +139,29 @@ def test_upgrade_is_idempotent(tmp_path):
         app_count = connection.execute(
             text(
                 "SELECT COUNT(*) FROM public_mcp_apps"
-                " WHERE app_id IN ('facebook', 'instagram')"
+                " WHERE app_id IN ('teams', 'outlook', 'onedrive')"
             )
         ).scalar()
-        assert app_count == 2
+        assert app_count == 3
         provider_count = connection.execute(
-            text("SELECT COUNT(*) FROM oauth_providers WHERE provider_name='meta'")
+            text("SELECT COUNT(*) FROM oauth_providers WHERE provider_name='microsoft'")
         ).scalar()
         assert provider_count == 1
 
 
 def test_downgrade_cleans_up_after_descendant_normalization_migration(tmp_path):
     """20260715_normalize_builtin_mcp_launch runs after this migration and
-    unconditionally rewrites facebook/instagram's launch_config (its own
-    downgrade is a deliberate no-op).
-    20260728_add_facebook_pages_read_user_content_scope runs later still and
-    adds a scope to facebook's oauth_scopes, but -- unlike 20260715 -- it DOES
-    revert that on its own downgrade. A downgrade chain that runs both of
-    those descendant migrations' downgrades (in reverse revision order, as
-    Alembic would) and then back through this migration must still remove
-    the seeded apps and provider, not preserve them as if an operator had
-    edited them.
+    unconditionally rewrites teams/outlook/onedrive's launch_config (its own
+    downgrade is a deliberate no-op). 20260911_update_onedrive_description
+    runs later still and rewrites onedrive's description, but -- unlike
+    20260715 -- it DOES revert that on its own downgrade. A downgrade chain
+    that runs both of those descendant migrations' downgrades (in reverse
+    revision order, as Alembic would) and then back through this migration
+    must still remove the seeded apps and provider, not preserve them as if
+    an operator had edited them.
 
     (No test here asserts this migration's frozen snapshot equals the live
-    registry: 20260728 proves that isn't always true by design -- a
+    registry: 20260911 proves that isn't always true by design -- a
     downstream migration can own a reversible delta on a field this
     migration seeded, in which case the frozen snapshot correctly stays at
     the *original* value forever, matching what a full downgrade chain
@@ -179,20 +169,22 @@ def test_downgrade_cleans_up_after_descendant_normalization_migration(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     normalize_migration = _load_normalize_migration_module()
-    facebook_scope_migration = _load_facebook_scope_migration_module()
+    onedrive_description_migration = _load_onedrive_description_migration_module()
     with engine.begin() as connection:
         _create_tables(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
         with patch.object(normalize_migration, "op", _operations(connection)):
             normalize_migration.upgrade()
-        with patch.object(facebook_scope_migration, "op", _operations(connection)):
-            facebook_scope_migration.upgrade()
-            facebook_scope_migration.downgrade()
+        with patch.object(
+            onedrive_description_migration, "op", _operations(connection)
+        ):
+            onedrive_description_migration.upgrade()
+            onedrive_description_migration.downgrade()
         with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()
-        assert not {"facebook", "instagram"} & _app_ids(connection)
-        assert "meta" not in _provider_names(connection)
+        assert not {"teams", "outlook", "onedrive"} & _app_ids(connection)
+        assert "microsoft" not in _provider_names(connection)
 
 
 def test_downgrade_removes_provider_and_apps(tmp_path):
@@ -203,13 +195,13 @@ def test_downgrade_removes_provider_and_apps(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
-        assert not {"facebook", "instagram"} & _app_ids(connection)
-        assert "meta" not in _provider_names(connection)
+        assert not {"teams", "outlook", "onedrive"} & _app_ids(connection)
+        assert "microsoft" not in _provider_names(connection)
 
 
 def test_downgrade_preserves_colliding_custom_app(tmp_path):
     """An operator's custom app that reuses one of this migration's app_ids
-    (e.g. a hand-created "facebook" connector with a different config) must
+    (e.g. a hand-created "teams" connector with a different config) must
     survive downgrade, since upgrade() itself no-ops on that collision."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
@@ -218,24 +210,25 @@ def test_downgrade_preserves_colliding_custom_app(tmp_path):
         connection.execute(
             text(
                 "INSERT INTO public_mcp_apps (app_id, name, transport, provider_name)"
-                " VALUES ('facebook', 'Custom Facebook Bridge', 'stdio', NULL)"
+                " VALUES ('teams', 'Custom Teams Bridge', 'stdio', NULL)"
             )
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
-        assert "facebook" in _app_ids(connection)
+        assert "teams" in _app_ids(connection)
         row = connection.execute(
-            text("SELECT name, transport FROM public_mcp_apps WHERE app_id='facebook'")
+            text("SELECT name, transport FROM public_mcp_apps WHERE app_id='teams'")
         ).first()
-        assert row[0] == "Custom Facebook Bridge"
+        assert row[0] == "Custom Teams Bridge"
         assert row[1] == "stdio"
-        assert "instagram" not in _app_ids(connection)
+        assert not {"outlook", "onedrive"} & _app_ids(connection)
 
 
-def test_downgrade_preserves_admin_created_meta_provider(tmp_path):
-    """A pre-existing admin-created "meta" provider (different shape than the
-    seeded row) must survive downgrade even when no meta apps remain."""
+def test_downgrade_preserves_admin_created_microsoft_provider(tmp_path):
+    """A pre-existing admin-created "microsoft" provider (different shape
+    than the seeded row) must survive downgrade even when no microsoft apps
+    remain."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -244,7 +237,7 @@ def test_downgrade_preserves_admin_created_meta_provider(tmp_path):
             text(
                 "INSERT INTO oauth_providers"
                 " (provider_name, name, client_id, client_secret, auth_url, token_url)"
-                " VALUES ('meta', 'Custom Meta', 'cid', 'secret',"
+                " VALUES ('microsoft', 'Custom Microsoft', 'cid', 'secret',"
                 " 'https://custom.example.com/authorize',"
                 " 'https://custom.example.com/token')"
             )
@@ -252,13 +245,13 @@ def test_downgrade_preserves_admin_created_meta_provider(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
-        assert not {"facebook", "instagram"} & _app_ids(connection)
-        assert "meta" in _provider_names(connection)
+        assert not {"teams", "outlook", "onedrive"} & _app_ids(connection)
+        assert "microsoft" in _provider_names(connection)
 
 
-def test_downgrade_keeps_provider_when_custom_meta_app_exists(tmp_path):
-    """The shared "meta" oauth_providers row must survive downgrade if a
-    non-seeded meta app is still present."""
+def test_downgrade_keeps_provider_when_custom_microsoft_app_exists(tmp_path):
+    """The shared "microsoft" oauth_providers row must survive downgrade if a
+    non-seeded microsoft app is still present."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -268,11 +261,11 @@ def test_downgrade_keeps_provider_when_custom_meta_app_exists(tmp_path):
             connection.execute(
                 text(
                     "INSERT INTO public_mcp_apps (app_id, name, transport, provider_name)"
-                    " VALUES ('custom-facebook', 'Custom Facebook', 'oauth', 'meta')"
+                    " VALUES ('custom-teams', 'Custom Teams', 'oauth', 'microsoft')"
                 )
             )
             migration.downgrade()
-        assert "meta" in _provider_names(connection)
+        assert "microsoft" in _provider_names(connection)
 
 
 def test_upgrade_and_downgrade_no_op_without_tables(tmp_path):

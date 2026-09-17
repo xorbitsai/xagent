@@ -12,6 +12,11 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.migrations.seed_helpers import (
+    OAUTH_PROVIDER_SEED_MATCH_COLUMNS,
+    delete_unmodified_seeded_rows,
+)
+
 # revision identifiers, used by Alembic.
 revision: str = "20260720_seed_docs_slides_hubspot"
 down_revision: Union[str, None] = "20260715_add_public_mcp_app_audits"
@@ -51,8 +56,6 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("is_visible_in_connector", sa.Boolean),
     sa.column("launch_config", sa.JSON),
 )
-
-NEW_APP_IDS = ("google-docs", "google-slides", "hubspot")
 
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
@@ -118,7 +121,18 @@ def _new_app_rows() -> list[dict[str, object]]:
         {
             "app_id": "hubspot",
             "name": "HubSpot",
-            "description": "Connect to HubSpot CRM and Marketing Hub to search, create, and update contacts and companies, create and update deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
+            # This is the snapshot as of this migration's own upgrade(), before
+            # 20260810_add_hubspot_marketing_scopes.py and
+            # 20260914_add_hubspot_deals_write_scope.py later expanded
+            # description/oauth_scopes. Those two migrations are properly
+            # reversible (each downgrade() restores its own PREVIOUS_* value),
+            # so a full downgrade chain brings the row back to exactly this
+            # original snapshot - keeping this frozen at the original value
+            # (rather than the live registry's current value) is what lets
+            # delete_unmodified_seeded_rows recognize the row as unmodified
+            # and clean it up. See the microsoft/meta seed migrations for the
+            # same pattern (onedrive description, facebook oauth_scopes).
+            "description": "Connect to HubSpot CRM to search, create, and update contacts and companies, read deals, and log notes.",
             "icon": "https://www.google.com/s2/favicons?domain=hubspot.com&sz=128",
             "transport": "oauth",
             "provider_name": "hubspot",
@@ -129,18 +143,6 @@ def _new_app_rows() -> list[dict[str, object]]:
                 "crm.objects.companies.read",
                 "crm.objects.companies.write",
                 "crm.objects.deals.read",
-                "crm.objects.deals.write",
-                "forms",
-            ],
-            # Not a public_mcp_apps column - _filter_row strips this before
-            # any insert, so it never reaches the DB. Present purely so this
-            # snapshot's dict equals the live registry row's dict, which is
-            # what tests/alembic/test_20260720_seed_docs_slides_hubspot.py's
-            # test_seed_rows_match_registry asserts.
-            "optional_oauth_scopes": [
-                "business-intelligence",
-                "marketing-email",
-                "marketing.campaigns.read",
             ],
             "is_visible_in_connector": True,
             "launch_config": {
@@ -192,14 +194,12 @@ def downgrade() -> None:
     existing_tables = set(inspector.get_table_names())
 
     if "public_mcp_apps" in existing_tables:
-        # Only the catalog entries are removed. Any user OAuth connections created
-        # against these apps are not owned by this migration and are cleaned up
-        # through the normal disconnect path.
-        bind.execute(
-            sa.delete(PUBLIC_MCP_APPS_TABLE).where(
-                PUBLIC_MCP_APPS_TABLE.c.app_id.in_(NEW_APP_IDS)
-            )
-        )
+        # Only rows still matching this migration's seed snapshot are removed,
+        # so an operator's pre-existing custom app_id reusing one of these ids
+        # is left in place. Any user OAuth connections created against these
+        # apps are not owned by this migration and are cleaned up through the
+        # normal disconnect path.
+        delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, _new_app_rows())
 
     if "oauth_providers" not in existing_tables:
         return
@@ -215,18 +215,12 @@ def downgrade() -> None:
 
     # Only delete the provider row when it still matches the static shape this
     # migration seeded, so an admin-created "hubspot" provider (via
-    # POST /admin/mcp/providers) is preserved. client_id/client_secret are
-    # env-dependent and intentionally not part of the guard.
-    provider_columns = {
-        column["name"] for column in inspector.get_columns("oauth_providers")
-    }
-    seeded_provider = _hubspot_provider_row()
-    delete_stmt = sa.delete(FULL_OAUTH_PROVIDERS_TABLE).where(
-        FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "hubspot"
+    # POST /admin/mcp/providers) is preserved. client_id/client_secret/
+    # redirect_uri are env-dependent and intentionally not part of the guard.
+    delete_unmodified_seeded_rows(
+        bind,
+        FULL_OAUTH_PROVIDERS_TABLE,
+        [_hubspot_provider_row()],
+        match_columns=OAUTH_PROVIDER_SEED_MATCH_COLUMNS,
+        id_column="provider_name",
     )
-    for column in ("name", "auth_url", "token_url"):
-        if column in provider_columns:
-            delete_stmt = delete_stmt.where(
-                FULL_OAUTH_PROVIDERS_TABLE.c[column] == seeded_provider[column]
-            )
-    bind.execute(delete_stmt)

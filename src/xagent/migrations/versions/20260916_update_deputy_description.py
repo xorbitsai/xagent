@@ -28,6 +28,9 @@ APP_ID = "deputy"
 PREVIOUS_DESCRIPTION = (
     "Connect to Deputy to look up employees, view rosters/shifts, and read timesheets."
 )
+# "no granular OAuth scopes" is confirmed at developer.deputy.com/docs/
+# using-oauth-20 -- Deputy's OAuth flow defines no per-resource read/write
+# scopes at all, only the token-lifecycle "longlife_refresh_token" value.
 CURRENT_DESCRIPTION = (
     "Connect to Deputy to look up employees, view rosters/shifts, read "
     "timesheets, and create or update records such as employees, rosters, "

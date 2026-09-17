@@ -49,6 +49,8 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 
 APP_ID = "deputy"
 
+# Deputy's only documented OAuth scope (developer.deputy.com/docs/
+# using-oauth-20) -- it defines no granular per-resource read/write scopes.
 DEPUTY_SCOPES = ["longlife_refresh_token"]
 
 # The description text this migration originally seeded, before

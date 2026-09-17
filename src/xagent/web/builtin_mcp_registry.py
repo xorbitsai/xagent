@@ -300,10 +300,12 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "userinfo_url": "",
             "user_id_path": "",
             "email_path": "",
-            # Deputy's only documented OAuth scope. Not a permission scope in
-            # the usual sense -- it just tells Deputy to also issue a
-            # refresh_token -- but the authorize, code-exchange, and refresh
-            # requests all require it to be present verbatim.
+            # Deputy's only documented OAuth scope (developer.deputy.com/
+            # docs/using-oauth-20 -- Deputy defines no granular per-resource
+            # read/write scopes at all). Not a permission scope in the usual
+            # sense -- it just tells Deputy to also issue a refresh_token --
+            # but the authorize, code-exchange, and refresh requests all
+            # require it to be present verbatim.
             "default_scopes": ["longlife_refresh_token"],
         },
         {

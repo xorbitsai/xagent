@@ -622,23 +622,43 @@ def test_create_resource_rejects_empty_data_without_calling_api(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_update_resource_sends_data_and_returns_record(monkeypatch):
+def test_update_resource_merges_data_into_the_fetched_record(monkeypatch):
+    """Deputy's V1 Resource API requires the full object on update, with
+    no partial-update support -- so deputy_update_resource must fetch the
+    current record first and merge `data` into it, not send `data` alone,
+    or every field the caller didn't mention would be dropped/reset."""
     mock_request = Mock(
-        return_value=MockResponse(json_data={"Id": 123, "Mobile": "0400000000"})
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "FirstName": "Ada", "Active": True}),
+            MockResponse(json_data={"Id": 123, "FirstName": "Ada", "Active": False}),
+        ]
     )
     monkeypatch.setattr(deputy.requests, "request", mock_request)
 
     result = json.loads(
-        deputy.deputy_update_resource("Employee", "123", {"Mobile": "0400000000"})
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
     )
 
     assert result["status"] == "success"
-    assert result["record"] == {"Id": 123, "Mobile": "0400000000"}
-    assert mock_request.call_args.kwargs["url"] == (
+    assert result["record"] == {"Id": 123, "FirstName": "Ada", "Active": False}
+    assert mock_request.call_count == 2
+
+    get_call, post_call = mock_request.call_args_list
+    assert get_call.kwargs["method"] == "GET"
+    assert get_call.kwargs["url"] == (
         "https://acme.au.deputy.com/api/v1/resource/Employee/123"
     )
-    assert mock_request.call_args.kwargs["method"] == "POST"
-    assert mock_request.call_args.kwargs["json"] == {"Mobile": "0400000000"}
+    assert post_call.kwargs["method"] == "POST"
+    assert post_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee/123"
+    )
+    # The fetched record's other fields (FirstName) are preserved in the
+    # write, not dropped just because the caller only mentioned Active.
+    assert post_call.kwargs["json"] == {
+        "Id": 123,
+        "FirstName": "Ada",
+        "Active": False,
+    }
 
 
 def test_update_resource_rejects_empty_data_without_calling_api(monkeypatch):
@@ -652,7 +672,7 @@ def test_update_resource_rejects_empty_data_without_calling_api(monkeypatch):
     mock_request.assert_not_called()
 
 
-def test_update_resource_returns_error_on_failure(monkeypatch):
+def test_update_resource_returns_error_when_fetch_fails(monkeypatch):
     monkeypatch.setattr(
         deputy.requests,
         "request",
@@ -660,14 +680,32 @@ def test_update_resource_returns_error_on_failure(monkeypatch):
     )
 
     result = json.loads(
-        deputy.deputy_update_resource("Employee", "999", {"Mobile": "x"})
+        deputy.deputy_update_resource("Employee", "999", {"Active": False})
     )
 
     assert result["status"] == "error"
     assert "gone" in result["message"]
 
 
-def test_update_resource_rejects_non_dict_response(monkeypatch):
+def test_update_resource_returns_error_when_write_fails_after_fetch(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(status_code=400, json_data={"error": "invalid"}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "error"
+    assert "invalid" in result["message"]
+    assert mock_request.call_count == 2
+
+
+def test_update_resource_rejects_non_dict_fetch_response(monkeypatch):
     monkeypatch.setattr(
         deputy.requests,
         "request",
@@ -675,7 +713,23 @@ def test_update_resource_rejects_non_dict_response(monkeypatch):
     )
 
     result = json.loads(
-        deputy.deputy_update_resource("Employee", "123", {"Mobile": "x"})
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "error"
+
+
+def test_update_resource_rejects_non_dict_write_response(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(json_data=["unexpected"]),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
     )
 
     assert result["status"] == "error"
@@ -697,7 +751,7 @@ def test_update_resource_rejects_invalid_ids_without_raising(
     monkeypatch.setattr(deputy.requests, "request", mock_request)
 
     result = json.loads(
-        deputy.deputy_update_resource(resource, resource_id, {"Mobile": "x"})
+        deputy.deputy_update_resource(resource, resource_id, {"Active": False})
     )
 
     assert result["status"] == "error"

@@ -346,12 +346,17 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     Create a new record (POST /resource/{resource}).
     resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
     "Timesheet", or "Leave".
-    data: field name -> value pairs for the new record, e.g. {"FirstName":
-    "Peter", "LastName": "Parker", "Email": "peter.parker@example.com"}.
+    data: field name -> value pairs for the new record. For "Employee",
+    Deputy's V1 schema requires "Company", "FirstName", "LastName",
+    "DisplayName", "Active", "Contact", and "Role" -- there is no
+    "Email" field. "Company"/"Contact"/"Role" are ids referencing
+    existing Company/Contact/EmployeeRole records, not literal values;
+    look up a valid id first (e.g. via deputy_list_resource("Company"))
+    rather than guessing one.
     Use deputy_list_resource or deputy_query_resource on an existing record
-    of the same type first to learn which field names Deputy expects --
-    deputy_get_resource needs an id, which isn't available yet when
-    creating the first record of a type.
+    of the same type first to learn which field names Deputy expects for
+    other resource types -- deputy_get_resource needs an id, which isn't
+    available yet when creating the first record of a type.
     This is not idempotent: retrying after a timeout or connection error
     can create a duplicate record. Use deputy_query_resource to check
     whether the record already exists before retrying a failed call.
@@ -372,21 +377,31 @@ def deputy_update_resource(
     resource: str, resource_id: str, data: dict[str, Any]
 ) -> str:
     """
-    Update an existing record. Only the fields provided are changed
-    (POST /resource/{resource}/{id} -- Deputy's Resource API uses POST, not
-    PATCH/PUT, for updates).
+    Update an existing record. Only the fields provided are changed.
+    Deputy's V1 Resource API requires the complete object on
+    POST /resource/{resource}/{id} -- it has no partial-update support
+    (Deputy's own V2 employee endpoint exists specifically to add that
+    for Employee; V1 has no equivalent for other resource types) -- so
+    this fetches the current record first and merges `data` into it
+    before writing the full object back, rather than sending `data` alone.
     resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
     "Timesheet", or "Leave".
     resource_id: the record's numeric id, as a string (e.g. "123").
-    data: field name -> value pairs to change, e.g. {"Mobile": "0400000000"}.
+    data: field name -> value pairs to change, e.g. {"Active": False} to
+    deactivate an Employee.
     """
     try:
         if not data:
             return _error("No data provided to update")
         safe_resource = url_path_id(resource, "resource")
         safe_resource_id = url_path_id(resource_id, "resource_id")
+        current = _request("GET", f"/resource/{safe_resource}/{safe_resource_id}")
+        if not isinstance(current, dict):
+            return _error(f"Deputy returned an unexpected response for {resource}")
         result = _request(
-            "POST", f"/resource/{safe_resource}/{safe_resource_id}", json_data=data
+            "POST",
+            f"/resource/{safe_resource}/{safe_resource_id}",
+            json_data={**current, **data},
         )
         return _record_response(resource, result)
     except Exception as e:

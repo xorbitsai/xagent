@@ -227,6 +227,112 @@ def test_get_contact_notes_paginates_and_reports_has_more(monkeypatch):
     assert association_calls == [{"limit": 5}, {"limit": 2, "after": "cursor-1"}]
 
 
+def test_get_contact_notes_passes_after_cursor(monkeypatch):
+    """Regression: hubspot_get_contact_notes had no `after` parameter at
+    all, so a contact with more notes than `limit` had no way to page past
+    the first batch even though `has_more` could report True."""
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/notes" in url:
+            assert params["after"] == "caller-cursor"
+            return MockResponse(json_data={"results": [{"id": "n1"}]})
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {"hs_note_body": "x"}}
+                    for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_contact_notes("c1", after="caller-cursor"))
+
+    assert result["status"] == "success"
+    assert [note["id"] for note in result["notes"]] == ["n1"]
+
+
+def test_get_contact_notes_truncates_an_oversized_page_into_valid_json(monkeypatch):
+    """Regression: hubspot_get_contact_notes returned the full batch-read
+    response via plain _success with no size cap, unlike every other
+    tool in this file that reads full property values in bulk - a
+    contact with several long hs_note_body values could get
+    hard-truncated by the platform's output filter into invalid JSON."""
+    note_ids = [f"n{i}" for i in range(8)]
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/notes" in url:
+            return MockResponse(json_data={"results": [{"id": i} for i in note_ids]})
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {"hs_note_body": "x" * 200}}
+                    for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 500)
+
+    raw = hubspot.hubspot_get_contact_notes("c1", limit=8, after="caller-input-cursor")
+    result = json.loads(raw)
+
+    assert len(raw) <= 500
+    assert result["status"] == "success"
+    assert 0 < len(result["notes"]) < 8
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["after"] == "caller-input-cursor"
+
+
+def test_list_association_ids_handles_an_explicit_null_results_field(monkeypatch):
+    """Regression: `page.get("results", [])` only substitutes the default
+    when the "results" key is ABSENT, not when HubSpot returns it as an
+    explicit JSON null - which used to raise TypeError instead of the
+    tool's usual structured error, the same class of bug already fixed
+    for _paged_list/_search."""
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"results": None})),
+    )
+
+    result = json.loads(hubspot.hubspot_get_contact_notes("c1"))
+
+    assert result == {
+        "status": "success",
+        "notes": [],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+    }
+
+
+def test_get_associated_deals_handles_an_explicit_null_batch_read_results_field(
+    monkeypatch,
+):
+    """Regression: `batch.get("results", [])` in _get_associated_deals had
+    the same absent-vs-null gap as _list_association_ids - an explicit
+    `{"results": null}` from the deals batch-read endpoint used to crash
+    with TypeError instead of the tool's usual structured error."""
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        return MockResponse(json_data={"results": None})
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
+
+    assert result["status"] == "success"
+    assert result["deals"] == []
+    assert result["missing_deal_ids"] == ["d1"]
+
+
 def test_get_contact_deals_single_page_has_no_more(monkeypatch):
     def fake_request(method, url, headers, params, json, timeout):
         if "/associations/deals" in url:
@@ -1577,11 +1683,35 @@ def test_get_marketing_email_statistics_passes_time_window(monkeypatch):
     }
 
 
-def test_get_marketing_email_statistics_rejects_whitespace_padded_id(monkeypatch):
-    mock_request = Mock()
+def test_get_marketing_email_statistics_trims_whitespace_after_the_comma(monkeypatch):
+    """Regression: `"e1, e2"` (a comma-separated list with the very common
+    space-after-comma formatting) used to be rejected outright, because
+    splitting on "," left a leading space on every id after the first and
+    _require_clean_identifier rejects any surrounding whitespace. The
+    whitespace here is introduced by this tool's own `.split(",")`, not
+    supplied by the caller directly, so it should be trimmed before
+    validation instead of surfacing a confusing error for natural input."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"results": [{"id": "e1"}]})
+    )
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
 
     result = json.loads(hubspot.hubspot_get_marketing_email_statistics("e1, e2"))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["params"] == {"emailIds": ["e1", "e2"]}
+
+
+def test_get_marketing_email_statistics_rejects_an_empty_entry_from_a_trailing_comma(
+    monkeypatch,
+):
+    """Trimming split-induced leading/trailing whitespace must not weaken
+    the check against a genuinely malformed list: a trailing comma still
+    produces an empty entry after stripping, which must still be rejected."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_marketing_email_statistics("e1, "))
 
     assert result["status"] == "error"
     assert "each email id" in result["message"]
@@ -2216,6 +2346,30 @@ def test_search_contacts_accepts_a_has_property_filter_with_no_value(monkeypatch
 
     assert result["status"] == "success"
     mock_request.assert_called_once()
+
+
+def test_search_contacts_trims_whitespace_from_property_name_and_operator(
+    monkeypatch,
+):
+    """Regression: _is_valid_filter only checks the STRIPPED value is
+    non-blank, so a padded propertyName/operator (e.g. from an LLM caller's
+    incidental formatting) passed local validation but reached HubSpot
+    verbatim, which matches these as strict enum tokens and would reject
+    " EQ " as an unrecognized operator. Trim before sending."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [{"filters": [{"propertyName": " dealstage ", "operator": " EQ "}]}]
+    )
+
+    hubspot.hubspot_search_contacts(filter_groups_json=filter_groups_json)
+
+    sent_filter = mock_request.call_args.kwargs["json"]["filterGroups"][0]["filters"][0]
+    assert sent_filter["propertyName"] == "dealstage"
+    assert sent_filter["operator"] == "EQ"
 
 
 def test_parse_filter_groups_rejects_malformed_json_with_an_actionable_message(

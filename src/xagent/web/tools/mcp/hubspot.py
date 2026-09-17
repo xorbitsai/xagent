@@ -353,7 +353,10 @@ def _list_association_ids(
         page = _request(
             "GET", path, params=params, timeout=ASSOCIATION_LISTING_TIMEOUT_SECONDS
         )
-        results = page.get("results", [])
+        # `or []` (not `.get("results", [])`) also catches HubSpot returning
+        # an explicit JSON null, not just an absent key - see _paged_list's
+        # docstring for why both cases need the same treatment.
+        results = page.get("results") or []
         for item in results:
             raw_id = item.get("id")
             if not raw_id:
@@ -427,6 +430,16 @@ def _parse_filter_groups(filter_groups_json: str) -> list[dict[str, Any]]:
         _is_valid_filter_group(group) for group in filter_groups
     ):
         raise ValueError(_FILTER_GROUPS_SHAPE_ERROR)
+    # propertyName/operator are enum-like tokens HubSpot matches exactly -
+    # _is_valid_filter only checks the STRIPPED value is non-blank, so a
+    # padded value like " EQ " passes local validation but would reach
+    # HubSpot verbatim and fail as an unrecognized operator. Trim them here;
+    # value/values/highValue are left untouched since that's user data
+    # where whitespace could be meaningful.
+    for group in filter_groups:
+        for filter_ in group["filters"]:
+            filter_["propertyName"] = filter_["propertyName"].strip()
+            filter_["operator"] = filter_["operator"].strip()
     return filter_groups
 
 
@@ -723,7 +736,7 @@ def _get_associated_deals(
             "inputs": [{"id": deal_id} for deal_id in deal_ids],
         },
     )
-    results = batch.get("results", [])
+    results = batch.get("results") or []
     deals = [
         {"id": item.get("id"), "properties": item.get("properties", {})}
         for item in results
@@ -1057,20 +1070,30 @@ def hubspot_list_contacts(limit: int = 100, after: str | None = None) -> str:
 
 
 @mcp.tool()
-def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
+def hubspot_get_contact_notes(
+    contact_id: str, limit: int = 20, after: str | None = None
+) -> str:
     """
     List the notes associated with a HubSpot contact (most recent interaction
-    history), including note body and timestamp. Returns at most `limit` notes
-    (max 100); `has_more` is true when the contact has additional notes.
+    history), including note body and timestamp. Returns at most `limit`
+    notes (max 100); `has_more` is true when there are more notes past this
+    page, either because of `limit` or because the response was trimmed to
+    fit the output size limit (`truncated` is then also true). Pass the
+    returned `after` cursor to retrieve the next page; if `truncated` is
+    true because notes were trimmed, retry that same cursor with a smaller
+    `limit`.
     """
     try:
         contact_id = _url_path_id(contact_id, "contact_id")
         note_ids, next_after = _list_association_ids(
             f"/crm/v3/objects/contacts/{contact_id}/associations/notes",
             _clamp_limit(limit, max_limit=100),
+            after,
         )
         if not note_ids:
-            return _success(notes=[], has_more=bool(next_after))
+            return _success(
+                notes=[], truncated=False, has_more=bool(next_after), after=next_after
+            )
 
         notes = _request(
             "POST",
@@ -1080,9 +1103,13 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
                 "inputs": [{"id": note_id} for note_id in note_ids],
             },
         )
-        return _success(
-            notes=_project_id_and_properties(notes.get("results") or []),
+        items = _project_id_and_properties(notes.get("results") or [])
+        return _bounded_page(
+            "notes",
+            items,
             has_more=bool(next_after),
+            next_after=next_after,
+            retry_after=after,
         )
     except Exception as e:
         logger.error(f"Error getting contact notes: {e}")
@@ -1325,9 +1352,10 @@ def hubspot_get_marketing_email_statistics(
     """
     Get send/open/click/bounce statistics for HubSpot marketing emails.
     `email_ids` is a single email id, or a comma-separated list of ids
-    (max 100) to fetch statistics for multiple emails at once - each id
-    must be non-empty with no surrounding whitespace. `start_date`/
-    `end_date` are optional ISO 8601 timestamps ("2024-01-01T00:00:00Z")
+    (max 100, e.g. "111, 222" - surrounding whitespace around each id is
+    trimmed) to fetch statistics for multiple emails at once; each id must
+    still be non-empty. `start_date`/`end_date` are optional ISO 8601
+    timestamps ("2024-01-01T00:00:00Z")
     that limit the reporting window; omitting both returns all-time
     statistics.
 
@@ -1339,7 +1367,10 @@ def hubspot_get_marketing_email_statistics(
     """
     try:
         raw_ids = email_ids.split(",")
-        ids = [_require_clean_identifier(raw_id, "each email id") for raw_id in raw_ids]
+        ids = [
+            _require_clean_identifier(raw_id.strip(), "each email id")
+            for raw_id in raw_ids
+        ]
         if len(ids) > _MAX_EMAIL_IDS_PER_STATISTICS_REQUEST:
             raise ValueError(
                 f"email_ids must contain at most "

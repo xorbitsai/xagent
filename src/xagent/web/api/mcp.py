@@ -2152,7 +2152,9 @@ def _custom_api_to_mcp_response(
     )
 
 
-def _oauth_account_summaries(db: Session, user_id: int) -> dict[str, tuple[str, str]]:
+def _oauth_account_summaries(
+    db: Session, user_id: int
+) -> dict[str, tuple[Optional[str], str]]:
     """Per-provider ``(email, connection_status)`` for the user's OAuth grants.
 
     ``connection_status`` is "connected" when the stored grant has a usable
@@ -2161,25 +2163,30 @@ def _oauth_account_summaries(db: Session, user_id: int) -> dict[str, tuple[str, 
     that started failing) -- distinct from never having connected at all,
     which simply has no entry here. Actor credentials are not personal
     server connections, so this only looks at the user's own scope.
+
+    ``email`` is nullable on ``UserOAuth`` (some providers never return one,
+    or it was never backfilled) -- a grant missing it is still a grant, so
+    it stays in this map with ``email=None`` rather than being dropped. A
+    provider silently excluded here would report ``connection_status`` as
+    absent (never connected) regardless of whether the grant is actually
+    healthy or broken, which is worse than a tile with no account label.
     """
     oauth_accounts = list_scoped_user_oauth_accounts(
         db,
         user_id=user_id,
         resource_owner_key=None,
     )
-    summaries: dict[str, tuple[str, str]] = {}
+    summaries: dict[str, tuple[Optional[str], str]] = {}
     for oauth in oauth_accounts:
-        if not oauth.email:
-            continue
         summaries[str(oauth.provider)] = (
-            str(oauth.email),
+            str(oauth.email) if oauth.email else None,
             "connected" if _oauth_account_can_connect(oauth) else "needs_reconnect",
         )
     return summaries
 
 
 def _enrich_oauth_server_info(
-    db: Session, server: MCPServer, oauth_accounts: dict[str, tuple[str, str]]
+    db: Session, server: MCPServer, oauth_accounts: dict[str, tuple[Optional[str], str]]
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
     Return (app_id, provider, connected_account, connection_status) for an

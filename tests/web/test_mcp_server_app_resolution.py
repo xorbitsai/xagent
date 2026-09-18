@@ -344,3 +344,22 @@ class TestTheChangedCallers:
         assert response.id == server_id
         assert response.connection_status == "connected"
         assert response.connected_account == "someone@acme.example"
+
+    def test_listing_reports_connection_status_even_without_an_email_on_file(self, db):
+        """``email`` is nullable on ``UserOAuth`` -- some providers never
+        return one. A grant missing it must still report its real
+        connection_status instead of being dropped from the summary map and
+        collapsing to "never connected" (or, for a broken grant with no
+        email, disappearing from "needs_reconnect" entirely)."""
+        from xagent.web.api.mcp import get_mcp_servers
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user, server_id = self._connected_id_named_app(db)
+        db.query(UserOAuth).filter(UserOAuth.user_id == user.id).update({"email": None})
+        db.commit()
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "connected"
+        assert response.connected_account is None

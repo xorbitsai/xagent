@@ -139,6 +139,17 @@ def test_resolve_list_path_rejects_mismatched_collection():
         planner._resolve_list_path("/planner/plans/plan-1/tasks", other_collection)
 
 
+def test_resolve_list_path_accepts_percent_encoding_case_difference():
+    """RFC 3986 percent-encoded octets are case-insensitive (%2F == %2f), so
+    a next_link differing from default_path only in hex-digit casing must
+    still be accepted rather than rejected as a mismatched collection."""
+    default_path = "/groups/plan%2Dgroup/planner/plans"
+    next_link = f"{planner.GRAPH_BASE_URL}/groups/plan%2dgroup/planner/plans?%24skip=50"
+    assert planner._resolve_list_path(default_path, next_link) == (
+        "/groups/plan%2dgroup/planner/plans?%24skip=50"
+    )
+
+
 # ---------------------------------------------------------------------------
 # plans
 # ---------------------------------------------------------------------------

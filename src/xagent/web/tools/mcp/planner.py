@@ -3,6 +3,7 @@ import logging
 import os
 import uuid
 from typing import Any
+from urllib.parse import unquote
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -160,7 +161,11 @@ def _resolve_list_path(default_path: str, next_link: str | None) -> str:
     exact same collection as the request that produced it, differing only
     in its query string ($skip/$skiptoken), so comparing the path portion
     against default_path accepts every legitimate value while rejecting a
-    forged one.
+    forged one. Both sides are percent-decoded before comparing since
+    RFC 3986 percent-encoded octets are case-insensitive (e.g. %2F and %2f
+    are the same character) -- comparing the raw, still-encoded strings
+    could reject a legitimate next_link over nothing but a hex-digit
+    casing difference.
     """
     if next_link is None:
         return default_path
@@ -170,7 +175,7 @@ def _resolve_list_path(default_path: str, next_link: str | None) -> str:
             "call to this tool"
         )
     path = next_link[len(GRAPH_BASE_URL) :]
-    if path.split("?", 1)[0] != default_path:
+    if unquote(path.split("?", 1)[0]) != unquote(default_path):
         raise ValueError(
             "next_link must be a @odata.nextLink value returned by a previous "
             "call to this tool"

@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import os
+from copy import deepcopy
 from typing import Any
 from urllib.parse import quote
 
@@ -11,6 +12,7 @@ from pptx import Presentation
 from pptx.oxml.ns import qn
 from pptx.presentation import Presentation as PresentationType
 
+from ....core.tools.core.file_analysis import iter_pptx_shapes
 from .utils import setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +35,27 @@ _POWERPOINT_MIME_TYPE = (
 # per-slide/per-shape Graph endpoints). Every tool here downloads the whole
 # file, edits it in memory with python-pptx, and re-uploads the whole file.
 # Kept entirely in memory (io.BytesIO, never written to local disk).
+#
+# Above this, the simple content PUT gives way to the resumable
+# upload-session API instead of failing outright -- matching onedrive.py's
+# own use of the same threshold to pick between the two, since a deck with
+# embedded media routinely exceeds this.
 _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
+
+# A deliberately arbitrary product ceiling (independent of any Graph-side
+# limit) on the *edited* presentation's serialized size -- unlike
+# onedrive.py's file upload, which streams a chunk at a time straight from
+# disk, this module's whole download-edit-reupload cycle already holds the
+# serialized bytes in memory at least twice over (the downloaded bytes, the
+# python-pptx object graph, and the re-saved buffer), so an unbounded size
+# here is an unbounded memory commitment, not just a slow upload.
+_MAX_PRESENTATION_BYTES = 200_000_000
+
+# Graph requires every upload-session fragment but the last to be a
+# multiple of 320 KiB, and documents a 60 MiB hard maximum per PUT; 5 MiB
+# is also in its recommended 5-10 MiB "best practice" range, and matches
+# onedrive.py's own chunk size for the same API.
+_UPLOAD_SESSION_CHUNK_BYTES = 5 * 1024 * 1024
 
 # python-pptx has no public API for adding a slide at other than the layout
 # picked, or for removing one at all -- see _delete_slide's own docstring
@@ -100,8 +122,16 @@ def _graph_request(
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
+        # Graph's /content GET 302s to a preauthenticated download URL (a
+        # bearer secret in its own query string) -- if *that* request then
+        # fails, requests.HTTPError's own str() embeds response.url, which
+        # by then is the signed redirect target, not the original Graph
+        # path. Building the message from status_code/response_text
+        # instead (never str(exc)) keeps that URL out of every caller's
+        # error/log output, matching _create_only_upload's identical guard
+        # on its own upload-session URL.
         response_text = response.text.strip()
-        message = str(exc)
+        message = f"Graph request failed with HTTP {response.status_code}"
         if response_text:
             message = f"{message} - {response_text}"
         raise _GraphRequestError(message, status_code=response.status_code) from exc
@@ -159,10 +189,19 @@ def _item_path(file_path: str, site_id: str | None, drive_id: str | None) -> str
     normalized = _normalize_relative_path(file_path)
     if site_id:
         site_segment = _site_segment(site_id)
+        # A "hostname:/server-relative-path" site_id needs a second,
+        # closing colon before appending another resource segment, to
+        # transition Graph's parser back from path-based site addressing to
+        # resource-based addressing (confirmed against Graph's own
+        # documented example: ".../sites/contoso.sharepoint.com:/teams/hr:
+        # /drive") -- the other two site_id shapes ("root" and the
+        # composite "hostname,spSiteId,spWebId" form) never contain ':' and
+        # are unaffected.
+        site_suffix = ":" if ":" in site_segment else ""
         drive_base = (
-            f"/sites/{site_segment}/drives/{url_path_id(drive_id, 'drive_id')}"
+            f"/sites/{site_segment}{site_suffix}/drives/{url_path_id(drive_id, 'drive_id')}"
             if drive_id
-            else f"/sites/{site_segment}/drive"
+            else f"/sites/{site_segment}{site_suffix}/drive"
         )
     elif drive_id:
         drive_base = f"/drives/{url_path_id(drive_id, 'drive_id')}"
@@ -199,12 +238,14 @@ def _upload_presentation(
     buffer = io.BytesIO()
     presentation.save(buffer)
     content = buffer.getvalue()
-    if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
+    if len(content) > _MAX_PRESENTATION_BYTES:
         raise ValueError(
             f"The updated presentation is {len(content)} bytes, over the "
-            f"{_SIMPLE_UPLOAD_MAX_BYTES // 1_000_000} MB limit this tool currently "
+            f"{_MAX_PRESENTATION_BYTES // 1_000_000} MB limit this tool currently "
             "supports"
         )
+    if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
+        return _upload_presentation_session(content, file_path, site_id, drive_id)
     result = _graph_request(
         "PUT",
         _content_path(file_path, site_id, drive_id),
@@ -212,6 +253,71 @@ def _upload_presentation(
         data=content,
         timeout=_BINARY_TIMEOUT_SECONDS,
     )
+    if not isinstance(result, dict) or not result.get("id"):
+        raise RuntimeError("Graph did not confirm the presentation upload completed")
+    safe_item = dict(result)
+    safe_item.pop("@microsoft.graph.downloadUrl", None)
+    return safe_item
+
+
+def _upload_presentation_session(
+    content: bytes, file_path: str, site_id: str | None, drive_id: str | None
+) -> dict[str, Any]:
+    """Upload content over _SIMPLE_UPLOAD_MAX_BYTES via Graph's
+    upload-session API instead of the simple content PUT, in
+    _UPLOAD_SESSION_CHUNK_BYTES-aligned fragments.
+
+    Unlike onedrive.py's own use of this API, content here is always
+    already fully resident in memory (python-pptx has no streaming save),
+    so this has no need for that module's disk-streaming/resume-on-
+    reconnect machinery -- a fragment failure simply fails the whole
+    upload, matching this module's existing _create_only_upload, which
+    takes the same no-retry stance on the same API for its own (always
+    single-fragment) use of it.
+    """
+    session = _graph_request(
+        "POST",
+        f"{_item_path(file_path, site_id, drive_id)}/createUploadSession",
+        body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+    )
+    upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
+    if not isinstance(upload_url, str) or not upload_url:
+        raise RuntimeError("Graph did not return an upload session URL")
+
+    total = len(content)
+    result: Any = None
+    # The upload-session URL is itself pre-authenticated (a token in its
+    # own query string) -- as with _create_only_upload's identical use of
+    # this API, this goes through a plain requests.Session() rather than
+    # _graph_request (which always attaches an Authorization header, which
+    # Graph's docs warn can itself cause a 401 here), and every exception
+    # is re-raised "from None" rather than "from exc" so a future
+    # traceback/log/APM capture can never surface this URL as __cause__.
+    with requests.Session() as http:
+        for start in range(0, total, _UPLOAD_SESSION_CHUNK_BYTES):
+            end = min(start + _UPLOAD_SESSION_CHUNK_BYTES, total)
+            try:
+                response = http.put(
+                    upload_url,
+                    data=content[start:end],
+                    headers={
+                        "Content-Range": f"bytes {start}-{end - 1}/{total}",
+                        "Content-Type": _POWERPOINT_MIME_TYPE,
+                    },
+                    timeout=_BINARY_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+            except requests.HTTPError:
+                raise _GraphRequestError(
+                    "PowerPoint presentation upload failed with HTTP "
+                    f"{response.status_code}",
+                    status_code=response.status_code,
+                ) from None
+            except requests.RequestException:
+                raise RuntimeError("PowerPoint presentation upload failed") from None
+            if end == total:
+                result = response.json()
+
     if not isinstance(result, dict) or not result.get("id"):
         raise RuntimeError("Graph did not confirm the presentation upload completed")
     safe_item = dict(result)
@@ -301,6 +407,47 @@ def _shape_text(shape: Any) -> str | None:
     return shape.text_frame.text if shape.has_text_frame else None
 
 
+def _slide_texts(slide: Any) -> list[str]:
+    """All shape text on slide, recursing into any group and pulling each
+    table cell's text.
+
+    slide.shapes alone only yields top-level shapes, and neither a group
+    (it has no text frame of its own -- the text lives on the shapes
+    nested inside it) nor a table (a GraphicFrame, whose has_text_frame is
+    also always False -- the text lives on its individual cells) would
+    otherwise contribute anything, so a plain has_text_frame filter over
+    slide.shapes silently omits both.
+    """
+    texts: list[str] = []
+    for shape in iter_pptx_shapes(slide.shapes):
+        if shape.has_text_frame:
+            text = shape.text_frame.text
+            if text:
+                texts.append(text)
+        elif getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    text = cell.text_frame.text
+                    if text:
+                        texts.append(text)
+    return texts
+
+
+def _slide_notes(slide: Any) -> str | None:
+    """slide's speaker notes text, or None if it has no notes slide.
+
+    Checked via has_notes_slide rather than a bare getattr/try -- python-
+    pptx's own notes_slide property *creates* a notes slide on first access
+    if one doesn't already exist, which would silently mutate a
+    presentation this module never intends to write back for a read-only
+    tool.
+    """
+    if not slide.has_notes_slide:
+        return None
+    text = slide.notes_slide.notes_text_frame.text
+    return text or None
+
+
 def _select_body_placeholder(slide: Any) -> Any | None:
     """Find the first non-title placeholder on slide that can hold text.
 
@@ -354,6 +501,49 @@ def _text_frame_has_dynamic_content(text_frame: Any) -> bool:
         tx_body.find(".//" + qn("a:hlinkClick")) is not None
         or tx_body.find(".//" + qn("a:fld")) is not None
     )
+
+
+def _replace_text_frame_text(text_frame: Any, text: str) -> None:
+    """Replace text_frame's text, preserving each existing paragraph's
+    paragraph-level formatting (alignment, bullet/numbering, indent level)
+    and its first run's character formatting (bold, italic, font, size,
+    color) by position.
+
+    TextFrame.text's own setter (python-pptx) clears every <a:p> and
+    rebuilds one new paragraph per "\n"-separated line, each holding a
+    single run with no <a:pPr>/<a:rPr> at all -- verified directly against
+    its source (CT_TextBody.clear_content / CT_TextParagraph.append_text)
+    -- so a plain assignment silently discards all of that. A paragraph
+    added or removed by this call (the new text has more/fewer lines than
+    the frame had paragraphs) has nothing to carry formatting over
+    to/from, so it gets/loses it; every other paragraph keeps its look.
+    """
+    saved: list[tuple[Any, Any]] = []
+    for paragraph in text_frame.paragraphs:
+        p_pr = paragraph._p.find(qn("a:pPr"))
+        first_run = paragraph.runs[0] if paragraph.runs else None
+        r_pr = first_run._r.find(qn("a:rPr")) if first_run is not None else None
+        saved.append(
+            (
+                deepcopy(p_pr) if p_pr is not None else None,
+                deepcopy(r_pr) if r_pr is not None else None,
+            )
+        )
+
+    text_frame.text = text
+
+    for (p_pr, r_pr), paragraph in zip(saved, text_frame.paragraphs):
+        if p_pr is not None:
+            existing_p_pr = paragraph._p.find(qn("a:pPr"))
+            if existing_p_pr is not None:
+                paragraph._p.remove(existing_p_pr)
+            paragraph._p.insert(0, p_pr)
+        if r_pr is not None and paragraph.runs:
+            run = paragraph.runs[0]
+            existing_r_pr = run._r.find(qn("a:rPr"))
+            if existing_r_pr is not None:
+                run._r.remove(existing_r_pr)
+            run._r.insert(0, r_pr)
 
 
 def _require_slide(presentation: PresentationType, slide_index: int) -> Any:
@@ -421,17 +611,16 @@ def powerpoint_get_presentation_text(
     file_path: str, site_id: str | None = None, drive_id: str | None = None
 ) -> str:
     """Get all text in a PowerPoint presentation, as a list of slides each
-    with the text of every text-bearing shape on it."""
+    with the text of every text-bearing shape on it (including a shape
+    nested inside a group, and each cell of a table) plus that slide's
+    speaker notes, if any."""
     try:
         presentation = _download_presentation(file_path, site_id, drive_id)
         slides = [
             {
                 "slide_index": slide_index,
-                "shapes": [
-                    text
-                    for shape in slide.shapes
-                    if (text := _shape_text(shape)) is not None and text
-                ],
+                "shapes": _slide_texts(slide),
+                "notes": _slide_notes(slide),
             }
             for slide_index, slide in enumerate(presentation.slides)
         ]
@@ -512,10 +701,15 @@ def powerpoint_set_shape_text(
     """Replace a shape's text on a slide, by slide_index and shape_index
     (from powerpoint_get_slide_text). Only works on a shape that already
     has a text frame (a title, body, or plain text box); errors otherwise.
-    Also errors (rather than silently discarding it) if the shape's text
-    contains a hyperlink or a dynamic field such as an auto-updating slide
-    number or date, since replacing the whole frame's text has no way to
-    carry those over -- edit that shape directly in PowerPoint instead."""
+    Preserves each existing paragraph's alignment/bullet/indent formatting
+    and its first run's character formatting (bold, italic, font, size,
+    color) by position; a paragraph this call adds or removes (a "\\n" in
+    text starts a new paragraph) has no corresponding old/new paragraph to
+    carry that formatting from/to. Also errors (rather than silently
+    discarding it) if the shape's text contains a hyperlink or a dynamic
+    field such as an auto-updating slide number or date, since replacing
+    the whole frame's text has no way to carry those over -- edit that
+    shape directly in PowerPoint instead."""
     try:
         slide_index = _require_int(slide_index, "slide_index")
         shape_index = _require_int(shape_index, "shape_index")
@@ -540,7 +734,7 @@ def powerpoint_set_shape_text(
                 "text would silently delete -- edit this shape directly in "
                 "PowerPoint instead"
             )
-        shape.text_frame.text = text
+        _replace_text_frame_text(shape.text_frame, text)
         item = _upload_presentation(presentation, file_path, site_id, drive_id)
         return _success(item=item)
     except Exception as e:

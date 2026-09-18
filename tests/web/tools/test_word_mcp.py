@@ -532,6 +532,107 @@ def test_replace_text_finds_match_inside_hyperlink_run(monkeypatch):
     assert uploaded.paragraphs[0].text == "before baz bar after"
 
 
+def test_replace_text_ignores_match_inside_tracked_insertion(monkeypatch):
+    """A <w:ins>-wrapped run holds someone else's pending, unaccepted
+    tracked-change insertion. A plain recursive run search would reach it
+    (unlike paragraph.runs, which excludes it) and silently rewrite that
+    person's edit with no new revision recorded -- must not touch it."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+
+    def build(d):
+        p = d.add_paragraph("before ")
+        ins = OxmlElement("w:ins")
+        ins.set(qn("w:author"), "Alice")
+        run_elm = OxmlElement("w:r")
+        text_elm = OxmlElement("w:t")
+        text_elm.text = "foo bar"
+        run_elm.append(text_elm)
+        ins.append(run_elm)
+        p._p.append(ins)
+        p.add_run(" after")
+
+    content = _docx_bytes(build)
+    responses = iter([MockResponse(content=content), MockResponse({"id": "item-1"})])
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "success"
+    assert result["replacements"] == 0
+    put_call = mock_request.call_args_list[1]
+    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
+    # The tracked insertion's text is untouched.
+    assert uploaded.paragraphs[0]._p.xpath(".//w:ins//w:t")[0].text == "foo bar"
+
+
+def test_replace_text_ignores_match_inside_text_box(monkeypatch):
+    """A text box's content is a separate stream anchored to (not part of)
+    the run holding its <w:drawing> -- invisible to word_get_document_text
+    and word_list_paragraphs, so word_replace_text must not silently edit
+    it either."""
+    from docx.oxml.shared import OxmlElement
+
+    def build(d):
+        p = d.add_paragraph("outer text")
+        anchor = p.add_run()
+        drawing = OxmlElement("w:drawing")
+        txbx_content = OxmlElement("w:txbxContent")
+        inner_p = OxmlElement("w:p")
+        inner_run = OxmlElement("w:r")
+        inner_text = OxmlElement("w:t")
+        inner_text.text = "foo bar"
+        inner_run.append(inner_text)
+        inner_p.append(inner_run)
+        txbx_content.append(inner_p)
+        drawing.append(txbx_content)
+        anchor._r.append(drawing)
+
+    content = _docx_bytes(build)
+    responses = iter([MockResponse(content=content), MockResponse({"id": "item-1"})])
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "success"
+    assert result["replacements"] == 0
+    put_call = mock_request.call_args_list[1]
+    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
+    # The text box's content is untouched.
+    assert uploaded.paragraphs[0]._p.xpath(".//w:txbxContent//w:t")[0].text == "foo bar"
+
+
+def test_set_paragraph_text_ignores_hyperlink_inside_text_box():
+    """A hyperlink nested inside a text box isn't part of this paragraph's
+    own visible flow (word_get_document_text/word_list_paragraphs never
+    show it), so it must not trigger the hyperlink-refusal guard -- though
+    the paragraph is still refused for the real reason: the drawing-holding
+    run itself is non-text content."""
+    from docx.oxml.shared import OxmlElement
+
+    document = Document()
+    paragraph = document.add_paragraph("caption ")
+    anchor = paragraph.add_run()
+    drawing = OxmlElement("w:drawing")
+    txbx_content = OxmlElement("w:txbxContent")
+    inner_p = OxmlElement("w:p")
+    hyperlink = OxmlElement("w:hyperlink")
+    inner_run = OxmlElement("w:r")
+    inner_text = OxmlElement("w:t")
+    inner_text.text = "Click here"
+    inner_run.append(inner_text)
+    hyperlink.append(inner_run)
+    inner_p.append(hyperlink)
+    txbx_content.append(inner_p)
+    drawing.append(txbx_content)
+    anchor._r.append(drawing)
+
+    with pytest.raises(ValueError, match="non-text content"):
+        word._set_paragraph_text(paragraph, "New caption")
+
+
 def test_upload_document_rejects_oversized_content(monkeypatch):
     document = Document()
     monkeypatch.setattr(word, "_SIMPLE_UPLOAD_MAX_BYTES", 10)

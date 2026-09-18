@@ -785,6 +785,25 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("stream-recovery").textContent).toBe("")
   })
 
+  it("keeps recovery when the first-ever snapshot for a run arrives after an interruption with no run known yet", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    // An explicit resync signal can arrive before this stream has ever seen
+    // a snapshot, so stream.runId is still undefined here.
+    send({ type: "stream_unavailable" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    // The first-ever snapshot for the CURRENT run is an undefined -> defined
+    // transition, not a run change - it must not silently clear the
+    // still-unresolved interruption before any real recovery happened.
+    send({ run_id: "run-1", state_version: 1, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+  })
+
   it("reconciles a gapped shared stream without appending later deltas or accepting an old run", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (message: Partial<TestWebSocketMessage>) => act(() => {

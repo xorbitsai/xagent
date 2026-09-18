@@ -2812,18 +2812,23 @@ export function AppProvider({
         const envelope = extractTaskControlEnvelope(message)
         if (!acceptTaskControlVersion(message, envelope, taskStateVersionsRef.current)) return
         const data = asMessageRecord(message.data)
+        // A new run starting can't have inherited an interruption from
+        // whatever run preceded it - carrying a stale `true` forward would
+        // flag the very first snapshot of a brand-new, healthy run. But
+        // going from "no run known yet" to "this run" is NOT a run change:
+        // stream.runId starts undefined, and an explicit stream_unavailable/
+        // stream_resync_required for the CURRENT run can set interrupted
+        // before its first snapshot ever arrives - only a defined-to-
+        // different-defined transition is a genuine new run.
+        const isNewRun =
+          stream.runId !== undefined && envelope.runId !== undefined && stream.runId !== envelope.runId
         if (stream.runId !== envelope.runId) {
           stream.runId = envelope.runId
           stream.prefixSeen = false
           stream.complete = false
-          // A new run starting can't have inherited an interruption from
-          // whatever run preceded it - carrying a stale `true` forward would
-          // flag the very first snapshot of a brand-new, healthy run.
-          // Mirrors the equivalent reset in the stream_run_id branch below.
-          stream.interrupted = false
+          if (isNewRun) stream.interrupted = false
         }
         stream.attemptId = typeof data.lease_attempt_id === "string" ? data.lease_attempt_id : null
-        const active = envelope.status === "running"
         // "running with no prefix seen yet" is the ordinary state of every task
         // between the run starting and its final-answer text beginning to
         // stream (planning, tool calls, etc.) - it is NOT evidence anything
@@ -2836,6 +2841,7 @@ export function AppProvider({
         // positive evidence content was produced without us. Leave
         // stream.interrupted as carried over from those instead of deriving
         // a new value from status alone.
+        const active = envelope.status === "running"
         if (envelope.status) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: {
             status: envelope.status, runId: envelope.runId,

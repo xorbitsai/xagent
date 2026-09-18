@@ -342,6 +342,33 @@ def test_get_file_content_rejects_streamed_body_over_limit(monkeypatch):
     assert "too large" in result["message"]
 
 
+def test_get_file_content_rejects_raw_content_over_output_limit(monkeypatch):
+    # Below _MAX_DOWNLOAD_BYTES (10MB) but well above a small output-length
+    # limit -- rejected before _decode_bytes/_success ever run on it.
+    monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 100)
+    mock_request = Mock(return_value=MockResponse(content=b"x" * 200))
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "medium.bin"))
+
+    assert result["status"] == "error"
+    assert "too large" in result["message"]
+
+
+def test_get_file_content_rejects_encoded_result_over_output_limit(monkeypatch):
+    # Raw content itself is under the output limit, but base64 inflates it
+    # (4/3x) past the limit -- must still be caught by the second check.
+    monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 100)
+    binary_content = b"\xff\xd8\xff\xe0" + b"x" * 70  # 74 bytes, base64 ~100+ chars
+    mock_request = Mock(return_value=MockResponse(content=binary_content))
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "photo.jpg"))
+
+    assert result["status"] == "error"
+    assert "too large" in result["message"]
+
+
 def test_get_file_content_rejects_compressed_content_encoding(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -395,6 +422,51 @@ def test_get_file_content_redacts_url_on_transport_error(monkeypatch):
     assert result["status"] == "error"
     assert "SECRET-CREDENTIAL" not in result["message"]
     assert "contoso.sharepoint.com" not in result["message"]
+
+
+def test_get_file_content_redacts_url_on_mid_stream_error(monkeypatch):
+    # A connection dropped partway through the body (after a 200 OK, while
+    # response.iter_content() is being consumed inside _read_capped_content)
+    # is a separate failure point from the connect-time and status-code
+    # branches above -- it must be redacted the same way.
+    sas_url = (
+        "https://contoso.sharepoint.com/_layouts/download.aspx"
+        "?sastoken=SECRET-CREDENTIAL"
+    )
+
+    class _MidStreamFailureResponse(MockResponse):
+        def iter_content(self, chunk_size=1):
+            raise requests.exceptions.ChunkedEncodingError(
+                f"Connection broken while reading from {self.url}"
+            )
+            yield b""  # pragma: no cover -- makes this a generator
+
+    mock_request = Mock(
+        return_value=_MidStreamFailureResponse(url=sas_url, content=b"partial")
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "notes.txt"))
+
+    assert result["status"] == "error"
+    assert "SECRET-CREDENTIAL" not in result["message"]
+    assert "contoso.sharepoint.com" not in result["message"]
+
+
+def test_get_file_content_preserves_graph_error_detail_on_http_error(monkeypatch):
+    # response.text is Graph's own JSON error body -- it describes the
+    # failure (e.g. accessDenied) but does not itself echo the request URL,
+    # so unlike str(exc)/response.url it is safe to keep for diagnostics.
+    graph_error_body = b'{"error":{"code":"accessDenied","message":"Access denied"}}'
+    mock_request = Mock(
+        return_value=MockResponse(status_code=403, content=graph_error_body)
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "notes.txt"))
+
+    assert result["status"] == "error"
+    assert "accessDenied" in result["message"]
 
 
 def test_upload_text_file_rejects_binary_extension():

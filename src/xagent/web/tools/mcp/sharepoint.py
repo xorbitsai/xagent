@@ -221,11 +221,15 @@ def _graph_request(
         # download URL -- itself a bearer credential, since whoever has it
         # can download the file with no further auth until it expires.
         # requests follows that redirect transparently, so both a
-        # RequestException raised while connecting to the final host (its
-        # message embeds the URL it was trying to reach) and
-        # response.url/str(HTTPError) after a failed response (same reason)
-        # would leak that credential into the returned/logged error.
-        # Everything in this branch is status-only for that reason.
+        # RequestException raised while connecting to (or reading from) the
+        # final host (its message embeds the URL it was trying to reach)
+        # and response.url/str(HTTPError) after a failed response (same
+        # reason) would leak that credential into the returned/logged
+        # error. response.text is not the same risk -- it's Graph's own
+        # JSON error body, which describes the failure but does not itself
+        # echo the request URL -- so it's kept for diagnostic detail
+        # (matching the non-raw branch below) while the URL-bearing
+        # exception/response.url are not.
         try:
             response = requests.request(
                 method=method,
@@ -244,11 +248,22 @@ def _graph_request(
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
+            response_text = response.text.strip()
+            message = f"{response.status_code} error downloading file content"
+            if response_text:
+                message = f"{message} - {response_text}"
+            raise _GraphRequestError(message, status_code=response.status_code) from exc
+        try:
+            return _read_capped_content(response, max_bytes=_MAX_DOWNLOAD_BYTES)
+        except requests.RequestException as exc:
+            # A connection drop mid-body (after the 200 OK, while streaming
+            # via response.iter_content() inside _read_capped_content) is
+            # not covered by the try/except above it -- redact it the same
+            # way rather than letting it propagate with the download URL
+            # embedded in its own message.
             raise _GraphRequestError(
-                f"{response.status_code} error downloading file content",
-                status_code=response.status_code,
+                "network error downloading file content", status_code=0
             ) from exc
-        return _read_capped_content(response, max_bytes=_MAX_DOWNLOAD_BYTES)
 
     response = requests.request(
         method=method,
@@ -634,6 +649,28 @@ def sharepoint_get_file_content(
         content = _graph_request(
             "GET", _drive_content_path(site_id, file_path, drive_id), raw=True
         )
+        # The runtime's generic output filter truncates any string value --
+        # the JSON envelope _success returns below is one -- at
+        # get_tool_max_output_length() characters without parsing it first,
+        # so an encoded payload that slips past that limit would come back
+        # as invalid JSON with a '"status": "success"' prefix still intact:
+        # silent corruption rather than a clear failure. Rejecting it here,
+        # before that filter ever sees it, trades that for an honest,
+        # actionable error.
+        #
+        # Encoding (UTF-8 text, or base64 for binary content) can only ever
+        # grow the byte count, never shrink it, so the raw download size
+        # alone is a safe lower bound on the eventual JSON string's length
+        # -- already exceeding the limit here means it will regardless of
+        # which encoding is picked, without needing to actually build (and
+        # immediately discard) the base64/JSON payload to find that out.
+        max_output_length = get_tool_max_output_length()
+        if len(content) > max_output_length:
+            return _error(
+                f"{file_path!r} is too large to return inline "
+                f"({len(content)} bytes downloaded, limit is "
+                f"{max_output_length} characters)"
+            )
         text_content, base64_content = _decode_bytes(content)
         result = _success(
             file_path=file_path,
@@ -641,14 +678,6 @@ def sharepoint_get_file_content(
             base64_content=base64_content,
             encoding="utf-8" if text_content is not None else "base64",
         )
-        # The runtime's generic output filter truncates any string value --
-        # this whole JSON envelope is one -- at get_tool_max_output_length()
-        # characters without parsing it first, so an encoded payload that
-        # slips past that limit would come back as invalid JSON with a
-        # '"status": "success"' prefix still intact: silent corruption
-        # rather than a clear failure. Rejecting it here, before that filter
-        # ever sees it, trades that for an honest, actionable error.
-        max_output_length = get_tool_max_output_length()
         if len(result) > max_output_length:
             return _error(
                 f"{file_path!r} is too large to return inline "

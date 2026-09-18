@@ -298,18 +298,20 @@ def _create_only_upload(
     return safe_item
 
 
-# Run-level children that _set_paragraph_text must never silently discard:
-# an inline image/drawing, an explicit break (line or page), and a field
-# character (the begin/separate/end markers for a Word field like a table
-# of contents or page-number field). Assigning Run.text replaces ALL of a
-# run's content, verified directly against python-docx's own Run.text
-# setter -- not just the visible text -- so a run holding any of these
-# would silently lose it with no error.
-_NON_TEXT_RUN_TAGS = (qn("w:drawing"), qn("w:br"), qn("w:fldChar"), qn("w:pict"))
-
-
+# Assigning Run.text clears every child of <w:r> except <w:rPr> (formatting)
+# and re-adds only <w:t>/<w:tab>/<w:br>/<w:cr> elements built from the new
+# text -- verified directly against python-docx's own CT_R.text getter and
+# setter. So rather than enumerate the specific tags known to be at risk (an
+# inline image/drawing, a field character, a symbol, a footnote reference,
+# and more -- an open-ended and version-fragile list), a run is treated as
+# unsafe to rewrite unless every one of its children is <w:rPr> or <w:t>.
+# This is deliberately conservative: some elements that do round-trip
+# correctly today (a <w:tab>, for instance) are refused too, and a <w:cr>
+# is silently downgraded to a <w:br> even before this guard runs -- both
+# acceptable trade-offs against a helper that has to be re-verified by hand
+# against python-docx's undocumented internals every time it's relied on.
 def _run_has_non_text_content(run: Any) -> bool:
-    return any(run._r.find(tag) is not None for tag in _NON_TEXT_RUN_TAGS)
+    return any(child.tag not in (qn("w:rPr"), qn("w:t")) for child in run._r)
 
 
 def _set_paragraph_text(paragraph: Any, text: str) -> None:

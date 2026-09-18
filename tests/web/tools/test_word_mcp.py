@@ -167,6 +167,46 @@ def test_set_paragraph_text_rejects_run_with_page_break():
         word._set_paragraph_text(paragraph, "New text")
 
 
+def test_run_has_non_text_content_rejects_unlisted_element_kinds():
+    """_run_has_non_text_content treats any child other than <w:rPr>/<w:t>
+    as unsafe, not just the specific tags this module happens to test --
+    <w:noBreakHyphen> and <w:sym> are silently destroyed by Run.text just
+    like an image or field character, verified directly against
+    python-docx's own CT_R.text setter, but neither has a dedicated test
+    above (nor is either tag hardcoded anywhere in the guard itself)."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+
+    for tag, attrs in [
+        ("w:noBreakHyphen", {}),
+        ("w:sym", {"w:font": "Wingdings", "w:char": "F0E0"}),
+    ]:
+        document = Document()
+        paragraph = document.add_paragraph()
+        run = paragraph.add_run("A")
+        elm = OxmlElement(tag)
+        for name, value in attrs.items():
+            elm.set(qn(name), value)
+        run._r.append(elm)
+
+        assert word._run_has_non_text_content(run), tag
+
+
+def test_set_paragraph_text_rejects_run_with_tab():
+    """A <w:tab> is not itself corrupted by Run.text (python-docx's setter
+    reconstructs it from a literal \\t), but the guard is deliberately
+    conservative -- it only special-cases <w:rPr>/<w:t> as known-safe
+    rather than trying to keep an allowlist of every element that happens
+    to round-trip correctly -- so a run with a tab is refused too."""
+    document = Document()
+    paragraph = document.add_paragraph()
+    run = paragraph.add_run()
+    run.add_tab()
+
+    with pytest.raises(ValueError, match="non-text content"):
+        word._set_paragraph_text(paragraph, "New text")
+
+
 # ---------------------------------------------------------------------------
 # create / existence check
 # ---------------------------------------------------------------------------

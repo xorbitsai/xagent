@@ -90,15 +90,14 @@ def test_build_assignments_empty_returns_none():
 def test_build_assignments_shape():
     result = planner._build_assignments(["user-1", "user-2"])
     assert result == {
-        "user-1": {
-            "@odata.type": "#microsoft.graph.plannerAssignment",
-            "orderHint": " !",
-        },
-        "user-2": {
-            "@odata.type": "#microsoft.graph.plannerAssignment",
-            "orderHint": " !",
-        },
+        "user-1": {"@odata.type": "#microsoft.graph.plannerAssignment"},
+        "user-2": {"@odata.type": "#microsoft.graph.plannerAssignment"},
     }
+
+
+def test_build_assignments_rejects_malformed_user_id():
+    with pytest.raises(ValueError, match="user_id"):
+        planner._build_assignments([" user-1 "])
 
 
 def test_resolve_list_path_defaults_when_no_next_link():
@@ -249,7 +248,10 @@ def test_list_buckets_fetches_next_page(monkeypatch):
     assert mock_request.call_args.kwargs["url"] == next_link
 
 
-def test_create_bucket_uses_default_order_hint(monkeypatch):
+def test_create_bucket_omits_order_hint(monkeypatch):
+    """orderHint is intentionally left unset so the service auto-generates
+    it -- sending the same literal for every bucket would give the 2nd+
+    bucket in a plan an identical, unordered hint (see module docstring)."""
     mock_request = Mock(return_value=MockResponse({"id": "bucket-1"}))
     monkeypatch.setattr(planner.requests, "request", mock_request)
 
@@ -259,7 +261,6 @@ def test_create_bucket_uses_default_order_hint(monkeypatch):
     assert mock_request.call_args.kwargs["json"] == {
         "name": "To do",
         "planId": "plan-1",
-        "orderHint": " !",
     }
 
 
@@ -345,12 +346,37 @@ def test_create_task_requires_title():
     assert result["status"] == "error"
 
 
+def test_create_task_rejects_malformed_plan_id():
+    result = json.loads(planner.planner_create_task(" plan-1 ", "Write report"))
+    assert result["status"] == "error"
+    assert "plan_id" in result["message"]
+
+
 def test_create_task_rejects_malformed_bucket_id():
     result = json.loads(
         planner.planner_create_task("plan-1", "Write report", bucket_id=" bucket-1 ")
     )
     assert result["status"] == "error"
     assert "bucket_id" in result["message"]
+
+
+def test_create_task_rejects_empty_bucket_id():
+    """Unlike omitting bucket_id, an explicit empty string is rejected --
+    consistent with planner_update_task's handling of the same parameter,
+    rather than silently creating the task unbucketed."""
+    result = json.loads(
+        planner.planner_create_task("plan-1", "Write report", bucket_id="")
+    )
+    assert result["status"] == "error"
+    assert "bucket_id" in result["message"]
+
+
+def test_create_task_rejects_empty_due_date_time():
+    result = json.loads(
+        planner.planner_create_task("plan-1", "Write report", due_date_time="  ")
+    )
+    assert result["status"] == "error"
+    assert "due_date_time" in result["message"]
 
 
 def test_create_task_rejects_malformed_assignee_id(monkeypatch):
@@ -431,6 +457,31 @@ def test_update_task_rejects_malformed_bucket_id():
     result = json.loads(planner.planner_update_task("task-1", bucket_id=" bucket-1 "))
     assert result["status"] == "error"
     assert "bucket_id" in result["message"]
+
+
+def test_update_task_clears_bucket_due_and_start_date_with_empty_string(monkeypatch):
+    responses = iter(
+        [
+            MockResponse({"id": "task-1", "@odata.etag": 'W/"etag-1"'}),
+            MockResponse({}, status_code=204, content=b""),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(
+        planner.planner_update_task(
+            "task-1", bucket_id="", due_date_time="", start_date_time=""
+        )
+    )
+
+    assert result["status"] == "success"
+    patch_call = mock_request.call_args_list[1]
+    assert patch_call.kwargs["json"] == {
+        "bucketId": None,
+        "dueDateTime": None,
+        "startDateTime": None,
+    }
 
 
 def test_delete_task_fetches_etag_and_sends_if_match(monkeypatch):

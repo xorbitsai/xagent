@@ -19,11 +19,13 @@ mcp = FastMCP("planner-mcp")
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
 
-# Microsoft's own Planner API examples for every "new item, let Planner
-# place it" case (create bucket, create task, add an assignment) use this
-# exact literal as the orderHint -- it is documented as a minimal valid
-# value under "Using order hints in Planner", not an app-specific choice.
-_DEFAULT_ORDER_HINT = " !"
+# orderHint is deliberately omitted everywhere a new bucket/assignment is
+# created below -- "Using order hints in Planner" documents ' !' as valid
+# only for the first item in an otherwise-empty list, and states it's
+# unnecessary even then, since the service auto-generates a hint when the
+# property is left unset. Sending the same literal for every new sibling
+# item (the 2nd+ bucket in a plan, or 2+ assignees in one call) would give
+# them identical, unordered hints instead of a service-assigned order.
 
 
 class _GraphRequestError(RuntimeError):
@@ -176,15 +178,16 @@ def _resolve_list_path(default_path: str, next_link: str | None) -> str:
     return path
 
 
+def _validated_user_ids(user_ids: list[str]) -> list[str]:
+    return [require_clean_identifier(user_id, "user_id") for user_id in user_ids]
+
+
 def _build_assignments(user_ids: list[str] | None) -> dict[str, Any] | None:
     if not user_ids:
         return None
     return {
-        require_clean_identifier(user_id, "user_id"): {
-            "@odata.type": "#microsoft.graph.plannerAssignment",
-            "orderHint": _DEFAULT_ORDER_HINT,
-        }
-        for user_id in user_ids
+        user_id: {"@odata.type": "#microsoft.graph.plannerAssignment"}
+        for user_id in _validated_user_ids(user_ids)
     }
 
 
@@ -264,7 +267,8 @@ def planner_list_buckets(plan_id: str, next_link: str | None = None) -> str:
 
 @mcp.tool()
 def planner_create_bucket(plan_id: str, name: str) -> str:
-    """Create a new bucket in a Planner plan, added after the existing buckets."""
+    """Create a new bucket in a Planner plan. Its position among existing
+    buckets is assigned by the service."""
     try:
         name = name.strip()
         if not name:
@@ -272,7 +276,6 @@ def planner_create_bucket(plan_id: str, name: str) -> str:
         body = {
             "name": name,
             "planId": require_clean_identifier(plan_id, "plan_id"),
-            "orderHint": _DEFAULT_ORDER_HINT,
         }
         result = _graph_request("POST", "/planner/buckets", body=body)
         return _success(bucket=result)
@@ -355,9 +358,12 @@ def planner_create_task(
             "planId": require_clean_identifier(plan_id, "plan_id"),
             "title": title,
         }
-        if bucket_id:
+        if bucket_id is not None:
             body["bucketId"] = require_clean_identifier(bucket_id, "bucket_id")
-        if due_date_time:
+        if due_date_time is not None:
+            due_date_time = due_date_time.strip()
+            if not due_date_time:
+                raise ValueError("due_date_time cannot be empty")
             body["dueDateTime"] = due_date_time
         assignments = _build_assignments(assignee_user_ids)
         if assignments:
@@ -386,7 +392,8 @@ def planner_update_task(
     percent_complete is 0-100 (100 marks the task completed). priority is
     0-10 (Planner maps 0-1 to "urgent", 2-4 "important", 5-7 "medium", 8-10
     "low"). due_date_time/start_date_time must be RFC3339/ISO 8601 UTC
-    timestamps, e.g. "2026-09-30T00:00:00Z". etag is optional -- pass the
+    timestamps, e.g. "2026-09-30T00:00:00Z"; pass "" for either to clear it.
+    Pass "" for bucket_id to unbucket the task. etag is optional -- pass the
     @odata.etag from a recent planner_get_task call on this same task to
     skip an extra lookup; omit it to have one fetched automatically."""
     try:
@@ -397,7 +404,11 @@ def planner_update_task(
                 raise ValueError("title cannot be empty")
             body["title"] = title
         if bucket_id is not None:
-            body["bucketId"] = require_clean_identifier(bucket_id, "bucket_id")
+            body["bucketId"] = (
+                None
+                if bucket_id == ""
+                else require_clean_identifier(bucket_id, "bucket_id")
+            )
         if percent_complete is not None:
             if not 0 <= percent_complete <= 100:
                 raise ValueError("percent_complete must be between 0 and 100")
@@ -407,9 +418,9 @@ def planner_update_task(
                 raise ValueError("priority must be between 0 and 10")
             body["priority"] = priority
         if due_date_time is not None:
-            body["dueDateTime"] = due_date_time
+            body["dueDateTime"] = due_date_time or None
         if start_date_time is not None:
-            body["startDateTime"] = start_date_time
+            body["startDateTime"] = start_date_time or None
         if not body:
             raise ValueError("at least one field must be provided to update the task")
 
@@ -450,12 +461,7 @@ def planner_unassign_task(
         if not user_ids:
             raise ValueError("user_ids is required")
         task_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
-        body = {
-            "assignments": {
-                require_clean_identifier(user_id, "user_id"): None
-                for user_id in user_ids
-            }
-        }
+        body = {"assignments": dict.fromkeys(_validated_user_ids(user_ids))}
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task unassigned successfully")
     except Exception as e:

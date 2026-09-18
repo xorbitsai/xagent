@@ -263,6 +263,12 @@ def test_create_bucket_uses_default_order_hint(monkeypatch):
     }
 
 
+def test_create_bucket_rejects_malformed_plan_id():
+    result = json.loads(planner.planner_create_bucket(" plan-1 ", "To do"))
+    assert result["status"] == "error"
+    assert "plan_id" in result["message"]
+
+
 # ---------------------------------------------------------------------------
 # tasks
 # ---------------------------------------------------------------------------
@@ -339,6 +345,28 @@ def test_create_task_requires_title():
     assert result["status"] == "error"
 
 
+def test_create_task_rejects_malformed_bucket_id():
+    result = json.loads(
+        planner.planner_create_task("plan-1", "Write report", bucket_id=" bucket-1 ")
+    )
+    assert result["status"] == "error"
+    assert "bucket_id" in result["message"]
+
+
+def test_create_task_rejects_malformed_assignee_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"id": "task-1"}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(
+        planner.planner_create_task(
+            "plan-1", "Write report", assignee_user_ids=[" user-1 "]
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "user_id" in result["message"]
+
+
 def test_update_task_fetches_etag_and_sends_if_match(monkeypatch):
     responses = iter(
         [
@@ -393,6 +421,18 @@ def test_update_task_validates_priority():
     assert "priority" in result["message"]
 
 
+def test_update_task_rejects_blank_title():
+    result = json.loads(planner.planner_update_task("task-1", title="   "))
+    assert result["status"] == "error"
+    assert "title" in result["message"]
+
+
+def test_update_task_rejects_malformed_bucket_id():
+    result = json.loads(planner.planner_update_task("task-1", bucket_id=" bucket-1 "))
+    assert result["status"] == "error"
+    assert "bucket_id" in result["message"]
+
+
 def test_delete_task_fetches_etag_and_sends_if_match(monkeypatch):
     responses = iter(
         [
@@ -433,6 +473,18 @@ def test_unassign_task_sends_null_per_user(monkeypatch):
     assert patch_call.kwargs["json"] == {
         "assignments": {"user-1": None, "user-2": None}
     }
+
+
+def test_unassign_task_rejects_malformed_user_id():
+    result = json.loads(planner.planner_unassign_task("task-1", [" user-1 "]))
+    assert result["status"] == "error"
+    assert "user_id" in result["message"]
+
+
+def test_assign_task_rejects_malformed_user_id():
+    result = json.loads(planner.planner_assign_task("task-1", [" user-1 "]))
+    assert result["status"] == "error"
+    assert "user_id" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +565,14 @@ def test_set_checklist_item_checked(monkeypatch):
     }
 
 
+def test_set_checklist_item_checked_rejects_malformed_item_id():
+    result = json.loads(
+        planner.planner_set_checklist_item_checked("task-1", " item-1 ", True)
+    )
+    assert result["status"] == "error"
+    assert "item_id" in result["message"]
+
+
 def test_delete_checklist_item_sends_null(monkeypatch):
     responses = iter(
         [
@@ -528,6 +588,12 @@ def test_delete_checklist_item_sends_null(monkeypatch):
     assert result["status"] == "success"
     patch_call = mock_request.call_args_list[1]
     assert patch_call.kwargs["json"] == {"checklist": {"item-1": None}}
+
+
+def test_delete_checklist_item_rejects_malformed_item_id():
+    result = json.loads(planner.planner_delete_checklist_item("task-1", " item-1 "))
+    assert result["status"] == "error"
+    assert "item_id" in result["message"]
 
 
 # ---------------------------------------------------------------------------

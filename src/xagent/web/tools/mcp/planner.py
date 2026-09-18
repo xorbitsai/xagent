@@ -7,7 +7,7 @@ from typing import Any
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env, url_path_id
+from .utils import require_clean_identifier, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("planner-mcp")
@@ -180,7 +180,7 @@ def _build_assignments(user_ids: list[str] | None) -> dict[str, Any] | None:
     if not user_ids:
         return None
     return {
-        user_id: {
+        require_clean_identifier(user_id, "user_id"): {
             "@odata.type": "#microsoft.graph.plannerAssignment",
             "orderHint": _DEFAULT_ORDER_HINT,
         }
@@ -269,7 +269,11 @@ def planner_create_bucket(plan_id: str, name: str) -> str:
         name = name.strip()
         if not name:
             raise ValueError("name is required")
-        body = {"name": name, "planId": plan_id, "orderHint": _DEFAULT_ORDER_HINT}
+        body = {
+            "name": name,
+            "planId": require_clean_identifier(plan_id, "plan_id"),
+            "orderHint": _DEFAULT_ORDER_HINT,
+        }
         result = _graph_request("POST", "/planner/buckets", body=body)
         return _success(bucket=result)
     except Exception as e:
@@ -347,9 +351,12 @@ def planner_create_task(
         title = title.strip()
         if not title:
             raise ValueError("title is required")
-        body: dict[str, Any] = {"planId": plan_id, "title": title}
+        body: dict[str, Any] = {
+            "planId": require_clean_identifier(plan_id, "plan_id"),
+            "title": title,
+        }
         if bucket_id:
-            body["bucketId"] = bucket_id
+            body["bucketId"] = require_clean_identifier(bucket_id, "bucket_id")
         if due_date_time:
             body["dueDateTime"] = due_date_time
         assignments = _build_assignments(assignee_user_ids)
@@ -385,9 +392,12 @@ def planner_update_task(
     try:
         body: dict[str, Any] = {}
         if title is not None:
+            title = title.strip()
+            if not title:
+                raise ValueError("title cannot be empty")
             body["title"] = title
         if bucket_id is not None:
-            body["bucketId"] = bucket_id
+            body["bucketId"] = require_clean_identifier(bucket_id, "bucket_id")
         if percent_complete is not None:
             if not 0 <= percent_complete <= 100:
                 raise ValueError("percent_complete must be between 0 and 100")
@@ -440,7 +450,12 @@ def planner_unassign_task(
         if not user_ids:
             raise ValueError("user_ids is required")
         task_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
-        body = {"assignments": dict.fromkeys(user_ids)}
+        body = {
+            "assignments": {
+                require_clean_identifier(user_id, "user_id"): None
+                for user_id in user_ids
+            }
+        }
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task unassigned successfully")
     except Exception as e:
@@ -531,7 +546,7 @@ def planner_set_checklist_item_checked(
         details_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}/details"
         body = {
             "checklist": {
-                item_id: {
+                require_clean_identifier(item_id, "item_id"): {
                     "@odata.type": "microsoft.graph.plannerChecklistItem",
                     "isChecked": is_checked,
                 }
@@ -557,7 +572,7 @@ def planner_delete_checklist_item(
     -- see planner_update_task_description."""
     try:
         details_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}/details"
-        body = {"checklist": {item_id: None}}
+        body = {"checklist": {require_clean_identifier(item_id, "item_id"): None}}
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(message="Checklist item deleted successfully")
     except Exception as e:

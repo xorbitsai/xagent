@@ -110,31 +110,40 @@ def _graph_request(
     raw: bool = False,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
-    response = requests.request(
-        method=method,
-        url=f"{GRAPH_BASE_URL}{path}",
-        headers=_graph_headers(extra_headers),
-        params=params,
-        json=body,
-        data=data,
-        timeout=timeout,
-    )
+    # Graph's /content GET 302s to a preauthenticated download URL (a
+    # bearer secret in its own query string), which requests follows
+    # automatically -- so *any* failure once that redirect has happened,
+    # not just an HTTP error status, can carry that signed URL: a
+    # connection-layer failure (timeout, reset, TLS error) raises a
+    # RequestException whose own str() embeds it exactly like HTTPError's
+    # does. Both branches below build their own message from method/path
+    # (this function's own input, never the possibly-redirected
+    # response/request URL) instead of str(exc), and raise "from None"
+    # rather than chaining the original exception as __cause__ -- chaining
+    # would still let a future traceback/log/APM capture surface that URL
+    # even with a clean top-level message, matching _create_only_upload's
+    # identical guard on its own upload-session URL.
+    try:
+        response = requests.request(
+            method=method,
+            url=f"{GRAPH_BASE_URL}{path}",
+            headers=_graph_headers(extra_headers),
+            params=params,
+            json=body,
+            data=data,
+            timeout=timeout,
+        )
+    except requests.RequestException:
+        raise RuntimeError(f"Graph request failed: {method} {path}") from None
+
     try:
         response.raise_for_status()
-    except requests.HTTPError as exc:
-        # Graph's /content GET 302s to a preauthenticated download URL (a
-        # bearer secret in its own query string) -- if *that* request then
-        # fails, requests.HTTPError's own str() embeds response.url, which
-        # by then is the signed redirect target, not the original Graph
-        # path. Building the message from status_code/response_text
-        # instead (never str(exc)) keeps that URL out of every caller's
-        # error/log output, matching _create_only_upload's identical guard
-        # on its own upload-session URL.
+    except requests.HTTPError:
         response_text = response.text.strip()
-        message = f"Graph request failed with HTTP {response.status_code}"
+        message = f"Graph {method} {path} failed with HTTP {response.status_code}"
         if response_text:
             message = f"{message} - {response_text}"
-        raise _GraphRequestError(message, status_code=response.status_code) from exc
+        raise _GraphRequestError(message, status_code=response.status_code) from None
 
     if raw:
         return response.content
@@ -316,7 +325,10 @@ def _upload_presentation_session(
             except requests.RequestException:
                 raise RuntimeError("PowerPoint presentation upload failed") from None
             if end == total:
-                result = response.json()
+                try:
+                    result = response.json()
+                except ValueError:
+                    result = None
 
     if not isinstance(result, dict) or not result.get("id"):
         raise RuntimeError("Graph did not confirm the presentation upload completed")
@@ -395,7 +407,10 @@ def _create_only_upload(
         ) from None
     except requests.RequestException:
         raise RuntimeError("PowerPoint presentation upload failed") from None
-    result = response.json()
+    try:
+        result = response.json()
+    except ValueError:
+        result = None
     if not isinstance(result, dict) or not result.get("id"):
         raise RuntimeError("Graph did not confirm the presentation upload completed")
     safe_item = dict(result)
@@ -420,10 +435,9 @@ def _slide_texts(slide: Any) -> list[str]:
     """
     texts: list[str] = []
     for shape in iter_pptx_shapes(slide.shapes):
-        if shape.has_text_frame:
-            text = shape.text_frame.text
-            if text:
-                texts.append(text)
+        text = _shape_text(shape)
+        if text:
+            texts.append(text)
         elif getattr(shape, "has_table", False):
             for row in shape.table.rows:
                 for cell in row.cells:
@@ -434,18 +448,24 @@ def _slide_texts(slide: Any) -> list[str]:
 
 
 def _slide_notes(slide: Any) -> str | None:
-    """slide's speaker notes text, or None if it has no notes slide.
+    """slide's speaker notes text, or None if it has no notes slide or no
+    notes placeholder on it.
 
     Checked via has_notes_slide rather than a bare getattr/try -- python-
     pptx's own notes_slide property *creates* a notes slide on first access
     if one doesn't already exist, which would silently mutate a
     presentation this module never intends to write back for a read-only
-    tool.
+    tool. notes_text_frame can still be None even when has_notes_slide is
+    True -- per its own docstring, that happens if the notes placeholder
+    was deleted from the notes slide (the notes-slide XML part survives,
+    just without a body placeholder).
     """
     if not slide.has_notes_slide:
         return None
-    text = slide.notes_slide.notes_text_frame.text
-    return text or None
+    notes_text_frame = slide.notes_slide.notes_text_frame
+    if notes_text_frame is None:
+        return None
+    return notes_text_frame.text or None
 
 
 def _select_body_placeholder(slide: Any) -> Any | None:

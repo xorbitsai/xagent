@@ -704,12 +704,47 @@ def test_upload_presentation_session_failure_does_not_leak_session_url(monkeypat
 # ---------------------------------------------------------------------------
 
 
-def test_graph_request_failure_does_not_leak_redirect_url(monkeypatch):
+def test_graph_request_http_error_does_not_leak_redirect_url(monkeypatch):
     """Graph's /content GET redirects to a preauthenticated download URL --
     if that final request fails, requests' own HTTPError.__str__ embeds
     that signed URL as response.url. _graph_request must never surface
-    that string, whether directly in the returned message or as the
-    chained exception's __cause__."""
+    that string, whether directly in the raised message or as the
+    chained exception's __cause__ (a future traceback/log/APM capture
+    could still surface a __cause__ even with a clean top-level message)."""
+    secret_url = "https://blob.example/deck.pptx?token=super-secret-value"
+    mock_request = Mock(return_value=MockResponse({}, status_code=403, url=secret_url))
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+
+    with pytest.raises(powerpoint._GraphRequestError) as exc_info:
+        powerpoint._graph_request("GET", "/me/drive/root:/Deck.pptx:/content")
+
+    assert "super-secret-value" not in str(exc_info.value)
+    assert secret_url not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_graph_request_connection_error_does_not_leak_redirect_url(monkeypatch):
+    """The initial requests.request() call itself (not just raise_for_status())
+    can fail at the connection layer (timeout, reset, TLS error) after
+    following the same redirect -- requests.RequestException's own str()
+    embeds the URL just like HTTPError's does, so this path must be
+    sanitized too."""
+    secret_url = "https://blob.example/deck.pptx?token=super-secret-value"
+    mock_request = Mock(
+        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
+    )
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        powerpoint._graph_request("GET", "/me/drive/root:/Deck.pptx:/content")
+
+    assert "super-secret-value" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_get_presentation_text_reports_download_failure_without_leaking_url(
+    monkeypatch,
+):
     secret_url = "https://blob.example/deck.pptx?token=super-secret-value"
     mock_request = Mock(return_value=MockResponse({}, status_code=403, url=secret_url))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
@@ -719,6 +754,59 @@ def test_graph_request_failure_does_not_leak_redirect_url(monkeypatch):
     assert result["status"] == "error"
     assert "super-secret-value" not in result["message"]
     assert secret_url not in result["message"]
+
+
+def test_slide_notes_returns_none_when_notes_placeholder_is_missing():
+    """notes_text_frame can be None even when has_notes_slide is True --
+    e.g. the notes placeholder was deleted from the notes slide while the
+    notes-slide XML part itself survives."""
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    notes_slide = slide.notes_slide  # creates the notes slide
+    notes_placeholder = notes_slide.notes_placeholder
+    notes_placeholder._element.getparent().remove(notes_placeholder._element)
+
+    assert notes_slide.notes_text_frame is None
+    assert powerpoint._slide_notes(slide) is None
+
+
+def _non_json_success_response() -> Mock:
+    """A 2xx response whose body isn't valid JSON -- unlike MockResponse,
+    whose .json() always returns a stored dict regardless of `content`,
+    this actually raises like a real empty/non-JSON body would."""
+    response = Mock()
+    response.status_code = 200
+    response.raise_for_status = Mock(return_value=None)
+    response.json = Mock(side_effect=ValueError("Expecting value"))
+    return response
+
+
+def test_upload_presentation_session_handles_non_json_final_response(monkeypatch):
+    """A 2xx final PUT with an empty/non-JSON body must raise the intended
+    'did not confirm' RuntimeError, not a raw JSONDecodeError."""
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+    )
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    mock_put = Mock(return_value=_non_json_success_response())
+    mock_session_cls = MagicMock()
+    mock_session_cls.return_value.__enter__.return_value.put = mock_put
+    monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
+
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        powerpoint._upload_presentation_session(b"content", "Deck.pptx", None, None)
+
+
+def test_create_only_upload_handles_non_json_final_response(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+    )
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    mock_put = Mock(return_value=_non_json_success_response())
+    monkeypatch.setattr(powerpoint.requests, "put", mock_put)
+
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        powerpoint._create_only_upload(b"content", "Deck.pptx", None, None)
 
 
 def test_replace_text_frame_text_preserves_run_formatting():

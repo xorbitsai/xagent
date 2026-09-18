@@ -2249,6 +2249,14 @@ def _enrich_oauth_server_info(
                 account_id,
             )
 
+    # A pre-existing invariant this response has always kept (see
+    # test_meta_oauth.py's blanked-token regression test, from an earlier
+    # reconnect-migration incident): a stale email left on a row whose token
+    # no longer works must not be surfaced as an account label. The row's
+    # health still drives connection_status above; only the label is masked.
+    if connection_status != "connected":
+        connected_account = None
+
     return app_id, provider, connected_account, connection_status
 
 

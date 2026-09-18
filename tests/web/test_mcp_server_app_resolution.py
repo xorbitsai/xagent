@@ -330,7 +330,7 @@ class TestTheChangedCallers:
 
         assert response.id == server_id
         assert response.connection_status == "needs_reconnect"
-        assert response.connected_account == "someone@acme.example"
+        assert response.connected_account is None
 
     def test_listing_reports_a_healthy_grant_as_connected(self, db):
         """The counterpart to the cleared-token case above: an untouched,
@@ -413,7 +413,10 @@ class TestTheChangedCallers:
         even though an older, healthy row exists under the other candidate
         key. This is the exact cross-key pooling code two earlier review
         rounds found bugs in; the test above only pins the newer-is-healthy
-        direction, this pins the newer-is-broken one."""
+        direction, this pins the newer-is-broken one. The stale email on
+        that broken row must not be surfaced as an account label (a
+        pre-existing invariant -- see test_meta_oauth.py's blanked-token
+        regression test)."""
         from xagent.web.api.mcp import get_mcp_servers
         from xagent.web.models.user_oauth import UserOAuth
 
@@ -433,7 +436,7 @@ class TestTheChangedCallers:
 
         assert response.id == server_id
         assert response.connection_status == "needs_reconnect"
-        assert response.connected_account == "newer@acme.example"
+        assert response.connected_account is None
 
     def test_summaries_pick_the_newest_row_even_when_it_is_broken(self, db):
         """The runtime token resolver always selects the single

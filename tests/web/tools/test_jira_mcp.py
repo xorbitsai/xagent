@@ -1,4 +1,5 @@
 import json
+import logging
 from unittest.mock import Mock
 
 import pytest
@@ -246,6 +247,34 @@ def test_get_issue_percent_encodes_issue_key_in_path(monkeypatch):
     )
 
 
+def test_path_segment_rejects_bare_dot_and_dot_dot():
+    # "." and ".." are always-unreserved per RFC 3986, so quote() never
+    # touches them, and requests/urllib3 normalize dot-segments out of
+    # the final URL before sending -- percent-encoding alone can't close
+    # this off, so the value must be rejected outright instead.
+    with pytest.raises(ValueError, match=r"\.\."):
+        jira._path_segment("..")
+    with pytest.raises(ValueError, match=r"\."):
+        jira._path_segment(".")
+    # A value that merely CONTAINS ".." (not equal to it) is a normal,
+    # legitimately encodable value -- only an exact match is rejected.
+    assert jira._path_segment("ENG-1/../secrets") == "ENG-1%2F..%2Fsecrets"
+
+
+def test_get_issue_rejects_bare_dot_dot_issue_key(monkeypatch):
+    mock_request = Mock(side_effect=[MockResponse(json_data=[_SITE_A])])
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue(".."))
+
+    assert result["status"] == "error"
+    # _issue_path(issue_key) is built (and raises) before _request is
+    # ever called, so no network request -- not even the
+    # accessible-resources lookup used to resolve cloud_id -- goes out
+    # at all.
+    mock_request.assert_not_called()
+
+
 def test_list_accessible_sites_returns_sites(monkeypatch):
     monkeypatch.setattr(
         jira.requests,
@@ -373,6 +402,7 @@ def test_search_issues_sends_jql_and_reports_next_page_token(monkeypatch):
                     "nextPageToken": "token-2",
                 }
             ),
+            MockResponse(json_data={"count": 42}),
         ]
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
@@ -381,6 +411,9 @@ def test_search_issues_sends_jql_and_reports_next_page_token(monkeypatch):
 
     assert result["status"] == "success"
     assert result["issues"][0]["key"] == "ENG-1"
+    assert result["issues"][0]["summary"] == "Bug"
+    assert result["returned_count"] == 1
+    assert result["total_count"] == 42
     assert result["truncated"] is True
     assert result["next_page_token"] == "token-2"
     search_call = mock_request.call_args_list[1]
@@ -388,6 +421,11 @@ def test_search_issues_sends_jql_and_reports_next_page_token(monkeypatch):
         "https://api.atlassian.com/ex/jira/site-a/rest/api/3/search/jql"
     )
     assert search_call.kwargs["params"]["jql"] == "project = ENG"
+    count_call = mock_request.call_args_list[2]
+    assert count_call.kwargs["url"] == (
+        "https://api.atlassian.com/ex/jira/site-a/rest/api/3/search/approximate-count"
+    )
+    assert count_call.kwargs["json"] == {"jql": "project = ENG"}
 
 
 def test_search_issues_passes_next_page_token_when_provided(monkeypatch):
@@ -400,6 +438,7 @@ def test_search_issues_passes_next_page_token_when_provided(monkeypatch):
                     "isLast": True,
                 }
             ),
+            MockResponse(json_data={"count": 1}),
         ]
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
@@ -413,6 +452,457 @@ def test_search_issues_passes_next_page_token_when_provided(monkeypatch):
     assert result["next_page_token"] is None
     search_call = mock_request.call_args_list[1]
     assert search_call.kwargs["params"]["nextPageToken"] == "token-2"
+
+
+def test_search_issues_summarizes_issue_fields(monkeypatch):
+    raw_issue = {
+        "expand": "renderedFields,names,schema,operations,editmeta,changelog",
+        "id": "34280",
+        "self": "https://api.atlassian.com/ex/jira/site-a/rest/api/3/issue/34280",
+        "key": "DW-782",
+        "fields": {
+            "summary": "[Connectify][6thman] Persist customer configuration",
+            "status": {
+                "name": "待办",
+                "id": "10004",
+                "iconUrl": "https://api.atlassian.com/.../10004",
+                "statusCategory": {"id": 2, "name": "To Do", "key": "new"},
+            },
+            "assignee": {
+                "accountId": "712020:98fdf2ea-b760-410a-ac9e-43b4f4d5038a",
+                "displayName": "jiarongling",
+                "emailAddress": "jiarongling@example.com",
+                "avatarUrls": {"48x48": "https://secure.gravatar.com/avatar/..."},
+            },
+            "priority": {
+                "name": "P2 - High",
+                "iconUrl": "https://api.atlassian.com/.../priority",
+            },
+            "issuetype": {"name": "任务", "avatarId": 10318, "subtask": False},
+            "project": {
+                "id": "10033",
+                "key": "DW",
+                "name": "Datapel WMS",
+                "avatarUrls": {"48x48": "https://api.atlassian.com/.../avatar"},
+            },
+            "parent": {"key": "DW-746", "fields": {"summary": "Epic"}},
+            "resolution": None,
+            "labels": ["connectify", "connectify-uplift"],
+            "created": "2026-09-09T10:00:00.000+0000",
+            "updated": "2026-09-11T19:57:00.000+0000",
+        },
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": [raw_issue], "isLast": True}),
+            MockResponse(json_data={"count": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_issues("project = DW"))
+
+    assert result["issues"] == [
+        {
+            "key": "DW-782",
+            "summary": "[Connectify][6thman] Persist customer configuration",
+            "status": "待办",
+            "status_category": "To Do",
+            "assignee": {
+                "account_id": "712020:98fdf2ea-b760-410a-ac9e-43b4f4d5038a",
+                "display_name": "jiarongling",
+            },
+            "priority": "P2 - High",
+            "issue_type": "任务",
+            "project_key": "DW",
+            "labels": ["connectify", "connectify-uplift"],
+            "parent_key": "DW-746",
+            "resolution": None,
+            "created": "2026-09-09T10:00:00.000+0000",
+            "updated": "2026-09-11T19:57:00.000+0000",
+        }
+    ]
+    # None of the URL/avatar/icon clutter that bloats a raw issue to
+    # ~3-4 KB should survive into the summarized shape.
+    assert "avatarUrls" not in json.dumps(result)
+    assert "self" not in result["issues"][0]
+    assert "expand" not in result["issues"][0]
+
+
+def test_search_issues_summarizes_resolved_issue(monkeypatch):
+    # The comprehensive fixture above only exercises resolution=None
+    # (unresolved). _summarize_issue reads resolution.get("name") for the
+    # resolved case, which a null-only fixture can never catch a
+    # regression in (e.g. reading the wrong key, or always emitting null).
+    raw_issue = {
+        "key": "DW-785",
+        "fields": {
+            "summary": "Identify /api/dev consumers",
+            "status": {"name": "Done", "statusCategory": {"name": "Done"}},
+            "resolution": {"id": "10000", "name": "Fixed"},
+        },
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": [raw_issue], "isLast": True}),
+            MockResponse(json_data={"count": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_issues("project = DW"))
+
+    assert result["issues"][0]["resolution"] == "Fixed"
+
+
+def test_search_issues_total_count_is_none_when_count_endpoint_fails(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": [], "isLast": True}),
+            MockResponse(json_data={"errorMessages": ["bad jql"]}, status_code=400),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_issues("text ~ Connectify"))
+
+    assert result["status"] == "success"
+    assert result["total_count"] is None
+    assert result["returned_count"] == 0
+
+
+def _raw_issue_with_summary(key: str, summary_length: int):
+    return {
+        "key": key,
+        "fields": {"summary": "x" * summary_length, "status": {"name": "To Do"}},
+    }
+
+
+def test_search_issues_retries_with_smaller_page_when_over_output_budget(monkeypatch):
+    # 20 issues is the projected page at the default limit (50); 3 issues
+    # is what the _RETRY_PAGE_SIZE (10) retry happens to return here.
+    large_page = {
+        "issues": [_raw_issue_with_summary(f"ENG-{i}", 200) for i in range(20)],
+        "nextPageToken": "orig-next-token",
+    }
+    small_page = {
+        "issues": [_raw_issue_with_summary(f"ENG-{i}", 200) for i in range(3)],
+        "nextPageToken": "retry-next-token",
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=large_page),
+            MockResponse(json_data=small_page),
+            MockResponse(json_data={"count": 500}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    # Small enough that the 20-issue page overflows but the 3-issue retry
+    # page fits.
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 1500)
+
+    result = json.loads(jira.jira_search_issues("project = ENG"))
+
+    assert result["status"] == "success"
+    assert result["returned_count"] == 3
+    assert result["total_count"] == 500
+    assert result["next_page_token"] == "retry-next-token"
+    first_search_call = mock_request.call_args_list[1]
+    retry_search_call = mock_request.call_args_list[2]
+    assert retry_search_call.kwargs["params"]["maxResults"] == jira._RETRY_PAGE_SIZE
+    # Both requests must use the SAME incoming next_page_token (absent
+    # here -- the caller passed none), not Jira's nextPageToken from the
+    # oversized first page: that token points past all 20 originally
+    # fetched issues, so retrying with it would skip the ones dropped
+    # here rather than actually returning a smaller, complete page.
+    assert "nextPageToken" not in first_search_call.kwargs["params"]
+    assert "nextPageToken" not in retry_search_call.kwargs["params"]
+
+
+def test_search_issues_returns_bounded_error_when_minimal_page_still_too_big(
+    monkeypatch,
+):
+    # One issue whose summary alone is bigger than the budget -- every
+    # candidate size in _page_size_candidates (default limit=50 -> 50,
+    # 10, 1) gets a page this oversized, so all three attempts must be
+    # exhausted (no count call: fit is never reached).
+    page = {
+        "issues": [_raw_issue_with_summary("ENG-1", 50)],
+        "nextPageToken": "token",
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=page),
+            MockResponse(json_data=page),
+            MockResponse(json_data=page),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 5)
+
+    result = json.loads(jira.jira_search_issues("project = ENG"))
+
+    assert result["status"] == "error"
+    assert "output limit" in result["message"]
+    assert mock_request.call_count == 4
+
+
+def test_page_size_candidates_include_a_floor_below_a_small_limit():
+    # A caller-requested limit at or below _RETRY_PAGE_SIZE must still
+    # get a chance at an even smaller page instead of skipping straight
+    # to "even at a minimal page size" without ever trying one.
+    assert jira._page_size_candidates(3) == (3, 1)
+    assert jira._page_size_candidates(jira._RETRY_PAGE_SIZE) == (
+        jira._RETRY_PAGE_SIZE,
+        1,
+    )
+    assert jira._page_size_candidates(50) == (50, jira._RETRY_PAGE_SIZE, 1)
+    assert jira._page_size_candidates(1) == (1,)
+
+
+def test_search_issues_tries_a_size_of_one_when_small_limit_overflows(monkeypatch):
+    # limit=3 (below _RETRY_PAGE_SIZE) must still fall back to size=1
+    # rather than erroring out after only the size-3 attempt.
+    oversized_page = {
+        "issues": [_raw_issue_with_summary("ENG-1", 200)],
+        "nextPageToken": None,
+    }
+    fitting_page = {"issues": [{"key": "ENG-2", "fields": {"summary": "ok"}}]}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=oversized_page),
+            MockResponse(json_data=fitting_page),
+            MockResponse(json_data={"count": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 400)
+
+    result = json.loads(jira.jira_search_issues("project = ENG", limit=3))
+
+    assert result["status"] == "success"
+    assert result["returned_count"] == 1
+    second_search_call = mock_request.call_args_list[2]
+    assert second_search_call.kwargs["params"]["maxResults"] == 1
+
+
+def test_search_issues_fails_on_non_advancing_pagination_cursor(monkeypatch):
+    page = {
+        "issues": [{"key": "ENG-1", "fields": {"summary": "ok"}}],
+        "nextPageToken": "same-token",
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=page),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_search_issues("project = ENG", next_page_token="same-token")
+    )
+
+    assert result["status"] == "error"
+    assert "did not advance" in result["message"]
+
+
+def test_search_issues_skips_approximate_count_on_later_pages(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": [], "isLast": True}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_search_issues("project = ENG", next_page_token="page-2-token")
+    )
+
+    assert result["status"] == "success"
+    assert result["total_count"] is None
+    # Only 2 calls total (sites + search) -- no approximate-count call.
+    assert mock_request.call_count == 2
+
+
+def test_approximate_count_warns_on_non_integer_count(monkeypatch, caplog):
+    mock_request = Mock(
+        side_effect=[MockResponse(json_data={"count": "12"})],
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with caplog.at_level(logging.WARNING, logger="jira-mcp"):
+        result = jira._approximate_count("site-a", "project = ENG")
+
+    assert result is None
+    assert "non-integer" in caplog.text
+
+
+def test_approximate_count_treats_bool_count_as_non_integer(monkeypatch, caplog):
+    # bool is a subclass of int in Python -- a "count": true shape
+    # anomaly must not be silently accepted as if it were a real count.
+    mock_request = Mock(side_effect=[MockResponse(json_data={"count": True})])
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with caplog.at_level(logging.WARNING, logger="jira-mcp"):
+        result = jira._approximate_count("site-a", "project = ENG")
+
+    assert result is None
+    assert "non-integer" in caplog.text
+
+
+def test_jql_digest_tolerates_a_non_string_jql():
+    # Runs inside exception handlers whose whole point is to insulate a
+    # failing advisory call from the primary search -- it must not
+    # itself raise if jql is ever something other than a str.
+    assert jira._jql_digest(12345) == jira._jql_digest("12345")
+
+
+def test_fetch_and_summarize_page_raises_on_non_list_issues(monkeypatch):
+    mock_request = Mock(side_effect=[MockResponse(json_data={"issues": "not-a-list"})])
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with pytest.raises(RuntimeError, match="Unexpected 'issues' shape"):
+        jira._fetch_and_summarize_page("site-a", "project = ENG", 50, "")
+
+
+def test_summarize_issue_tolerates_malformed_nested_fields():
+    # A single issue with a malformed nested field (e.g. a misconfigured
+    # custom field reshaping "assignee" to a string) must degrade
+    # gracefully instead of raising AttributeError and failing the
+    # entire page over one bad issue.
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "assignee": "not-a-dict",
+            "status": ["not", "a", "dict"],
+            "priority": 42,
+        },
+    }
+    result = jira._summarize_issue(raw_issue)
+    assert result["key"] == "ENG-1"
+    assert result["assignee"] is None
+    assert result["status"] is None
+    assert result["priority"] is None
+
+
+def test_search_issues_fallback_attempts_use_a_shorter_bounded_timeout(monkeypatch):
+    # The first attempt (at the caller's requested size) should keep the
+    # normal timeout/retry settings; only later fallback attempts get
+    # the shorter, no-retry budget, so a rate-limited Jira endpoint can't
+    # stack a full 429 retry-sleep across every one of up to 3 attempts.
+    large_page = {
+        "issues": [_raw_issue_with_summary(f"ENG-{i}", 200) for i in range(20)],
+        "nextPageToken": "orig-next-token",
+    }
+    small_page = {"issues": [{"key": "ENG-1", "fields": {"summary": "ok"}}]}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=large_page),
+            MockResponse(json_data=small_page),
+            MockResponse(json_data={"count": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 1500)
+
+    jira.jira_search_issues("project = ENG")
+
+    first_search_call = mock_request.call_args_list[1]
+    fallback_search_call = mock_request.call_args_list[2]
+    assert first_search_call.kwargs["timeout"] == jira.DEFAULT_TIMEOUT_SECONDS
+    assert fallback_search_call.kwargs["timeout"] == (
+        jira._FALLBACK_ATTEMPT_TIMEOUT_SECONDS
+    )
+
+
+_SENTINEL_JQL = 'text ~ "super-secret-customer-name@example.com"'
+
+
+def test_search_issues_success_log_omits_raw_jql(monkeypatch, caplog):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": [], "isLast": True}),
+            MockResponse(json_data={"count": 0}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with caplog.at_level(logging.INFO, logger="jira-mcp"):
+        jira.jira_search_issues(_SENTINEL_JQL)
+
+    assert "super-secret-customer-name" not in caplog.text
+
+
+def test_search_issues_count_failure_warning_omits_raw_jql(monkeypatch, caplog):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": [], "isLast": True}),
+            MockResponse(json_data={"errorMessages": [_SENTINEL_JQL]}, status_code=400),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with caplog.at_level(logging.WARNING, logger="jira-mcp"):
+        jira.jira_search_issues(_SENTINEL_JQL)
+
+    assert "super-secret-customer-name" not in caplog.text
+
+
+def test_search_issues_error_log_omits_raw_jql(monkeypatch, caplog):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"errorMessages": [_SENTINEL_JQL]}, status_code=400),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with caplog.at_level(logging.ERROR, logger="jira-mcp"):
+        jira.jira_search_issues(_SENTINEL_JQL)
+
+    assert "super-secret-customer-name" not in caplog.text
+
+
+def test_approximate_count_uses_a_short_no_retry_timeout(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"count": 3}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = jira._approximate_count("site-a", "project = ENG")
+
+    assert result == 3
+    count_call = mock_request.call_args_list[0]
+    assert count_call.kwargs["timeout"] == jira._APPROXIMATE_COUNT_TIMEOUT_SECONDS
+
+
+def test_approximate_count_does_not_retry_on_429(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(jira.time, "sleep", lambda s: sleep_calls.append(s))
+    mock_request = Mock(
+        return_value=MockResponse(status_code=429, headers={"Retry-After": "1"})
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = jira._approximate_count("site-a", "project = ENG")
+
+    assert result is None
+    assert sleep_calls == []
+    assert mock_request.call_count == 1
 
 
 def test_get_issue_returns_issue(monkeypatch):

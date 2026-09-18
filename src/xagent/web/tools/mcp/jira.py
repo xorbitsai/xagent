@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -65,12 +67,24 @@ def _truncate(text: str) -> str:
 
 def _path_segment(value: str) -> str:
     """Percent-encode a value for safe interpolation into a URL path
-    segment (e.g. an issue key or cloud id), matching hubspot.py's
-    _url_path_id / intercom.py's inline quote() calls. Percent-encoding -
-    not a blocklist of "/", "?", "#" - is what actually prevents a value
-    like "ENG-1/../other" from escaping its intended path segment.
+    segment (e.g. an issue key or cloud id), matching mcp/utils.py's
+    url_path_id. Percent-encoding - not a blocklist of "/", "?", "#" -
+    is what actually prevents a value like "ENG-1/../other" from
+    escaping its intended path segment.
+
+    "." and ".." are the one case percent-encoding alone can't close:
+    both are always-unreserved per RFC 3986, so quote() never touches
+    them, and requests/urllib3 normalize dot-segments out of the final
+    URL before sending it (verified directly: requests.Request("GET",
+    ".../issue/%2E%2E/secrets").prepare().url collapses right back to
+    ".../issue/../secrets" -- a completely different, still-valid
+    endpoint). Rejecting the value outright, exactly as url_path_id
+    does, is what actually closes this off; encoding alone can't.
     """
-    return quote(str(value), safe="")
+    value = str(value)
+    if value in (".", ".."):
+        raise ValueError(f"path segment must not be '.' or '..': {value!r}")
+    return quote(value, safe="")
 
 
 def _issue_path(issue_key: str, suffix: str = "") -> str:
@@ -118,6 +132,8 @@ def _request_absolute(
     *,
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    allow_retry: bool = True,
 ) -> Any:
     for attempt in (0, 1):
         response = requests.request(
@@ -126,9 +142,9 @@ def _request_absolute(
             headers=_headers(),
             params=params,
             json=json_data,
-            timeout=DEFAULT_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
-        if response.status_code == 429 and attempt == 0:
+        if allow_retry and response.status_code == 429 and attempt == 0:
             try:
                 retry_after = int(response.headers.get("Retry-After", "0"))
             except ValueError:
@@ -199,6 +215,8 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    allow_retry: bool = True,
 ) -> Any:
     resolved_cloud_id = _resolve_cloud_id(cloud_id)
     return _request_absolute(
@@ -206,6 +224,8 @@ def _request(
         f"{JIRA_API_BASE}/{_path_segment(resolved_cloud_id)}{path}",
         params=params,
         json_data=json_data,
+        timeout=timeout,
+        allow_retry=allow_retry,
     )
 
 
@@ -286,52 +306,378 @@ def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -
         return _error(str(e))
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Return value if it's a dict, else {}.
+
+    A single choke point for the "unwrap an optional Jira object field"
+    pattern, so a non-dict truthy value (e.g. a misconfigured custom
+    field, or a proxy that reshapes one field) degrades to {} instead of
+    raising AttributeError on the next .get(...) call.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _summarize_issue(issue: dict[str, Any]) -> dict[str, Any]:
+    """Slim a raw Jira issue down to the handful of fields a search/triage
+    view needs.
+
+    A raw issue carries `expand`/`self`/`avatarUrls`/`iconUrl` on every
+    nested object (status, priority, issuetype, project, ...), which runs
+    ~3-4 KB per issue. jira_search_issues can return up to MAX_LIMIT (100)
+    of them in one call, so an unslimmed page routinely exceeds the
+    per-tool-output-string cap (see OutputFilteredToolWrapper) and gets cut
+    off mid-JSON -- including the `truncated`/`next_page_token` fields at
+    the tail, so the caller can't even tell pagination was in play.
+    """
+    # _as_dict guards every nested unwrap: a non-dict truthy value on
+    # any of these (e.g. a misconfigured custom field, or a proxy that
+    # reshapes one field on one malformed issue in an otherwise-good
+    # page) would otherwise raise AttributeError on the next .get(...)
+    # from inside the list comprehension in _fetch_and_summarize_page,
+    # failing the ENTIRE page over a single bad issue instead of just
+    # that issue degrading gracefully.
+    fields = _as_dict(issue.get("fields"))
+    assignee = _as_dict(fields.get("assignee"))
+    status = _as_dict(fields.get("status"))
+    priority = _as_dict(fields.get("priority"))
+    issuetype = _as_dict(fields.get("issuetype"))
+    project = _as_dict(fields.get("project"))
+    parent = _as_dict(fields.get("parent"))
+    resolution = _as_dict(fields.get("resolution"))
+    return {
+        "key": issue.get("key"),
+        "summary": fields.get("summary"),
+        "status": status.get("name"),
+        "status_category": _as_dict(status.get("statusCategory")).get("name"),
+        "assignee": (
+            {
+                "account_id": assignee.get("accountId"),
+                "display_name": assignee.get("displayName"),
+            }
+            if assignee
+            else None
+        ),
+        "priority": priority.get("name"),
+        "issue_type": issuetype.get("name"),
+        "project_key": project.get("key"),
+        "labels": fields.get("labels") or [],
+        "parent_key": parent.get("key"),
+        "resolution": resolution.get("name"),
+        "created": fields.get("created"),
+        "updated": fields.get("updated"),
+    }
+
+
+#: A short, no-retry budget for the advisory approximate-count call. The
+#: primary search has already succeeded by the time this runs, so a slow
+#: or rate-limited count endpoint must not hold the whole tool call for
+#: up to DEFAULT_TIMEOUT_SECONDS (or longer, via the normal 429
+#: retry-sleep) just for a number that is allowed to come back None.
+_APPROXIMATE_COUNT_TIMEOUT_SECONDS = 5
+
+#: A conservative page size to fall back to if the summarized page still
+#: doesn't fit the output budget at the caller's requested `limit` (e.g.
+#: very long summaries/labels at limit=100, or a lower configured
+#: XAGENT_TOOL_MAX_OUTPUT_LENGTH). Even a worst-case issue (255-char
+#: summary, several labels) runs under 1 KB summarized, so 10 of them
+#: comfortably fits any realistic budget.
+_RETRY_PAGE_SIZE = 10
+
+#: Timeout/retry budget for the SECOND-and-later attempts in
+#: jira_search_issues' page-size fallback loop (never the first, which
+#: keeps the normal DEFAULT_TIMEOUT_SECONDS/allow_retry=True so the
+#: caller's actual requested page respects Jira's real backpressure).
+#: Without this, up to 3 attempts could each independently hit a 429
+#: and sleep up to MAX_RETRY_AFTER_SECONDS before retrying -- a single
+#: tool call stacking towards ~4.5 minutes of worst-case latency purely
+#: to recover from an output-budget overflow, the same "advisory/
+#: recovery work must not hold the primary call hostage" principle
+#: already applied to _approximate_count, just for a different reason
+#: (bounding a self-inflicted retry instead of skipping optional data).
+_FALLBACK_ATTEMPT_TIMEOUT_SECONDS = 10
+
+#: Fields requested for jira_search_issues. Kept in one place so every
+#: page-size attempt in jira_search_issues' fallback loop below requests
+#: the same fields as the first.
+_SEARCH_ISSUE_FIELDS = (
+    "summary,status,assignee,priority,issuetype,project,"
+    "updated,created,resolution,labels,parent"
+)
+
+
+def _page_size_candidates(max_results: int) -> tuple[int, ...]:
+    """Descending, deduplicated page sizes to try in jira_search_issues:
+    the caller's requested size, then _RETRY_PAGE_SIZE, then 1 -- each
+    only kept if it's smaller than the one before and no larger than
+    what the caller asked for.
+
+    Without the final floor of 1, a caller-requested `limit` at or below
+    _RETRY_PAGE_SIZE (e.g. limit=3) would skip every fallback and go
+    straight to a bounded error that claims "even at a minimal page
+    size" without ever actually trying one.
+    """
+    candidates: list[int] = []
+    for size in (max_results, _RETRY_PAGE_SIZE, 1):
+        if size <= max_results and (not candidates or size < candidates[-1]):
+            candidates.append(size)
+    return tuple(candidates)
+
+
+def _jql_digest(jql: str) -> str:
+    """A short, non-reversible identifier for correlating log lines about
+    the same query without ever logging its content. Jira's own
+    JQL-syntax-error text routinely echoes back the literal clause that
+    failed to parse (which can carry whatever sensitive text the caller
+    searched for), so the query itself and exception messages are kept
+    out of every log line below -- this digest is what lets someone
+    grep prod logs for "the same query recurring" or "this query, later,
+    succeeded" without it ever revealing what was searched for.
+    """
+    # str(jql) defensively: this runs inside exception handlers whose
+    # whole point is to insulate a failing advisory call from the
+    # primary search -- it must not itself raise if jql is ever
+    # something other than a str at runtime (the type hint isn't
+    # enforced), which would defeat that insulation.
+    return hashlib.sha256(str(jql).encode("utf-8")).hexdigest()[:12]
+
+
+def _log_metadata_only(
+    level_fn: Any, action: str, jql: str, exc: Exception | None
+) -> None:
+    """Log `action` with only a jql_digest (see _jql_digest) and, if this
+    is an exception path, the exception's type -- never the JQL itself or
+    the exception's message. Shared by every log site touching a JQL
+    search so the no-raw-content policy has one place to read and one
+    place to change, instead of being restated at each call site.
+    """
+    suffix = f": {type(exc).__name__}" if exc is not None else ""
+    level_fn(f"{action} (jql_digest={_jql_digest(jql)}){suffix}")
+
+
+def _approximate_count(cloud_id: str, jql: str) -> int | None:
+    """Best-effort match count via /search/approximate-count, so a caller
+    can tell "you're seeing all N matches" apart from "there are more".
+
+    Returns None (never raises) on any failure -- the JQL search itself
+    already succeeded by the time this is called, so a count endpoint
+    that rejects an unbounded query or errors out must not fail the
+    whole tool call over a number that is advisory anyway.
+    """
+    try:
+        result = _request(
+            "POST",
+            cloud_id,
+            "/rest/api/3/search/approximate-count",
+            json_data={"jql": jql},
+            timeout=_APPROXIMATE_COUNT_TIMEOUT_SECONDS,
+            allow_retry=False,
+        )
+        if isinstance(result, dict):
+            count = result.get("count")
+            # bool is a subclass of int in Python -- exclude it
+            # explicitly, or a `"count": true` shape anomaly would
+            # silently return the bool as if it were a real count
+            # instead of hitting the non-integer warning below.
+            if isinstance(count, int) and not isinstance(count, bool):
+                return count
+            if count is not None:
+                # Distinguish "the endpoint answered but with a shape we
+                # don't recognize" (e.g. a proxy re-serializing the count
+                # as a float or numeric string) from a genuine failure --
+                # both currently return None, but only this one has no
+                # exception to explain itself otherwise.
+                logger.warning(
+                    "Approximate count endpoint returned a non-integer "
+                    f"count (jql_digest={_jql_digest(jql)}): "
+                    f"{type(count).__name__}"
+                )
+    except Exception as e:
+        _log_metadata_only(logger.warning, "Could not get an approximate count", jql, e)
+    return None
+
+
+def _fetch_and_summarize_page(
+    cloud_id: str,
+    jql: str,
+    max_results: int,
+    next_page_token: str,
+    *,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    allow_retry: bool = True,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """One search/jql call, projected through _summarize_issue.
+
+    Raises on any request/shape failure; callers run this inside their
+    own try/except (jira_search_issues' outer one already does).
+    """
+    # /rest/api/2/search and /rest/api/3/search are deprecated (removed
+    # by Atlassian on Jira Cloud); /rest/api/3/search/jql is the
+    # replacement and pages via nextPageToken instead of startAt/total.
+    params: dict[str, Any] = {
+        "jql": jql,
+        "maxResults": max_results,
+        "fields": _SEARCH_ISSUE_FIELDS,
+    }
+    if next_page_token:
+        params["nextPageToken"] = next_page_token
+    result = _request(
+        "GET",
+        cloud_id,
+        "/rest/api/3/search/jql",
+        params=params,
+        timeout=timeout,
+        allow_retry=allow_retry,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Unexpected response format from Jira search API")
+    raw_issues = result.get("issues")
+    if raw_issues is None:
+        raw_issues = []
+    elif not isinstance(raw_issues, list):
+        # `or []` alone only replaces a falsy value -- a non-list truthy
+        # "issues" (e.g. a proxy/gateway rewriting it to a string or
+        # dict) would otherwise iterate silently and produce an empty
+        # page with no error, contradicting this function's own "raises
+        # on any shape failure" contract.
+        raise RuntimeError("Unexpected 'issues' shape in Jira search response")
+    issues = [
+        _summarize_issue(issue) for issue in raw_issues if isinstance(issue, dict)
+    ]
+    # The enhanced-search endpoint signals "more pages" by including
+    # nextPageToken; isLast is not guaranteed to be present, so the
+    # token's presence is the reliable pagination signal in both
+    # directions (no token => last page, token => more pages).
+    return issues, result.get("nextPageToken")
+
+
+def _build_search_response(
+    issues: list[dict[str, Any]], total_count: int | None, next_token: str | None
+) -> str:
+    # Field order matters here: total_count/returned_count/truncated/
+    # next_page_token come before the (much larger) issues list so that
+    # if this string is ever truncated downstream anyway, the caller
+    # still sees the pagination signal, not just a partial issues array
+    # with no idea more pages exist.
+    return _success(
+        total_count=total_count,
+        returned_count=len(issues),
+        truncated=bool(next_token),
+        next_page_token=next_token or None,
+        issues=issues,
+    )
+
+
 @mcp.tool()
 def jira_search_issues(
-    jql: str, cloud_id: str = "", limit: int = 20, next_page_token: str = ""
+    jql: str, cloud_id: str = "", limit: int = 50, next_page_token: str = ""
 ) -> str:
     """
     Search issues with JQL (Jira Query Language) -- the recommended way to
-    find issues by project, assignee, status, text, etc.
+    find issues by project, assignee, status, text, etc. Each result is a
+    compact projection (key, summary, status, status_category, assignee,
+    priority, issue_type, project_key, labels, parent_key, resolution,
+    created, updated) -- not the full issue. Use jira_get_issue for a
+    description, dependencies (issue_links/subtasks), or any other field
+    not in that list.
     jql: a JQL query, e.g. 'project = ENG AND status = "In Progress"
     ORDER BY updated DESC' or 'text ~ "login bug"'.
-    limit: max issues to return (default 20, capped at 100).
+    limit: max issues to return per page (default 50, capped at 100).
     next_page_token: pass the previous response's next_page_token to fetch
-    the next page.
+    the next page -- always check `truncated` and re-call with it instead
+    of assuming one page is everything.
+    Returns total_count: an approximate count of ALL issues matching the
+    JQL (independent of pagination; null if unavailable, e.g. the count
+    endpoint failed, OR because including it would have pushed an
+    otherwise-fitting page over the output limit -- both cases look the
+    same to the caller). Only computed for the first page of a search
+    (when next_page_token is empty) -- it's a per-JQL constant, not tied
+    to any one page, so carry it forward yourself for later pages of the
+    same search instead of expecting it again. Compare it against
+    returned_count to know whether more issues exist beyond what
+    truncated/next_page_token alone would tell you.
     """
     try:
+        resolved_cloud_id = _resolve_cloud_id(cloud_id)
         max_results = _clamp_limit(limit)
-        # /rest/api/2/search and /rest/api/3/search are deprecated (removed
-        # by Atlassian on Jira Cloud); /rest/api/3/search/jql is the
-        # replacement and pages via nextPageToken instead of startAt/total.
-        params: dict[str, Any] = {
-            "jql": jql,
-            "maxResults": max_results,
-            "fields": "summary,status,assignee,priority,issuetype,project,updated",
-        }
-        if next_page_token:
-            params["nextPageToken"] = next_page_token
-        result = _request(
-            "GET",
-            cloud_id,
-            "/rest/api/3/search/jql",
-            params=params,
+        max_output_length = get_tool_max_output_length()
+
+        issues: list[dict[str, Any]] = []
+        next_token: str | None = None
+        response = ""
+        fit = False
+        for attempt, size in enumerate(_page_size_candidates(max_results)):
+            # Every attempt re-issues the search FROM THE SAME
+            # next_page_token the caller passed in (never a
+            # previous attempt's own nextPageToken): Jira's
+            # nextPageToken is positional over the whole maxResults it
+            # was asked for, so slicing an already-fetched oversized page
+            # locally while keeping its token, or chaining a smaller
+            # retry off of it, would silently skip rows on the caller's
+            # next call. Re-fetching at a smaller size from the original
+            # starting point is what makes the returned token correctly
+            # correspond to exactly what's returned here.
+            is_first_attempt = attempt == 0
+            issues, next_token = _fetch_and_summarize_page(
+                resolved_cloud_id,
+                jql,
+                size,
+                next_page_token,
+                timeout=(
+                    DEFAULT_TIMEOUT_SECONDS
+                    if is_first_attempt
+                    else _FALLBACK_ATTEMPT_TIMEOUT_SECONDS
+                ),
+                allow_retry=is_first_attempt,
+            )
+            response = _build_search_response(issues, None, next_token)
+            if len(response) <= max_output_length:
+                fit = True
+                break
+
+        if not fit:
+            # Even a minimal page doesn't fit -- a single issue's summary
+            # and/or labels alone exceed the budget. Fail safely rather
+            # than return invalid (cut-mid-JSON) output or a token that
+            # would skip rows.
+            return _error(
+                "A Jira search result page exceeds the tool output limit "
+                "even at a minimal page size; narrow the JQL query"
+            )
+
+        if next_token and next_token == next_page_token:
+            # A cursor that didn't advance would make a caller
+            # mechanically following truncated/next_page_token loop on
+            # the same page forever -- fail instead of handing back a
+            # token that goes nowhere (mirrors shopify.py's
+            # _success_paginated cursor-safety check).
+            return _error(
+                "Jira returned a pagination cursor that did not advance; "
+                "pagination stopped to prevent an infinite loop"
+            )
+
+        # total_count is a per-JQL constant, independent of pagination --
+        # only fetch it once, for the caller's first page, and only after
+        # a page has actually been settled on (never on either early
+        # return above -- the size-overflow error or the stuck-cursor
+        # error -- where it would just be wasted work).
+        total_count = (
+            None if next_page_token else _approximate_count(resolved_cloud_id, jql)
         )
-        if not isinstance(result, dict):
-            return _error("Unexpected response format from Jira search API")
-        issues = result.get("issues") or []
-        # The enhanced-search endpoint signals "more pages" by including
-        # nextPageToken; isLast is not guaranteed to be present, so the
-        # token's presence is the reliable pagination signal in both
-        # directions (no token => last page, token => more pages).
-        next_token = result.get("nextPageToken")
-        return _success(
-            issues=issues,
-            truncated=bool(next_token),
-            next_page_token=next_token or None,
+        response = _build_search_response(issues, total_count, next_token)
+        if len(response) > max_output_length:
+            # total_count is advisory; if adding it is ever what tips an
+            # already-fitting page over budget, drop it rather than
+            # fail a search that otherwise fit.
+            response = _build_search_response(issues, None, next_token)
+
+        logger.info(
+            f"jira_search_issues: returned={len(issues)} "
+            f"approx_total={total_count} has_next_page={bool(next_token)} "
+            f"jql_digest={_jql_digest(jql)}"
         )
+        return response
     except Exception as e:
-        logger.error(f"Error searching Jira issues with JQL '{jql}': {e}")
+        _log_metadata_only(logger.error, "Error searching Jira issues", jql, e)
         return _error(str(e))
 
 

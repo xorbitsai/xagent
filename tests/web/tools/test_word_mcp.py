@@ -112,6 +112,31 @@ def test_set_paragraph_text_rejects_hyperlink_paragraph():
     assert paragraph._p.findall(qn("w:hyperlink"))  # untouched, not duplicated
 
 
+def test_set_paragraph_text_rejects_hyperlink_nested_in_sdt():
+    """A hyperlink can be wrapped in a structured document tag (<w:sdt>) --
+    a direct-child-only check for <w:hyperlink> would miss it and let the
+    zero-runs branch duplicate it instead of refusing."""
+    from docx.oxml.shared import OxmlElement
+
+    document = Document()
+    paragraph = document.add_paragraph()
+    sdt = OxmlElement("w:sdt")
+    sdt_content = OxmlElement("w:sdtContent")
+    hyperlink = OxmlElement("w:hyperlink")
+    run_elm = OxmlElement("w:r")
+    text_elm = OxmlElement("w:t")
+    text_elm.text = "Click here"
+    run_elm.append(text_elm)
+    hyperlink.append(run_elm)
+    sdt_content.append(hyperlink)
+    sdt.append(sdt_content)
+    paragraph._p.append(sdt)
+    assert not paragraph.runs  # confirms the hyperlink run is invisible to .runs
+
+    with pytest.raises(ValueError, match="hyperlink"):
+        word._set_paragraph_text(paragraph, "New text")
+
+
 def test_set_paragraph_text_rejects_run_with_image():
     import base64
 
@@ -214,6 +239,38 @@ def test_create_document_upload_connection_error_does_not_leak_session_url(
     assert result["status"] == "error"
     assert "super-secret-value" not in result["message"]
     assert secret_url not in result["message"]
+
+
+def test_create_only_upload_does_not_chain_secret_bearing_exception(monkeypatch):
+    """raise ... from exc would still attach the original, URL-bearing
+    exception as __cause__ even though the raised message itself is
+    sanitized -- a future traceback/log/APM capture could surface it.
+    from None must be used instead, matching onedrive.py's precedent."""
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({}, status_code=500, url=secret_url))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    with pytest.raises(word._GraphRequestError) as exc_info:
+        word._create_only_upload(b"content", "Report.docx", None, None)
+
+    assert exc_info.value.__cause__ is None
+
+
+def test_create_only_upload_connection_error_does_not_chain_exception(monkeypatch):
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(
+        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
+    )
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        word._create_only_upload(b"content", "Report.docx", None, None)
+
+    assert exc_info.value.__cause__ is None
 
 
 def test_create_document_uploads_blank_document(monkeypatch):
@@ -402,6 +459,37 @@ def test_replace_text_rejects_match_in_run_with_image(monkeypatch):
     assert "non-text content" in result["message"]
     # Only the download GET happened -- no upload was attempted.
     assert mock_request.call_count == 1
+
+
+def test_replace_text_finds_match_inside_hyperlink_run(monkeypatch):
+    """paragraph.runs excludes runs nested inside <w:hyperlink>. Iterating
+    only paragraph.runs would silently skip a match inside hyperlink text
+    even though word_get_document_text surfaces that same text."""
+    from docx.oxml.shared import OxmlElement
+
+    def build(d):
+        p = d.add_paragraph("before ")
+        hyperlink = OxmlElement("w:hyperlink")
+        run_elm = OxmlElement("w:r")
+        text_elm = OxmlElement("w:t")
+        text_elm.text = "foo bar"
+        run_elm.append(text_elm)
+        hyperlink.append(run_elm)
+        p._p.append(hyperlink)
+        p.add_run(" after")
+
+    content = _docx_bytes(build)
+    responses = iter([MockResponse(content=content), MockResponse({"id": "item-1"})])
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "success"
+    assert result["replacements"] == 1
+    put_call = mock_request.call_args_list[1]
+    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
+    assert uploaded.paragraphs[0].text == "before baz bar after"
 
 
 def test_upload_document_rejects_oversized_content(monkeypatch):

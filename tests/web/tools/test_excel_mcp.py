@@ -101,6 +101,20 @@ def test_odata_string_literal_escapes_quote():
     assert excel._odata_string_literal("O'Brien!A1") == "O%27%27Brien%21A1"
 
 
+def test_normalize_relative_path_rejects_non_string():
+    with pytest.raises(TypeError, match="must be a string"):
+        excel._normalize_relative_path(123)
+
+
+def test_odata_string_literal_rejects_non_string():
+    with pytest.raises(TypeError, match="must be a string"):
+        excel._odata_string_literal(123)
+
+
+def test_valid_clear_apply_to_is_immutable():
+    assert isinstance(excel._VALID_CLEAR_APPLY_TO, frozenset)
+
+
 def test_parse_values_json_requires_array_of_arrays():
     with pytest.raises(ValueError, match="array of arrays"):
         excel._parse_values_json('["a", "b"]')
@@ -113,6 +127,11 @@ def test_parse_values_json_rejects_invalid_json():
 
 def test_parse_values_json_success():
     assert excel._parse_values_json('[["a", 1], ["b", 2]]') == [["a", 1], ["b", 2]]
+
+
+def test_parse_values_json_rejects_non_string():
+    with pytest.raises(TypeError, match="must be a string"):
+        excel._parse_values_json(123)
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +327,23 @@ def test_add_table_rows_without_index_omits_field(monkeypatch):
 
 def test_delete_table_row_rejects_negative_index():
     result = json.loads(excel.excel_delete_table_row("book.xlsx", "Table1", -1))
+    assert result["status"] == "error"
+    assert "row_index" in result["message"]
+
+
+def test_delete_table_row_rejects_bool_index():
+    """bool is a subclass of int in Python, so `isinstance(True, int)` is
+    True and `True < 0` is False -- without an explicit bool exclusion,
+    row_index=True would silently pass validation and get interpolated into
+    the URL as the literal string "True", producing a broken Graph request
+    instead of a clear local validation error."""
+    result = json.loads(excel.excel_delete_table_row("book.xlsx", "Table1", True))
+    assert result["status"] == "error"
+    assert "row_index" in result["message"]
+
+
+def test_delete_table_row_rejects_non_integer():
+    result = json.loads(excel.excel_delete_table_row("book.xlsx", "Table1", "3"))
     assert result["status"] == "error"
     assert "row_index" in result["message"]
 

@@ -298,6 +298,9 @@ def _create_only_upload(
     return safe_item
 
 
+_SAFE_RUN_CHILD_TAGS = (qn("w:rPr"), qn("w:t"))
+
+
 # Assigning Run.text clears every child of <w:r> except <w:rPr> (formatting)
 # and re-adds only <w:t>/<w:tab>/<w:br>/<w:cr> elements built from the new
 # text -- verified directly against python-docx's own CT_R.text getter and
@@ -311,7 +314,33 @@ def _create_only_upload(
 # acceptable trade-offs against a helper that has to be re-verified by hand
 # against python-docx's undocumented internals every time it's relied on.
 def _run_has_non_text_content(run: Any) -> bool:
-    return any(child.tag not in (qn("w:rPr"), qn("w:t")) for child in run._r)
+    return any(child.tag not in _SAFE_RUN_CHILD_TAGS for child in run._r)
+
+
+# Runs and hyperlinks reached through one of these ancestors are not part of
+# a paragraph's own edit history: w:ins/w:del/w:moveFrom/w:moveTo mark
+# tracked-change insertions, deletions, and moves attributed to someone
+# else's not-yet-accepted edit, and w:txbxContent is a text box's own
+# separate content stream, merely anchored to (not part of) the run that
+# holds its <w:drawing> -- none of this is visible through
+# word_get_document_text/word_list_paragraphs either. A plain recursive
+# ".//w:r" or ".//w:hyperlink" search would reach into all of these and
+# silently rewrite or misdetect content the caller never saw (verified: a
+# tracked insertion's run text is readable and matchable even though
+# paragraph.runs excludes it, and a text box's nested <w:p> is invisible to
+# document.paragraphs but still reachable via ".//" from its anchor run).
+_PARAGRAPH_FLOW_PREDICATE = (
+    "not(ancestor::w:ins) and not(ancestor::w:del) "
+    "and not(ancestor::w:moveFrom) and not(ancestor::w:moveTo) "
+    "and not(ancestor::w:txbxContent)"
+)
+
+
+def _paragraph_flow_elements(paragraph: Any, local_tag: str) -> Any:
+    """Descendants of paragraph matching local_tag (e.g. "w:r", "w:hyperlink"),
+    excluding ones nested in tracked-change markup or a text box -- see
+    _PARAGRAPH_FLOW_PREDICATE."""
+    return paragraph._p.xpath(f".//{local_tag}[{_PARAGRAPH_FLOW_PREDICATE}]")
 
 
 def _set_paragraph_text(paragraph: Any, text: str) -> None:
@@ -329,7 +358,7 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
     image, break, or field character, which the plain-text runs[0].text
     assignment below would silently delete.
     """
-    if paragraph._p.xpath(".//w:hyperlink"):
+    if _paragraph_flow_elements(paragraph, "w:hyperlink"):
         raise ValueError(
             "paragraph contains a hyperlink; word_set_paragraph_text does not "
             "support editing it here (the hyperlink's own run text is outside "
@@ -506,7 +535,9 @@ def word_replace_text(
     hyperlink or other wrapper (a content control, a smart tag) --
     paragraph.runs itself only sees direct children, which would otherwise
     make hyperlink text invisible to this tool even though it's included
-    when reading the document back with word_get_document_text.
+    when reading the document back with word_get_document_text. Does not
+    search inside a text box or a tracked-change insertion/deletion/move,
+    since neither is visible through this module's read tools either.
 
     Refuses (rather than silently corrupting the document) a match found in
     a run that also holds non-text content -- an image, break, or field --
@@ -518,7 +549,7 @@ def word_replace_text(
         document = _download_document(file_path, site_id, drive_id)
         replacements = 0
         for paragraph in document.paragraphs:
-            for r in paragraph._p.xpath(".//w:r"):
+            for r in _paragraph_flow_elements(paragraph, "w:r"):
                 run = Run(r, paragraph)
                 if find in run.text:
                     if _run_has_non_text_content(run):

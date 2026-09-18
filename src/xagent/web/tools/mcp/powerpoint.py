@@ -24,7 +24,11 @@ mcp = FastMCP("powerpoint-mcp")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
-_BINARY_TIMEOUT_SECONDS = 60
+# Matches onedrive.py's _BINARY_UPLOAD_TIMEOUT_SECONDS for the same class of
+# operation (a large binary GET/PUT); used for both directions here since
+# this module's download and upload can each move up to
+# _MAX_PRESENTATION_BYTES.
+_BINARY_TIMEOUT_SECONDS = 120
 
 _POWERPOINT_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -167,8 +171,11 @@ def _site_segment(site_id: str) -> str:
     if not isinstance(site_id, str) or not site_id.strip():
         raise ValueError("site_id is required")
     value = site_id.strip()
-    if any(segment in (".", "..") for segment in value.split("/")):
-        raise ValueError(f"site_id must not contain '.' or '..' segments: {site_id!r}")
+    if any(segment in (".", "..", "") for segment in value.split("/")):
+        raise ValueError(
+            f"site_id must not contain '.', '..', or empty (e.g. '//') segments: "
+            f"{site_id!r}"
+        )
     return quote(value, safe=":/,")
 
 
@@ -187,16 +194,26 @@ def _normalize_relative_path(path: str) -> str:
         )
     if "\\" in value:
         raise ValueError("file_path must use '/' separators and must not contain '\\'")
-    if any(segment in (".", "..") for segment in value.split("/")):
-        raise ValueError(f"file_path must not contain '.' or '..' segments: {path!r}")
+    if any(segment in (".", "..", "") for segment in value.split("/")):
+        raise ValueError(
+            f"file_path must not contain '.', '..', or empty (e.g. '//') segments: "
+            f"{path!r}"
+        )
     if value.rsplit("/", 1)[-1].endswith("."):
         raise ValueError(f"file_path filename must not end with a period: {path!r}")
     return value
 
 
 def _item_path(file_path: str, site_id: str | None, drive_id: str | None) -> str:
+    # Checked via "is not None" rather than truthiness: an empty string is
+    # a caller mistake (e.g. an upstream field that defaults unset to ""
+    # rather than None), not "not provided" -- a bare truthiness check
+    # would silently treat it the same as None and fall through to
+    # /me/drive, reading/editing the wrong drive with no indication site_id
+    # or drive_id was ever ignored. This way it reaches _site_segment /
+    # url_path_id, which already reject an empty id with a clear error.
     normalized = _normalize_relative_path(file_path)
-    if site_id:
+    if site_id is not None:
         site_segment = _site_segment(site_id)
         # A "hostname:/server-relative-path" site_id needs a second,
         # closing colon before appending another resource segment, to
@@ -209,10 +226,10 @@ def _item_path(file_path: str, site_id: str | None, drive_id: str | None) -> str
         site_suffix = ":" if ":" in site_segment else ""
         drive_base = (
             f"/sites/{site_segment}{site_suffix}/drives/{url_path_id(drive_id, 'drive_id')}"
-            if drive_id
+            if drive_id is not None
             else f"/sites/{site_segment}{site_suffix}/drive"
         )
-    elif drive_id:
+    elif drive_id is not None:
         drive_base = f"/drives/{url_path_id(drive_id, 'drive_id')}"
     else:
         drive_base = "/me/drive"
@@ -227,7 +244,10 @@ def _download_presentation(
     file_path: str, site_id: str | None, drive_id: str | None
 ) -> PresentationType:
     content = _graph_request(
-        "GET", _content_path(file_path, site_id, drive_id), raw=True
+        "GET",
+        _content_path(file_path, site_id, drive_id),
+        raw=True,
+        timeout=_BINARY_TIMEOUT_SECONDS,
     )
     try:
         return Presentation(io.BytesIO(content))
@@ -735,13 +755,13 @@ def powerpoint_set_shape_text(
         shape_index = _require_int(shape_index, "shape_index")
         presentation = _download_presentation(file_path, site_id, drive_id)
         slide = _require_slide(presentation, slide_index)
-        shapes = list(slide.shapes)
-        if not 0 <= shape_index < len(shapes):
+        shape_count = len(slide.shapes)
+        if not 0 <= shape_index < shape_count:
             raise ValueError(
                 f"shape_index {shape_index} is out of range for slide {slide_index} "
-                f"with {len(shapes)} shapes"
+                f"with {shape_count} shapes"
             )
-        shape = shapes[shape_index]
+        shape = slide.shapes[shape_index]
         if not shape.has_text_frame:
             raise ValueError(
                 f"shape {shape_index} on slide {slide_index} has no text frame "

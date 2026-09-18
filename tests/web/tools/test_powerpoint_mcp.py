@@ -103,6 +103,32 @@ def test_normalize_relative_path_rejects_dot_segments():
         powerpoint._normalize_relative_path("../secret.pptx")
 
 
+def test_normalize_relative_path_rejects_doubled_slash():
+    """An empty segment (from a doubled '/') isn't '.' or '..' but would
+    still build a malformed root:/{path}: Graph URL if let through."""
+    with pytest.raises(ValueError, match="empty"):
+        powerpoint._normalize_relative_path("reports//Q1.pptx")
+
+
+def test_site_segment_rejects_doubled_slash():
+    with pytest.raises(ValueError, match="empty"):
+        powerpoint._site_segment("contoso.sharepoint.com:/teams//hr")
+
+
+def test_item_path_rejects_empty_site_id():
+    """An empty string is a caller mistake (e.g. an upstream field
+    defaulting unset to "" instead of None), not "not provided" -- it must
+    not be silently treated the same as site_id=None and routed to
+    /me/drive instead."""
+    with pytest.raises(ValueError, match="site_id is required"):
+        powerpoint._item_path("Deck.pptx", "", None)
+
+
+def test_item_path_rejects_empty_drive_id():
+    with pytest.raises(ValueError, match="drive_id"):
+        powerpoint._item_path("Deck.pptx", None, "")
+
+
 # ---------------------------------------------------------------------------
 # slide helpers
 # ---------------------------------------------------------------------------
@@ -356,6 +382,9 @@ def test_get_presentation_text(monkeypatch):
     assert result["slides"] == [
         {"slide_index": 0, "shapes": ["Title A", "Body A"], "notes": None}
     ]
+    assert (
+        mock_request.call_args.kwargs["timeout"] == powerpoint._BINARY_TIMEOUT_SECONDS
+    )
 
 
 def test_get_presentation_text_includes_group_table_and_notes(monkeypatch):

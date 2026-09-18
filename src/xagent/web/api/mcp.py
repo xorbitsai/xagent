@@ -2208,10 +2208,21 @@ def _enrich_oauth_server_info(
     app_id = app_info.get("id")
     connected_account: Optional[str] = None
     connection_status: Optional[str] = None
+    # app_id and provider are two independent lookup keys (an app-scoped
+    # connect and a bare-provider connect leave separate UserOAuth rows --
+    # see auth.py's OAuth callback), so a usable grant under the *second*
+    # key must still win over an unusable one already found under the
+    # first: keep scanning past a "needs_reconnect" hit in case a later
+    # key is actually connected, and only stop early once one is.
     for key in restrict_to_app_scoped_oauth_grant(app_id, [app_id, provider]):
         summary = oauth_accounts.get(key)
-        if summary:
-            connected_account, connection_status = summary
+        if not summary:
+            continue
+        email, status = summary
+        if connection_status is None:
+            connected_account, connection_status = email, status
+        if status == "connected":
+            connected_account, connection_status = email, status
             break
 
     return app_id, provider, connected_account, connection_status

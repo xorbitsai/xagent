@@ -363,3 +363,36 @@ class TestTheChangedCallers:
         assert response.id == server_id
         assert response.connection_status == "connected"
         assert response.connected_account is None
+
+    def test_listing_prefers_a_healthy_grant_over_a_broken_one_at_a_different_key(
+        self, db
+    ):
+        """``app_id`` and ``provider`` are two independent lookup keys -- an
+        app-scoped connect and a bare-provider connect leave separate
+        ``UserOAuth`` rows (see auth.py's OAuth callback, which deletes only
+        the row matching the key it connected under). A broken grant under
+        the first key checked must not shadow a working grant under the
+        second: the id-named row here ("acme-mail") is broken, but a second,
+        healthy row exists under the bare provider key ("prov-acme-mail")."""
+        from xagent.web.api.mcp import get_mcp_servers
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user, server_id = self._connected_id_named_app(db)
+        db.query(UserOAuth).filter(UserOAuth.user_id == user.id).update(
+            {"access_token": "", "refresh_token": None}
+        )
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="prov-acme-mail",
+                access_token="live-token",
+                email="fallback@acme.example",
+            )
+        )
+        db.commit()
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "connected"
+        assert response.connected_account == "fallback@acme.example"

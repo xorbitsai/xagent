@@ -180,6 +180,42 @@ def test_create_document_rejects_when_upload_put_conflicts(monkeypatch):
     assert "already exists" in result["message"]
 
 
+def test_create_document_upload_failure_does_not_leak_session_url(monkeypatch):
+    """The upload-session URL is a pre-authenticated bearer secret (a token
+    in its own query string) -- a failed upload must never let that URL
+    reach the caller through the error message, whether the failure comes
+    from raise_for_status() or a lower-level connection/timeout error."""
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({}, status_code=500, url=secret_url))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(word.word_create_document("Report.docx"))
+
+    assert result["status"] == "error"
+    assert "super-secret-value" not in result["message"]
+    assert secret_url not in result["message"]
+
+
+def test_create_document_upload_connection_error_does_not_leak_session_url(
+    monkeypatch,
+):
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(
+        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
+    )
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(word.word_create_document("Report.docx"))
+
+    assert result["status"] == "error"
+    assert "super-secret-value" not in result["message"]
+    assert secret_url not in result["message"]
+
+
 def test_create_document_uploads_blank_document(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
@@ -337,6 +373,35 @@ def test_replace_text_counts_matches_within_runs(monkeypatch):
 def test_replace_text_rejects_empty_find():
     result = json.loads(word.word_replace_text("Report.docx", "", "x"))
     assert result["status"] == "error"
+
+
+def test_replace_text_rejects_match_in_run_with_image(monkeypatch):
+    """A match inside a run that also holds a drawing must be refused, not
+    silently applied -- run.text = ... would delete the drawing too."""
+    import base64
+
+    from docx.shared import Inches
+
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUB"
+        "AScY42YAAAAASUVORK5CYII="
+    )
+
+    def build(d):
+        p = d.add_paragraph()
+        run = p.add_run("foo bar")
+        run.add_picture(io.BytesIO(png_bytes), width=Inches(0.1))
+
+    content = _docx_bytes(build)
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "error"
+    assert "non-text content" in result["message"]
+    # Only the download GET happened -- no upload was attempted.
+    assert mock_request.call_count == 1
 
 
 def test_upload_document_rejects_oversized_content(monkeypatch):

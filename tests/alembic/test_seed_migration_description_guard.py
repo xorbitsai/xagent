@@ -35,13 +35,24 @@ def _module_app_id(tree: ast.Module) -> str | None:
     # a module-level constant by convention, and walking the whole tree would
     # false-positive on a same-named local inside some other function.
     for node in tree.body:
-        if (
-            isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "APP_ID" for t in node.targets)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
-            return node.value.value
+        if isinstance(node, ast.Assign):
+            if (
+                any(isinstance(t, ast.Name) and t.id == "APP_ID" for t in node.targets)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                return node.value.value
+        elif isinstance(node, ast.AnnAssign):
+            # Covers a future `APP_ID: str = "..."` style, matching how
+            # `revision`/`down_revision` are already annotated in these
+            # migration files.
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id == "APP_ID"
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                return node.value.value
     return None
 
 
@@ -65,14 +76,26 @@ def _has_naive_description_guard(downgrade: ast.FunctionDef) -> bool:
             and isinstance(node.func, ast.Name)
             and node.func.id == "_row_matches_seeded_shape"
         ):
-            for arg in node.args:
-                if isinstance(arg, ast.Set):
-                    for element in arg.elts:
-                        if (
-                            isinstance(element, ast.Constant)
-                            and element.value == "description"
-                        ):
-                            return True
+            # compare_columns is the function's 3rd parameter -- target it
+            # specifically (3rd positional arg, or the keyword) rather than
+            # scanning every positional arg, so a coincidental set literal
+            # elsewhere in the call can't false-positive, and a call that
+            # passes it by keyword isn't silently missed (false negative).
+            compare_columns_node = None
+            if len(node.args) >= 3:
+                compare_columns_node = node.args[2]
+            else:
+                for keyword in node.keywords:
+                    if keyword.arg == "compare_columns":
+                        compare_columns_node = keyword.value
+                        break
+            if isinstance(compare_columns_node, ast.Set):
+                for element in compare_columns_node.elts:
+                    if (
+                        isinstance(element, ast.Constant)
+                        and element.value == "description"
+                    ):
+                        return True
     return False
 
 

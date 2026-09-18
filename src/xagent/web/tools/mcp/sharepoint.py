@@ -32,6 +32,13 @@ _BINARY_UPLOAD_TIMEOUT_SECONDS = 120
 # rather than silently attempted and possibly failed by Graph.
 _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 
+# sharepoint_get_file_content buffers the whole download into memory (and then
+# again as a base64 string in the tool result), so an unbounded download of a
+# large document-library file risks exhausting worker memory and blowing up
+# the tool output. Capped at the same order of magnitude as the simple-upload
+# limit above.
+_MAX_DOWNLOAD_BYTES = 10_000_000
+
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"
 
 # Extensions this connector refuses for sharepoint_upload_text_file, since
@@ -97,6 +104,39 @@ def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str
     return headers
 
 
+def _read_capped_content(response: requests.Response, *, max_bytes: int) -> bytes:
+    """Read a streamed response body, rejecting it once it exceeds ``max_bytes``.
+
+    The caller sends Accept-Encoding: identity so Content-Length reflects the
+    actual byte count (requests would otherwise transparently decompress a
+    gzip/deflate body, making that header describe the wire size rather than
+    the size actually buffered here) -- the Content-Encoding check below is
+    a fallback for a server that ignores the request header anyway.
+    """
+    encoding = response.headers.get("Content-Encoding", "identity")
+    if encoding.lower() != "identity":
+        raise ValueError(f"unsupported compressed content encoding: {encoding!r}")
+
+    content_length = response.headers.get("Content-Length")
+    if content_length is not None and content_length.isdigit():
+        if int(content_length) > max_bytes:
+            raise ValueError(
+                f"file is too large to download ({content_length} bytes, "
+                f"limit is {max_bytes} bytes)"
+            )
+
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=65536):
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(
+                f"file is too large to download (limit is {max_bytes} bytes)"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _graph_request(
     method: str,
     path: str,
@@ -108,14 +148,18 @@ def _graph_request(
     raw: bool = False,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
+    request_headers = _graph_headers(extra_headers)
+    if raw:
+        request_headers["Accept-Encoding"] = "identity"
     response = requests.request(
         method=method,
         url=f"{GRAPH_BASE_URL}{path}",
-        headers=_graph_headers(extra_headers),
+        headers=request_headers,
         params=params,
         json=body,
         data=data,
         timeout=timeout,
+        stream=raw,
     )
     try:
         response.raise_for_status()
@@ -127,7 +171,7 @@ def _graph_request(
         raise _GraphRequestError(message, status_code=response.status_code) from exc
 
     if raw:
-        return response.content
+        return _read_capped_content(response, max_bytes=_MAX_DOWNLOAD_BYTES)
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()

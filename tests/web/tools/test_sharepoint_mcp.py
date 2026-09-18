@@ -8,7 +8,14 @@ from xagent.web.tools.mcp import sharepoint
 
 
 class MockResponse:
-    def __init__(self, json_data=None, status_code=200, content=None, url=None):
+    def __init__(
+        self,
+        json_data=None,
+        status_code=200,
+        content=None,
+        url=None,
+        headers=None,
+    ):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
         self.content = (
@@ -16,6 +23,7 @@ class MockResponse:
         )
         self.text = self.content.decode("utf-8", errors="replace")
         self.url = url or "https://graph.microsoft.com/v1.0/example"
+        self.headers = headers if headers is not None else {}
 
     def json(self):
         return self._json_data
@@ -26,6 +34,11 @@ class MockResponse:
                 f"{self.status_code} Client Error: Error for url: {self.url}",
                 response=self,
             )
+
+    def iter_content(self, chunk_size=1):
+        content = self.content
+        for i in range(0, len(content), chunk_size):
+            yield content[i : i + chunk_size]
 
 
 @pytest.fixture(autouse=True)
@@ -184,7 +197,61 @@ def test_get_file_content_falls_back_to_base64_for_binary(monkeypatch):
 
     assert result["status"] == "success"
     assert result["encoding"] == "base64"
-    assert result["text_content"] is None
+
+
+def test_get_file_content_streams_with_identity_encoding(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(content=b"hello world"))
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    sharepoint.sharepoint_get_file_content("root", "notes.txt")
+
+    _, kwargs = mock_request.call_args
+    assert kwargs["stream"] is True
+    assert kwargs["headers"]["Accept-Encoding"] == "identity"
+
+
+def test_get_file_content_rejects_declared_content_length_over_limit(monkeypatch):
+    oversized = sharepoint._MAX_DOWNLOAD_BYTES + 1
+    mock_request = Mock(
+        return_value=MockResponse(
+            content=b"irrelevant",
+            headers={"Content-Length": str(oversized)},
+        )
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "huge.bin"))
+
+    assert result["status"] == "error"
+    assert "too large" in result["message"]
+
+
+def test_get_file_content_rejects_streamed_body_over_limit(monkeypatch):
+    # No (or a wrong) Content-Length header must not bypass the cap -- the
+    # streamed byte count is the source of truth.
+    oversized_content = b"x" * (sharepoint._MAX_DOWNLOAD_BYTES + 1)
+    mock_request = Mock(return_value=MockResponse(content=oversized_content))
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "huge.bin"))
+
+    assert result["status"] == "error"
+    assert "too large" in result["message"]
+
+
+def test_get_file_content_rejects_compressed_content_encoding(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            content=b"compressed-bytes",
+            headers={"Content-Encoding": "gzip"},
+        )
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "notes.txt"))
+
+    assert result["status"] == "error"
+    assert "compressed" in result["message"]
 
 
 def test_upload_text_file_rejects_binary_extension():

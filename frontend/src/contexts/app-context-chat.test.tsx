@@ -745,6 +745,29 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("messages").textContent).toContain("second visible answer")
   })
 
+  it("does not flag recovery for a running task that simply hasn't started streaming yet", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    // The periodic reconciliation snapshot fires every few seconds for every
+    // connected task regardless of stream health. A task still planning or
+    // calling tools is legitimately "running" with no final-answer prefix
+    // seen yet - several such pings in a row must not trip the recovery
+    // banner, since nothing has actually been missed.
+    send({ run_id: "run-1", state_version: 1, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+    send({ run_id: "run-1", state_version: 2, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+    send({ type: "final_answer_start", stream_run_id: "run-1", data: { message_id: "final_answer_1" } })
+    send({ type: "final_answer_delta", stream_run_id: "run-1", data: { message_id: "final_answer_1", delta: "on time answer" } })
+    expect(screen.getByTestId("messages").textContent).toContain("on time answer")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
   it("reconciles a gapped shared stream without appending later deltas or accepting an old run", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (message: Partial<TestWebSocketMessage>) => act(() => {

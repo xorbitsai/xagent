@@ -2819,7 +2819,18 @@ export function AppProvider({
         }
         stream.attemptId = typeof data.lease_attempt_id === "string" ? data.lease_attempt_id : null
         const active = envelope.status === "running"
-        stream.interrupted = stream.interrupted || (active && !stream.prefixSeen)
+        // "running with no prefix seen yet" is the ordinary state of every task
+        // between the run starting and its final-answer text beginning to
+        // stream (planning, tool calls, etc.) - it is NOT evidence anything
+        // was missed. This periodic snapshot fires every 5s for every
+        // connected task regardless of stream health, so treating that as an
+        // interruption flagged the recovery banner on almost every run.
+        // Genuine misses are already caught elsewhere: an explicit
+        // stream_unavailable/stream_resync_required message above, or a
+        // final_answer_delta arriving before its prefix below - both leave
+        // positive evidence content was produced without us. Leave
+        // stream.interrupted as carried over from those instead of deriving
+        // a new value from status alone.
         if (envelope.status) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: {
             status: envelope.status, runId: envelope.runId,

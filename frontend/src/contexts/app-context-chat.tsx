@@ -2816,6 +2816,11 @@ export function AppProvider({
           stream.runId = envelope.runId
           stream.prefixSeen = false
           stream.complete = false
+          // A new run starting can't have inherited an interruption from
+          // whatever run preceded it - carrying a stale `true` forward would
+          // flag the very first snapshot of a brand-new, healthy run.
+          // Mirrors the equivalent reset in the stream_run_id branch below.
+          stream.interrupted = false
         }
         stream.attemptId = typeof data.lease_attempt_id === "string" ? data.lease_attempt_id : null
         const active = envelope.status === "running"

@@ -768,6 +768,23 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("stream-recovery").textContent).toBe("")
   })
 
+  it("clears recovery once a new run's snapshot supersedes an interrupted one", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    send({ run_id: "run-1", state_version: 1, control_state: "running", status: "running", data: {} })
+    send({ type: "stream_unavailable" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    // A brand-new run cannot have inherited the previous run's interruption -
+    // its very first snapshot must not carry the stale flag forward.
+    send({ run_id: "run-2", state_version: 2, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
   it("reconciles a gapped shared stream without appending later deltas or accepting an old run", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (message: Partial<TestWebSocketMessage>) => act(() => {

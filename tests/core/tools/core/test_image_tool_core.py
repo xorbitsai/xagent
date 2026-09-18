@@ -732,3 +732,146 @@ class TestImageGenerationToolCore:
         call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
         assert "size" in call_kwargs
         assert call_kwargs["size"] == "1024*1024"
+
+
+def _transparency_tool(mock_workspace, *, supports: bool):
+    """Single-model tool whose provider either emits alpha or cannot."""
+    model = Mock(spec=BaseImageModel)
+    model.generate_image = AsyncMock(
+        return_value={"image_url": "https://example.com/out.png", "usage": {}}
+    )
+    model.edit_image = AsyncMock(
+        return_value={"image_url": "https://example.com/out.png", "usage": {}}
+    )
+    model.has_ability = Mock(return_value=True)
+    # Explicit because Mock(spec=...) would otherwise answer this property with
+    # a truthy Mock and silently claim the capability.
+    model.supports_transparent_background = supports
+    tool = ImageGenerationToolCore({"m": model}, {"m": "Test model"}, mock_workspace)
+    return tool, model
+
+
+class TestTransparentBackground:
+    """Served natively where the provider supports it, refused where it does not."""
+
+    def test_descriptions_document_the_parameter(self):
+        for description in (
+            ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION,
+            ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION,
+        ):
+            assert "transparent_background" in description
+            # The model has to know prompt wording alone never produces alpha,
+            # or it will keep asking for transparency in prose.
+            assert "does NOT work" in description
+            assert "◻" in description
+
+    @pytest.mark.asyncio
+    async def test_capable_model_receives_the_flag(self, mock_workspace):
+        tool, model = _transparency_tool(mock_workspace, supports=True)
+
+        result = await tool.generate_image(
+            prompt="a rocket icon", transparent_background=True
+        )
+
+        assert result["success"] is True
+        assert model.generate_image.call_args.kwargs["transparent_background"] is True
+
+    @pytest.mark.asyncio
+    async def test_incapable_model_is_refused_not_downgraded(self, mock_workspace):
+        tool, model = _transparency_tool(mock_workspace, supports=False)
+
+        result = await tool.generate_image(
+            prompt="a rocket icon", transparent_background=True
+        )
+
+        # Returning an opaque image as though it had worked is the failure this
+        # guard exists to prevent.
+        assert result["success"] is False
+        assert "transparent background" in result["error"]
+        model.generate_image.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refusal_says_no_model_can_when_none_can(self, mock_workspace):
+        tool, _ = _transparency_tool(mock_workspace, supports=False)
+
+        result = await tool.generate_image(prompt="x", transparent_background=True)
+
+        # Without this the caller can only retry blindly against the same model.
+        assert "No configured image model" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_a_capable_model_when_one_exists(self, mock_workspace):
+        capable = Mock(spec=BaseImageModel)
+        capable.has_ability = Mock(return_value=True)
+        capable.supports_transparent_background = True
+        plain = Mock(spec=BaseImageModel)
+        plain.has_ability = Mock(return_value=True)
+        plain.generate_image = AsyncMock(return_value={"image_url": "u", "usage": {}})
+        plain.supports_transparent_background = False
+        tool = ImageGenerationToolCore(
+            {"plain": plain, "gpt-image-1": capable}, {}, mock_workspace
+        )
+
+        result = await tool.generate_image(
+            prompt="x", model_id="plain", transparent_background=True
+        )
+
+        assert result["success"] is False
+        assert "gpt-image-1" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_flag_sent_when_not_requested(self, mock_workspace):
+        tool, model = _transparency_tool(mock_workspace, supports=True)
+
+        await tool.generate_image(prompt="a rocket icon")
+
+        assert "transparent_background" not in model.generate_image.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_edit_path_is_gated_too(self, mock_workspace):
+        tool, model = _transparency_tool(mock_workspace, supports=False)
+
+        result = await tool.edit_image(
+            prompt="cut the product out",
+            image_url="https://example.com/in.png",
+            transparent_background=True,
+        )
+
+        assert result["success"] is False
+        model.edit_image.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reference_images_carry_the_request_into_editing(
+        self, mock_workspace
+    ):
+        tool, model = _transparency_tool(mock_workspace, supports=True)
+
+        # generate_image delegates to edit_image when references are supplied;
+        # dropping the flag there would silently return an opaque image.
+        await tool.generate_image(
+            prompt="cut this out",
+            images="https://example.com/ref.png",
+            transparent_background=True,
+        )
+
+        assert model.edit_image.call_args.kwargs["transparent_background"] is True
+
+    def test_listing_reports_the_capability(self, mock_workspace):
+        capable, _ = _transparency_tool(mock_workspace, supports=True)
+        plain, _ = _transparency_tool(mock_workspace, supports=False)
+
+        assert (
+            capable.list_available_models()["models"][0][
+                "supports_transparent_background"
+            ]
+            is True
+        )
+        assert (
+            plain.list_available_models()["models"][0][
+                "supports_transparent_background"
+            ]
+            is False
+        )
+        # The legend the descriptions explain has to actually appear.
+        assert "◻" in capable._model_info_text
+        assert "◻" not in plain._model_info_text

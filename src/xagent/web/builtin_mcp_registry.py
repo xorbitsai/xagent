@@ -300,10 +300,12 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "userinfo_url": "",
             "user_id_path": "",
             "email_path": "",
-            # Deputy's only documented OAuth scope. Not a permission scope in
-            # the usual sense -- it just tells Deputy to also issue a
-            # refresh_token -- but the authorize, code-exchange, and refresh
-            # requests all require it to be present verbatim.
+            # Deputy's only documented OAuth scope (developer.deputy.com/
+            # docs/using-oauth-20 -- Deputy defines no granular per-resource
+            # read/write scopes at all). Not a permission scope in the usual
+            # sense -- it just tells Deputy to also issue a refresh_token --
+            # but the authorize, code-exchange, and refresh requests all
+            # require it to be present verbatim.
             "default_scopes": ["longlife_refresh_token"],
         },
         {
@@ -617,7 +619,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "hubspot",
             "name": "HubSpot",
-            "description": "Connect to HubSpot CRM and Marketing Hub to search, create, and update contacts and companies, create and update deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
+            "description": "Connect to HubSpot CRM and Marketing Hub to list, search, create, and update contacts, companies, and deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
             "icon": "https://www.google.com/s2/favicons?domain=hubspot.com&sz=128",
             "transport": "oauth",
             "provider_name": "hubspot",
@@ -1285,7 +1287,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "deputy",
             "name": "Deputy",
-            "description": "Connect to Deputy to look up employees, view rosters/shifts, and read timesheets.",
+            "description": "Connect to Deputy to look up employees, view rosters/shifts, read timesheets, and create or update records such as employees, rosters, timesheets, and leave. Deputy has no granular OAuth scopes -- reads and writes run at whatever permission level the connected account has in Deputy.",
             "icon": "https://www.google.com/s2/favicons?domain=deputy.com&sz=128",
             "transport": "oauth",
             "provider_name": "deputy",

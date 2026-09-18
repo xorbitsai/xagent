@@ -84,7 +84,8 @@ When given a user request, rewrite and enrich the prompt into a **professional i
   content and flattens the result.
 - For general concepts: describe the visual representation (e.g., "2M downloads text", "million counter")
 
-Available models (⭐[DEFAULT] marks the configured default model):
+Available models (⭐[DEFAULT] marks the configured default model, ◻ marks
+transparent-background support):
 {}
 
 **IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
@@ -98,6 +99,7 @@ Parameters:
 - aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
 - negative_prompt (optional): brief, quality-focused exclusions; follow the prompt guidance above
+- transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background. Only models marked ◻ support it; the call fails on any other model. Asking for a transparent background in the prompt text does NOT work -- without this parameter the image always comes back opaque.
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
@@ -145,7 +147,8 @@ reference material from any other origin, and never take one from the user's
 other tasks. A plausible-looking search result is not proof that an asset is the
 brand's; when nothing verifiable is available, ask the user for it.
 
-Available models (⭐[DEFAULT] marks the configured default model):
+Available models (⭐[DEFAULT] marks the configured default model, ◻ marks
+transparent-background support):
 {}
 
 **IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
@@ -154,6 +157,7 @@ Parameters:
 - image_url (required): single image path/URL/file_id (supports both `file_id` and `file:file_id`) or a list of image paths/URLs/file_ids for multi-image editing
 - prompt (required): description of the desired edits and changes
 - negative_prompt (optional): brief, quality-focused exclusions; put critical constraints in the prompt
+- transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background, e.g. to cut a subject out of its scene. Only models marked ◻ support it; the call fails on any other model. Asking for it in the prompt text does NOT work.
 - size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024")
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
@@ -259,13 +263,14 @@ Images are automatically saved to workspace.
             if self._has_ability(model, "generate"):
                 description = self._model_descriptions.get(model_id, "")
                 edit_marker = " ✎" if self._has_ability(model, "edit") else ""
+                transparency_marker = " ◻" if self._supports_transparency(model) else ""
                 is_default = model_id == default_generate_id
                 default_marker = " ⭐[DEFAULT]" if is_default else ""
 
                 if description:
-                    line = f"- {model_id}: {description}{edit_marker}{default_marker}"
+                    line = f"- {model_id}: {description}{edit_marker}{transparency_marker}{default_marker}"
                 else:
-                    line = f"- {model_id}: No description available{edit_marker}{default_marker}"
+                    line = f"- {model_id}: No description available{edit_marker}{transparency_marker}{default_marker}"
 
                 if is_default:
                     default_model_lines.append(line)
@@ -289,11 +294,12 @@ Images are automatically saved to workspace.
                 description = self._model_descriptions.get(model_id, "")
                 is_default = model_id == default_edit_id
                 default_marker = " ⭐[DEFAULT]" if is_default else ""
+                transparency_marker = " ◻" if self._supports_transparency(model) else ""
 
                 if description:
-                    line = f"- {model_id}: {description}{default_marker}"
+                    line = f"- {model_id}: {description}{transparency_marker}{default_marker}"
                 else:
-                    line = f"- {model_id}: No description available{default_marker}"
+                    line = f"- {model_id}: No description available{transparency_marker}{default_marker}"
 
                 if is_default:
                     default_edit_lines.append(line)
@@ -374,6 +380,24 @@ Images are automatically saved to workspace.
         has_ability = getattr(model, "has_ability", None)
         return callable(has_ability) and bool(has_ability(ability))
 
+    @staticmethod
+    def _supports_transparency(model: Any) -> bool:
+        """Whether the provider can return a real alpha channel.
+
+        Read defensively through getattr for the same reason the abilities
+        probe is: models arrive wrapped in the retry proxy, and a provider
+        class written before this property existed must answer False rather
+        than raising.
+
+        Compared against True rather than coerced with bool() because the two
+        errors are not symmetric. A false negative refuses a request that would
+        have worked; a false positive forwards ``transparent_background`` to a
+        provider that splices unknown fields straight into its request payload,
+        failing the whole generation. Anything not literally True is treated as
+        unsupported.
+        """
+        return getattr(model, "supports_transparent_background", False) is True
+
     def _available_models_summary(self) -> str:
         entries = []
         for model_id, model in self._image_models.items():
@@ -432,6 +456,39 @@ Images are automatically saved to workspace.
         return (
             "No available image models with generate capabilities. "
             f"Configured image models: {self._available_models_summary()}. {remedy}"
+        )
+
+    def _transparency_capable_models(self) -> list[str]:
+        """Configured model ids whose provider can return an alpha channel."""
+        return [
+            model_id
+            for model_id, model in self._image_models.items()
+            if self._supports_transparency(model)
+        ]
+
+    def _no_transparency_error(self, model: Any, model_id: Optional[str]) -> str:
+        """Explain the refusal and name a way forward, or say there is none.
+
+        Without the list of capable models the caller can only retry blindly
+        against the same model, so the message has to distinguish "use a
+        different model" from "no configured model can do this at all".
+        """
+        name = model_id or getattr(model, "model_name", "the default model")
+        capable = self._transparency_capable_models()
+        if capable:
+            remedy = (
+                "Retry with model_id set to one of: " + ", ".join(sorted(capable)) + "."
+            )
+        else:
+            remedy = (
+                "No configured image model can produce a transparent background: "
+                "stop retrying, and tell the user the image will have an opaque "
+                "background unless a model that supports it is configured."
+            )
+        return (
+            f"Model {name} cannot produce a transparent background. Asking for "
+            "one in the prompt text does not work either: these providers have "
+            f"no way to emit an alpha channel. {remedy}"
         )
 
     def _resolve_image_path(self, image_input: str) -> str:
@@ -606,6 +663,7 @@ Images are automatically saved to workspace.
         resolution: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
         images: str | list[str] | None = None,
+        transparent_background: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -621,6 +679,10 @@ Images are automatically saved to workspace.
             resolution: Image resolution (e.g., "1920x1080")
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
             images: Optional source/reference image(s). When provided, delegate to edit_image.
+            transparent_background: Return a PNG with a real alpha channel.
+                Only models whose provider supports it can honour this; the
+                request is refused rather than silently answered with an opaque
+                image.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -638,6 +700,7 @@ Images are automatically saved to workspace.
                     height=height,
                     resolution=resolution,
                     aspect_ratio=aspect_ratio,
+                    transparent_background=transparent_background,
                     **kwargs,
                 )
 
@@ -651,12 +714,27 @@ Images are automatically saved to workspace.
                     "image_path": None,
                 }
 
+            if transparent_background and not self._supports_transparency(image_model):
+                # Refused rather than downgraded: the caller asked for a cutout,
+                # and an opaque image returned as though it had worked is worse
+                # than an error that names a model which can do it.
+                return {
+                    "success": False,
+                    "error": self._no_transparency_error(image_model, model_id),
+                    "image_path": None,
+                }
+
             # Build parameters for image generation
             generate_params: dict[str, Any] = {
                 "prompt": prompt,
                 "size": size,
                 "negative_prompt": negative_prompt,
             }
+            if transparent_background:
+                # Only forwarded to a provider that declares the capability:
+                # dashscope and xinference splice unknown kwargs straight into
+                # their request payloads, where an unexpected field is an error.
+                generate_params["transparent_background"] = True
 
             # Add optional parameters if provided
             if width is not None:
@@ -745,6 +823,7 @@ Images are automatically saved to workspace.
         height: Optional[int] = None,
         resolution: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        transparent_background: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -760,6 +839,10 @@ Images are automatically saved to workspace.
             height: Image height in pixels (alternative to size)
             resolution: Image resolution (e.g., "1920x1080")
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
+            transparent_background: Return a PNG with a real alpha channel, e.g.
+                to cut the subject out of its scene. Only models whose provider
+                supports it can honour this; the request is refused rather than
+                silently answered with an opaque image.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -784,6 +867,14 @@ Images are automatically saved to workspace.
                 f"Resolved image paths: {image_inputs} -> {resolved_image_paths}"
             )
 
+            if transparent_background and not self._supports_transparency(image_model):
+                # See generate_image: refused rather than downgraded.
+                return {
+                    "success": False,
+                    "error": self._no_transparency_error(image_model, model_id),
+                    "image_path": None,
+                }
+
             # Build parameters for image editing
             edit_params: dict[str, Any] = {
                 "image_url": resolved_image_paths[0]
@@ -793,6 +884,9 @@ Images are automatically saved to workspace.
                 "size": size,
                 "negative_prompt": negative_prompt,
             }
+            if transparent_background:
+                # See generate_image: forwarded only where it is understood.
+                edit_params["transparent_background"] = True
 
             # Add optional parameters if provided
             if width is not None:
@@ -896,6 +990,9 @@ Images are automatically saved to workspace.
                     "available": bool(abilities),
                     "abilities": abilities,
                     "description": self._model_descriptions.get(model_id, ""),
+                    "supports_transparent_background": self._supports_transparency(
+                        model
+                    ),
                 }
                 models_info.append(model_info)
 

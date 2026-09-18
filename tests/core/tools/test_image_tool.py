@@ -973,6 +973,10 @@ class TestImageToolCapabilityGating:
             "available": True,
             "abilities": ["edit"],
             "description": "",
+            # A Mock attribute is not literally True, so this reports the safe
+            # answer: the capability is not claimed on a model that never
+            # declared it.
+            "supports_transparent_background": False,
         }
 
     def test_a_model_without_has_ability_is_not_trusted(self, mock_workspace):

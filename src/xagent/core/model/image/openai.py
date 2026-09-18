@@ -36,6 +36,45 @@ class OpenAIImageModel(BaseImageModel):
     def abilities(self) -> List[str]:
         return self._abilities
 
+    @property
+    def _is_gpt_image(self) -> bool:
+        """Whether this row points at the gpt-image family.
+
+        Matched as a substring rather than a prefix because proxies routinely
+        re-expose the model under a namespaced name such as
+        ``openai.gpt-image-1``, and those serve the same request shape.
+        """
+        return "gpt-image" in self.model_name.lower()
+
+    @property
+    def supports_transparent_background(self) -> bool:
+        """Only gpt-image-* accepts ``background``; DALL-E has no alpha at all."""
+        return self._is_gpt_image
+
+    def _transparency_kwargs(self) -> dict[str, Any]:
+        """Request fields that make gpt-image-* return an alpha channel."""
+        if not self.supports_transparent_background:
+            raise RuntimeError(
+                f"Model {self.model_name} cannot return a transparent "
+                "background: only the gpt-image family accepts it."
+            )
+        # output_format matters as much as background: the default may be webp
+        # or jpeg, and jpeg would silently flatten the alpha we just asked for.
+        return {"background": "transparent", "output_format": "png"}
+
+    def _apply_response_format(
+        self, request_kwargs: dict[str, Any], response_format: Optional[str]
+    ) -> None:
+        """Set ``response_format`` only where the endpoint tolerates it.
+
+        gpt-image-* rejects the field outright and always answers with
+        ``b64_json``; every other OpenAI-compatible image endpoint needs it, and
+        defaults to a URL as before.
+        """
+        if self._is_gpt_image:
+            return
+        request_kwargs["response_format"] = response_format or "url"
+
     def _ensure_client(self) -> None:
         if self._client is None:
             self._client = AsyncOpenAI(
@@ -46,7 +85,12 @@ class OpenAIImageModel(BaseImageModel):
                 timeout=self.timeout,
             )
 
-    def _normalize_size(self, size: str) -> str:
+    def _normalize_size(self, size: Optional[str]) -> str:
+        # Tolerates None because callers forward an unset size explicitly rather
+        # than omitting it: image_tool always puts "size" in its params dict, and
+        # a parameter default only covers a missing key, never an explicit None.
+        if not size:
+            return "1024x1024"
         if "*" in size:
             return size.replace("*", "x")
         return size
@@ -82,6 +126,7 @@ class OpenAIImageModel(BaseImageModel):
         width: Optional[int] = None,
         height: Optional[int] = None,
         aspect_ratio: Optional[str] = None,
+        transparent_background: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
@@ -95,6 +140,9 @@ class OpenAIImageModel(BaseImageModel):
             width: Image width in pixels
             height: Image height in pixels
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
+            transparent_background: Ask for an alpha channel instead of an
+                opaque background. Only gpt-image-* supports it; anything else
+                raises rather than returning an opaque image as if it had worked.
             **kwargs: Additional parameters (response_format, etc.)
 
         Returns:
@@ -126,14 +174,18 @@ class OpenAIImageModel(BaseImageModel):
         self._ensure_client()
         assert self._client is not None
 
-        response_format = kwargs.pop("response_format", "url")
+        response_format = kwargs.pop("response_format", None)
+        request_kwargs: dict[str, Any] = dict(kwargs)
+        self._apply_response_format(request_kwargs, response_format)
+        if transparent_background:
+            request_kwargs.update(self._transparency_kwargs())
+
         images_client: Any = self._client.images
         response = await images_client.generate(
             prompt=prompt,
             model=self.model_name,
             size=self._normalize_size(size),  # pyright: ignore[reportArgumentType]
-            response_format=response_format,
-            **kwargs,
+            **request_kwargs,
         )
 
         image_url = None
@@ -155,6 +207,7 @@ class OpenAIImageModel(BaseImageModel):
         image_url: str | list[str],
         prompt: str,
         negative_prompt: str = "",
+        transparent_background: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         if not self.has_ability("edit"):
@@ -177,7 +230,13 @@ class OpenAIImageModel(BaseImageModel):
                 image_path = temp_path
             image_paths.append(image_path)
 
-        response_format = kwargs.pop("response_format", "url")
+        response_format = kwargs.pop("response_format", None)
+        size = self._normalize_size(kwargs.pop("size", None))
+        request_kwargs: dict[str, Any] = dict(kwargs)
+        self._apply_response_format(request_kwargs, response_format)
+        if transparent_background:
+            request_kwargs.update(self._transparency_kwargs())
+
         image_files = []
         try:
             image_files = [open(path, "rb") for path in image_paths]
@@ -186,9 +245,8 @@ class OpenAIImageModel(BaseImageModel):
                 image=image_files if len(image_files) > 1 else image_files[0],
                 prompt=prompt,
                 model=self.model_name,
-                size=self._normalize_size(kwargs.pop("size", "1024*1024")),  # pyright: ignore[reportArgumentType]
-                response_format=response_format,
-                **kwargs,
+                size=size,  # pyright: ignore[reportArgumentType]
+                **request_kwargs,
             )
         finally:
             for image_file in image_files:

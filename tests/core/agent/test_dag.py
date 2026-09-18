@@ -28,6 +28,7 @@ from xagent.core.agent.clarification import (
 )
 from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
+from xagent.core.agent.grounding import step_intent_not_fact_rule
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -38,6 +39,7 @@ from xagent.core.agent.pattern.dag import dag as dag_module
 from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
 from xagent.core.agent.pattern.dag.plan_generator import (
     PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
+    PRESUPPOSED_ANSWER_CLAUSE,
     PlanLanguageMismatchError,
 )
 from xagent.core.memory.core import MemoryNote as StoredMemoryNote
@@ -405,6 +407,72 @@ class FailingPlanGenerator(PlanGenerator):
 
 def build_plan(*steps: PlanStep) -> ExecutionPlan:
     return ExecutionPlan(steps=list(steps))
+
+
+def test_completion_assessment_plan_withholds_execution_intent_fields() -> None:
+    """The call that writes the user's answer never sees planner-authored prose.
+
+    Step 2 of the production incident carried a Ctrl+P workaround in its
+    description and termination_condition before any lookup ran; handing those
+    to this call lets it answer from planner intent instead of tool results.
+    The title is withheld for the same reason: it is planner prose too.
+    """
+    step = PlanStep(
+        id="step_2",
+        task="Summarize printing instructions",
+        dependencies=["step_1"],
+        description=(
+            "If step_1 found instructions, summarize them. If not, advise the "
+            "user to use the browser's print function (Ctrl+P / Cmd+P)."
+        ),
+        termination_condition=(
+            "The final answer provides either the specific steps found or a "
+            "valid browser-based printing workaround."
+        ),
+        completion_evidence="The answer names the printing path.",
+        tool_names=["search_knowledge_base"],
+        status="completed",
+    )
+    plan = build_plan(step)
+    pattern = DAGPattern(lambda **_: plan)
+    pattern.plan = plan
+    context = ExecutionContext(execution_id="dag-assessment-plan-projection")
+    context.add_user_message("how do I get a printout of an incident?")
+
+    messages = pattern._completion_assessment_messages(context)
+    payload = json.loads(messages[1]["content"])
+
+    # The prompt names what the projection actually leaves in the payload.
+    assert (
+        "The plan's step ids, dependencies, and statuses, the step results, and "
+        "the candidate output are evidence of execution only" in messages[0]["content"]
+    )
+
+    assert payload["plan"] == {
+        "steps": [
+            {
+                "id": "step_2",
+                "dependencies": ["step_1"],
+                "status": "completed",
+            }
+        ]
+    }
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "Ctrl+P" not in serialized
+    assert "Summarize printing instructions" not in serialized
+    # to_dict() still carries them for checkpoint persistence.
+    assert set(step.to_dict()) == {
+        "id",
+        "task",
+        "dependencies",
+        "description",
+        "termination_condition",
+        "completion_evidence",
+        "tool_names",
+        "status",
+        "result",
+        "error",
+    }
 
 
 def test_dag_completion_assessment_prompt_includes_grounding_rule() -> None:
@@ -2246,6 +2314,12 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
         in messages[-1]["content"]
     )
     assert "your next action must be final_answer" in messages[-1]["content"]
+    instruction = messages[-1]["content"]
+    intent_rule = step_intent_not_fact_rule()
+    stop_heading = "TERMINATION CONDITION - AUTHORITATIVE STOP RULE"
+    assert intent_rule in instruction
+    assert stop_heading in instruction
+    assert instruction.index(intent_rule) > instruction.index(stop_heading)
     assert "Execute only the current DAG step" in messages[-1]["content"]
     assert (
         "Do not infer extra work from the overall user goal" in messages[-1]["content"]
@@ -4349,6 +4423,178 @@ async def test_dag_pattern_replan_treats_invalidated_step_as_pending() -> None:
     assert pattern.active_step_ids == []
     assert pattern.active_step_pattern_states == {}
     assert pattern.active_step_contexts == {}
+
+
+@pytest.mark.asyncio
+async def test_plan_generator_bars_presupposed_answers_from_step_fields() -> None:
+    """The planner writes step fields before any tool runs, so the prompt and the
+    schema must both bar it from pre-writing what those tools will find."""
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-plan-intent")
+    context.add_user_message("Look up the printing steps and answer")
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "lookup",
+                    "task": "Look up the steps",
+                    "dependencies": [],
+                    "termination_condition": "Stop after the lookup returns.",
+                    "completion_evidence": "The lookup returned its results.",
+                    "tool_names": [],
+                }
+            ]
+        )
+    )
+
+    await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-plan-intent",
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    system_prompt = llm.calls[0]["messages"][0]["content"]
+    assert "declarations of execution intent" in system_prompt
+    assert (
+        "write only the "
+        "decision the executor must make, not the answer for each "
+        "branch" in system_prompt
+    )
+    assert "counts as that step completing normally" in system_prompt
+    assert PRESUPPOSED_ANSWER_CLAUSE in system_prompt
+    # Per word against the rendered prompt: the whole-clause assert above still
+    # passes when a kind is dropped from the shared constant.
+    for kind in ("fact", "finding", "conclusion", "recommendation", "workaround"):
+        assert kind in system_prompt
+    assert "its dependency results can establish" in system_prompt
+
+    properties = generator._plan_tool_schema()["function"]["parameters"]["properties"][
+        "steps"
+    ]["items"]["properties"]
+    assert (
+        "not the substance of information this "
+        "step has not obtained yet" in properties["description"]["description"]
+    )
+    assert (
+        "Do not encode the answer" in properties["termination_condition"]["description"]
+    )
+    assert "must not state or pre-write" in properties["task"]["description"]
+    assert (
+        "names what proves completion, not what the step will find"
+        in properties["completion_evidence"]["description"]
+    )
+    for field in (
+        "task",
+        "description",
+        "termination_condition",
+        "completion_evidence",
+    ):
+        assert PRESUPPOSED_ANSWER_CLAUSE in properties[field]["description"]
+
+
+@pytest.mark.asyncio
+async def test_replan_prompt_qualifies_previous_plan_as_intent_not_fact() -> None:
+    """previous_plan is the plan a completion assessment just rejected, and its
+    prose still reaches the replanner for id and continuity reuse."""
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-replan-intent")
+    context.add_user_message("how do I get a printout of an incident?")
+    previous_plan = build_plan(
+        PlanStep(
+            id="summarize",
+            task="Summarize printing instructions",
+            description="If nothing is found, advise using Ctrl+P.",
+            termination_condition="The answer names a browser printing workaround.",
+            completion_evidence="The answer names the printing path.",
+            status="completed",
+        )
+    )
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "summarize",
+                    "task": "Summarize whatever the lookup returned",
+                    "dependencies": [],
+                    "termination_condition": "Stop after reporting the lookup result.",
+                    "completion_evidence": "The lookup result was reported.",
+                    "tool_names": [],
+                }
+            ]
+        )
+    )
+
+    await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-replan-intent",
+            replan=True,
+            previous_plan=previous_plan,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    system_prompt = llm.calls[0]["messages"][0]["content"]
+    assert (
+        "The previous_plan field is the prior version's declared execution "
+        "intent, not established fact" in system_prompt
+    )
+    assert "Reuse it for step ids, ordering, and continuity only" in system_prompt
+    assert (
+        "do not carry a conclusion, recommendation, or workaround stated in that "
+        "text into the new plan or into the final answer unless "
+        "completed_step_results supports it." in system_prompt
+    )
+    assert "Ctrl+P" in llm.calls[0]["messages"][1]["content"]
+
+    first_plan_llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "summarize",
+                    "task": "Summarize whatever the lookup returned",
+                    "dependencies": [],
+                    "termination_condition": "Stop after reporting the lookup result.",
+                    "completion_evidence": "The lookup result was reported.",
+                    "tool_names": [],
+                }
+            ]
+        )
+    )
+    await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-replan-intent",
+            available_tool_names=[],
+        ),
+        llm=first_plan_llm,
+    )
+
+    first_plan_prompt = first_plan_llm.calls[0]["messages"][0]["content"]
+    assert '"previous_plan": null' in first_plan_llm.calls[0]["messages"][1]["content"]
+    assert "The previous_plan field is the prior version's" not in first_plan_prompt
+    assert "Reuse it for step ids, ordering, and continuity only" not in (
+        first_plan_prompt
+    )
+    assert "was just judged incomplete" not in first_plan_prompt
+
+
+def test_step_intent_rule_forms_state_the_same_rule() -> None:
+    full = step_intent_not_fact_rule()
+    compact = step_intent_not_fact_rule(compact=True)
+    assert full.startswith("STEP INTENT IS NOT A SOURCE OF FACTS\n")
+    for form in (full, compact):
+        assert "termination condition" in form
+        assert "completion evidence" in form
+        assert "declare the work to perform" in form
+        assert "presuppose a fact" in form
+        assert "must not reach your answer" in form
+        assert "gap the way your own agent instructions" in form
+        assert "Facts the user gave in their own messages" in form
 
 
 @pytest.mark.asyncio
@@ -6646,6 +6892,8 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     )
     assert instruction != stale_instruction
     assert "Output language: Simplified Chinese" not in instruction
+    # A restored step must not run without the fact-source rule.
+    assert step_intent_not_fact_rule() in instruction
 
 
 _FILE_REFERENCE_BLOCK = (

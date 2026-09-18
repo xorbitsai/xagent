@@ -49,7 +49,21 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 
 APP_ID = "deputy"
 
+# Deputy's only documented OAuth scope (developer.deputy.com/docs/
+# using-oauth-20) -- it defines no granular per-resource read/write scopes.
 DEPUTY_SCOPES = ["longlife_refresh_token"]
+
+# The description text this migration originally seeded, before
+# 20260916_update_deputy_description.py started backfilling it forward to
+# _deputy_app_row()["description"]'s current text. Mirrors that migration's
+# own PREVIOUS_DESCRIPTION constant (kept as a separate literal, not an
+# import, since migrations are self-contained). Used by downgrade()'s shape
+# guard below to accept either value as "not customized" -- see that
+# function's comment for why description can't just be compared against
+# the current text alone.
+_ORIGINAL_DEPUTY_DESCRIPTION = (
+    "Connect to Deputy to look up employees, view rosters/shifts, and read timesheets."
+)
 
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
@@ -78,7 +92,7 @@ def _deputy_app_row() -> dict[str, object]:
     return {
         "app_id": APP_ID,
         "name": "Deputy",
-        "description": "Connect to Deputy to look up employees, view rosters/shifts, and read timesheets.",
+        "description": "Connect to Deputy to look up employees, view rosters/shifts, read timesheets, and create or update records such as employees, rosters, timesheets, and leave. Deputy has no granular OAuth scopes -- reads and writes run at whatever permission level the connected account has in Deputy.",
         "icon": "https://www.google.com/s2/favicons?domain=deputy.com&sz=128",
         "transport": "oauth",
         "provider_name": "deputy",
@@ -165,31 +179,63 @@ def downgrade() -> None:
         # _BUILTIN_PROTECTED_FIELDS blocks a PATCH from changing
         # oauth_scopes/launch_config away from the built-in registry's
         # values while this app_id stays registered as built-in, but
-        # description/is_visible_in_connector are freely PATCHable today,
-        # and a raw DB edit (or the app_id later being dropped from the
-        # built-in registry while this row persists) could diverge any of
-        # them -- so every one of this row's non-env-dependent columns is
+        # is_visible_in_connector is freely PATCHable today, and a raw DB
+        # edit (or the app_id later being dropped from the built-in
+        # registry while this row persists) could diverge any of them --
+        # so every one of this row's non-env-dependent columns is
         # compared, not just the always-PATCHable few. In Python, see
         # _row_matches_seeded_shape's docstring for why not in SQL.
+        #
+        # description is checked separately below, not through
+        # _row_matches_seeded_shape's single-value equality: dedicated
+        # migrations like 20260916_update_deputy_description.py backfill it
+        # forward on already-seeded rows, and _deputy_app_row()["description"]
+        # here is kept equal to the *current* registry value (for
+        # test_seed_rows_match_registry's sake), not the value this
+        # migration originally seeded. On a full downgrade, 20260916's own
+        # downgrade() reverts the row's description to the *old* text
+        # before this migration's downgrade() ever runs, so requiring an
+        # exact match against the current text alone would never match at
+        # that point, silently orphaning the row instead of removing it
+        # (reported in PR #2449's review). Dropping description from the
+        # guard entirely would fix that but reopen a different case: an
+        # admin who PATCHed *only* description (still freely PATCHable
+        # today, like is_visible_in_connector) would no longer be protected
+        # from having that customization discarded. Accepting either the
+        # original or the current known-canonical text -- but nothing else
+        # -- keeps both cases covered.
         app_row = bind.execute(
             sa.select(PUBLIC_MCP_APPS_TABLE).where(
                 PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
             )
         ).first()
-        if app_row is not None and _row_matches_seeded_shape(
-            app_row,
-            _deputy_app_row(),
-            {
-                "name",
-                "description",
-                "icon",
-                "transport",
-                "provider_name",
-                "category",
-                "oauth_scopes",
-                "is_visible_in_connector",
-                "launch_config",
-            },
+        description_is_uncustomized = app_row is not None and app_row._mapping[
+            "description"
+        ] in (
+            _deputy_app_row()["description"],
+            _ORIGINAL_DEPUTY_DESCRIPTION,
+        )
+        if (
+            # Logically implied by description_is_uncustomized already
+            # being False when app_row is None, but mypy can't narrow
+            # app_row through that separately-computed bool -- kept
+            # explicit so _row_matches_seeded_shape below type-checks.
+            app_row is not None
+            and description_is_uncustomized
+            and _row_matches_seeded_shape(
+                app_row,
+                _deputy_app_row(),
+                {
+                    "name",
+                    "icon",
+                    "transport",
+                    "provider_name",
+                    "category",
+                    "oauth_scopes",
+                    "is_visible_in_connector",
+                    "launch_config",
+                },
+            )
         ):
             bind.execute(
                 sa.delete(PUBLIC_MCP_APPS_TABLE).where(

@@ -21,7 +21,7 @@ from ...context.enrichment import (
 )
 from ...context.execution import tool_evidence_state
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
-from ...grounding import evidence_facts, grounding_rule
+from ...grounding import evidence_facts, grounding_rule, step_intent_not_fact_rule
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     effective_output_language,
@@ -1566,7 +1566,23 @@ class DAGPattern(AgentPattern):
             ),
             "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,
-            "plan": self.plan.to_dict() if self.plan is not None else None,
+            # This call writes the user-facing answer, so it gets structure
+            # only: planner prose is never a fact source here, and `status`
+            # is always "completed" -- its sole entry requires that.
+            "plan": (
+                {
+                    "steps": [
+                        {
+                            "id": step.id,
+                            "dependencies": list(step.dependencies),
+                            "status": step.status,
+                        }
+                        for step in self.plan.steps
+                    ]
+                }
+                if self.plan is not None
+                else None
+            ),
             "step_results": self.step_results,
             "candidate_output": self._final_output(),
             "previous_completion_feedback": self.completion_feedback,
@@ -1582,8 +1598,9 @@ class DAGPattern(AgentPattern):
                 "content": (
                     "Assess whether the completed DAG steps satisfy the user's "
                     "overall request. The authoritative_user_requests field is "
-                    "the only source of required scope. The plan, step results, "
-                    "briefs, inferred formats, and candidate output are evidence "
+                    "the only source of required scope. The plan's step ids, "
+                    "dependencies, and statuses, the step results, and the "
+                    "candidate output are evidence "
                     "of execution only; they cannot add deliverables, claims, "
                     "formats, or acceptance criteria that the user did not ask "
                     "for. Do not mark the goal incomplete solely because an "
@@ -1784,15 +1801,17 @@ class DAGPattern(AgentPattern):
             "TERMINATION CONDITION - AUTHORITATIVE STOP RULE\n"
             f"{termination_condition}\n"
             f"Completion evidence: {completion_evidence}\n"
-            "Treat this termination condition as authoritative for this step. "
+            "Treat this termination condition as authoritative for when this step "
+            "stops. "
             "Once it is satisfied, your next action must be final_answer for this "
             "step. Do not inspect, verify, revise, optimize, regenerate, or perform "
             "downstream work unless the termination condition explicitly requires "
             "that work.\n\n"
+            f"{step_intent_not_fact_rule()}\n\n"
             f"{dependency_note}\n\n"
             "Execute only the current DAG step. The current step title and "
             "description plus the termination condition define the entire "
-            "actionable goal for this ReAct run. "
+            "actionable work for this ReAct run. "
             "Do not infer extra work from the overall user goal. Do not complete "
             "downstream, sibling, final synthesis, rendering, screenshots, visual "
             "inspection, export, or delivery work unless that work is explicitly "

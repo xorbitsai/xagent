@@ -9,6 +9,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from .utils import clamp_limit as _clamp_limit
 from .utils import require_clean_identifier as _require_clean_identifier
 from .utils import setup_proxy_env
 from .utils import success_with_capped_dict as _success_with_capped_dict
@@ -128,33 +129,42 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-def _paged_list(
-    path: str,
+def _next_cursor(result: dict[str, Any]) -> str | None:
+    """The next-page cursor from a HubSpot cursor-paginated response
+    (GET list or POST search alike - both nest it the same way)."""
+    return ((result.get("paging") or {}).get("next") or {}).get("after")
+
+
+def _bounded_page(
     list_field: str,
+    items: list[Any],
     *,
-    params: dict[str, Any],
-    after: str | None,
-    project: Callable[[list[Any]], list[Any]] = lambda items: items,
+    has_more: bool,
+    next_after: str | None,
+    retry_after: str | None,
+    total: int | None = None,
 ) -> str:
-    """Fetch one page from a HubSpot cursor-paginated list endpoint, project
-    its items, and halve them until the response fits the platform's
-    output limit.
+    """Serialize a cursor-paginated page of already-projected items, halving
+    them until the response fits the platform's output limit.
 
-    Unprojected HubSpot objects (full property maps) can serialize past the
-    output filter's threshold and get hard-truncated into broken JSON, the
-    same failure mode documented in google_analytics.py's list/report
-    tools. Halving (rather than a fixed slice) keeps the cap adaptive to
-    whatever property payload size a given portal's objects happen to
-    have, and continues down to zero items - a single oversized item must
-    still be capped, not silently returned whole because there's nothing
-    left to halve away from it.
+    Shared by every cursor-paginated HubSpot list/search endpoint in this
+    file (GET list endpoints via _paged_list, and the POST /search endpoint
+    via _search). Unprojected HubSpot objects (full property maps) can
+    serialize past the output filter's threshold and get hard-truncated
+    into broken JSON, the same failure mode documented in
+    google_analytics.py's list/report tools. Halving (rather than a fixed
+    slice) keeps the cap adaptive to whatever property payload size a given
+    portal's objects happen to have, and continues down to zero items - a
+    single oversized item must still be capped, not silently returned whole
+    because there's nothing left to halve away from it.
 
-    On truncation, the returned ``after`` is deliberately this call's own
-    input cursor, not the server's next-page cursor: the server already
-    considers the full (untruncated) page consumed, so advancing to its
-    next page would permanently skip whatever this page didn't return for
-    space reasons. Retrying with the same ``after`` and a smaller ``limit``
-    is what actually surfaces the trimmed entries.
+    On truncation, the returned ``after`` is deliberately ``retry_after``
+    (the caller's own input cursor), not the server's next-page cursor
+    (``next_after``): the server already considers the full (untruncated)
+    page consumed, so advancing to its next page would permanently skip
+    whatever this page didn't return for space reasons. Retrying with the
+    same cursor and a smaller ``limit`` is what actually surfaces the
+    trimmed entries.
 
     The explanatory "dead end" message added when halving collapses to
     zero items is itself re-checked against the size limit before being
@@ -162,28 +172,28 @@ def _paged_list(
     converged could push an already-fitted response back over the limit,
     the exact failure mode this function exists to prevent.
     """
-    result = _request("GET", path, params=params)
-    next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
-    items = project(result.get("results", []))
+
+    def _payload(
+        items: list[Any], truncated: bool, has_more: bool, after: str | None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            list_field: items,
+            "truncated": truncated,
+            "has_more": has_more,
+            "after": after,
+        }
+        if total is not None:
+            payload["total"] = total
+        return payload
 
     max_output_length = get_tool_max_output_length()
     truncated = False
-    payload = {
-        list_field: items,
-        "truncated": truncated,
-        "has_more": bool(next_after),
-        "after": next_after,
-    }
+    payload = _payload(items, truncated, has_more, next_after)
     response = _success(**payload)
     while len(response) > max_output_length and items:
         items = items[: len(items) // 2]
         truncated = True
-        payload = {
-            list_field: items,
-            "truncated": truncated,
-            "has_more": True,
-            "after": after,
-        }
+        payload = _payload(items, truncated, True, retry_after)
         response = _success(**payload)
     if truncated and not items:
         # Collapsing all the way to zero means even the single largest
@@ -213,6 +223,35 @@ def _paged_list(
         if len(response_with_message) <= max_output_length:
             response = response_with_message
     return response
+
+
+def _paged_list(
+    path: str,
+    list_field: str,
+    *,
+    params: dict[str, Any],
+    after: str | None,
+    project: Callable[[list[Any]], list[Any]] = lambda items: items,
+) -> str:
+    """Fetch one page from a HubSpot cursor-paginated GET list endpoint and
+    project its items - see _bounded_page for the output-size handling."""
+    if after:
+        after = _require_clean_identifier(after, "after")
+    result = _request("GET", path, params=params)
+    next_after = _next_cursor(result)
+    # result.get("results", []) only substitutes the default when the key
+    # is ABSENT, not when HubSpot returns it as an explicit JSON null (key
+    # present, value None) - `or []` catches that too, so every caller of
+    # this function (including one with no custom `project`, which would
+    # otherwise pass None straight through) gets a list either way.
+    items = project(result.get("results") or [])
+    return _bounded_page(
+        list_field,
+        items,
+        has_more=bool(next_after),
+        next_after=next_after,
+        retry_after=after,
+    )
 
 
 def _require_date_format(
@@ -304,6 +343,8 @@ def _list_association_ids(
     Invalid ids are ignored and duplicate ids are collapsed while preserving
     order. Returns the collected ids and the cursor for the next unread page.
     """
+    if after:
+        after = _require_clean_identifier(after, "after")
     ids: list[str] = []
     seen_ids: set[str] = set()
     cursor = after
@@ -316,7 +357,10 @@ def _list_association_ids(
         page = _request(
             "GET", path, params=params, timeout=ASSOCIATION_LISTING_TIMEOUT_SECONDS
         )
-        results = page.get("results", [])
+        # `or []` (not `.get("results", [])`) also catches HubSpot returning
+        # an explicit JSON null, not just an absent key - see _paged_list's
+        # docstring for why both cases need the same treatment.
+        results = page.get("results") or []
         for item in results:
             raw_id = item.get("id")
             if not raw_id:
@@ -342,33 +386,248 @@ def _parse_properties(properties_json: str) -> dict[str, Any]:
     return properties
 
 
+_FILTER_GROUPS_SHAPE_ERROR = (
+    "filter_groups_json must be a JSON array of HubSpot filterGroups objects, "
+    'each with a non-empty "filters" list of filter objects that each have '
+    'a non-blank "propertyName" and "operator" (e.g. [{"filters": '
+    '[{"propertyName": "dealstage", "operator": "EQ", "value": '
+    '"appointmentscheduled"}]}]) - not a flat list of conditions, and not a '
+    "group with an empty or missing filters list (which HubSpot treats as "
+    "matching everything, defeating the point of filtering)."
+)
+
+
+def _is_valid_filter(filter_: Any) -> bool:
+    """Whether ``filter_`` has the two fields every HubSpot filter object
+    requires regardless of operator - confirmed against HubSpot's CRM
+    Search API docs: ``propertyName``/``operator`` are always required,
+    while ``value``/``values``/``highValue`` are operator-dependent (e.g.
+    HAS_PROPERTY/NOT_HAS_PROPERTY take no value at all) - so those are
+    deliberately NOT checked here, to avoid rejecting a legitimate filter
+    that has no value field by design.
+    """
+    if not isinstance(filter_, dict):
+        return False
+    return all(
+        isinstance(filter_.get(field), str) and filter_[field].strip()
+        for field in ("propertyName", "operator")
+    )
+
+
+def _is_valid_filter_group(group: Any) -> bool:
+    if not isinstance(group, dict):
+        return False
+    filters = group.get("filters")
+    return (
+        isinstance(filters, list)
+        and bool(filters)
+        and all(_is_valid_filter(f) for f in filters)
+    )
+
+
+# HubSpot's CRM Search API caps filterGroups at 5 groups, 6 filters per
+# group, and 18 filters in total across all groups - confirmed against
+# HubSpot's CRM Search API docs. Enforced locally so an over-large filter
+# set surfaces as an actionable local error instead of an opaque 400.
+_MAX_FILTER_GROUPS = 5
+_MAX_FILTERS_PER_GROUP = 6
+_MAX_TOTAL_FILTERS = 18
+
+
+def _parse_filter_groups(filter_groups_json: str) -> list[dict[str, Any]]:
+    try:
+        filter_groups = json.loads(filter_groups_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"filter_groups_json is not valid JSON: {e}") from e
+    if not isinstance(filter_groups, list) or not all(
+        _is_valid_filter_group(group) for group in filter_groups
+    ):
+        raise ValueError(_FILTER_GROUPS_SHAPE_ERROR)
+    if len(filter_groups) > _MAX_FILTER_GROUPS or any(
+        len(group["filters"]) > _MAX_FILTERS_PER_GROUP for group in filter_groups
+    ):
+        raise ValueError(
+            f"filter_groups_json must have at most {_MAX_FILTER_GROUPS} filter "
+            f"groups with at most {_MAX_FILTERS_PER_GROUP} filters each "
+            "(HubSpot's CRM Search API limit)"
+        )
+    total_filters = sum(len(group["filters"]) for group in filter_groups)
+    if total_filters > _MAX_TOTAL_FILTERS:
+        raise ValueError(
+            f"filter_groups_json must have at most {_MAX_TOTAL_FILTERS} filters "
+            "in total across all groups (HubSpot's CRM Search API limit)"
+        )
+    # propertyName/operator are enum-like tokens HubSpot matches exactly -
+    # _is_valid_filter only checks the STRIPPED value is non-blank, so a
+    # padded value like " eq " passes local validation but would reach
+    # HubSpot verbatim and fail as an unrecognized operator; operator is
+    # also uppercased since HubSpot's operator enum is case-sensitive
+    # uppercase (EQ, GTE, HAS_PROPERTY, ...) - mirroring the
+    # .strip().lower() + allow-list precedent hubspot_get_analytics_report
+    # already uses for its own case-sensitive enum params. propertyName is
+    # only trimmed, never cased, since it's the caller's own custom field
+    # name and HubSpot property names are case-sensitive.
+    for group in filter_groups:
+        for filter_ in group["filters"]:
+            filter_["propertyName"] = filter_["propertyName"].strip()
+            filter_["operator"] = filter_["operator"].strip().upper()
+    return filter_groups
+
+
+def _project_id_and_properties(items: list[Any] | None) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    return [
+        {"id": item.get("id"), "properties": item.get("properties") or {}}
+        for item in items
+        if isinstance(item, dict)
+    ]
+
+
+def _resolve_properties(properties: str | None, default: list[str]) -> list[str]:
+    """A caller-supplied comma-separated `properties` override, or the
+    tool's own default property set when none is given (including when the
+    override is empty/all-whitespace, which is treated the same as
+    omitting it rather than sending HubSpot an empty properties list)."""
+    if not properties:
+        return default
+    overridden = [p.strip() for p in properties.split(",") if p.strip()]
+    return overridden or default
+
+
 def _search(
-    object_type: str, query: str, properties: list[str], limit: int
-) -> dict[str, Any]:
+    object_type: str,
+    properties: list[str],
+    limit: int,
+    tool_name: str,
+    list_tool_name: str,
+    query: str | None = None,
+    filter_groups_json: str | None = None,
+    after: str | None = None,
+) -> str:
+    """Free-text search, property filtering, or both, against one HubSpot
+    CRM object type's /search endpoint.
+
+    filter_groups_json, when given, is HubSpot's native filterGroups JSON -
+    see _parse_filter_groups for the exact shape required. Requires at
+    least one of `query` or a non-empty `filter_groups_json`: the search
+    endpoint would otherwise silently accept neither and return an
+    arbitrary, unfiltered page that looks like a real match - `list_tool_name`
+    exists specifically for that case and says so up front instead of a
+    plausible-looking but meaningless result.
+
+    `tool_name`/`list_tool_name` are the caller's own public tool names
+    (e.g. "hubspot_search_contacts"/"hubspot_list_contacts"), passed in
+    explicitly rather than derived from `object_type` by string
+    interpolation - a future object_type with no matching hubspot_list_X
+    tool couldn't otherwise be caught pointing an error message at a
+    nonexistent tool.
+
+    `after` is HubSpot's search-cursor - pass back the `after` this call
+    returns to fetch the next page, the same cursor contract as
+    `list_tool_name`. Results are also routed through _bounded_page (see
+    its docstring) since an unprojected page of up to 100 records can
+    otherwise serialize past the output filter's threshold and get
+    hard-truncated into invalid JSON.
+    """
+    query = query.strip() if query else None
+    filter_groups = (
+        _parse_filter_groups(filter_groups_json) if filter_groups_json else None
+    )
+    if after:
+        after = _require_clean_identifier(after, "after")
+    if not query and not filter_groups:
+        if after:
+            # A continuation call: the caller has a page-2+ cursor, so they
+            # already had real search criteria on page 1 - this endpoint is
+            # stateless and doesn't remember it, so it must be resent
+            # alongside `after` on every page, not just the first.
+            raise ValueError(
+                f"{tool_name} needs a query or filter_groups_json on every "
+                f"call, including this one with `after` set - resend the "
+                f"same query/filter_groups_json you used to get this "
+                f"`after` cursor, not `after` alone."
+            )
+        raise ValueError(
+            f"{tool_name} needs a query or filter_groups_json - to list "
+            f"every {object_type} with neither, use {list_tool_name} instead."
+        )
     body: dict[str, Any] = {
-        "query": query,
         "properties": properties,
-        "limit": max(1, min(limit, 100)),
+        "limit": _clamp_limit(limit, max_limit=100),
     }
+    if query:
+        body["query"] = query
+    if filter_groups:
+        body["filterGroups"] = filter_groups
+    if after:
+        body["after"] = after
     result = _request("POST", f"/crm/v3/objects/{object_type}/search", body=body)
-    return {
-        "total": result.get("total", 0),
-        "results": [
-            {"id": item.get("id"), "properties": item.get("properties", {})}
-            for item in result.get("results", [])
-        ],
-    }
+    next_after = _next_cursor(result)
+    items = _project_id_and_properties(result.get("results") or [])
+    return _bounded_page(
+        "results",
+        items,
+        has_more=bool(next_after),
+        next_after=next_after,
+        retry_after=after,
+        total=result.get("total") or 0,
+    )
 
 
 @mcp.tool()
-def hubspot_search_contacts(query: str, limit: int = 10) -> str:
+def hubspot_search_contacts(
+    query: str | None = None,
+    filter_groups_json: str | None = None,
+    limit: int = 10,
+    after: str | None = None,
+    properties: str | None = None,
+) -> str:
     """
-    Search HubSpot contacts by free-text query (matches name, email, phone, company).
-    Always search before creating a contact to avoid duplicates.
+    Search HubSpot contacts by free-text query (matches name, email, phone,
+    company), by property filters, or both. Always search before creating a
+    contact to avoid duplicates.
+
+    filter_groups_json, when given, is HubSpot's native filterGroups JSON
+    array, e.g. '[{"filters": [{"propertyName": "createdate", "operator":
+    "GTE", "value": "2026-09-01"}]}]' - filters within one group are ANDed,
+    and groups are ORed. See HubSpot's CRM search API docs for the full set
+    of operators (EQ, GTE, LTE, CONTAINS_TOKEN, ...). Every group needs a
+    non-empty "filters" list, and every filter needs a non-blank
+    "propertyName" and "operator" (the two fields HubSpot requires
+    regardless of operator - "value"/"values"/"highValue" are
+    operator-dependent, e.g. HAS_PROPERTY needs none of them). At most 5
+    filter groups, 6 filters per group, and 18 filters in total (HubSpot's
+    own CRM Search API limit). To list every contact with no query or
+    filter at all, use hubspot_list_contacts instead - it's the more
+    direct tool for that and doesn't need an empty search body.
+
+    `properties` is an optional comma-separated list of HubSpot contact
+    property names to return instead of the default set - use this to pull
+    a custom/non-default property without a separate hubspot_get_contact
+    call per result.
+
+    Returns at most `limit` contacts (max 100); `has_more` is true when
+    there are more matches past this page, either because of `limit` or
+    because the response was trimmed to fit the output size limit
+    (`truncated` is then also true). To retrieve the next page, call again
+    with the SAME `query`/`filter_groups_json` plus the returned `after`
+    cursor - HubSpot's search endpoint is stateless, so `after` alone
+    without resending the original criteria is rejected the same as
+    calling with no criteria at all. If `truncated` is true because results
+    were trimmed, retry that same cursor with a smaller `limit`.
     """
     try:
-        found = _search("contacts", query, DEFAULT_CONTACT_PROPERTIES, limit)
-        return _success(**found)
+        return _search(
+            "contacts",
+            _resolve_properties(properties, DEFAULT_CONTACT_PROPERTIES),
+            limit,
+            "hubspot_search_contacts",
+            "hubspot_list_contacts",
+            query=query,
+            filter_groups_json=filter_groups_json,
+            after=after,
+        )
     except Exception as e:
         logger.error(f"Error searching contacts: {e}")
         return _error(str(e))
@@ -434,13 +693,38 @@ def hubspot_update_contact(contact_id: str, properties_json: str) -> str:
 
 
 @mcp.tool()
-def hubspot_search_companies(query: str, limit: int = 10) -> str:
+def hubspot_search_companies(
+    query: str | None = None,
+    filter_groups_json: str | None = None,
+    limit: int = 10,
+    after: str | None = None,
+    properties: str | None = None,
+) -> str:
     """
-    Search HubSpot companies by free-text query (matches name, domain).
+    Search HubSpot companies by free-text query (matches name, domain), by
+    property filters, or both.
+
+    filter_groups_json, when given, is HubSpot's native filterGroups JSON
+    array - see hubspot_search_contacts for the exact shape, operator, and
+    cardinality limits. `properties` is an optional comma-separated list of
+    HubSpot company property names to return instead of the default set.
+    To list every company with no query or filter at all, use
+    hubspot_list_companies instead.
+
+    Returns at most `limit` companies (max 100); `has_more`/`truncated`/
+    `after` behave as in hubspot_search_contacts.
     """
     try:
-        found = _search("companies", query, DEFAULT_COMPANY_PROPERTIES, limit)
-        return _success(**found)
+        return _search(
+            "companies",
+            _resolve_properties(properties, DEFAULT_COMPANY_PROPERTIES),
+            limit,
+            "hubspot_search_companies",
+            "hubspot_list_companies",
+            query=query,
+            filter_groups_json=filter_groups_json,
+            after=after,
+        )
     except Exception as e:
         logger.error(f"Error searching companies: {e}")
         return _error(str(e))
@@ -498,7 +782,7 @@ def _get_associated_deals(
     """
     deal_ids, next_after = _list_association_ids(
         f"/crm/v3/objects/{object_type}/{object_id}/associations/deals",
-        max(1, min(limit, 100)),
+        _clamp_limit(limit, max_limit=100),
         after,
     )
     if not deal_ids:
@@ -518,11 +802,8 @@ def _get_associated_deals(
             "inputs": [{"id": deal_id} for deal_id in deal_ids],
         },
     )
-    results = batch.get("results", [])
-    deals = [
-        {"id": item.get("id"), "properties": item.get("properties", {})}
-        for item in results
-    ]
+    results = batch.get("results") or []
+    deals = _project_id_and_properties(results)
     # A partial batch-read (e.g. an archived deal dropped between the
     # association listing above and this call) must be surfaced, not
     # silently returned as if every requested id came back. Normalize ids to
@@ -707,20 +988,203 @@ def hubspot_update_deal(deal_id: str, properties_json: str) -> str:
 
 
 @mcp.tool()
-def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
+def hubspot_search_deals(
+    query: str | None = None,
+    filter_groups_json: str | None = None,
+    limit: int = 10,
+    after: str | None = None,
+    properties: str | None = None,
+) -> str:
+    """
+    Search HubSpot deals by property filters (stage, pipeline, amount,
+    close date, ...), by free-text query, or both - across the whole
+    portal, not scoped to one contact or company. `query` only matches
+    `dealname` (deals have no broader default-searchable property set the
+    way contacts/companies do) - for anything else (owner, amount, a
+    stage), use filter_groups_json instead of expecting query to find it.
+
+    filter_groups_json, when given, is HubSpot's native filterGroups JSON
+    array, e.g. '[{"filters": [{"propertyName": "dealstage", "operator":
+    "EQ", "value": "appointmentscheduled"}]}]' - see hubspot_search_contacts
+    for the exact shape, operator, and cardinality limits. `properties` is
+    an optional comma-separated list of HubSpot deal property names to
+    return instead of the default set.
+
+    Returns at most `limit` deals (max 100); `has_more`/`truncated`/`after`
+    behave as in hubspot_search_contacts.
+
+    For every deal tied to one contact or company, hubspot_get_contact_deals
+    / hubspot_get_company_deals are cheaper and don't need a filter. To list
+    every deal in the portal with no query or filter, use hubspot_list_deals.
+    """
+    try:
+        return _search(
+            "deals",
+            _resolve_properties(properties, DEFAULT_DEAL_PROPERTIES),
+            limit,
+            "hubspot_search_deals",
+            "hubspot_list_deals",
+            query=query,
+            filter_groups_json=filter_groups_json,
+            after=after,
+        )
+    except Exception as e:
+        logger.error(f"Error searching deals: {e}")
+        return _error(str(e))
+
+
+def _list_objects(
+    path: str,
+    list_field: str,
+    default_properties: list[str],
+    limit: int,
+    after: str | None,
+    properties: str | None,
+) -> str:
+    """Shared body for hubspot_list_deals/companies/contacts: clamp
+    `limit`, resolve `properties` (a caller override or the tool's default
+    set), and delegate to _paged_list."""
+    params: dict[str, Any] = {
+        "limit": _clamp_limit(limit, max_limit=100),
+        "properties": ",".join(_resolve_properties(properties, default_properties)),
+    }
+    if after:
+        params["after"] = after
+    return _paged_list(
+        path,
+        list_field,
+        params=params,
+        after=after,
+        project=_project_id_and_properties,
+    )
+
+
+@mcp.tool()
+def hubspot_list_deals(
+    limit: int = 100, after: str | None = None, properties: str | None = None
+) -> str:
+    """
+    List every deal in the portal - not scoped to any one contact or
+    company - including deal stage, pipeline, amount, close date, and the
+    closed-state flags hs_is_closed/hs_is_closed_won/hs_is_closed_lost; use
+    those flags to tell open from closed rather than
+    dealstage/pipeline/closedate (see hubspot_get_contact_deals for why
+    those aren't reliable alone). Returns at most `limit` deals (max 100);
+    `has_more` is true when the portal has more deals past this page
+    (`after` is the cursor to fetch it), and `truncated` is true when this
+    page itself was trimmed to fit the output size limit - retry with a
+    smaller `limit` to see the trimmed entries. `properties` is an optional
+    comma-separated list of HubSpot deal property names to return instead
+    of the default set.
+
+    Use this for "list/show me all deals" requests. For deals tied to one
+    contact or company, hubspot_get_contact_deals / hubspot_get_company_deals
+    are cheaper and don't require paging the whole portal. For deals
+    matching a filter (stage, amount, date range, ...), use
+    hubspot_search_deals instead of listing everything and filtering
+    yourself.
+    """
+    try:
+        return _list_objects(
+            "/crm/v3/objects/deals",
+            "deals",
+            DEFAULT_DEAL_PROPERTIES,
+            limit,
+            after,
+            properties,
+        )
+    except Exception as e:
+        logger.error(f"Error listing deals: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_list_companies(
+    limit: int = 100, after: str | None = None, properties: str | None = None
+) -> str:
+    """
+    List every company in the portal. Returns at most `limit` companies
+    (max 100); `has_more` is true when the portal has more companies past
+    this page (`after` is the cursor to fetch it), and `truncated` is true
+    when this page itself was trimmed to fit the output size limit - retry
+    with a smaller `limit` to see the trimmed entries. `properties` is an
+    optional comma-separated list of HubSpot company property names to
+    return instead of the default set.
+
+    Use this for "list/show me all companies" requests. For a name/domain
+    lookup, use hubspot_search_companies instead - it's cheaper and doesn't
+    require paging the whole portal.
+    """
+    try:
+        return _list_objects(
+            "/crm/v3/objects/companies",
+            "companies",
+            DEFAULT_COMPANY_PROPERTIES,
+            limit,
+            after,
+            properties,
+        )
+    except Exception as e:
+        logger.error(f"Error listing companies: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_list_contacts(
+    limit: int = 100, after: str | None = None, properties: str | None = None
+) -> str:
+    """
+    List every contact in the portal. Returns at most `limit` contacts
+    (max 100); `has_more` is true when the portal has more contacts past
+    this page (`after` is the cursor to fetch it), and `truncated` is true
+    when this page itself was trimmed to fit the output size limit - retry
+    with a smaller `limit` to see the trimmed entries. `properties` is an
+    optional comma-separated list of HubSpot contact property names to
+    return instead of the default set.
+
+    Use this for "list/show me all contacts" requests. For a name/email/
+    phone/company lookup, use hubspot_search_contacts instead - it's
+    cheaper and doesn't require paging the whole portal.
+    """
+    try:
+        return _list_objects(
+            "/crm/v3/objects/contacts",
+            "contacts",
+            DEFAULT_CONTACT_PROPERTIES,
+            limit,
+            after,
+            properties,
+        )
+    except Exception as e:
+        logger.error(f"Error listing contacts: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def hubspot_get_contact_notes(
+    contact_id: str, limit: int = 20, after: str | None = None
+) -> str:
     """
     List the notes associated with a HubSpot contact (most recent interaction
-    history), including note body and timestamp. Returns at most `limit` notes
-    (max 100); `has_more` is true when the contact has additional notes.
+    history), including note body and timestamp. Returns at most `limit`
+    notes (max 100); `has_more` is true when there are more notes past this
+    page, either because of `limit` or because the response was trimmed to
+    fit the output size limit (`truncated` is then also true). Pass the
+    returned `after` cursor to retrieve the next page; if `truncated` is
+    true because notes were trimmed, retry that same cursor with a smaller
+    `limit`.
     """
     try:
         contact_id = _url_path_id(contact_id, "contact_id")
         note_ids, next_after = _list_association_ids(
             f"/crm/v3/objects/contacts/{contact_id}/associations/notes",
-            max(1, min(limit, 100)),
+            _clamp_limit(limit, max_limit=100),
+            after,
         )
         if not note_ids:
-            return _success(notes=[], has_more=bool(next_after))
+            return _success(
+                notes=[], truncated=False, has_more=bool(next_after), after=next_after
+            )
 
         notes = _request(
             "POST",
@@ -730,12 +1194,13 @@ def hubspot_get_contact_notes(contact_id: str, limit: int = 20) -> str:
                 "inputs": [{"id": note_id} for note_id in note_ids],
             },
         )
-        return _success(
-            notes=[
-                {"id": item.get("id"), "properties": item.get("properties", {})}
-                for item in notes.get("results", [])
-            ],
+        items = _project_id_and_properties(notes.get("results") or [])
+        return _bounded_page(
+            "notes",
+            items,
             has_more=bool(next_after),
+            next_after=next_after,
+            retry_after=after,
         )
     except Exception as e:
         logger.error(f"Error getting contact notes: {e}")
@@ -835,7 +1300,7 @@ def hubspot_list_forms(limit: int = 20, after: str | None = None) -> str:
     specific form.
     """
     try:
-        params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        params: dict[str, Any] = {"limit": _clamp_limit(limit, max_limit=100)}
         if after:
             params["after"] = after
         return _paged_list(
@@ -865,7 +1330,7 @@ def hubspot_get_form_submissions(
     """
     try:
         form_id = _url_path_id(form_id, "form_id")
-        params: dict[str, Any] = {"limit": max(1, min(limit, 50))}
+        params: dict[str, Any] = {"limit": _clamp_limit(limit, max_limit=50)}
         if after:
             params["after"] = after
         return _paged_list(
@@ -954,7 +1419,7 @@ def hubspot_list_marketing_emails(limit: int = 20, after: str | None = None) -> 
     works for every other tool.
     """
     try:
-        params: dict[str, Any] = {"limit": max(1, min(limit, 100))}
+        params: dict[str, Any] = {"limit": _clamp_limit(limit, max_limit=100)}
         if after:
             params["after"] = after
         return _paged_list(
@@ -978,9 +1443,10 @@ def hubspot_get_marketing_email_statistics(
     """
     Get send/open/click/bounce statistics for HubSpot marketing emails.
     `email_ids` is a single email id, or a comma-separated list of ids
-    (max 100) to fetch statistics for multiple emails at once - each id
-    must be non-empty with no surrounding whitespace. `start_date`/
-    `end_date` are optional ISO 8601 timestamps ("2024-01-01T00:00:00Z")
+    (max 100, e.g. "111, 222" - surrounding whitespace around each id is
+    trimmed) to fetch statistics for multiple emails at once; each id must
+    still be non-empty. `start_date`/`end_date` are optional ISO 8601
+    timestamps ("2024-01-01T00:00:00Z")
     that limit the reporting window; omitting both returns all-time
     statistics.
 
@@ -992,7 +1458,10 @@ def hubspot_get_marketing_email_statistics(
     """
     try:
         raw_ids = email_ids.split(",")
-        ids = [_require_clean_identifier(raw_id, "each email id") for raw_id in raw_ids]
+        ids = [
+            _require_clean_identifier(raw_id.strip(), "each email id")
+            for raw_id in raw_ids
+        ]
         if len(ids) > _MAX_EMAIL_IDS_PER_STATISTICS_REQUEST:
             raise ValueError(
                 f"email_ids must contain at most "
@@ -1042,7 +1511,7 @@ def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
     """
     try:
         params: dict[str, Any] = {
-            "limit": max(1, min(limit, 100)),
+            "limit": _clamp_limit(limit, max_limit=100),
             "properties": ",".join(DEFAULT_CAMPAIGN_PROPERTIES),
         }
         if after:
@@ -1052,11 +1521,7 @@ def hubspot_list_campaigns(limit: int = 20, after: str | None = None) -> str:
             "campaigns",
             params=params,
             after=after,
-            project=lambda items: [
-                {"id": item.get("id"), "properties": item.get("properties", {})}
-                for item in items
-                if isinstance(item, dict)
-            ],
+            project=_project_id_and_properties,
         )
     except Exception as e:
         logger.error(f"Error listing campaigns: {e}")

@@ -227,6 +227,112 @@ def test_get_contact_notes_paginates_and_reports_has_more(monkeypatch):
     assert association_calls == [{"limit": 5}, {"limit": 2, "after": "cursor-1"}]
 
 
+def test_get_contact_notes_passes_after_cursor(monkeypatch):
+    """Regression: hubspot_get_contact_notes had no `after` parameter at
+    all, so a contact with more notes than `limit` had no way to page past
+    the first batch even though `has_more` could report True."""
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/notes" in url:
+            assert params["after"] == "caller-cursor"
+            return MockResponse(json_data={"results": [{"id": "n1"}]})
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {"hs_note_body": "x"}}
+                    for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_contact_notes("c1", after="caller-cursor"))
+
+    assert result["status"] == "success"
+    assert [note["id"] for note in result["notes"]] == ["n1"]
+
+
+def test_get_contact_notes_truncates_an_oversized_page_into_valid_json(monkeypatch):
+    """Regression: hubspot_get_contact_notes returned the full batch-read
+    response via plain _success with no size cap, unlike every other
+    tool in this file that reads full property values in bulk - a
+    contact with several long hs_note_body values could get
+    hard-truncated by the platform's output filter into invalid JSON."""
+    note_ids = [f"n{i}" for i in range(8)]
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/notes" in url:
+            return MockResponse(json_data={"results": [{"id": i} for i in note_ids]})
+        return MockResponse(
+            json_data={
+                "results": [
+                    {"id": item["id"], "properties": {"hs_note_body": "x" * 200}}
+                    for item in json["inputs"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 500)
+
+    raw = hubspot.hubspot_get_contact_notes("c1", limit=8, after="caller-input-cursor")
+    result = json.loads(raw)
+
+    assert len(raw) <= 500
+    assert result["status"] == "success"
+    assert 0 < len(result["notes"]) < 8
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["after"] == "caller-input-cursor"
+
+
+def test_list_association_ids_handles_an_explicit_null_results_field(monkeypatch):
+    """Regression: `page.get("results", [])` only substitutes the default
+    when the "results" key is ABSENT, not when HubSpot returns it as an
+    explicit JSON null - which used to raise TypeError instead of the
+    tool's usual structured error, the same class of bug already fixed
+    for _paged_list/_search."""
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"results": None})),
+    )
+
+    result = json.loads(hubspot.hubspot_get_contact_notes("c1"))
+
+    assert result == {
+        "status": "success",
+        "notes": [],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+    }
+
+
+def test_get_associated_deals_handles_an_explicit_null_batch_read_results_field(
+    monkeypatch,
+):
+    """Regression: `batch.get("results", [])` in _get_associated_deals had
+    the same absent-vs-null gap as _list_association_ids - an explicit
+    `{"results": null}` from the deals batch-read endpoint used to crash
+    with TypeError instead of the tool's usual structured error."""
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}]})
+        assert url.endswith("/crm/v3/objects/deals/batch/read")
+        return MockResponse(json_data={"results": None})
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
+
+    assert result["status"] == "success"
+    assert result["deals"] == []
+    assert result["missing_deal_ids"] == ["d1"]
+
+
 def test_get_contact_deals_single_page_has_no_more(monkeypatch):
     def fake_request(method, url, headers, params, json, timeout):
         if "/associations/deals" in url:
@@ -248,6 +354,26 @@ def test_get_contact_deals_single_page_has_no_more(monkeypatch):
     assert result["status"] == "success"
     assert [deal["id"] for deal in result["deals"]] == ["d1", "d2"]
     assert result["has_more"] is False
+
+
+def test_get_contact_deals_treats_a_null_properties_value_as_empty(monkeypatch):
+    """Regression: _get_associated_deals used to build its deals list with
+    its own inline `item.get("properties", {})` (no isinstance guard, and
+    substituting the default only on an absent key, not an explicit null).
+    Now reuses _project_id_and_properties, the same null-safe helper every
+    other tool in this file already relies on."""
+
+    def fake_request(method, url, headers, params, json, timeout):
+        if "/associations/deals" in url:
+            return MockResponse(json_data={"results": [{"id": "d1"}]})
+        return MockResponse(json_data={"results": [{"id": "d1", "properties": None}]})
+
+    monkeypatch.setattr(hubspot.requests, "request", Mock(side_effect=fake_request))
+
+    result = json.loads(hubspot.hubspot_get_contact_deals("c1"))
+
+    assert result["status"] == "success"
+    assert result["deals"] == [{"id": "d1", "properties": {}}]
 
 
 def test_association_listing_stops_on_empty_page_with_cursor(monkeypatch):
@@ -1059,6 +1185,27 @@ def test_get_form_submissions_reports_has_more(monkeypatch):
     )
 
 
+def test_get_form_submissions_handles_an_explicit_null_results_field(monkeypatch):
+    """Regression: _paged_list's default identity `project` (used here,
+    unlike hubspot_list_deals/companies/contacts which pass
+    _project_id_and_properties) used to pass an explicit HubSpot
+    "results": null straight through as None instead of an empty list -
+    result.get("results", []) only substitutes the default when the key
+    is absent, not when it's present with value None."""
+    mock_request = Mock(return_value=MockResponse(json_data={"results": None}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_form_submissions("form-1"))
+
+    assert result == {
+        "status": "success",
+        "submissions": [],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+    }
+
+
 def test_get_form_submissions_clamps_limit_to_valid_range(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
@@ -1556,11 +1703,35 @@ def test_get_marketing_email_statistics_passes_time_window(monkeypatch):
     }
 
 
-def test_get_marketing_email_statistics_rejects_whitespace_padded_id(monkeypatch):
-    mock_request = Mock()
+def test_get_marketing_email_statistics_trims_whitespace_after_the_comma(monkeypatch):
+    """Regression: `"e1, e2"` (a comma-separated list with the very common
+    space-after-comma formatting) used to be rejected outright, because
+    splitting on "," left a leading space on every id after the first and
+    _require_clean_identifier rejects any surrounding whitespace. The
+    whitespace here is introduced by this tool's own `.split(",")`, not
+    supplied by the caller directly, so it should be trimmed before
+    validation instead of surfacing a confusing error for natural input."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"results": [{"id": "e1"}]})
+    )
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
 
     result = json.loads(hubspot.hubspot_get_marketing_email_statistics("e1, e2"))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["params"] == {"emailIds": ["e1", "e2"]}
+
+
+def test_get_marketing_email_statistics_rejects_an_empty_entry_from_a_trailing_comma(
+    monkeypatch,
+):
+    """Trimming split-induced leading/trailing whitespace must not weaken
+    the check against a genuinely malformed list: a trailing comma still
+    produces an empty entry after stripping, which must still be rejected."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_get_marketing_email_statistics("e1, "))
 
     assert result["status"] == "error"
     assert "each email id" in result["message"]
@@ -1820,8 +1991,9 @@ def test_get_campaign_metrics_passes_through_a_non_dict_body(monkeypatch):
 
 def test_list_campaigns_skips_non_dict_items(monkeypatch):
     """A non-dict item in the results (a malformed/unexpected upstream
-    shape) must be dropped rather than crash the whole page, matching the
-    guard _project_fields already applies for forms/emails."""
+    shape) must be dropped rather than crash the whole page - now routed
+    through the shared _project_id_and_properties helper instead of a
+    campaigns-specific inline lambda."""
     mock_request = Mock(
         return_value=MockResponse(
             json_data={"results": ["not-a-dict", {"id": "c1", "properties": {}}]}
@@ -1833,6 +2005,34 @@ def test_list_campaigns_skips_non_dict_items(monkeypatch):
 
     assert result["status"] == "success"
     assert result["campaigns"] == [{"id": "c1", "properties": {}}]
+
+
+def test_list_campaigns_treats_a_null_properties_value_as_empty(monkeypatch):
+    """Regression: the campaigns-specific projection this now shares with
+    hubspot_list_deals/companies/contacts used to do item.get("properties",
+    {}) - only substitutes the default when the key is absent, so an
+    explicit "properties": null (key present, value None) passed through
+    as None instead of {}."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"results": [{"id": "c1", "properties": None}]}
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_campaigns())
+
+    assert result["campaigns"] == [{"id": "c1", "properties": {}}]
+
+
+def test_list_campaigns_handles_an_explicit_null_results_field(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": None}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_campaigns())
+
+    assert result["status"] == "success"
+    assert result["campaigns"] == []
 
 
 def test_create_note_treats_empty_string_id_as_not_provided(monkeypatch):
@@ -1870,6 +2070,835 @@ def test_get_campaign_metrics_wraps_request_errors(monkeypatch):
     )
 
     result = json.loads(hubspot.hubspot_get_campaign_metrics("campaign-1"))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+
+
+def test_list_deals_hits_the_bare_deals_endpoint_with_properties(monkeypatch):
+    """Regression: a request for "all deals" (not scoped to a contact or
+    company) previously had no dedicated MCP tool at all, so an agent
+    would fall back to the credential-less generic api_call tool and
+    always get a 401 - see the 2026-09-16 incident. hubspot_list_deals
+    covers that gap the same way hubspot_list_forms already covers forms."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": [
+                    {
+                        "id": "d1",
+                        "properties": {"dealname": "Acme", "dealstage": "closedwon"},
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_deals(limit=50))
+
+    assert result == {
+        "status": "success",
+        "deals": [
+            {"id": "d1", "properties": {"dealname": "Acme", "dealstage": "closedwon"}}
+        ],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+    }
+    assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/deals")
+    params = mock_request.call_args.kwargs["params"]
+    assert params["limit"] == 50
+    assert "dealname" in params["properties"]
+
+
+def test_list_companies_hits_the_bare_companies_endpoint(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"results": [{"id": "c1", "properties": {"name": "Acme"}}]}
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_companies())
+
+    assert result["status"] == "success"
+    assert result["companies"] == [{"id": "c1", "properties": {"name": "Acme"}}]
+    assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/companies")
+
+
+def test_list_contacts_hits_the_bare_contacts_endpoint(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"results": [{"id": "p1", "properties": {"email": "a@b.com"}}]}
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_contacts())
+
+    assert result["status"] == "success"
+    assert result["contacts"] == [{"id": "p1", "properties": {"email": "a@b.com"}}]
+    assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/contacts")
+
+
+@pytest.mark.parametrize(
+    "tool, id_prefix",
+    [
+        (hubspot.hubspot_list_deals, "d"),
+        (hubspot.hubspot_list_companies, "c"),
+        (hubspot.hubspot_list_contacts, "p"),
+    ],
+)
+def test_list_passes_after_cursor_and_reports_next_one(monkeypatch, tool, id_prefix):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": [{"id": f"{id_prefix}1", "properties": {}}],
+                "paging": {"next": {"after": "cursor-1"}},
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(tool(after="cursor-0"))
+
+    assert mock_request.call_args.kwargs["params"]["after"] == "cursor-0"
+    assert result["has_more"] is True
+    assert result["after"] == "cursor-1"
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        hubspot.hubspot_list_deals,
+        hubspot.hubspot_list_companies,
+        hubspot.hubspot_list_contacts,
+    ],
+)
+def test_list_clamps_limit_to_valid_range(monkeypatch, tool):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    tool(limit=0)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 1
+
+    tool(limit=5000)
+    assert mock_request.call_args.kwargs["params"]["limit"] == 100
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        hubspot.hubspot_list_deals,
+        hubspot.hubspot_list_companies,
+        hubspot.hubspot_list_contacts,
+    ],
+)
+def test_list_accepts_a_properties_override(monkeypatch, tool):
+    """A caller-supplied `properties` overrides the tool's default set,
+    e.g. to pull a custom field without a separate get-by-id call per
+    result."""
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    tool(properties="custom_field, another_field")
+
+    assert (
+        mock_request.call_args.kwargs["params"]["properties"]
+        == "custom_field,another_field"
+    )
+
+
+@pytest.mark.parametrize(
+    "tool, default_property",
+    [
+        (hubspot.hubspot_list_deals, "dealname"),
+        (hubspot.hubspot_list_companies, "name"),
+        (hubspot.hubspot_list_contacts, "email"),
+    ],
+)
+def test_list_falls_back_to_defaults_when_properties_is_blank(
+    monkeypatch, tool, default_property
+):
+    """An empty or all-whitespace `properties` override must be treated
+    the same as omitting it, not sent to HubSpot as an empty property
+    list (which would return no properties at all)."""
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    tool(properties="   ")
+
+    assert default_property in mock_request.call_args.kwargs["params"]["properties"]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: hubspot.hubspot_list_deals(after=" cursor "),
+        lambda: hubspot.hubspot_search_contacts(query="acme", after=" cursor "),
+        lambda: hubspot.hubspot_get_contact_deals("c1", after=" cursor "),
+    ],
+)
+def test_after_cursor_rejects_surrounding_whitespace(monkeypatch, call):
+    """Regression: unlike other caller-supplied identifiers in this file,
+    `after` was never validated via _require_clean_identifier - a
+    whitespace-padded cursor reached HubSpot un-trimmed and produced an
+    opaque upstream error instead of the tool's usual structured one."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert "after" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_list_deals_handles_an_explicit_null_results_field(monkeypatch):
+    """Regression: `result.get("results", [])` only falls back to `[]` when
+    the "results" key is ABSENT, not when HubSpot returns it as an explicit
+    JSON null - which is still a key that exists, just with value None. That
+    None used to reach _project_id_and_properties's `for item in items` and
+    raise TypeError instead of the tool's usual structured error."""
+    mock_request = Mock(return_value=MockResponse(json_data={"results": None}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_list_deals())
+
+    assert result == {
+        "status": "success",
+        "deals": [],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+    }
+
+
+def test_project_id_and_properties_treats_a_null_properties_value_as_empty():
+    """A single item with `"properties": null` (key present, value None)
+    must come back as `{}`, not None - item.get("properties", {}) only
+    substitutes the default when the key is missing, not when it's None."""
+    result = hubspot._project_id_and_properties(
+        [{"id": "d1", "properties": None}, {"id": "d2", "properties": {"amount": "5"}}]
+    )
+
+    assert result == [
+        {"id": "d1", "properties": {}},
+        {"id": "d2", "properties": {"amount": "5"}},
+    ]
+
+
+def test_list_deals_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_list_deals())
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+
+
+def test_search_contacts_sends_free_text_query_only(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_search_contacts(query="chelsea")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["query"] == "chelsea"
+    assert "filterGroups" not in body
+
+
+def test_search_contacts_sends_filter_groups_with_no_query(monkeypatch):
+    """Regression: the 2026-09-16 incident's failed request had a
+    filterGroups-only body with no "query" key at all (filtering contacts
+    created after a date) - the generic api_call tool was the only way to
+    express that. filter_groups_json must let hubspot_search_contacts send
+    exactly that shape without a query."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [
+            {
+                "filters": [
+                    {
+                        "propertyName": "createdate",
+                        "operator": "GTE",
+                        "value": "2026-09-01",
+                    }
+                ]
+            }
+        ]
+    )
+
+    hubspot.hubspot_search_contacts(filter_groups_json=filter_groups_json)
+
+    body = mock_request.call_args.kwargs["json"]
+    assert "query" not in body
+    assert body["filterGroups"] == [
+        {
+            "filters": [
+                {"propertyName": "createdate", "operator": "GTE", "value": "2026-09-01"}
+            ]
+        }
+    ]
+
+
+def test_search_contacts_combines_query_and_filter_groups(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [
+            {
+                "filters": [
+                    {
+                        "propertyName": "lifecyclestage",
+                        "operator": "EQ",
+                        "value": "lead",
+                    }
+                ]
+            }
+        ]
+    )
+
+    hubspot.hubspot_search_contacts(query="acme", filter_groups_json=filter_groups_json)
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["query"] == "acme"
+    assert "filterGroups" in body
+
+
+@pytest.mark.parametrize(
+    "bad_filter_groups",
+    [
+        pytest.param({"filters": []}, id="top-level-not-a-list"),
+        pytest.param(["stage=won"], id="flat-list-of-conditions-not-groups"),
+        pytest.param([{}], id="group-missing-filters-key"),
+        pytest.param([{"filters": "not-a-list"}], id="filters-not-a-list"),
+        pytest.param([{"filters": []}], id="filters-list-empty"),
+        pytest.param([{"filters": [{}]}], id="filter-object-empty"),
+        pytest.param([{"filters": ["dealstage"]}], id="filter-entry-not-a-dict"),
+        pytest.param(
+            [{"filters": [{"propertyName": "dealstage"}]}],
+            id="filter-missing-operator",
+        ),
+        pytest.param(
+            [{"filters": [{"propertyName": "  ", "operator": "HAS_PROPERTY"}]}],
+            id="filter-whitespace-only-property-name",
+        ),
+        pytest.param(
+            [{"filters": [{"propertyName": "email", "operator": True}]}],
+            id="filter-non-string-operator",
+        ),
+    ],
+)
+def test_search_contacts_rejects_malformed_filter_groups_json(
+    monkeypatch, bad_filter_groups
+):
+    """Each case exercises a distinct branch of _is_valid_filter/
+    _is_valid_filter_group/_parse_filter_groups, built up across several
+    rounds: not a list at all; a flat list of conditions instead of group
+    objects; a group with no/wrong-typed/empty "filters"; a non-empty
+    filters list containing an empty or non-dict filter (the "matches
+    everything" hole one level deeper than the top-level-empty case,
+    verified against HubSpot's CRM Search API docs: propertyName/operator
+    are required on every filter regardless of operator); and a filter
+    whose propertyName/operator is present but blank or non-string (the
+    check only tested truthiness at first, so whitespace and non-string
+    truthy values slipped through)."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(
+        hubspot.hubspot_search_contacts(
+            filter_groups_json=json.dumps(bad_filter_groups)
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "filter_groups_json" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_accepts_a_has_property_filter_with_no_value(monkeypatch):
+    """HAS_PROPERTY/NOT_HAS_PROPERTY are real HubSpot operators that take
+    no "value" field at all - the propertyName/operator check must not
+    reject a legitimate filter just because it has neither "value" nor
+    "values" nor "highValue". Verified against HubSpot's CRM Search API
+    docs."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [{"filters": [{"propertyName": "email", "operator": "HAS_PROPERTY"}]}]
+    )
+
+    result = json.loads(
+        hubspot.hubspot_search_contacts(filter_groups_json=filter_groups_json)
+    )
+
+    assert result["status"] == "success"
+    mock_request.assert_called_once()
+
+
+def test_search_contacts_trims_whitespace_from_property_name_and_operator(
+    monkeypatch,
+):
+    """Regression: _is_valid_filter only checks the STRIPPED value is
+    non-blank, so a padded propertyName/operator (e.g. from an LLM caller's
+    incidental formatting) passed local validation but reached HubSpot
+    verbatim, which matches these as strict enum tokens and would reject
+    " EQ " as an unrecognized operator. Trim before sending."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [{"filters": [{"propertyName": " dealstage ", "operator": " EQ "}]}]
+    )
+
+    hubspot.hubspot_search_contacts(filter_groups_json=filter_groups_json)
+
+    sent_filter = mock_request.call_args.kwargs["json"]["filterGroups"][0]["filters"][0]
+    assert sent_filter["propertyName"] == "dealstage"
+    assert sent_filter["operator"] == "EQ"
+
+
+def test_search_contacts_uppercases_a_lowercase_operator(monkeypatch):
+    """HubSpot's operator enum is case-sensitive uppercase (EQ, GTE,
+    HAS_PROPERTY, ...) - a lowercase or mixed-case operator from an LLM
+    caller must be normalized before it reaches HubSpot verbatim and fails
+    as an unrecognized enum value. propertyName is left cased as-is since
+    it's the caller's own custom field name, which is case-sensitive."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [{"filters": [{"propertyName": "dealstage", "operator": "eq"}]}]
+    )
+
+    hubspot.hubspot_search_contacts(filter_groups_json=filter_groups_json)
+
+    sent_filter = mock_request.call_args.kwargs["json"]["filterGroups"][0]["filters"][0]
+    assert sent_filter["operator"] == "EQ"
+    assert sent_filter["propertyName"] == "dealstage"
+
+
+def test_search_contacts_rejects_more_than_five_filter_groups(monkeypatch):
+    """HubSpot's CRM Search API caps filterGroups at 5 groups - an
+    over-large filter set should surface as an actionable local error
+    instead of an opaque upstream 400."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [{"filters": [{"propertyName": "dealstage", "operator": "EQ"}]}] * 6
+    )
+
+    result = json.loads(
+        hubspot.hubspot_search_contacts(filter_groups_json=filter_groups_json)
+    )
+
+    assert result["status"] == "error"
+    assert "5" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_rejects_more_than_six_filters_in_one_group(monkeypatch):
+    """HubSpot's CRM Search API caps each filterGroup at 6 filters."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [
+            {
+                "filters": [
+                    {"propertyName": "dealstage", "operator": "EQ"} for _ in range(7)
+                ]
+            }
+        ]
+    )
+
+    result = json.loads(
+        hubspot.hubspot_search_contacts(filter_groups_json=filter_groups_json)
+    )
+
+    assert result["status"] == "error"
+    assert "6" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_rejects_more_than_eighteen_filters_in_total(monkeypatch):
+    """HubSpot's CRM Search API caps the total filter count at 18 across
+    all groups, even when no single group exceeds the per-group limit of
+    6 and the group count stays within the 5-group limit."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [
+            {
+                "filters": [
+                    {"propertyName": "dealstage", "operator": "EQ"} for _ in range(4)
+                ]
+            }
+            for _ in range(5)
+        ]
+    )  # 5 groups x 4 filters = 20 total, under the per-group cap of 6 but
+    # over the overall cap of 18.
+
+    result = json.loads(
+        hubspot.hubspot_search_contacts(filter_groups_json=filter_groups_json)
+    )
+
+    assert result["status"] == "error"
+    assert "18" in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        hubspot.hubspot_search_contacts,
+        hubspot.hubspot_search_companies,
+        hubspot.hubspot_search_deals,
+    ],
+)
+def test_search_accepts_a_properties_override(monkeypatch, tool):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    tool(query="acme", properties="custom_field, another_field")
+
+    assert mock_request.call_args.kwargs["json"]["properties"] == [
+        "custom_field",
+        "another_field",
+    ]
+
+
+def test_parse_filter_groups_rejects_malformed_json_with_an_actionable_message(
+    monkeypatch,
+):
+    """Genuinely malformed (non-JSON) filter_groups_json used to raise a raw
+    json.JSONDecodeError with no parameter name context - still caught by
+    the tool's try/except (JSONDecodeError is a ValueError subclass) so it
+    never crashed, but the message didn't say which parameter was wrong."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_search_contacts(filter_groups_json="not json"))
+
+    assert result["status"] == "error"
+    assert "filter_groups_json" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_rejects_whitespace_only_query(monkeypatch):
+    """A whitespace-only query is not meaningfully different from no query
+    at all - it must not (a) be sent to HubSpot as a real search term, or
+    (b) count as "a query was given" and bypass the no-criteria guard."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_search_contacts(query="   "))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_strips_query_before_sending(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    hubspot.hubspot_search_contacts(query="  acme  ")
+
+    assert mock_request.call_args.kwargs["json"]["query"] == "acme"
+
+
+@pytest.mark.parametrize(
+    "tool, path",
+    [
+        (hubspot.hubspot_search_contacts, "/crm/v3/objects/contacts/search"),
+        (hubspot.hubspot_search_companies, "/crm/v3/objects/companies/search"),
+        (hubspot.hubspot_search_deals, "/crm/v3/objects/deals/search"),
+    ],
+)
+def test_search_hits_the_expected_search_endpoint(monkeypatch, tool, path):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    tool(query="acme")
+
+    assert mock_request.call_args.kwargs["url"].endswith(path)
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        hubspot.hubspot_search_contacts,
+        hubspot.hubspot_search_companies,
+        hubspot.hubspot_search_deals,
+    ],
+)
+def test_search_passes_after_cursor_and_reports_next_one(monkeypatch, tool):
+    """Regression: _search used to drop paging.next.after entirely, so a
+    search matching more records than one page could never be paged past
+    its first page - the caller had no cursor to ask for the rest."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "total": 2,
+                "results": [{"id": "1", "properties": {}}],
+                "paging": {"next": {"after": "server-next-cursor"}},
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(tool(query="acme", after="caller-cursor"))
+
+    assert mock_request.call_args.kwargs["json"]["after"] == "caller-cursor"
+    assert result["has_more"] is True
+    assert result["after"] == "server-next-cursor"
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        hubspot.hubspot_search_contacts,
+        hubspot.hubspot_search_companies,
+        hubspot.hubspot_search_deals,
+    ],
+)
+def test_search_truncates_an_oversized_page_into_valid_json(monkeypatch, tool):
+    """Regression: _search returned the full projected page straight to
+    _success with no size cap, unlike every other list/search-shaped tool
+    in this file - a wide page of real-sized property payloads could get
+    hard-truncated by the platform's output filter into invalid JSON. This
+    mirrors test_paged_list_reports_input_after_not_next_after_when_truncated
+    for the search path: a truncated page must report the caller's own
+    input cursor, not the server's next-page cursor, since the server
+    already considers the full (untruncated) page consumed."""
+    records = [{"id": str(i), "properties": {"name": "x" * 200}} for i in range(8)]
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "total": 8,
+                "results": records,
+                "paging": {"next": {"after": "server-next-cursor"}},
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 500)
+
+    raw = tool(query="acme", after="caller-input-cursor")
+    result = json.loads(raw)
+
+    assert len(raw) <= 500
+    assert result["status"] == "success"
+    assert 0 < len(result["results"]) < 8
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["after"] == "caller-input-cursor"
+    assert result["total"] == 8
+
+
+@pytest.mark.parametrize(
+    "tool, list_tool_name",
+    [
+        (hubspot.hubspot_search_contacts, "hubspot_list_contacts"),
+        (hubspot.hubspot_search_companies, "hubspot_list_companies"),
+        (hubspot.hubspot_search_deals, "hubspot_list_deals"),
+    ],
+)
+def test_search_rejects_no_query_and_no_filter(monkeypatch, tool, list_tool_name):
+    """Regression: query used to be a required, non-empty `str` (no
+    default), so an unfiltered search was structurally unreachable. Making
+    it optional (for the filter-only case) also made a call with NEITHER
+    query nor filter_groups_json newly possible - which would otherwise
+    silently return an arbitrary, unfiltered page that looks like a real
+    match instead of the caller's evidently-missing search criteria."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(tool())
+
+    assert result["status"] == "error"
+    assert list_tool_name in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        hubspot.hubspot_search_contacts,
+        hubspot.hubspot_search_companies,
+        hubspot.hubspot_search_deals,
+    ],
+)
+def test_search_rejects_after_alone_with_a_more_specific_message(monkeypatch, tool):
+    """Regression: adding `after` must not make a criteria-less call look
+    reachable via a documented-looking continuation flow. A caller with a
+    page-2+ cursor already had real search criteria on page 1 - this
+    endpoint is stateless and doesn't remember it, so `after` alone (query/
+    filter_groups_json dropped) must still be rejected, with a message
+    that says to resend the original criteria rather than pointing at
+    hubspot_list_* (which would drop the search criteria entirely)."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(tool(after="cursor-from-page-1"))
+
+    assert result["status"] == "error"
+    assert "after" in result["message"]
+    assert "hubspot_list_" not in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_rejects_an_empty_filter_groups_array(monkeypatch):
+    """An explicit `filter_groups_json="[]"` parses to an empty list, which
+    is exactly as unscoped as omitting it - it must not be treated as "a
+    filter was given" and bypass the no-criteria guard above."""
+    mock_request = Mock()
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_search_contacts(filter_groups_json="[]"))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_search_contacts_handles_an_explicit_null_total(monkeypatch):
+    """Regression: result.get("total", 0) only substitutes the default when
+    the key is absent, not when HubSpot returns an explicit JSON null -
+    the same class of bug already fixed for the "results" field."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": None, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    result = json.loads(hubspot.hubspot_search_contacts(query="acme"))
+
+    assert result == {
+        "status": "success",
+        "results": [],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+        "total": 0,
+    }
+
+
+def test_search_companies_sends_filter_groups(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total": 0, "results": []})
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [{"filters": [{"propertyName": "industry", "operator": "EQ", "value": "SAAS"}]}]
+    )
+
+    hubspot.hubspot_search_companies(filter_groups_json=filter_groups_json)
+
+    body = mock_request.call_args.kwargs["json"]
+    assert "query" not in body
+    assert body["filterGroups"] == [
+        {"filters": [{"propertyName": "industry", "operator": "EQ", "value": "SAAS"}]}
+    ]
+
+
+def test_search_deals_hits_the_deals_search_endpoint(monkeypatch):
+    """New tool: previously there was no way to search/filter deals at all
+    across the whole portal (only per-contact/per-company lookups), so an
+    agent asking for e.g. "deals in the qualifiedtobuy stage" had no MCP
+    tool for it and had to fall back to the credential-less api_call tool."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "total": 1,
+                "results": [
+                    {"id": "d1", "properties": {"dealstage": "qualifiedtobuy"}}
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+
+    filter_groups_json = json.dumps(
+        [
+            {
+                "filters": [
+                    {
+                        "propertyName": "dealstage",
+                        "operator": "EQ",
+                        "value": "qualifiedtobuy",
+                    }
+                ]
+            }
+        ]
+    )
+
+    result = json.loads(
+        hubspot.hubspot_search_deals(filter_groups_json=filter_groups_json)
+    )
+
+    assert result == {
+        "status": "success",
+        "results": [{"id": "d1", "properties": {"dealstage": "qualifiedtobuy"}}],
+        "truncated": False,
+        "has_more": False,
+        "after": None,
+        "total": 1,
+    }
+    assert mock_request.call_args.kwargs["url"].endswith("/crm/v3/objects/deals/search")
+    body = mock_request.call_args.kwargs["json"]
+    assert "query" not in body
+    assert body["filterGroups"] == [
+        {
+            "filters": [
+                {
+                    "propertyName": "dealstage",
+                    "operator": "EQ",
+                    "value": "qualifiedtobuy",
+                }
+            ]
+        }
+    ]
+
+
+def test_search_deals_wraps_request_errors(monkeypatch):
+    monkeypatch.setattr(
+        hubspot.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(hubspot.hubspot_search_deals(query="acme"))
 
     assert result["status"] == "error"
     assert "boom" in result["message"]

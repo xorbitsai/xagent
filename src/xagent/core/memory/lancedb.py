@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
@@ -18,6 +18,7 @@ from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
+from .retrieval_compatibility import stream_lexical_top_k
 from .schema_migration import (
     MemoryMismatchKind,
     classify_memory_schema_mismatch,
@@ -32,6 +33,7 @@ from .scope_columns import (
     encode_scope_dims,
     scope_dim_where_term,
 )
+from .storage_admission import DormantLanceDBMemoryHandle
 
 logger = logging.getLogger(__name__)
 
@@ -726,39 +728,22 @@ class LanceDBMemoryStore(MemoryStore):
             include_null_vector_fallback=True,
         )
 
-    def _lexical_candidates(
-        self,
-        table: Any,
-        query: str,
-        filters: Optional[dict[str, Any]],
-        *,
-        null_vectors_only: bool,
-    ) -> list[MemoryNote]:
-        scan = table.search()
-        if null_vectors_only:
-            scan = scan.where("vector IS NULL")
-        rows = scan.limit(None).to_arrow().to_pylist()
-        other_filters = self._flat_other_filters(filters)
-        needle = query.casefold()
-        ranked: list[tuple[tuple[int, int, str], MemoryNote]] = []
-        for row in rows:
-            text = row.get("text") or ""
-            folded = text.casefold()
-            if needle and needle not in folded:
-                continue
-            try:
-                note = self._dict_to_memory_note(row)
-            except Exception as row_error:
-                logger.warning("Skipping malformed lexical memory row: %s", row_error)
-                continue
-            if filters and not self._matches_filters(note, filters, other_filters):
-                continue
-            match_kind = (
-                0 if folded == needle else 1 if folded.startswith(needle) else 2
-            )
-            ranked.append(((match_kind, -folded.count(needle), str(note.id)), note))
-        ranked.sort(key=lambda item: item[0])
-        return [note for _rank, note in ranked]
+    def _residual_note_filter(
+        self, residual_filters: dict[str, Any]
+    ) -> Callable[[MemoryNote], bool]:
+        """Bind the shared filter dispatch to one residual filter set.
+
+        ``_flat_other_filters`` is note-independent, so it is computed once here
+        rather than per scanned row.
+        """
+        other_filters = self._flat_other_filters(residual_filters)
+        return lambda note: self._matches_filters(note, residual_filters, other_filters)
+
+    def _dormant_memory_handle(self) -> DormantLanceDBMemoryHandle:
+        """This collection as the layer B handle the streaming scan takes."""
+        return DormantLanceDBMemoryHandle(
+            self._vector_store.get_raw_connection(), self._collection_name
+        )
 
     def _search(
         self,
@@ -906,11 +891,19 @@ class LanceDBMemoryStore(MemoryStore):
                         seen_ids.add(identity)
                         deduplicated.append(note)
                 results = deduplicated
+                # Dormant streaming retrieval (#2346): bounded batches, the
+                # scope clause pushed into `where`, and a heap bounded at the
+                # outstanding quota. ANN ids are excluded at the source, so a
+                # duplicate cannot consume a lexical slot.
                 candidates = (
-                    self._lexical_candidates(
-                        table,
+                    stream_lexical_top_k(
+                        self._dormant_memory_handle(),
                         query,
-                        filters,
+                        k - len(results),
+                        row_to_note=self._dict_to_memory_note,
+                        note_filter_factory=self._residual_note_filter,
+                        filters=filters,
+                        exclude_ids=seen_ids,
                         null_vectors_only=ann_search_completed,
                     )
                     if len(results) < k

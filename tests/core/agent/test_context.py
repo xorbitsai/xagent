@@ -29,7 +29,7 @@ from xagent.core.agent.context.execution import (
     CLOCK_TIMEZONE_METADATA_KEY,
     COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
 )
-from xagent.core.agent.grounding import VALUE_KINDS
+from xagent.core.agent.grounding import VALUE_KINDS, step_intent_not_fact_rule
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     detect_prose_script_mismatch,
@@ -817,6 +817,10 @@ def test_get_messages_for_llm_uses_compact_dag_output_language_policy() -> None:
     assert '"output_language": "English"' in system_content
     assert "Create two posters." not in system_content
     assert "Only execute the current DAG step" in system_content
+    assert (
+        "provided in the latest DAG step instruction message.\n"
+        f"{step_intent_not_fact_rule(compact=True)}\n" in system_content
+    )
     assert [message["role"] for message in result].count("system") == 1
 
 

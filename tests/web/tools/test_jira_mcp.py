@@ -1381,6 +1381,91 @@ def test_get_issue_caps_an_oversized_extra_field_value(monkeypatch):
     value = result["issue"]["extra_field_values"]["customfield_10099"]
     assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
     assert value.endswith("[truncated]")
+    assert result["issue"]["extra_field_values_truncated"] is True
+
+
+def test_get_issue_flattens_and_caps_an_adf_shaped_extra_field(monkeypatch):
+    # A custom "Rich Text" field comes back as an ADF dict, the same
+    # shape description does -- it must be flattened to plain text (not
+    # returned as a raw JSON tree) and still capped like any other large
+    # extra_fields value, since isinstance(value, str) alone would miss
+    # it entirely.
+    long_adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "x" * (jira._ISSUE_DESCRIPTION_MAX_CHARS + 500),
+                    }
+                ],
+            }
+        ],
+    }
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_10050": long_adf},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_10050"))
+
+    value = result["issue"]["extra_field_values"]["customfield_10050"]
+    assert isinstance(value, str)
+    assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
+    assert result["issue"]["extra_field_values_truncated"] is True
+
+
+def test_get_issue_caps_an_oversized_list_shaped_extra_field(monkeypatch):
+    # A multi-value picker/linked-records field can come back as a list
+    # rather than a string -- isinstance(value, str) alone would let it
+    # through uncapped.
+    long_list = ["x" * 200 for _ in range(200)]
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_10060": long_list},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_10060"))
+
+    value = result["issue"]["extra_field_values"]["customfield_10060"]
+    assert isinstance(value, str)
+    assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
+    assert result["issue"]["extra_field_values_truncated"] is True
+
+
+def test_path_segment_rejects_bare_dot_segments():
+    # "." and ".." survive percent-encoding unchanged (always-unreserved
+    # per RFC 3986); requests/urllib3 normalize them out of the final
+    # URL before sending, silently redirecting to a different endpoint
+    # unless rejected outright, matching utils.py's url_path_id.
+    with pytest.raises(ValueError):
+        jira._path_segment(".")
+    with pytest.raises(ValueError):
+        jira._path_segment("..")
+    assert jira._path_segment("ENG-1") == "ENG-1"
 
 
 def test_get_issue_response_always_has_a_truncated_key(monkeypatch):

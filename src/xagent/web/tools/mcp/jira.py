@@ -72,8 +72,18 @@ def _path_segment(value: str) -> str:
     _url_path_id / intercom.py's inline quote() calls. Percent-encoding -
     not a blocklist of "/", "?", "#" - is what actually prevents a value
     like "ENG-1/../other" from escaping its intended path segment.
+
+    "." and ".." are the one exception that survives encoding unchanged
+    (always-unreserved per RFC 3986, so quote() never touches them), and
+    requests/urllib3 normalize dot-segments out of the final URL before
+    sending -- collapsing e.g. ".../issue/.." to ".../issue" (or further),
+    a different endpoint than the one requested. Rejected explicitly,
+    matching utils.py's url_path_id, since encoding can't close this off.
     """
-    return quote(str(value), safe="")
+    text = str(value)
+    if text in (".", ".."):
+        raise ValueError(f"invalid path segment: {text!r}")
+    return quote(text, safe="")
 
 
 def _issue_path(issue_key: str, suffix: str = "") -> str:
@@ -610,6 +620,33 @@ _GET_ISSUE_FIELDS = (
 )
 
 
+def _cap_extra_field_value(value: Any, max_chars: int) -> tuple[Any, bool]:
+    """Bound one extra_fields raw value the same way description/comment
+    bodies are bounded, regardless of whether Jira returns it as a plain
+    string, an ADF rich-text dict (a custom "Rich Text" field uses the
+    same ADF shape description does), or some other JSON-shaped value
+    (a multi-value picker's list, for instance). Without this, only the
+    str case was capped -- a dict/list value bypassed the cap entirely,
+    and, being the sole key of extra_field_values, could also make that
+    whole field collapse to {} in one step if success_with_capped_dict's
+    halving fallback ever had to shrink it (halving a single-key dict's
+    keys drops to nothing, unlike halving a list). Returns (possibly-
+    capped value, whether it was truncated).
+    """
+    if isinstance(value, dict) and value.get("type") == "doc":
+        value = _flatten_adf(value)
+    if isinstance(value, str):
+        if len(value) > max_chars:
+            return _truncate(value, max_chars), True
+        return value, False
+    if value is None:
+        return None, False
+    serialized = json.dumps(value, ensure_ascii=False)
+    if len(serialized) > max_chars:
+        return _truncate(serialized, max_chars), True
+    return value, False
+
+
 @mcp.tool()
 def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -> str:
     """
@@ -627,8 +664,10 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
     "customfield_10010", found via your Jira admin's field
     configuration). Returned as {field_id: raw_value} under
     extra_field_values in the result, so you can reach any field this
-    tool doesn't summarize by name. A large text value here is still
-    subject to the same per-field cap as description.
+    tool doesn't summarize by name. An ADF-shaped (rich text) value is
+    flattened to plain text first, matching description; any resulting
+    large value (text or otherwise) is capped the same way, with
+    extra_field_values_truncated set to true if any entry was cut.
     Use this, not jira_search_issues, when you need an issue's
     dependencies or full description: issue_links/subtasks/description
     are only returned here. A description longer than
@@ -655,18 +694,17 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
         if requested_extra:
             raw_fields = _as_dict(result.get("fields"))
             extra_field_values: dict[str, Any] = {}
+            extra_field_values_truncated = False
             for name in requested_extra:
-                value = raw_fields.get(name)
-                # extra_fields is a caller-named escape hatch, so it can
-                # land on an unbounded raw field (e.g. a large ADF/wiki
-                # description-like custom field) that the summarizer
-                # never sized -- cap it the same way description/comment
-                # bodies are, instead of letting it bypass every other
-                # field's size guarantee.
-                if isinstance(value, str) and len(value) > _ISSUE_DESCRIPTION_MAX_CHARS:
-                    value = _truncate(value, _ISSUE_DESCRIPTION_MAX_CHARS)
+                value, was_truncated = _cap_extra_field_value(
+                    raw_fields.get(name), _ISSUE_DESCRIPTION_MAX_CHARS
+                )
                 extra_field_values[name] = value
+                extra_field_values_truncated = (
+                    extra_field_values_truncated or was_truncated
+                )
             issue["extra_field_values"] = extra_field_values
+            issue["extra_field_values_truncated"] = extra_field_values_truncated
         description_truncated = _cap_text_field(
             issue, "description", _ISSUE_DESCRIPTION_MAX_CHARS
         )
@@ -946,12 +984,14 @@ def _fit_comments_page(
     next_start_at, extended to also cover a size-triggered cut, not
     just a filtered-out malformed entry).
     """
-    kept: list[dict[str, Any]] = []
-    raw_positions: list[int] = []
-    for index, raw in enumerate(raw_comments):
-        if isinstance(raw, dict):
-            kept.append(_summarize_comment(raw))
-            raw_positions.append(index)
+    # (raw index, summarized comment) pairs -- kept together instead of
+    # two parallel lists so the two can't drift out of alignment under a
+    # future edit to the filter below.
+    kept: list[tuple[int, dict[str, Any]]] = [
+        (index, _summarize_comment(raw))
+        for index, raw in enumerate(raw_comments)
+        if isinstance(raw, dict)
+    ]
 
     def next_start_at_for(count: int) -> int | None:
         if count == len(kept):
@@ -963,29 +1003,27 @@ def _fit_comments_page(
             # Nothing kept yet -- resume at the first comment this page
             # actually has, rather than the "-1 + 1" arithmetic below,
             # which has no count-1 to read when count is 0.
-            return offset + raw_positions[0]
-        return offset + raw_positions[count - 1] + 1
+            return offset + kept[0][0]
+        return offset + kept[count - 1][0] + 1
 
-    # Response length is monotonically non-decreasing in count: kept[:n]
-    # is a prefix of kept[:n+1], so every character the smaller page
-    # serializes to is also present in the larger page's serialization.
-    # That makes the largest fitting count findable by binary search
-    # instead of re-serializing the whole shrinking slice once per
-    # count -- O(log n) json.dumps calls instead of O(n) (each itself
-    # O(n)), matching the halving strategy utils.py's
-    # success_with_capped_dict already uses for the same kind of
-    # "shrink a list field until the response fits" problem.
-    lo, hi = 0, len(kept)
-    best: str | None = None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        response = _build_comments_response(kept[:mid], total, next_start_at_for(mid))
-        if len(response) <= max_output_length:
-            best = response
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return best
+    def response_for(count: int) -> str:
+        comments = [comment for _, comment in kept[:count]]
+        return _build_comments_response(comments, total, next_start_at_for(count))
+
+    # Try every kept comment first, then halve the count until the
+    # response fits -- the same halving strategy utils.py's
+    # success_with_capped_dict/_halve_largest_list_fields_until_bounded
+    # use for the same "shrink a list field until the response fits"
+    # problem, rather than a bespoke bisection: MAX_LIMIT bounds a page
+    # to 100 comments, so the extra precision an exact-largest-fit search
+    # would buy isn't worth this being the one mechanism in the file that
+    # doesn't match its siblings.
+    count = len(kept)
+    response = response_for(count)
+    while len(response) > max_output_length and count > 0:
+        count //= 2
+        response = response_for(count)
+    return response if len(response) <= max_output_length else None
 
 
 @mcp.tool()
@@ -993,14 +1031,18 @@ def jira_list_comments(
     issue_key: str, cloud_id: str = "", limit: int = 50, start_at: int = 0
 ) -> str:
     """
-    List comments on an issue (body, author, timestamp).
+    List comments on an issue (id, body, author, visibility, timestamps).
+    visibility is set (role/group) when a comment is restricted, so it's
+    not mistaken for a normal public one.
     start_at: offset into the full comment list -- pass the previous
     response's next_start_at to fetch the next page (0 to start over).
     A comment body longer than _COMMENT_BODY_MAX_CHARS is truncated
     with body_truncated set to true on that comment; if the whole page
     still doesn't fit the tool output limit even after that, fewer
-    comments than requested are returned with next_start_at pointing at
-    the first one left out, so pagination stays valid.
+    comments than requested are returned (down to zero) with
+    next_start_at pointing at the first one left out, so pagination
+    stays valid. Only if even a single empty page doesn't fit is an
+    error returned instead.
     """
     try:
         max_results = _clamp_limit(limit)

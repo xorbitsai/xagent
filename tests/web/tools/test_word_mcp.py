@@ -137,6 +137,50 @@ def test_set_paragraph_text_rejects_hyperlink_nested_in_sdt():
         word._set_paragraph_text(paragraph, "New text")
 
 
+def test_set_paragraph_text_rejects_tracked_insertion():
+    """A <w:ins>-wrapped run's text is outside paragraph.runs, so rewriting
+    only the direct-child runs would leave the tracked insertion's old text
+    stale and still physically present -- verified: it stays in the saved
+    XML even though it drops out of paragraph.text -- rather than replaced."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+
+    document = Document()
+    paragraph = document.add_paragraph("before ")
+    ins = OxmlElement("w:ins")
+    ins.set(qn("w:author"), "Alice")
+    run_elm = OxmlElement("w:r")
+    text_elm = OxmlElement("w:t")
+    text_elm.text = "Q3 revenue"
+    run_elm.append(text_elm)
+    ins.append(run_elm)
+    paragraph._p.append(ins)
+
+    with pytest.raises(ValueError, match="tracked change"):
+        word._set_paragraph_text(paragraph, "New text")
+
+
+def test_set_paragraph_text_rejects_content_control():
+    """A <w:sdt> (structured document tag / content control) holds its own
+    runs the same way a hyperlink does -- invisible to paragraph.runs."""
+    from docx.oxml.shared import OxmlElement
+
+    document = Document()
+    paragraph = document.add_paragraph()
+    sdt = OxmlElement("w:sdt")
+    sdt_content = OxmlElement("w:sdtContent")
+    run_elm = OxmlElement("w:r")
+    text_elm = OxmlElement("w:t")
+    text_elm.text = "field value"
+    run_elm.append(text_elm)
+    sdt_content.append(run_elm)
+    sdt.append(sdt_content)
+    paragraph._p.append(sdt)
+
+    with pytest.raises(ValueError, match="content control"):
+        word._set_paragraph_text(paragraph, "New text")
+
+
 def test_set_paragraph_text_rejects_run_with_image():
     import base64
 

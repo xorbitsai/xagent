@@ -343,6 +343,30 @@ def _paragraph_flow_elements(paragraph: Any, local_tag: str) -> Any:
     return paragraph._p.xpath(f".//{local_tag}[{_PARAGRAPH_FLOW_PREDICATE}]")
 
 
+# Elements that hold their own runs outside paragraph.runs' direct-children
+# view, the same way a hyperlink does: w:ins/w:del/w:moveFrom/w:moveTo (a
+# tracked-change insertion, deletion, or move) and w:sdt (a content
+# control). _set_paragraph_text only rewrites paragraph.runs[0] and empties
+# the rest, so any of these left untouched keeps its old text -- verified
+# directly: the old text is still physically present in the saved XML
+# (readable via ".//w:t", just not reflected in paragraph.text), and Word
+# would render it alongside the new text. Excludes ones inside a text box,
+# which is a separate content stream this rewrite never touches anyway.
+_UNSUPPORTED_NESTED_ELEMENT_TAGS = (
+    "w:hyperlink",
+    "w:ins",
+    "w:del",
+    "w:moveFrom",
+    "w:moveTo",
+    "w:sdt",
+)
+
+
+def _paragraph_has_unsupported_structure(paragraph: Any) -> bool:
+    predicate = " or ".join(f"self::{tag}" for tag in _UNSUPPORTED_NESTED_ELEMENT_TAGS)
+    return bool(paragraph._p.xpath(f".//*[{predicate}][not(ancestor::w:txbxContent)]"))
+
+
 def _set_paragraph_text(paragraph: Any, text: str) -> None:
     """Replace a paragraph's visible text, keeping its first run's
     character formatting (font, bold, etc.) and its own paragraph style.
@@ -351,19 +375,20 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
     effect but a paragraph with zero runs to begin with needs one added.
 
     Refuses (rather than silently corrupting the document) a paragraph
-    that's entirely a hyperlink -- python-docx's paragraph.runs excludes
-    runs nested inside a <w:hyperlink>, so the zero-runs branch above would
-    otherwise append a new plain-text run alongside the untouched hyperlink
-    instead of replacing it -- or a paragraph containing a run with an
-    image, break, or field character, which the plain-text runs[0].text
-    assignment below would silently delete.
+    containing a hyperlink, a tracked-change insertion/deletion/move, or a
+    content control -- each holds its own runs outside paragraph.runs, so
+    the rewrite below would leave their old text stale rather than
+    replacing it -- or a paragraph containing a run with an image, break,
+    or field character, which the plain-text runs[0].text assignment below
+    would silently delete.
     """
-    if _paragraph_flow_elements(paragraph, "w:hyperlink"):
+    if _paragraph_has_unsupported_structure(paragraph):
         raise ValueError(
-            "paragraph contains a hyperlink; word_set_paragraph_text does not "
-            "support editing it here (the hyperlink's own run text is outside "
-            "python-docx's paragraph.runs, so it would be duplicated rather "
-            "than replaced) -- edit this paragraph directly in Word instead"
+            "paragraph contains a hyperlink, tracked change, or content "
+            "control; word_set_paragraph_text does not support editing it "
+            "here (its own run text is outside python-docx's paragraph.runs, "
+            "so it would be left stale rather than replaced) -- edit this "
+            "paragraph directly in Word instead"
         )
     for run in paragraph.runs:
         if _run_has_non_text_content(run):

@@ -259,6 +259,30 @@ def test_upload_file_success(monkeypatch, _upload_allowed_dirs_env):
     assert kwargs["url"].endswith("/sites/root/drive/root:/Docs/data.bin:/content")
 
 
+def test_guess_mime_type_covers_macro_enabled_and_opendocument_formats():
+    # These are exactly the formats sharepoint_upload_text_file's own
+    # _BINARY_ONLY_EXTENSIONS denylist already recognizes as real binary
+    # Office formats; the override table must recognize them too so
+    # sharepoint_upload_file doesn't mislabel them on a host whose stdlib
+    # mimetypes has no system mime.types file to fall back on.
+    assert (
+        sharepoint._guess_mime_type("budget.xlsm")
+        == "application/vnd.ms-excel.sheet.macroEnabled.12"
+    )
+    assert (
+        sharepoint._guess_mime_type("notes.odt")
+        == "application/vnd.oasis.opendocument.text"
+    )
+    assert sharepoint._guess_mime_type("book.epub") == "application/epub+zip"
+
+
+def test_guess_mime_type_uses_encoding_not_decompressed_type():
+    # mimetypes.guess_type("report.pdf.gz") reports the *decompressed*
+    # type ("application/pdf") plus a "gzip" encoding; the actual bytes on
+    # the wire are gzip, not PDF, so Content-Type must reflect that.
+    assert sharepoint._guess_mime_type("report.pdf.gz") == "application/gzip"
+
+
 # ---------------------------------------------------------------------------
 # lists
 # ---------------------------------------------------------------------------

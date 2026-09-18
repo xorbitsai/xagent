@@ -46,10 +46,20 @@ _BINARY_ONLY_EXTENSIONS = frozenset({
     ".pdf", ".zip", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
 })  # fmt: skip
 
+# Matches onedrive.py's own _MIME_TYPE_OVERRIDES: stdlib mimetypes.guess_type()
+# only recognizes these extensions when a system mime.types file happens to be
+# installed, which a minimal/slim host (a stripped-down container image) may
+# not have -- verified directly there via MimeTypes(filenames=()) returning
+# (None, None) for every one of these.
 _MIME_TYPE_OVERRIDES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".epub": "application/epub+zip",
 }
 
 
@@ -216,11 +226,32 @@ def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
 
 
 def _guess_mime_type(name: str) -> str | None:
+    """Guess ``name``'s real mime type: _MIME_TYPE_OVERRIDES first, for the
+    formats stdlib mimetypes can't reliably identify on its own, then stdlib
+    itself.
+
+    Only the type element of mimetypes.guess_type()'s result is normally
+    usable directly -- but when it also reports a non-None *encoding* (e.g.
+    "gzip" for ".gz"), the type element describes the *decompressed*
+    content, not what's actually going out over the wire:
+    mimetypes.guess_type("report.pdf.gz") returns ("application/pdf",
+    "gzip"), and blindly using "application/pdf" as Content-Type would tell
+    any client trusting that header to parse a raw gzip stream as an
+    uncompressed PDF. Falls back to the standard encoding-to-mimetype
+    mapping in that case instead, matching onedrive.py's identical guard.
+    """
     suffix = Path(name).suffix.lower()
     override = _MIME_TYPE_OVERRIDES.get(suffix)
     if override is not None:
         return override
-    guessed_type, _guessed_encoding = mimetypes.guess_type(name)
+    guessed_type, guessed_encoding = mimetypes.guess_type(name)
+    if guessed_encoding is not None:
+        return {
+            "gzip": "application/gzip",
+            "bzip2": "application/x-bzip2",
+            "xz": "application/x-xz",
+            "compress": "application/x-compress",
+        }.get(guessed_encoding, "application/octet-stream")
     return guessed_type
 
 

@@ -9,7 +9,9 @@ from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
+from ....config import get_tool_max_output_length
 from .utils import allowed_dirs_from_env, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
@@ -41,17 +43,79 @@ _MAX_DOWNLOAD_BYTES = 10_000_000
 
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"
 
-# Extensions this connector refuses for sharepoint_upload_text_file, since
-# writing arbitrary text content under one of these names would silently
-# produce a mislabeled (and broken) binary file rather than the real
-# document format. Deliberately a small denylist of common binary document/
-# media formats, not the exhaustive text-extension allowlist onedrive.py and
-# google_drive.py each carry -- a real file already on disk should go
-# through sharepoint_upload_file instead.
-_BINARY_ONLY_EXTENSIONS = frozenset({
-    ".docx", ".dotx", ".xlsx", ".xltx", ".xlsm", ".pptx", ".potx",
-    ".pdf", ".zip", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-})  # fmt: skip
+
+def _split_stem_suffix(base: str) -> tuple[str, str]:
+    """Like Path(base).stem/.suffix, except a name that's *entirely* a
+    leading dot plus extension (e.g. ".pdf") is treated as having that
+    extension. pathlib's own split refuses to do this -- it follows the
+    Unix dotfile convention where a single leading dot with nothing before
+    it never counts as an extension separator, leaving Path(".pdf").suffix
+    empty -- but silently losing the extension here would let a name like
+    that slip past _name_looks_binary's guard as "extensionless" (accepted)
+    when it's actually naming a real binary format. Only that narrow shape
+    is special-cased; e.g. "..pdf" or "..." already split the way we want
+    via plain pathlib and are left alone. Matches onedrive.py's identical
+    helper.
+    """
+    suffix = Path(base).suffix
+    if not suffix and base.startswith(".") and base.count(".") == 1 and len(base) > 1:
+        return "", base
+    return Path(base).stem, suffix
+
+
+# Stable text-extension allowlist, matching onedrive.py's/google_drive.py's
+# identical set. Host MIME databases vary, so they cannot safely decide
+# whether the text-only tool may use a filename. Unknown extensions are
+# rejected; names without an extension remain valid for files such as
+# README and Dockerfile. Ambiguous but commonly textual source extensions
+# such as .ts and .bat are allowed, while formats with common binary
+# variants such as .crt and .plist are not.
+_KNOWN_TEXT_EXTENSIONS = {
+    # plain text / docs / dotfiles
+    ".txt", ".md", ".markdown", ".mdx", ".rst", ".adoc", ".rtf", ".log",
+    ".lock", ".gitignore", ".gitattributes", ".editorconfig",
+    ".dockerignore", ".env", ".ini", ".cfg", ".conf", ".properties",
+    ".toml",
+    # structured/data formats
+    ".json", ".json5", ".xml", ".yaml", ".yml", ".csv", ".tsv", ".dtd",
+    ".xsd", ".xsl", ".xslt", ".proto", ".graphql", ".gql", ".thrift",
+    ".avsc", ".ipynb", ".jsonl", ".ndjson", ".geojson",
+    # web
+    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".svg",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".vue", ".svelte", ".astro",
+    # source code
+    ".py", ".rb", ".php", ".java", ".c", ".h", ".cpp", ".hpp", ".cc",
+    ".cxx", ".cs", ".m", ".mm", ".go", ".rs", ".swift", ".kt", ".kts",
+    ".scala", ".groovy", ".lua", ".r", ".jl", ".pl", ".pm", ".hs", ".fs",
+    ".fsx", ".ml", ".mli", ".clj", ".cljs", ".erl", ".ex", ".exs", ".nim",
+    ".zig", ".v", ".d", ".dart", ".elm", ".cr", ".tcl", ".scm", ".sc",
+    ".rkt", ".lisp", ".el", ".asm", ".s", ".pas", ".f90", ".for", ".vb",
+    ".vbs", ".cabal", ".nix",
+    # shell / scripting / templates
+    ".sh", ".bash", ".zsh", ".csh", ".ksh", ".fish",
+    ".ps1", ".bat", ".cmd", ".awk", ".sed", ".sql", ".j2", ".tpl", ".srt",
+    # build / infra
+    ".tex", ".latex", ".bib", ".cls", ".sty", ".diff", ".patch",
+    ".hcl", ".tf", ".tfvars", ".gradle", ".dockerfile", ".cmake",
+    # misc
+    ".pem", ".po",
+}  # fmt: skip
+
+
+def _name_looks_binary(name: str) -> bool:
+    """Whether ``name``'s extension is NOT a recognized text format.
+
+    Default-deny: an extension is only accepted if it's in
+    _KNOWN_TEXT_EXTENSIONS. A name with no extension at all (e.g.
+    "Dockerfile", "README") is accepted too -- the absence of an extension
+    isn't evidence of binary intent the way an unrecognized one is. Matches
+    onedrive.py's identical guard; see _split_stem_suffix above for why it,
+    not plain ``Path.suffix``, decides the extension.
+    """
+    suffix = _split_stem_suffix(Path(name.strip()).name)[1].lower()
+    return bool(suffix) and suffix not in _KNOWN_TEXT_EXTENSIONS
+
 
 # Matches onedrive.py's own _MIME_TYPE_OVERRIDES: stdlib mimetypes.guess_type()
 # only recognizes these extensions when a system mime.types file happens to be
@@ -151,6 +215,41 @@ def _graph_request(
     request_headers = _graph_headers(extra_headers)
     if raw:
         request_headers["Accept-Encoding"] = "identity"
+
+    if raw:
+        # Graph's /content redirects to a short-lived preauthenticated
+        # download URL -- itself a bearer credential, since whoever has it
+        # can download the file with no further auth until it expires.
+        # requests follows that redirect transparently, so both a
+        # RequestException raised while connecting to the final host (its
+        # message embeds the URL it was trying to reach) and
+        # response.url/str(HTTPError) after a failed response (same reason)
+        # would leak that credential into the returned/logged error.
+        # Everything in this branch is status-only for that reason.
+        try:
+            response = requests.request(
+                method=method,
+                url=f"{GRAPH_BASE_URL}{path}",
+                headers=request_headers,
+                params=params,
+                json=body,
+                data=data,
+                timeout=timeout,
+                stream=True,
+            )
+        except requests.RequestException as exc:
+            raise _GraphRequestError(
+                "network error downloading file content", status_code=0
+            ) from exc
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise _GraphRequestError(
+                f"{response.status_code} error downloading file content",
+                status_code=response.status_code,
+            ) from exc
+        return _read_capped_content(response, max_bytes=_MAX_DOWNLOAD_BYTES)
+
     response = requests.request(
         method=method,
         url=f"{GRAPH_BASE_URL}{path}",
@@ -159,7 +258,6 @@ def _graph_request(
         json=body,
         data=data,
         timeout=timeout,
-        stream=raw,
     )
     try:
         response.raise_for_status()
@@ -170,11 +268,65 @@ def _graph_request(
             message = f"{message} - {response_text}"
         raise _GraphRequestError(message, status_code=response.status_code) from exc
 
-    if raw:
-        return _read_capped_content(response, max_bytes=_MAX_DOWNLOAD_BYTES)
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
+
+
+def _graph_get_absolute(
+    url: str, *, timeout: int = DEFAULT_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    """GET an already-absolute Graph URL (an @odata.nextLink), which carries
+    its own host/path/query and must not be re-prefixed with GRAPH_BASE_URL
+    the way _graph_request's ``path`` argument is."""
+    response = requests.request(
+        method="GET", url=url, headers=_graph_headers(), timeout=timeout
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response_text = response.text.strip()
+        message = str(exc)
+        if response_text:
+            message = f"{message} - {response_text}"
+        raise _GraphRequestError(message, status_code=response.status_code) from exc
+    if response.status_code == 204 or not response.content:
+        return {}
+    payload: dict[str, Any] = response.json()
+    return payload
+
+
+# Defensive stop against a pathological @odata.nextLink chain, well beyond
+# any legitimate page count this connector's own $top caps (<= 200 per
+# request) would ever need to reach a caller-requested limit.
+_MAX_PAGINATION_PAGES = 50
+
+
+def _graph_paginate(
+    path: str, params: dict[str, Any], *, limit: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """GET a Graph collection, following @odata.nextLink until either
+    ``limit`` items are collected or the collection is exhausted.
+
+    Graph pages supported collections independently of the caller's $top --
+    a server-side page size smaller than $top is common, and returning only
+    the first page would make later records silently inaccessible rather
+    than reporting that more exist. Returns (items, truncated): items is
+    capped at ``limit``, and truncated is True when the collection has (or
+    may have, if _MAX_PAGINATION_PAGES was hit first) more items beyond it.
+    """
+    items: list[dict[str, Any]] = []
+    result = _graph_request("GET", path, params=params)
+    items.extend(result.get("value", []))
+    next_link = result.get("@odata.nextLink")
+    pages = 1
+    while next_link and len(items) < limit and pages < _MAX_PAGINATION_PAGES:
+        result = _graph_get_absolute(next_link)
+        items.extend(result.get("value", []))
+        next_link = result.get("@odata.nextLink")
+        pages += 1
+    truncated = bool(next_link) or len(items) > limit
+    return items[:limit], truncated
 
 
 def _site_segment(site_id: str) -> str:
@@ -405,8 +557,10 @@ def sharepoint_get_site(site_id: str) -> str:
 def sharepoint_list_drives(site_id: str) -> str:
     """List the document libraries (drives) in a SharePoint site."""
     try:
-        result = _graph_request("GET", f"/sites/{_site_segment(site_id)}/drives")
-        return _success(drives=result.get("value", []))
+        drives, truncated = _graph_paginate(
+            f"/sites/{_site_segment(site_id)}/drives", {}, limit=200
+        )
+        return _success(drives=drives, truncated=truncated)
     except Exception as e:
         logger.error("Error listing SharePoint drives for site %s: %s", site_id, e)
         return _error(str(e))
@@ -423,13 +577,15 @@ def sharepoint_list_items(
     under a folder path. Uses the site's default document library unless
     drive_id (from sharepoint_list_drives) is given."""
     try:
-        result = _graph_request(
-            "GET",
+        capped_top = max(1, min(top, 200))
+        items, truncated = _graph_paginate(
             _drive_children_path(site_id, folder_path, drive_id),
-            params={"$top": max(1, min(top, 200))},
+            {"$top": capped_top},
+            limit=capped_top,
         )
         return _success(
-            items=[_caller_safe_drive_item(item) for item in result.get("value", [])]
+            items=[_caller_safe_drive_item(item) for item in items],
+            truncated=truncated,
         )
     except Exception as e:
         logger.error(
@@ -451,13 +607,15 @@ def sharepoint_search_files(
             raise ValueError("query is required")
         escaped_query = query.replace("'", "''")
         base = _drive_base(site_id, drive_id)
-        result = _graph_request(
-            "GET",
+        capped_top = max(1, min(top, 100))
+        items, truncated = _graph_paginate(
             f"{base}/root/search(q='{quote(escaped_query, safe='')}')",
-            params={"$top": max(1, min(top, 100))},
+            {"$top": capped_top},
+            limit=capped_top,
         )
         return _success(
-            items=[_caller_safe_drive_item(item) for item in result.get("value", [])]
+            items=[_caller_safe_drive_item(item) for item in items],
+            truncated=truncated,
         )
     except Exception as e:
         logger.error("Error searching SharePoint files for site %s: %s", site_id, e)
@@ -469,18 +627,35 @@ def sharepoint_get_file_content(
     site_id: str, file_path: str, drive_id: str | None = None
 ) -> str:
     """Download a file's content from a SharePoint document library by path.
-    Returns text when possible, otherwise base64."""
+    Returns text when possible, otherwise base64. Rejected outright, rather
+    than returned truncated, when the encoded result would be too large for
+    a single tool response."""
     try:
         content = _graph_request(
             "GET", _drive_content_path(site_id, file_path, drive_id), raw=True
         )
         text_content, base64_content = _decode_bytes(content)
-        return _success(
+        result = _success(
             file_path=file_path,
             text_content=text_content,
             base64_content=base64_content,
             encoding="utf-8" if text_content is not None else "base64",
         )
+        # The runtime's generic output filter truncates any string value --
+        # this whole JSON envelope is one -- at get_tool_max_output_length()
+        # characters without parsing it first, so an encoded payload that
+        # slips past that limit would come back as invalid JSON with a
+        # '"status": "success"' prefix still intact: silent corruption
+        # rather than a clear failure. Rejecting it here, before that filter
+        # ever sees it, trades that for an honest, actionable error.
+        max_output_length = get_tool_max_output_length()
+        if len(result) > max_output_length:
+            return _error(
+                f"{file_path!r} is too large to return inline "
+                f"({len(content)} bytes downloaded, {len(result)} characters "
+                f"encoded, limit is {max_output_length} characters)"
+            )
+        return result
     except Exception as e:
         logger.error(
             "Error downloading SharePoint file %s for site %s: %s",
@@ -491,7 +666,7 @@ def sharepoint_get_file_content(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
 def sharepoint_upload_text_file(
     site_id: str,
     file_path: str,
@@ -507,10 +682,9 @@ def sharepoint_upload_text_file(
     sharepoint_upload_file with that file's path instead.
     """
     try:
-        suffix = Path(file_path.strip()).suffix.lower()
-        if suffix in _BINARY_ONLY_EXTENSIONS:
+        if _name_looks_binary(file_path):
             return _error(
-                f"'{file_path}' names a binary document format, but "
+                f"'{file_path}' looks like a binary file, but "
                 "sharepoint_upload_text_file only writes text content -- "
                 "uploading it here would produce a mislabeled, broken file. "
                 "If you already have this file on disk (e.g. as a task "
@@ -536,7 +710,7 @@ def sharepoint_upload_text_file(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
 def sharepoint_upload_file(
     local_file_path: str,
     site_id: str,
@@ -627,12 +801,13 @@ def sharepoint_list_lists(site_id: str, top: int = 50) -> str:
     """List the SharePoint lists (e.g. custom lists, document metadata
     lists) in a site."""
     try:
-        result = _graph_request(
-            "GET",
+        capped_top = max(1, min(top, 200))
+        lists, truncated = _graph_paginate(
             f"/sites/{_site_segment(site_id)}/lists",
-            params={"$top": max(1, min(top, 200))},
+            {"$top": capped_top},
+            limit=capped_top,
         )
-        return _success(lists=result.get("value", []))
+        return _success(lists=lists, truncated=truncated)
     except Exception as e:
         logger.error("Error listing SharePoint lists for site %s: %s", site_id, e)
         return _error(str(e))
@@ -644,12 +819,13 @@ def sharepoint_list_list_items(site_id: str, list_id: str, top: int = 50) -> str
 
     list_id accepts either the list's Graph id or its display name."""
     try:
-        result = _graph_request(
-            "GET",
+        capped_top = max(1, min(top, 200))
+        items, truncated = _graph_paginate(
             f"/sites/{_site_segment(site_id)}/lists/{url_path_id(list_id, 'list_id')}/items",
-            params={"$top": max(1, min(top, 200)), "$expand": "fields"},
+            {"$top": capped_top, "$expand": "fields"},
+            limit=capped_top,
         )
-        return _success(items=result.get("value", []))
+        return _success(items=items, truncated=truncated)
     except Exception as e:
         logger.error(
             "Error listing SharePoint list items for site %s list %s: %s",
@@ -660,14 +836,18 @@ def sharepoint_list_list_items(site_id: str, list_id: str, top: int = 50) -> str
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
 def sharepoint_create_list_item(site_id: str, list_id: str, fields_json: str) -> str:
     """Create an item in a SharePoint list.
 
     fields_json is a JSON object string of column-name to value pairs, e.g.
     '{"Title": "New task", "Status": "Not Started"}'. Column names and
     valid values are list-specific; use sharepoint_list_list_items or the
-    list's own settings to discover them."""
+    list's own settings to discover them.
+
+    This is not idempotent: retrying after a timeout or connection error
+    can create a duplicate item. Use sharepoint_list_list_items to check
+    whether the item already exists before retrying a failed call."""
     try:
         fields = _parse_fields_json(fields_json)
         result = _graph_request(
@@ -686,7 +866,7 @@ def sharepoint_create_list_item(site_id: str, list_id: str, fields_json: str) ->
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
 def sharepoint_update_list_item(
     site_id: str, list_id: str, item_id: str, fields_json: str
 ) -> str:
@@ -716,7 +896,7 @@ def sharepoint_update_list_item(
         return _error(str(e))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
 def sharepoint_delete_list_item(site_id: str, list_id: str, item_id: str) -> str:
     """Delete an item from a SharePoint list."""
     try:

@@ -55,6 +55,78 @@ def _upload_allowed_dirs_env(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# pagination
+# ---------------------------------------------------------------------------
+
+
+def test_graph_paginate_follows_next_link_until_limit_reached(monkeypatch):
+    next_link = "https://graph.microsoft.com/v1.0/sites/root/lists?$skiptoken=abc"
+    responses = [
+        MockResponse(
+            {"value": [{"id": "1"}, {"id": "2"}], "@odata.nextLink": next_link}
+        ),
+        MockResponse({"value": [{"id": "3"}, {"id": "4"}]}),
+    ]
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    items, truncated = sharepoint._graph_paginate("/sites/root/lists", {}, limit=10)
+
+    assert [item["id"] for item in items] == ["1", "2", "3", "4"]
+    assert truncated is False
+    # The second call must GET the nextLink verbatim -- not re-prefix it
+    # with GRAPH_BASE_URL, which would double up the host/path.
+    assert mock_request.call_args_list[1].kwargs["url"] == next_link
+
+
+def test_graph_paginate_stops_and_reports_truncated_at_limit(monkeypatch):
+    next_link = "https://graph.microsoft.com/v1.0/sites/root/lists?$skiptoken=abc"
+    mock_request = Mock(
+        return_value=MockResponse(
+            {"value": [{"id": "1"}, {"id": "2"}], "@odata.nextLink": next_link}
+        )
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    items, truncated = sharepoint._graph_paginate("/sites/root/lists", {}, limit=1)
+
+    assert [item["id"] for item in items] == ["1"]
+    assert truncated is True
+    # The limit was already reached by the first page -- no nextLink fetch.
+    assert mock_request.call_count == 1
+
+
+def test_graph_paginate_not_truncated_when_collection_exactly_exhausted(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"value": [{"id": "1"}, {"id": "2"}]})
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    items, truncated = sharepoint._graph_paginate("/sites/root/lists", {}, limit=2)
+
+    assert [item["id"] for item in items] == ["1", "2"]
+    assert truncated is False
+
+
+def test_list_list_items_reports_truncated_across_pages(monkeypatch):
+    next_link = (
+        "https://graph.microsoft.com/v1.0/sites/root/lists/Tasks/items?$skiptoken=abc"
+    )
+    responses = [
+        MockResponse({"value": [{"id": "1"}], "@odata.nextLink": next_link}),
+        MockResponse({"value": [{"id": "2"}]}),
+    ]
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_list_list_items("root", "Tasks", top=2))
+
+    assert result["status"] == "success"
+    assert [item["id"] for item in result["items"]] == ["1", "2"]
+    assert result["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
 # path/id helpers
 # ---------------------------------------------------------------------------
 
@@ -145,6 +217,19 @@ def test_get_root_site_success(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith("/sites/root")
 
 
+def test_list_drives_success(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"value": [{"id": "drive-1", "name": "Documents"}]})
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_list_drives("root"))
+
+    assert result["status"] == "success"
+    assert result["drives"] == [{"id": "drive-1", "name": "Documents"}]
+    assert result["truncated"] is False
+
+
 # ---------------------------------------------------------------------------
 # document library items
 # ---------------------------------------------------------------------------
@@ -173,6 +258,24 @@ def test_list_items_strips_download_url(monkeypatch):
     item = result["items"][0]
     assert item["id"] == "item-1"
     assert "@microsoft.graph.downloadUrl" not in item
+
+
+def test_search_files_success(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"value": [{"id": "item-1", "name": "report.pdf"}]})
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_search_files("root", "report"))
+
+    assert result["status"] == "success"
+    assert result["items"] == [{"id": "item-1", "name": "report.pdf"}]
+    assert result["truncated"] is False
+
+
+def test_search_files_requires_query():
+    result = json.loads(sharepoint.sharepoint_search_files("root", "   "))
+    assert result["status"] == "error"
 
 
 def test_get_file_content_decodes_text(monkeypatch):
@@ -254,12 +357,83 @@ def test_get_file_content_rejects_compressed_content_encoding(monkeypatch):
     assert "compressed" in result["message"]
 
 
+def test_get_file_content_redacts_url_on_http_error(monkeypatch):
+    # Graph's /content redirects to a short-lived preauthenticated download
+    # URL; a failure on that final host must not leak it (it's a bearer
+    # credential in its own right) into the returned error.
+    sas_url = (
+        "https://contoso.sharepoint.com/_layouts/download.aspx"
+        "?sastoken=SECRET-CREDENTIAL"
+    )
+    mock_request = Mock(
+        return_value=MockResponse(status_code=404, url=sas_url, content=b"")
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "notes.txt"))
+
+    assert result["status"] == "error"
+    assert "404" in result["message"]
+    assert "SECRET-CREDENTIAL" not in result["message"]
+    assert "contoso.sharepoint.com" not in result["message"]
+
+
+def test_get_file_content_redacts_url_on_transport_error(monkeypatch):
+    sas_url = (
+        "https://contoso.sharepoint.com/_layouts/download.aspx"
+        "?sastoken=SECRET-CREDENTIAL"
+    )
+    mock_request = Mock(
+        side_effect=requests.exceptions.ConnectionError(
+            f"Max retries exceeded with url: {sas_url}"
+        )
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "notes.txt"))
+
+    assert result["status"] == "error"
+    assert "SECRET-CREDENTIAL" not in result["message"]
+    assert "contoso.sharepoint.com" not in result["message"]
+
+
 def test_upload_text_file_rejects_binary_extension():
     result = json.loads(
         sharepoint.sharepoint_upload_text_file("root", "report.docx", "hello")
     )
     assert result["status"] == "error"
-    assert "binary document format" in result["message"]
+    assert "looks like a binary file" in result["message"]
+
+
+def test_upload_text_file_rejects_unlisted_binary_extension():
+    # Default-deny: an extension absent from the known-text allowlist is
+    # rejected even though it isn't one of the small set of formats an
+    # older denylist-based guard would have named explicitly.
+    result = json.loads(
+        sharepoint.sharepoint_upload_text_file("root", "report.doc", "hello")
+    )
+    assert result["status"] == "error"
+    assert "looks like a binary file" in result["message"]
+
+
+def test_upload_text_file_accepts_extensionless_name(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(
+        sharepoint.sharepoint_upload_text_file("root", "Dockerfile", "hello")
+    )
+
+    assert result["status"] == "success"
+
+
+def test_upload_text_file_rejects_dotfile_only_binary_name():
+    # ".pdf" is entirely a leading dot plus extension -- Path(".pdf").suffix
+    # is empty per pathlib's dotfile convention, which would otherwise slip
+    # this past the guard as "extensionless" (accepted).
+    result = json.loads(sharepoint.sharepoint_upload_text_file("root", ".pdf", "hello"))
+    assert result["status"] == "error"
+    assert "looks like a binary file" in result["message"]
 
 
 def test_upload_text_file_rejects_trailing_period_instead_of_bypassing_guard():
@@ -353,6 +527,19 @@ def test_guess_mime_type_uses_encoding_not_decompressed_type():
 # ---------------------------------------------------------------------------
 # lists
 # ---------------------------------------------------------------------------
+
+
+def test_list_lists_success(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"value": [{"id": "list-1", "name": "Tasks"}]})
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_list_lists("root"))
+
+    assert result["status"] == "success"
+    assert result["lists"] == [{"id": "list-1", "name": "Tasks"}]
+    assert result["truncated"] is False
 
 
 def test_list_list_items_expands_fields(monkeypatch):

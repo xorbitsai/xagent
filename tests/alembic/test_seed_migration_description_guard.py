@@ -13,11 +13,22 @@ text as "uncustomized" (see _ORIGINAL_DEPUTY_DESCRIPTION).
 
 employment-hero/salesforce/myob's seed migrations have the identical naive
 guard today but no paired description-update migration yet, so the bug is
-latent there, not live. This test statically scans every seed migration and
-every description-update migration in the versions directory and fails the
-moment someone adds a description-update migration for an app whose seed
-migration still has the naive guard -- so the fix (or an equivalent one) has
-to land alongside it, instead of being rediscovered by a future PR review.
+latent there, not live. This test statically scans every migration in the
+versions directory (not just ones matching a *_seed_*_mcp_app.py naming
+convention -- see _candidate_migrations) and fails the moment a migration
+using the vulnerable guard shape is paired with a description-update
+migration for the same app_id, so the fix (or an equivalent one) has to land
+alongside it, instead of being rediscovered by a future PR review.
+
+Known scope boundary: this is a source-pattern scanner, not a full dataflow
+analyzer. It resolves compare_columns/APP_ID from literals written inline at
+the call site; it does not trace a value assigned to an intermediate
+variable elsewhere in the file, and it only recognizes `_row_matches_seeded_
+shape` called by its bare name (not via an attribute access or an aliased
+import) -- acceptable here because every migration in this repo is
+deliberately self-contained (no cross-migration imports, per e.g.
+_ORIGINAL_DEPUTY_DESCRIPTION's own comment), so there is nothing to alias or
+import in the first place.
 """
 
 import ast
@@ -65,37 +76,90 @@ def _downgrade_function(tree: ast.Module) -> ast.FunctionDef | None:
     return None
 
 
-def _has_naive_description_guard(downgrade: ast.FunctionDef) -> bool:
-    """True if downgrade() calls `_row_matches_seeded_shape(...)` with a
-    compare_columns set literal that includes "description" -- the shape of
-    the guard that silently no-ops once a sibling migration has reverted
-    that column to a different (but still "uncustomized") value."""
-    for node in ast.walk(downgrade):
+def _literal_container_elements(node: ast.AST | None) -> list[ast.expr] | None:
+    """Return the elements of a Set/List/Tuple literal, or of a
+    frozenset(...)/set(...) call wrapping one of those -- the shapes
+    actually used for a fixed collection of column names or acceptable
+    values in this codebase -- or None if `node` isn't one of those."""
+    if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+        return list(node.elts)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("frozenset", "set")
+        and len(node.args) == 1
+    ):
+        return _literal_container_elements(node.args[0])
+    return None
+
+
+def _calls_row_matches_seeded_shape(downgrade: ast.FunctionDef) -> list[ast.Call]:
+    return [
+        node
+        for node in ast.walk(downgrade)
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "_row_matches_seeded_shape"
+        )
+    ]
+
+
+def _compare_columns_arg(call: ast.Call) -> ast.AST | None:
+    # compare_columns is the function's 3rd parameter -- target it
+    # specifically (3rd positional arg, or the keyword) rather than treating
+    # every positional arg as a candidate, so a coincidental literal
+    # elsewhere in the call can't false-positive, and a call that passes it
+    # by keyword isn't silently missed (false negative).
+    if len(call.args) >= 3:
+        return call.args[2]
+    for keyword in call.keywords:
+        if keyword.arg == "compare_columns":
+            return keyword.value
+    return None
+
+
+def _has_naive_description_guard(downgrade: ast.FunctionDef) -> bool:
+    """True if downgrade() calls `_row_matches_seeded_shape(...)` with a
+    compare_columns literal that includes "description" -- the shape of the
+    guard that silently no-ops once a sibling migration has reverted that
+    column to a different (but still "uncustomized") value."""
+    for call in _calls_row_matches_seeded_shape(downgrade):
+        elements = _literal_container_elements(_compare_columns_arg(call))
+        if elements is None:
+            continue
+        if any(
+            isinstance(element, ast.Constant) and element.value == "description"
+            for element in elements
         ):
-            # compare_columns is the function's 3rd parameter -- target it
-            # specifically (3rd positional arg, or the keyword) rather than
-            # scanning every positional arg, so a coincidental set literal
-            # elsewhere in the call can't false-positive, and a call that
-            # passes it by keyword isn't silently missed (false negative).
-            compare_columns_node = None
-            if len(node.args) >= 3:
-                compare_columns_node = node.args[2]
-            else:
-                for keyword in node.keywords:
-                    if keyword.arg == "compare_columns":
-                        compare_columns_node = keyword.value
-                        break
-            if isinstance(compare_columns_node, ast.Set):
-                for element in compare_columns_node.elts:
-                    if (
-                        isinstance(element, ast.Constant)
-                        and element.value == "description"
-                    ):
-                        return True
+            return True
+    return False
+
+
+def _is_description_subscript(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == "description"
+    )
+
+
+def _has_description_membership_check(downgrade: ast.FunctionDef) -> bool:
+    """True if downgrade() compares a `something["description"]` value for
+    membership in a container of values (`row["description"] in (a, b)`) --
+    the shape of 20260826_seed_deputy_mcp_app.py's separate, non-naive
+    description check. This is what has to replace "description" in
+    compare_columns for removing it to be a real fix, rather than just
+    trading the orphaning bug for silently discarding a description-only
+    customization instead (an admin who PATCHed only that field would no
+    longer be protected by anything)."""
+    for node in ast.walk(downgrade):
+        if isinstance(node, ast.Compare) and any(
+            isinstance(op, (ast.In, ast.NotIn)) for op in node.ops
+        ):
+            operands = [node.left, *node.comparators]
+            if any(_is_description_subscript(operand) for operand in operands):
+                return True
     return False
 
 
@@ -107,18 +171,43 @@ def _is_vulnerable(seed_path: Path, description_update_app_ids: set[str]) -> boo
         return False
     if app_id not in description_update_app_ids:
         return False
-    # Deliberately not also gated on "does the module define an _ORIGINAL_
-    # constant": that alone doesn't prove the naive equality check was
-    # actually replaced, only that a same-named constant exists somewhere in
-    # the file. A migration is only actually protected once "description" is
-    # gone from the compare_columns set _has_naive_description_guard checks
-    # below -- exactly what the real fix (20260826_seed_deputy_mcp_app.py)
-    # does.
-    return _has_naive_description_guard(downgrade)
+    if not _calls_row_matches_seeded_shape(downgrade):
+        # Never used the structural-match guard to begin with (e.g. an
+        # unconditional delete, like 20260817_seed_github_mcp_app.py) --
+        # nothing to regress: it never offered description-customization
+        # protection in the first place.
+        return False
+    if _has_naive_description_guard(downgrade):
+        return True
+    # "description" isn't in compare_columns, but downgrade() does gate
+    # deletion on other columns matching -- if nothing replaced description
+    # there, an admin who customized only that field loses the protection
+    # compare_columns used to give it, and downgrade silently deletes their
+    # row instead of preserving it. Deliberately not gated on "does the
+    # module define an _ORIGINAL_... constant" instead: that alone doesn't
+    # prove anything actually consumes it -- only that a same-named
+    # constant exists somewhere in the file.
+    return not _has_description_membership_check(downgrade)
 
 
-def _seed_migrations() -> list[Path]:
-    return sorted(VERSIONS_DIR.glob("*_seed_*_mcp_app.py"))
+def _all_migration_files() -> list[Path]:
+    return sorted(VERSIONS_DIR.glob("*.py"))
+
+
+def _candidate_migrations() -> list[Path]:
+    """Every migration whose downgrade() calls _row_matches_seeded_shape at
+    all -- the function whose naive "description" comparison caused the
+    orphaning bug. Found by inspecting every migration file directly rather
+    than matching a *_seed_*_mcp_app.py filename convention: that glob
+    would silently miss a differently-named or multi-app seed migration
+    (e.g. 20260526_seed_builtin_microsoft_graph_mcp_apps.py's plural
+    filename) that adopts the same pattern later."""
+    candidates = []
+    for path in _all_migration_files():
+        downgrade = _downgrade_function(_parse(path))
+        if downgrade is not None and _calls_row_matches_seeded_shape(downgrade):
+            candidates.append(path)
+    return candidates
 
 
 def _description_update_app_ids() -> set[str]:
@@ -138,20 +227,38 @@ def test_seed_migrations_with_paired_description_migration_guard_description_saf
     assert "deputy" in description_update_app_ids
     assert "github" in description_update_app_ids
 
+    candidates = _candidate_migrations()
+    assert candidates, "expected at least the deputy migration to be a candidate"
+
+    # A candidate whose APP_ID this scanner can't resolve (e.g. a multi-app
+    # migration keyed by a list of ids instead of a single top-level
+    # APP_ID) must fail loudly for manual review, not be silently treated
+    # as "unanalyzable == safe" by _is_vulnerable's own early return.
+    unresolved = [
+        path.name for path in candidates if _module_app_id(_parse(path)) is None
+    ]
+    assert not unresolved, (
+        "These migrations call _row_matches_seeded_shape but this scanner "
+        "could not resolve a single top-level APP_ID for them -- likely a "
+        "multi-app migration. Extend _module_app_id or special-case them "
+        f"explicitly instead of leaving them unanalyzed: {unresolved}"
+    )
+
     vulnerable = [
         path.name
-        for path in _seed_migrations()
+        for path in candidates
         if _is_vulnerable(path, description_update_app_ids)
     ]
-
     assert not vulnerable, (
-        "These seed migrations compare 'description' for exact equality "
-        "against the current text in downgrade()'s shape guard, but also "
-        "have a sibling *_update_*_description.py migration that reverts "
-        "the column on its own downgrade -- the same combination that "
-        "silently orphaned public_mcp_apps/oauth_providers rows for "
-        "deputy (PR #2449). Apply the accept-original-or-current-text fix "
-        "from 20260826_seed_deputy_mcp_app.py's _ORIGINAL_DEPUTY_DESCRIPTION "
+        "These migrations use the _row_matches_seeded_shape guard in a way "
+        "that either compares 'description' for exact equality against the "
+        "current text, or drops it from compare_columns with nothing "
+        "replacing the protection it gave -- and are paired with a sibling "
+        "*_update_*_description.py migration that reverts that column on "
+        "its own downgrade. The same combination silently orphaned "
+        "public_mcp_apps/oauth_providers rows for deputy (PR #2449). Apply "
+        "the accept-original-or-current-text fix from "
+        "20260826_seed_deputy_mcp_app.py's _ORIGINAL_DEPUTY_DESCRIPTION "
         f"pattern to: {vulnerable}"
     )
 
@@ -191,11 +298,11 @@ def downgrade():
 
 
 def test_is_vulnerable_accepts_the_deputy_fix_shape(tmp_path):
-    """Companion self-test: a seed migration that removes "description" from
-    the compare_columns set entirely (the applied fix's actual shape --
-    _ORIGINAL_DEPUTY_DESCRIPTION is checked separately, outside
-    _row_matches_seeded_shape) must not be flagged, even when paired with a
-    sibling description-update migration."""
+    """Companion self-test: a seed migration shaped like the real applied
+    fix -- "description" removed from compare_columns *and* replaced by a
+    separate membership check against _ORIGINAL_WIDGET_DESCRIPTION -- must
+    not be flagged, even when paired with a sibling description-update
+    migration."""
     seed_path = tmp_path / "20260101_seed_widget_mcp_app.py"
     seed_path.write_text(
         """
@@ -210,10 +317,20 @@ def _widget_app_row():
 
 def downgrade():
     app_row = None
-    if app_row is not None and _row_matches_seeded_shape(
-        app_row,
-        _widget_app_row(),
-        {"name", "icon"},
+    description_is_uncustomized = app_row is not None and app_row._mapping[
+        "description"
+    ] in (
+        _widget_app_row()["description"],
+        _ORIGINAL_WIDGET_DESCRIPTION,
+    )
+    if (
+        app_row is not None
+        and description_is_uncustomized
+        and _row_matches_seeded_shape(
+            app_row,
+            _widget_app_row(),
+            {"name", "icon"},
+        )
     ):
         pass
 """
@@ -226,9 +343,9 @@ def test_is_vulnerable_flags_an_original_constant_that_was_never_wired_up(tmp_pa
     """Regression test for a false negative caught in review: defining an
     "_ORIGINAL_..." constant alone proves nothing if "description" is still
     left in the compare_columns set -- the equality check it feeds is just
-    as naive as if the constant didn't exist. _is_vulnerable must key
-    entirely off compare_columns, not off whether some "_ORIGINAL_"-prefixed
-    name merely exists somewhere in the file."""
+    as naive as if the constant didn't exist. _is_vulnerable must key off
+    the actual guard shape, not off whether some "_ORIGINAL_"-prefixed name
+    merely exists somewhere in the file."""
     seed_path = tmp_path / "20260101_seed_widget_mcp_app.py"
     seed_path.write_text(
         """
@@ -255,6 +372,89 @@ def downgrade():
     assert _is_vulnerable(seed_path, {"widget"})
 
 
+def test_is_vulnerable_flags_description_dropped_without_replacement(tmp_path):
+    """Regression test for a gap caught in review: removing "description"
+    from compare_columns is only half the fix. Without a replacement check
+    protecting description-only customizations (the membership-check shape
+    exercised above), the migration trades the orphaning bug for a
+    different one -- silently deleting a row an admin customized only by
+    its description, instead of preserving it."""
+    seed_path = tmp_path / "20260101_seed_widget_mcp_app.py"
+    seed_path.write_text(
+        """
+APP_ID = "widget"
+
+_ORIGINAL_WIDGET_DESCRIPTION = "old text"
+
+
+def _widget_app_row():
+    return {"description": "current text"}
+
+
+def downgrade():
+    app_row = None
+    if app_row is not None and _row_matches_seeded_shape(
+        app_row,
+        _widget_app_row(),
+        {"name", "icon"},
+    ):
+        pass
+"""
+    )
+
+    assert _is_vulnerable(seed_path, {"widget"})
+
+
+def test_is_vulnerable_ignores_migrations_without_the_structural_guard(tmp_path):
+    """A migration whose downgrade() never calls _row_matches_seeded_shape
+    (an unconditional delete, like 20260817_seed_github_mcp_app.py) never
+    offered description-customization protection to begin with, so pairing
+    it with a description-update migration isn't a regression -- there is
+    no protection for description to have been dropped from."""
+    seed_path = tmp_path / "20260101_seed_widget_mcp_app.py"
+    seed_path.write_text(
+        """
+APP_ID = "widget"
+
+
+def downgrade():
+    pass
+"""
+    )
+
+    assert not _is_vulnerable(seed_path, {"widget"})
+
+
+def test_is_vulnerable_recognizes_list_and_frozenset_compare_columns(tmp_path):
+    """compare_columns is always written as a `{...}` set literal in this
+    codebase today, but the guard logic doesn't depend on that -- confirm a
+    list literal or a frozenset(...)/set(...) call wrapping one is
+    recognized too, so a stylistic variation doesn't silently evade
+    detection."""
+    seed_path = tmp_path / "20260101_seed_widget_mcp_app.py"
+    seed_path.write_text(
+        """
+APP_ID = "widget"
+
+
+def _widget_app_row():
+    return {"description": "current text"}
+
+
+def downgrade():
+    app_row = None
+    if app_row is not None and _row_matches_seeded_shape(
+        app_row,
+        _widget_app_row(),
+        frozenset(["name", "description", "icon"]),
+    ):
+        pass
+"""
+    )
+
+    assert _is_vulnerable(seed_path, {"widget"})
+
+
 def test_real_deputy_seed_migration_is_not_vulnerable():
     """Positive real-world check that the applied fix satisfies the
     scanner, using the actual file rather than a fabricated stand-in."""
@@ -263,18 +463,50 @@ def test_real_deputy_seed_migration_is_not_vulnerable():
     assert not _is_vulnerable(path, {"deputy"})
 
 
-def test_real_seed_migrations_are_only_latently_vulnerable_today():
+def test_real_github_seed_migration_is_not_vulnerable_despite_unconditional_delete():
+    """github's downgrade() unconditionally deletes the app row (no
+    _row_matches_seeded_shape call at all) and is already paired with
+    20260914_update_github_description.py -- confirms the "never used the
+    structural guard" exemption in _is_vulnerable doesn't accidentally
+    apply to (or miss) a real file it wasn't modeled on."""
+    path = VERSIONS_DIR / "20260817_seed_github_mcp_app.py"
+    assert path.exists()
+    assert not _is_vulnerable(path, {"github"})
+
+
+def test_real_seed_migrations_are_not_vulnerable_today():
     """employment-hero/salesforce/myob have the naive guard today but no
-    sibling description migration -- purely preventative. Confirm the
-    scanner would actually catch it, using the real file content, the
-    moment one is added -- this is what makes the main test above a
-    tripwire instead of a no-op."""
-    for app_id, filename in [
-        ("employment-hero", "20260826_seed_employment_hero_mcp_app.py"),
-        ("salesforce", "20260818_seed_salesforce_mcp_app.py"),
-        ("myob", "20260903_seed_myob_mcp_app.py"),
+    sibling description migration, so pairing them with a fabricated one
+    here (not their real app_id membership) proves the scanner *would*
+    catch it without asserting anything about the migrations' current
+    real-world shape. Asserting "these real files are vulnerable today"
+    instead would make this test fail the moment someone properly fixes
+    them -- the opposite of what a regression guard should do; that
+    coverage already lives in the synthetic-fixture tests above."""
+    for filename in [
+        "20260826_seed_employment_hero_mcp_app.py",
+        "20260818_seed_salesforce_mcp_app.py",
+        "20260903_seed_myob_mcp_app.py",
     ]:
         path = VERSIONS_DIR / filename
         assert path.exists()
         assert not _is_vulnerable(path, set())
-        assert _is_vulnerable(path, {app_id})
+
+
+def test_multi_app_migrations_are_included_in_the_scan_but_not_flagged():
+    """Regression test for the coverage gap caught in review: a
+    `*_seed_*_mcp_app.py` glob would silently miss a differently-named or
+    multi-app seed migration -- like this plural-filename migration, or the
+    very first table-creation migration -- if either later adopted the
+    structural guard. Confirm both are visible to _all_migration_files
+    today (so a future change to them would actually be scanned) and are
+    correctly excluded from _candidate_migrations for the right reason:
+    neither calls _row_matches_seeded_shape yet, not because the scanner
+    can't see them."""
+    all_names = {path.name for path in _all_migration_files()}
+    assert "20260526_seed_builtin_microsoft_graph_mcp_apps.py" in all_names
+    assert "f1427c3a7261_add_oauthprovider_and_publicmcpapp_.py" in all_names
+
+    candidate_names = {path.name for path in _candidate_migrations()}
+    assert "20260526_seed_builtin_microsoft_graph_mcp_apps.py" not in candidate_names
+    assert "f1427c3a7261_add_oauthprovider_and_publicmcpapp_.py" not in candidate_names

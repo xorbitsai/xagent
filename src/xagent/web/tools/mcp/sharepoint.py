@@ -5,7 +5,7 @@ import mimetypes
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -336,7 +336,22 @@ def _graph_get_absolute(
 ) -> dict[str, Any]:
     """GET an already-absolute Graph URL (an @odata.nextLink), which carries
     its own host/path/query and must not be re-prefixed with GRAPH_BASE_URL
-    the way _graph_request's ``path`` argument is."""
+    the way _graph_request's ``path`` argument is.
+
+    Requires the link to still start with GRAPH_BASE_URL before sending
+    this connector's bearer token to it -- matches outlook.py's identical
+    _next_link_path guard against a nextLink that's ever off-host (this
+    connector's own token must never be handed to an arbitrary URL just
+    because Graph's response body named it).
+    """
+    if not isinstance(url, str) or not url.startswith(f"{GRAPH_BASE_URL}/"):
+        raise ValueError("SharePoint returned an invalid pagination next link.")
+    # Decode before splitting so an encoded slash cannot hide a dot segment
+    # inside one raw segment (matches outlook.py's identical rationale).
+    if any(
+        segment in {".", ".."} for segment in unquote(urlsplit(url).path).split("/")
+    ):
+        raise ValueError("SharePoint returned an invalid pagination next link.")
     response = requests.request(
         method="GET", url=url, headers=_graph_headers(), timeout=timeout
     )

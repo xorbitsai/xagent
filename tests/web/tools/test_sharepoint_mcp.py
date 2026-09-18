@@ -108,6 +108,26 @@ def test_graph_paginate_not_truncated_when_collection_exactly_exhausted(monkeypa
     assert truncated is False
 
 
+def test_graph_get_absolute_rejects_off_host_next_link(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    with pytest.raises(ValueError, match="invalid pagination next link"):
+        sharepoint._graph_get_absolute("https://evil.example.com/sites/root/lists")
+
+    mock_request.assert_not_called()
+
+
+def test_graph_get_absolute_rejects_dot_segment_next_link(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    with pytest.raises(ValueError, match="invalid pagination next link"):
+        sharepoint._graph_get_absolute(f"{sharepoint.GRAPH_BASE_URL}/sites/../secret")
+
+    mock_request.assert_not_called()
+
+
 def test_success_with_capped_list_passes_through_small_list():
     result = json.loads(
         sharepoint._success_with_capped_list("items", [{"id": "1"}], truncated=False)

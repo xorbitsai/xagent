@@ -76,6 +76,11 @@ def test_workbook_base_rejects_trailing_slash():
         excel._workbook_base("Reports/", None, None)
 
 
+def test_workbook_base_rejects_consecutive_slashes():
+    with pytest.raises(ValueError, match="empty segments"):
+        excel._workbook_base("Reports//Q1.xlsx", None, None)
+
+
 def test_workbook_base_rejects_trailing_period_filename():
     """A trailing-dot filename can be silently normalized by Graph/SharePoint's
     backing storage to the name without the dot, so "Report.xlsx." could

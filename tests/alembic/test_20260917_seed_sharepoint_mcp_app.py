@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -107,6 +108,110 @@ def test_downgrade_removes_sharepoint(tmp_path):
             migration.upgrade()
             migration.downgrade()
         assert "sharepoint" not in _app_ids(connection)
+
+
+def test_upgrade_refuses_custom_catalog_collision(tmp_path):
+    """A pre-existing custom app_id='sharepoint' row (e.g. hand-created by
+    an operator via POST /admin/mcp/apps before this migration deployed)
+    has no provenance marker, so this must fail closed rather than silently
+    leaving the row in place for the builtin execution overlay to
+    potentially misidentify later."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, is_visible_in_connector) "
+                "VALUES ('sharepoint', 'Operator SharePoint', 'hand-made', "
+                "'oauth', 0)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="public_mcp_apps"):
+                migration.upgrade()
+        row = connection.execute(
+            text("SELECT name FROM public_mcp_apps WHERE app_id='sharepoint'")
+        ).scalar_one()
+    assert row == "Operator SharePoint"
+
+
+def test_upgrade_raises_when_launch_config_column_is_missing(tmp_path):
+    """launch_config is where the provenance marker lives; without the
+    column there is no way to prove ownership of any existing row, so this
+    must fail loudly instead of seeding (or skipping) silently."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth'
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="launch_config"):
+                migration.upgrade()
+        assert "sharepoint" not in _app_ids(connection)
+
+
+def test_downgrade_preserves_a_preexisting_operator_row(tmp_path):
+    """A pre-existing operator row makes upgrade() raise (it never gets
+    inserted/adopted), so downgrade() must never delete it either."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, provider_name) "
+                "VALUES ('sharepoint', 'SharePoint', 'hand-made', "
+                "'oauth', 'microsoft')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        row = connection.execute(
+            text(
+                "SELECT name, description FROM public_mcp_apps WHERE app_id='sharepoint'"
+            )
+        ).first()
+        assert row == ("SharePoint", "hand-made")
+
+
+def test_downgrade_is_a_noop_when_launch_config_column_is_missing(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth'
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport) "
+                "VALUES ('sharepoint', 'SharePoint', 'oauth')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert "sharepoint" in _app_ids(connection)
 
 
 def test_upgrade_and_downgrade_no_op_without_table(tmp_path):

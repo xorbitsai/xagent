@@ -7,7 +7,7 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env, url_path_id
+from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("excel-mcp")
@@ -103,8 +103,10 @@ def _site_segment(site_id: str) -> str:
     if not isinstance(site_id, str) or not site_id.strip():
         raise ValueError("site_id is required")
     value = site_id.strip()
-    if any(segment in (".", "..") for segment in value.split("/")):
-        raise ValueError(f"site_id must not contain '.' or '..' segments: {site_id!r}")
+    if any(segment in (".", "..", "") for segment in value.split("/")):
+        raise ValueError(
+            f"site_id must not contain '.', '..', or empty segments: {site_id!r}"
+        )
     return quote(value, safe=":/,")
 
 
@@ -121,12 +123,17 @@ def _normalize_relative_path(path: str) -> str:
     slash" semantic to fall back on here that wouldn't risk silently
     addressing a different path than the caller wrote.
 
-    The trailing-period case matters even though this module never writes
-    arbitrary file content (unlike onedrive.py/sharepoint.py's upload
-    tools): Graph/SharePoint's backing storage can silently normalize a
-    trailing-dot filename to the same name without the dot, so
-    "Report.xlsx." could silently resolve to a real, different
-    "Report.xlsx" workbook than the caller intended to address.
+    The trailing-period and leading/trailing-whitespace checks matter even
+    though this module never writes arbitrary file content (unlike
+    onedrive.py/sharepoint.py's upload tools): Graph/SharePoint's backing
+    storage rejects or silently normalizes a folder/file name with a
+    trailing dot or leading/trailing spaces (confirmed against Microsoft's
+    own OneDrive/SharePoint restrictions doc: "Leading and trailing spaces
+    in file or folder names also aren't allowed"), so e.g. "Reports./Q1.xlsx"
+    or "Reports /Q1.xlsx" could silently resolve to a different path than
+    the caller intended to address. This is checked on every segment, not
+    just the filename, since an intermediate folder segment is exposed to
+    the same hazard.
     """
     if not isinstance(path, str):
         raise TypeError("file_path must be a string")
@@ -139,12 +146,19 @@ def _normalize_relative_path(path: str) -> str:
         )
     if "\\" in value:
         raise ValueError("file_path must use '/' separators and must not contain '\\'")
-    if any(segment in (".", "..", "") for segment in value.split("/")):
+    segments = value.split("/")
+    if any(segment in (".", "..", "") for segment in segments):
         raise ValueError(
             f"file_path must not contain '.', '..', or empty segments: {path!r}"
         )
-    if value.rsplit("/", 1)[-1].endswith("."):
-        raise ValueError(f"file_path filename must not end with a period: {path!r}")
+    for segment in segments:
+        if segment != segment.strip():
+            raise ValueError(
+                "file_path segments must not have leading or trailing "
+                f"whitespace: {path!r}"
+            )
+        if segment.endswith("."):
+            raise ValueError(f"file_path segments must not end with a period: {path!r}")
     return value
 
 
@@ -165,7 +179,9 @@ def _odata_string_literal(value: str) -> str:
     """Escape and percent-encode a string for use inside a Graph OData
     function call argument, e.g. range(address='...')."""
     if not isinstance(value, str):
-        raise TypeError("value must be a string")
+        raise TypeError("address must be a string")
+    if not value:
+        raise ValueError("address is required")
     escaped = value.replace("'", "''")
     return quote(escaped, safe="")
 
@@ -178,14 +194,14 @@ def _workbook_base(file_path: str, site_id: str | None, drive_id: str | None) ->
     library).
     """
     normalized = _normalize_relative_path(file_path)
-    if site_id:
+    if site_id and site_id.strip():
         site_segment = _site_segment(site_id)
         drive_base = (
             f"/sites/{site_segment}/drives/{url_path_id(drive_id, 'drive_id')}"
-            if drive_id
+            if drive_id and drive_id.strip()
             else f"/sites/{site_segment}/drive"
         )
-    elif drive_id:
+    elif drive_id and drive_id.strip():
         drive_base = f"/drives/{url_path_id(drive_id, 'drive_id')}"
     else:
         drive_base = "/me/drive"
@@ -222,11 +238,15 @@ def excel_list_worksheets(
     default this addresses the caller's own OneDrive; pass site_id (a Graph
     site id -- "root" for the tenant's root site, or a site's own id/path)
     to address a SharePoint site's document library instead, optionally
-    with drive_id for a non-default library."""
+    with drive_id for a non-default library. next_link is set when Graph
+    paginates and more worksheets remain beyond this page."""
     try:
         base = _workbook_base(file_path, site_id, drive_id)
         result = _graph_request("GET", f"{base}/worksheets")
-        return _success(worksheets=result.get("value", []))
+        return _success(
+            worksheets=result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+        )
     except Exception as e:
         logger.error("Error listing worksheets for %s: %s", file_path, e)
         return _error(str(e))
@@ -289,7 +309,7 @@ def excel_get_range(
         if address:
             path += f"(address='{_odata_string_literal(address)}')"
         result = _graph_request("GET", path)
-        return _success(range=result)
+        return success_with_capped_dict("range", result)
     except Exception as e:
         logger.error(
             "Error getting range %s on worksheet %s in %s: %s",
@@ -388,7 +408,7 @@ def excel_get_used_range(
         if values_only:
             path += "(valuesOnly=true)"
         result = _graph_request("GET", path)
-        return _success(range=result)
+        return success_with_capped_dict("range", result)
     except Exception as e:
         logger.error(
             "Error getting used range for worksheet %s in %s: %s",
@@ -403,11 +423,17 @@ def excel_get_used_range(
 def excel_list_tables(
     file_path: str, site_id: str | None = None, drive_id: str | None = None
 ) -> str:
-    """List the tables (structured ranges) defined in an Excel workbook."""
+    """List the tables (structured ranges) defined in an Excel workbook.
+
+    next_link is set when Graph paginates and more tables remain beyond
+    this page."""
     try:
         base = _workbook_base(file_path, site_id, drive_id)
         result = _graph_request("GET", f"{base}/tables")
-        return _success(tables=result.get("value", []))
+        return _success(
+            tables=result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+        )
     except Exception as e:
         logger.error("Error listing tables in %s: %s", file_path, e)
         return _error(str(e))
@@ -439,12 +465,16 @@ def excel_list_table_rows(
     file_path: str, table: str, site_id: str | None = None, drive_id: str | None = None
 ) -> str:
     """List the rows in an Excel table. table is either the table's Graph
-    id or its display name."""
+    id or its display name. Graph pages this endpoint (around 200 rows by
+    default); next_link is set when more rows remain beyond this page."""
     try:
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)
         result = _graph_request("GET", f"{base}/{segment}/rows")
-        return _success(rows=result.get("value", []))
+        return _success(
+            rows=result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+        )
     except Exception as e:
         logger.error("Error listing rows for table %s in %s: %s", table, file_path, e)
         return _error(str(e))
@@ -467,6 +497,11 @@ def excel_add_table_rows(
     into one call over calling this repeatedly for single rows."""
     try:
         values = _parse_values_json(values_json)
+        if index is not None:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("index must be an integer")
+            if index < 0:
+                raise ValueError("index must be zero or a positive integer")
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)
         body: dict[str, Any] = {"values": values}

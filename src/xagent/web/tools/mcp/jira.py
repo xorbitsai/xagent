@@ -8,7 +8,8 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from ....config import get_tool_max_output_length
+from .utils import setup_proxy_env, success_with_capped_dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-mcp")
@@ -56,10 +57,12 @@ def _clamp_limit(limit: int) -> int:
     return max(1, min(int(limit), MAX_LIMIT))
 
 
-def _truncate(text: str) -> str:
-    """Bound error text to MAX_ERROR_RESPONSE_TEXT_CHARS, marking the cut."""
-    if len(text) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-        return text[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+def _truncate(text: str, max_chars: int = MAX_ERROR_RESPONSE_TEXT_CHARS) -> str:
+    """Bound text to max_chars (MAX_ERROR_RESPONSE_TEXT_CHARS by default,
+    for error text), marking the cut.
+    """
+    if len(text) > max_chars:
+        return text[:max_chars] + "... [truncated]"
     return text
 
 
@@ -250,11 +253,26 @@ def jira_get_current_user() -> str:
         return _error(str(e))
 
 
+def _summarize_project(project: dict[str, Any]) -> dict[str, Any]:
+    """Drop a project's avatarUrls (an id/emoji/size ladder of icon
+    links) -- the id/key/name/type are all a caller ever needs to pick a
+    project for jira_create_issue/jira_search_issues.
+    """
+    return {
+        "id": project.get("id"),
+        "key": project.get("key"),
+        "name": project.get("name"),
+        "project_type_key": project.get("projectTypeKey"),
+    }
+
+
 @mcp.tool()
 def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -> str:
     """
-    List projects on a Jira site -- id, key (e.g. "ENG"), and name. Use the
-    returned key with jira_create_issue and jira_search_issues.
+    List projects on a Jira site -- id, key (e.g. "ENG"), name, and
+    project_type_key. Use the returned key with jira_create_issue and
+    jira_search_issues. Other project metadata (lead, category, archived/
+    private flags) is not returned.
     cloud_id: optional site id from jira_list_accessible_sites; omit when
     the account has only one accessible site.
     start_at: offset into the full project list -- pass the previous
@@ -271,15 +289,21 @@ def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -
         )
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira projects API")
-        projects = result.get("values") or []
-        # bool(projects) guards against a server that signals more pages
-        # while returning an empty page: without it next_start_at would
-        # equal start_at and a caller following it would loop forever.
-        truncated = bool(projects) and not result.get("isLast", True)
+        raw_projects = result.get("values") or []
+        projects = [_summarize_project(p) for p in raw_projects if isinstance(p, dict)]
+        # bool(raw_projects) guards against a server that signals more
+        # pages while returning an empty page: without it next_start_at
+        # would equal start_at and a caller following it would loop
+        # forever. Counting the RAW page (not the filtered `projects`) --
+        # same pattern as jira_search_users below -- matters because
+        # Jira's startAt is positional over the raw page: undercounting
+        # by however many entries got filtered out would make the next
+        # request re-fetch (duplicate) entries already consumed here.
+        truncated = bool(raw_projects) and not result.get("isLast", True)
         return _success(
             projects=projects,
             truncated=truncated,
-            next_start_at=(offset + len(projects)) if truncated else None,
+            next_start_at=(offset + len(raw_projects)) if truncated else None,
         )
     except Exception as e:
         logger.error(f"Error listing Jira projects: {e}")
@@ -335,16 +359,316 @@ def jira_search_issues(
         return _error(str(e))
 
 
-@mcp.tool()
-def jira_get_issue(issue_key: str, cloud_id: str = "") -> str:
+#: Cap on ADF recursion depth, mirroring the same trace-depth guard used
+#: in core.agent.trace._MAX_TRACE_DEPTH. Without this, a pathologically
+#: nested document (e.g. hundreds of levels of nested lists/blockquotes,
+#: from a pasted document or a buggy upstream integration) would drive
+#: Python's call stack past its default recursion limit and raise
+#: RecursionError instead of degrading gracefully.
+_ADF_MAX_DEPTH = 50
+_ADF_NESTED_TOO_DEEP_MESSAGE = "[... nested too deep ...]"
+
+#: Proactive per-field caps for the two known hot-spot text fields that
+#: can otherwise make jira_get_issue/jira_list_comments' whole
+#: serialized response exceed the output budget on their own: a Jira
+#: description (single object, so there is no "smaller page" fallback
+#: the way a list of issues/comments has) and a single comment body.
+#: Both are well under a typical 50 KiB budget on their own, leaving
+#: room for the rest of the response, and both are capped BEFORE the
+#: response is ever measured, so the caller gets an explicit
+#: truncation signal and predictable partial content instead of
+#: whatever OutputValueFilter happens to slice off mid-JSON.
+_ISSUE_DESCRIPTION_MAX_CHARS = 30_000
+_COMMENT_BODY_MAX_CHARS = 4_000
+
+
+def _cap_text_field(payload: dict[str, Any], field: str, max_chars: int) -> bool:
+    """Truncate payload[field] in place if it's a str longer than
+    max_chars, marking the cut. Returns whether it was truncated.
     """
-    Get one issue's full details, including description, status, assignee,
-    and priority.
+    value = payload.get(field)
+    if isinstance(value, str) and len(value) > max_chars:
+        payload[field] = _truncate(value, max_chars)
+        return True
+    return False
+
+
+def _flatten_adf(value: Any) -> str | None:
+    """Render a Jira ADF (Atlassian Document Format) rich-text field --
+    used by an issue's description and a comment's body on Jira Cloud --
+    down to plain text.
+
+    Falls back to returning a plain string unchanged (Jira Server/Data
+    Center can still return wiki-markup strings for the same field), so
+    this is safe to call unconditionally on either shape.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value or None
+    if not isinstance(value, dict):
+        return None
+
+    # Appending to a shared list and joining once at the end is O(N) in
+    # the document's total text length; returning and re-joining a
+    # string at every ancestor level (the previous approach) is O(N*D)
+    # for nesting depth D, since each character gets copied once per
+    # level on the way back up the tree.
+    out: list[str] = []
+
+    def _walk(node: Any, depth: int) -> None:
+        if not isinstance(node, dict):
+            return
+        if depth > _ADF_MAX_DEPTH:
+            out.append(_ADF_NESTED_TOO_DEEP_MESSAGE)
+            return
+        node_type = node.get("type")
+        attrs = _as_dict(node.get("attrs"))
+        if node_type == "text":
+            out.append(str(node.get("text") or ""))
+            return
+        if node_type == "hardBreak":
+            out.append("\n")
+            return
+        # mention/emoji/inlineCard are leaf inline nodes -- no "text" and
+        # no "content" to recurse into -- so without explicit handling
+        # they'd silently render as "", dropping the @-mention, emoji,
+        # or link entirely.
+        if node_type == "mention":
+            # `text` (a "@Display Name" label) is documented as optional
+            # on a mention node -- only `id` is required -- so falling
+            # back to the raw account id still surfaces *something*
+            # instead of the mention vanishing when text is omitted.
+            mention_id = attrs.get("id")
+            out.append(
+                str(attrs.get("text") or (f"@{mention_id}" if mention_id else ""))
+            )
+            return
+        if node_type == "emoji":
+            out.append(str(attrs.get("text") or attrs.get("shortName") or ""))
+            return
+        if node_type == "inlineCard":
+            # Atlassian's docs: an inlineCard's attrs carries EITHER
+            # `data` (a JSON-LD resource) OR `url`, never both -- so a
+            # `data`-only smart link still needs a fallback or it
+            # silently renders as "" exactly like the bug this function
+            # exists to fix.
+            url = attrs.get("url")
+            if not url:
+                data = _as_dict(attrs.get("data"))
+                url = data.get("url") or data.get("name") or data.get("title")
+            out.append(str(url or ""))
+            return
+        for child in node.get("content") or []:
+            _walk(child, depth + 1)
+        # listItem/blockquote wrap block children (typically a paragraph)
+        # that already append their own trailing "\n" -- appending a
+        # second one here would double it into a blank line per list
+        # item / at the end of every blockquote.
+        if node_type in ("paragraph", "heading", "codeBlock"):
+            out.append("\n")
+
+    for block in value.get("content") or []:
+        _walk(block, 1)
+
+    text = "".join(out)
+    return text.strip() or None
+
+
+def _summarize_mini_issue(entry: dict[str, Any]) -> dict[str, Any]:
+    """Extract key/summary/status from a Jira "mini issue" shape --
+    {key, fields: {summary, status: {name}}} -- the same shape Jira uses
+    both for a subtasks entry and for issuelinks' linked-issue object.
+    Shared by _summarize_subtask and _summarize_issue_link so the two
+    don't drift if a field is added to one and not the other.
+    """
+    fields = _as_dict(entry.get("fields"))
+    return {
+        "issue_key": entry.get("key"),
+        "summary": fields.get("summary"),
+        "status": _as_dict(fields.get("status")).get("name"),
+    }
+
+
+def _summarize_issue_link(link: dict[str, Any]) -> dict[str, Any]:
+    """Slim one issuelinks entry to the relationship plus the linked
+    issue's key/summary/status.
+
+    issuelinks/subtasks are only ever present on jira_get_issue's raw
+    payload -- jira_search_issues has no such field to request -- so this
+    (and jira_get_issue below) is the only place a caller can learn an
+    issue's dependencies at all.
+    """
+    outward = link.get("outwardIssue")
+    linked = outward or link.get("inwardIssue") or {}
+    link_type = _as_dict(link.get("type"))
+    return {
+        "relationship": link_type.get("outward" if outward else "inward"),
+        **_summarize_mini_issue(_as_dict(linked)),
+    }
+
+
+def _summarize_subtask(subtask: dict[str, Any]) -> dict[str, Any]:
+    return _summarize_mini_issue(subtask)
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Return value if it's a dict, else {}.
+
+    A single choke point for the "unwrap an optional Jira object field"
+    pattern used throughout this module, so every such unwrap gets the
+    same isinstance guard the array-shaped fields (components,
+    fixVersions, issuelinks, subtasks) already get -- a non-dict truthy
+    value here (e.g. a malformed gateway response serializing an object
+    field as a bare string) would otherwise raise AttributeError on the
+    next `.get(...)` and fail the whole tool call.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _summarize_person(person: Any) -> dict[str, Any] | None:
+    person = _as_dict(person)
+    if not person:
+        return None
+    return {
+        "account_id": person.get("accountId"),
+        "display_name": person.get("displayName"),
+    }
+
+
+def _summarize_full_issue(issue: dict[str, Any]) -> dict[str, Any]:
+    """Slim a full raw issue (jira_get_issue's payload) down to what a
+    detail/dependency view needs, flattening ADF rich text and dropping
+    the url/avatar/icon/changelog clutter that let a single issue run up
+    to ~180 KB and get cut mid-JSON by the output filter.
+    """
+    fields = _as_dict(issue.get("fields"))
+    status = _as_dict(fields.get("status"))
+    priority = _as_dict(fields.get("priority"))
+    issuetype = _as_dict(fields.get("issuetype"))
+    project = _as_dict(fields.get("project"))
+    parent = _as_dict(fields.get("parent"))
+    resolution = _as_dict(fields.get("resolution"))
+    return {
+        "id": issue.get("id"),
+        "key": issue.get("key"),
+        "summary": fields.get("summary"),
+        "description": _flatten_adf(fields.get("description")),
+        "status": status.get("name"),
+        "status_category": _as_dict(status.get("statusCategory")).get("name"),
+        "assignee": _summarize_person(fields.get("assignee")),
+        "reporter": _summarize_person(fields.get("reporter")),
+        "creator": _summarize_person(fields.get("creator")),
+        "priority": priority.get("name"),
+        "issue_type": issuetype.get("name"),
+        "project_key": project.get("key"),
+        "labels": fields.get("labels") or [],
+        "parent_key": parent.get("key"),
+        "resolution": resolution.get("name"),
+        "components": [
+            c.get("name") for c in fields.get("components") or [] if isinstance(c, dict)
+        ],
+        "fix_versions": [
+            v.get("name")
+            for v in fields.get("fixVersions") or []
+            if isinstance(v, dict)
+        ],
+        "due_date": fields.get("duedate"),
+        "created": fields.get("created"),
+        "updated": fields.get("updated"),
+        "issue_links": [
+            _summarize_issue_link(link)
+            for link in fields.get("issuelinks") or []
+            if isinstance(link, dict)
+        ],
+        "subtasks": [
+            _summarize_subtask(subtask)
+            for subtask in fields.get("subtasks") or []
+            if isinstance(subtask, dict)
+        ],
+    }
+
+
+#: Fields requested for jira_get_issue. Keep this in lockstep with every
+#: `fields.get(...)` call inside _summarize_full_issue below: Jira's API
+#: returns ONLY this subset once any `fields` param is passed, so a key
+#: _summarize_full_issue reads but this list omits will silently and
+#: permanently come back as None. test_get_issue_requests_exact_field_list
+#: in test_jira_mcp.py pins this constant's value so a change here shows
+#: up in review, but it does not by itself verify the two stay matched --
+#: check _summarize_full_issue's fields.get(...) calls by hand when
+#: editing either.
+_GET_ISSUE_FIELDS = (
+    "summary,description,status,assignee,reporter,creator,"
+    "priority,issuetype,project,parent,resolution,labels,"
+    "components,fixVersions,duedate,created,updated,"
+    "issuelinks,subtasks"
+)
+
+
+@mcp.tool()
+def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -> str:
+    """
+    Get one issue's details -- description, status, assignee,
+    reporter/creator, priority, components, fix versions, due date, and
+    its dependencies (issue_links -- e.g. blocks/is blocked by/relates to
+    -- and subtasks). Only the fields listed here are fetched by default;
+    other Jira fields (attachments, worklog, votes, watchers, time
+    tracking, affected versions, security level, sprint/epic link,
+    custom fields) are not requested and will not appear in the result
+    unless named via extra_fields.
     issue_key: an issue key (e.g. "ENG-123") or its numeric id.
+    extra_fields: optional comma-separated Jira field ids not in the
+    default set above -- standard (e.g. "duedate") or custom (e.g.
+    "customfield_10010", found via your Jira admin's field
+    configuration). Returned as {field_id: raw_value} under
+    extra_field_values in the result, so you can reach any field this
+    tool doesn't summarize by name.
+    Use this, not jira_search_issues, when you need an issue's
+    dependencies or full description: issue_links/subtasks/description
+    are only returned here. A description longer than
+    _ISSUE_DESCRIPTION_MAX_CHARS is truncated with description_truncated
+    set to true, so the result is always parseable JSON regardless of
+    how large the real description is.
     """
     try:
-        result = _request("GET", cloud_id, _issue_path(issue_key))
-        return _success(issue=result)
+        requested_extra = [
+            name.strip() for name in extra_fields.split(",") if name.strip()
+        ]
+        fields_param = _GET_ISSUE_FIELDS
+        if requested_extra:
+            fields_param = f"{fields_param},{','.join(requested_extra)}"
+        result = _request(
+            "GET",
+            cloud_id,
+            _issue_path(issue_key),
+            params={"fields": fields_param},
+        )
+        if not isinstance(result, dict):
+            return _error("Unexpected response format from Jira issue API")
+        issue = _summarize_full_issue(result)
+        if requested_extra:
+            raw_fields = _as_dict(result.get("fields"))
+            issue["extra_field_values"] = {
+                name: raw_fields.get(name) for name in requested_extra
+            }
+        description_truncated = _cap_text_field(
+            issue, "description", _ISSUE_DESCRIPTION_MAX_CHARS
+        )
+        response = _success(issue=issue, description_truncated=description_truncated)
+        max_output_length = get_tool_max_output_length()
+        if len(response) > max_output_length:
+            # Capping the one known hot-spot field wasn't enough (e.g.
+            # an unusually large number of dependencies/labels, or a
+            # large extra_field_values value) -- fall back to the
+            # generic shrink-until-bounded helper rather than return
+            # invalid (cut-mid-JSON) output.
+            response = success_with_capped_dict(
+                "issue",
+                issue,
+                extra_fields={"description_truncated": description_truncated},
+            )
+        return response
     except Exception as e:
         logger.error(f"Error fetching Jira issue {issue_key}: {e}")
         return _error(str(e))
@@ -532,6 +856,100 @@ def jira_transition_issue(
         return _error(str(e))
 
 
+def _summarize_comment(comment: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a comment's ADF body to plain text and drop the author's
+    avatarUrls -- a long comment thread otherwise repeats that avatar
+    ladder once per comment and is a routine way jira_list_comments'
+    output ran past the per-tool-output-string cap.
+    """
+    visibility = _as_dict(comment.get("visibility"))
+    summarized = {
+        "id": comment.get("id"),
+        "author": _summarize_person(comment.get("author")),
+        "body": _flatten_adf(comment.get("body")),
+        # A comment can be restricted to a role/group; surfacing that
+        # (rather than dropping it) matters because a caller relaying
+        # comments elsewhere (e.g. into a customer-facing channel) needs
+        # to know a comment was never meant to be public.
+        "visibility": (
+            {"type": visibility.get("type"), "value": visibility.get("value")}
+            if visibility
+            else None
+        ),
+        "created": comment.get("created"),
+        "updated": comment.get("updated"),
+    }
+    # Capping ONE comment's body can't by itself make an oversized PAGE
+    # fit (see _fit_comments_page for that), but it does guarantee a
+    # single pathologically large comment is never why a page can't be
+    # built at all.
+    summarized["body_truncated"] = _cap_text_field(
+        summarized, "body", _COMMENT_BODY_MAX_CHARS
+    )
+    return summarized
+
+
+def _build_comments_response(
+    comments: list[dict[str, Any]], total: int, next_start_at: int | None
+) -> str:
+    return _success(
+        total=total,
+        returned_count=len(comments),
+        truncated=next_start_at is not None,
+        next_start_at=next_start_at,
+        comments=comments,
+    )
+
+
+def _fit_comments_page(
+    raw_comments: list[Any],
+    offset: int,
+    total: int,
+    has_more_raw: bool,
+    max_output_length: int,
+) -> str | None:
+    """Build the largest whole-comment prefix (each comment already
+    body-capped by _summarize_comment) that fits max_output_length,
+    trying every raw entry first and only shrinking if that overflows.
+
+    Returns None if not even a single comment fits (the caller should
+    treat that as a bounded error, the same way jira_search_issues does
+    when its minimal page still doesn't fit).
+
+    next_start_at is computed from the RAW position immediately after
+    the last comment actually kept -- not from the filtered/kept count
+    -- so a caller resuming from it neither skips nor re-fetches a
+    comment already accounted for here (same reasoning
+    jira_list_projects/jira_search_users use for their own
+    next_start_at, extended to also cover a size-triggered cut, not
+    just a filtered-out malformed entry).
+    """
+    kept: list[dict[str, Any]] = []
+    raw_positions: list[int] = []
+    for index, raw in enumerate(raw_comments):
+        if isinstance(raw, dict):
+            kept.append(_summarize_comment(raw))
+            raw_positions.append(index)
+
+    if not kept:
+        next_start_at = (offset + len(raw_comments)) if has_more_raw else None
+        response = _build_comments_response(kept, total, next_start_at)
+        return response if len(response) <= max_output_length else None
+
+    for count in range(len(kept), 0, -1):
+        if count == len(kept):
+            # Every raw comment on this page is accounted for -- the
+            # existing "is there more beyond this raw page" signal is
+            # exactly right, size aside.
+            next_start_at = (offset + len(raw_comments)) if has_more_raw else None
+        else:
+            next_start_at = offset + raw_positions[count - 1] + 1
+        response = _build_comments_response(kept[:count], total, next_start_at)
+        if len(response) <= max_output_length:
+            return response
+    return None
+
+
 @mcp.tool()
 def jira_list_comments(
     issue_key: str, cloud_id: str = "", limit: int = 50, start_at: int = 0
@@ -540,6 +958,11 @@ def jira_list_comments(
     List comments on an issue (body, author, timestamp).
     start_at: offset into the full comment list -- pass the previous
     response's next_start_at to fetch the next page (0 to start over).
+    A comment body longer than _COMMENT_BODY_MAX_CHARS is truncated
+    with body_truncated set to true on that comment; if the whole page
+    still doesn't fit the tool output limit even after that, fewer
+    comments than requested are returned with next_start_at pointing at
+    the first one left out, so pagination stays valid.
     """
     try:
         max_results = _clamp_limit(limit)
@@ -552,17 +975,31 @@ def jira_list_comments(
         )
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira comments API")
-        comments = result.get("comments") or []
+        raw_comments = result.get("comments") or []
         raw_total = result.get("total")
-        total = raw_total if isinstance(raw_total, int) else offset + len(comments)
-        # bool(comments) guards the no-progress case (empty page while total
-        # still exceeds offset): next_start_at must never equal start_at.
-        truncated = bool(comments) and offset + len(comments) < total
-        return _success(
-            comments=comments,
-            truncated=truncated,
-            next_start_at=(offset + len(comments)) if truncated else None,
+        total = raw_total if isinstance(raw_total, int) else offset + len(raw_comments)
+        # bool(raw_comments) guards the no-progress case (empty page
+        # while total still exceeds offset): next_start_at must never
+        # equal start_at. Counted from the RAW page (not any filtered/
+        # size-cut list) -- same reasoning as jira_list_projects/
+        # jira_search_users: Jira's startAt is positional over the raw
+        # page, so undercounting here would make the next request
+        # re-fetch (duplicate) comments already consumed.
+        has_more_raw = bool(raw_comments) and offset + len(raw_comments) < total
+        response = _fit_comments_page(
+            raw_comments,
+            offset,
+            total,
+            has_more_raw,
+            get_tool_max_output_length(),
         )
+        if response is None:
+            return _error(
+                "A Jira comments page exceeds the tool output limit even "
+                "with a single comment; fetch it individually or narrow "
+                "the request"
+            )
+        return response
     except Exception as e:
         logger.error(f"Error listing comments for Jira issue {issue_key}: {e}")
         return _error(str(e))

@@ -402,6 +402,39 @@ class TestTheChangedCallers:
         assert response.connection_status == "connected"
         assert response.connected_account == "fallback@acme.example"
 
+    def test_listing_reports_needs_reconnect_when_the_newer_cross_key_grant_is_broken(
+        self, db
+    ):
+        """The inverse of the case above: the id-named row ("acme-mail") is
+        healthy and older; a newer row exists under the bare provider key
+        ("prov-acme-mail") with its token cleared. The runtime resolver
+        pools both keys and always takes the single newest by id, so the
+        newer, broken row must win here too -- reporting needs_reconnect --
+        even though an older, healthy row exists under the other candidate
+        key. This is the exact cross-key pooling code two earlier review
+        rounds found bugs in; the test above only pins the newer-is-healthy
+        direction, this pins the newer-is-broken one."""
+        from xagent.web.api.mcp import get_mcp_servers
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user, server_id = self._connected_id_named_app(db)
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="prov-acme-mail",
+                access_token="",
+                refresh_token=None,
+                email="newer@acme.example",
+            )
+        )
+        db.commit()
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "needs_reconnect"
+        assert response.connected_account == "newer@acme.example"
+
     def test_summaries_pick_the_newest_row_even_when_it_is_broken(self, db):
         """The runtime token resolver always selects the single
         most-recently-created ``UserOAuth`` row for a provider

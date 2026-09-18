@@ -9,6 +9,7 @@ import requests
 from docx import Document
 from docx.document import Document as DocumentType
 from docx.oxml.ns import qn
+from docx.text.run import Run
 from mcp.server.fastmcp import FastMCP
 
 from .utils import setup_proxy_env, url_path_id
@@ -258,13 +259,13 @@ def _create_only_upload(
     # query string) -- Graph's createUploadSession docs warn that including
     # an Authorization header on this PUT can cause a 401 -- so this goes
     # through a plain requests.put, not _graph_request (which always
-    # attaches one). Because the URL itself is a bearer secret, neither
-    # requests.put's own exception (a connection failure or timeout) nor the
-    # HTTPError from raise_for_status() is ever stringified into a message
-    # here: both embed the full request URL in their default str() (verified
-    # against requests' own exception formatting), which would otherwise
-    # leak the token through this function's caller -- matching onedrive.py's
-    # identical guard on the same hazard for its own upload-session code.
+    # attaches one). Both requests.put's own exception (a connection failure
+    # or timeout) and the HTTPError from raise_for_status() embed the full
+    # request URL in their default str(), so neither is stringified into a
+    # message below, and each is re-raised with "from None" rather than
+    # "from exc" -- chaining the original would still attach it as
+    # __cause__, which a future traceback/log/APM capture could surface --
+    # matching onedrive.py's identical guard on the same hazard.
     try:
         response = requests.put(
             upload_url,
@@ -276,19 +277,19 @@ def _create_only_upload(
             timeout=_BINARY_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-    except requests.HTTPError as exc:
+    except requests.HTTPError:
         status_code = response.status_code
         if status_code == 409:
             raise ValueError(
                 f"{file_path!r} already exists; use the other word_* tools to "
                 "edit it instead of recreating it"
-            ) from exc
+            ) from None
         raise _GraphRequestError(
             f"Word document upload failed with HTTP {status_code}",
             status_code=status_code,
-        ) from exc
-    except requests.RequestException as exc:
-        raise RuntimeError("Word document upload failed") from exc
+        ) from None
+    except requests.RequestException:
+        raise RuntimeError("Word document upload failed") from None
     result = response.json()
     if not isinstance(result, dict) or not result.get("id"):
         raise RuntimeError("Graph did not confirm the document upload completed")
@@ -326,7 +327,7 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
     image, break, or field character, which the plain-text runs[0].text
     assignment below would silently delete.
     """
-    if paragraph._p.findall(qn("w:hyperlink")):
+    if paragraph._p.xpath(".//w:hyperlink"):
         raise ValueError(
             "paragraph contains a hyperlink; word_set_paragraph_text does not "
             "support editing it here (the hyperlink's own run text is outside "
@@ -499,6 +500,12 @@ def word_replace_text(
     word_set_paragraph_text for a guaranteed replacement in a specific
     paragraph.
 
+    Searches every run in a paragraph, including ones nested inside a
+    hyperlink or other wrapper (a content control, a smart tag) --
+    paragraph.runs itself only sees direct children, which would otherwise
+    make hyperlink text invisible to this tool even though it's included
+    when reading the document back with word_get_document_text.
+
     Refuses (rather than silently corrupting the document) a match found in
     a run that also holds non-text content -- an image, break, or field --
     since assigning that run's text would delete it the same way
@@ -509,7 +516,8 @@ def word_replace_text(
         document = _download_document(file_path, site_id, drive_id)
         replacements = 0
         for paragraph in document.paragraphs:
-            for run in paragraph.runs:
+            for r in paragraph._p.xpath(".//w:r"):
+                run = Run(r, paragraph)
                 if find in run.text:
                     if _run_has_non_text_content(run):
                         raise ValueError(

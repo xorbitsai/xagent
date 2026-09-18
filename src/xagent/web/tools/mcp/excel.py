@@ -113,7 +113,8 @@ def _site_segment(site_id: str) -> str:
 def _normalize_relative_path(path: str) -> str:
     """Normalize a drive-relative file path for a root:/{path}: request URL,
     rejecting '.'/'..' segments, an empty segment (consecutive slashes), a
-    trailing folder separator, and a filename ending in a period.
+    trailing folder separator, and any segment with a trailing period or
+    leading/trailing whitespace.
 
     An empty segment (e.g. "Reports//Q1.xlsx") is rejected rather than
     collapsed: unlike a ".." segment, which requests' own PreparedRequest
@@ -465,8 +466,8 @@ def excel_list_table_rows(
     file_path: str, table: str, site_id: str | None = None, drive_id: str | None = None
 ) -> str:
     """List the rows in an Excel table. table is either the table's Graph
-    id or its display name. Graph pages this endpoint (around 200 rows by
-    default); next_link is set when more rows remain beyond this page."""
+    id or its display name. Graph may page this endpoint for a large
+    table; next_link is set when more rows remain beyond this page."""
     try:
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)

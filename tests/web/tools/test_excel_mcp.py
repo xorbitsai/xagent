@@ -400,6 +400,22 @@ def test_list_tables_success(monkeypatch):
     assert result["next_link"] is None
 
 
+def test_list_tables_exposes_next_link(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "value": [{"id": "1"}],
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/next-page",
+            }
+        )
+    )
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_list_tables("book.xlsx"))
+
+    assert result["next_link"] == "https://graph.microsoft.com/v1.0/next-page"
+
+
 def test_add_table_sends_address_and_has_headers(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"id": "1", "name": "Table1"}))
     monkeypatch.setattr(excel.requests, "request", mock_request)

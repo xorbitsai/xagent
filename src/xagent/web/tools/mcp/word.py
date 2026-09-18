@@ -307,6 +307,10 @@ def _create_only_upload(
 _NON_TEXT_RUN_TAGS = (qn("w:drawing"), qn("w:br"), qn("w:fldChar"), qn("w:pict"))
 
 
+def _run_has_non_text_content(run: Any) -> bool:
+    return any(run._r.find(tag) is not None for tag in _NON_TEXT_RUN_TAGS)
+
+
 def _set_paragraph_text(paragraph: Any, text: str) -> None:
     """Replace a paragraph's visible text, keeping its first run's
     character formatting (font, bold, etc.) and its own paragraph style.
@@ -330,7 +334,7 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
             "than replaced) -- edit this paragraph directly in Word instead"
         )
     for run in paragraph.runs:
-        if any(run._r.find(tag) is not None for tag in _NON_TEXT_RUN_TAGS):
+        if _run_has_non_text_content(run):
             raise ValueError(
                 "paragraph contains a run with non-text content (an image, "
                 "line/page break, or field such as a table of contents entry) "
@@ -507,7 +511,7 @@ def word_replace_text(
         for paragraph in document.paragraphs:
             for run in paragraph.runs:
                 if find in run.text:
-                    if any(run._r.find(tag) is not None for tag in _NON_TEXT_RUN_TAGS):
+                    if _run_has_non_text_content(run):
                         raise ValueError(
                             "found a match in a run that also contains non-text "
                             "content (an image, break, or field) that replacing "

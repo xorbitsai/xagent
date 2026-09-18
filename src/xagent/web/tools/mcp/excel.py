@@ -110,8 +110,16 @@ def _site_segment(site_id: str) -> str:
 
 def _normalize_relative_path(path: str) -> str:
     """Normalize a drive-relative file path for a root:/{path}: request URL,
-    rejecting '.'/'..' segments, a trailing folder separator, and a filename
-    ending in a period.
+    rejecting '.'/'..' segments, an empty segment (consecutive slashes), a
+    trailing folder separator, and a filename ending in a period.
+
+    An empty segment (e.g. "Reports//Q1.xlsx") is rejected rather than
+    collapsed: unlike a ".." segment, which requests' own PreparedRequest
+    normalizes away before the request is even sent (verified directly --
+    see the '.'/'..' check below), a doubled slash is sent to Graph
+    exactly as given, and there's no well-defined "collapse to a single
+    slash" semantic to fall back on here that wouldn't risk silently
+    addressing a different path than the caller wrote.
 
     The trailing-period case matters even though this module never writes
     arbitrary file content (unlike onedrive.py/sharepoint.py's upload
@@ -131,8 +139,10 @@ def _normalize_relative_path(path: str) -> str:
         )
     if "\\" in value:
         raise ValueError("file_path must use '/' separators and must not contain '\\'")
-    if any(segment in (".", "..") for segment in value.split("/")):
-        raise ValueError(f"file_path must not contain '.' or '..' segments: {path!r}")
+    if any(segment in (".", "..", "") for segment in value.split("/")):
+        raise ValueError(
+            f"file_path must not contain '.', '..', or empty segments: {path!r}"
+        )
     if value.rsplit("/", 1)[-1].endswith("."):
         raise ValueError(f"file_path filename must not end with a period: {path!r}")
     return value

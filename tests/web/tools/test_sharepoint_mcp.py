@@ -108,6 +108,29 @@ def test_graph_paginate_not_truncated_when_collection_exactly_exhausted(monkeypa
     assert truncated is False
 
 
+def test_success_with_capped_list_passes_through_small_list():
+    result = json.loads(
+        sharepoint._success_with_capped_list("items", [{"id": "1"}], truncated=False)
+    )
+    assert result["status"] == "success"
+    assert result["items"] == [{"id": "1"}]
+    assert result["truncated"] is False
+
+
+def test_success_with_capped_list_halves_until_it_fits(monkeypatch):
+    monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 200)
+    items = [{"id": str(i), "padding": "x" * 50} for i in range(10)]
+
+    result = json.loads(
+        sharepoint._success_with_capped_list("items", items, truncated=False)
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["items"]) < len(items)
+    assert "did not fit" in result["message"]
+
+
 def test_list_list_items_reports_truncated_across_pages(monkeypatch):
     next_link = (
         "https://graph.microsoft.com/v1.0/sites/root/lists/Tasks/items?$skiptoken=abc"
@@ -227,6 +250,26 @@ def test_list_drives_success(monkeypatch):
 
     assert result["status"] == "success"
     assert result["drives"] == [{"id": "drive-1", "name": "Documents"}]
+    assert result["truncated"] is False
+    # Matching every other pagination call site: $top must be sent so
+    # Graph's own default page size doesn't force extra round trips to
+    # reach the 200-item cap this call already asks _graph_paginate for.
+    assert mock_request.call_args.kwargs["params"]["$top"] == 200
+
+
+def test_search_sites_reports_truncated_across_pages(monkeypatch):
+    next_link = "https://graph.microsoft.com/v1.0/sites?$skiptoken=abc"
+    responses = [
+        MockResponse({"value": [{"id": "site-1"}], "@odata.nextLink": next_link}),
+        MockResponse({"value": [{"id": "site-2"}]}),
+    ]
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_search_sites("team", top=2))
+
+    assert result["status"] == "success"
+    assert [s["id"] for s in result["sites"]] == ["site-1", "site-2"]
     assert result["truncated"] is False
 
 
@@ -367,6 +410,22 @@ def test_get_file_content_rejects_encoded_result_over_output_limit(monkeypatch):
 
     assert result["status"] == "error"
     assert "too large" in result["message"]
+
+
+def test_get_file_content_accepts_multibyte_text_over_byte_count_limit(monkeypatch):
+    # UTF-8 decoding SHRINKS byte count to character count for multi-byte
+    # text (each of these Chinese characters is 3 raw bytes but 1 decoded
+    # char) -- a byte-count-based early rejection would wrongly reject this
+    # file even though the actual JSON response comfortably fits.
+    monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 500)
+    content = ("中" * 200).encode("utf-8")  # 600 raw bytes, 200 chars
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "notes_zh.txt"))
+
+    assert result["status"] == "success"
+    assert result["text_content"] == "中" * 200
 
 
 def test_get_file_content_rejects_compressed_content_encoding(monkeypatch):
@@ -553,6 +612,45 @@ def test_upload_file_rejects_over_size_limit(monkeypatch, _upload_allowed_dirs_e
 
     assert result["status"] == "error"
     assert "MB limit" in result["message"]
+
+
+def test_upload_file_rejects_content_emptied_after_size_check(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    # Simulates the file being truncated to empty between the fstat() size
+    # check and the read() -- fstat reports non-empty (so that check
+    # passes), but the real, empty-on-disk file's read() genuinely returns
+    # b"", which must still be caught rather than PUT as an empty body.
+    local_file = _upload_allowed_dirs_env / "vanishes.bin"
+    local_file.write_bytes(b"")
+
+    class _FakeStat:
+        st_size = 10
+
+    monkeypatch.setattr(sharepoint.os, "fstat", lambda fd: _FakeStat())
+
+    result = json.loads(sharepoint.sharepoint_upload_file(str(local_file), "root"))
+
+    assert result["status"] == "error"
+    assert "empty" in result["message"]
+
+
+def test_upload_file_names_remote_path_in_path_errors(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    # _drive_content_path's error messages default to naming "file_path",
+    # but sharepoint_upload_file's own parameter is "remote_path" -- the
+    # error must name the parameter this tool actually has.
+    local_file = _upload_allowed_dirs_env / "data.bin"
+    local_file.write_bytes(b"\x00\x01")
+
+    result = json.loads(
+        sharepoint.sharepoint_upload_file(str(local_file), "root", remote_path="Docs/")
+    )
+
+    assert result["status"] == "error"
+    assert "remote_path" in result["message"]
+    assert "file_path" not in result["message"]
 
 
 def test_upload_file_success(monkeypatch, _upload_allowed_dirs_env):

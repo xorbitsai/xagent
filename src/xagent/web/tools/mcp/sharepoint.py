@@ -153,6 +153,49 @@ def _error(message: str, *, details: Any = None) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _success_with_capped_list(
+    list_field: str, items: list[Any], *, truncated: bool = False, **extra: Any
+) -> str:
+    """Build a success payload, halving ``items`` until the response fits
+    the platform's output limit.
+
+    _graph_paginate's own ``limit`` cap keeps a normal-sized page well under
+    that limit, but a page of items with unusually large per-item content
+    (e.g. sharepoint_list_list_items' $expand=fields pulling in long Rich
+    Text column values) can still serialize past the runtime's generic
+    output filter's fixed character threshold and get hard-truncated into
+    broken JSON -- the same corruption sharepoint_get_file_content's own
+    output-length guard exists to avoid. Halving (rather than a fixed
+    slice) adapts to whatever size a given site's items happen to be, and
+    continues down to zero items: a single oversized item must still be
+    capped, not returned whole because there's nothing left to halve away
+    from it. Matches deputy.py's/salesforce.py's identical
+    _success_with_capped_list.
+    """
+
+    def _build(items: list[Any], truncated: bool, halved: bool) -> str:
+        payload = {list_field: items, "truncated": truncated, **extra}
+        if halved:
+            payload["message"] = (
+                f"Returned {len(items)} {list_field} out of the full result; "
+                "the rest did not fit the output size limit and cannot be "
+                "recovered via this tool call."
+            )
+        return _success(**payload)
+
+    max_output_length = get_tool_max_output_length()
+    halved = False
+    response = _build(items, truncated, halved)
+    while len(response) > max_output_length and items:
+        items = items[: len(items) // 2]
+        truncated = True
+        halved = True
+        response = _build(items, truncated, halved)
+    if halved and len(response) > max_output_length:
+        response = _build(items, truncated, False)
+    return response
+
+
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
     token = os.environ.get("AUTH_TOKEN")
     if not token:
@@ -400,11 +443,21 @@ def _drive_children_path(
     return f"{base}/root:/{quote(normalized, safe='/')}:/children"
 
 
-def _drive_content_path(site_id: str, file_path: str, drive_id: str | None) -> str:
+def _drive_content_path(
+    site_id: str,
+    file_path: str,
+    drive_id: str | None,
+    *,
+    field_name: str = "file_path",
+) -> str:
+    # field_name lets a caller whose own parameter isn't literally named
+    # "file_path" (sharepoint_upload_file's is "remote_path") get an error
+    # that names its actual argument instead of a parameter it doesn't
+    # have -- matches onedrive.py's identically-parametrized _content_path.
     stripped_path = file_path.strip()
     if stripped_path.endswith("/"):
         raise ValueError(
-            "file_path must include a filename, not end with a folder separator"
+            f"{field_name} must include a filename, not end with a folder separator"
         )
     if Path(stripped_path).name.endswith("."):
         # Matches onedrive.py's _content_path guard: a trailing-dot filename
@@ -414,10 +467,10 @@ def _drive_content_path(site_id: str, file_path: str, drive_id: str | None) -> s
         # as "", not ".docx") AND land as "report.docx" on the server side --
         # silently overwriting an unrelated real document with mislabeled
         # text content.
-        raise ValueError(f"{file_path!r} filename must not end with a period")
+        raise ValueError(f"{field_name} {file_path!r} must not end with a period")
     normalized = _normalize_relative_path(file_path)
     if not normalized:
-        raise ValueError("file_path is required")
+        raise ValueError(f"{field_name} is required")
     base = _drive_base(site_id, drive_id)
     return f"{base}/root:/{quote(normalized, safe='/')}:/content"
 
@@ -534,12 +587,11 @@ def sharepoint_search_sites(query: str, top: int = 25) -> str:
     try:
         if not query.strip():
             raise ValueError("query is required")
-        result = _graph_request(
-            "GET",
-            "/sites",
-            params={"search": query, "$top": max(1, min(top, 100))},
+        capped_top = max(1, min(top, 100))
+        sites, truncated = _graph_paginate(
+            "/sites", {"search": query, "$top": capped_top}, limit=capped_top
         )
-        return _success(sites=result.get("value", []))
+        return _success_with_capped_list("sites", sites, truncated=truncated)
     except Exception as e:
         logger.error("Error searching SharePoint sites: %s", e)
         return _error(str(e))
@@ -573,9 +625,9 @@ def sharepoint_list_drives(site_id: str) -> str:
     """List the document libraries (drives) in a SharePoint site."""
     try:
         drives, truncated = _graph_paginate(
-            f"/sites/{_site_segment(site_id)}/drives", {}, limit=200
+            f"/sites/{_site_segment(site_id)}/drives", {"$top": 200}, limit=200
         )
-        return _success(drives=drives, truncated=truncated)
+        return _success_with_capped_list("drives", drives, truncated=truncated)
     except Exception as e:
         logger.error("Error listing SharePoint drives for site %s: %s", site_id, e)
         return _error(str(e))
@@ -598,8 +650,9 @@ def sharepoint_list_items(
             {"$top": capped_top},
             limit=capped_top,
         )
-        return _success(
-            items=[_caller_safe_drive_item(item) for item in items],
+        return _success_with_capped_list(
+            "items",
+            [_caller_safe_drive_item(item) for item in items],
             truncated=truncated,
         )
     except Exception as e:
@@ -628,8 +681,9 @@ def sharepoint_search_files(
             {"$top": capped_top},
             limit=capped_top,
         )
-        return _success(
-            items=[_caller_safe_drive_item(item) for item in items],
+        return _success_with_capped_list(
+            "items",
+            [_caller_safe_drive_item(item) for item in items],
             truncated=truncated,
         )
     except Exception as e:
@@ -657,21 +711,24 @@ def sharepoint_get_file_content(
         # silent corruption rather than a clear failure. Rejecting it here,
         # before that filter ever sees it, trades that for an honest,
         # actionable error.
-        #
-        # Encoding (UTF-8 text, or base64 for binary content) can only ever
-        # grow the byte count, never shrink it, so the raw download size
-        # alone is a safe lower bound on the eventual JSON string's length
-        # -- already exceeding the limit here means it will regardless of
-        # which encoding is picked, without needing to actually build (and
-        # immediately discard) the base64/JSON payload to find that out.
         max_output_length = get_tool_max_output_length()
-        if len(content) > max_output_length:
-            return _error(
-                f"{file_path!r} is too large to return inline "
-                f"({len(content)} bytes downloaded, limit is "
-                f"{max_output_length} characters)"
-            )
         text_content, base64_content = _decode_bytes(content)
+        if base64_content is not None:
+            # Base64 inflates the byte count by exactly 4 * ceil(n/3) --
+            # deterministically larger than len(content), so this is a
+            # safe, exact lower bound on the eventual JSON string's length
+            # without needing to build (and immediately discard) the full
+            # envelope to find out. This does NOT hold for the text_content
+            # branch below: decoding multi-byte UTF-8 (CJK, emoji, ...)
+            # produces FEWER characters than input bytes, so a byte-count
+            # check there would reject files that would have fit -- that
+            # branch instead falls through to the exact len(result) check.
+            if len(base64_content) > max_output_length:
+                return _error(
+                    f"{file_path!r} is too large to return inline "
+                    f"({len(content)} bytes downloaded, limit is "
+                    f"{max_output_length} characters)"
+                )
         result = _success(
             file_path=file_path,
             text_content=text_content,
@@ -763,7 +820,9 @@ def sharepoint_upload_file(
     try:
         local_path = _resolve_upload_file_path(local_file_path)
         resolved_remote_path = remote_path.strip() or local_path.name
-        content_path = _drive_content_path(site_id, resolved_remote_path, drive_id)
+        content_path = _drive_content_path(
+            site_id, resolved_remote_path, drive_id, field_name="remote_path"
+        )
         resolved_mime_type = mime_type.strip() or _guess_mime_type(resolved_remote_path)
         if resolved_mime_type is None:
             resolved_mime_type = (
@@ -795,6 +854,13 @@ def sharepoint_upload_file(
                     "sharepoint_upload_file currently supports"
                 )
             content = fh.read(_SIMPLE_UPLOAD_MAX_BYTES + 1)
+        if not content:
+            # A concurrent truncation of the file between the fstat() size
+            # check above and this read() would otherwise fall through
+            # (content == b"" is not > _SIMPLE_UPLOAD_MAX_BYTES) and PUT an
+            # empty body to SharePoint instead of raising -- matches
+            # onedrive.py's identical re-check for the same race.
+            raise ValueError(f"File is empty: {local_file_path}")
         if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
             raise RuntimeError("the local file grew during upload")
 
@@ -836,7 +902,7 @@ def sharepoint_list_lists(site_id: str, top: int = 50) -> str:
             {"$top": capped_top},
             limit=capped_top,
         )
-        return _success(lists=lists, truncated=truncated)
+        return _success_with_capped_list("lists", lists, truncated=truncated)
     except Exception as e:
         logger.error("Error listing SharePoint lists for site %s: %s", site_id, e)
         return _error(str(e))
@@ -854,7 +920,7 @@ def sharepoint_list_list_items(site_id: str, list_id: str, top: int = 50) -> str
             {"$top": capped_top, "$expand": "fields"},
             limit=capped_top,
         )
-        return _success(items=items, truncated=truncated)
+        return _success_with_capped_list("items", items, truncated=truncated)
     except Exception as e:
         logger.error(
             "Error listing SharePoint list items for site %s list %s: %s",

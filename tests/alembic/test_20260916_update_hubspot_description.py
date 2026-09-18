@@ -1,0 +1,333 @@
+"""Tests for updating the HubSpot connector's description."""
+
+import importlib.util
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+import sqlalchemy as sa
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
+from sqlalchemy import create_engine, text
+
+
+def _load_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260916_update_hubspot_description.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "update_hubspot_description_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_previous_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260914_add_hubspot_deals_write_scope.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_hubspot_deals_write_scope_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _operations(connection):
+    return Operations(MigrationContext.configure(connection))
+
+
+def _create_table(
+    connection, description: str | None, with_description_column: bool = True
+):
+    description_column = "description TEXT," if with_description_column else ""
+    connection.execute(
+        text(
+            f"""
+            CREATE TABLE public_mcp_apps (
+                id INTEGER PRIMARY KEY,
+                app_id VARCHAR(100) NOT NULL UNIQUE,
+                {description_column}
+                oauth_scopes JSON
+            )
+            """
+        )
+    )
+    description_col = ", description" if with_description_column else ""
+    description_val = ", :description" if with_description_column else ""
+    connection.execute(
+        text(
+            f"INSERT INTO public_mcp_apps (app_id{description_col}) "
+            f"VALUES ('hubspot'{description_val})"
+        ),
+        {"description": description},
+    )
+
+
+def _description(connection):
+    return connection.execute(
+        text("SELECT description FROM public_mcp_apps WHERE app_id='hubspot'")
+    ).scalar()
+
+
+def test_upgrade_updates_description(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert _description(connection) == migration.CURRENT_DESCRIPTION
+
+
+def test_upgrade_is_idempotent(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.upgrade()
+        assert _description(connection) == migration.CURRENT_DESCRIPTION
+
+
+def test_downgrade_restores_previous_description(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert _description(connection) == migration.PREVIOUS_DESCRIPTION
+
+
+def test_upgrade_downgrade_upgrade_round_trip(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+            migration.upgrade()
+        assert _description(connection) == migration.CURRENT_DESCRIPTION
+
+
+def test_upgrade_preserves_admin_customized_description(tmp_path):
+    """description is not in _BUILTIN_PROTECTED_FIELDS (admin_mcp.py), so an
+    operator can have edited it via the admin PATCH endpoint. The migration
+    must not clobber a value that no longer matches the last-known default.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description="Our internal CRM connector")
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert _description(connection) == "Our internal CRM connector"
+
+
+def test_upgrade_preserves_null_description(tmp_path):
+    """NULL is not the previous seeded default, so the migration must not
+    guess whether it represents an intentional customization or damaged data.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=None)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert _description(connection) is None
+
+
+def test_downgrade_preserves_admin_customized_description(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            connection.execute(
+                text(
+                    "UPDATE public_mcp_apps SET description = :d "
+                    "WHERE app_id = 'hubspot'"
+                ),
+                {"d": "Our internal CRM connector"},
+            )
+            migration.downgrade()
+        assert _description(connection) == "Our internal CRM connector"
+
+
+def test_upgrade_without_description_column_is_a_noop(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(
+            connection,
+            description=migration.PREVIOUS_DESCRIPTION,
+            with_description_column=False,
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise when description is missing
+        # The column genuinely doesn't exist -- confirms the no-op above
+        # actually exercised the missing-column guard, not a coincidence.
+        columns = {
+            c["name"] for c in sa.inspect(connection).get_columns("public_mcp_apps")
+        }
+        assert "description" not in columns
+
+
+def test_upgrade_without_app_id_column_is_a_noop(tmp_path):
+    """_columns_present requires BOTH app_id and description; only the
+    description-missing half was covered above."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    description TEXT
+                )
+                """
+            )
+        )
+        connection.execute(
+            text("INSERT INTO public_mcp_apps (description) VALUES (:d)"),
+            {"d": migration.PREVIOUS_DESCRIPTION},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise when app_id is missing
+        description = connection.execute(
+            text("SELECT description FROM public_mcp_apps")
+        ).scalar()
+        assert description == migration.PREVIOUS_DESCRIPTION
+
+
+def test_upgrade_without_table_is_a_noop(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise when the table doesn't exist
+        tables = set(sa.inspect(connection).get_table_names())
+        assert "public_mcp_apps" not in tables
+
+
+def test_upgrade_without_matching_row_is_a_noop(tmp_path):
+    """A different app_id in the table must be untouched, and no matching
+    row is not a customization to protect -- it's simply nothing to do."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    description TEXT,
+                    oauth_scopes JSON
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, description) "
+                "VALUES ('google-drive', 'unrelated')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        description = connection.execute(
+            text("SELECT description FROM public_mcp_apps WHERE app_id='google-drive'")
+        ).scalar()
+        assert description == "unrelated"
+
+
+def test_migration_fields_match_registry():
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    migration = _load_migration_module()
+    registry_row = next(
+        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "hubspot"
+    )
+    assert registry_row["description"] == migration.CURRENT_DESCRIPTION
+
+
+def test_previous_description_chains_from_the_prior_migration():
+    """This migration's PREVIOUS_DESCRIPTION must exactly equal 20260914's
+    CURRENT_DESCRIPTION - not just "close enough" - or the two migrations'
+    downgrade() calls stop being inverses of each other. This exact coupling
+    already broke once for the analogous 20260810/20260914 pair (see that
+    migration's own test_previous_fields_chain_from_the_prior_migration): a
+    historical migration's CURRENT_DESCRIPTION got bumped forward to match
+    the live registry, which desynced it from a later migration's
+    PREVIOUS_DESCRIPTION and broke the sequential downgrade chain. This test
+    pins the invariant directly instead of relying on it only showing up as
+    a full-chain downgrade failure.
+    """
+    migration = _load_migration_module()
+    previous_migration = _load_previous_migration_module()
+    assert migration.PREVIOUS_DESCRIPTION == previous_migration.CURRENT_DESCRIPTION
+
+
+def test_sequential_downgrade_from_head_restores_a_consistent_pre_0914_row():
+    """Downgrading head (this migration, then 20260914) must land on
+    20260914's PREVIOUS_DESCRIPTION *and* PREVIOUS_SCOPES together - a
+    consistent pre-deals-write snapshot - not a description from one
+    migration paired with scopes left over from another. A stale
+    CURRENT_DESCRIPTION on either migration would leave a description that
+    still claims deal-write capability after 20260914.downgrade() has
+    already revoked the crm.objects.deals.write scope.
+    """
+    migration = _load_migration_module()
+    previous_migration = _load_previous_migration_module()
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    description TEXT,
+                    oauth_scopes JSON
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, oauth_scopes, description) "
+                "VALUES ('hubspot', :scopes, :description)"
+            ),
+            {
+                "scopes": json.dumps(previous_migration.PREVIOUS_SCOPES),
+                "description": previous_migration.PREVIOUS_DESCRIPTION,
+            },
+        )
+        ops = _operations(connection)
+        with patch.object(previous_migration, "op", ops):
+            previous_migration.upgrade()
+        with patch.object(migration, "op", ops):
+            migration.upgrade()
+            migration.downgrade()
+        with patch.object(previous_migration, "op", ops):
+            previous_migration.downgrade()
+
+        row = connection.execute(
+            text("SELECT description, oauth_scopes FROM public_mcp_apps")
+        ).one()
+        description, scopes = row[0], json.loads(row[1])
+        assert description == previous_migration.PREVIOUS_DESCRIPTION
+        assert scopes == previous_migration.PREVIOUS_SCOPES

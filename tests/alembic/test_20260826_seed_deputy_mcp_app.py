@@ -231,6 +231,53 @@ def test_downgrade_preserves_app_row_admin_edited_beyond_structural_fields(tmp_p
         assert "deputy" in _app_ids(connection)
 
 
+def test_downgrade_preserves_app_row_admin_edited_description_only(tmp_path):
+    """An admin who PATCHed *only* description (still freely PATCHable
+    today, like is_visible_in_connector) must not have that edit silently
+    discarded by downgrade either -- description is checked separately from
+    _row_matches_seeded_shape's other columns (see downgrade()'s comment),
+    and that separate check must still catch a genuine customization, not
+    just a stand-in for "always matches"."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        connection.execute(
+            text(
+                "UPDATE public_mcp_apps SET description = 'Our internal HR connector'"
+                " WHERE app_id = 'deputy'"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert "deputy" in _app_ids(connection)
+
+
+def test_downgrade_removes_row_with_original_pre_backfill_description(tmp_path):
+    """A row whose description is still the *original* pre-write-tools text
+    (the state after 20260916_update_deputy_description.py's own downgrade
+    reverts it, in a full downgrade chain) must still be recognized as
+    "not customized" and removed -- not just a row with the *current*
+    text. See test_full_upgrade_downgrade_chain_with_description_migration_removes_row
+    for the same scenario exercised through both migrations together; this
+    isolates it to 20260826 alone."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        connection.execute(
+            text("UPDATE public_mcp_apps SET description = :d WHERE app_id = 'deputy'"),
+            {"d": migration._ORIGINAL_DEPUTY_DESCRIPTION},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert "deputy" not in _app_ids(connection)
+
+
 def test_downgrade_preserves_admin_created_deputy_provider(tmp_path):
     """A pre-existing admin-created "deputy" provider (different shape than
     the seeded row) must survive downgrade even when no deputy apps
@@ -279,6 +326,91 @@ def test_downgrade_preserves_provider_row_admin_edited_beyond_structural_fields(
             migration.downgrade()
         assert "deputy" not in _app_ids(connection)
         assert "deputy" in _provider_names(connection)
+
+
+def test_original_description_constant_matches_backfill_migration():
+    """`_ORIGINAL_DEPUTY_DESCRIPTION` here and
+    20260916_update_deputy_description.py's `PREVIOUS_DESCRIPTION` are the
+    same historical text, hardcoded twice because migrations are
+    self-contained (not importing each other). Nothing else ties them
+    together, so a future edit to one without the other would silently
+    turn downgrade()'s description guard into a permanent no-op for
+    already-migrated rows -- this is that tripwire."""
+    description_migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260916_update_deputy_description.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "update_deputy_description_migration_for_constant_check",
+        description_migration_file,
+    )
+    description_migration = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(description_migration)
+
+    migration = _load_migration_module()
+
+    assert (
+        migration._ORIGINAL_DEPUTY_DESCRIPTION
+        == description_migration.PREVIOUS_DESCRIPTION
+    )
+
+
+def test_full_upgrade_downgrade_chain_with_description_migration_removes_row(
+    tmp_path,
+):
+    """Regression test for a full `alembic upgrade head` followed by a full
+    downgrade past this migration, with 20260916_update_deputy_description.py
+    in between (as it is on the real revision chain).
+
+    20260916's own downgrade() runs *before* this migration's downgrade()
+    (later migrations unwind first), reverting the row's description back
+    to the pre-write-tools text. If this migration's downgrade() guard
+    still compared "description" against _deputy_app_row()'s *current*
+    text, that comparison would never match at that point, and the delete
+    would be silently skipped -- orphaning the public_mcp_apps/
+    oauth_providers rows instead of removing them. See PR #2449 review.
+    """
+    description_migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260916_update_deputy_description.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "update_deputy_description_migration", description_migration_file
+    )
+    description_migration = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(description_migration)
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        ops = _operations(connection)
+        with (
+            patch.object(migration, "op", ops),
+            patch.object(description_migration, "op", ops),
+        ):
+            migration.upgrade()
+            description_migration.upgrade()
+            description_migration.downgrade()
+
+            # Confirms the actual mechanism this test guards against, not
+            # just the final outcome: at this point description_migration's
+            # own downgrade() must have already reverted the row's
+            # description back to the pre-write-tools text -- this is the
+            # exact state migration.downgrade()'s guard has to recognize
+            # as "not customized" (via _ORIGINAL_DEPUTY_DESCRIPTION) for
+            # the final assertions below to mean what they claim.
+            description = connection.execute(
+                text("SELECT description FROM public_mcp_apps WHERE app_id='deputy'")
+            ).scalar()
+            assert description == migration._ORIGINAL_DEPUTY_DESCRIPTION
+
+            migration.downgrade()
+
+        assert "deputy" not in _app_ids(connection)
+        assert "deputy" not in _provider_names(connection)
 
 
 def test_upgrade_and_downgrade_no_op_without_tables(tmp_path):

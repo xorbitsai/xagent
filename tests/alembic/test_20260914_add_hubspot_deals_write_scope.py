@@ -327,6 +327,13 @@ def test_downgrade_does_not_touch_user_oauth(tmp_path):
 
 
 def test_migration_fields_match_registry():
+    """This migration's CURRENT_DESCRIPTION is a historical snapshot, not the
+    app's final value - 20260916_update_hubspot_description layers another
+    description update on top of it, so the live description is no longer
+    this migration's CURRENT_DESCRIPTION but 20260916's (see that migration's
+    own test_migration_fields_match_registry for the exact-match check).
+    CURRENT_SCOPES has no such follow-up migration, so it still holds
+    exactly."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration_module()
@@ -334,7 +341,6 @@ def test_migration_fields_match_registry():
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "hubspot"
     )
     assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]
-    assert migration.CURRENT_DESCRIPTION == registry_row["description"]
 
 
 def test_previous_fields_chain_from_the_prior_migration():

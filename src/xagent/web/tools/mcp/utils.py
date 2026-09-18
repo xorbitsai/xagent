@@ -260,8 +260,17 @@ def success_with_capped_dict(
 
     if len(response) > max_output_length:
         compact_data: dict[str, Any] = {}
-        if isinstance(data.get("id"), (str, int, float, bool)):
-            compact_data["id"] = data["id"]
+        # Checked in this order, first match wins: different connectors'
+        # APIs spell their identity field differently (Salesforce/HubSpot:
+        # "id"; Deputy: "Id"; MYOB: "Uid") -- without checking the
+        # capitalized variants too, a record that's otherwise unrecoverable
+        # after truncation would lose even its id just because the field
+        # isn't spelled exactly "id", leaving a caller with no way to look
+        # the record back up.
+        for id_key in ("id", "Id", "ID", "Uid", "UID"):
+            if isinstance(data.get(id_key), (str, int, float, bool)):
+                compact_data[id_key] = data[id_key]
+                break
         candidates = (
             _build(compact_data, True, with_extras=False),
             _build({}, True, with_extras=False),
@@ -461,10 +470,9 @@ def attendees_were_given(attendees: list[str] | str | None) -> bool:
     """Whether `attendees` was actually provided by the caller for an
     update, treating an empty string the same as not-provided at all -
     matching every other optional field's truthy convention here (and the
-    create path's own check) - rather than as "clear every attendee".
-    An explicit empty list is still considered supplied, even though the
-    current additive attendee API treats it as a no-op rather than removing
-    existing attendees."""
+    create path's own check). An explicit empty list is still considered
+    supplied; the caller decides whether that means clearing attendees or an
+    additive no-op."""
     return attendees is not None and attendees != ""
 
 
@@ -473,11 +481,11 @@ def attendees_to_add(
 ) -> list[str]:
     """The newly-added addresses from an update's `attendees` argument,
     normalized and deduped, that aren't already in
-    `existing_attendee_emails` - what actually needs writing when
-    `attendees` only ever adds attendees and never removes any. Returns
-    [] for anything `attendees_were_given` treats as not-provided (None,
-    ""), matching its own convention, as well as for a caller-supplied
-    list/string that turns out to name only people already on the event.
+    `existing_attendee_emails`. This is also useful for a replacement API that
+    checks newly added and retained attendees separately. Returns [] for
+    anything `attendees_were_given` treats as not-provided (None, ""), matching
+    its own convention, as well as for a caller-supplied list/string that turns
+    out to name only people already on the event.
     """
     if not attendees_were_given(attendees):
         return []

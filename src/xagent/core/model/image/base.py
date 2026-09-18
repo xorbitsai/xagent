@@ -56,6 +56,18 @@ class BaseImageModel(ABC):
         """
         pass
 
+    @property
+    def supports_transparent_background(self) -> bool:
+        """Whether the provider can return an image with an alpha channel.
+
+        False by default, because most providers only emit flat RGB: gemini,
+        dashscope, and xinference have no way to express transparency at all.
+        Asking one of those for a transparent background can only produce an
+        opaque image, so callers refuse the request rather than returning a
+        result that quietly is not what was asked for.
+        """
+        return False
+
     def has_ability(self, ability: str) -> bool:
         """
         Check if this image model implementation supports a specific ability.

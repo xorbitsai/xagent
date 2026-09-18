@@ -6,8 +6,12 @@ from datetime import timezone
 from typing import Any, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, aliased, selectinload
+from sqlalchemy.sql import ColumnElement, visitors
+from sqlalchemy.sql.elements import ColumnClause, TextClause
+from sqlalchemy.types import Boolean
 
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
@@ -17,6 +21,11 @@ from ..models.task import Task, TraceEvent
 from ..models.trigger import AgentTrigger, TriggerRun
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services.conversation_log_sources import (
+    EXTERNAL_TASK_SOURCE,
+    get_external_task_public_context,
+    get_external_task_source_branches,
+)
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -26,6 +35,7 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
+from ..services.task_runtime import MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY
 from ..utils.db_timezone import format_datetime_for_api
 
 logger = logging.getLogger(__name__)
@@ -57,7 +67,19 @@ DIRECT_SOURCE_TO_UI_SOURCE = {
 TRIGGER_TYPE_TO_UI_SOURCE = {
     "webhook": SOURCE_WEBHOOK,
 }
-EXTERNAL_TASK_SOURCES = {*DIRECT_SOURCE_TO_UI_SOURCE, "trigger"}
+# ``external`` is stamped by the deployment layer's session transport and
+# covers both REST/SDK and widget-session tasks; the deployment classifies it
+# through ``services.conversation_log_sources`` and unclassified rows default
+# to REST API so they are never dropped from the page.
+EXTERNAL_DEFAULT_UI_SOURCE = SOURCE_REST_API
+# Webhook is excluded: its detail view expects a TriggerRun, which external
+# rows never have.
+EXTERNAL_HOOK_UI_SOURCES = {SOURCE_WIDGET, SOURCE_REST_API, SOURCE_SHARED_LINK}
+EXTERNAL_TASK_SOURCES = {
+    *DIRECT_SOURCE_TO_UI_SOURCE,
+    "trigger",
+    EXTERNAL_TASK_SOURCE,
+}
 
 
 def _status_value(task: Task) -> str:
@@ -99,8 +121,198 @@ def _ui_source_from_values(source: str, trigger_type: str | None) -> str | None:
     return None
 
 
+def _validated_external_source_branches(
+    db: Session,
+) -> list[tuple[ColumnElement[bool], str]]:
+    """Deployment ``(predicate, ui_source)`` pairs, in the order the hook returns them.
+
+    Two-tier fail-soft, matching the hook contract in
+    ``services.conversation_log_sources``: a hook that raises is treated as
+    unregistered, and an entry that is not a ``(boolean SQL predicate over
+    tasks, known ui_source)`` pair is skipped on its own so the
+    deployment's other branches still apply. Rows that only a skipped branch
+    would have matched fall back to the REST API default instead of the page
+    going down.
+    """
+    try:
+        entries = get_external_task_source_branches(db)
+    except Exception as exc:
+        logger.exception("External task source hook failed; using default")
+        _rollback_after_hook_failure(db, exc)
+        return []
+    branches: list[tuple[ColumnElement[bool], str]] = []
+    for entry in entries:
+        try:
+            branch = _validated_source_branch(entry)
+        except Exception as exc:
+            _rollback_after_hook_failure(db, exc)
+            # Hook-supplied objects run their own code inside the checks
+            # (``__clause_element__``, SQL compilation); a failure there is a
+            # malformed entry, not a page outage.
+            logger.warning(
+                "Ignoring external task source branch %r: validation raised",
+                entry,
+                exc_info=True,
+            )
+            continue
+        if branch is not None:
+            branches.append(branch)
+    return branches
+
+
+def _validated_source_branch(entry: Any) -> tuple[ColumnElement[bool], str] | None:
+    """Return ``entry`` as a validated branch, or ``None`` after logging why not."""
+    if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
+        logger.warning(
+            "Ignoring malformed external task source branch %r: expected a "
+            "(predicate, ui_source) pair",
+            entry,
+        )
+        return None
+    predicate, ui_source = entry
+    # ORM attributes such as ``Task.is_visible`` are InstrumentedAttribute
+    # proxies, not ColumnElements; unwrap them so bare columns are judged by
+    # their SQL type like any other expression.
+    clause_element = getattr(predicate, "__clause_element__", None)
+    if callable(clause_element):
+        predicate = clause_element()
+    if not isinstance(predicate, ColumnElement):
+        logger.warning(
+            "Ignoring external task source branch: predicate %r is not a "
+            "SQL expression",
+            predicate,
+        )
+        return None
+    raw_sql = _raw_sql_fragments(predicate)
+    if raw_sql:
+        # text() and literal_column() declare no FROM entries, so the check
+        # below cannot see the tables they name; they fail at execute time
+        # instead ("missing FROM-clause entry" on PostgreSQL).
+        logger.warning(
+            "Ignoring external task source branch: predicate %s embeds raw SQL "
+            "%s; build predicates from Task columns and bound parameters",
+            predicate,
+            ", ".join(repr(fragment) for fragment in raw_sql),
+        )
+        return None
+    if not isinstance(predicate.type, Boolean):
+        # SQLite coerces a non-boolean CASE condition; PostgreSQL raises
+        # "argument of CASE/WHEN must be type boolean" at execute time.
+        logger.warning(
+            "Ignoring external task source branch: predicate %s is not "
+            "boolean-typed (wrap functions with type_=Boolean or cast(Boolean))",
+            predicate,
+        )
+        return None
+    foreign_froms = _foreign_from_names(predicate)
+    if foreign_froms:
+        # A bare cross-table comparison (or a Task alias) adds that FROM entry
+        # to both the list query and the detail query and cartesian-joins
+        # them; other tables must be reached through exists() or in_(subquery).
+        logger.warning(
+            "Ignoring external task source branch: predicate %s adds %s to "
+            "FROM; only the tasks table may appear",
+            predicate,
+            ", ".join(foreign_froms),
+        )
+        return None
+    if not isinstance(ui_source, str) or ui_source not in EXTERNAL_HOOK_UI_SOURCES:
+        logger.warning(
+            "Ignoring external task source branch with unsupported ui_source %r",
+            ui_source,
+        )
+        return None
+    return predicate, ui_source
+
+
+def _rollback_after_hook_failure(db: Session, exc: BaseException) -> None:
+    """Restore the request session after a deployment hook failed on it.
+
+    A hook statement that errors leaves the PostgreSQL transaction aborted,
+    so every later statement in the request would be refused and the
+    fail-soft default could never be rendered. Both endpoints are read-only
+    GETs and call their hooks before any write, so nothing durable is
+    discarded (same reasoning as ``connector_team_scope``'s hook seam). A
+    failure that never reached the database leaves the transaction usable,
+    so only SQLAlchemy errors roll back; this keeps the identity map warm
+    for the rest of the request.
+    """
+    if not isinstance(exc, SQLAlchemyError):
+        return
+    try:
+        db.rollback()
+    except Exception:
+        logger.warning(
+            "Rolling back after a failed external task hook failed", exc_info=True
+        )
+
+
+def _raw_sql_fragments(predicate: ColumnElement[bool]) -> list[str]:
+    """Raw SQL embedded in ``predicate``: ``text()`` and table-less columns.
+
+    ``literal_column()`` and ``column()`` both produce a ``ColumnClause`` bound
+    to no table, so they contribute no FROM entries and name whatever they
+    like. ``exists()`` renders its projection as ``literal_column("*")``; that
+    one literal is structural and allowed.
+    """
+    fragments: list[str] = []
+    for element in visitors.iterate(predicate):
+        if isinstance(element, TextClause):
+            fragments.append(element.text)
+        elif (
+            isinstance(element, ColumnClause)
+            and element.table is None
+            and element.name != "*"
+        ):
+            fragments.append(str(element.name))
+    return fragments
+
+
+def _foreign_from_names(predicate: ColumnElement[bool]) -> list[str]:
+    """Names of FROM entries other than the ``tasks`` table that ``predicate`` adds.
+
+    Correlated ``exists()`` contributes no FROM entries and ``in_(subquery)``
+    contributes only ``tasks``; a bare ``Task.x == Other.y`` contributes both,
+    and an ``aliased(Task)`` contributes a second ``tasks`` alias.
+    """
+    return [
+        str(getattr(source, "description", None) or source)
+        for source in select(predicate).get_final_froms()
+        if source is not Task.__table__
+    ]
+
+
+def _external_ui_source_case(
+    branches: Sequence[tuple[ColumnElement[bool], str]],
+) -> Any:
+    """Classification of a ``source="external"`` row; shared by list and detail.
+
+    Returns the plain default when no branch is registered: ``case()`` needs
+    at least one WHEN arm, and a bare bound parameter is what the existing
+    arms already use.
+    """
+    if not branches:
+        return EXTERNAL_DEFAULT_UI_SOURCE
+    return case(*branches, else_=EXTERNAL_DEFAULT_UI_SOURCE)
+
+
+def _external_ui_source_for_task(db: Session, task: Task) -> str:
+    branches = _validated_external_source_branches(db)
+    if not branches:
+        return EXTERNAL_DEFAULT_UI_SOURCE
+    ui_source = (
+        db.query(_external_ui_source_case(branches))
+        .select_from(Task)
+        .filter(Task.id == int(task.id))
+        .scalar()
+    )
+    return str(ui_source or EXTERNAL_DEFAULT_UI_SOURCE)
+
+
 def _ui_source_for_task(db: Session, task: Task) -> str | None:
-    source = str(getattr(task, "source", "") or "")
+    source = str(task.source or "")
+    if source == EXTERNAL_TASK_SOURCE:
+        return _external_ui_source_for_task(db, task)
     return _ui_source_from_values(source, _trigger_type_for_task(db, task))
 
 
@@ -117,6 +329,14 @@ def _apply_external_task_scope(query: Any, user: User) -> Any:
     query = query.filter(
         Task.is_visible.is_(False),
         Task.source.in_(sorted(EXTERNAL_TASK_SOURCES)),
+        # MCP actor/OAuth-negotiation turns are stored as hidden external
+        # tasks too (``channel_runtime`` selects them by this key). They are
+        # channel plumbing, not conversations, so keep them off this page as
+        # they were before ``external`` entered the scope. NULL IS NOT TRUE
+        # holds, so rows without the key are unaffected.
+        Task.agent_config[MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY]
+        .as_boolean()
+        .isnot(True),
     )
     if not bool(user.is_admin):
         query = query.filter(Task.user_id == int(user.id))
@@ -187,6 +407,10 @@ def _conversation_source_query(
             )
             for trigger_type_value, ui_source in TRIGGER_TYPE_TO_UI_SOURCE.items()
         ],
+        (
+            Task.source == EXTERNAL_TASK_SOURCE,
+            _external_ui_source_case(_validated_external_source_branches(db)),
+        ),
         else_=None,
     ).label("ui_source")
 
@@ -399,7 +623,18 @@ def _serialize_trigger_metadata(
     }
 
 
-def _serialize_public_context(task: Task, ui_source: str) -> dict[str, Any] | None:
+def _serialize_public_context(
+    db: Session, task: Task, ui_source: str
+) -> dict[str, Any] | None:
+    if str(task.source or "") == EXTERNAL_TASK_SOURCE:
+        # The session transport does not populate agent_config with widget or
+        # share details, so external rows carry only deployment-provided context.
+        try:
+            return get_external_task_public_context(db, task, ui_source)
+        except Exception as exc:
+            logger.exception("External task context hook failed; omitting context")
+            _rollback_after_hook_failure(db, exc)
+            return None
     config = _agent_config(task)
     if ui_source == SOURCE_WIDGET:
         return {
@@ -594,7 +829,7 @@ async def get_conversation_log_detail(
                 "description": task.description,
             },
             "trigger": _serialize_trigger_metadata(db, task),
-            "public_context": _serialize_public_context(task, ui_source),
+            "public_context": _serialize_public_context(db, task, ui_source),
         },
         "read_only": True,
     }

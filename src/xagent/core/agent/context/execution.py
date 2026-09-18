@@ -29,7 +29,7 @@ from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
 )
-from ..grounding import VALUE_KINDS
+from ..grounding import VALUE_KINDS, step_intent_not_fact_rule
 from ..language import (
     effective_output_language,
     render_dag_step_language_reference,
@@ -900,7 +900,8 @@ class ExecutionContext:
                 f"- Current step dependencies: {dag_dependencies}\n"
                 f"- Suggested tools for this step: {suggested_tools}\n\n"
                 "Only execute the current DAG step. Detailed step boundary rules are "
-                "provided in the latest DAG step instruction message.\n\n"
+                "provided in the latest DAG step instruction message.\n"
+                f"{step_intent_not_fact_rule(compact=True)}\n\n"
                 f"{language_harness}"
             )
         memory_context = self.metadata.get(MEMORY_CONTEXT_METADATA_KEY)

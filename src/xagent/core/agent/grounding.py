@@ -183,3 +183,58 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         "report the gap instead."
         f"{tool_argument_rule}"
     )
+
+
+def step_intent_not_fact_rule(*, compact: bool = False) -> str:
+    """Return the rule that a DAG step's declared intent is not a fact source.
+
+    Args:
+        compact: ``True`` for the form rendered at the end of the step's
+            system-context scope block, ``False`` for the standalone section of
+            the step instruction message. Both forms must carry the same rule
+            over the same four fields; only the surrounding prompt shape differs.
+            The compact form names the instruction message explicitly because
+            that block renders only the title and description itself.
+    """
+    if compact:
+        return (
+            "The step title and description above, and the termination condition "
+            "and completion evidence in the DAG step instruction message, declare "
+            "the work to perform, not "
+            "facts about the result. If they presuppose a fact, conclusion, or "
+            "solution that this step's tool results and dependency results do not "
+            "support, those results decide and the presupposed content must not "
+            "reach your answer; report the gap the way your own agent instructions "
+            "direct and treat that report as this step done. Facts the user gave in "
+            "their own messages stay usable as given."
+        )
+    return (
+        "STEP INTENT IS NOT A SOURCE OF FACTS\n"
+        "The step title, description, termination condition, and completion "
+        "evidence declare the work to perform and the shape of the result to "
+        "report. They are not a source of facts about that result's content. "
+        "Where they read as if some fact, "
+        "finding, conclusion, recommendation, or workaround were already known, "
+        "that is an expectation of what this step may establish, not something "
+        "it has established.\n"
+        "If they presuppose a fact, conclusion, or solution that this step's "
+        "tool results and dependency results do not support, or that those "
+        "results contradict, the tool results and dependency results decide and "
+        "the presupposed content must not reach your answer. This applies only "
+        "to facts that were supposed to come from tool results or dependency "
+        "results. Facts the user gave in their own messages, including ones the "
+        "plan copied out of a user message, remain usable exactly as given, and "
+        "this rule does not restrict how you word them. It restricts the facts "
+        "asserted inside content this step asks you to compose, not your choice "
+        "of wording for that content.\n"
+        "When the information this step needs turns out to be unavailable, or a "
+        "dependency result does not support this step's premise, report that gap "
+        "the way your own agent instructions tell you to report it, and treat "
+        "that report as satisfying this termination condition: it is a complete "
+        "and correct result for this step. Do not restate the presupposed "
+        "content to fill the gap, and do not retry or stall trying to make the "
+        "presupposition true. Do not answer emptily or evasively either: a "
+        "description that lays out conditional branches is still valid "
+        "instruction, so follow the branch the actual results support and report "
+        "every part of this step those results do support."
+    )

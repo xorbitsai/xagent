@@ -117,6 +117,40 @@ def test_require_int_rejects_bool():
         powerpoint._require_int(True, "slide_index")
 
 
+def _make_placeholder(idx: int, has_text_frame: bool) -> Mock:
+    placeholder = Mock()
+    placeholder.placeholder_format.idx = idx
+    placeholder.has_text_frame = has_text_frame
+    return placeholder
+
+
+def test_select_body_placeholder_skips_title():
+    title = _make_placeholder(0, has_text_frame=True)
+    body = _make_placeholder(1, has_text_frame=True)
+    slide = Mock()
+    slide.placeholders = [title, body]
+    assert powerpoint._select_body_placeholder(slide) is body
+
+
+def test_select_body_placeholder_skips_non_text_placeholder():
+    """A picture/chart placeholder can sit at a lower idx than the real
+    text placeholder -- this must not stop at it and give up."""
+    title = _make_placeholder(0, has_text_frame=True)
+    picture = _make_placeholder(1, has_text_frame=False)
+    body = _make_placeholder(2, has_text_frame=True)
+    slide = Mock()
+    slide.placeholders = [title, picture, body]
+    assert powerpoint._select_body_placeholder(slide) is body
+
+
+def test_select_body_placeholder_returns_none_when_no_match():
+    title = _make_placeholder(0, has_text_frame=True)
+    picture = _make_placeholder(1, has_text_frame=False)
+    slide = Mock()
+    slide.placeholders = [title, picture]
+    assert powerpoint._select_body_placeholder(slide) is None
+
+
 def test_delete_slide_removes_correct_slide():
     presentation = Presentation()
     for title in ("A", "B", "C"):

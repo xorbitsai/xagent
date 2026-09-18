@@ -301,6 +301,27 @@ def _shape_text(shape: Any) -> str | None:
     return shape.text_frame.text if shape.has_text_frame else None
 
 
+def _select_body_placeholder(slide: Any) -> Any | None:
+    """Find the first non-title placeholder on slide that can hold text.
+
+    A placeholder's idx alone doesn't guarantee it has a text frame -- a
+    picture, chart, or other content placeholder can sit at a lower idx
+    than a real text placeholder (verified: python-pptx's own
+    SlidePlaceholders iterates in idx order, with no guarantee idx order
+    matches "text placeholders first"), so this skips non-text
+    placeholders entirely rather than stopping at the first non-title one
+    regardless of whether it can actually hold text.
+    """
+    return next(
+        (
+            ph
+            for ph in slide.placeholders
+            if ph.placeholder_format.idx != 0 and ph.has_text_frame
+        ),
+        None,
+    )
+
+
 def _require_int(value: Any, field_name: str) -> int:
     """Validate an integer-typed tool argument.
 
@@ -549,14 +570,13 @@ def powerpoint_add_slide(
     use powerpoint_list_slide_layouts to see what this presentation
     actually has, since layouts vary by template). title, if given, is set
     on the layout's title placeholder when present. body_text, if given, is
-    set on the layout's first non-title placeholder (by idx order) that has
-    a text frame -- for a common content layout that's the body, but for
-    e.g. a "Title Slide" layout it's actually the subtitle, and for a layout
-    whose first non-title placeholder is a picture/chart placeholder with no
-    text frame, body_text is silently left unset even though a later
-    placeholder on the same slide might have held it. Use
-    powerpoint_get_slide_text after adding the slide to confirm where each
-    piece of text actually landed."""
+    set on the first non-title placeholder (by idx order) that has a text
+    frame -- a non-text placeholder earlier in idx order (e.g. a picture or
+    chart placeholder) is skipped rather than causing body_text to be left
+    unset. This is still a heuristic, not a guaranteed "body" role: on a
+    "Title Slide" layout, for example, that placeholder is actually the
+    subtitle. Use powerpoint_get_slide_text after adding the slide to
+    confirm where each piece of text actually landed."""
     try:
         layout_index = _require_int(layout_index, "layout_index")
         presentation = _download_presentation(file_path, site_id, drive_id)
@@ -570,11 +590,8 @@ def powerpoint_add_slide(
         if title is not None and slide.shapes.title is not None:
             slide.shapes.title.text = title
         if body_text is not None:
-            body_placeholder = next(
-                (ph for ph in slide.placeholders if ph.placeholder_format.idx != 0),
-                None,
-            )
-            if body_placeholder is not None and body_placeholder.has_text_frame:
+            body_placeholder = _select_body_placeholder(slide)
+            if body_placeholder is not None:
                 body_placeholder.text_frame.text = body_text
         item = _upload_presentation(presentation, file_path, site_id, drive_id)
         return _success(item=item, slide_index=len(presentation.slides) - 1)

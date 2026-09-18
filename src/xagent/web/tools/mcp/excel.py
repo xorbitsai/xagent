@@ -19,7 +19,7 @@ mcp = FastMCP("excel-mcp")
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
 
-_VALID_CLEAR_APPLY_TO = {"All", "Formats", "Contents"}
+_VALID_CLEAR_APPLY_TO = frozenset({"All", "Formats", "Contents"})
 
 
 class _GraphRequestError(RuntimeError):
@@ -120,6 +120,8 @@ def _normalize_relative_path(path: str) -> str:
     "Report.xlsx." could silently resolve to a real, different
     "Report.xlsx" workbook than the caller intended to address.
     """
+    if not isinstance(path, str):
+        raise TypeError("file_path must be a string")
     value = path.strip().strip("/")
     if not value:
         raise ValueError("file_path is required")
@@ -152,6 +154,8 @@ def _odata_key_segment(collection: str, value: str) -> str:
 def _odata_string_literal(value: str) -> str:
     """Escape and percent-encode a string for use inside a Graph OData
     function call argument, e.g. range(address='...')."""
+    if not isinstance(value, str):
+        raise TypeError("value must be a string")
     escaped = value.replace("'", "''")
     return quote(escaped, safe="")
 
@@ -187,6 +191,8 @@ def _parse_values_json(values_json: str) -> list:
     numbers, booleans, and nulls that an MCP tool schema can't usefully
     constrain further.
     """
+    if not isinstance(values_json, str):
+        raise TypeError("values_json must be a string")
     try:
         parsed = json.loads(values_json)
     except json.JSONDecodeError as exc:
@@ -473,6 +479,8 @@ def excel_delete_table_row(
 ) -> str:
     """Delete a row from an Excel table by its zero-based row index."""
     try:
+        if not isinstance(row_index, int) or isinstance(row_index, bool):
+            raise TypeError("row_index must be an integer")
         if row_index < 0:
             raise ValueError("row_index must be zero or a positive integer")
         base = _workbook_base(file_path, site_id, drive_id)

@@ -177,6 +177,42 @@ def test_create_presentation_rejects_when_session_creation_conflicts(monkeypatch
     assert mock_request.call_args.kwargs["url"].endswith("createUploadSession")
 
 
+def test_create_presentation_upload_failure_does_not_leak_session_url(monkeypatch):
+    """The upload-session URL is a pre-authenticated bearer secret (a token
+    in its own query string) -- a failed upload must never let that URL
+    reach the caller through the error message, whether the failure comes
+    from raise_for_status() or a lower-level connection/timeout error."""
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({}, status_code=500, url=secret_url))
+    monkeypatch.setattr(powerpoint.requests, "put", mock_put)
+
+    result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptx"))
+
+    assert result["status"] == "error"
+    assert "super-secret-value" not in result["message"]
+    assert secret_url not in result["message"]
+
+
+def test_create_presentation_upload_connection_error_does_not_leak_session_url(
+    monkeypatch,
+):
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    mock_put = Mock(
+        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
+    )
+    monkeypatch.setattr(powerpoint.requests, "put", mock_put)
+
+    result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptx"))
+
+    assert result["status"] == "error"
+    assert "super-secret-value" not in result["message"]
+    assert secret_url not in result["message"]
+
+
 def test_create_presentation_uploads_blank_presentation(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse({"uploadUrl": "https://upload.example/session"})

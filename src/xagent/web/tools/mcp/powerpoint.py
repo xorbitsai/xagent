@@ -258,25 +258,37 @@ def _create_only_upload(
     # query string) -- Graph's createUploadSession docs warn that including
     # an Authorization header on this PUT can cause a 401 -- so this goes
     # through a plain requests.put, not _graph_request (which always
-    # attaches one).
-    response = requests.put(
-        upload_url,
-        data=content,
-        headers={
-            "Content-Range": f"bytes 0-{len(content) - 1}/{len(content)}",
-            "Content-Type": _POWERPOINT_MIME_TYPE,
-        },
-        timeout=_BINARY_TIMEOUT_SECONDS,
-    )
+    # attaches one). Because the URL itself is a bearer secret, neither
+    # requests.put's own exception (a connection failure or timeout) nor the
+    # HTTPError from raise_for_status() is ever stringified into a message
+    # here: both embed the full request URL in their default str(), which
+    # would otherwise leak the token through this function's caller --
+    # matching onedrive.py's identical guard on the same hazard for its own
+    # upload-session code.
     try:
+        response = requests.put(
+            upload_url,
+            data=content,
+            headers={
+                "Content-Range": f"bytes 0-{len(content) - 1}/{len(content)}",
+                "Content-Type": _POWERPOINT_MIME_TYPE,
+            },
+            timeout=_BINARY_TIMEOUT_SECONDS,
+        )
         response.raise_for_status()
     except requests.HTTPError as exc:
-        if response.status_code == 409:
+        status_code = response.status_code
+        if status_code == 409:
             raise ValueError(
                 f"{file_path!r} already exists; use the other powerpoint_* "
                 "tools to edit it instead of recreating it"
             ) from exc
-        raise _GraphRequestError(str(exc), status_code=response.status_code) from exc
+        raise _GraphRequestError(
+            f"PowerPoint presentation upload failed with HTTP {status_code}",
+            status_code=status_code,
+        ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError("PowerPoint presentation upload failed") from exc
     result = response.json()
     if not isinstance(result, dict) or not result.get("id"):
         raise RuntimeError("Graph did not confirm the presentation upload completed")

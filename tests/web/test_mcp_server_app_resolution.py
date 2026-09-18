@@ -299,10 +299,48 @@ class TestTheChangedCallers:
         user, server_id = self._connected_id_named_app(db)
         server = db.query(MCPServer).filter(MCPServer.id == server_id).one()
 
-        app_id, provider, connected_account = _enrich_oauth_server_info(
-            db, server, {"acme-mail": "someone@acme.example"}
+        app_id, provider, connected_account, connection_status = (
+            _enrich_oauth_server_info(
+                db, server, {"acme-mail": ("someone@acme.example", "connected")}
+            )
         )
 
         assert app_id == "acme-mail"
         assert provider == "prov-acme-mail"
         assert connected_account == "someone@acme.example"
+        assert connection_status == "connected"
+
+    def test_listing_flags_a_cleared_token_as_needing_reconnect(self, db):
+        """A grant row that survives with an empty/absent token (e.g. a scope
+        migration that force-invalidates every existing grant, as
+        ``20260914_add_hubspot_deals_write_scope`` does for HubSpot) must not
+        be reported the same as a healthy connection -- the listing endpoint
+        used to say "connected" from row presence alone, while every actual
+        tool call failed on the empty token underneath it."""
+        from xagent.web.api.mcp import get_mcp_servers
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user, server_id = self._connected_id_named_app(db)
+        db.query(UserOAuth).filter(UserOAuth.user_id == user.id).update(
+            {"access_token": "", "refresh_token": None}
+        )
+        db.commit()
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "needs_reconnect"
+        assert response.connected_account == "someone@acme.example"
+
+    def test_listing_reports_a_healthy_grant_as_connected(self, db):
+        """The counterpart to the cleared-token case above: an untouched,
+        freshly-authorized grant still reports "connected"."""
+        from xagent.web.api.mcp import get_mcp_servers
+
+        user, server_id = self._connected_id_named_app(db)
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "connected"
+        assert response.connected_account == "someone@acme.example"

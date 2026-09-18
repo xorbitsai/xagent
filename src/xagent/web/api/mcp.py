@@ -225,6 +225,7 @@ class MCPServerResponse(BaseModel):
     connected_account: Optional[str] = None
     app_id: Optional[str] = None
     provider: Optional[str] = None
+    connection_status: Optional[Literal["connected", "needs_reconnect"]] = None
 
     class Config:
         from_attributes = True
@@ -2075,6 +2076,7 @@ def _db_server_to_response(
     app_id: Optional[str] = None,
     provider: Optional[str] = None,
     is_admin: bool = False,
+    connection_status: Optional[str] = None,
 ) -> MCPServerResponse:
     """Convert database MCPServer to response model."""
     # Get status from manager if available
@@ -2114,6 +2116,7 @@ def _db_server_to_response(
         connected_account=connected_account,
         app_id=app_id,
         provider=provider,
+        connection_status=connection_status,
     )
 
 
@@ -2149,32 +2152,62 @@ def _custom_api_to_mcp_response(
     )
 
 
-def _enrich_oauth_server_info(
-    db: Session, server: MCPServer, oauth_emails: dict
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _oauth_account_summaries(db: Session, user_id: int) -> dict[str, tuple[str, str]]:
+    """Per-provider ``(email, connection_status)`` for the user's OAuth grants.
+
+    ``connection_status`` is "connected" when the stored grant has a usable
+    token and "needs_reconnect" when a grant row exists but its token was
+    cleared or expired (e.g. a scope-migration invalidation, or a refresh
+    that started failing) -- distinct from never having connected at all,
+    which simply has no entry here. Actor credentials are not personal
+    server connections, so this only looks at the user's own scope.
     """
-    Return (app_id, provider, connected_account) for an OAuth-based MCPServer.
-    This encapsulates the logic of looking up app information in O(1) time.
+    oauth_accounts = list_scoped_user_oauth_accounts(
+        db,
+        user_id=user_id,
+        resource_owner_key=None,
+    )
+    summaries: dict[str, tuple[str, str]] = {}
+    for oauth in oauth_accounts:
+        if not oauth.email:
+            continue
+        summaries[str(oauth.provider)] = (
+            str(oauth.email),
+            "connected" if _oauth_account_can_connect(oauth) else "needs_reconnect",
+        )
+    return summaries
+
+
+def _enrich_oauth_server_info(
+    db: Session, server: MCPServer, oauth_accounts: dict[str, tuple[str, str]]
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Return (app_id, provider, connected_account, connection_status) for an
+    OAuth-based MCPServer. This encapsulates the logic of looking up app
+    information in O(1) time. ``oauth_accounts`` maps provider/app keys to
+    ``(email, connection_status)``, as built by ``_oauth_account_summaries``.
     """
     if server.transport != "oauth":
-        return None, None, None
+        return None, None, None, None
 
     # Stable identity, not the mutable display name: an id-named row (the
     # catalog-connect convention) resolved to nothing here, so its app_id,
     # provider and connected account were all reported as absent.
     app_info = get_app_for_mcp_server(db, server)
     if not app_info:
-        return None, None, None
+        return None, None, None, None
 
     provider = app_info.get("provider")
     app_id = app_info.get("id")
-    connected_account = None
+    connected_account: Optional[str] = None
+    connection_status: Optional[str] = None
     for key in restrict_to_app_scoped_oauth_grant(app_id, [app_id, provider]):
-        connected_account = oauth_emails.get(key)
-        if connected_account:
+        summary = oauth_accounts.get(key)
+        if summary:
+            connected_account, connection_status = summary
             break
 
-    return app_id, provider, connected_account
+    return app_id, provider, connected_account, connection_status
 
 
 def _app_lookup_keys(*values: object) -> list[str]:
@@ -3096,23 +3129,13 @@ def get_mcp_servers(
             .all()
         )
 
-        # Actor credentials are not personal server connections.
-        oauth_accounts = list_scoped_user_oauth_accounts(
-            db,
-            user_id=effective_user_id,
-            resource_owner_key=None,
-        )
-        oauth_emails = {
-            str(oauth.provider): str(oauth.email)
-            for oauth in oauth_accounts
-            if oauth.email and _oauth_account_can_connect(oauth)
-        }
+        oauth_account_summaries = _oauth_account_summaries(db, effective_user_id)
 
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
-            app_id, provider, connected_account = _enrich_oauth_server_info(
-                db, server, oauth_emails
+            app_id, provider, connected_account, connection_status = (
+                _enrich_oauth_server_info(db, server, oauth_account_summaries)
             )
             responses.append(
                 _db_server_to_response(
@@ -3123,6 +3146,7 @@ def get_mcp_servers(
                     app_id,
                     provider,
                     is_admin=is_admin,
+                    connection_status=connection_status,
                 )
             )
 
@@ -3149,8 +3173,8 @@ def get_mcp_servers(
             for server in (
                 db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
             ):
-                app_id, provider, connected_account = _enrich_oauth_server_info(
-                    db, server, oauth_emails
+                app_id, provider, connected_account, connection_status = (
+                    _enrich_oauth_server_info(db, server, oauth_account_summaries)
                 )
                 responses.append(
                     _db_server_to_response(
@@ -3161,6 +3185,7 @@ def get_mcp_servers(
                         app_id,
                         provider,
                         is_admin=is_admin,
+                        connection_status=connection_status,
                     )
                 )
 
@@ -3212,20 +3237,9 @@ def get_mcp_server(
 
         user_mcp, server = result
 
-        # Actor credentials are not personal server connections.
-        oauth_accounts = list_scoped_user_oauth_accounts(
-            db,
-            user_id=int(user_id),
-            resource_owner_key=None,
-        )
-        oauth_emails = {
-            oauth.provider: oauth.email
-            for oauth in oauth_accounts
-            if oauth.email and _oauth_account_can_connect(oauth)
-        }
-
-        app_id, provider, connected_account = _enrich_oauth_server_info(
-            db, server, oauth_emails
+        oauth_account_summaries = _oauth_account_summaries(db, int(user_id))
+        app_id, provider, connected_account, connection_status = (
+            _enrich_oauth_server_info(db, server, oauth_account_summaries)
         )
 
         return _db_server_to_response(
@@ -3236,6 +3250,7 @@ def get_mcp_server(
             app_id,
             provider,
             is_admin=getattr(current_user, "is_admin", False),
+            connection_status=connection_status,
         )
 
     except HTTPException:

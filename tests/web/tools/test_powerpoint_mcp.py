@@ -247,6 +247,38 @@ def test_create_presentation_upload_connection_error_does_not_leak_session_url(
     assert secret_url not in result["message"]
 
 
+def test_create_only_upload_does_not_chain_secret_bearing_exception(monkeypatch):
+    """raise ... from exc would still attach the original, URL-bearing
+    exception as __cause__ even though the raised message itself is
+    sanitized -- a future traceback/log/APM capture could surface it.
+    from None must be used instead, matching onedrive.py's precedent."""
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({}, status_code=500, url=secret_url))
+    monkeypatch.setattr(powerpoint.requests, "put", mock_put)
+
+    with pytest.raises(powerpoint._GraphRequestError) as exc_info:
+        powerpoint._create_only_upload(b"content", "Deck.pptx", None, None)
+
+    assert exc_info.value.__cause__ is None
+
+
+def test_create_only_upload_connection_error_does_not_chain_exception(monkeypatch):
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    mock_put = Mock(
+        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
+    )
+    monkeypatch.setattr(powerpoint.requests, "put", mock_put)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        powerpoint._create_only_upload(b"content", "Deck.pptx", None, None)
+
+    assert exc_info.value.__cause__ is None
+
+
 def test_create_presentation_uploads_blank_presentation(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse({"uploadUrl": "https://upload.example/session"})

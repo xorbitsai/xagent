@@ -2236,10 +2236,9 @@ def _enrich_oauth_server_info(
         if not summary:
             continue
         email, status = summary
-        if connection_status is None:
+        if connection_status is None or status == "connected":
             connected_account, connection_status = email, status
         if status == "connected":
-            connected_account, connection_status = email, status
             break
 
     return app_id, provider, connected_account, connection_status

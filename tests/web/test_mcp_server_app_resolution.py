@@ -301,7 +301,7 @@ class TestTheChangedCallers:
 
         app_id, provider, connected_account, connection_status = (
             _enrich_oauth_server_info(
-                db, server, {"acme-mail": ("someone@acme.example", "connected")}
+                db, server, {"acme-mail": ("someone@acme.example", "connected", 1)}
             )
         )
 
@@ -364,16 +364,21 @@ class TestTheChangedCallers:
         assert response.connection_status == "connected"
         assert response.connected_account is None
 
-    def test_listing_prefers_a_healthy_grant_over_a_broken_one_at_a_different_key(
+    def test_listing_prefers_the_newer_grant_across_the_app_id_and_provider_keys(
         self, db
     ):
         """``app_id`` and ``provider`` are two independent lookup keys -- an
         app-scoped connect and a bare-provider connect leave separate
         ``UserOAuth`` rows (see auth.py's OAuth callback, which deletes only
-        the row matching the key it connected under). A broken grant under
-        the first key checked must not shadow a working grant under the
-        second: the id-named row here ("acme-mail") is broken, but a second,
-        healthy row exists under the bare provider key ("prov-acme-mail")."""
+        the row matching the key it connected under). The runtime token
+        resolver (``config.py``) pools both keys with
+        ``provider.in_([app_id, provider])`` and picks the single
+        most-recently-created row across both -- this listing must pick the
+        same one, not "whichever key happens to look healthier": the
+        id-named row here ("acme-mail") is older and broken; a newer,
+        healthy row exists under the bare provider key ("prov-acme-mail")
+        and must win because it is newer (the case where the newer row is
+        the *broken* one, and must still win, is pinned separately below)."""
         from xagent.web.api.mcp import get_mcp_servers
         from xagent.web.models.user_oauth import UserOAuth
 
@@ -397,14 +402,16 @@ class TestTheChangedCallers:
         assert response.connection_status == "connected"
         assert response.connected_account == "fallback@acme.example"
 
-    def test_summaries_do_not_let_a_newer_broken_row_shadow_an_older_healthy_one(
-        self, db
-    ):
-        """``(user_id, provider, provider_user_id)`` is unique, not
-        ``(user_id, provider)`` -- two rows for the same provider string
-        are not a schema violation. Accounts are read in id order, so a
-        naive last-write-wins dict build would let a newer, broken
-        duplicate silently overwrite an older, healthy row's entry."""
+    def test_summaries_pick_the_newest_row_even_when_it_is_broken(self, db):
+        """The runtime token resolver always selects the single
+        most-recently-created ``UserOAuth`` row for a provider
+        (``config.py``'s ``.filter(UserOAuth.provider.in_(...)).order_by(
+        UserOAuth.id.desc()).first()``), with no fallback to an older,
+        healthier row. This summary must pick the same row runtime would,
+        not whichever is healthiest -- reporting "connected" for an account
+        runtime will never actually select is worse than the bug this PR
+        exists to fix: a tool call would still fail with
+        ``oauth_token_required`` despite the API saying it's fine."""
         from xagent.web.api.mcp import _oauth_account_summaries
         from xagent.web.models.user import User
         from xagent.web.models.user_oauth import UserOAuth
@@ -436,4 +443,5 @@ class TestTheChangedCallers:
 
         summaries = _oauth_account_summaries(db, int(user.id))
 
-        assert summaries["hubspot"] == ("first@acme.example", "connected")
+        email, status, _account_id = summaries["hubspot"]
+        assert (email, status) == ("second@acme.example", "needs_reconnect")

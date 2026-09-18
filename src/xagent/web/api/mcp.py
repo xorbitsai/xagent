@@ -2154,8 +2154,9 @@ def _custom_api_to_mcp_response(
 
 def _oauth_account_summaries(
     db: Session, user_id: int
-) -> dict[str, tuple[Optional[str], str]]:
-    """Per-provider ``(email, connection_status)`` for the user's OAuth grants.
+) -> dict[str, tuple[Optional[str], str, int]]:
+    """Per-provider ``(email, connection_status, account_id)`` for the user's
+    OAuth grants.
 
     ``connection_status`` is "connected" when the stored grant has a usable
     token and "needs_reconnect" when a grant row exists but its token was
@@ -2173,43 +2174,46 @@ def _oauth_account_summaries(
 
     ``(user_id, provider, provider_user_id)`` is unique, not
     ``(user_id, provider)`` -- two rows for the same provider are not a
-    schema violation (a reconnect deletes the old row by provider before
-    inserting the new one, but that's a write-path convention this reader
-    can't assume held for every row already on disk, e.g. an older grant
-    from before that convention existed). Accounts arrive in id order, so a
-    naive last-write-wins overwrite would let a newer *broken* row shadow
-    an older *healthy* one for the same provider. A "connected" entry is
-    therefore sticky: once found, only another "connected" row can replace
-    it, never a "needs_reconnect" one.
+    schema violation, and the runtime token resolver
+    (``config.py``'s ``.filter(UserOAuth.provider.in_(...)).order_by(
+    UserOAuth.id.desc()).first()``) always uses the single most-recently
+    -created row for a provider, never falling back to an older row even
+    if it is the only usable one. This map must pick the same row runtime
+    would, or the API can claim "connected" for an account runtime will
+    never actually select -- ``account_id`` is kept so a caller checking
+    more than one candidate provider key for one app (an app-scoped and a
+    bare-provider connect are independent rows) can pool them the same way
+    runtime's ``provider.in_(...)`` does and take the overall newest.
     """
     oauth_accounts = list_scoped_user_oauth_accounts(
         db,
         user_id=user_id,
         resource_owner_key=None,
     )
-    summaries: dict[str, tuple[Optional[str], str]] = {}
+    summaries: dict[str, tuple[Optional[str], str, int]] = {}
     for oauth in oauth_accounts:
         provider = str(oauth.provider)
+        account_id = int(oauth.id)
+        existing = summaries.get(provider)
+        if existing is not None and existing[2] >= account_id:
+            continue
         email = str(oauth.email) if oauth.email else None
         status = "connected" if _oauth_account_can_connect(oauth) else "needs_reconnect"
-        existing = summaries.get(provider)
-        if (
-            existing is None
-            or status == "connected"
-            or existing[1] == "needs_reconnect"
-        ):
-            summaries[provider] = (email, status)
+        summaries[provider] = (email, status, account_id)
     return summaries
 
 
 def _enrich_oauth_server_info(
-    db: Session, server: MCPServer, oauth_accounts: dict[str, tuple[Optional[str], str]]
+    db: Session,
+    server: MCPServer,
+    oauth_accounts: dict[str, tuple[Optional[str], str, int]],
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
     Return (app_id, provider, connected_account, connection_status) for an
     OAuth-based MCPServer. This encapsulates the logic of looking up app
     information in O(1) time. ``oauth_accounts`` maps provider/app keys to
-    ``(email, connection_status)``, as built by ``_oauth_account_summaries``.
+    ``(email, connection_status, account_id)``, as built by
+    ``_oauth_account_summaries``.
     """
     if server.transport != "oauth":
         return None, None, None, None
@@ -2225,21 +2229,25 @@ def _enrich_oauth_server_info(
     app_id = app_info.get("id")
     connected_account: Optional[str] = None
     connection_status: Optional[str] = None
+    best_account_id = -1
     # app_id and provider are two independent lookup keys (an app-scoped
     # connect and a bare-provider connect leave separate UserOAuth rows --
-    # see auth.py's OAuth callback), so a usable grant under the *second*
-    # key must still win over an unusable one already found under the
-    # first: keep scanning past a "needs_reconnect" hit in case a later
-    # key is actually connected, and only stop early once one is.
+    # see auth.py's OAuth callback): pool whichever of the two has rows and
+    # take the overall newest by id, exactly mirroring the runtime token
+    # resolver's own `provider.in_([app_id, provider]).order_by(id.desc())`
+    # query -- never "whichever key is healthier," which can pick a row
+    # runtime would never select.
     for key in restrict_to_app_scoped_oauth_grant(app_id, [app_id, provider]):
         summary = oauth_accounts.get(key)
         if not summary:
             continue
-        email, status = summary
-        if connection_status is None or status == "connected":
-            connected_account, connection_status = email, status
-        if status == "connected":
-            break
+        email, status, account_id = summary
+        if account_id > best_account_id:
+            connected_account, connection_status, best_account_id = (
+                email,
+                status,
+                account_id,
+            )
 
     return app_id, provider, connected_account, connection_status
 

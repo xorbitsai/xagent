@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import mimetypes
@@ -40,10 +41,10 @@ _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"
 # media formats, not the exhaustive text-extension allowlist onedrive.py and
 # google_drive.py each carry -- a real file already on disk should go
 # through sharepoint_upload_file instead.
-_BINARY_ONLY_EXTENSIONS = {
+_BINARY_ONLY_EXTENSIONS = frozenset({
     ".docx", ".dotx", ".xlsx", ".xltx", ".xlsm", ".pptx", ".potx",
     ".pdf", ".zip", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-}  # fmt: skip
+})  # fmt: skip
 
 _MIME_TYPE_OVERRIDES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -211,8 +212,6 @@ def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
     try:
         return content.decode("utf-8"), None
     except UnicodeDecodeError:
-        import base64
-
         return None, base64.b64encode(content).decode("ascii")
 
 

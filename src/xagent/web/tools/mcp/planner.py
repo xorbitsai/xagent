@@ -143,6 +143,28 @@ def _etag_guarded_write(
     )
 
 
+def _resolve_list_path(default_path: str, next_link: str | None) -> str:
+    """Resolve a list tool's request path: the default first-page path, or
+    a caller-supplied next_link to continue a previous page.
+
+    next_link must be validated as actually pointing at Graph before being
+    reused as a request path -- accepting an arbitrary caller-supplied URL
+    here and handing it to _graph_request would let a forged next_link
+    redirect this server-side, bearer-token-carrying request to a
+    different host (Graph's own @odata.nextLink is always same-origin with
+    GRAPH_BASE_URL, so requiring that exact prefix accepts every
+    legitimate value while rejecting a forged one).
+    """
+    if next_link is None:
+        return default_path
+    if not isinstance(next_link, str) or not next_link.startswith(f"{GRAPH_BASE_URL}/"):
+        raise ValueError(
+            "next_link must be a @odata.nextLink value returned by a previous "
+            "call to this tool"
+        )
+    return next_link[len(GRAPH_BASE_URL) :]
+
+
 def _build_assignments(user_ids: list[str] | None) -> dict[str, Any] | None:
     if not user_ids:
         return None
@@ -156,12 +178,16 @@ def _build_assignments(user_ids: list[str] | None) -> dict[str, Any] | None:
 
 
 @mcp.tool()
-def planner_list_plans(group_id: str) -> str:
-    """List the Planner plans owned by a Microsoft 365 group."""
+def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
+    """List the Planner plans owned by a Microsoft 365 group.
+
+    next_link is optional -- pass the next_link value from a previous
+    response to fetch the next page instead of the first."""
     try:
-        result = _graph_request(
-            "GET", f"/groups/{url_path_id(group_id, 'group_id')}/planner/plans"
+        path = _resolve_list_path(
+            f"/groups/{url_path_id(group_id, 'group_id')}/planner/plans", next_link
         )
+        result = _graph_request("GET", path)
         return _success(
             plans=result.get("value", []), next_link=result.get("@odata.nextLink")
         )
@@ -207,12 +233,16 @@ def planner_create_plan(group_id: str, title: str) -> str:
 
 
 @mcp.tool()
-def planner_list_buckets(plan_id: str) -> str:
-    """List the buckets (task-board columns) in a Planner plan."""
+def planner_list_buckets(plan_id: str, next_link: str | None = None) -> str:
+    """List the buckets (task-board columns) in a Planner plan.
+
+    next_link is optional -- pass the next_link value from a previous
+    response to fetch the next page instead of the first."""
     try:
-        result = _graph_request(
-            "GET", f"/planner/plans/{url_path_id(plan_id, 'plan_id')}/buckets"
+        path = _resolve_list_path(
+            f"/planner/plans/{url_path_id(plan_id, 'plan_id')}/buckets", next_link
         )
+        result = _graph_request("GET", path)
         return _success(
             buckets=result.get("value", []), next_link=result.get("@odata.nextLink")
         )
@@ -237,12 +267,16 @@ def planner_create_bucket(plan_id: str, name: str) -> str:
 
 
 @mcp.tool()
-def planner_list_tasks(plan_id: str) -> str:
-    """List the tasks in a Planner plan."""
+def planner_list_tasks(plan_id: str, next_link: str | None = None) -> str:
+    """List the tasks in a Planner plan.
+
+    next_link is optional -- pass the next_link value from a previous
+    response to fetch the next page instead of the first."""
     try:
-        result = _graph_request(
-            "GET", f"/planner/plans/{url_path_id(plan_id, 'plan_id')}/tasks"
+        path = _resolve_list_path(
+            f"/planner/plans/{url_path_id(plan_id, 'plan_id')}/tasks", next_link
         )
+        result = _graph_request("GET", path)
         return _success(
             tasks=result.get("value", []), next_link=result.get("@odata.nextLink")
         )
@@ -252,10 +286,14 @@ def planner_list_tasks(plan_id: str) -> str:
 
 
 @mcp.tool()
-def planner_list_my_tasks() -> str:
-    """List the Planner tasks assigned to the signed-in user, across all plans."""
+def planner_list_my_tasks(next_link: str | None = None) -> str:
+    """List the Planner tasks assigned to the signed-in user, across all plans.
+
+    next_link is optional -- pass the next_link value from a previous
+    response to fetch the next page instead of the first."""
     try:
-        result = _graph_request("GET", "/me/planner/tasks")
+        path = _resolve_list_path("/me/planner/tasks", next_link)
+        result = _graph_request("GET", path)
         return _success(
             tasks=result.get("value", []), next_link=result.get("@odata.nextLink")
         )

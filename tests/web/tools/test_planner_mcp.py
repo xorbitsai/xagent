@@ -101,15 +101,43 @@ def test_build_assignments_shape():
     }
 
 
+def test_resolve_list_path_defaults_when_no_next_link():
+    assert planner._resolve_list_path("/planner/plans/plan-1/tasks", None) == (
+        "/planner/plans/plan-1/tasks"
+    )
+
+
+def test_resolve_list_path_strips_graph_base_url():
+    next_link = f"{planner.GRAPH_BASE_URL}/planner/plans/plan-1/tasks?%24skip=50"
+    assert planner._resolve_list_path("/default", next_link) == (
+        "/planner/plans/plan-1/tasks?%24skip=50"
+    )
+
+
+def test_resolve_list_path_rejects_foreign_url():
+    """A next_link that doesn't point at Graph must be rejected outright --
+    passing it through to _graph_request would let a forged next_link
+    redirect this bearer-token-carrying request to an attacker-controlled
+    host (SSRF)."""
+    with pytest.raises(ValueError, match="next_link"):
+        planner._resolve_list_path("/default", "https://evil.example/steal-token")
+
+
+def test_resolve_list_path_rejects_non_string():
+    with pytest.raises(ValueError, match="next_link"):
+        planner._resolve_list_path("/default", 12345)  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # plans
 # ---------------------------------------------------------------------------
 
 
 def test_list_plans_success(monkeypatch):
+    next_link = f"{planner.GRAPH_BASE_URL}/groups/group-1/planner/plans?%24skip=50"
     mock_request = Mock(
         return_value=MockResponse(
-            {"value": [{"id": "plan-1"}], "@odata.nextLink": "https://next"}
+            {"value": [{"id": "plan-1"}], "@odata.nextLink": next_link}
         )
     )
     monkeypatch.setattr(planner.requests, "request", mock_request)
@@ -118,10 +146,36 @@ def test_list_plans_success(monkeypatch):
 
     assert result["status"] == "success"
     assert result["plans"] == [{"id": "plan-1"}]
-    assert result["next_link"] == "https://next"
+    assert result["next_link"] == next_link
     assert mock_request.call_args.kwargs["url"].endswith(
         "/groups/group-1/planner/plans"
     )
+
+
+def test_list_plans_fetches_next_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "plan-2"}]}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/groups/group-1/planner/plans?%24skip=50"
+
+    result = json.loads(planner.planner_list_plans("group-1", next_link=next_link))
+
+    assert result["status"] == "success"
+    assert result["plans"] == [{"id": "plan-2"}]
+    assert mock_request.call_args.kwargs["url"] == next_link
+
+
+def test_list_plans_rejects_forged_next_link(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(
+        planner.planner_list_plans(
+            "group-1", next_link="https://evil.example/steal-token"
+        )
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_create_plan_builds_container_url(monkeypatch):
@@ -159,6 +213,30 @@ def test_create_plan_strips_title_whitespace(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_list_buckets_success(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "bucket-1"}]}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_list_buckets("plan-1"))
+
+    assert result["status"] == "success"
+    assert result["buckets"] == [{"id": "bucket-1"}]
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/planner/plans/plan-1/buckets"
+    )
+
+
+def test_list_buckets_fetches_next_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "bucket-2"}]}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/planner/plans/plan-1/buckets?%24skip=50"
+
+    result = json.loads(planner.planner_list_buckets("plan-1", next_link=next_link))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"] == next_link
+
+
 def test_create_bucket_uses_default_order_hint(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"id": "bucket-1"}))
     monkeypatch.setattr(planner.requests, "request", mock_request)
@@ -176,6 +254,50 @@ def test_create_bucket_uses_default_order_hint(monkeypatch):
 # ---------------------------------------------------------------------------
 # tasks
 # ---------------------------------------------------------------------------
+
+
+def test_list_tasks_success(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "task-1"}]}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_list_tasks("plan-1"))
+
+    assert result["status"] == "success"
+    assert result["tasks"] == [{"id": "task-1"}]
+    assert mock_request.call_args.kwargs["url"].endswith("/planner/plans/plan-1/tasks")
+
+
+def test_list_tasks_fetches_next_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "task-2"}]}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/planner/plans/plan-1/tasks?%24skip=50"
+
+    result = json.loads(planner.planner_list_tasks("plan-1", next_link=next_link))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"] == next_link
+
+
+def test_list_my_tasks_success(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "task-1"}]}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_list_my_tasks())
+
+    assert result["status"] == "success"
+    assert result["tasks"] == [{"id": "task-1"}]
+    assert mock_request.call_args.kwargs["url"].endswith("/me/planner/tasks")
+
+
+def test_list_my_tasks_fetches_next_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "task-2"}]}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/me/planner/tasks?%24skip=50"
+
+    result = json.loads(planner.planner_list_my_tasks(next_link=next_link))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"] == next_link
 
 
 def test_create_task_with_assignees_and_due_date(monkeypatch):

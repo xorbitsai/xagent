@@ -108,8 +108,9 @@ def test_resolve_list_path_defaults_when_no_next_link():
 
 
 def test_resolve_list_path_strips_graph_base_url():
-    next_link = f"{planner.GRAPH_BASE_URL}/planner/plans/plan-1/tasks?%24skip=50"
-    assert planner._resolve_list_path("/default", next_link) == (
+    default_path = "/planner/plans/plan-1/tasks"
+    next_link = f"{planner.GRAPH_BASE_URL}{default_path}?%24skip=50"
+    assert planner._resolve_list_path(default_path, next_link) == (
         "/planner/plans/plan-1/tasks?%24skip=50"
     )
 
@@ -126,6 +127,17 @@ def test_resolve_list_path_rejects_foreign_url():
 def test_resolve_list_path_rejects_non_string():
     with pytest.raises(ValueError, match="next_link"):
         planner._resolve_list_path("/default", 12345)  # type: ignore[arg-type]
+
+
+def test_resolve_list_path_rejects_mismatched_collection():
+    """Even a next_link that is a genuine graph.microsoft.com URL must be
+    rejected if it points at a different collection than the tool's own
+    default_path -- otherwise a forged next_link could redirect a call to
+    e.g. planner_list_plans into fetching an unrelated resource such as
+    /me/messages using the same shared AUTH_TOKEN."""
+    other_collection = f"{planner.GRAPH_BASE_URL}/me/messages?%24skip=50"
+    with pytest.raises(ValueError, match="next_link"):
+        planner._resolve_list_path("/planner/plans/plan-1/tasks", other_collection)
 
 
 # ---------------------------------------------------------------------------

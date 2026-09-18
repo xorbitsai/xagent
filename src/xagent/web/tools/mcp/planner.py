@@ -147,13 +147,18 @@ def _resolve_list_path(default_path: str, next_link: str | None) -> str:
     """Resolve a list tool's request path: the default first-page path, or
     a caller-supplied next_link to continue a previous page.
 
-    next_link must be validated as actually pointing at Graph before being
-    reused as a request path -- accepting an arbitrary caller-supplied URL
-    here and handing it to _graph_request would let a forged next_link
-    redirect this server-side, bearer-token-carrying request to a
-    different host (Graph's own @odata.nextLink is always same-origin with
-    GRAPH_BASE_URL, so requiring that exact prefix accepts every
-    legitimate value while rejecting a forged one).
+    next_link must be validated as actually pointing at Graph, and at this
+    exact tool's own collection, before being reused as a request path.
+    Requiring the GRAPH_BASE_URL prefix alone would still let a forged
+    next_link redirect this server-side, bearer-token-carrying request to
+    an unrelated Graph endpoint (e.g. /me/messages) that this tool was
+    never meant to reach -- the AUTH_TOKEN is shared across every connected
+    Microsoft connector, so that redirection could expose data well beyond
+    this tool's own scope. A genuine @odata.nextLink always targets the
+    exact same collection as the request that produced it, differing only
+    in its query string ($skip/$skiptoken), so comparing the path portion
+    against default_path accepts every legitimate value while rejecting a
+    forged one.
     """
     if next_link is None:
         return default_path
@@ -162,7 +167,13 @@ def _resolve_list_path(default_path: str, next_link: str | None) -> str:
             "next_link must be a @odata.nextLink value returned by a previous "
             "call to this tool"
         )
-    return next_link[len(GRAPH_BASE_URL) :]
+    path = next_link[len(GRAPH_BASE_URL) :]
+    if path.split("?", 1)[0] != default_path:
+        raise ValueError(
+            "next_link must be a @odata.nextLink value returned by a previous "
+            "call to this tool"
+        )
+    return path
 
 
 def _build_assignments(user_ids: list[str] | None) -> dict[str, Any] | None:

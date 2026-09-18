@@ -396,3 +396,44 @@ class TestTheChangedCallers:
         assert response.id == server_id
         assert response.connection_status == "connected"
         assert response.connected_account == "fallback@acme.example"
+
+    def test_summaries_do_not_let_a_newer_broken_row_shadow_an_older_healthy_one(
+        self, db
+    ):
+        """``(user_id, provider, provider_user_id)`` is unique, not
+        ``(user_id, provider)`` -- two rows for the same provider string
+        are not a schema violation. Accounts are read in id order, so a
+        naive last-write-wins dict build would let a newer, broken
+        duplicate silently overwrite an older, healthy row's entry."""
+        from xagent.web.api.mcp import _oauth_account_summaries
+        from xagent.web.models.user import User
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user = User(username="dup-owner", password_hash="h", is_admin=False)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="hubspot",
+                provider_user_id="old-account",
+                access_token="live-token",
+                email="first@acme.example",
+            )
+        )
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="hubspot",
+                provider_user_id="new-account",
+                access_token="",
+                refresh_token=None,
+                email="second@acme.example",
+            )
+        )
+        db.commit()
+
+        summaries = _oauth_account_summaries(db, int(user.id))
+
+        assert summaries["hubspot"] == ("first@acme.example", "connected")

@@ -2170,6 +2170,17 @@ def _oauth_account_summaries(
     provider silently excluded here would report ``connection_status`` as
     absent (never connected) regardless of whether the grant is actually
     healthy or broken, which is worse than a tile with no account label.
+
+    ``(user_id, provider, provider_user_id)`` is unique, not
+    ``(user_id, provider)`` -- two rows for the same provider are not a
+    schema violation (a reconnect deletes the old row by provider before
+    inserting the new one, but that's a write-path convention this reader
+    can't assume held for every row already on disk, e.g. an older grant
+    from before that convention existed). Accounts arrive in id order, so a
+    naive last-write-wins overwrite would let a newer *broken* row shadow
+    an older *healthy* one for the same provider. A "connected" entry is
+    therefore sticky: once found, only another "connected" row can replace
+    it, never a "needs_reconnect" one.
     """
     oauth_accounts = list_scoped_user_oauth_accounts(
         db,
@@ -2178,10 +2189,16 @@ def _oauth_account_summaries(
     )
     summaries: dict[str, tuple[Optional[str], str]] = {}
     for oauth in oauth_accounts:
-        summaries[str(oauth.provider)] = (
-            str(oauth.email) if oauth.email else None,
-            "connected" if _oauth_account_can_connect(oauth) else "needs_reconnect",
-        )
+        provider = str(oauth.provider)
+        email = str(oauth.email) if oauth.email else None
+        status = "connected" if _oauth_account_can_connect(oauth) else "needs_reconnect"
+        existing = summaries.get(provider)
+        if (
+            existing is None
+            or status == "connected"
+            or existing[1] == "needs_reconnect"
+        ):
+            summaries[provider] = (email, status)
     return summaries
 
 

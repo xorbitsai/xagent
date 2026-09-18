@@ -499,11 +499,15 @@ def _summarize_issue_link(link: dict[str, Any]) -> dict[str, Any]:
     (and jira_get_issue below) is the only place a caller can learn an
     issue's dependencies at all.
     """
-    outward = link.get("outwardIssue")
-    linked = outward or link.get("inwardIssue") or {}
+    # Presence, not truthiness: Jira can send a present-but-redacted
+    # "outwardIssue": {} for a permission-restricted linked issue, which
+    # must still be reported as an outward link rather than silently
+    # falling through to inwardIssue.
+    is_outward = "outwardIssue" in link
+    linked = link.get("outwardIssue") if is_outward else link.get("inwardIssue")
     link_type = _as_dict(link.get("type"))
     return {
-        "relationship": link_type.get("outward" if outward else "inward"),
+        "relationship": link_type.get("outward" if is_outward else "inward"),
         **_summarize_mini_issue(_as_dict(linked)),
     }
 
@@ -619,11 +623,12 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
     unless named via extra_fields.
     issue_key: an issue key (e.g. "ENG-123") or its numeric id.
     extra_fields: optional comma-separated Jira field ids not in the
-    default set above -- standard (e.g. "duedate") or custom (e.g.
+    default set above -- standard (e.g. "votes") or custom (e.g.
     "customfield_10010", found via your Jira admin's field
     configuration). Returned as {field_id: raw_value} under
     extra_field_values in the result, so you can reach any field this
-    tool doesn't summarize by name.
+    tool doesn't summarize by name. A large text value here is still
+    subject to the same per-field cap as description.
     Use this, not jira_search_issues, when you need an issue's
     dependencies or full description: issue_links/subtasks/description
     are only returned here. A description longer than
@@ -649,13 +654,25 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
         issue = _summarize_full_issue(result)
         if requested_extra:
             raw_fields = _as_dict(result.get("fields"))
-            issue["extra_field_values"] = {
-                name: raw_fields.get(name) for name in requested_extra
-            }
+            extra_field_values: dict[str, Any] = {}
+            for name in requested_extra:
+                value = raw_fields.get(name)
+                # extra_fields is a caller-named escape hatch, so it can
+                # land on an unbounded raw field (e.g. a large ADF/wiki
+                # description-like custom field) that the summarizer
+                # never sized -- cap it the same way description/comment
+                # bodies are, instead of letting it bypass every other
+                # field's size guarantee.
+                if isinstance(value, str) and len(value) > _ISSUE_DESCRIPTION_MAX_CHARS:
+                    value = _truncate(value, _ISSUE_DESCRIPTION_MAX_CHARS)
+                extra_field_values[name] = value
+            issue["extra_field_values"] = extra_field_values
         description_truncated = _cap_text_field(
             issue, "description", _ISSUE_DESCRIPTION_MAX_CHARS
         )
-        response = _success(issue=issue, description_truncated=description_truncated)
+        response = _success(
+            issue=issue, description_truncated=description_truncated, truncated=False
+        )
         max_output_length = get_tool_max_output_length()
         if len(response) > max_output_length:
             # Capping the one known hot-spot field wasn't enough (e.g.
@@ -862,7 +879,8 @@ def _summarize_comment(comment: dict[str, Any]) -> dict[str, Any]:
     ladder once per comment and is a routine way jira_list_comments'
     output ran past the per-tool-output-string cap.
     """
-    visibility = _as_dict(comment.get("visibility"))
+    raw_visibility = comment.get("visibility")
+    visibility = _as_dict(raw_visibility)
     summarized = {
         "id": comment.get("id"),
         "author": _summarize_person(comment.get("author")),
@@ -870,10 +888,13 @@ def _summarize_comment(comment: dict[str, Any]) -> dict[str, Any]:
         # A comment can be restricted to a role/group; surfacing that
         # (rather than dropping it) matters because a caller relaying
         # comments elsewhere (e.g. into a customer-facing channel) needs
-        # to know a comment was never meant to be public.
+        # to know a comment was never meant to be public. Checked by
+        # presence, not truthiness: a present-but-empty {} visibility
+        # object must still be reported as restricted, not silently
+        # treated the same as "no visibility field at all".
         "visibility": (
             {"type": visibility.get("type"), "value": visibility.get("value")}
-            if visibility
+            if raw_visibility is not None
             else None
         ),
         "created": comment.get("created"),
@@ -912,13 +933,14 @@ def _fit_comments_page(
     body-capped by _summarize_comment) that fits max_output_length,
     trying every raw entry first and only shrinking if that overflows.
 
-    Returns None if not even a single comment fits (the caller should
-    treat that as a bounded error, the same way jira_search_issues does
-    when its minimal page still doesn't fit).
+    Returns None if not even an empty page (0 comments, pointing
+    next_start_at at the first one) fits -- the caller should treat
+    that as a bounded error, the same way jira_search_issues does when
+    its minimal page still doesn't fit.
 
-    next_start_at is computed from the RAW position immediately after
-    the last comment actually kept -- not from the filtered/kept count
-    -- so a caller resuming from it neither skips nor re-fetches a
+    next_start_at is computed from the RAW position of (or immediately
+    after) the last comment actually kept -- not from the filtered/kept
+    count -- so a caller resuming from it neither skips nor re-fetches a
     comment already accounted for here (same reasoning
     jira_list_projects/jira_search_users use for their own
     next_start_at, extended to also cover a size-triggered cut, not
@@ -931,23 +953,39 @@ def _fit_comments_page(
             kept.append(_summarize_comment(raw))
             raw_positions.append(index)
 
-    if not kept:
-        next_start_at = (offset + len(raw_comments)) if has_more_raw else None
-        response = _build_comments_response(kept, total, next_start_at)
-        return response if len(response) <= max_output_length else None
-
-    for count in range(len(kept), 0, -1):
+    def next_start_at_for(count: int) -> int | None:
         if count == len(kept):
             # Every raw comment on this page is accounted for -- the
             # existing "is there more beyond this raw page" signal is
             # exactly right, size aside.
-            next_start_at = (offset + len(raw_comments)) if has_more_raw else None
-        else:
-            next_start_at = offset + raw_positions[count - 1] + 1
-        response = _build_comments_response(kept[:count], total, next_start_at)
+            return (offset + len(raw_comments)) if has_more_raw else None
+        if count == 0:
+            # Nothing kept yet -- resume at the first comment this page
+            # actually has, rather than the "-1 + 1" arithmetic below,
+            # which has no count-1 to read when count is 0.
+            return offset + raw_positions[0]
+        return offset + raw_positions[count - 1] + 1
+
+    # Response length is monotonically non-decreasing in count: kept[:n]
+    # is a prefix of kept[:n+1], so every character the smaller page
+    # serializes to is also present in the larger page's serialization.
+    # That makes the largest fitting count findable by binary search
+    # instead of re-serializing the whole shrinking slice once per
+    # count -- O(log n) json.dumps calls instead of O(n) (each itself
+    # O(n)), matching the halving strategy utils.py's
+    # success_with_capped_dict already uses for the same kind of
+    # "shrink a list field until the response fits" problem.
+    lo, hi = 0, len(kept)
+    best: str | None = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        response = _build_comments_response(kept[:mid], total, next_start_at_for(mid))
         if len(response) <= max_output_length:
-            return response
-    return None
+            best = response
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 @mcp.tool()
@@ -996,8 +1034,7 @@ def jira_list_comments(
         if response is None:
             return _error(
                 "A Jira comments page exceeds the tool output limit even "
-                "with a single comment; fetch it individually or narrow "
-                "the request"
+                "when empty; fetch it individually or narrow the request"
             )
         return response
     except Exception as e:

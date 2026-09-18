@@ -1223,6 +1223,29 @@ def test_list_comments_returns_bounded_error_when_single_comment_too_big(monkeyp
     assert "output limit" in result["message"]
 
 
+def test_list_comments_returns_empty_page_when_only_one_comment_overflows(monkeypatch):
+    # When there's room for an empty page but not for the single
+    # comment on it, that's a valid bounded page (0 comments,
+    # next_start_at pointing right back at the comment left out) --
+    # not the hard error the too-small-for-even-that case above hits.
+    raw_comment = {"id": "1", "body": "x" * 50}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"comments": [raw_comment], "total": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    empty_page_size = len(jira._build_comments_response([], 1, 0))
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: empty_page_size + 5)
+
+    result = json.loads(jira.jira_list_comments("ENG-1"))
+
+    assert result["status"] == "success"
+    assert result["comments"] == []
+    assert result["next_start_at"] == 0
+
+
 def test_list_comments_next_start_at_counts_raw_page_not_filtered(monkeypatch):
     # Same reasoning as the equivalent jira_list_projects test: one
     # malformed (non-dict) entry alongside two real comments must not
@@ -1307,6 +1330,78 @@ def test_get_issue_fields_constant_value():
         "components,fixVersions,duedate,created,updated,"
         "issuelinks,subtasks"
     )
+
+
+def test_summarize_issue_link_reports_outward_for_empty_but_present_outward_issue():
+    # A permission-redacted linked issue can come back as a present but
+    # empty outwardIssue ({}) rather than an absent key. Truthiness on
+    # outwardIssue would treat that the same as "no outward issue at
+    # all" and silently fall through to inwardIssue, inverting the
+    # reported relationship direction.
+    link = {
+        "type": {"inward": "is blocked by", "outward": "blocks"},
+        "outwardIssue": {},
+    }
+    assert jira._summarize_issue_link(link) == {
+        "relationship": "blocks",
+        "issue_key": None,
+        "summary": None,
+        "status": None,
+    }
+
+
+def test_summarize_comment_reports_restricted_for_empty_but_present_visibility():
+    # Same presence-vs-truthiness bug class: a present-but-empty {}
+    # visibility object must still be reported as restricted, not
+    # collapsed into None (which this tool's docstring says means "not
+    # restricted").
+    summarized = jira._summarize_comment({"id": "1", "body": "x", "visibility": {}})
+    assert summarized["visibility"] == {"type": None, "value": None}
+
+
+def test_get_issue_caps_an_oversized_extra_field_value(monkeypatch):
+    long_value = "x" * (jira._ISSUE_DESCRIPTION_MAX_CHARS + 500)
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_10099": long_value},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_10099"))
+
+    value = result["issue"]["extra_field_values"]["customfield_10099"]
+    assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
+    assert value.endswith("[truncated]")
+
+
+def test_get_issue_response_always_has_a_truncated_key(monkeypatch):
+    # Every other capped-response path in this package guarantees a
+    # top-level "truncated" key is always present; the normal (fits
+    # comfortably) path must not be the one exception.
+    raw_issue = {"key": "ENG-1", "fields": {"summary": "ok"}}
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    assert result["truncated"] is False
 
 
 def test_flatten_adf_mention_falls_back_to_account_id_without_text():

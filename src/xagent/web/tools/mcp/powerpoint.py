@@ -289,6 +289,22 @@ def _shape_text(shape: Any) -> str | None:
     return shape.text_frame.text if shape.has_text_frame else None
 
 
+def _require_int(value: Any, field_name: str) -> int:
+    """Validate an integer-typed tool argument.
+
+    FastMCP/Pydantic validates and coerces arguments against a tool's type
+    hints for a real call over the MCP protocol, but that validation is
+    bypassed by a caller that invokes this Python function directly (e.g. a
+    test, or any other in-process caller) -- without this, a non-int index
+    reaches python-pptx's own indexing/comparison and fails with a raw,
+    less clear TypeError instead. bool is excluded even though it's a
+    subclass of int in Python, since True/False are never valid indices.
+    """
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be an integer")
+    return value
+
+
 def _text_frame_has_dynamic_content(text_frame: Any) -> bool:
     """Whether text_frame holds a hyperlink or a dynamic field (e.g. an
     auto-updating slide number or date placeholder) that a full-frame text
@@ -428,6 +444,7 @@ def powerpoint_get_slide_text(
     """Get one slide's shapes with their index, type, and text (needed by
     powerpoint_set_shape_text)."""
     try:
+        slide_index = _require_int(slide_index, "slide_index")
         presentation = _download_presentation(file_path, site_id, drive_id)
         slide = _require_slide(presentation, slide_index)
         shapes = [
@@ -467,6 +484,8 @@ def powerpoint_set_shape_text(
     number or date, since replacing the whole frame's text has no way to
     carry those over -- edit that shape directly in PowerPoint instead."""
     try:
+        slide_index = _require_int(slide_index, "slide_index")
+        shape_index = _require_int(shape_index, "shape_index")
         presentation = _download_presentation(file_path, site_id, drive_id)
         slide = _require_slide(presentation, slide_index)
         shapes = list(slide.shapes)
@@ -527,6 +546,7 @@ def powerpoint_add_slide(
     powerpoint_get_slide_text after adding the slide to confirm where each
     piece of text actually landed."""
     try:
+        layout_index = _require_int(layout_index, "layout_index")
         presentation = _download_presentation(file_path, site_id, drive_id)
         layouts = presentation.slide_layouts
         if not 0 <= layout_index < len(layouts):
@@ -584,6 +604,7 @@ def powerpoint_delete_slide(
 ) -> str:
     """Delete a slide from a PowerPoint presentation by index."""
     try:
+        slide_index = _require_int(slide_index, "slide_index")
         presentation = _download_presentation(file_path, site_id, drive_id)
         _delete_slide(presentation, slide_index)
         item = _upload_presentation(presentation, file_path, site_id, drive_id)

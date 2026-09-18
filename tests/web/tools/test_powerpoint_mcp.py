@@ -100,6 +100,23 @@ def test_require_slide_out_of_range():
         powerpoint._require_slide(presentation, 0)
 
 
+def test_require_int_accepts_int():
+    assert powerpoint._require_int(3, "slide_index") == 3
+
+
+def test_require_int_rejects_non_int():
+    with pytest.raises(TypeError, match="slide_index must be an integer"):
+        powerpoint._require_int("0", "slide_index")
+
+
+def test_require_int_rejects_bool():
+    """bool is a subclass of int in Python -- isinstance(True, int) is True
+    -- so this must be checked explicitly rather than relying on isinstance
+    alone, since True/False are never valid slide/shape/layout indices."""
+    with pytest.raises(TypeError, match="slide_index must be an integer"):
+        powerpoint._require_int(True, "slide_index")
+
+
 def test_delete_slide_removes_correct_slide():
     presentation = Presentation()
     for title in ("A", "B", "C"):
@@ -243,6 +260,16 @@ def test_get_slide_text_out_of_range(monkeypatch):
     assert "out of range" in result["message"]
 
 
+def test_get_slide_text_rejects_non_int_slide_index():
+    """A direct Python call (e.g. from a test, or any caller bypassing
+    FastMCP's own schema validation) with a non-int slide_index must get a
+    clean error response, not an unhandled exception."""
+    result = json.loads(powerpoint.powerpoint_get_slide_text("Deck.pptx", "0"))
+
+    assert result["status"] == "error"
+    assert "slide_index must be an integer" in result["message"]
+
+
 def test_list_slide_layouts(monkeypatch):
     content = _pptx_bytes()
     mock_request = Mock(return_value=MockResponse(content=content))
@@ -285,6 +312,12 @@ def test_add_slide_rejects_out_of_range_layout():
     assert result["status"] == "error"
 
 
+def test_add_slide_rejects_non_int_layout_index():
+    result = json.loads(powerpoint.powerpoint_add_slide("Deck.pptx", layout_index="1"))
+    assert result["status"] == "error"
+    assert "layout_index must be an integer" in result["message"]
+
+
 def test_set_shape_text_success(monkeypatch):
     def build(prs):
         slide = prs.slides.add_slide(prs.slide_layouts[1])
@@ -303,6 +336,20 @@ def test_set_shape_text_success(monkeypatch):
     put_call = mock_request.call_args_list[1]
     uploaded = Presentation(io.BytesIO(put_call.kwargs["data"]))
     assert uploaded.slides[0].shapes.title.text == "New Title"
+
+
+def test_set_shape_text_rejects_non_int_indices():
+    result = json.loads(
+        powerpoint.powerpoint_set_shape_text("Deck.pptx", "0", 0, "text")
+    )
+    assert result["status"] == "error"
+    assert "slide_index must be an integer" in result["message"]
+
+    result = json.loads(
+        powerpoint.powerpoint_set_shape_text("Deck.pptx", 0, "0", "text")
+    )
+    assert result["status"] == "error"
+    assert "shape_index must be an integer" in result["message"]
 
 
 def test_set_shape_text_rejects_shape_without_text_frame(monkeypatch):
@@ -380,6 +427,12 @@ def test_delete_slide_tool_uploads_updated_presentation(monkeypatch):
     put_call = mock_request.call_args_list[1]
     uploaded = Presentation(io.BytesIO(put_call.kwargs["data"]))
     assert [s.shapes.title.text for s in uploaded.slides] == ["B"]
+
+
+def test_delete_slide_tool_rejects_non_int_slide_index():
+    result = json.loads(powerpoint.powerpoint_delete_slide("Deck.pptx", "0"))
+    assert result["status"] == "error"
+    assert "slide_index must be an integer" in result["message"]
 
 
 def test_upload_presentation_rejects_oversized_content(monkeypatch):

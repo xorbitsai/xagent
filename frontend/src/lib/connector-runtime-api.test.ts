@@ -24,6 +24,7 @@ import {
   type ConnectorRuntimeSection,
   type ConnectorRuntimeType,
   type DialogOutcome,
+  type DialogOutcomeKind,
   type SubmitTaskConnectorRuntimeValuesFailure,
 } from "./connector-runtime-api"
 
@@ -366,19 +367,19 @@ describe("buildSubmitItems", () => {
     ])
 
     const blankDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "unsatisfiedKey")]: "",
-      [connectorRuntimeInputDraftKey(REF_A, "secretUnsatisfied")]: "value",
-      [connectorRuntimeInputDraftKey(REF_A, "authKey")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "unsatisfiedKey", "string")]: "",
+      [connectorRuntimeInputDraftKey(REF_A, "secrets", "secretUnsatisfied", "string")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "auth_selector", "authKey", "string")]: "value",
     }
     expect(buildSubmitItems(r, blankDrafts)).toEqual([])
 
     const whitespaceDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "unsatisfiedKey")]: "   ",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "unsatisfiedKey", "string")]: "   ",
     }
     expect(buildSubmitItems(r, whitespaceDrafts)).toEqual([])
 
     const tabDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "unsatisfiedKey")]: "\t\n",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "unsatisfiedKey", "string")]: "\t\n",
     }
     expect(buildSubmitItems(r, tabDrafts)).toEqual([])
 
@@ -386,22 +387,22 @@ describe("buildSubmitItems", () => {
     // own blank check on an object-typed field is `not value`, and `{}`
     // fails it, so a submission that includes it 400s the whole batch.
     const emptyObjectDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "objKey")]: "{}",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "objKey", "object")]: "{}",
     }
     expect(buildSubmitItems(r, emptyObjectDrafts)).toEqual([])
 
     const paddedEmptyObjectDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "objKey")]: "  {}  ",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "objKey", "object")]: "  {}  ",
     }
     expect(buildSubmitItems(r, paddedEmptyObjectDrafts)).toEqual([])
 
     const validDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "unsatisfiedKey")]: "a",
-      [connectorRuntimeInputDraftKey(REF_A, "objKey")]: '{"k":1}',
+      [connectorRuntimeInputDraftKey(REF_A, "context", "unsatisfiedKey", "string")]: "a",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "objKey", "object")]: '{"k":1}',
       // These would 422 if they leaked into the request; proving they never
       // do is this test's whole point.
-      [connectorRuntimeInputDraftKey(REF_A, "secretUnsatisfied")]: "value",
-      [connectorRuntimeInputDraftKey(REF_A, "authKey")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "secrets", "secretUnsatisfied", "string")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "auth_selector", "authKey", "string")]: "value",
     }
     expect(buildSubmitItems(r, validDrafts)).toEqual([
       { connector_ref: REF_A, context: { unsatisfiedKey: "a", objKey: { k: 1 } } },
@@ -419,12 +420,12 @@ describe("buildSubmitItems", () => {
       ]),
     ])
     for (const raw of ["  abc  ", "\tabc\n", "abc ", " abc"]) {
-      expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "token")]: raw })).toEqual([
+      expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "context", "token", "string")]: raw })).toEqual([
         { connector_ref: REF_A, context: { token: "abc" } },
       ])
     }
     // Interior whitespace is part of the value and is left alone.
-    expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "token")]: "  a b  " })).toEqual([
+    expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "context", "token", "string")]: "  a b  " })).toEqual([
       { connector_ref: REF_A, context: { token: "a b" } },
     ])
   })
@@ -479,11 +480,15 @@ describe("classifySubmitFailure", () => {
     expect(classifySubmitFailure(coded(409, "runtime_context_immutable", "conflict.context.token", REF_A), baseReport)).toEqual({
       messageKey: "conflict", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "token" },
     })
+    // A type mismatch refreshes: the connector owner can change a key's
+    // declared type between the report this dialog read and the write it
+    // just submitted, and without a refresh every retry keeps failing the
+    // same way against the stale declaration.
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "type_mismatch.context.config", REF_A), baseReport)).toEqual({
-      messageKey: "typeObject", retry: false, refresh: false, locate: { connectorRef: REF_A, key: "config" },
+      messageKey: "typeObject", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "config" },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "type_mismatch.context.token", REF_A), baseReport)).toEqual({
-      messageKey: "typeString", retry: false, refresh: false, locate: { connectorRef: REF_A, key: "token" },
+      messageKey: "typeString", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "token" },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "empty_value.context.token", REF_A), baseReport)).toEqual({
       messageKey: "emptyValue", retry: false, refresh: false, locate: { connectorRef: REF_A, key: "token" },
@@ -541,6 +546,25 @@ describe("classifySubmitFailure", () => {
     // A hook-installed code entirely outside the closed set.
     expect(classifySubmitFailure(coded(400, "some_future_code", "anything"), baseReport)).toEqual({
       messageKey: "contactAdmin", retry: false, refresh: false, locate: {},
+    })
+  })
+
+  it("picks the context declaration's type, not a same-named secrets row that comes first in the report", () => {
+    // A secrets-section row named "shared" is listed before the context row
+    // sharing that name: findDeclaredInputType must not let the first
+    // match-by-key-alone win, or a type_mismatch on the context row would
+    // report the secrets row's type instead.
+    const reportWithSecretsFirst = report(false, [
+      connector(REF_A, "A", [
+        input({ section: "secrets", key: "shared", type: "object", required: false }),
+        input({ section: "context", key: "shared", type: "string", required: true }),
+      ]),
+    ])
+    expect(classifySubmitFailure(
+      coded(400, "invalid_runtime_context", "type_mismatch.context.shared", REF_A),
+      reportWithSecretsFirst,
+    )).toEqual({
+      messageKey: "typeString", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "shared" },
     })
   })
 })
@@ -655,6 +679,7 @@ describe("derives the action set from the outcome and the resend snapshot", () =
   const fillable: DialogOutcome = { kind: "fillable", blocking: [] }
   const unsupportedOnly: DialogOutcome = { kind: "unsupported_only", blocking: [] }
   const nothingFillable: DialogOutcome = { kind: "nothing_fillable" }
+  const met: DialogOutcome = { kind: "met" }
 
   it.each([
     ["fillable", fillable, true, ["saveAndResend", "saveOnly"]],
@@ -663,8 +688,27 @@ describe("derives the action set from the outcome and the resend snapshot", () =
     ["unsupported_only", unsupportedOnly, false, ["acknowledge"]],
     ["nothing_fillable", nothingFillable, true, ["acknowledge"]],
     ["nothing_fillable", nothingFillable, false, ["acknowledge"]],
+    // A met report is normally closed before it can render, but the refresh
+    // a failed save triggers can install one into an open dialog. It must
+    // still carry a button, or that dialog has an empty footer.
+    ["met", met, true, ["acknowledge"]],
+    ["met", met, false, ["acknowledge"]],
   ] as const)("derives the action set for %s with resend=%s", (_label, outcome, hasResendPayload, expected) => {
     expect(resolveDialogActions(outcome, hasResendPayload)).toEqual(expected)
+  })
+
+  it("gives every outcome kind at least one action", () => {
+    const byKind: Record<DialogOutcomeKind, DialogOutcome> = {
+      met,
+      unsupported_only: unsupportedOnly,
+      nothing_fillable: nothingFillable,
+      fillable,
+    }
+    for (const kind of DIALOG_OUTCOME_KINDS) {
+      for (const hasResendPayload of [true, false]) {
+        expect(resolveDialogActions(byKind[kind], hasResendPayload).length).toBeGreaterThan(0)
+      }
+    }
   })
 })
 
@@ -689,7 +733,7 @@ describe("isSubmitEnabled", () => {
       ]),
     ])
     const onlyBadKeyFilled: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "bad key")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "bad key", "string")]: "value",
     }
     expect(isSubmitEnabled(buildSubmitItems(fourMissingKeysReport, onlyBadKeyFilled), false)).toBe(true)
   })

@@ -316,7 +316,11 @@ function findDeclaredInputType(
       || connector.connector_ref.connector_id !== connectorRef.connector_id
     ) continue
     for (const input of connector.inputs) {
-      if (input.key === key) return input.type
+      // Every type_mismatch reason this backs is section-scoped to "context"
+      // (see locateFieldError in connector-runtime-dialog.tsx, which filters
+      // the same way): without this filter a same-named "secrets" row could
+      // win the search and report that row's declared type instead.
+      if (input.section === "context" && input.key === key) return input.type
     }
   }
   return null
@@ -380,10 +384,21 @@ export function classifySubmitFailure(
     if (reason.startsWith(TYPE_MISMATCH_CONTEXT_PREFIX)) {
       const key = reason.slice(TYPE_MISMATCH_CONTEXT_PREFIX.length)
       const declaredType = findDeclaredInputType(report, connectorRef, key)
+      // The connector's own edit endpoint writes a new declaration in place,
+      // with no version and no snapshot held by the task -- so the type this
+      // dialog read and the type the write endpoint just checked against can
+      // differ. Refreshing here is what lets the row pick up the new
+      // declaration on its next render, rather than staying keyed to the
+      // stale one. The messageKey below is chosen against the pre-refresh
+      // report passed into this call and is not itself recomputed after the
+      // refresh; isTypeMismatchDispositionStale (below) is what the caller
+      // checks against the refreshed report to clear this hint outright
+      // when the row's type no longer matches it, instead of leaving a
+      // type-specific message attached to a row that has since changed type.
       return {
         messageKey: declaredType === "object" ? "typeObject" : "typeString",
         retry: false,
-        refresh: false,
+        refresh: true,
         locate: { connectorRef, key },
       }
     }
@@ -420,6 +435,29 @@ export function classifySubmitFailure(
   // ConnectorRuntimeError with any code/status of its own choosing, and it
   // lands here the same way.
   return GENERIC_DISPOSITION
+}
+
+/**
+ * Whether a type-mismatch disposition's hint no longer matches the row it
+ * would attach to, given a report re-read after the disposition's own
+ * `refresh: true` landed. `typeObject`/`typeString` are the only two
+ * messageKeys this disposition shape can carry that name a specific type;
+ * every other messageKey is never type-specific, so this always reads false
+ * for it. A `locate.key` this refreshed report no longer declares under
+ * "context" returns false here too -- that case is a dropped row, not a
+ * changed type, and the dialog's own field-error location already falls
+ * back to whole-dialog scope for it.
+ */
+export function isTypeMismatchDispositionStale(
+  disposition: ConnectorRuntimeFailureDisposition,
+  refreshedReport: ConnectorRuntimeReport,
+): boolean {
+  if (disposition.messageKey !== "typeObject" && disposition.messageKey !== "typeString") return false
+  const { connectorRef, key } = disposition.locate
+  if (key === undefined) return false
+  const expectedType = disposition.messageKey === "typeObject" ? "object" : "string"
+  const currentType = findDeclaredInputType(refreshedReport, connectorRef, key)
+  return currentType !== null && currentType !== expectedType
 }
 
 /**
@@ -526,22 +564,58 @@ export type ConnectorRuntimeDialogAction = "saveAndResend" | "saveOnly" | "ackno
  * stash is non-empty, which is cleared the moment the snapshot is handed to
  * the request; reading the stash here instead would make the resend button
  * disappear right after the handoff that is supposed to enable it.
+ *
+ * Every outcome maps to at least one button, `met` included. A met report
+ * normally closes the dialog before it renders -- the first read does, and
+ * so does a successful save -- but the refresh a failed save triggers can
+ * install one into an already-open dialog, and returning no buttons there
+ * left the footer empty with only the window chrome's close control to get
+ * out of it.
  */
 export function resolveDialogActions(
   outcome: DialogOutcome,
   hasResendPayload: boolean,
 ): ConnectorRuntimeDialogAction[] {
-  if (outcome.kind === "unsupported_only" || outcome.kind === "nothing_fillable") {
-    return ["acknowledge"]
+  if (outcome.kind === "fillable") {
+    return hasResendPayload ? ["saveAndResend", "saveOnly"] : ["saveOnly"]
   }
-  if (outcome.kind === "met") return []
-  return hasResendPayload ? ["saveAndResend", "saveOnly"] : ["saveOnly"]
+  return ["acknowledge"]
 }
 
-/** Shared by the dialog's draft state and buildSubmitItems so a draft value
- *  written under one key is always read back under the same key. */
-export function connectorRuntimeInputDraftKey(ref: ConnectorRuntimeRef, key: string): string {
-  return `${ref.connector_type}:${ref.connector_id}:${key}`
+/**
+ * Shared by the dialog's draft state and buildSubmitItems so a draft value
+ * written under one key is always read back under the same key. Keyed by the
+ * input's full identity -- connector, section, key name and declared type --
+ * not just connector and key name: the connector's own edit endpoint can
+ * change a key's declared type in place between the report a draft was
+ * written against and the next one the dialog reads (no version, no
+ * per-task snapshot), and two different sections of the same connector may
+ * legitimately reuse a key name. Including type means a stale draft cannot
+ * silently survive a type change under a new, unrelated meaning; including
+ * section means two same-named rows in different sections never collide,
+ * including as React list keys (the dialog reuses this same string there).
+ */
+export function connectorRuntimeInputDraftKey(
+  ref: ConnectorRuntimeRef,
+  section: ConnectorRuntimeSection,
+  key: string,
+  type: ConnectorRuntimeType,
+): string {
+  return `${ref.connector_type}:${ref.connector_id}:${section}:${key}:${type}`
+}
+
+/**
+ * Whether a parsed JSON value is an object-typed context draft worth
+ * submitting: a plain object (not an array, not null) with at least one key.
+ * An empty object parses as valid JSON, but the server's own blank check
+ * (`not value` for an object-typed context field) treats `{}` as empty and
+ * 400s the whole submission, taking every other filled-in key in the same
+ * batch down with it -- so this is the one predicate both the dialog's blur
+ * validation and buildSubmitItems below read, instead of each hand-rolling
+ * its own "is this submittable" check and drifting apart on `{}`.
+ */
+export function isSubmittableObjectValue(parsed: unknown): boolean {
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) && Object.keys(parsed).length > 0
 }
 
 /**
@@ -565,7 +639,7 @@ export function buildSubmitItems(
     const context: Record<string, unknown> = {}
     for (const input of connector.inputs) {
       if (input.section !== "context" || input.satisfied) continue
-      const rawValue = drafts[connectorRuntimeInputDraftKey(connector.connector_ref, input.key)]
+      const rawValue = drafts[connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type)]
       if (rawValue === undefined) continue
       if (input.type === "string") {
         // Submit the trimmed value, not the raw one. The server's merge makes
@@ -583,12 +657,7 @@ export function buildSubmitItems(
         } catch {
           continue
         }
-        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue
-        // An empty object is the object-draft equivalent of a blank string:
-        // the server's own blank check (`not value` for an object-typed
-        // context field) treats `{}` as empty and 400s the whole submission,
-        // taking every other filled-in key in the same batch down with it.
-        if (Object.keys(parsed).length === 0) continue
+        if (!isSubmittableObjectValue(parsed)) continue
         context[input.key] = parsed
       }
     }
@@ -600,12 +669,16 @@ export function buildSubmitItems(
 
 /**
  * The submit button's only enabling rule: at least one submittable key, and
- * no context draft that failed object-JSON parsing. Never adds "every
- * required key filled" -- that would be a second, independently-maintained
- * copy of the server's own completeness rule, the exact drift the design
- * forbids. A malformed key-name warning never participates here either: it
- * is informational, and the row it warns about can still be submitted (the
- * server, not this rule, is the one that will reject it).
+ * `hasInvalidObjectDraft` is false. That flag means an invalid-object draft
+ * on a row the current report still offers an editable control for --
+ * deciding which marks are still live is the caller's job, not this
+ * function's; a mark against a row the report no longer renders as editable
+ * must not reach this parameter. Never adds "every required key filled" --
+ * that would be a second, independently-maintained copy of the server's own
+ * completeness rule, the exact drift the design forbids. A malformed
+ * key-name warning never participates here either: it is informational, and
+ * the row it warns about can still be submitted (the server, not this rule,
+ * is the one that will reject it).
  */
 export function isSubmitEnabled(items: ConnectorRuntimeSubmitItem[], hasInvalidObjectDraft: boolean): boolean {
   return items.length > 0 && !hasInvalidObjectDraft

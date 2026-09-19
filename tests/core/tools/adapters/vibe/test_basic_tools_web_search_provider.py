@@ -141,6 +141,7 @@ async def test_web_search_category_selection_keeps_web_fetch_tool(monkeypatch):
         "fetch_web_content",
         "get_current_time",
         "validate_local_time",
+        "resolve_datetime",
     ]
 
 

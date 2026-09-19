@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, status
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
@@ -3100,6 +3100,86 @@ async def test_delete_mcp_server_revokes_only_the_disconnecting_users_grant(
         .one_or_none()
         is None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redirect_after", [None, "/tools"])
+async def test_actor_callback_closes_popup(db_session, monkeypatch, redirect_after):
+    db, user, _ = db_session
+    _, _, flow = _add_callback_client_and_state(
+        db, user, state="actor-popup", redirect_after=redirect_after
+    )
+    owner = "toby:slack:workspace:alice"
+    flow.resource_owner_key = owner
+    db.commit()
+
+    async def exchange(**kwargs):
+        assert kwargs["code_verifier"] == "verifier-123"
+        return {
+            "access_token": "actor-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange)
+    # Only OAuth state proof is present: the actor has no Xagent browser login.
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=consent&state=actor-popup"), db
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert "location" not in response.headers
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.headers["cache-control"] == "no-store"
+    assert "window.close()" in response.body.decode()
+    assert "You can close this window" in response.body.decode()
+    assert "actor-token" not in response.body.decode()
+    assert owner not in response.body.decode()
+    assert "Max-Age=0" in response.headers["set-cookie"]
+    grant = db.query(MCPOAuthGrant).one()
+    assert grant.resource_owner_key == owner
+    assert decrypt_value(grant.access_token) == "actor-token"
+    assert db.query(MCPOAuthFlowState).one().consumed_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["ordinary", "denied", "commit_failure"])
+async def test_callback_preserves_redirects(db_session, monkeypatch, outcome):
+    db, user, _ = db_session
+    _, _, flow = _add_callback_client_and_state(
+        db, user, state="popup-control", redirect_after="/tools"
+    )
+    if outcome != "ordinary":
+        flow.resource_owner_key = "toby:slack:workspace:alice"
+        db.commit()
+
+    async def exchange(**_kwargs):
+        if outcome == "denied":
+            pytest.fail("Denied consent must not exchange tokens")
+        if outcome == "commit_failure":
+
+            def fail_commit():
+                raise RuntimeError("Commit failed")
+
+            monkeypatch.setattr(db, "commit", fail_commit)
+        return {"access_token": "control-token", "token_type": "Bearer"}
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange)
+    query = "error=access_denied" if outcome == "denied" else "code=consent"
+    response = await mcp_oauth_callback(
+        _request(f"/api/mcp/oauth/callback?{query}&state=popup-control"), db
+    )
+
+    assert response.status_code == status.HTTP_307_TEMPORARY_REDIRECT
+    assert "window.close()" not in response.body.decode()
+    if outcome == "ordinary":
+        assert _redirect_query(response)["mcp_oauth_success"] == ["1"]
+        assert (
+            db.query(MCPOAuthGrant).one().resource_owner_key == f"xagent:user:{user.id}"
+        )
+    else:
+        assert "mcp_oauth_error" in _redirect_query(response)
+        assert db.query(MCPOAuthGrant).count() == 0
 
 
 @pytest.mark.asyncio

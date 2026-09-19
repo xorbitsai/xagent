@@ -17,7 +17,7 @@ from filelock import FileLock
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from . import lancedb_maintenance as maintenance
-from .scope_columns import SCOPE_DIMS_COLUMN, USER_ID_COLUMN, derive_scope_columns
+from .scope_columns import SCOPE_DIMS_COLUMN, USER_ID_COLUMN, strict_scope_columns
 
 VECTOR_IDENTITY_METADATA_KEY = b"xagent.memory.vector_space"
 # Deliberately a different namespace from the scope-only maintenance marker in
@@ -256,15 +256,11 @@ def _validated_rows(
             raise ValueError("legacy IDs must be unique")
         if metadata is not None and not isinstance(metadata, str):
             raise ValueError("legacy metadata must be a string or SQL NULL")
-        try:
-            scope = derive_scope_columns(metadata)
-        except OverflowError as exc:
-            raise ValueError(
-                "legacy user_id must be finite and fit signed int64"
-            ) from exc
-        if scope[0] is not None and not -(2**63) <= scope[0] < 2**63:
-            raise ValueError("legacy user_id must fit signed int64")
-        derived.append(scope)
+        # Strict, not best-effort: the staged ``user_id`` column is the only
+        # owner a rewritten row keeps, so every persisted value that does not
+        # denote exactly one in-range owner has to block the rewrite rather than
+        # stage as "unowned" (JSON ``NaN``) or as somebody else (``1.5``).
+        derived.append(strict_scope_columns(metadata))
     return derived
 
 

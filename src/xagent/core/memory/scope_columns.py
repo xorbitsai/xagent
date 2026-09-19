@@ -21,6 +21,7 @@ escaping, and there is no substring-collision surface (``tenant=a`` never matche
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Mapping, Optional
 
 from ..execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
@@ -36,6 +37,9 @@ SCOPE_DIMS_COLUMN = "scope_dims"
 # the store's filter layer (an ``array_length`` term on the vector path, a Python
 # check on the text fallback) and never reaches equality matching.
 SCOPE_EXCLUSIVE_FILTER_KEY = "__scope_exclusive__"
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 
 def scope_dim_element(dim_key: str, value: Any) -> str:
@@ -57,13 +61,55 @@ def encode_scope_dims(metadata: Mapping[str, Any]) -> list[str]:
 
 
 def coerce_user_id(value: Any) -> Optional[int]:
-    """Best-effort integer owner id for the column; ``None`` when absent/bad."""
+    """Best-effort integer owner id for the column; ``None`` when absent/bad.
+
+    Deliberately total: the query path needs an unreadable ``user_id`` to come
+    back as ``None`` so ``build_scope_where`` drops the pushdown term and leaves
+    the value to the Python post-filter, which compares the authoritative
+    metadata. Never raise from here. Code that rewrites a table, where the
+    derived column becomes the only owner a row keeps, must use
+    ``strict_user_id``/``strict_scope_columns`` instead.
+    """
     if value is None:
         return None
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def strict_user_id(value: Any) -> Optional[int]:
+    """The one signed-int64 owner a persisted ``user_id`` denotes.
+
+    ``None`` only when no owner was persisted (key absent or JSON ``null``).
+    Anything else that does not denote exactly one in-range integer raises
+    ``ValueError``: a rewrite has no authoritative value to fall back on, so
+    ``coerce_user_id``'s ``None`` would silently turn an owned note into an
+    unowned one (JSON ``NaN``, ``"nan"``) and its truncation would silently hand
+    one note to a different owner (``1.5`` -> ``1``, ``true`` -> ``1``).
+    Accepts every spelling ``coerce_user_id`` resolves today -- an ``int``, an
+    integral finite ``float``, a base-10 numeric string -- unchanged.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("legacy user_id must be a whole number, not a boolean")
+    if isinstance(value, int):
+        user_id = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError("legacy user_id must be a finite whole number")
+        user_id = int(value)
+    elif isinstance(value, str):
+        try:
+            user_id = int(value, 10)
+        except ValueError as exc:
+            raise ValueError("legacy user_id must spell a whole number") from exc
+    else:
+        raise ValueError("legacy user_id must be a number or a numeric string")
+    if not _INT64_MIN <= user_id <= _INT64_MAX:
+        raise ValueError("legacy user_id must fit signed int64")
+    return user_id
 
 
 def _sql_string_literal(text: str) -> str:
@@ -141,6 +187,15 @@ def build_scope_where(
     return where_sql, residual
 
 
+def _parsed_metadata(metadata_json: Optional[str]) -> dict[str, Any]:
+    """The metadata object a stored JSON string holds; ``{}`` when it holds none."""
+    try:
+        metadata = json.loads(metadata_json) if metadata_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
 def derive_scope_columns(
     metadata_json: Optional[str],
 ) -> tuple[Optional[int], list[str]]:
@@ -150,10 +205,20 @@ def derive_scope_columns(
     or non-object metadata yields ``(None, [])`` rather than raising, so one bad
     row cannot abort a migration.
     """
-    try:
-        metadata = json.loads(metadata_json) if metadata_json else {}
-    except (json.JSONDecodeError, TypeError):
-        metadata = {}
-    if not isinstance(metadata, dict):
-        return None, []
+    metadata = _parsed_metadata(metadata_json)
     return coerce_user_id(metadata.get("user_id")), encode_scope_dims(metadata)
+
+
+def strict_scope_columns(
+    metadata_json: Optional[str],
+) -> tuple[Optional[int], list[str]]:
+    """``derive_scope_columns`` for paths that stage a rewrite of the table.
+
+    Identical for every row whose ``user_id`` is readable, but raises
+    ``ValueError`` instead of dropping or truncating one that is not, so a
+    caller can classify the row as invalid legacy data and leave the stored
+    table alone. Unreadable metadata still yields ``(None, [])``: a string that
+    holds no JSON object carries no owner to lose.
+    """
+    metadata = _parsed_metadata(metadata_json)
+    return strict_user_id(metadata.get("user_id")), encode_scope_dims(metadata)

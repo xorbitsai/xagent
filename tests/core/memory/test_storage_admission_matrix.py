@@ -494,8 +494,25 @@ def test_contended_lock_returns_a_typed_retryable_outcome(tmp_path, scope):
     assert _snapshot(connection) == before
 
 
-@pytest.mark.parametrize("metadata", ['{"user_id":1e309}', '{"user_id":Infinity}'])
-def test_nonfinite_legacy_user_id_requires_repair(tmp_path, metadata):
+# One contract: a persisted user_id that does not denote exactly one in-range
+# owner blocks the rewrite, whether coercing it overflows ("1e309", "Infinity"),
+# raises ValueError ("NaN", the strings naming them) or silently succeeds on a
+# value that is not an owner (a fractional float, a bool, a list).
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        '{"user_id":1e309}',
+        '{"user_id":Infinity}',
+        '{"user_id":-Infinity}',
+        '{"user_id":NaN}',
+        '{"user_id":"nan"}',
+        '{"user_id":"Infinity"}',
+        '{"user_id":1.5}',
+        '{"user_id":true}',
+        '{"user_id":[1]}',
+    ],
+)
+def test_unusable_legacy_user_id_requires_repair(tmp_path, metadata):
     connection = lancedb.connect(tmp_path)
     table = connection.create_table(
         "memories",
@@ -507,6 +524,23 @@ def test_nonfinite_legacy_user_id_requires_repair(tmp_path, metadata):
     assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
     assert outcome.detail == REPAIR_REQUIRED_DETAIL
     assert _snapshot(connection) == before
+
+
+# The other half of that contract: every spelling admission resolved before
+# still admits, and still lands on the same owner.
+@pytest.mark.parametrize(
+    "metadata", ['{"user_id":5}', '{"user_id":5.0}', '{"user_id":"5"}']
+)
+def test_resolvable_legacy_user_id_still_admits(tmp_path, metadata):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table({"id": ["note"], "text": ["text"], "metadata": [metadata]}),
+    )
+    _safe_close_table(table)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert _snapshot(connection)[2][0][USER_ID_COLUMN] == 5
 
 
 def test_distant_duplicate_is_rejected_without_mutation(tmp_path):

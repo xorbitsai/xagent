@@ -20,6 +20,14 @@ CodeType = Literal["python", "javascript"]
 """Supported code execution types."""
 
 
+class ExactGenerationProbe(str, Enum):
+    """Fail-closed presence result for one generation-specific backend name."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
 class SandboxNotFoundError(Exception):
     """Raised when a requested sandbox resource no longer exists."""
 

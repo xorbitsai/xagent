@@ -284,6 +284,47 @@ class TestMigrations:
         assert "user_oauth" in tables, "user_oauth table should exist"
         assert "durable_sandbox_lifecycles" in tables
 
+        lifecycle_columns = {
+            column["name"]
+            for column in inspect(postgresql_tester.engine).get_columns(
+                "durable_sandbox_lifecycles"
+            )
+        }
+        assert {
+            "active_scope_digest",
+            "create_operation_token",
+            "create_phase",
+            "create_terminal_outcome",
+        }.issubset(lifecycle_columns)
+        lifecycle_checks = {
+            constraint["name"]
+            for constraint in inspect(postgresql_tester.engine).get_check_constraints(
+                "durable_sandbox_lifecycles"
+            )
+        }
+        assert {
+            "ck_dsl_active_generation",
+            "ck_dsl_create_phase",
+            "ck_dsl_create_terminal_outcome",
+        }.issubset(lifecycle_checks)
+        lifecycle_uniques = {
+            constraint["name"]
+            for constraint in inspect(postgresql_tester.engine).get_unique_constraints(
+                "durable_sandbox_lifecycles"
+            )
+        }
+        assert {
+            "uq_dsl_active_scope_digest",
+            "uq_dsl_create_operation_token",
+        }.issubset(lifecycle_uniques)
+        lifecycle_indexes = {
+            index["name"]
+            for index in inspect(postgresql_tester.engine).get_indexes(
+                "durable_sandbox_lifecycles"
+            )
+        }
+        assert "ix_dsl_scope_digest" in lifecycle_indexes
+
         # Verify agents table structure.
         columns = postgresql_tester.get_column_names("agents")
         assert "models" in columns, "models column should exist"
@@ -766,6 +807,197 @@ class TestMigrations:
         winners = [outcome for outcome in outcomes if outcome is not None]
         assert len(winners) == 1
         assert winners[0].delete_attempts == 1
+
+    @pytest.mark.postgresql
+    def test_postgresql_durable_lifecycle_supports_owned_close_and_late_completion(
+        self, postgresql_tester
+    ):
+        """Owned close and quarantined completion match SQLite semantics."""
+        from datetime import datetime, timedelta, timezone
+
+        from xagent.web.models.database import Base
+        from xagent.web.models.task import Task, TaskStatus
+        from xagent.web.models.user import User
+        from xagent.web.services.durable_sandbox_lifecycle import (
+            DurableLifecycleConflict,
+            DurableSandboxLifecycleRepository,
+            RegisterLifecycle,
+        )
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        session_factory = sessionmaker(
+            bind=postgresql_tester.engine, expire_on_commit=False
+        )
+        now = datetime.now(timezone.utc)
+        request = RegisterLifecycle(
+            scope_digest="e" * 64,
+            task_id=43,
+            run_id="run",
+            lease_attempt_id="attempt",
+            turn_digest=None,
+            eligible_at=now - timedelta(minutes=2),
+            owner_lease_expires_at=now - timedelta(minutes=1),
+        )
+        with session_factory() as session:
+            repo = DurableSandboxLifecycleRepository(session)
+            first = repo.register(request)
+            closed = repo.mark_deleting_owned(
+                first, now=now, claim_ttl=timedelta(minutes=1)
+            )
+            assert closed is not None
+            successor = repo.register(request)
+            assert successor.active_scope_digest == request.scope_digest
+            assert closed.active_scope_digest is None
+            session.commit()
+
+        with session_factory() as session:
+            with pytest.raises(DurableLifecycleConflict):
+                DurableSandboxLifecycleRepository(session).register(request)
+            session.rollback()
+
+        late_request = RegisterLifecycle(
+            scope_digest="d" * 64,
+            task_id=45,
+            run_id="run",
+            lease_attempt_id="attempt",
+            turn_digest=None,
+            eligible_at=now - timedelta(minutes=2),
+            owner_lease_expires_at=now - timedelta(minutes=1),
+        )
+        with session_factory() as session:
+            repo = DurableSandboxLifecycleRepository(session)
+            user = User(username="durable-create-pg", password_hash="hash")
+            session.add(user)
+            session.flush()
+            session.add(
+                Task(
+                    id=late_request.task_id,
+                    user_id=user.id,
+                    title="durable create CAS",
+                    status=TaskStatus.RUNNING,
+                    runner_id="runner",
+                    run_id=late_request.run_id,
+                    lease_attempt_id=late_request.lease_attempt_id,
+                    lease_expires_at=now + timedelta(minutes=1),
+                )
+            )
+            session.flush()
+            creating = repo.register(late_request)
+            begun = repo.begin_create(creating, now=now)
+            assert begun is not None
+            quarantined = repo.quarantine_create(
+                begun, now=now, claim_ttl=timedelta(minutes=1)
+            )
+            assert quarantined is not None
+            late_success = repo.complete_quarantined_create(
+                begun, now=now, outcome="success"
+            )
+            assert late_success is not None
+            assert late_success.state == "deleting"
+            assert late_success.create_phase == "terminal"
+            assert late_success.create_terminal_outcome == "success"
+            assert late_success.version == quarantined.version + 1
+            session.rollback()
+
+    @pytest.mark.postgresql
+    @pytest.mark.parametrize("phase", ["may_publish", "observed"])
+    def test_postgresql_durable_create_downgrade_refuses_ambiguous_generation(
+        self, postgresql_tester, phase
+    ):
+        """Downgrade cannot erase an unresolved backend-publication verdict."""
+        postgresql_tester.create_metadata_owned_users_table()
+        command.upgrade(postgresql_tester.alembic_cfg, "head")
+        with postgresql_tester.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO durable_sandbox_lifecycles "
+                    "(scope_digest, active_scope_digest, lifecycle_token, "
+                    "backend_lifecycle_digest, owner_token, create_operation_token, "
+                    "create_phase, version, state, task_id, run_id, "
+                    "lease_attempt_id, eligible_at, owner_lease_expires_at, "
+                    "deleting_at, delete_claim_expires_at, delete_attempts) VALUES "
+                    "(:scope, NULL, :lifecycle, :backend, :owner, :operation, "
+                    ":phase, 1, 'deleting', 1, 'run', 'attempt', NOW(), NOW(), "
+                    "NOW(), NOW(), 0)"
+                ),
+                {
+                    "scope": "1" * 64,
+                    "lifecycle": "2" * 64,
+                    "backend": "3" * 64,
+                    "owner": "4" * 64,
+                    "operation": "5" * 64,
+                    "phase": phase,
+                },
+            )
+        with pytest.raises(RuntimeError, match="ambiguous generation"):
+            command.downgrade(
+                postgresql_tester.alembic_cfg,
+                "20260911_global_memory_authority",
+            )
+
+    @pytest.mark.postgresql
+    def test_postgresql_durable_create_safe_downgrade_round_trip(
+        self, postgresql_tester
+    ):
+        postgresql_tester.create_metadata_owned_users_table()
+        command.upgrade(postgresql_tester.alembic_cfg, "head")
+        command.downgrade(
+            postgresql_tester.alembic_cfg,
+            "20260911_global_memory_authority",
+        )
+        columns = set(postgresql_tester.get_column_names("durable_sandbox_lifecycles"))
+        assert "create_phase" not in columns
+        assert "create_terminal_outcome" not in columns
+
+        command.upgrade(postgresql_tester.alembic_cfg, "head")
+        columns = set(postgresql_tester.get_column_names("durable_sandbox_lifecycles"))
+        assert {"create_phase", "create_terminal_outcome"}.issubset(columns)
+
+    @pytest.mark.postgresql
+    def test_postgresql_durable_lifecycle_has_one_concurrent_active_winner(
+        self, postgresql_tester
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        from xagent.web.models.database import Base
+        from xagent.web.services.durable_sandbox_lifecycle import (
+            DurableLifecycleConflict,
+            DurableSandboxLifecycleRepository,
+            RegisterLifecycle,
+        )
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        session_factory = sessionmaker(
+            bind=postgresql_tester.engine, expire_on_commit=False
+        )
+        now = datetime.now(timezone.utc)
+        request = RegisterLifecycle(
+            scope_digest="f" * 64,
+            task_id=44,
+            run_id="run",
+            lease_attempt_id="attempt",
+            turn_digest=None,
+            eligible_at=now - timedelta(minutes=2),
+            owner_lease_expires_at=now - timedelta(minutes=1),
+        )
+        barrier = threading.Barrier(2)
+
+        def register(_index):
+            with session_factory() as session:
+                barrier.wait(timeout=10)
+                try:
+                    result = DurableSandboxLifecycleRepository(session).register(
+                        request
+                    )
+                    session.commit()
+                    return result
+                except DurableLifecycleConflict:
+                    session.rollback()
+                    return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(register, range(2)))
+        assert sum(outcome is not None for outcome in outcomes) == 1
 
     def test_sqlite_incremental_upgrade(self, sqlite_tester):
         """Test incremental upgrades from b9d890ed31b5 to head on SQLite.

@@ -5272,3 +5272,47 @@ def test_app_teardown_serializes_later_sqlite_replacement(
     assert not teardown_thread.is_alive() and not mutation_thread.is_alive()
     expected_index = 0 if replaced == "catalog" else 1
     assert replacement_generation[0] != generations[expected_index]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["ordinary", "actor"])
+async def test_callback_owner_guard(db_session, monkeypatch, owner):
+    from xagent.web.services import oauth_persistence
+
+    db, user, _ = db_session
+    _, _, flow = _add_callback_client_and_state(db, user, state="owner-guard")
+    if owner == "actor":
+        flow.resource_owner_key = "tenant:actor:alice"
+        db.commit()
+    calls = []
+    revoked = []
+
+    def guard(session, user_id, owner_key):
+        assert session is db
+        calls.append((user_id, owner_key))
+        raise ValueError("Owner stopped")
+
+    async def exchange(**kwargs):
+        return {"access_token": "fresh-token", "token_type": "Bearer"}
+
+    async def revoke(snapshot):
+        assert not db.in_transaction()
+        revoked.append(snapshot)
+
+    monkeypatch.setattr(oauth_persistence, "_guard", None)
+    oauth_persistence.set_oauth_persistence_guard(guard)
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange)
+    monkeypatch.setattr(mcp_api, "_revoke_mcp_oauth_issued_token_externally", revoke)
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=consent&state=owner-guard"), db
+    )
+    if owner == "ordinary":
+        assert calls == []
+        assert revoked == []
+        assert "mcp_oauth_success=1" in response.headers["location"]
+        assert db.query(MCPOAuthGrant).count() == 1
+    else:
+        assert calls == [(user.id, "tenant:actor:alice")]
+        assert len(revoked) == 1
+        assert "mcp_oauth_error=invalid_state" in response.headers["location"]
+        assert db.query(MCPOAuthGrant).count() == 0

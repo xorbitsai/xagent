@@ -299,10 +299,185 @@ class TestTheChangedCallers:
         user, server_id = self._connected_id_named_app(db)
         server = db.query(MCPServer).filter(MCPServer.id == server_id).one()
 
-        app_id, provider, connected_account = _enrich_oauth_server_info(
-            db, server, {"acme-mail": "someone@acme.example"}
+        app_id, provider, connected_account, connection_status = (
+            _enrich_oauth_server_info(
+                db, server, {"acme-mail": ("someone@acme.example", "connected", 1)}
+            )
         )
 
         assert app_id == "acme-mail"
         assert provider == "prov-acme-mail"
         assert connected_account == "someone@acme.example"
+        assert connection_status == "connected"
+
+    def test_listing_flags_a_cleared_token_as_needing_reconnect(self, db):
+        """A grant row that survives with an empty/absent token (e.g. a scope
+        migration that force-invalidates every existing grant, as
+        ``20260914_add_hubspot_deals_write_scope`` does for HubSpot) must not
+        be reported the same as a healthy connection -- the listing endpoint
+        used to say "connected" from row presence alone, while every actual
+        tool call failed on the empty token underneath it."""
+        from xagent.web.api.mcp import get_mcp_servers
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user, server_id = self._connected_id_named_app(db)
+        db.query(UserOAuth).filter(UserOAuth.user_id == user.id).update(
+            {"access_token": "", "refresh_token": None}
+        )
+        db.commit()
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "needs_reconnect"
+        assert response.connected_account is None
+
+    def test_listing_reports_a_healthy_grant_as_connected(self, db):
+        """The counterpart to the cleared-token case above: an untouched,
+        freshly-authorized grant still reports "connected"."""
+        from xagent.web.api.mcp import get_mcp_servers
+
+        user, server_id = self._connected_id_named_app(db)
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "connected"
+        assert response.connected_account == "someone@acme.example"
+
+    def test_listing_reports_connection_status_even_without_an_email_on_file(self, db):
+        """``email`` is nullable on ``UserOAuth`` -- some providers never
+        return one. A grant missing it must still report its real
+        connection_status instead of being dropped from the summary map and
+        collapsing to "never connected" (or, for a broken grant with no
+        email, disappearing from "needs_reconnect" entirely)."""
+        from xagent.web.api.mcp import get_mcp_servers
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user, server_id = self._connected_id_named_app(db)
+        db.query(UserOAuth).filter(UserOAuth.user_id == user.id).update({"email": None})
+        db.commit()
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "connected"
+        assert response.connected_account is None
+
+    def test_listing_prefers_the_newer_grant_across_the_app_id_and_provider_keys(
+        self, db
+    ):
+        """``app_id`` and ``provider`` are two independent lookup keys -- an
+        app-scoped connect and a bare-provider connect leave separate
+        ``UserOAuth`` rows (see auth.py's OAuth callback, which deletes only
+        the row matching the key it connected under). The runtime token
+        resolver (``config.py``) pools both keys with
+        ``provider.in_([app_id, provider])`` and picks the single
+        most-recently-created row across both -- this listing must pick the
+        same one, not "whichever key happens to look healthier": the
+        id-named row here ("acme-mail") is older and broken; a newer,
+        healthy row exists under the bare provider key ("prov-acme-mail")
+        and must win because it is newer (the case where the newer row is
+        the *broken* one, and must still win, is pinned separately below)."""
+        from xagent.web.api.mcp import get_mcp_servers
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user, server_id = self._connected_id_named_app(db)
+        db.query(UserOAuth).filter(UserOAuth.user_id == user.id).update(
+            {"access_token": "", "refresh_token": None}
+        )
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="prov-acme-mail",
+                access_token="live-token",
+                email="fallback@acme.example",
+            )
+        )
+        db.commit()
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "connected"
+        assert response.connected_account == "fallback@acme.example"
+
+    def test_listing_reports_needs_reconnect_when_the_newer_cross_key_grant_is_broken(
+        self, db
+    ):
+        """The inverse of the case above: the id-named row ("acme-mail") is
+        healthy and older; a newer row exists under the bare provider key
+        ("prov-acme-mail") with its token cleared. The runtime resolver
+        pools both keys and always takes the single newest by id, so the
+        newer, broken row must win here too -- reporting needs_reconnect --
+        even though an older, healthy row exists under the other candidate
+        key. This is the exact cross-key pooling code two earlier review
+        rounds found bugs in; the test above only pins the newer-is-healthy
+        direction, this pins the newer-is-broken one. The stale email on
+        that broken row must not be surfaced as an account label (a
+        pre-existing invariant -- see test_meta_oauth.py's blanked-token
+        regression test)."""
+        from xagent.web.api.mcp import get_mcp_servers
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user, server_id = self._connected_id_named_app(db)
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="prov-acme-mail",
+                access_token="",
+                refresh_token=None,
+                email="newer@acme.example",
+            )
+        )
+        db.commit()
+
+        [response] = get_mcp_servers(current_user=user, db=db)
+
+        assert response.id == server_id
+        assert response.connection_status == "needs_reconnect"
+        assert response.connected_account is None
+
+    def test_summaries_pick_the_newest_row_even_when_it_is_broken(self, db):
+        """The runtime token resolver always selects the single
+        most-recently-created ``UserOAuth`` row for a provider
+        (``config.py``'s ``.filter(UserOAuth.provider.in_(...)).order_by(
+        UserOAuth.id.desc()).first()``), with no fallback to an older,
+        healthier row. This summary must pick the same row runtime would,
+        not whichever is healthiest -- reporting "connected" for an account
+        runtime will never actually select is worse than the bug this PR
+        exists to fix: a tool call would still fail with
+        ``oauth_token_required`` despite the API saying it's fine."""
+        from xagent.web.api.mcp import _oauth_account_summaries
+        from xagent.web.models.user import User
+        from xagent.web.models.user_oauth import UserOAuth
+
+        user = User(username="dup-owner", password_hash="h", is_admin=False)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="hubspot",
+                provider_user_id="old-account",
+                access_token="live-token",
+                email="first@acme.example",
+            )
+        )
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="hubspot",
+                provider_user_id="new-account",
+                access_token="",
+                refresh_token=None,
+                email="second@acme.example",
+            )
+        )
+        db.commit()
+
+        summaries = _oauth_account_summaries(db, int(user.id))
+
+        email, status, _account_id = summaries["hubspot"]
+        assert (email, status) == ("second@acme.example", "needs_reconnect")

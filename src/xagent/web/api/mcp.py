@@ -225,6 +225,7 @@ class MCPServerResponse(BaseModel):
     connected_account: Optional[str] = None
     app_id: Optional[str] = None
     provider: Optional[str] = None
+    connection_status: Optional[Literal["connected", "needs_reconnect"]] = None
 
     class Config:
         from_attributes = True
@@ -2075,6 +2076,7 @@ def _db_server_to_response(
     app_id: Optional[str] = None,
     provider: Optional[str] = None,
     is_admin: bool = False,
+    connection_status: Optional[str] = None,
 ) -> MCPServerResponse:
     """Convert database MCPServer to response model."""
     # Get status from manager if available
@@ -2114,6 +2116,7 @@ def _db_server_to_response(
         connected_account=connected_account,
         app_id=app_id,
         provider=provider,
+        connection_status=connection_status,
     )
 
 
@@ -2149,32 +2152,112 @@ def _custom_api_to_mcp_response(
     )
 
 
-def _enrich_oauth_server_info(
-    db: Session, server: MCPServer, oauth_emails: dict
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _oauth_account_summaries(
+    db: Session, user_id: int
+) -> dict[str, tuple[Optional[str], str, int]]:
+    """Per-provider ``(email, connection_status, account_id)`` for the user's
+    OAuth grants.
+
+    ``connection_status`` is "connected" when the stored grant has a usable
+    token and "needs_reconnect" when a grant row exists but its token was
+    cleared or expired (e.g. a scope-migration invalidation, or a refresh
+    that started failing) -- distinct from never having connected at all,
+    which simply has no entry here. Actor credentials are not personal
+    server connections, so this only looks at the user's own scope.
+
+    ``email`` is nullable on ``UserOAuth`` (some providers never return one,
+    or it was never backfilled) -- a grant missing it is still a grant, so
+    it stays in this map with ``email=None`` rather than being dropped. A
+    provider silently excluded here would report ``connection_status`` as
+    absent (never connected) regardless of whether the grant is actually
+    healthy or broken, which is worse than a tile with no account label.
+
+    ``(user_id, provider, provider_user_id)`` is unique, not
+    ``(user_id, provider)`` -- two rows for the same provider are not a
+    schema violation, and the runtime token resolver
+    (``config.py``'s ``.filter(UserOAuth.provider.in_(...)).order_by(
+    UserOAuth.id.desc()).first()``) always uses the single most-recently
+    -created row for a provider, never falling back to an older row even
+    if it is the only usable one. This map must pick the same row runtime
+    would, or the API can claim "connected" for an account runtime will
+    never actually select -- ``account_id`` is kept so a caller checking
+    more than one candidate provider key for one app (an app-scoped and a
+    bare-provider connect are independent rows) can pool them the same way
+    runtime's ``provider.in_(...)`` does and take the overall newest.
     """
-    Return (app_id, provider, connected_account) for an OAuth-based MCPServer.
-    This encapsulates the logic of looking up app information in O(1) time.
+    oauth_accounts = list_scoped_user_oauth_accounts(
+        db,
+        user_id=user_id,
+        resource_owner_key=None,
+    )
+    summaries: dict[str, tuple[Optional[str], str, int]] = {}
+    for oauth in oauth_accounts:
+        provider = str(oauth.provider)
+        account_id = int(oauth.id)
+        existing = summaries.get(provider)
+        if existing is not None and existing[2] >= account_id:
+            continue
+        email = str(oauth.email) if oauth.email else None
+        status = "connected" if _oauth_account_can_connect(oauth) else "needs_reconnect"
+        summaries[provider] = (email, status, account_id)
+    return summaries
+
+
+def _enrich_oauth_server_info(
+    db: Session,
+    server: MCPServer,
+    oauth_accounts: dict[str, tuple[Optional[str], str, int]],
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Return (app_id, provider, connected_account, connection_status) for an
+    OAuth-based MCPServer. This encapsulates the logic of looking up app
+    information in O(1) time. ``oauth_accounts`` maps provider/app keys to
+    ``(email, connection_status, account_id)``, as built by
+    ``_oauth_account_summaries``.
     """
     if server.transport != "oauth":
-        return None, None, None
+        return None, None, None, None
 
     # Stable identity, not the mutable display name: an id-named row (the
     # catalog-connect convention) resolved to nothing here, so its app_id,
     # provider and connected account were all reported as absent.
     app_info = get_app_for_mcp_server(db, server)
     if not app_info:
-        return None, None, None
+        return None, None, None, None
 
     provider = app_info.get("provider")
     app_id = app_info.get("id")
-    connected_account = None
+    connected_account: Optional[str] = None
+    connection_status: Optional[str] = None
+    best_account_id = -1
+    # app_id and provider are two independent lookup keys (an app-scoped
+    # connect and a bare-provider connect leave separate UserOAuth rows --
+    # see auth.py's OAuth callback): pool whichever of the two has rows and
+    # take the overall newest by id, exactly mirroring the runtime token
+    # resolver's own `provider.in_([app_id, provider]).order_by(id.desc())`
+    # query -- never "whichever key is healthier," which can pick a row
+    # runtime would never select.
     for key in restrict_to_app_scoped_oauth_grant(app_id, [app_id, provider]):
-        connected_account = oauth_emails.get(key)
-        if connected_account:
-            break
+        summary = oauth_accounts.get(key)
+        if not summary:
+            continue
+        email, status, account_id = summary
+        if account_id > best_account_id:
+            connected_account, connection_status, best_account_id = (
+                email,
+                status,
+                account_id,
+            )
 
-    return app_id, provider, connected_account
+    # A pre-existing invariant this response has always kept (see
+    # test_meta_oauth.py's blanked-token regression test, from an earlier
+    # reconnect-migration incident): a stale email left on a row whose token
+    # no longer works must not be surfaced as an account label. The row's
+    # health still drives connection_status above; only the label is masked.
+    if connection_status != "connected":
+        connected_account = None
+
+    return app_id, provider, connected_account, connection_status
 
 
 def _app_lookup_keys(*values: object) -> list[str]:
@@ -3096,23 +3179,13 @@ def get_mcp_servers(
             .all()
         )
 
-        # Actor credentials are not personal server connections.
-        oauth_accounts = list_scoped_user_oauth_accounts(
-            db,
-            user_id=effective_user_id,
-            resource_owner_key=None,
-        )
-        oauth_emails = {
-            str(oauth.provider): str(oauth.email)
-            for oauth in oauth_accounts
-            if oauth.email and _oauth_account_can_connect(oauth)
-        }
+        oauth_account_summaries = _oauth_account_summaries(db, effective_user_id)
 
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
-            app_id, provider, connected_account = _enrich_oauth_server_info(
-                db, server, oauth_emails
+            app_id, provider, connected_account, connection_status = (
+                _enrich_oauth_server_info(db, server, oauth_account_summaries)
             )
             responses.append(
                 _db_server_to_response(
@@ -3123,6 +3196,7 @@ def get_mcp_servers(
                     app_id,
                     provider,
                     is_admin=is_admin,
+                    connection_status=connection_status,
                 )
             )
 
@@ -3149,8 +3223,8 @@ def get_mcp_servers(
             for server in (
                 db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
             ):
-                app_id, provider, connected_account = _enrich_oauth_server_info(
-                    db, server, oauth_emails
+                app_id, provider, connected_account, connection_status = (
+                    _enrich_oauth_server_info(db, server, oauth_account_summaries)
                 )
                 responses.append(
                     _db_server_to_response(
@@ -3161,6 +3235,7 @@ def get_mcp_servers(
                         app_id,
                         provider,
                         is_admin=is_admin,
+                        connection_status=connection_status,
                     )
                 )
 
@@ -3212,20 +3287,9 @@ def get_mcp_server(
 
         user_mcp, server = result
 
-        # Actor credentials are not personal server connections.
-        oauth_accounts = list_scoped_user_oauth_accounts(
-            db,
-            user_id=int(user_id),
-            resource_owner_key=None,
-        )
-        oauth_emails = {
-            oauth.provider: oauth.email
-            for oauth in oauth_accounts
-            if oauth.email and _oauth_account_can_connect(oauth)
-        }
-
-        app_id, provider, connected_account = _enrich_oauth_server_info(
-            db, server, oauth_emails
+        oauth_account_summaries = _oauth_account_summaries(db, int(user_id))
+        app_id, provider, connected_account, connection_status = (
+            _enrich_oauth_server_info(db, server, oauth_account_summaries)
         )
 
         return _db_server_to_response(
@@ -3236,6 +3300,7 @@ def get_mcp_server(
             app_id,
             provider,
             is_admin=getattr(current_user, "is_admin", False),
+            connection_status=connection_status,
         )
 
     except HTTPException:

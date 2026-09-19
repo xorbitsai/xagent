@@ -2452,7 +2452,7 @@ async def _load_direct_mcp_tools(
 # sockets) without limit — the gate slot is only released when the load
 # task actually finishes, so abandoned loads keep counting against the cap
 # and later callers fail fast instead of opening yet another transport.
-_MAX_INFLIGHT_LOADS_PER_SERVER = 4
+_MAX_INFLIGHT_LOADS_PER_SERVER = 8
 
 # Semaphores are bound to an event loop; key by loop (weakly, so a
 # discarded loop doesn't pin its gates) then by server name. Web and

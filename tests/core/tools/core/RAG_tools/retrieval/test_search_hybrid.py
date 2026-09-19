@@ -309,7 +309,7 @@ class TestSearchHybrid:
 
     @pytest.fixture
     def mock_sub_searches(
-        self, make_handle, routed_facade
+        self, make_handle, routed_coordinator
     ) -> Generator[Tuple[Mock, Mock], None, None]:
         """Mock the handle's dense/sparse sub-searches and route the public call.
 
@@ -330,7 +330,7 @@ class TestSearchHybrid:
         object.__setattr__(handle, "search_dense", mock_dense)
         object.__setattr__(handle, "search_sparse", mock_sparse)
 
-        with routed_facade(search_hybrid_module, handle):
+        with routed_coordinator(search_hybrid_module, handle):
             yield mock_dense, mock_sparse
 
     def test_hybrid_search_rrf_strategy(

@@ -5,9 +5,50 @@ from typing import Any, List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
-from openai import AsyncOpenAI
+from openai import APIResponseValidationError, AsyncOpenAI
 
-from .base import BaseImageModel
+from ..chat.token_context import MediaCallType
+from .base import (
+    BaseImageModel,
+    InvalidImageResponseError,
+    call_billed_endpoint_async,
+    image_url_from_item,
+    invalid_response_from,
+)
+from .usage import record_image_usage
+
+
+def _openai_image_url(response: Any) -> Optional[str]:
+    """The image URL from an OpenAI images response, or None when absent.
+
+    Raises on a shape the SDK is not supposed to produce -- a truthy but
+    non-indexable ``data`` -- rather than guessing. Callers meter first and then
+    classify that as an already-billed invalid response.
+    """
+    if not response.data:
+        return None
+    return image_url_from_item(response.data[0])
+
+
+def _record_unusable_response(
+    model: "OpenAIImageModel", call_type: MediaCallType, image_count: Any, size: str
+) -> None:
+    """Record a billed call whose response the SDK refused to hand over.
+
+    There is no usage payload to read -- the SDK raised instead of returning one
+    -- so the row carries the requested count and no tokens. That is exactly
+    what a zero-token row means elsewhere in media accounting: the call happened
+    and was charged, and its size is unmeasured. Dropping it instead would
+    report a clean run for money that was actually spent.
+    """
+    record_image_usage(
+        {},
+        model_name=model.model_name,
+        model_id=model.model_id,
+        call_type=call_type,
+        image_count=image_count,
+        resolution=size,
+    )
 
 
 class OpenAIImageModel(BaseImageModel):
@@ -22,8 +63,15 @@ class OpenAIImageModel(BaseImageModel):
         base_url: Optional[str] = None,
         timeout: float = 3600.0,
         abilities: Optional[List[str]] = None,
+        model_id: str = "",
     ):
         self.model_name = model_name
+        # Configured id, not the provider-facing name. Kept on the provider
+        # itself because the provider is what records usage: setting it on the
+        # retry wrapper instead left the recording layer with only model_name,
+        # and the aggregator groups on `model_id or model`, so two configured
+        # models sharing a name collapsed into one billing group.
+        self.model_id = model_id
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = (
             base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
@@ -175,32 +223,68 @@ class OpenAIImageModel(BaseImageModel):
         assert self._client is not None
 
         response_format = kwargs.pop("response_format", None)
+        normalized_size = self._normalize_size(size)
         request_kwargs: dict[str, Any] = dict(kwargs)
         self._apply_response_format(request_kwargs, response_format)
         if transparent_background:
             request_kwargs.update(self._transparency_kwargs())
 
+        # Captured for usage accounting: n reaches this provider only via
+        # kwargs, and billing must reflect how many images were requested.
+        image_count = request_kwargs.get("n", 1)
         images_client: Any = self._client.images
-        response = await images_client.generate(
-            prompt=prompt,
-            model=self.model_name,
-            size=self._normalize_size(size),  # pyright: ignore[reportArgumentType]
-            **request_kwargs,
-        )
+        # Wrapped for the same reason as the other providers: the SDK decodes
+        # and validates the body itself, so a 200 it has already been billed for
+        # but cannot parse surfaces from this call rather than from a body walk.
+        # APIResponseValidationError is that case; status and connection errors
+        # are separate types and stay retryable.
+        try:
+            response = await call_billed_endpoint_async(
+                lambda: images_client.generate(
+                    prompt=prompt,
+                    model=self.model_name,
+                    size=normalized_size,  # pyright: ignore[reportArgumentType]
+                    **request_kwargs,
+                ),
+                "OpenAI returned an unusable body",
+                also_billed=(APIResponseValidationError,),
+            )
+        except InvalidImageResponseError:
+            # Metered before re-raising, for the same reason the success path
+            # meters before walking the body: OpenAI charged for this response.
+            # Classifying it without recording would stop the double-billing but
+            # leave the one real charge invisible -- the exact failure this
+            # boundary exists to prevent, in the other direction.
+            _record_unusable_response(
+                self, MediaCallType.GENERATE_IMAGE, image_count, normalized_size
+            )
+            raise
 
-        image_url = None
-        if response.data:
-            image_item = response.data[0]
-            if getattr(image_item, "url", None):
-                image_url = image_item.url
-            elif getattr(image_item, "b64_json", None):
-                image_url = f"data:image/png;base64,{image_item.b64_json}"
-
-        return {
-            "image_url": image_url,
+        # Metered before the response body is walked, as in the other
+        # providers. The typed SDK is supposed to make `data` a list or None,
+        # but that is a guarantee from another package: a truthy non-indexable
+        # `data` raised a TypeError here, before the metering call, and the
+        # retry policy treats a bare TypeError as retryable -- so one billed
+        # call became max_retries charges with no row recorded.
+        result = {
+            "image_url": None,
             "usage": getattr(response, "usage", {}) or {},
             "request_id": getattr(response, "id", None),
         }
+        record_image_usage(
+            result,
+            model_name=self.model_name,
+            model_id=self.model_id,
+            call_type=MediaCallType.GENERATE_IMAGE,
+            image_count=image_count,
+            resolution=str(normalized_size or ""),
+        )
+
+        try:
+            result["image_url"] = _openai_image_url(response)
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            raise invalid_response_from(e, "Invalid response format") from e
+        return result
 
     async def edit_image(
         self,
@@ -237,17 +321,34 @@ class OpenAIImageModel(BaseImageModel):
         if transparent_background:
             request_kwargs.update(self._transparency_kwargs())
 
+        # Mirrors generate_image: n reaches this provider only via kwargs, and
+        # the provider generates and bills the full count.
+        image_count = request_kwargs.get("n", 1)
+
         image_files = []
         try:
-            image_files = [open(path, "rb") for path in image_paths]
+            for path in image_paths:
+                image_files.append(open(path, "rb"))
             images_client: Any = self._client.images
-            response = await images_client.edit(
-                image=image_files if len(image_files) > 1 else image_files[0],
-                prompt=prompt,
-                model=self.model_name,
-                size=size,  # pyright: ignore[reportArgumentType]
-                **request_kwargs,
-            )
+            try:
+                response = await call_billed_endpoint_async(
+                    lambda: images_client.edit(
+                        image=image_files if len(image_files) > 1 else image_files[0],
+                        prompt=prompt,
+                        model=self.model_name,
+                        size=size,  # pyright: ignore[reportArgumentType]
+                        **request_kwargs,
+                    ),
+                    "OpenAI returned an unusable body",
+                    also_billed=(APIResponseValidationError,),
+                )
+            except InvalidImageResponseError:
+                # See generate_image: a billed response must leave a row even
+                # when the SDK could not give us one to read usage from.
+                _record_unusable_response(
+                    self, MediaCallType.EDIT_IMAGE, image_count, size
+                )
+                raise
         finally:
             for image_file in image_files:
                 try:
@@ -257,16 +358,24 @@ class OpenAIImageModel(BaseImageModel):
             for temp_path in temp_paths:
                 Path(temp_path).unlink(missing_ok=True)
 
-        response_image_url: str | None = None
-        if response.data:
-            image_item = response.data[0]
-            if getattr(image_item, "url", None):
-                response_image_url = image_item.url
-            elif getattr(image_item, "b64_json", None):
-                response_image_url = f"data:image/png;base64,{image_item.b64_json}"
-
-        return {
-            "image_url": response_image_url,
+        # See generate_image: metered before the body walk, and a body-walk
+        # failure classified as an invalid response rather than retried.
+        result = {
+            "image_url": None,
             "usage": getattr(response, "usage", {}) or {},
             "request_id": getattr(response, "id", None),
         }
+        record_image_usage(
+            result,
+            model_name=self.model_name,
+            model_id=self.model_id,
+            call_type=MediaCallType.EDIT_IMAGE,
+            image_count=image_count,
+            resolution=str(size or ""),
+        )
+
+        try:
+            result["image_url"] = _openai_image_url(response)
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            raise invalid_response_from(e, "Invalid response format") from e
+        return result

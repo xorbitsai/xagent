@@ -804,6 +804,15 @@ class TestCreateAgentTool:
 
                 sibling_path = Path(workspace_root) / "sibling.txt"
                 sibling_path.write_text("sibling", encoding="utf-8")
+                foreign_user = User(
+                    username="foreign-worker-output-user",
+                    password_hash="x",
+                    is_admin=False,
+                )
+                db.add(foreign_user)
+                db.flush()
+                foreign_path = Path(workspace_root) / "foreign.txt"
+                foreign_path.write_text("foreign", encoding="utf-8")
                 db.add(
                     UploadedFile(
                         file_id="sibling-file",
@@ -816,17 +825,67 @@ class TestCreateAgentTool:
                         file_size=sibling_path.stat().st_size,
                     )
                 )
+                db.add_all(
+                    [
+                        UploadedFile(
+                            file_id="foreign-local-file",
+                            user_id=foreign_user.id,
+                            task_id=None,
+                            filename=foreign_path.name,
+                            storage_path=str(foreign_path),
+                            storage_status="available",
+                            mime_type="text/plain",
+                            file_size=foreign_path.stat().st_size,
+                        ),
+                        UploadedFile(
+                            file_id="foreign-durable-file",
+                            user_id=foreign_user.id,
+                            task_id=None,
+                            filename="foreign.pdf",
+                            storage_path=str(
+                                Path(workspace_root) / "missing" / "foreign.pdf"
+                            ),
+                            storage_key=(
+                                f"users/{foreign_user.id}/uploads/"
+                                "foreign-durable-file/foreign.pdf"
+                            ),
+                            storage_status="available",
+                            mime_type="application/pdf",
+                            file_size=12,
+                        ),
+                    ]
+                )
                 db.commit()
-                with patch(
-                    "xagent.core.storage.manager.create_db_session",
-                    SessionLocal,
+                with (
+                    patch(
+                        "xagent.core.storage.manager.create_db_session",
+                        SessionLocal,
+                    ),
+                    patch(
+                        "xagent.web.services.managed_file_ref.ManagedFileRef.materialize",
+                        side_effect=AssertionError("foreign durable file materialized"),
+                    ) as materialize,
                 ):
                     child_workspace = ToolFactory.create_workspace(workspace_config)
                     assert child_workspace is not None
+                    assert child_workspace.owner_user_id == user.id
                     with pytest.raises(FileNotFoundError):
                         WorkspaceFileOperations(child_workspace).read_file(
                             "sibling-file"
                         )
+                    assert (
+                        child_workspace.resolve_file_binding_detached(
+                            "foreign-local-file"
+                        )
+                        is None
+                    )
+                    assert (
+                        child_workspace.resolve_file_binding_detached(
+                            "foreign-durable-file"
+                        )
+                        is None
+                    )
+                    materialize.assert_not_called()
 
                 assert parent_tracer.events[-1]["data"]["file_outputs"] == file_outputs
 

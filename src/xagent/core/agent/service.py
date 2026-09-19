@@ -182,11 +182,19 @@ class AgentService:
         self.scope_segments: tuple[str, ...] = tuple(scope_segments or ())
         self.workspace = workspace
 
+        runtime_workspace = (
+            self.tool_config.get_task_runtime_workspace()
+            if isinstance(self.tool_config, BaseToolConfig)
+            else None
+        )
+        if self.workspace is None and runtime_workspace is not None:
+            self.workspace = runtime_workspace
+
         if (
             tool_config
             and hasattr(tool_config, "_workspace_config")
             and tool_config._workspace_config
-            and not workspace
+            and self.workspace is None
         ):
             from ..workspace import WorkspaceManager
 
@@ -210,6 +218,9 @@ class AgentService:
             )
         elif self.enable_workspace:
             self._setup_workspace()
+
+        if isinstance(self.tool_config, BaseToolConfig) and self.workspace is not None:
+            self.tool_config.set_task_runtime_workspace(self.workspace)
 
         if self.enable_default_tools and not self.tools and not self.tool_config:
             self.tool_config = self._create_default_tool_config()

@@ -342,6 +342,20 @@ class _OAuthInstanceUrlRequired(Exception):
         self.env_key = env_key
 
 
+def _is_trusted_google_drive_file_ref_app(app_info: Mapping[str, Any]) -> bool:
+    """Return whether app metadata matches the canonical Drive launcher."""
+
+    if app_info.get("id") != "google-drive":
+        return False
+    from ..builtin_mcp_registry import get_builtin_execution_fields
+
+    execution_fields = get_builtin_execution_fields("google-drive")
+    return bool(
+        execution_fields
+        and app_info.get("launch_config") == execution_fields.get("launch_config")
+    )
+
+
 @dataclass(frozen=True)
 class _ToolFactoryRuntimeLoadPlan:
     """Detached inputs describing the synchronous factory reads to prefetch."""
@@ -3773,18 +3787,23 @@ class WebToolConfig(BaseToolConfig):
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-                env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-            # Distinct from the five read allowlists above: Google Drive's
+            # Distinct from the four read allowlists above: Google Drive's
             # download tool writes NEW files into the task workspace, so it
             # gets its own single-value, task-dir-only var rather than
             # reusing the read-allowlist shape (see
             # _build_mcp_task_output_dir's docstring for why that would be
-            # wrong, not just differently-shaped). google_drive_upload_file
-            # reads from XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS above instead,
-            # like the other four read allowlists.
+            # wrong, not just differently-shaped).
             task_output_dir = self._build_mcp_task_output_dir()
             if task_output_dir:
                 env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir
+            # Only the canonical built-in may receive the adapter's one-call,
+            # task-scoped FileRef resolution. Matching an arbitrary launch
+            # argument is not provenance.
+            if _is_trusted_google_drive_file_ref_app(app_info):
+                transport_config["workspace_file_ref_env"] = {
+                    "google_drive_upload_file": "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE"
+                }
+                transport_config["_trusted_workspace_file_ref"] = True
             transport_config["env"] = env
             return transport_config
 

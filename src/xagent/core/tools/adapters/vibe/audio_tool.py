@@ -244,7 +244,7 @@ async def create_audio_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     if not asr_models and not tts_models:
         return []
 
-    workspace = ToolFactory.create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.get_or_create_runtime_workspace(config)
     if not workspace:
         return []
 

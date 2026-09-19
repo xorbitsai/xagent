@@ -2289,6 +2289,7 @@ class AgentTool(AbstractBaseTool):
                     "base_dir": self._workspace_base_dir,
                     "task_id": execution_task_id,
                     "db_task_id": parent_db_task_id,
+                    "user_id": self._user_id,
                     FILE_OPERATION_ACCESS_VERSION_KEY: self._file_operation_access_version,
                     "scope_segments": _scope_segments,
                     "durable_storage_segments": _durable_storage_segments,

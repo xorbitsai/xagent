@@ -1163,9 +1163,8 @@ def onedrive_upload_file(
         # A fresh by-path open, not the same descriptor
         # _resolve_upload_file_path used for its allowlist check -- a
         # symlink swapped in during that window wouldn't be caught.
-        # Accepted risk: holding a file descriptor open across the whole
-        # allowlist resolution isn't worth it for a local, non-shared task
-        # workspace (same tradeoff google_drive_upload_file makes).
+        # Accepted risk for this legacy path-based OneDrive tool: holding a
+        # file descriptor open across allowlist resolution is not implemented.
         try:
             fh_ctx = local_path.open("rb")
         except OSError as e:

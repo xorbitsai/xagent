@@ -1877,4 +1877,239 @@ describe("ChatInput", () => {
     })
     expect(container.querySelector('button[type="submit"]')).toBeDisabled()
   })
+
+  it("disables the stop square while a stop is in flight", () => {
+    const onStop = vi.fn()
+    const { unmount } = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="stopping"
+        taskStatus="running"
+      />
+    )
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).toBeDisabled()
+    unmount()
+
+    const secondRender = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    const stopButton = screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    expect(stopButton).not.toBeDisabled()
+    expect(stopButton).toHaveAttribute("type", "button")
+    const hint = screen.getByText("widgetSession.stopTimedOut")
+    expect(hint).toBeInTheDocument()
+    expect(stopButton).toHaveAttribute("aria-describedby", hint.id)
+    expect(screen.getByRole("textbox")).not.toHaveAttribute("aria-describedby")
+    fireEvent.click(stopButton)
+    expect(onStop).toHaveBeenCalledTimes(1)
+    secondRender.unmount()
+
+    const thirdRender = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="not_sent"
+        taskStatus="running"
+      />
+    )
+    // A refusal and a timeout are different outcomes, so they get different
+    // sentences; the timed-out copy must not leak through for a refusal.
+    expect(screen.getByText("widgetSession.stopNotSent")).toBeInTheDocument()
+    expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeDisabled()
+    thirdRender.unmount()
+
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="draft"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
+  })
+
+  it("swaps the compact submit control for a stop square", () => {
+    const cases: Array<[string, string]> = [
+      ["", "widgetSession.stopResponse"],
+      ["draft", "common.send"],
+    ]
+    const renderedClassNames: string[] = []
+
+    for (const [inputValue, expectedName] of cases) {
+      const otherName = expectedName === "common.send"
+        ? "widgetSession.stopResponse"
+        : "common.send"
+      const { unmount } = render(
+        <ChatInput
+          compact
+          hideConfig
+          hideFileUpload
+          inputValue={inputValue}
+          isLoading
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+          stopState="idle"
+          taskStatus="running"
+        />
+      )
+      const control = screen.getByRole("button", { name: expectedName })
+      expect(control).toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: otherName })).not.toBeInTheDocument()
+      renderedClassNames.push(control.className)
+      unmount()
+    }
+
+    // Neither render dims its control here, so the two class strings differ
+    // only if the controls stopped taking their size and box styling from the
+    // same expression -- which is what would let the slot change shape when
+    // the stop square takes the send button's place.
+    const [stopClassName, submitClassName] = renderedClassNames
+    expect(stopClassName).toContain("h-8 w-8")
+    expect(submitClassName).toBe(stopClassName)
+  })
+
+  it("renders no stop control without an onStop callback", () => {
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        taskStatus="running"
+      />
+    )
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "common.send" })).toBeInTheDocument()
+  })
+
+  it("blocks sending while a stop request is still pending", () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="please also do X"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        onStop={vi.fn()}
+        readOnlyConfig
+        stopState="stopping"
+        taskStatus="running"
+      />
+    )
+
+    // The draft keeps the send control in the slot, as it always has; what
+    // changes while a stop is outstanding is that the control cannot act.
+    const submitButton = screen.getByRole("button", { name: "common.send" })
+    expect(submitButton).toBeDisabled()
+    expect(submitButton.className).toContain("bg-muted text-muted-foreground/50")
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).not.toBeInTheDocument()
+
+    fireEvent.click(submitButton)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" })
+
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("still sends when no stop request is pending", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="please also do X"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        onStop={vi.fn()}
+        readOnlyConfig
+        stopState="idle"
+        taskStatus="running"
+      />
+    )
+
+    const submitButton = screen.getByRole("button", { name: "common.send" })
+    expect(submitButton).not.toBeDisabled()
+    expect(submitButton.className).not.toContain("bg-muted")
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    expect(onSend.mock.calls[0][0]).toBe("please also do X")
+  })
+
+  it("renders no stop control outside the compact toolbar", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+        readOnlyConfig
+        stopState="idle"
+        taskStatus="running"
+      />
+    )
+
+    // The wider toolbar has no stop control by design; it carries the pause
+    // control instead, and passing onStop here changes nothing.
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).not.toBeInTheDocument()
+    expect(container.querySelector('button[type="submit"]')).toBeInTheDocument()
+  })
 })

@@ -444,6 +444,42 @@ const dagBurst = (taskId: number): TestWebSocketMessage[] => [
   }),
 ]
 
+// A running task_stream_snapshot as it actually reaches handleMessage.
+// use-websocket.ts's onMessage normalization lifts the control envelope
+// (run_id/state_version/control_state/status) to the root and nests the
+// whole flat backend frame under `data`, so both places carry the same
+// fields. Real snapshots have no timestamp field; the hook fills one at
+// delivery time, so the literal here only keeps assertions stable and
+// predictable across runs.
+const runningSnapshotFrame = (overrides: {
+  runId?: string
+  stateVersion?: number
+  leaseAttemptId?: string
+} = {}): TestWebSocketMessage => {
+  const runId = overrides.runId ?? "run-1"
+  const stateVersion = overrides.stateVersion ?? 1
+  const leaseAttemptId = overrides.leaseAttemptId ?? "attempt-1"
+  return {
+    type: "task_stream_snapshot",
+    task_id: 1,
+    timestamp: "2026-05-27T05:00:00Z",
+    run_id: runId,
+    state_version: stateVersion,
+    status: "running",
+    control_state: "running",
+    data: {
+      type: "task_stream_snapshot",
+      task_id: 1,
+      run_id: runId,
+      state_version: stateVersion,
+      status: "running",
+      control_state: "running",
+      output: null,
+      lease_attempt_id: leaseAttemptId,
+    },
+  }
+}
+
 function SeedRunningTask() {
   const { dispatch } = useApp()
 
@@ -727,6 +763,103 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("stream-recovery").textContent).toBe("")
   })
 
+  it.each([
+    [1, "no frames", false],
+    [1, "no frames", true],
+    [1, "same-run trace_event frames", false],
+    [1, "same-run trace_event frames", true],
+    [3, "no frames", false],
+    [3, "no frames", true],
+    [3, "same-run trace_event frames", false],
+    [3, "same-run trace_event frames", true],
+  ] as const)(
+    "keeps stream recovery clear while a run is still working (snapshots=%i, between=%s, wrapped=%s)",
+    (snapshotCount, between, wrapped) => {
+      render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+      const send = (message: Partial<TestWebSocketMessage> & Record<string, unknown>) => act(() => {
+        webSocketOptions.current?.onMessage?.({
+          task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message,
+        } as TestWebSocketMessage)
+      })
+      const recovery = () => screen.getByTestId("stream-recovery").textContent
+      send({
+        type: "task_started", stream_run_id: "run-1", stream_attempt_id: "attempt-1",
+        run_id: "run-1", state_version: 1, status: "running", control_state: "running",
+      })
+      expect(recovery()).toBe("")
+      for (let i = 0; i < snapshotCount; i += 1) {
+        send(runningSnapshotFrame())
+        expect(recovery()).toBe("")
+        if (between === "same-run trace_event frames") {
+          send({
+            type: "trace_event", stream_run_id: "run-1", stream_attempt_id: "attempt-1",
+            data: { event_id: `progress-${i}`, event_type: "agent_progress", data: { message: "Working" } },
+          })
+          expect(recovery()).toBe("")
+        }
+      }
+      const answerFrame = (type: string, data: Record<string, unknown>) => send({
+        stream_run_id: "run-1", stream_attempt_id: "attempt-1",
+        ...(wrapped ? { type: "trace_event", event_type: type, data: { data } } : { type, data }),
+      })
+      answerFrame("final_answer_start", { message_id: "final_answer_1" })
+      expect(recovery()).toBe("")
+      answerFrame("final_answer_delta", { message_id: "final_answer_1", delta: "visible mid-run answer" })
+      expect(recovery()).toBe("")
+      expect(screen.getByTestId("messages").textContent).toContain("visible mid-run answer")
+    },
+  )
+
+  it.each([
+    ["stream_unavailable", 1],
+    ["stream_unavailable", 3],
+    ["stream_resync_required", 1],
+    ["stream_resync_required", 3],
+  ] as const)(
+    "preserves stream recovery across running snapshots after %s (snapshots=%i)",
+    (signal, snapshotCount) => {
+      render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+      const send = (message: Partial<TestWebSocketMessage> & Record<string, unknown>) => act(() => {
+        webSocketOptions.current?.onMessage?.({
+          task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message,
+        } as TestWebSocketMessage)
+      })
+      const recovery = () => screen.getByTestId("stream-recovery").textContent
+      send({ type: signal })
+      expect(recovery()).toBe("1")
+      for (let i = 0; i < snapshotCount; i += 1) {
+        send(runningSnapshotFrame())
+        expect(recovery()).toBe("1")
+      }
+    },
+  )
+
+  it.each(["attempt-1", "attempt-0"])(
+    "drops answer frames from a superseded lease attempt (attempt=%s)",
+    (deltaAttemptId) => {
+      render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+      const send = (message: Partial<TestWebSocketMessage> & Record<string, unknown>) => act(() => {
+        webSocketOptions.current?.onMessage?.({
+          task_id: 1, timestamp: "2026-05-27T05:00:00Z", ...message,
+        } as TestWebSocketMessage)
+      })
+      send(runningSnapshotFrame())
+      send({
+        type: "final_answer_start", stream_run_id: "run-1", stream_attempt_id: "attempt-1",
+        data: { message_id: "final_answer_1" },
+      })
+      send({
+        type: "final_answer_delta", stream_run_id: "run-1", stream_attempt_id: deltaAttemptId,
+        data: { message_id: "final_answer_1", delta: "superseded-lease-text" },
+      })
+      if (deltaAttemptId === "attempt-1") {
+        expect(screen.getByTestId("messages").textContent).toContain("superseded-lease-text")
+      } else {
+        expect(screen.getByTestId("messages").textContent).not.toContain("superseded-lease-text")
+      }
+    },
+  )
+
   it("streams a new answer whose prefix arrives after an active snapshot", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (message: Partial<TestWebSocketMessage>) => act(() => {
@@ -736,6 +869,7 @@ describe("AppProvider websocket message routing", () => {
       })
     })
     send({ run_id: "run-1", state_version: 1, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
     send({ type: "final_answer_start", stream_run_id: "run-1", data: { message_id: "final_answer_1" } })
     send({ type: "final_answer_delta", stream_run_id: "run-1", data: { message_id: "final_answer_1", delta: "first visible answer" } })
     expect(screen.getByTestId("messages").textContent).toContain("first visible answer")

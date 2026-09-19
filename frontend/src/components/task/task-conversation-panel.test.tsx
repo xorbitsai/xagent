@@ -18,6 +18,7 @@ const appState = vi.hoisted(() => ({
   isProcessing: false,
   isHistoryLoading: false,
   taskId: 42,
+  streamRecoveryTaskId: null as number | null,
   filePreview: { isOpen: false, fileId: "", fileName: "", viewMode: "preview" },
   dagExecution: null,
   steps: [],
@@ -271,10 +272,32 @@ describe("TaskConversationPanel", () => {
     appState.currentTask = null
     appState.taskRuntimeExtensions = {}
     appState.taskId = 42
+    appState.streamRecoveryTaskId = null
     appState.isProcessing = false
     appState.isHistoryLoading = false
     appState.filePreview = { isOpen: false, fileId: "", fileName: "", viewMode: "preview" }
   })
+
+  it.each([
+    [42, true],
+    [7, false],
+    [null, false],
+  ] as const)(
+    "renders the interrupted banner only when recovery targets the viewed task (recovery=%s)",
+    (recoveryTaskId, expectBanner) => {
+      appState.taskId = 42
+      appState.streamRecoveryTaskId = recoveryTaskId
+
+      render(<TaskConversationPanel mode="page" />)
+
+      if (expectBanner) {
+        const banner = screen.getByRole("status")
+        expect(banner.textContent).toBe("sharedStream.interrupted")
+      } else {
+        expect(screen.queryByRole("status")).toBeNull()
+      }
+    },
+  )
 
   it("marks user turns with the task's Local browser context", () => {
     appState.messages = [{

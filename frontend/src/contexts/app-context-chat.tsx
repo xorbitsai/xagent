@@ -2819,7 +2819,10 @@ export function AppProvider({
         }
         stream.attemptId = typeof data.lease_attempt_id === "string" ? data.lease_attempt_id : null
         const active = envelope.status === "running"
-        stream.interrupted = stream.interrupted || (active && !stream.prefixSeen)
+        // A snapshot describes the task row, not this connection's delivery: a run
+        // that has not opened its answer yet is not a lost stream. `interrupted` is
+        // raised only by stream_unavailable / stream_resync_required or by an answer
+        // frame with no start for its run; it gates answer frames and reconcile too.
         if (envelope.status) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: {
             status: envelope.status, runId: envelope.runId,

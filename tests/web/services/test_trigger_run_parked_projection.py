@@ -34,10 +34,13 @@ artefact. Three kinds of test live here:
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import Enum as SAEnum
+from sqlalchemy import String, create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.models.agent import Agent
@@ -57,7 +60,11 @@ from xagent.web.services.task_lease_service import (
     get_expired_task_lease_candidates,
     utc_now,
 )
-from xagent.web.services.task_orchestrator import finish_turn, sync_trigger_run_status
+from xagent.web.services.task_orchestrator import (
+    _trigger_run_status_for_task_status,
+    finish_turn,
+    sync_trigger_run_status,
+)
 
 RUNNER_ID = "parked-runner"
 RUN_ID = "parked-run"
@@ -88,34 +95,45 @@ def db_session():
         engine.dispose()
 
 
-def _create_user(db) -> User:
-    user = User(username="parked-trigger-user", password_hash="hash", is_admin=False)
+def _create_user(db, *, suffix: str = "") -> User:
+    user = User(
+        username=f"parked-trigger-user{suffix}",
+        password_hash="hash",
+        is_admin=False,
+    )
     db.add(user)
     db.commit()
     db.refresh(user)
     return user
 
 
-def _seed_parked_run(
-    db, *, parked_status: TaskStatus
-) -> tuple[Task, TriggerRun, TaskLease]:
-    """Seed the exact row state a parked turn leaves behind.
+def _seed_task_with_run(
+    db,
+    *,
+    task_status: TaskStatus,
+    run_status: str = TriggerRunStatus.RUNNING.value,
+    task_error: str | None = None,
+    run_error: str | None = None,
+    with_lease: bool = False,
+    suffix: str = "",
+) -> tuple[Task, TriggerRun, TaskLease | None]:
+    """Seed a task with its trigger run at an explicit pair of states.
 
-    Mirrors production ordering: the park branch in ``task_execution`` commits
-    the task's parked status while the turn's lease is still held, and
-    ``finish_turn`` runs afterwards from ``_schedule_bg._runner``'s finally with
-    that same lease.
+    With ``with_lease`` this mirrors production ordering: the park branch in
+    ``task_execution`` commits the task's parked status while the turn's lease is
+    still held, and ``finish_turn`` then runs from ``_schedule_bg._runner``'s
+    finally with that same lease.
     """
 
-    user = _create_user(db)
-    agent = Agent(user_id=int(user.id), name="parked trigger agent")
+    user = _create_user(db, suffix=suffix)
+    agent = Agent(user_id=int(user.id), name=f"parked trigger agent{suffix}")
     db.add(agent)
     db.flush()
     trigger = AgentTrigger(
         user_id=int(user.id),
         agent_id=int(agent.id),
         type=TriggerType.WEBHOOK.value,
-        name="parked trigger",
+        name=f"parked trigger{suffix}",
         config={},
     )
     db.add(trigger)
@@ -124,14 +142,15 @@ def _seed_parked_run(
         user_id=int(user.id),
         title="Parked trigger task",
         description="parked trigger projection reproduction",
-        status=parked_status,
-        control_state=control_state_for_status(parked_status).value,
+        status=task_status,
+        control_state=control_state_for_status(task_status).value,
         execution_mode="auto",
         source="trigger",
-        runner_id=RUNNER_ID,
-        run_id=RUN_ID,
-        lease_attempt_id=ATTEMPT_ID,
-        lease_expires_at=utc_now() + timedelta(minutes=5),
+        error_message=task_error,
+        runner_id=RUNNER_ID if with_lease else None,
+        run_id=RUN_ID if with_lease else None,
+        lease_attempt_id=ATTEMPT_ID if with_lease else None,
+        lease_expires_at=utc_now() + timedelta(minutes=5) if with_lease else None,
         state_version=1,
     )
     db.add(task)
@@ -139,20 +158,40 @@ def _seed_parked_run(
     run = TriggerRun(
         trigger_id=int(trigger.id),
         task_id=int(task.id),
-        status=TriggerRunStatus.RUNNING.value,
-        idempotency_key=f"parked-run-{parked_status.value}",
+        status=run_status,
+        error_message=run_error,
+        idempotency_key=f"parked-run-{task_status.value}-{run_status}{suffix}",
     )
     db.add(run)
     db.commit()
     db.refresh(task)
     db.refresh(run)
 
-    lease = TaskLease(
-        task_id=int(task.id),
-        runner_id=RUNNER_ID,
-        run_id=RUN_ID,
-        attempt_id=ATTEMPT_ID,
+    lease = (
+        TaskLease(
+            task_id=int(task.id),
+            runner_id=RUNNER_ID,
+            run_id=RUN_ID,
+            attempt_id=ATTEMPT_ID,
+        )
+        if with_lease
+        else None
     )
+    return task, run, lease
+
+
+def _seed_parked_run(
+    db, *, parked_status: TaskStatus
+) -> tuple[Task, TriggerRun, TaskLease]:
+    """Seed the exact row state a parked turn leaves behind."""
+
+    task, run, lease = _seed_task_with_run(
+        db,
+        task_status=parked_status,
+        with_lease=True,
+        suffix=f"-{parked_status.value}",
+    )
+    assert lease is not None
     return task, run, lease
 
 
@@ -410,3 +449,155 @@ def test_replayed_delivery_does_not_reset_an_advanced_run(db_session):
     stored = db_session.get(TriggerRun, run_id)
     assert stored.status == TriggerRunStatus.PAUSED.value
     assert int(stored.task_id) == int(task.id)
+
+
+# ---------------------------------------------------------------------------
+# COMPAT: the change stays additive, and the mapping stays total
+# ---------------------------------------------------------------------------
+
+LEGACY_RUN_STATUS_VALUES = frozenset({"pending", "running", "completed", "failed"})
+
+
+def test_legacy_run_status_values_are_unchanged_and_only_paused_was_added():
+    """Existing rows carry these strings: no value may move or disappear."""
+
+    values = {member.value for member in TriggerRunStatus}
+    assert LEGACY_RUN_STATUS_VALUES <= values
+    assert values - LEGACY_RUN_STATUS_VALUES == {TriggerRunStatus.PAUSED.value}, (
+        "the parked value must be the only addition, and the only one needed"
+    )
+
+
+def test_run_status_column_is_plain_text_so_the_new_value_needs_no_migration():
+    """A native enum column would need ``ALTER TYPE ... ADD VALUE`` instead."""
+
+    column = TriggerRun.__table__.c.status
+    assert isinstance(column.type, String)
+    assert not isinstance(column.type, SAEnum)
+    assert column.type.length is not None
+    for member in TriggerRunStatus:
+        assert len(member.value) <= column.type.length
+
+
+def test_the_parked_value_is_not_terminal():
+    assert TriggerRunStatus.terminal_values() == frozenset(
+        {TriggerRunStatus.COMPLETED.value, TriggerRunStatus.FAILED.value}
+    )
+    assert TriggerRunStatus.PAUSED.value not in TriggerRunStatus.terminal_values()
+
+
+@pytest.mark.parametrize(
+    ("task_status", "explicit_error", "expected_error"),
+    [
+        (TaskStatus.COMPLETED, None, None),
+        (TaskStatus.FAILED, None, "task level failure"),
+        (TaskStatus.FAILED, "explicit failure", "explicit failure"),
+    ],
+)
+def test_terminal_projection_still_writes_what_it_always_wrote(
+    db_session, task_status, explicit_error, expected_error
+):
+    """COMPLETED clears the error, FAILED carries one, an override still wins.
+
+    Lease recovery passes an explicit message and depends on that precedence.
+    """
+
+    task, run, _lease = _seed_task_with_run(
+        db_session,
+        task_status=task_status,
+        task_error="task level failure",
+        run_error="stale error",
+        suffix=f"-{task_status.value}-{explicit_error}",
+    )
+    run_id = int(run.id)
+
+    assert (
+        sync_trigger_run_status(
+            db_session, task, task_status, error_message=explicit_error
+        )
+        is True
+    )
+    db_session.commit()
+    db_session.expire_all()
+
+    stored = db_session.get(TriggerRun, run_id)
+    assert stored.status == task_status.value
+    assert stored.finished_at is not None
+    assert stored.error_message == expected_error
+
+
+@pytest.mark.parametrize(
+    "run_status",
+    [TriggerRunStatus.PENDING.value, TriggerRunStatus.RUNNING.value],
+)
+def test_rows_the_previous_selector_covered_are_still_finalized(db_session, run_status):
+    """pending / running were the old selector's whole world: keep finalizing."""
+
+    task, run, _lease = _seed_task_with_run(
+        db_session, task_status=TaskStatus.COMPLETED, run_status=run_status
+    )
+    run_id = int(run.id)
+
+    assert sync_trigger_run_status(db_session, task, TaskStatus.COMPLETED) is True
+    db_session.commit()
+    db_session.expire_all()
+    assert db_session.get(TriggerRun, run_id).status == TriggerRunStatus.COMPLETED.value
+
+
+def test_a_stale_pending_projection_cannot_regress_a_live_run(db_session):
+    """PENDING belongs to preparation/dispatch, so it projects onto nothing."""
+
+    task, run, _lease = _seed_task_with_run(
+        db_session,
+        task_status=TaskStatus.PENDING,
+        run_status=TriggerRunStatus.RUNNING.value,
+    )
+    run_id = int(run.id)
+
+    assert sync_trigger_run_status(db_session, task, TaskStatus.PENDING) is False
+    db_session.commit()
+    db_session.expire_all()
+
+    stored = db_session.get(TriggerRun, run_id)
+    assert stored.status == TriggerRunStatus.RUNNING.value
+    assert stored.finished_at is None
+
+
+@pytest.mark.parametrize("task_status", list(TaskStatus), ids=lambda item: item.value)
+def test_every_task_status_has_an_explicit_projection_answer(task_status):
+    """The guard against a repeat of #2177: no task state may lack an answer."""
+
+    target = _trigger_run_status_for_task_status(task_status)
+    if task_status is TaskStatus.PENDING:
+        assert target is None
+        return
+    assert target is not None, (
+        f"TaskStatus.{task_status.name} has no trigger run projection; a task "
+        "settling in that state would leave its run at its previous value"
+    )
+    assert target in {member.value for member in TriggerRunStatus}
+
+
+def test_frontend_status_vocabulary_matches_the_backend_enum():
+    """The UI list is a contract: every value the backend writes needs a label."""
+
+    source = (
+        Path(__file__).resolve().parents[3]
+        / "frontend"
+        / "src"
+        / "lib"
+        / "agent-triggers-api.ts"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r"AGENT_TRIGGER_RUN_STATUSES\s*=\s*\[(.*?)\]\s*as const",
+        source,
+        re.DOTALL,
+    )
+    assert match is not None, (
+        "AGENT_TRIGGER_RUN_STATUSES is gone from frontend/src/lib/agent-triggers-api.ts"
+    )
+
+    frontend_values = re.findall(r'"([a-z_]+)"', match.group(1))
+    assert set(frontend_values) == {member.value for member in TriggerRunStatus}, (
+        "the frontend run status list and the backend TriggerRunStatus enum disagree"
+    )

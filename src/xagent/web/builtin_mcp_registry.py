@@ -1708,6 +1708,20 @@ def is_builtin_public_mcp_app(app_id: str) -> bool:
     return get_builtin_public_mcp_app(app_id) is not None
 
 
+def is_reserved_builtin_public_mcp_app_id(app_id: str) -> bool:
+    """Whether an ID collides with a built-in after identity normalization.
+
+    Persisted lookups remain exact so an existing operator-owned row cannot be
+    silently reinterpreted. New rows use this stricter check to prevent a
+    case/whitespace alias from surviving a downgrade and blocking a later seed.
+    """
+    identity = canonicalize_builtin_identity(app_id)
+    return any(
+        canonicalize_builtin_identity(row["app_id"]) == identity
+        for row in get_builtin_public_mcp_app_rows()
+    )
+
+
 def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     row = get_builtin_public_mcp_app(app_id)
     if row is None:

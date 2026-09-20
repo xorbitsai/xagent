@@ -2200,7 +2200,13 @@ def test_admin_custom_patch_validates_merged_state_and_keeps_app_id_immutable() 
             pass
 
 
-def test_admin_create_rejects_reserved_builtin_id_after_deletion() -> None:
+@pytest.mark.parametrize(
+    ("builtin_id", "attempted_id"),
+    [("gmail", "gmail"), ("planner", "PLANNER"), ("planner", " planner ")],
+)
+def test_admin_create_rejects_reserved_builtin_id_after_deletion(
+    builtin_id: str, attempted_id: str
+) -> None:
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 
     temp_dir = _setup_test_db()
@@ -2209,13 +2215,14 @@ def test_admin_create_rejects_reserved_builtin_id_after_deletion() -> None:
         admin_headers = _login("admin", "admin123")
         db = next(get_db())
         try:
-            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == builtin_id).one()
             db.delete(app)
             db.commit()
         finally:
             db.close()
-        canonical = get_builtin_public_mcp_app("gmail")
+        canonical = get_builtin_public_mcp_app(builtin_id)
         assert canonical is not None
+        canonical["app_id"] = attempted_id
 
         response = client.post(
             "/api/admin/mcp/apps",
@@ -2227,7 +2234,9 @@ def test_admin_create_rejects_reserved_builtin_id_after_deletion() -> None:
         db = next(get_db())
         try:
             assert (
-                db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").first()
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id.in_([builtin_id, attempted_id]))
+                .first()
                 is None
             )
         finally:

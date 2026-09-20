@@ -14,6 +14,7 @@ from ..builtin_mcp_registry import (
     get_builtin_execution_fields,
     get_builtin_public_mcp_app,
     is_builtin_public_mcp_app,
+    is_reserved_builtin_public_mcp_app_id,
 )
 from ..models.database import get_db
 from ..models.oauth_provider import OAuthProvider
@@ -452,7 +453,7 @@ async def create_app(
     db: Session = Depends(get_db),
     actor: User = Depends(verify_admin),
 ) -> Any:
-    if is_builtin_public_mcp_app(app.app_id):
+    if is_reserved_builtin_public_mcp_app_id(app.app_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Built-in MCP app IDs are reserved",

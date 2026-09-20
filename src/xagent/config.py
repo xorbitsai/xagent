@@ -240,6 +240,10 @@ TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+# Keep room for a small structured status envelope. Values below this make
+# even defensive connector fallbacks vulnerable to the output filter cutting
+# their JSON in the middle.
+MIN_TOOL_MAX_OUTPUT_LENGTH = 64
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
 TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
 MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
@@ -3108,9 +3112,9 @@ def get_tool_max_output_length() -> int:
     env_str = os.getenv(TOOL_MAX_OUTPUT_LENGTH)
     if env_str:
         try:
-            return int(env_str)
+            return max(MIN_TOOL_MAX_OUTPUT_LENGTH, int(env_str))
         except ValueError:
-            logger.warning("Invalid TOOL_MAX_OUTPUT_LENGTH value: {env_str}")
+            logger.warning("Invalid %s value: %s", TOOL_MAX_OUTPUT_LENGTH, env_str)
     return 50 * 1024
 
 

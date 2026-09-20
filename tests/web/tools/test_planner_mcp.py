@@ -117,8 +117,14 @@ def test_build_assignments_empty_returns_none():
 def test_build_assignments_shape():
     result = planner._build_assignments(["user-1", "user-2"])
     assert result == {
-        "user-1": {"@odata.type": "#microsoft.graph.plannerAssignment"},
-        "user-2": {"@odata.type": "#microsoft.graph.plannerAssignment"},
+        "user-1": {
+            "@odata.type": "#microsoft.graph.plannerAssignment",
+            "orderHint": " !",
+        },
+        "user-2": {
+            "@odata.type": "#microsoft.graph.plannerAssignment",
+            "orderHint": " !",
+        },
     }
 
 
@@ -185,6 +191,27 @@ def test_bounded_list_response_does_not_advance_when_page_cannot_fit(monkeypatch
     assert result["status"] == "error"
     assert result["retry_next_link"] == current_page
     assert result.get("retry_next_link") != server_next_page
+
+
+def test_bounded_list_response_uses_real_output_limit_env_name(monkeypatch):
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: 350)
+    response = planner._bounded_list_response(
+        "tasks",
+        [{"id": f"task-{index}", "title": "x" * 256} for index in range(50)],
+        next_link=None,
+        retry_next_link=None,
+    )
+
+    assert "XAGENT_TOOL_MAX_OUTPUT_LENGTH" in response
+
+
+@pytest.mark.parametrize("configured_limit", [18, 0, -1])
+def test_bounded_envelopes_remain_valid_below_minimum(monkeypatch, configured_limit):
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: configured_limit)
+
+    response = planner._error("x" * 10_000)
+    assert len(response) <= planner.MIN_TOOL_MAX_OUTPUT_LENGTH
+    assert json.loads(response)["status"] == "error"
 
 
 def test_resolve_list_path_defaults_when_no_next_link():
@@ -303,6 +330,40 @@ def test_create_plan_builds_container_url(monkeypatch):
     }
 
 
+def test_create_plan_transport_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests, "request", Mock(side_effect=requests.Timeout("timed out"))
+    )
+
+    result = json.loads(planner.planner_create_plan("group-1", "New plan"))
+
+    assert result["status"] == "indeterminate"
+    assert result["retryable"] is False
+    assert result["mutation_may_have_completed"] is True
+
+
+def test_create_plan_unreadable_success_is_indeterminate(monkeypatch):
+    response = MockResponse({"id": "plan-1"})
+    response.json = Mock(side_effect=ValueError("invalid JSON"))
+    monkeypatch.setattr(planner.requests, "request", Mock(return_value=response))
+
+    result = json.loads(planner.planner_create_plan("group-1", "New plan"))
+
+    assert result["status"] == "indeterminate"
+
+
+def test_create_plan_server_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(return_value=MockResponse({"error": "gateway"}, status_code=503)),
+    )
+
+    result = json.loads(planner.planner_create_plan("group-1", "New plan"))
+
+    assert result["status"] == "indeterminate"
+
+
 def test_create_plan_requires_title():
     result = json.loads(planner.planner_create_plan("group-1", "   "))
     assert result["status"] == "error"
@@ -326,6 +387,39 @@ def test_get_plan_success(monkeypatch):
     assert result["status"] == "success"
     assert result["plan"] == {"id": "plan-1", "title": "Plan"}
     assert mock_request.call_args.kwargs["url"].endswith("/planner/plans/plan-1")
+
+
+def test_get_plan_caps_large_singleton_response(monkeypatch):
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "300")
+    mock_request = Mock(
+        return_value=MockResponse(
+            {"id": "plan-1", "large": {str(index): "x" * 80 for index in range(50)}}
+        )
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    response = planner.planner_get_plan("plan-1")
+    result = json.loads(response)
+
+    assert len(response) <= 300
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def test_get_plan_caps_and_redacts_large_graph_error(monkeypatch):
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "300")
+    response = MockResponse(
+        content=(b"Authorization: Bearer secret-token " + b"x" * 10_000),
+        status_code=400,
+    )
+    monkeypatch.setattr(planner.requests, "request", Mock(return_value=response))
+
+    serialized = planner.planner_get_plan("plan-1")
+    result = json.loads(serialized)
+
+    assert len(serialized) <= 300
+    assert result["status"] == "error"
+    assert "secret-token" not in serialized
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +599,7 @@ def test_create_task_with_assignees_and_due_date(monkeypatch):
     assert body["planId"] == "plan-1"
     assert body["bucketId"] == "bucket-1"
     assert body["dueDateTime"] == "2026-09-30T00:00:00Z"
-    assert "user-1" in body["assignments"]
+    assert body["assignments"]["user-1"]["orderHint"] == " !"
 
 
 def test_create_task_requires_title():
@@ -781,8 +875,26 @@ def test_assign_task_sends_body_and_if_match(monkeypatch):
     patch_call = mock_request.call_args_list[1]
     assert patch_call.kwargs["headers"]["If-Match"] == 'W/"etag-1"'
     assert patch_call.kwargs["json"] == {
-        "assignments": {"user-1": {"@odata.type": "#microsoft.graph.plannerAssignment"}}
+        "assignments": {
+            "user-1": {
+                "@odata.type": "#microsoft.graph.plannerAssignment",
+                "orderHint": " !",
+            }
+        }
     }
+
+
+def test_assign_task_transport_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests, "request", Mock(side_effect=requests.Timeout("timed out"))
+    )
+
+    result = json.loads(
+        planner.planner_assign_task("task-1", ["user-1"], etag='W/"etag"')
+    )
+
+    assert result["status"] == "indeterminate"
+    assert result["mutation_may_have_completed"] is True
 
 
 def test_unassign_task_rejects_non_list_user_ids():

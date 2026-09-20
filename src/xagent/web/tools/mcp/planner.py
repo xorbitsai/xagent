@@ -9,8 +9,19 @@ from urllib.parse import unquote
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from ....config import get_tool_max_output_length
-from .utils import require_clean_identifier, setup_proxy_env, url_path_id
+from ....config import (
+    MIN_TOOL_MAX_OUTPUT_LENGTH,
+    TOOL_MAX_OUTPUT_LENGTH,
+    get_tool_max_output_length,
+)
+from ....core.utils.security import redact_sensitive_text
+from ...utils.graphql_errors import truncate_error_text
+from .utils import (
+    require_clean_identifier,
+    setup_proxy_env,
+    success_with_capped_dict,
+    url_path_id,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("planner-mcp")
@@ -22,13 +33,10 @@ mcp = FastMCP("planner-mcp")
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
 
-# orderHint is deliberately omitted everywhere a new bucket/assignment is
-# created below -- "Using order hints in Planner" documents ' !' as valid
-# only for the first item in an otherwise-empty list, and states it's
-# unnecessary even then, since the service auto-generates a hint when the
-# property is left unset. Sending the same literal for every new sibling
-# item (the 2nd+ bucket in a plan, or 2+ assignees in one call) would give
-# them identical, unordered hints instead of a service-assigned order.
+# Planner assignment writes require an orderHint for every assigned user.
+# Microsoft's create/update examples use " !" as the insertion hint; Graph
+# resolves that relative hint to a concrete value. Bucket creation can still
+# omit orderHint because Graph generates bucket ordering when it is absent.
 
 
 class _GraphRequestError(RuntimeError):
@@ -44,20 +52,58 @@ class _EtagConflictError(RuntimeError):
     race (Graph responded 412 Precondition Failed)."""
 
 
+class _MutationOutcomeIndeterminate(RuntimeError):
+    """A mutation may have reached Graph but its outcome cannot be observed."""
+
+
+def _bounded_json(payloads: tuple[dict[str, Any], ...]) -> str:
+    max_output_length = max(MIN_TOOL_MAX_OUTPUT_LENGTH, get_tool_max_output_length())
+    for payload in payloads:
+        response = json.dumps(payload, ensure_ascii=False)
+        if len(response) <= max_output_length:
+            return response
+    return json.dumps({"status": "error"}, ensure_ascii=False)
+
+
 def _success(**payload: Any) -> str:
-    return json.dumps({"status": "success", **payload}, ensure_ascii=False)
+    return _bounded_json(
+        ({"status": "success", **payload}, {"status": "success", "truncated": True})
+    )
 
 
 def _error(message: str, *, details: Any = None) -> str:
+    message = truncate_error_text(redact_sensitive_text(str(message)))
     payload: dict[str, Any] = {"status": "error", "message": message}
     if details is not None:
         payload["details"] = details
-    return json.dumps(payload, ensure_ascii=False)
+    return _bounded_json(
+        (payload, {"status": "error", "message": message[:128]}, {"status": "error"})
+    )
 
 
 def _conflict(message: str) -> str:
-    return json.dumps(
-        {"status": "conflict_stale_version", "message": message}, ensure_ascii=False
+    message = truncate_error_text(redact_sensitive_text(str(message)))
+    return _bounded_json(
+        (
+            {"status": "conflict_stale_version", "message": message},
+            {"status": "conflict_stale_version"},
+        )
+    )
+
+
+def _indeterminate(message: str) -> str:
+    message = truncate_error_text(redact_sensitive_text(str(message)))
+    return _bounded_json(
+        (
+            {
+                "status": "indeterminate",
+                "retryable": False,
+                "mutation_may_have_completed": True,
+                "message": message,
+            },
+            {"status": "indeterminate", "retryable": False},
+            {"status": "indeterminate"},
+        )
     )
 
 
@@ -107,7 +153,7 @@ def _bounded_list_response(
     if list_field not in _LIST_PROJECTION_FIELDS:
         raise ValueError(f"unsupported Planner list field: {list_field}")
 
-    max_output_length = get_tool_max_output_length()
+    max_output_length = max(MIN_TOOL_MAX_OUTPUT_LENGTH, get_tool_max_output_length())
 
     def _serialize(values: list[Any], *, truncated: bool, mode: str | None) -> str:
         payload: dict[str, Any] = {
@@ -160,7 +206,7 @@ def _bounded_list_response(
             "status": "error",
             "message": (
                 "This Planner page cannot fit the configured output limit even "
-                "after projection; increase TOOL_MAX_OUTPUT_LENGTH and retry the "
+                f"after projection; increase {TOOL_MAX_OUTPUT_LENGTH} and retry the "
                 "same page. No records from this page were returned."
             ),
             "retry_next_link": retry_next_link,
@@ -203,27 +249,54 @@ def _graph_request(
     body: dict[str, Any] | None = None,
     extra_headers: dict[str, str] | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    mutation: bool = False,
 ) -> Any:
-    response = requests.request(
-        method=method,
-        url=f"{GRAPH_BASE_URL}{path}",
-        headers=_graph_headers(extra_headers),
-        params=params,
-        json=body,
-        timeout=timeout,
-    )
+    try:
+        response = requests.request(
+            method=method,
+            url=f"{GRAPH_BASE_URL}{path}",
+            headers=_graph_headers(extra_headers),
+            params=params,
+            json=body,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        if mutation:
+            raise _MutationOutcomeIndeterminate(
+                "Planner mutation outcome is unknown after a transport failure; "
+                "do not retry automatically. Read the resource first to determine "
+                "whether the change was applied."
+            ) from exc
+        raise
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
-        response_text = response.text.strip()
-        message = str(exc)
+        response_text = truncate_error_text(
+            redact_sensitive_text(response.text.strip())
+        )
+        message = truncate_error_text(redact_sensitive_text(str(exc)))
         if response_text:
             message = f"{message} - {response_text}"
+        if mutation and response.status_code >= 500:
+            raise _MutationOutcomeIndeterminate(
+                "Planner mutation outcome is unknown after a server failure; "
+                "do not retry automatically. Read the resource first to determine "
+                "whether the change was applied."
+            ) from exc
         raise _GraphRequestError(message, status_code=response.status_code) from exc
 
     if response.status_code == 204 or not response.content:
         return {}
-    return response.json()
+    try:
+        return response.json()
+    except ValueError as exc:
+        if mutation:
+            raise _MutationOutcomeIndeterminate(
+                "Planner accepted the mutation request but returned an unreadable "
+                "response; do not retry automatically. Read the resource first to "
+                "determine whether the change was applied."
+            ) from exc
+        raise RuntimeError("Planner returned an unreadable JSON response") from exc
 
 
 def _current_etag(path: str) -> str:
@@ -286,7 +359,11 @@ def _etag_guarded_write(
     resolved_etag = etag or _current_etag(path)
     try:
         return _graph_request(
-            method, path, body=body, extra_headers={"If-Match": resolved_etag}
+            method,
+            path,
+            body=body,
+            extra_headers={"If-Match": resolved_etag},
+            mutation=True,
         )
     except _GraphRequestError as exc:
         if exc.status_code in (409, 412):
@@ -376,7 +453,10 @@ def _build_assignments(user_ids: list[str] | None) -> dict[str, Any] | None:
     if not user_ids:
         return None
     return {
-        user_id: {"@odata.type": "#microsoft.graph.plannerAssignment"}
+        user_id: {
+            "@odata.type": "#microsoft.graph.plannerAssignment",
+            "orderHint": " !",
+        }
         for user_id in _validated_user_ids(user_ids)
     }
 
@@ -410,7 +490,7 @@ def planner_get_plan(plan_id: str) -> str:
         result = _graph_request(
             "GET", f"/planner/plans/{url_path_id(plan_id, 'plan_id')}"
         )
-        return _success(plan=result)
+        return success_with_capped_dict("plan", result)
     except Exception as e:
         logger.error("Error getting Planner plan %s: %s", plan_id, e)
         return _error(str(e))
@@ -432,8 +512,10 @@ def planner_create_plan(group_id: str, title: str) -> str:
             },
             "title": title,
         }
-        result = _graph_request("POST", "/planner/plans", body=body)
-        return _success(plan=result)
+        result = _graph_request("POST", "/planner/plans", body=body, mutation=True)
+        return success_with_capped_dict("plan", result)
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error creating Planner plan for group %s: %s", group_id, e)
         return _error(str(e))
@@ -473,8 +555,10 @@ def planner_create_bucket(plan_id: str, name: str) -> str:
             "name": name,
             "planId": require_clean_identifier(plan_id, "plan_id"),
         }
-        result = _graph_request("POST", "/planner/buckets", body=body)
-        return _success(bucket=result)
+        result = _graph_request("POST", "/planner/buckets", body=body, mutation=True)
+        return success_with_capped_dict("bucket", result)
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error creating Planner bucket in plan %s: %s", plan_id, e)
         return _error(str(e))
@@ -531,7 +615,7 @@ def planner_get_task(task_id: str) -> str:
         result = _graph_request(
             "GET", f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
         )
-        return _success(task=result)
+        return success_with_capped_dict("task", result)
     except Exception as e:
         logger.error("Error getting Planner task %s: %s", task_id, e)
         return _error(str(e))
@@ -572,8 +656,10 @@ def planner_create_task(
         assignments = _build_assignments(assignee_user_ids)
         if assignments:
             body["assignments"] = assignments
-        result = _graph_request("POST", "/planner/tasks", body=body)
-        return _success(task=result)
+        result = _graph_request("POST", "/planner/tasks", body=body, mutation=True)
+        return success_with_capped_dict("task", result)
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error creating Planner task in plan %s: %s", plan_id, e)
         return _error(str(e))
@@ -643,6 +729,8 @@ def planner_update_task(
         task_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task updated successfully")
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -666,6 +754,8 @@ def planner_assign_task(
         body = {"assignments": _build_assignments(user_ids)}
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task assigned successfully")
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -688,6 +778,8 @@ def planner_unassign_task(
         body = {"assignments": dict.fromkeys(_validated_user_ids(user_ids))}
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task unassigned successfully")
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -702,6 +794,8 @@ def planner_delete_task(task_id: str, etag: str | None = None) -> str:
         task_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
         _etag_guarded_write(task_path, "DELETE", etag=etag)
         return _success(message="Task deleted successfully")
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -716,7 +810,7 @@ def planner_get_task_details(task_id: str) -> str:
         result = _graph_request(
             "GET", f"/planner/tasks/{url_path_id(task_id, 'task_id')}/details"
         )
-        return _success(details=result)
+        return success_with_capped_dict("details", result)
     except Exception as e:
         logger.error("Error getting Planner task details for %s: %s", task_id, e)
         return _error(str(e))
@@ -735,6 +829,8 @@ def planner_update_task_description(
             details_path, "PATCH", body={"description": description}, etag=etag
         )
         return _success(message="Task description updated successfully")
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -766,6 +862,8 @@ def planner_add_checklist_item(
         }
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(checklist_item_id=item_id)
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -792,6 +890,8 @@ def planner_set_checklist_item_checked(
         }
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(message="Checklist item updated successfully")
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -815,6 +915,8 @@ def planner_delete_checklist_item(
         body = {"checklist": {require_clean_identifier(item_id, "item_id"): None}}
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(message="Checklist item deleted successfully")
+    except _MutationOutcomeIndeterminate as e:
+        return _indeterminate(str(e))
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:

@@ -225,9 +225,37 @@ def test_site_segment_preserves_colon_slash_comma():
     )
 
 
+def test_site_subresource_base_closes_colon_for_path_addressed_site():
+    # A path-addressed site id ("hostname:/path") must be closed with a
+    # second colon before appending a sub-resource segment, matching
+    # Graph's documented convention for chaining after path addressing
+    # (e.g. GET /sites/{hostname}:/{path}:/lists). Without it, Graph parses
+    # the appended segment as part of the site's own server-relative path
+    # and returns 400/404 instead of the intended sub-resource.
+    assert (
+        sharepoint._site_subresource_base("contoso.sharepoint.com:/sites/team")
+        == "/sites/contoso.sharepoint.com:/sites/team:"
+    )
+
+
+def test_site_subresource_base_leaves_root_and_composite_id_unchanged():
+    assert sharepoint._site_subresource_base("root") == "/sites/root"
+    assert (
+        sharepoint._site_subresource_base("contoso.sharepoint.com,abc-123,def-456")
+        == "/sites/contoso.sharepoint.com,abc-123,def-456"
+    )
+
+
 def test_drive_base_defaults_to_site_default_drive():
     assert sharepoint._drive_base("root", None) == "/sites/root/drive"
     assert sharepoint._drive_base("root", "drive-1") == "/sites/root/drives/drive-1"
+
+
+def test_drive_base_closes_colon_for_path_addressed_site():
+    assert (
+        sharepoint._drive_base("contoso.sharepoint.com:/sites/team", None)
+        == "/sites/contoso.sharepoint.com:/sites/team:/drive"
+    )
 
 
 def test_drive_children_path_root_vs_folder():
@@ -254,6 +282,18 @@ def test_drive_content_path_rejects_dot_segments():
 def test_drive_content_path_rejects_trailing_period():
     with pytest.raises(ValueError, match="must not end with a period"):
         sharepoint._drive_content_path("root", "report.docx.", None)
+
+
+def test_drive_content_path_dot_segment_error_names_the_actual_field():
+    with pytest.raises(ValueError, match=r"^remote_path must not contain"):
+        sharepoint._drive_content_path(
+            "root", "../secret.bin", None, field_name="remote_path"
+        )
+
+
+def test_drive_children_path_backslash_error_names_folder_path():
+    with pytest.raises(ValueError, match=r"^folder_path must use '/' separators"):
+        sharepoint._drive_children_path("root", "a\\b", None)
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +866,18 @@ def test_guess_mime_type_uses_encoding_not_decompressed_type():
     # type ("application/pdf") plus a "gzip" encoding; the actual bytes on
     # the wire are gzip, not PDF, so Content-Type must reflect that.
     assert sharepoint._guess_mime_type("report.pdf.gz") == "application/gzip"
+
+
+def test_guess_mime_type_recognizes_dotfile_only_name():
+    # Path(".xlsx").suffix is "" under pathlib's dotfile convention (no stem
+    # before the dot), so a remote name that's entirely an extension must go
+    # through _split_stem_suffix the same way _name_looks_binary does --
+    # otherwise the override table lookup misses and the upload silently
+    # falls back to application/octet-stream for a recognized Office format.
+    assert (
+        sharepoint._guess_mime_type(".xlsx")
+        == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
 # ---------------------------------------------------------------------------

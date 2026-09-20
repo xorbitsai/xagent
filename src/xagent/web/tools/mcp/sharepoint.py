@@ -435,25 +435,51 @@ def _site_segment(site_id: str) -> str:
     return quote(value, safe=":/,")
 
 
+def _site_subresource_base(site_id: str) -> str:
+    """Site path prefix for appending a further path segment (e.g.
+    "/drives", "/lists"). A path-addressed site id ("hostname:/path") must
+    be closed with a second colon before appending more segments -- the
+    same convention Graph requires for drive-item path addressing (see
+    _drive_children_path) -- otherwise Graph parses the appended segment as
+    part of the site's own server-relative path instead of as a
+    sub-resource name. The "root" and composite-id ("hostname,siteId,webId")
+    forms contain no colon and are returned unchanged."""
+    value = site_id.strip()
+    segment = _site_segment(site_id)
+    if ":" in value and not value.endswith(":"):
+        return f"/sites/{segment}:"
+    return f"/sites/{segment}"
+
+
 def _drive_base(site_id: str, drive_id: str | None) -> str:
-    site_segment = _site_segment(site_id)
+    site_base = _site_subresource_base(site_id)
     if drive_id:
-        return f"/sites/{site_segment}/drives/{url_path_id(drive_id, 'drive_id')}"
-    return f"/sites/{site_segment}/drive"
+        return f"{site_base}/drives/{url_path_id(drive_id, 'drive_id')}"
+    return f"{site_base}/drive"
 
 
-def _normalize_relative_path(path: str | None) -> str | None:
+def _normalize_relative_path(
+    path: str | None, *, field_name: str = "path"
+) -> str | None:
     """Normalize a drive-relative path for a root:/{path}: request URL,
-    rejecting '.'/'..' segments -- same rationale as _site_segment above."""
+    rejecting '.'/'..' segments -- same rationale as _site_segment above.
+
+    field_name lets a caller whose own parameter isn't literally named
+    "path" (e.g. "folder_path", or _drive_content_path's own field_name)
+    get an error that names its actual argument."""
     if path is None:
         return None
     value = path.strip().strip("/")
     if not value:
         return None
     if "\\" in value:
-        raise ValueError("path must use '/' separators and must not contain '\\'")
+        raise ValueError(
+            f"{field_name} must use '/' separators and must not contain '\\'"
+        )
     if any(segment in (".", "..") for segment in value.split("/")):
-        raise ValueError(f"path must not contain '.' or '..' segments: {path!r}")
+        raise ValueError(
+            f"{field_name} must not contain '.' or '..' segments: {path!r}"
+        )
     return value
 
 
@@ -461,7 +487,7 @@ def _drive_children_path(
     site_id: str, folder_path: str | None, drive_id: str | None
 ) -> str:
     base = _drive_base(site_id, drive_id)
-    normalized = _normalize_relative_path(folder_path)
+    normalized = _normalize_relative_path(folder_path, field_name="folder_path")
     if not normalized:
         return f"{base}/root/children"
     return f"{base}/root:/{quote(normalized, safe='/')}:/children"
@@ -492,7 +518,7 @@ def _drive_content_path(
         # silently overwriting an unrelated real document with mislabeled
         # text content.
         raise ValueError(f"{field_name} {file_path!r} must not end with a period")
-    normalized = _normalize_relative_path(file_path)
+    normalized = _normalize_relative_path(file_path, field_name=field_name)
     if not normalized:
         raise ValueError(f"{field_name} is required")
     base = _drive_base(site_id, drive_id)
@@ -528,7 +554,7 @@ def _guess_mime_type(name: str) -> str | None:
     uncompressed PDF. Falls back to the standard encoding-to-mimetype
     mapping in that case instead, matching onedrive.py's identical guard.
     """
-    suffix = Path(name).suffix.lower()
+    suffix = _split_stem_suffix(Path(name).name)[1].lower()
     override = _MIME_TYPE_OVERRIDES.get(suffix)
     if override is not None:
         return override
@@ -649,7 +675,7 @@ def sharepoint_list_drives(site_id: str) -> str:
     """List the document libraries (drives) in a SharePoint site."""
     try:
         drives, truncated = _graph_paginate(
-            f"/sites/{_site_segment(site_id)}/drives", {"$top": 200}, limit=200
+            f"{_site_subresource_base(site_id)}/drives", {"$top": 200}, limit=200
         )
         return _success_with_capped_list("drives", drives, truncated=truncated)
     except Exception as e:
@@ -922,7 +948,7 @@ def sharepoint_list_lists(site_id: str, top: int = 50) -> str:
     try:
         capped_top = clamp_limit(top, max_limit=200)
         lists, truncated = _graph_paginate(
-            f"/sites/{_site_segment(site_id)}/lists",
+            f"{_site_subresource_base(site_id)}/lists",
             {"$top": capped_top},
             limit=capped_top,
         )
@@ -940,7 +966,7 @@ def sharepoint_list_list_items(site_id: str, list_id: str, top: int = 50) -> str
     try:
         capped_top = clamp_limit(top, max_limit=200)
         items, truncated = _graph_paginate(
-            f"/sites/{_site_segment(site_id)}/lists/{url_path_id(list_id, 'list_id')}/items",
+            f"{_site_subresource_base(site_id)}/lists/{url_path_id(list_id, 'list_id')}/items",
             {"$top": capped_top, "$expand": "fields"},
             limit=capped_top,
         )
@@ -971,7 +997,7 @@ def sharepoint_create_list_item(site_id: str, list_id: str, fields_json: str) ->
         fields = _parse_fields_json(fields_json)
         result = _graph_request(
             "POST",
-            f"/sites/{_site_segment(site_id)}/lists/{url_path_id(list_id, 'list_id')}/items",
+            f"{_site_subresource_base(site_id)}/lists/{url_path_id(list_id, 'list_id')}/items",
             body={"fields": fields},
         )
         return _success(item=result)
@@ -999,7 +1025,7 @@ def sharepoint_update_list_item(
             raise ValueError("fields_json must contain at least one field to update")
         result = _graph_request(
             "PATCH",
-            f"/sites/{_site_segment(site_id)}/lists/{url_path_id(list_id, 'list_id')}"
+            f"{_site_subresource_base(site_id)}/lists/{url_path_id(list_id, 'list_id')}"
             f"/items/{url_path_id(item_id, 'item_id')}/fields",
             body=fields,
         )
@@ -1021,7 +1047,7 @@ def sharepoint_delete_list_item(site_id: str, list_id: str, item_id: str) -> str
     try:
         _graph_request(
             "DELETE",
-            f"/sites/{_site_segment(site_id)}/lists/{url_path_id(list_id, 'list_id')}"
+            f"{_site_subresource_base(site_id)}/lists/{url_path_id(list_id, 'list_id')}"
             f"/items/{url_path_id(item_id, 'item_id')}",
         )
         return _success(message="List item deleted successfully")

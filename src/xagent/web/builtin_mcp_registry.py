@@ -777,6 +777,11 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.word"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "word",
+                    "version": 1,
+                },
             },
         },
         {

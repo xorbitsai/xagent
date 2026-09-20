@@ -520,6 +520,33 @@ def test_oauth_account_can_connect_matches_runtimes_refresh_skew() -> None:
     assert mcp_api._oauth_account_can_connect(refreshable_within_skew) is True
 
 
+def test_oauth_account_can_connect_exempts_meta_family_from_the_skew_rule() -> None:
+    """Meta's runtime refresh branch (refresh_oauth_token_if_needed's "meta"
+    case) exchanges the stored access_token itself via fb_exchange_token and
+    never looks at refresh_token or expires_at -- see
+    test_meta_expired_token_refresh_uses_fb_exchange_token, which refreshes
+    an already-*expired*, refresh_token-less Meta grant successfully. Every
+    catalog app whose provider_name is "meta" (facebook, instagram, and any
+    UserOAuth row stored under the bare "meta" key) must report connectable
+    regardless of expiry, or the API would say needs_reconnect for a normal,
+    self-healing Meta token while the real tool call would succeed."""
+    now = datetime.now(timezone.utc)
+    expired_no_refresh_token = {
+        "access_token": "old-long-token",
+        "refresh_token": None,
+        "expires_at": now - timedelta(minutes=1),
+    }
+
+    for provider in ("facebook", "instagram", "meta"):
+        account = SimpleNamespace(provider=provider, **expired_no_refresh_token)
+        assert mcp_api._oauth_account_can_connect(account) is True, provider
+
+    # A non-Meta provider in the exact same shape must still report broken --
+    # the exemption must not silently swallow the generic-provider check.
+    other_provider = SimpleNamespace(provider="hubspot", **expired_no_refresh_token)
+    assert mcp_api._oauth_account_can_connect(other_provider) is False
+
+
 def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
     temp_dir = _setup_test_db()
     try:

@@ -49,6 +49,7 @@ from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
+from ..builtin_mcp_registry import get_builtin_public_mcp_app
 from ..mcp_apps import (
     get_all_mcp_apps,
     get_app_for_mcp_server,
@@ -2350,10 +2351,25 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
     across modules silently starts reading the real clock underneath a
     test that believes it has frozen it. Not worth that footgun to remove
     one more copy of a two-line comparison.
+
+    Meta (Facebook Pages, Instagram, Meta Ads, WhatsApp) is a deliberate
+    exception to the ``refresh_token``/skew rule above: its runtime refresh
+    branch exchanges the stored ``access_token`` itself via Facebook's
+    ``fb_exchange_token`` grant and never looks at ``refresh_token`` or
+    ``expires_at`` at all -- see
+    ``test_meta_expired_token_refresh_uses_fb_exchange_token``, which
+    refreshes an already-*expired*, ``refresh_token``-less Meta grant
+    successfully. Treating Meta like every other provider would report
+    ``needs_reconnect`` the moment a normal, self-healing Meta token's
+    stored ``expires_at`` lapses, which is routine for Meta and not an
+    actual problem.
     """
     access_token = getattr(oauth_account, "access_token", None)
     if not access_token:
         return False
+
+    if _is_meta_family_oauth_account(oauth_account):
+        return True
 
     expires_at = getattr(oauth_account, "expires_at", None)
     if not isinstance(expires_at, datetime):
@@ -2366,6 +2382,25 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
 
     return expires_at > datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW
+
+
+def _is_meta_family_oauth_account(oauth_account: object) -> bool:
+    """Whether this grant's provider key resolves to Meta's OAuth provider.
+
+    ``UserOAuth.provider`` for an app-scoped connect is the catalog
+    ``app_id`` (e.g. "facebook"), not the provider itself ("meta") --
+    resolved via the static builtin registry (no DB access) rather than a
+    hardcoded app_id list, so a future Meta-family app added to the
+    catalog doesn't need a second, easy-to-forget update here.
+    """
+    provider = getattr(oauth_account, "provider", None)
+    if not provider:
+        return False
+    provider = str(provider)
+    if provider.lower() == "meta":
+        return True
+    app_row = get_builtin_public_mcp_app(provider)
+    return bool(app_row) and str(app_row.get("provider_name", "")).lower() == "meta"
 
 
 def _oauth_keys_for_app(app: dict) -> list[str]:

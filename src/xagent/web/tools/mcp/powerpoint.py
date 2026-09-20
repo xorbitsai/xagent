@@ -63,6 +63,7 @@ _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 # is also in its recommended 5-10 MiB "best practice" range, and matches
 # onedrive.py's own chunk size for the same API.
 _UPLOAD_SESSION_CHUNK_BYTES = 5 * 1024 * 1024
+_UPLOAD_CANCEL_TIMEOUT_SECONDS = 10
 
 # python-pptx has no public API for adding a slide at other than the layout
 # picked, or for removing one at all -- see _delete_slide's own docstring
@@ -94,58 +95,86 @@ class _PresentationSnapshot:
     etag: str
 
 
-def _success(**payload: Any) -> str:
-    return json.dumps({"status": "success", **payload}, ensure_ascii=False)
-
-
-def _error(message: str, *, details: Any = None) -> str:
-    payload: dict[str, Any] = {"status": "error", "message": message}
-    if details is not None:
-        payload["details"] = details
-    return json.dumps(payload, ensure_ascii=False)
-
-
-def _conflict(message: str) -> str:
-    return json.dumps({"status": "conflict", "message": message}, ensure_ascii=False)
-
-
-def _indeterminate(message: str) -> str:
-    return json.dumps(
-        {
-            "status": "indeterminate",
-            "message": message,
-            "safe_to_retry": False,
-        },
-        ensure_ascii=False,
-    )
-
-
 def _compact_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _bounded_error(message: str, *, details: Any = None) -> str:
-    """Return a valid error envelope that fits the platform's string cap."""
+def _bounded_envelope(
+    candidates: list[dict[str, Any]], *, fallback: dict[str, Any]
+) -> str:
+    """Choose the richest valid JSON envelope that the string filter won't cut."""
     max_chars = get_tool_max_output_length()
-    candidates = []
+    for payload in candidates:
+        response = _compact_json(payload)
+        if len(response) <= max_chars:
+            return response
+    # An operator can configure a cap below even the smallest contract-bearing
+    # object. Preserve valid JSON and the outcome status rather than pretending
+    # an empty object is a usable mutation result.
+    return _compact_json(fallback)
+
+
+def _caller_safe_item(item: Any) -> dict[str, Any]:
+    """Keep only stable, scalar driveItem fields useful after a mutation."""
+    if not isinstance(item, dict):
+        return {}
+    return {
+        field: value
+        for field in ("id", "name", "eTag", "cTag", "size", "webUrl")
+        if isinstance((value := item.get(field)), (str, int, float, bool))
+    }
+
+
+def _success(**payload: Any) -> str:
+    compact_payload = dict(payload)
+    if "item" in compact_payload:
+        compact_payload["item"] = _caller_safe_item(compact_payload["item"])
+    without_item = {
+        key: value for key, value in compact_payload.items() if key != "item"
+    }
+    return _bounded_envelope(
+        [
+            {"status": "success", **payload},
+            {"status": "success", **compact_payload},
+            {"status": "success", **without_item},
+            {"status": "success"},
+        ],
+        fallback={"status": "success"},
+    )
+
+
+def _error(message: str, *, details: Any = None) -> str:
+    candidates: list[dict[str, Any]] = []
     if details is not None:
         candidates.append({"status": "error", "message": message, "details": details})
     candidates.extend(
         [
             {"status": "error", "message": message},
-            {"status": "error", "message": "Tool output limit is too small"},
+            {"status": "error", "message": "output cap too small"},
             {"status": "error"},
-            {},
         ]
     )
-    for payload in candidates:
-        response = _compact_json(payload)
-        if len(response) <= max_chars:
-            return response
-    # A configured limit below two characters cannot carry any valid JSON.
-    # Returning the smallest valid document is still preferable to emitting a
-    # knowingly malformed partial envelope.
-    return "{}"
+    return _bounded_envelope(candidates, fallback={"status": "error"})
+
+
+def _conflict(message: str) -> str:
+    return _bounded_envelope(
+        [{"status": "conflict", "message": message}, {"status": "conflict"}],
+        fallback={"status": "conflict"},
+    )
+
+
+def _indeterminate(message: str) -> str:
+    minimal = {"status": "indeterminate", "safe_to_retry": False}
+    return _bounded_envelope(
+        [{**minimal, "message": message}, minimal],
+        fallback=minimal,
+    )
+
+
+def _bounded_error(message: str, *, details: Any = None) -> str:
+    """Backward-compatible name used by bounded read response builders."""
+    return _error(message, details=details)
 
 
 def _encode_read_cursor(index: int, etag: str, scope: str) -> str:
@@ -634,6 +663,7 @@ def _upload_presentation_session(
                 response.raise_for_status()
             except requests.HTTPError:
                 if response.status_code == 412:
+                    _cancel_upload_session(http, upload_url)
                     raise _ConflictError(
                         "The presentation changed before the update could be committed"
                     ) from None
@@ -643,6 +673,7 @@ def _upload_presentation_session(
                         "final response was lost; do not retry without reading the "
                         "presentation again"
                     ) from None
+                _cancel_upload_session(http, upload_url)
                 raise _GraphRequestError(
                     "PowerPoint presentation upload failed with HTTP "
                     f"{response.status_code}",
@@ -655,6 +686,7 @@ def _upload_presentation_session(
                         "final response was lost; do not retry without reading the "
                         "presentation again"
                     ) from None
+                _cancel_upload_session(http, upload_url)
                 raise RuntimeError("PowerPoint presentation upload failed") from None
 
             if response.status_code in (200, 201):
@@ -672,15 +704,18 @@ def _upload_presentation_session(
                 ranges = payload["nextExpectedRanges"]
                 offsets = [int(value.split("-", 1)[0]) for value in ranges]
             except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                _cancel_upload_session(http, upload_url)
                 raise RuntimeError(
                     "Graph returned invalid PowerPoint upload-session progress"
                 ) from exc
             if not offsets:
+                _cancel_upload_session(http, upload_url)
                 raise RuntimeError(
                     "Graph returned empty PowerPoint upload-session progress"
                 )
             next_start = min(offsets)
             if not start < next_start <= end:
+                _cancel_upload_session(http, upload_url)
                 raise RuntimeError(
                     "Graph returned inconsistent PowerPoint upload-session progress"
                 )
@@ -694,6 +729,18 @@ def _upload_presentation_session(
     safe_item = dict(result)
     safe_item.pop("@microsoft.graph.downloadUrl", None)
     return safe_item
+
+
+def _cancel_upload_session(http: Any, upload_url: str) -> None:
+    """Best-effort cleanup for a session known not to have committed.
+
+    The URL is a bearer secret, so cancellation failures are deliberately
+    swallowed without logging or exception chaining.
+    """
+    try:
+        http.delete(upload_url, timeout=_UPLOAD_CANCEL_TIMEOUT_SECONDS)
+    except requests.RequestException:
+        pass
 
 
 def _create_only_upload(
@@ -756,6 +803,7 @@ def _create_only_upload(
     except requests.HTTPError:
         status_code = response.status_code
         if status_code == 409:
+            _cancel_upload_session(requests, upload_url)
             raise ValueError(
                 f"{file_path!r} already exists; use the other powerpoint_* "
                 "tools to edit it instead of recreating it"
@@ -765,6 +813,7 @@ def _create_only_upload(
                 "Graph may have created the PowerPoint presentation, but its final "
                 "response was lost; check whether the file exists before retrying"
             ) from None
+        _cancel_upload_session(requests, upload_url)
         raise _GraphRequestError(
             f"PowerPoint presentation upload failed with HTTP {status_code}",
             status_code=status_code,

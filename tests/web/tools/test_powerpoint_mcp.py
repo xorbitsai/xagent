@@ -12,6 +12,7 @@ from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
+from xagent.core.tools.adapters.vibe.output_filter import OutputValueFilter
 from xagent.web.tools.mcp import powerpoint
 
 
@@ -92,6 +93,54 @@ def _mock_versioned_write(monkeypatch, content: bytes, etag: str = '"etag-1"'):
 @pytest.fixture(autouse=True)
 def _credentials(monkeypatch):
     monkeypatch.setenv("AUTH_TOKEN", "test-graph-token")
+
+
+@pytest.mark.parametrize(
+    ("response_factory", "expected_status"),
+    [
+        (
+            lambda: powerpoint._success(
+                item={"id": "x" * 500, "description": "y" * 500},
+                slide_index=3,
+            ),
+            "success",
+        ),
+        (lambda: powerpoint._error("x" * 500, details={"raw": "y" * 500}), "error"),
+        (lambda: powerpoint._conflict("x" * 500), "conflict"),
+        (lambda: powerpoint._indeterminate("x" * 500), "indeterminate"),
+    ],
+)
+def test_outcome_envelopes_survive_platform_string_filter(
+    monkeypatch, response_factory, expected_status
+):
+    """Mutation outcomes must be valid JSON after the generic output filter.
+
+    That filter truncates strings without understanding JSON, so PowerPoint
+    must make each envelope fit before returning it.
+    """
+    max_chars = 80
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: max_chars)
+
+    raw = response_factory()
+    filtered = OutputValueFilter(
+        max_chars=max_chars, max_fields=100, max_recursion=10
+    ).filter(raw, "powerpoint_mutation")
+
+    assert filtered == raw
+    assert len(raw) <= max_chars
+    result = json.loads(filtered)
+    assert result["status"] == expected_status
+    if expected_status == "indeterminate":
+        assert result["safe_to_retry"] is False
+
+
+def test_success_envelope_preserves_provider_metadata_when_it_fits(monkeypatch):
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 500)
+    item = {"id": "item-1", "customFacet": {"value": "kept"}}
+
+    result = json.loads(powerpoint._success(item=item))
+
+    assert result["item"] == item
 
 
 # ---------------------------------------------------------------------------
@@ -415,11 +464,43 @@ def test_create_presentation_keeps_final_upload_conflict_definite(monkeypatch):
         "put",
         Mock(return_value=MockResponse({}, status_code=409)),
     )
+    # Cleanup is best-effort and must not replace the original definite error,
+    # even if the provider rejects or loses the DELETE too.
+    mock_delete = Mock(side_effect=requests.ConnectionError("cleanup failed"))
+    monkeypatch.setattr(powerpoint.requests, "delete", mock_delete)
 
     result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptx"))
 
     assert result["status"] == "error"
     assert "already exists" in result["message"]
+    mock_delete.assert_called_once_with(
+        "https://upload.example/session",
+        timeout=powerpoint._UPLOAD_CANCEL_TIMEOUT_SECONDS,
+    )
+
+
+def test_create_only_upload_cancels_session_after_definite_http_failure(monkeypatch):
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": secret_url})),
+    )
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "put",
+        Mock(return_value=MockResponse({}, status_code=400, url=secret_url)),
+    )
+    mock_delete = Mock(return_value=MockResponse({}, status_code=204))
+    monkeypatch.setattr(powerpoint.requests, "delete", mock_delete)
+
+    with pytest.raises(powerpoint._GraphRequestError) as exc_info:
+        powerpoint._create_only_upload(b"content", "Deck.pptx", None, None)
+
+    assert "super-secret-value" not in str(exc_info.value)
+    mock_delete.assert_called_once_with(
+        secret_url, timeout=powerpoint._UPLOAD_CANCEL_TIMEOUT_SECONDS
+    )
 
 
 def test_create_presentation_upload_failure_does_not_leak_session_url(monkeypatch):
@@ -840,6 +921,31 @@ def test_add_slide_reports_unrequested_content_as_not_applied(monkeypatch):
     assert result["body_applied"] is False
 
 
+def test_committed_add_slide_result_survives_low_platform_output_cap(monkeypatch):
+    content = _pptx_bytes()
+    _, _, mock_put = _mock_versioned_write(monkeypatch, content)
+    mock_put.return_value = MockResponse(
+        {
+            "id": "item-1",
+            "name": "Deck.pptx",
+            "description": "provider metadata " * 100,
+            "thumbnails": [{"large": {"url": "https://example.test/" + "x" * 500}}],
+        },
+        status_code=200,
+    )
+    max_chars = 80
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: max_chars)
+
+    raw = powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"')
+    filtered = OutputValueFilter(
+        max_chars=max_chars, max_fields=100, max_recursion=10
+    ).filter(raw, "powerpoint_add_slide")
+
+    assert filtered == raw
+    assert len(raw) <= max_chars
+    assert json.loads(filtered)["status"] == "success"
+
+
 def test_add_slide_rejects_out_of_range_layout(monkeypatch):
     _mock_download(monkeypatch, _pptx_bytes())
     mock_session_cls = MagicMock()
@@ -1141,7 +1247,8 @@ def test_upload_presentation_session_failure_does_not_leak_session_url(monkeypat
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
     mock_put = Mock(return_value=MockResponse({}, status_code=500, url=secret_url))
     mock_session_cls = MagicMock()
-    mock_session_cls.return_value.__enter__.return_value.put = mock_put
+    mock_http = mock_session_cls.return_value.__enter__.return_value
+    mock_http.put = mock_put
     monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
 
     with pytest.raises(powerpoint._IndeterminateWriteError) as exc_info:
@@ -1151,6 +1258,62 @@ def test_upload_presentation_session_failure_does_not_leak_session_url(monkeypat
 
     assert exc_info.value.__cause__ is None
     assert "super-secret-value" not in str(exc_info.value)
+    mock_http.delete.assert_not_called()
+
+
+def test_upload_session_cancels_after_definite_nonfinal_failure(monkeypatch):
+    secret_url = "https://upload.example/session?token=super-secret-value"
+    monkeypatch.setattr(powerpoint, "_UPLOAD_SESSION_CHUNK_BYTES", 5)
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": secret_url})),
+    )
+    responses = iter(
+        [
+            MockResponse({"nextExpectedRanges": ["5-"]}, status_code=202),
+            MockResponse({}, status_code=400, url=secret_url),
+        ]
+    )
+    mock_session_cls = MagicMock()
+    mock_http = mock_session_cls.return_value.__enter__.return_value
+    mock_http.put = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
+
+    with pytest.raises(powerpoint._GraphRequestError) as exc_info:
+        powerpoint._upload_presentation_session(
+            b"0123456789", "Deck.pptx", None, None, '"etag-1"'
+        )
+
+    assert "super-secret-value" not in str(exc_info.value)
+    mock_http.delete.assert_called_once_with(
+        secret_url, timeout=powerpoint._UPLOAD_CANCEL_TIMEOUT_SECONDS
+    )
+
+
+def test_upload_session_cancels_after_invalid_progress(monkeypatch):
+    upload_url = "https://upload.example/session"
+    monkeypatch.setattr(powerpoint, "_UPLOAD_SESSION_CHUNK_BYTES", 5)
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "request",
+        Mock(return_value=MockResponse({"uploadUrl": upload_url})),
+    )
+    mock_session_cls = MagicMock()
+    mock_http = mock_session_cls.return_value.__enter__.return_value
+    mock_http.put = Mock(
+        return_value=MockResponse({"nextExpectedRanges": []}, status_code=202)
+    )
+    monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
+
+    with pytest.raises(RuntimeError, match="empty.*progress"):
+        powerpoint._upload_presentation_session(
+            b"0123456789", "Deck.pptx", None, None, '"etag-1"'
+        )
+
+    mock_http.delete.assert_called_once_with(
+        upload_url, timeout=powerpoint._UPLOAD_CANCEL_TIMEOUT_SECONDS
+    )
 
 
 def test_upload_session_follows_server_reported_next_offset(monkeypatch):

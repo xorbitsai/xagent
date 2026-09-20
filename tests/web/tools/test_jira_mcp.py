@@ -555,7 +555,7 @@ def test_update_issue_rejects_empty_summary(monkeypatch):
     mock_request.assert_not_called()
 
 
-def test_update_issue_rejects_whitespace_only_summary(monkeypatch):
+def test_update_issue_rejects_padded_summary(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(jira.requests, "request", mock_request)
 
@@ -578,7 +578,7 @@ def test_update_issue_rejects_empty_priority(monkeypatch):
     mock_request.assert_not_called()
 
 
-def test_update_issue_rejects_whitespace_only_priority(monkeypatch):
+def test_update_issue_rejects_padded_priority(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(jira.requests, "request", mock_request)
 
@@ -601,12 +601,14 @@ def test_summary_and_priority_rejection_does_not_log_an_error(monkeypatch, caplo
         create_result = json.loads(
             jira.jira_create_issue(project_key="ENG", summary="")
         )
-        update_result = json.loads(
-            jira.jira_update_issue("ENG-1", summary="", priority="")
+        update_summary_result = json.loads(jira.jira_update_issue("ENG-1", summary=""))
+        update_priority_result = json.loads(
+            jira.jira_update_issue("ENG-1", priority="")
         )
 
     assert create_result["status"] == "error"
-    assert update_result["status"] == "error"
+    assert update_summary_result["status"] == "error"
+    assert update_priority_result["status"] == "error"
     assert caplog.records == []
 
 

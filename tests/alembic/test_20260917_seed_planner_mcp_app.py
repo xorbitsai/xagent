@@ -130,6 +130,36 @@ def test_downgrade_preserves_operator_modified_row(tmp_path):
         assert "planner" in _app_ids(connection)
 
 
+def test_downgrade_skips_delete_when_snapshot_columns_missing(tmp_path):
+    """sa.delete(table).where(*conditions) with an empty conditions list
+    compiles to an unconditional DELETE FROM public_mcp_apps -- if none of
+    the snapshot columns (app_id/name/description/transport) exist on the
+    live table, downgrade() must skip the delete entirely rather than
+    wiping every row in the shared catalog table."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    icon VARCHAR(1000)
+                )
+                """
+            )
+        )
+        connection.execute(
+            text("INSERT INTO public_mcp_apps (id, icon) VALUES (1, 'unrelated-row')")
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        remaining = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps")
+        ).scalar()
+        assert remaining == 1
+
+
 def test_upgrade_warns_and_skips_missing_columns(tmp_path):
     """upgrade() must still insert a row when the live table is missing a
     column ROW defines (e.g. an out-of-order migration state), omitting

@@ -589,6 +589,32 @@ def test_update_task_rejects_blank_due_date_time():
     assert "due_date_time" in result["message"]
 
 
+def test_update_task_strips_due_and_start_date_time(monkeypatch):
+    responses = iter(
+        [
+            MockResponse({"id": "task-1", "@odata.etag": 'W/"etag-1"'}),
+            MockResponse({}, status_code=204, content=b""),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(
+        planner.planner_update_task(
+            "task-1",
+            due_date_time=" 2026-09-30T00:00:00Z ",
+            start_date_time=" 2026-09-01T00:00:00Z ",
+        )
+    )
+
+    assert result["status"] == "success"
+    patch_call = mock_request.call_args_list[1]
+    assert patch_call.kwargs["json"] == {
+        "dueDateTime": "2026-09-30T00:00:00Z",
+        "startDateTime": "2026-09-01T00:00:00Z",
+    }
+
+
 def test_update_task_rejects_blank_start_date_time():
     result = json.loads(planner.planner_update_task("task-1", start_date_time="   "))
     assert result["status"] == "error"

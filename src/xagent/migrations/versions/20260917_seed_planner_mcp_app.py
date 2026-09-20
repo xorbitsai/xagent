@@ -90,6 +90,13 @@ def downgrade() -> None:
     # rather than overwriting it), and an unconditional delete-by-app_id here
     # would then destroy that unrelated row on a later rollback.
     snapshot_columns = {"app_id", "name", "description", "transport"} & columns
+    if not snapshot_columns:
+        # sa.delete(...).where() with no conditions compiles to an
+        # unconditional DELETE FROM public_mcp_apps -- if none of the
+        # snapshot columns exist on this table, there is nothing safe to
+        # match on, so skip the delete rather than wiping every connector's
+        # catalog row (Outlook/Teams/OneDrive and any operator-added apps).
+        return
     conditions = [
         PUBLIC_MCP_APPS_TABLE.c[key] == ROW[key] for key in sorted(snapshot_columns)
     ]

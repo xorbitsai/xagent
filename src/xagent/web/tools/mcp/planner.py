@@ -481,13 +481,21 @@ def planner_update_task(
                 raise ValueError("priority must be between 0 and 10")
             body["priority"] = priority
         if due_date_time is not None:
-            if due_date_time != "" and not due_date_time.strip():
-                raise ValueError("due_date_time cannot be blank")
-            body["dueDateTime"] = due_date_time or None
+            if due_date_time == "":
+                body["dueDateTime"] = None
+            else:
+                due_date_time = due_date_time.strip()
+                if not due_date_time:
+                    raise ValueError("due_date_time cannot be blank")
+                body["dueDateTime"] = due_date_time
         if start_date_time is not None:
-            if start_date_time != "" and not start_date_time.strip():
-                raise ValueError("start_date_time cannot be blank")
-            body["startDateTime"] = start_date_time or None
+            if start_date_time == "":
+                body["startDateTime"] = None
+            else:
+                start_date_time = start_date_time.strip()
+                if not start_date_time:
+                    raise ValueError("start_date_time cannot be blank")
+                body["startDateTime"] = start_date_time
         if not body:
             raise ValueError("at least one field must be provided to update the task")
 

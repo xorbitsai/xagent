@@ -82,6 +82,22 @@ def test_etag_guarded_write_uses_supplied_etag(monkeypatch):
     assert mock_request.call_args.kwargs["headers"]["If-Match"] == 'W/"supplied"'
 
 
+def test_etag_guarded_write_raises_conflict_on_412(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({}, status_code=412))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    with pytest.raises(planner._EtagConflictError):
+        planner._etag_guarded_write("/planner/tasks/task-1", "DELETE", etag='W/"stale"')
+
+
+def test_etag_guarded_write_reraises_non_412_graph_error(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({}, status_code=404))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    with pytest.raises(planner._GraphRequestError):
+        planner._etag_guarded_write("/planner/tasks/task-1", "DELETE", etag='W/"x"')
+
+
 def test_build_assignments_empty_returns_none():
     assert planner._build_assignments(None) is None
     assert planner._build_assignments([]) is None
@@ -230,19 +246,40 @@ def test_create_plan_strips_title_whitespace(monkeypatch):
     assert mock_request.call_args.kwargs["json"]["title"] == "New plan"
 
 
+def test_get_plan_success(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"id": "plan-1", "title": "Plan"}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_get_plan("plan-1"))
+
+    assert result["status"] == "success"
+    assert result["plan"] == {"id": "plan-1", "title": "Plan"}
+    assert mock_request.call_args.kwargs["url"].endswith("/planner/plans/plan-1")
+
+
 # ---------------------------------------------------------------------------
 # buckets
 # ---------------------------------------------------------------------------
 
 
 def test_list_buckets_success(monkeypatch):
-    mock_request = Mock(return_value=MockResponse({"value": [{"id": "bucket-1"}]}))
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "value": [{"id": "bucket-1"}],
+                "@odata.nextLink": f"{planner.GRAPH_BASE_URL}/planner/plans/plan-1/buckets?%24skip=50",
+            }
+        )
+    )
     monkeypatch.setattr(planner.requests, "request", mock_request)
 
     result = json.loads(planner.planner_list_buckets("plan-1"))
 
     assert result["status"] == "success"
     assert result["buckets"] == [{"id": "bucket-1"}]
+    assert result["next_link"] == (
+        f"{planner.GRAPH_BASE_URL}/planner/plans/plan-1/buckets?%24skip=50"
+    )
     assert mock_request.call_args.kwargs["url"].endswith(
         "/planner/plans/plan-1/buckets"
     )
@@ -287,13 +324,23 @@ def test_create_bucket_rejects_malformed_plan_id():
 
 
 def test_list_tasks_success(monkeypatch):
-    mock_request = Mock(return_value=MockResponse({"value": [{"id": "task-1"}]}))
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "value": [{"id": "task-1"}],
+                "@odata.nextLink": f"{planner.GRAPH_BASE_URL}/planner/plans/plan-1/tasks?%24skip=50",
+            }
+        )
+    )
     monkeypatch.setattr(planner.requests, "request", mock_request)
 
     result = json.loads(planner.planner_list_tasks("plan-1"))
 
     assert result["status"] == "success"
     assert result["tasks"] == [{"id": "task-1"}]
+    assert result["next_link"] == (
+        f"{planner.GRAPH_BASE_URL}/planner/plans/plan-1/tasks?%24skip=50"
+    )
     assert mock_request.call_args.kwargs["url"].endswith("/planner/plans/plan-1/tasks")
 
 
@@ -309,13 +356,23 @@ def test_list_tasks_fetches_next_page(monkeypatch):
 
 
 def test_list_my_tasks_success(monkeypatch):
-    mock_request = Mock(return_value=MockResponse({"value": [{"id": "task-1"}]}))
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "value": [{"id": "task-1"}],
+                "@odata.nextLink": f"{planner.GRAPH_BASE_URL}/me/planner/tasks?%24skip=50",
+            }
+        )
+    )
     monkeypatch.setattr(planner.requests, "request", mock_request)
 
     result = json.loads(planner.planner_list_my_tasks())
 
     assert result["status"] == "success"
     assert result["tasks"] == [{"id": "task-1"}]
+    assert (
+        result["next_link"] == f"{planner.GRAPH_BASE_URL}/me/planner/tasks?%24skip=50"
+    )
     assert mock_request.call_args.kwargs["url"].endswith("/me/planner/tasks")
 
 
@@ -328,6 +385,34 @@ def test_list_my_tasks_fetches_next_page(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["url"] == next_link
+
+
+def test_get_task_success(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"id": "task-1", "title": "Write report"})
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_get_task("task-1"))
+
+    assert result["status"] == "success"
+    assert result["task"] == {"id": "task-1", "title": "Write report"}
+    assert mock_request.call_args.kwargs["url"].endswith("/planner/tasks/task-1")
+
+
+def test_get_task_details_success(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"description": "Notes", "checklist": {}})
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_get_task_details("task-1"))
+
+    assert result["status"] == "success"
+    assert result["details"] == {"description": "Notes", "checklist": {}}
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/planner/tasks/task-1/details"
+    )
 
 
 def test_create_task_with_assignees_and_due_date(monkeypatch):
@@ -495,6 +580,21 @@ def test_update_task_clears_bucket_due_and_start_date_with_empty_string(monkeypa
     }
 
 
+def test_update_task_rejects_blank_due_date_time():
+    """Unlike "" (the clear-the-field sentinel), a whitespace-only value
+    is neither a real timestamp nor a clear request and must be rejected
+    locally rather than forwarded to Graph as an opaque 400."""
+    result = json.loads(planner.planner_update_task("task-1", due_date_time="   "))
+    assert result["status"] == "error"
+    assert "due_date_time" in result["message"]
+
+
+def test_update_task_rejects_blank_start_date_time():
+    result = json.loads(planner.planner_update_task("task-1", start_date_time="   "))
+    assert result["status"] == "error"
+    assert "start_date_time" in result["message"]
+
+
 def test_delete_task_fetches_etag_and_sends_if_match(monkeypatch):
     responses = iter(
         [
@@ -513,9 +613,71 @@ def test_delete_task_fetches_etag_and_sends_if_match(monkeypatch):
     assert delete_call.kwargs["headers"]["If-Match"] == 'W/"etag-1"'
 
 
+def test_delete_task_returns_conflict_on_stale_etag(monkeypatch):
+    responses = iter(
+        [
+            MockResponse({"id": "task-1", "@odata.etag": 'W/"etag-1"'}),
+            MockResponse({}, status_code=412),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_delete_task("task-1"))
+
+    assert result["status"] == "conflict_stale_version"
+
+
+def test_update_task_returns_conflict_on_stale_etag(monkeypatch):
+    responses = iter(
+        [
+            MockResponse({"id": "task-1", "@odata.etag": 'W/"etag-1"'}),
+            MockResponse({}, status_code=412),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_update_task("task-1", title="New title"))
+
+    assert result["status"] == "conflict_stale_version"
+
+
 def test_assign_task_requires_user_ids():
     result = json.loads(planner.planner_assign_task("task-1", []))
     assert result["status"] == "error"
+
+
+def test_assign_task_rejects_non_list_user_ids():
+    result = json.loads(planner.planner_assign_task("task-1", "user-1"))
+    assert result["status"] == "error"
+    assert "user_ids" in result["message"]
+
+
+def test_assign_task_sends_body_and_if_match(monkeypatch):
+    responses = iter(
+        [
+            MockResponse({"id": "task-1", "@odata.etag": 'W/"etag-1"'}),
+            MockResponse({}, status_code=204, content=b""),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_assign_task("task-1", ["user-1"]))
+
+    assert result["status"] == "success"
+    patch_call = mock_request.call_args_list[1]
+    assert patch_call.kwargs["headers"]["If-Match"] == 'W/"etag-1"'
+    assert patch_call.kwargs["json"] == {
+        "assignments": {"user-1": {"@odata.type": "#microsoft.graph.plannerAssignment"}}
+    }
+
+
+def test_unassign_task_rejects_non_list_user_ids():
+    result = json.loads(planner.planner_unassign_task("task-1", "user-1"))
+    assert result["status"] == "error"
+    assert "user_ids" in result["message"]
 
 
 def test_unassign_task_sends_null_per_user(monkeypatch):

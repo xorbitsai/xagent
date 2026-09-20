@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import uuid
 from typing import Any
 from urllib.parse import unquote
@@ -37,6 +38,11 @@ class _GraphRequestError(RuntimeError):
         self.status_code = status_code
 
 
+class _EtagConflictError(RuntimeError):
+    """Raised when an etag-guarded write loses an optimistic-concurrency
+    race (Graph responded 412 Precondition Failed)."""
+
+
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
@@ -46,6 +52,12 @@ def _error(message: str, *, details: Any = None) -> str:
     if details is not None:
         payload["details"] = details
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _conflict(message: str) -> str:
+    return json.dumps(
+        {"status": "conflict_stale_version", "message": message}, ensure_ascii=False
+    )
 
 
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -139,11 +151,42 @@ def _etag_guarded_write(
     write with 412 rather than silently applying it, so this is a pure
     latency optimization, not a weaker safety guarantee. When omitted, a
     fresh etag is fetched immediately before the write, as before.
+
+    A 412 response is this mechanism's designed outcome (a concurrent edit
+    won the race), not a generic failure, so it's raised as _EtagConflictError
+    rather than left as an opaque _GraphRequestError -- every caller catches
+    it separately to return a structured conflict_stale_version response,
+    mirroring outlook.py's handling of the same status code.
     """
     resolved_etag = etag or _current_etag(path)
-    return _graph_request(
-        method, path, body=body, extra_headers={"If-Match": resolved_etag}
-    )
+    try:
+        return _graph_request(
+            method, path, body=body, extra_headers={"If-Match": resolved_etag}
+        )
+    except _GraphRequestError as exc:
+        if exc.status_code == 412:
+            raise _EtagConflictError(
+                "This item changed before the update could be applied. Read "
+                "it again and retry."
+            ) from exc
+        raise
+
+
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
+def _normalize_percent_escape_case(path: str) -> str:
+    """Uppercase the hex digits of every %XX escape in ``path``.
+
+    RFC 3986 percent-encoded octets are case-insensitive (%2F and %2f are
+    the same character), so this lets a next_link that differs from
+    default_path only in hex-digit casing compare equal. Unlike
+    ``unquote()``, this never turns an escaped character back into its
+    literal form -- %2F stays %2F rather than becoming a real "/" -- so it
+    can't blur the boundary between a genuine path separator and a
+    percent-encoded one sitting inside a single segment.
+    """
+    return _PERCENT_ESCAPE_RE.sub(lambda m: m.group(0).upper(), path)
 
 
 def _resolve_list_path(default_path: str, next_link: str | None) -> str:
@@ -161,11 +204,18 @@ def _resolve_list_path(default_path: str, next_link: str | None) -> str:
     exact same collection as the request that produced it, differing only
     in its query string ($skip/$skiptoken), so comparing the path portion
     against default_path accepts every legitimate value while rejecting a
-    forged one. Both sides are percent-decoded before comparing since
-    RFC 3986 percent-encoded octets are case-insensitive (e.g. %2F and %2f
-    are the same character) -- comparing the raw, still-encoded strings
-    could reject a legitimate next_link over nothing but a hex-digit
-    casing difference.
+    forged one.
+
+    The comparison normalizes percent-escape hex-digit casing only -- it
+    deliberately does not fully decode either side. A caller-supplied
+    next_link is untrusted, and requests/urllib3 percent-decode some
+    escapes (e.g. %2E -> '.') without re-collapsing dot segments that
+    decoding reveals, while leaving others (%2F) encoded; comparing on a
+    fully-decoded representation would validate a different string than
+    the one actually sent, and could accept dot-segments that decoding
+    only reveals after this check has already passed. As defense in
+    depth, any decoded dot segment in the candidate path is rejected
+    outright, mirroring outlook.py's _next_link_path.
     """
     if next_link is None:
         return default_path
@@ -175,7 +225,15 @@ def _resolve_list_path(default_path: str, next_link: str | None) -> str:
             "call to this tool"
         )
     path = next_link[len(GRAPH_BASE_URL) :]
-    if unquote(path.split("?", 1)[0]) != unquote(default_path):
+    candidate = path.split("?", 1)[0]
+    if _normalize_percent_escape_case(candidate) != _normalize_percent_escape_case(
+        default_path
+    ):
+        raise ValueError(
+            "next_link must be a @odata.nextLink value returned by a previous "
+            "call to this tool"
+        )
+    if any(segment in {".", ".."} for segment in unquote(candidate).split("/")):
         raise ValueError(
             "next_link must be a @odata.nextLink value returned by a previous "
             "call to this tool"
@@ -423,8 +481,12 @@ def planner_update_task(
                 raise ValueError("priority must be between 0 and 10")
             body["priority"] = priority
         if due_date_time is not None:
+            if due_date_time != "" and not due_date_time.strip():
+                raise ValueError("due_date_time cannot be blank")
             body["dueDateTime"] = due_date_time or None
         if start_date_time is not None:
+            if start_date_time != "" and not start_date_time.strip():
+                raise ValueError("start_date_time cannot be blank")
             body["startDateTime"] = start_date_time or None
         if not body:
             raise ValueError("at least one field must be provided to update the task")
@@ -432,6 +494,8 @@ def planner_update_task(
         task_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task updated successfully")
+    except _EtagConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error("Error updating Planner task %s: %s", task_id, e)
         return _error(str(e))
@@ -445,12 +509,16 @@ def planner_assign_task(
     existing assignees. To unassign a user, use planner_unassign_task.
     etag is optional -- see planner_update_task."""
     try:
+        if not isinstance(user_ids, list):
+            raise TypeError("user_ids must be a list of strings")
         if not user_ids:
             raise ValueError("user_ids is required")
         task_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
         body = {"assignments": _build_assignments(user_ids)}
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task assigned successfully")
+    except _EtagConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error("Error assigning Planner task %s: %s", task_id, e)
         return _error(str(e))
@@ -463,12 +531,16 @@ def planner_unassign_task(
     """Remove one or more users from a Planner task's assignments. etag is
     optional -- see planner_update_task."""
     try:
+        if not isinstance(user_ids, list):
+            raise TypeError("user_ids must be a list of strings")
         if not user_ids:
             raise ValueError("user_ids is required")
         task_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
         body = {"assignments": dict.fromkeys(_validated_user_ids(user_ids))}
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task unassigned successfully")
+    except _EtagConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error("Error unassigning Planner task %s: %s", task_id, e)
         return _error(str(e))
@@ -481,6 +553,8 @@ def planner_delete_task(task_id: str, etag: str | None = None) -> str:
         task_path = f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
         _etag_guarded_write(task_path, "DELETE", etag=etag)
         return _success(message="Task deleted successfully")
+    except _EtagConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error("Error deleting Planner task %s: %s", task_id, e)
         return _error(str(e))
@@ -512,6 +586,8 @@ def planner_update_task_description(
             details_path, "PATCH", body={"description": description}, etag=etag
         )
         return _success(message="Task description updated successfully")
+    except _EtagConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error("Error updating Planner task description for %s: %s", task_id, e)
         return _error(str(e))
@@ -541,6 +617,8 @@ def planner_add_checklist_item(
         }
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(checklist_item_id=item_id)
+    except _EtagConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error("Error adding checklist item to Planner task %s: %s", task_id, e)
         return _error(str(e))
@@ -565,6 +643,8 @@ def planner_set_checklist_item_checked(
         }
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(message="Checklist item updated successfully")
+    except _EtagConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error(
             "Error updating checklist item %s on Planner task %s: %s",
@@ -586,6 +666,8 @@ def planner_delete_checklist_item(
         body = {"checklist": {require_clean_identifier(item_id, "item_id"): None}}
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(message="Checklist item deleted successfully")
+    except _EtagConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error(
             "Error deleting checklist item %s from Planner task %s: %s",

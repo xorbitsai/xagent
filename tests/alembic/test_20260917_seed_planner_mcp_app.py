@@ -109,6 +109,56 @@ def test_downgrade_removes_planner(tmp_path):
         assert "planner" not in _app_ids(connection)
 
 
+def test_downgrade_preserves_operator_modified_row(tmp_path):
+    """downgrade() must not delete a row that no longer matches the
+    snapshot this migration seeded -- an operator could have hand-edited
+    it (or hand-created a different app under the same app_id before
+    upgrade() ever ran, since upgrade() no-ops on that collision)."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            connection.execute(
+                text(
+                    "UPDATE public_mcp_apps SET name='Custom Planner' "
+                    "WHERE app_id='planner'"
+                )
+            )
+            migration.downgrade()
+        assert "planner" in _app_ids(connection)
+
+
+def test_upgrade_warns_and_skips_missing_columns(tmp_path):
+    """upgrade() must still insert a row when the live table is missing a
+    column ROW defines (e.g. an out-of-order migration state), omitting
+    only that column rather than failing the whole seed."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    icon VARCHAR(1000),
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    provider_name VARCHAR(50),
+                    is_visible_in_connector BOOLEAN NOT NULL DEFAULT 1,
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert "planner" in _app_ids(connection)
+
+
 def test_upgrade_and_downgrade_no_op_without_table(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

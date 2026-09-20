@@ -804,6 +804,30 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
   })
 
+  it("keeps recovery when a pending task's null run id transitions to its first real run", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    // extractTaskControlEnvelope only resolves a literal `null` run id
+    // through its innermost fallback (data.data.run_id) - a flat top-level
+    // `run_id: null`, the shape a real pending-task snapshot actually sends,
+    // collapses to `undefined` through the `??` chain instead. Exercise the
+    // guard against an actual `null`, which stream.runId's `string | null`
+    // type allows for.
+    send({ state_version: 1, control_state: "idle", status: "pending", data: { data: { run_id: null } } })
+    send({ type: "stream_unavailable" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    // A known-null run transitioning to the task's first real run is not a
+    // change between two known runs - it must not silently clear the
+    // still-unresolved interruption before anything confirms recovery.
+    send({ run_id: "run-1", state_version: 2, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+  })
+
   it("reconciles a gapped shared stream without appending later deltas or accepting an old run", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (message: Partial<TestWebSocketMessage>) => act(() => {

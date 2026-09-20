@@ -2816,12 +2816,14 @@ export function AppProvider({
         // whatever run preceded it - carrying a stale `true` forward would
         // flag the very first snapshot of a brand-new, healthy run. But
         // going from "no run known yet" to "this run" is NOT a run change:
-        // stream.runId starts undefined, and an explicit stream_unavailable/
+        // stream.runId starts undefined, and the backend reports `null` for
+        // a task that hasn't started running yet (both mean "nothing to
+        // compare against" the same way) - an explicit stream_unavailable/
         // stream_resync_required for the CURRENT run can set interrupted
-        // before its first snapshot ever arrives - only a defined-to-
-        // different-defined transition is a genuine new run.
+        // before its first snapshot with a real run id ever arrives. Only a
+        // known-to-different-known transition is a genuine new run.
         const isNewRun =
-          stream.runId !== undefined && envelope.runId !== undefined && stream.runId !== envelope.runId
+          stream.runId != null && envelope.runId != null && stream.runId !== envelope.runId
         if (stream.runId !== envelope.runId) {
           stream.runId = envelope.runId
           stream.prefixSeen = false

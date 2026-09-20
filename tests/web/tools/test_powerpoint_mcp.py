@@ -914,6 +914,19 @@ def test_text_frame_equivalent_run_formatting_is_not_rejected():
     assert not powerpoint._text_frame_has_distinct_run_formatting(box.text_frame)
 
 
+def test_text_frame_distinct_line_break_formatting_is_detected():
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+    box.text_frame.text = "First\vSecond"
+    for run in box.text_frame.paragraphs[0].runs:
+        run.font.size = Pt(24)
+    line_break = box.text_frame.paragraphs[0]._p.find(qn("a:br"))
+    line_break.get_or_add_rPr().set("sz", "4000")
+
+    assert powerpoint._text_frame_has_distinct_run_formatting(box.text_frame)
+
+
 def test_text_frame_has_dynamic_content_false_for_plain_text():
     presentation = Presentation()
     slide = presentation.slides.add_slide(presentation.slide_layouts[6])
@@ -981,8 +994,8 @@ def test_upload_presentation_rejects_oversized_content(monkeypatch):
         )
 
 
-def test_upload_presentation_uses_version_fenced_upload_session(monkeypatch):
-    """Every replacement uses an upload session so If-Match is enforced."""
+def test_upload_presentation_conditionally_creates_upload_session(monkeypatch):
+    """Every replacement uses If-Match when its upload session is created."""
     presentation = Presentation()
     monkeypatch.setattr(powerpoint, "_UPLOAD_SESSION_CHUNK_BYTES", 10)
     mock_request = Mock(
@@ -1325,6 +1338,28 @@ def test_replace_text_frame_text_preserves_formatting_across_soft_break():
     for result_run in runs:
         assert result_run.font.bold is True
         assert result_run.font.size == Pt(24)
+    line_break = box.text_frame.paragraphs[0]._p.find(qn("a:br"))
+    line_break_properties = line_break.find(qn("a:rPr"))
+    assert line_break_properties is not None
+    assert line_break_properties.get("b") == "1"
+    assert line_break_properties.get("sz") == "2400"
+
+
+def test_replace_text_frame_text_preserves_end_paragraph_formatting():
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+    box.text_frame.text = "Old"
+    end_properties = box.text_frame.paragraphs[0]._p.get_or_add_endParaRPr()
+    end_properties.set("b", "1")
+    end_properties.set("sz", "3200")
+
+    powerpoint._replace_text_frame_text(box.text_frame, "New")
+
+    result = box.text_frame.paragraphs[0]._p.find(qn("a:endParaRPr"))
+    assert result is not None
+    assert result.get("b") == "1"
+    assert result.get("sz") == "3200"
 
 
 def test_set_shape_text_preserves_formatting(monkeypatch):
@@ -1360,6 +1395,8 @@ def test_set_shape_text_preserves_formatting_across_structural_breaks(monkeypatc
         run.text = "Old"
         run.font.bold = True
         run.font.size = Pt(24)
+        end_properties = paragraph._p.get_or_add_endParaRPr()
+        end_properties.set("lang", "en-US")
 
     content = _pptx_bytes(build)
     _, _, mock_put = _mock_versioned_write(monkeypatch, content)
@@ -1382,6 +1419,14 @@ def test_set_shape_text_preserves_formatting_across_structural_breaks(monkeypatc
         for run in paragraph.runs:
             assert run.font.bold is True
             assert run.font.size == Pt(24)
+        end_properties = paragraph._p.find(qn("a:endParaRPr"))
+        assert end_properties is not None
+        assert end_properties.get("lang") == "en-US"
+    line_break = paragraphs[1]._p.find(qn("a:br"))
+    line_break_properties = line_break.find(qn("a:rPr"))
+    assert line_break_properties is not None
+    assert line_break_properties.get("b") == "1"
+    assert line_break_properties.get("sz") == "2400"
 
 
 def test_set_shape_text_allows_equivalently_formatted_runs(monkeypatch):

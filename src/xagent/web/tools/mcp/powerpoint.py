@@ -557,9 +557,11 @@ def _upload_presentation(
             f"{_MAX_PRESENTATION_BYTES // 1_000_000} MB limit this tool currently "
             "supports"
         )
-    # Graph's simple content PUT does not document conditional writes. Use
-    # an upload session for every replacement so the eTag read with the
-    # caller's snapshot can be enforced atomically with If-Match.
+    # Graph's simple content PUT does not document conditional writes. Use an
+    # upload session for every replacement so a stale snapshot is rejected at
+    # session creation with If-Match. Graph does not document whether that
+    # precondition remains version-fenced through final-fragment commit; see
+    # _upload_presentation_session's docstring for the remaining boundary.
     return _upload_presentation_session(
         content, file_path, site_id, drive_id, _require_etag(expected_etag)
     )
@@ -572,11 +574,16 @@ def _upload_presentation_session(
     drive_id: str | None,
     expected_etag: str,
 ) -> dict[str, Any]:
-    """Replace a presentation through a version-fenced Graph upload session.
+    """Replace a presentation through a conditionally created upload session.
 
     Content is already resident in memory because python-pptx cannot stream a
     save. Progress follows Graph's nextExpectedRanges so a partially accepted
-    fragment resumes from the server-reported offset.
+    fragment resumes from the server-reported offset. ``If-Match`` rejects a
+    stale version when the session is created. Microsoft Graph does not publish
+    a cross-provider commit-time conditional-write contract: deferred source-URL
+    commit is Personal-only, while Business/SharePoint use a different final
+    POST. Consequently this function must not claim that a change made after
+    session creation is proven to be fenced by the final fragment.
     """
     try:
         session = _graph_request(
@@ -893,6 +900,14 @@ def _text_frame_has_distinct_run_formatting(text_frame: Any) -> bool:
             formatting.add(
                 str(run_properties.xml) if run_properties is not None else None
             )
+        # A DrawingML line break may carry direct character properties even
+        # though python-pptx does not expose it through paragraph.runs. An
+        # absent br/rPr inherits surrounding formatting and is therefore not a
+        # distinct style; an explicit one must participate in the guard.
+        for line_break in paragraph._p.findall(qn("a:br")):
+            run_properties = line_break.find(qn("a:rPr"))
+            if run_properties is not None:
+                formatting.add(str(run_properties.xml))
         if len(formatting) > 1:
             return True
     return False
@@ -910,25 +925,33 @@ def _replace_text_frame_text(text_frame: Any, text: str) -> None:
     <a:pPr>/<a:rPr> at all. Existing paragraphs keep their formatting by
     position; additional paragraphs inherit the final old paragraph's
     formatting, and every generated run in a paragraph receives that old
-    paragraph's first-run formatting. Removed paragraphs have no output
-    counterpart and are discarded.
+    paragraph's first-run formatting, including the generated ``a:br`` node.
+    Paragraph-end character properties are retained by position as well.
+    Removed paragraphs have no output counterpart and are discarded.
     """
-    saved: list[tuple[Any, Any]] = []
+    saved: list[tuple[Any, Any, Any]] = []
     for paragraph in text_frame.paragraphs:
         p_pr = paragraph._p.find(qn("a:pPr"))
         first_run = paragraph.runs[0] if paragraph.runs else None
         r_pr = first_run._r.find(qn("a:rPr")) if first_run is not None else None
+        if r_pr is None:
+            first_break = paragraph._p.find(qn("a:br"))
+            r_pr = first_break.find(qn("a:rPr")) if first_break is not None else None
+        end_para_r_pr = paragraph._p.find(qn("a:endParaRPr"))
+        if r_pr is None:
+            r_pr = end_para_r_pr
         saved.append(
             (
                 deepcopy(p_pr) if p_pr is not None else None,
                 deepcopy(r_pr) if r_pr is not None else None,
+                deepcopy(end_para_r_pr) if end_para_r_pr is not None else None,
             )
         )
 
     text_frame.text = text
 
     for index, paragraph in enumerate(text_frame.paragraphs):
-        p_pr, r_pr = saved[min(index, len(saved) - 1)]
+        p_pr, r_pr, end_para_r_pr = saved[min(index, len(saved) - 1)]
         if p_pr is not None:
             existing_p_pr = paragraph._p.find(qn("a:pPr"))
             if existing_p_pr is not None:
@@ -940,6 +963,16 @@ def _replace_text_frame_text(text_frame: Any, text: str) -> None:
                 if existing_r_pr is not None:
                     run._r.remove(existing_r_pr)
                 run._r.insert(0, deepcopy(r_pr))
+            for line_break in paragraph._p.findall(qn("a:br")):
+                existing_r_pr = line_break.find(qn("a:rPr"))
+                if existing_r_pr is not None:
+                    line_break.remove(existing_r_pr)
+                line_break.insert(0, deepcopy(r_pr))
+        if end_para_r_pr is not None:
+            existing_end_para_r_pr = paragraph._p.find(qn("a:endParaRPr"))
+            if existing_end_para_r_pr is not None:
+                paragraph._p.remove(existing_end_para_r_pr)
+            paragraph._p.append(deepcopy(end_para_r_pr))
 
 
 def _require_slide(presentation: PresentationType, slide_index: int) -> Any:
@@ -1063,8 +1096,9 @@ def powerpoint_list_slides(
 ) -> str:
     """List a PowerPoint presentation's slides, with each slide's index,
     layout name, and shape count. Returns an etag that must be supplied to
-    mutating tools so positional indices cannot target a newer snapshot. Pass
-    next_cursor back as cursor when truncated is true."""
+    mutating tools so a stale positional request is rejected before its upload
+    session is created. Pass next_cursor back as cursor when truncated is
+    true."""
     try:
         snapshot = _download_presentation(file_path, site_id, drive_id)
         presentation = snapshot.presentation
@@ -1173,10 +1207,12 @@ def powerpoint_set_shape_text(
     and its single run's character formatting (bold, italic, font, size,
     color) by position. Additional paragraphs (a "\\n" in text starts a new
     paragraph) inherit the final existing paragraph's formatting, and runs
-    generated around a "\\v" soft break inherit their paragraph's character
-    formatting. Errors rather than silently discarding multiple differently
-    formatted runs, hyperlinks, or dynamic fields such as an auto-updating
-    slide number or date; edit those shapes directly in PowerPoint instead."""
+    and the break node generated by a "\\v" soft break inherit their
+    paragraph's character formatting; paragraph-end character properties are
+    retained too. Errors rather than silently discarding multiple differently
+    formatted runs or breaks, hyperlinks, or dynamic fields such as an
+    auto-updating slide number or date; edit those shapes directly in
+    PowerPoint instead."""
     try:
         slide_index = _require_int(slide_index, "slide_index")
         shape_index = _require_int(shape_index, "shape_index")
@@ -1319,8 +1355,8 @@ def powerpoint_list_slide_layouts(
 ) -> str:
     """List the slide layouts available in a presentation's template, with
     the index powerpoint_add_slide's layout_index expects, plus the etag that
-    tool requires for a version-fenced mutation. Pass next_cursor back as
-    cursor when truncated is true."""
+    tool requires to reject a stale snapshot before creating its upload
+    session. Pass next_cursor back as cursor when truncated is true."""
     try:
         snapshot = _download_presentation(file_path, site_id, drive_id)
         presentation = snapshot.presentation

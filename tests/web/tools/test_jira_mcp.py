@@ -558,10 +558,19 @@ def test_search_issues_summarizes_resolved_issue(monkeypatch):
 
 
 def test_search_issues_total_count_is_none_when_count_endpoint_fails(monkeypatch):
+    # Approximate-count is only called when the first page has more
+    # results beyond it (a nextPageToken) -- a final page's count is
+    # exact for free, so this needs a page with one to actually reach
+    # the count endpoint at all.
     mock_request = Mock(
         side_effect=[
             MockResponse(json_data=[_SITE_A]),
-            MockResponse(json_data={"issues": [], "isLast": True}),
+            MockResponse(
+                json_data={
+                    "issues": [{"key": "ENG-1", "fields": {"summary": "ok"}}],
+                    "nextPageToken": "next-token",
+                }
+            ),
             MockResponse(json_data={"errorMessages": ["bad jql"]}, status_code=400),
         ]
     )
@@ -571,7 +580,7 @@ def test_search_issues_total_count_is_none_when_count_endpoint_fails(monkeypatch
 
     assert result["status"] == "success"
     assert result["total_count"] is None
-    assert result["returned_count"] == 0
+    assert result["returned_count"] == 1
 
 
 def _raw_issue_with_summary(key: str, summary_length: int):
@@ -629,7 +638,44 @@ def test_search_issues_returns_bounded_error_when_minimal_page_still_too_big(
     # One issue whose summary alone is bigger than the budget -- every
     # candidate size in _page_size_candidates (default limit=50 -> 50,
     # 10, 1) gets a page this oversized, so all three attempts must be
-    # exhausted (no count call: fit is never reached).
+    # exhausted (no count call: fit is never reached). The budget (100)
+    # is small enough to force the error message itself to be truncated,
+    # but big enough to still hold a real (shortened) message -- the
+    # fallback error response must itself respect the configured cap,
+    # not just the search page it's reporting on.
+    page = {
+        "issues": [_raw_issue_with_summary("ENG-1", 50)],
+        "nextPageToken": "token",
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=page),
+            MockResponse(json_data=page),
+            MockResponse(json_data=page),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 100)
+
+    raw_response = jira.jira_search_issues("project = ENG")
+    result = json.loads(raw_response)
+
+    assert len(raw_response) <= 100
+    assert result["status"] == "error"
+    assert "output limit" in result["message"]
+    assert mock_request.call_count == 4
+
+
+def test_search_issues_bounded_error_degrades_to_minimal_envelope_below_overhead(
+    monkeypatch,
+):
+    # A configured cap smaller than even the shortest possible error
+    # envelope ({"status": "error"}, 19 chars) can't hold a "message"
+    # key at all -- there's no valid JSON this tool could return that's
+    # both under budget and carries explanatory text, so the best it can
+    # do is the smallest valid envelope rather than crash or emit
+    # invalid JSON.
     page = {
         "issues": [_raw_issue_with_summary("ENG-1", 50)],
         "nextPageToken": "token",
@@ -645,11 +691,39 @@ def test_search_issues_returns_bounded_error_when_minimal_page_still_too_big(
     monkeypatch.setattr(jira.requests, "request", mock_request)
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 5)
 
-    result = json.loads(jira.jira_search_issues("project = ENG"))
+    raw_response = jira.jira_search_issues("project = ENG")
+    result = json.loads(raw_response)
 
+    assert result == {"status": "error"}
+
+
+def test_search_issues_cursor_stuck_error_is_also_bounded(monkeypatch):
+    # The pagination-cursor-stuck error is a second, independent _error
+    # call site with the same unmeasured-against-the-cap gap the
+    # minimal-page-overflow error had -- must be fixed the same way, not
+    # just at the one call site a review happened to point at. An empty
+    # page (129 chars serialized) fits the 130-char budget so the "does
+    # the page fit" check passes and this error path is actually
+    # reached; the full cursor-stuck message (136 chars) doesn't, so the
+    # response must be the truncated form instead.
+    page = {"issues": [], "nextPageToken": "same-token"}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=page),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 130)
+
+    raw_response = jira.jira_search_issues(
+        "project = ENG", next_page_token="same-token"
+    )
+    result = json.loads(raw_response)
+
+    assert len(raw_response) <= 130
     assert result["status"] == "error"
-    assert "output limit" in result["message"]
-    assert mock_request.call_count == 4
+    assert "did not advance" in result["message"]
 
 
 def test_page_size_candidates_include_a_floor_below_a_small_limit():
@@ -732,6 +806,124 @@ def test_search_issues_skips_approximate_count_on_later_pages(monkeypatch):
     assert mock_request.call_count == 2
 
 
+def test_search_issues_final_first_page_uses_exact_count_without_a_network_call(
+    monkeypatch,
+):
+    # A first page with no nextPageToken is the complete result set --
+    # len(issues) is already the exact count, so calling the advisory
+    # approximate-count endpoint for it would be a pure wasted request.
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={
+                    "issues": [
+                        {"key": "ENG-1", "fields": {"summary": "a"}},
+                        {"key": "ENG-2", "fields": {"summary": "b"}},
+                    ]
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_issues("project = ENG"))
+
+    assert result["status"] == "success"
+    assert result["total_count"] == 2
+    assert result["returned_count"] == 2
+    # Only 2 calls total (sites + search) -- no approximate-count call.
+    assert mock_request.call_count == 2
+
+
+def test_search_issues_first_page_with_more_results_still_calls_approximate_count(
+    monkeypatch,
+):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={
+                    "issues": [{"key": "ENG-1", "fields": {"summary": "a"}}],
+                    "nextPageToken": "next-token",
+                }
+            ),
+            MockResponse(json_data={"count": 42}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_issues("project = ENG"))
+
+    assert result["total_count"] == 42
+    assert mock_request.call_count == 3
+
+
+def test_search_issues_raw_fields_returns_the_unslimmed_jira_shape(monkeypatch):
+    # An existing integration written against the pre-projection schema
+    # (issue["fields"]["status"]["id"], etc.) can opt back into it
+    # instead of the compact projection.
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "status": {"id": "3", "name": "In Progress"},
+            "assignee": {"accountId": "u1", "emailAddress": "a@example.com"},
+            "project": {"id": "10", "name": "Engineering"},
+        },
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": [raw_issue]}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_issues("project = ENG", raw_fields=True))
+
+    assert result["issues"] == [raw_issue]
+    assert result["issues"][0]["fields"]["status"]["id"] == "3"
+    assert result["issues"][0]["fields"]["assignee"]["emailAddress"] == "a@example.com"
+
+
+def test_search_issues_default_still_returns_the_compact_projection(monkeypatch):
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "status": {"id": "3", "name": "In Progress"},
+        },
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": [raw_issue]}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_issues("project = ENG"))
+
+    assert result["issues"] == [
+        {
+            "key": "ENG-1",
+            "summary": "ok",
+            "status": "In Progress",
+            "status_category": None,
+            "assignee": None,
+            "priority": None,
+            "issue_type": None,
+            "project_key": None,
+            "labels": [],
+            "parent_key": None,
+            "resolution": None,
+            "created": None,
+            "updated": None,
+        }
+    ]
+
+
 def test_approximate_count_warns_on_non_integer_count(monkeypatch, caplog):
     mock_request = Mock(
         side_effect=[MockResponse(json_data={"count": "12"})],
@@ -756,13 +948,6 @@ def test_approximate_count_treats_bool_count_as_non_integer(monkeypatch, caplog)
 
     assert result is None
     assert "non-integer" in caplog.text
-
-
-def test_jql_digest_tolerates_a_non_string_jql():
-    # Runs inside exception handlers whose whole point is to insulate a
-    # failing advisory call from the primary search -- it must not
-    # itself raise if jql is ever something other than a str.
-    assert jira._jql_digest(12345) == jira._jql_digest("12345")
 
 
 def test_fetch_and_summarize_page_raises_on_non_list_issues(monkeypatch):
@@ -829,11 +1014,12 @@ _SENTINEL_JQL = 'text ~ "super-secret-customer-name@example.com"'
 
 
 def test_search_issues_success_log_omits_raw_jql(monkeypatch, caplog):
+    # A final first page (no nextPageToken) has an exact count for free
+    # (len(issues)) and never calls the approximate-count endpoint.
     mock_request = Mock(
         side_effect=[
             MockResponse(json_data=[_SITE_A]),
             MockResponse(json_data={"issues": [], "isLast": True}),
-            MockResponse(json_data={"count": 0}),
         ]
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
@@ -845,10 +1031,18 @@ def test_search_issues_success_log_omits_raw_jql(monkeypatch, caplog):
 
 
 def test_search_issues_count_failure_warning_omits_raw_jql(monkeypatch, caplog):
+    # Approximate-count is only called for a first page that has MORE
+    # results beyond it (a nextPageToken) -- a final first page's count
+    # is exact for free and never calls the endpoint at all.
     mock_request = Mock(
         side_effect=[
             MockResponse(json_data=[_SITE_A]),
-            MockResponse(json_data={"issues": [], "isLast": True}),
+            MockResponse(
+                json_data={
+                    "issues": [{"key": "ENG-1", "fields": {"summary": "ok"}}],
+                    "nextPageToken": "next-token",
+                }
+            ),
             MockResponse(json_data={"errorMessages": [_SENTINEL_JQL]}, status_code=400),
         ]
     )

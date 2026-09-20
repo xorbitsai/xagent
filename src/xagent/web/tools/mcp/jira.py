@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import os
@@ -423,35 +422,24 @@ def _page_size_candidates(max_results: int) -> tuple[int, ...]:
     return tuple(candidates)
 
 
-def _jql_digest(jql: str) -> str:
-    """A short, non-reversible identifier for correlating log lines about
-    the same query without ever logging its content. Jira's own
-    JQL-syntax-error text routinely echoes back the literal clause that
-    failed to parse (which can carry whatever sensitive text the caller
-    searched for), so the query itself and exception messages are kept
-    out of every log line below -- this digest is what lets someone
-    grep prod logs for "the same query recurring" or "this query, later,
-    succeeded" without it ever revealing what was searched for.
-    """
-    # str(jql) defensively: this runs inside exception handlers whose
-    # whole point is to insulate a failing advisory call from the
-    # primary search -- it must not itself raise if jql is ever
-    # something other than a str at runtime (the type hint isn't
-    # enforced), which would defeat that insulation.
-    return hashlib.sha256(str(jql).encode("utf-8")).hexdigest()[:12]
-
-
-def _log_metadata_only(
-    level_fn: Any, action: str, jql: str, exc: Exception | None
-) -> None:
-    """Log `action` with only a jql_digest (see _jql_digest) and, if this
-    is an exception path, the exception's type -- never the JQL itself or
-    the exception's message. Shared by every log site touching a JQL
-    search so the no-raw-content policy has one place to read and one
-    place to change, instead of being restated at each call site.
+def _log_metadata_only(level_fn: Any, action: str, exc: Exception | None) -> None:
+    """Log `action` with, if this is an exception path, only the
+    exception's type -- never the JQL itself or the exception's message.
+    Jira's own JQL-syntax-error text routinely echoes back the literal
+    clause that failed to parse (which can carry whatever sensitive text
+    the caller searched for), so both are kept out of every log line
+    touching a search. No query-derived identifier (e.g. a hash of the
+    JQL) is logged either: JQL is caller-controlled and often low-
+    entropy/structured (e.g. `project = ENG`, `text ~ "login bug"`), so
+    an unsalted digest would let anyone with log access confirm a
+    specific query via a small offline dictionary of likely predicates --
+    not the secrecy boundary logging usually assumes a hash provides.
+    Shared by every log site touching a JQL search so the no-raw-content
+    policy has one place to read and one place to change, instead of
+    being restated at each call site.
     """
     suffix = f": {type(exc).__name__}" if exc is not None else ""
-    level_fn(f"{action} (jql_digest={_jql_digest(jql)}){suffix}")
+    level_fn(f"{action}{suffix}")
 
 
 def _approximate_count(cloud_id: str, jql: str) -> int | None:
@@ -488,11 +476,10 @@ def _approximate_count(cloud_id: str, jql: str) -> int | None:
                 # exception to explain itself otherwise.
                 logger.warning(
                     "Approximate count endpoint returned a non-integer "
-                    f"count (jql_digest={_jql_digest(jql)}): "
-                    f"{type(count).__name__}"
+                    f"count: {type(count).__name__}"
                 )
     except Exception as e:
-        _log_metadata_only(logger.warning, "Could not get an approximate count", jql, e)
+        _log_metadata_only(logger.warning, "Could not get an approximate count", e)
     return None
 
 
@@ -504,8 +491,10 @@ def _fetch_and_summarize_page(
     *,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     allow_retry: bool = True,
+    raw_fields: bool = False,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """One search/jql call, projected through _summarize_issue.
+    """One search/jql call, projected through _summarize_issue unless
+    raw_fields is set (see jira_search_issues' raw_fields param).
 
     Raises on any request/shape failure; callers run this inside their
     own try/except (jira_search_issues' outer one already does).
@@ -540,9 +529,13 @@ def _fetch_and_summarize_page(
         # page with no error, contradicting this function's own "raises
         # on any shape failure" contract.
         raise RuntimeError("Unexpected 'issues' shape in Jira search response")
-    issues = [
-        _summarize_issue(issue) for issue in raw_issues if isinstance(issue, dict)
-    ]
+    issues = (
+        [issue for issue in raw_issues if isinstance(issue, dict)]
+        if raw_fields
+        else [
+            _summarize_issue(issue) for issue in raw_issues if isinstance(issue, dict)
+        ]
+    )
     # The enhanced-search endpoint signals "more pages" by including
     # nextPageToken; isLast is not guaranteed to be present, so the
     # token's presence is the reliable pagination signal in both
@@ -567,9 +560,43 @@ def _build_search_response(
     )
 
 
+def _bounded_search_error(message: str, max_output_length: int) -> str:
+    """Build an _error(...) response for jira_search_issues that's
+    guaranteed to fit max_output_length, trying progressively shorter
+    text.
+
+    XAGENT_TOOL_MAX_OUTPUT_LENGTH has no enforced minimum (see
+    config.get_tool_max_output_length), so a deployment could configure
+    a cap small enough that even this function's own bounded-error
+    message would itself get sliced mid-JSON by the downstream
+    OutputValueFilter -- exactly the invalid-output failure mode this
+    whole fallback path exists to avoid. The last candidate ({"status":
+    "error"}) is the smallest valid envelope this module can produce;
+    below that there's no budget left to signal failure in valid JSON at
+    all, which is a systemic gap in the cap itself, not something a
+    single tool's error path can close.
+    """
+    full = _error(message)
+    if len(full) <= max_output_length:
+        return full
+    # Trim the message text itself (not _truncate's fixed 1000-char
+    # cap, which does nothing for a configured budget smaller than
+    # that) down to whatever's left after the envelope's own overhead.
+    budget = max_output_length - len(_error(""))
+    if budget > 0:
+        short = _error(message[:budget])
+        if len(short) <= max_output_length:
+            return short
+    return json.dumps({"status": "error"}, ensure_ascii=False)
+
+
 @mcp.tool()
 def jira_search_issues(
-    jql: str, cloud_id: str = "", limit: int = 50, next_page_token: str = ""
+    jql: str,
+    cloud_id: str = "",
+    limit: int = 50,
+    next_page_token: str = "",
+    raw_fields: bool = False,
 ) -> str:
     """
     Search issues with JQL (Jira Query Language) -- the recommended way to
@@ -585,6 +612,14 @@ def jira_search_issues(
     next_page_token: pass the previous response's next_page_token to fetch
     the next page -- always check `truncated` and re-call with it instead
     of assuming one page is everything.
+    raw_fields: return each issue as Jira's own nested object (under
+    "fields", e.g. issue["fields"]["status"]["id"]) instead of the
+    compact projection -- for an existing integration written against
+    the raw shape this tool returned before compact projection was
+    added. Bigger per-issue payload, so a raw page can need more/smaller
+    fallback pages to fit the output budget than the same query would
+    at the default setting; prefer the default projection for new
+    integrations.
     Returns total_count: an approximate count of ALL issues matching the
     JQL (independent of pagination; null if unavailable, e.g. the count
     endpoint failed, OR because including it would have pushed an
@@ -628,6 +663,7 @@ def jira_search_issues(
                     else _FALLBACK_ATTEMPT_TIMEOUT_SECONDS
                 ),
                 allow_retry=is_first_attempt,
+                raw_fields=raw_fields,
             )
             response = _build_search_response(issues, None, next_token)
             if len(response) <= max_output_length:
@@ -639,9 +675,10 @@ def jira_search_issues(
             # and/or labels alone exceed the budget. Fail safely rather
             # than return invalid (cut-mid-JSON) output or a token that
             # would skip rows.
-            return _error(
+            return _bounded_search_error(
                 "A Jira search result page exceeds the tool output limit "
-                "even at a minimal page size; narrow the JQL query"
+                "even at a minimal page size; narrow the JQL query",
+                max_output_length,
             )
 
         if next_token and next_token == next_page_token:
@@ -650,19 +687,27 @@ def jira_search_issues(
             # the same page forever -- fail instead of handing back a
             # token that goes nowhere (mirrors shopify.py's
             # _success_paginated cursor-safety check).
-            return _error(
+            return _bounded_search_error(
                 "Jira returned a pagination cursor that did not advance; "
-                "pagination stopped to prevent an infinite loop"
+                "pagination stopped to prevent an infinite loop",
+                max_output_length,
             )
 
         # total_count is a per-JQL constant, independent of pagination --
-        # only fetch it once, for the caller's first page, and only after
-        # a page has actually been settled on (never on either early
-        # return above -- the size-overflow error or the stuck-cursor
-        # error -- where it would just be wasted work).
-        total_count = (
-            None if next_page_token else _approximate_count(resolved_cloud_id, jql)
-        )
+        # only fetch it once, for the caller's first page, and only when
+        # there's actually more beyond this page: an exact count is
+        # already known for free (len(issues)) when this page is both
+        # the first and the last, so calling the advisory endpoint there
+        # would just be a redundant network round trip for a number
+        # that's already exact. Never fetched on either early return
+        # above (size-overflow or stuck-cursor) either, for the same
+        # "don't do wasted work" reason.
+        if next_page_token:
+            total_count = None
+        elif next_token:
+            total_count = _approximate_count(resolved_cloud_id, jql)
+        else:
+            total_count = len(issues)
         response = _build_search_response(issues, total_count, next_token)
         if len(response) > max_output_length:
             # total_count is advisory; if adding it is ever what tips an
@@ -672,13 +717,12 @@ def jira_search_issues(
 
         logger.info(
             f"jira_search_issues: returned={len(issues)} "
-            f"approx_total={total_count} has_next_page={bool(next_token)} "
-            f"jql_digest={_jql_digest(jql)}"
+            f"approx_total={total_count} has_next_page={bool(next_token)}"
         )
         return response
     except Exception as e:
-        _log_metadata_only(logger.error, "Error searching Jira issues", jql, e)
-        return _error(str(e))
+        _log_metadata_only(logger.error, "Error searching Jira issues", e)
+        return _bounded_search_error(str(e), get_tool_max_output_length())
 
 
 @mcp.tool()

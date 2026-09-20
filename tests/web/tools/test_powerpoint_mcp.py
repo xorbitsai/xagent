@@ -8,6 +8,7 @@ import requests
 from lxml import etree
 from pptx import Presentation
 from pptx.enum.text import PP_ALIGN
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
@@ -143,6 +144,16 @@ def test_content_path_appends_content():
 def test_normalize_relative_path_rejects_trailing_period():
     with pytest.raises(ValueError, match="must not end with a period"):
         powerpoint._normalize_relative_path("Deck.pptx.")
+
+
+@pytest.mark.parametrize("path", ["Deck.pptm", "Deck.ppt", "Deck", "Deck.ppsx"])
+def test_normalize_relative_path_rejects_unsupported_powerpoint_package(path):
+    with pytest.raises(ValueError, match=r"must name a \.pptx"):
+        powerpoint._normalize_relative_path(path)
+
+
+def test_normalize_relative_path_allows_case_insensitive_pptx_extension():
+    assert powerpoint._normalize_relative_path("Deck.PPTX") == "Deck.PPTX"
 
 
 def test_normalize_relative_path_rejects_dot_segments():
@@ -294,9 +305,89 @@ def test_delete_slide_prunes_relationship_and_part():
     assert [s.shapes.title.text for s in reloaded.slides] == ["B"]
 
 
+def test_delete_slide_rejects_custom_show_reference_without_mutating():
+    presentation = Presentation()
+    target_slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    target = list(presentation.slides._sldIdLst)[0]
+    relationship_id = target.get(qn("r:id"))
+    custom_show_list = etree.SubElement(presentation._element, qn("p:custShowLst"))
+    custom_show = etree.SubElement(custom_show_list, qn("p:custShow"))
+    custom_show.set("name", "Referenced slide")
+    custom_show.set("id", "1")
+    custom_slide_list = etree.SubElement(custom_show, qn("p:sldLst"))
+    custom_slide = etree.SubElement(custom_slide_list, qn("p:sld"))
+    custom_slide.set(qn("r:id"), relationship_id)
+
+    with pytest.raises(ValueError, match="custom slide show"):
+        powerpoint._delete_slide(presentation, 0)
+
+    assert list(presentation.slides) == [target_slide]
+    assert relationship_id in presentation.part.rels
+
+
+def test_delete_slide_rejects_link_from_another_slide_without_mutating():
+    presentation = Presentation()
+    source = presentation.slides.add_slide(presentation.slide_layouts[6])
+    target = presentation.slides.add_slide(presentation.slide_layouts[6])
+    source.part.relate_to(target.part, RT.SLIDE)
+
+    with pytest.raises(ValueError, match="linked from another slide"):
+        powerpoint._delete_slide(presentation, 1)
+
+    assert list(presentation.slides) == [source, target]
+
+
+def test_delete_slide_rejects_section_reference_without_mutating():
+    presentation = Presentation()
+    target_slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    target = list(presentation.slides._sldIdLst)[0]
+    powerpoint_2010 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
+    extension_list = etree.SubElement(presentation._element, qn("p:extLst"))
+    extension = etree.SubElement(extension_list, qn("p:ext"))
+    extension.set("uri", "{521415D9-36F7-43E2-AB2F-B90AF26B5E84}")
+    section_list = etree.SubElement(extension, f"{{{powerpoint_2010}}}sectionLst")
+    section = etree.SubElement(section_list, f"{{{powerpoint_2010}}}section")
+    section.set("name", "Section 1")
+    section.set("id", "{00000000-0000-0000-0000-000000000001}")
+    section_slide_list = etree.SubElement(section, f"{{{powerpoint_2010}}}sldIdLst")
+    section_slide_id = etree.SubElement(
+        section_slide_list, f"{{{powerpoint_2010}}}sldId"
+    )
+    section_slide_id.set("id", target.get("id"))
+
+    with pytest.raises(ValueError, match="presentation section"):
+        powerpoint._delete_slide(presentation, 0)
+
+    assert list(presentation.slides) == [target_slide]
+
+
+def test_delete_slide_with_notes_remains_supported():
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    slide.notes_slide.notes_text_frame.text = "Speaker notes"
+
+    powerpoint._delete_slide(presentation, 0)
+
+    assert len(presentation.slides) == 0
+    buffer = io.BytesIO()
+    presentation.save(buffer)
+    assert len(Presentation(io.BytesIO(buffer.getvalue())).slides) == 0
+
+
 # ---------------------------------------------------------------------------
 # create
 # ---------------------------------------------------------------------------
+
+
+def test_create_presentation_rejects_unsupported_extension_before_graph(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+
+    result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptm"))
+
+    assert result["status"] == "error"
+    assert ".pptx" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_create_presentation_rejects_when_session_creation_conflicts(monkeypatch):
@@ -1110,6 +1201,19 @@ def test_add_slide_maps_upload_precondition_failure_to_conflict(monkeypatch):
     result = json.loads(powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"'))
 
     assert result["status"] == "conflict"
+
+
+def test_add_slide_maps_final_fragment_precondition_failure_to_conflict(monkeypatch):
+    content = _pptx_bytes()
+    _, _, mock_put = _mock_versioned_write(monkeypatch, content)
+    mock_put.return_value = MockResponse(
+        {"error": {"code": "preconditionFailed"}}, status_code=412
+    )
+
+    result = json.loads(powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"'))
+
+    assert result["status"] == "conflict"
+    assert "changed" in result["message"]
 
 
 def test_add_slide_reports_final_connection_loss_as_indeterminate(monkeypatch):

@@ -378,6 +378,11 @@ def _normalize_relative_path(path: str) -> str:
         )
     if value.rsplit("/", 1)[-1].endswith("."):
         raise ValueError(f"file_path filename must not end with a period: {path!r}")
+    if not value.rsplit("/", 1)[-1].lower().endswith(".pptx"):
+        raise ValueError(
+            "file_path must name a .pptx presentation; macro-enabled and other "
+            "PowerPoint package types are not supported"
+        )
     return value
 
 
@@ -628,6 +633,10 @@ def _upload_presentation_session(
                 )
                 response.raise_for_status()
             except requests.HTTPError:
+                if response.status_code == 412:
+                    raise _ConflictError(
+                        "The presentation changed before the update could be committed"
+                    ) from None
                 if is_final_local_fragment and response.status_code >= 500:
                     raise _IndeterminateWriteError(
                         "Graph may have committed the PowerPoint update, but its "
@@ -1000,9 +1009,12 @@ def _delete_slide(presentation: PresentationType, slide_index: int) -> None:
     caller reading the package's parts/relationships directly (rather than
     walking presentation.slides) would still see the "deleted" slide's
     content, and repeated add/delete cycles would accumulate dead parts.
-    part.drop_rel() below removes that relationship (and, since it's the
-    part's only remaining reference, the part itself) so the deleted
-    slide's content doesn't survive in the saved file at all.
+    part.drop_rel() below removes that relationship (and, when no supported
+    inbound reference remains, the part itself) so the deleted slide's content
+    doesn't survive in the saved file at all. Custom shows, section metadata,
+    and hyperlinks from another slide can reference the target independently;
+    those cases fail closed because silently leaving a dangling reference or
+    rewriting the user's navigation structure would both be unsafe.
     """
     slide_id_list = presentation.slides._sldIdLst
     slide_ids = list(slide_id_list)
@@ -1013,6 +1025,43 @@ def _delete_slide(presentation: PresentationType, slide_index: int) -> None:
         )
     target = slide_ids[slide_index]
     relationship_id = target.get(qn("r:id"))
+    target_slide_id = target.get("id")
+    if relationship_id:
+        for element in presentation._element.iter():
+            if element is target:
+                continue
+            if element.get(qn("r:id")) == relationship_id:
+                raise ValueError(
+                    "The slide is referenced by a custom slide show or other "
+                    "presentation feature and cannot be deleted safely"
+                )
+            local_name = (
+                element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else ""
+            )
+            if (
+                local_name == "sldId"
+                and target_slide_id is not None
+                and element.get("id") == target_slide_id
+            ):
+                raise ValueError(
+                    "The slide is referenced by a presentation section and cannot "
+                    "be deleted safely"
+                )
+
+        target_part = presentation.part.related_part(relationship_id)
+        for other_slide in presentation.slides:
+            if other_slide.part is target_part:
+                continue
+            for relationship in other_slide.part.rels.values():
+                if (
+                    not relationship.is_external
+                    and relationship.target_part is target_part
+                ):
+                    raise ValueError(
+                        "The slide is linked from another slide and cannot be "
+                        "deleted safely"
+                    )
+
     slide_id_list.remove(target)
     if relationship_id:
         presentation.part.drop_rel(relationship_id)

@@ -111,6 +111,12 @@ def test_workbook_base_rejects_malicious_site_id():
         excel._workbook_base("book.xlsx", "contoso.sharepoint.com:/../etc", None)
 
 
+@pytest.mark.parametrize("site_id", [".", ".."])
+def test_workbook_base_rejects_dot_only_site_id(site_id):
+    with pytest.raises(ValueError, match="must not be"):
+        excel._workbook_base("book.xlsx", site_id, None)
+
+
 def test_workbook_base_rejects_empty_string_site_id():
     with pytest.raises(ValueError, match="site_id is required"):
         excel._workbook_base("book.xlsx", "", None)
@@ -775,6 +781,36 @@ def test_non_idempotent_mutation_transport_failure_is_indeterminate(
     monkeypatch.setattr(excel.requests, "request", Mock(side_effect=side_effect))
 
     result = json.loads(call())
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+    assert "may already have been applied" in result["message"]
+
+
+def test_non_idempotent_mutation_truncated_response_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(
+            side_effect=requests.exceptions.ChunkedEncodingError("response truncated")
+        ),
+    )
+
+    result = json.loads(excel.excel_add_worksheet("book.xlsx"))
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+    assert "may already have been applied" in result["message"]
+
+
+def test_non_idempotent_mutation_invalid_success_body_is_indeterminate(monkeypatch):
+    response = MockResponse(content=b"{invalid")
+    response.json = Mock(
+        side_effect=requests.exceptions.JSONDecodeError("invalid JSON", "{invalid", 1)
+    )
+    monkeypatch.setattr(excel.requests, "request", Mock(return_value=response))
+
+    result = json.loads(excel.excel_add_worksheet("book.xlsx"))
 
     assert result["status"] == "indeterminate"
     assert result["retry_safe"] is False

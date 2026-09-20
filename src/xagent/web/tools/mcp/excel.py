@@ -155,11 +155,11 @@ def _graph_mutation_request(
                 "the workbook before retrying."
             ) from exc
         raise
-    except (requests.Timeout, requests.ConnectionError) as exc:
+    except requests.RequestException as exc:
         raise _GraphMutationIndeterminateError(
-            "The connection ended before Graph confirmed this non-idempotent "
-            "request. The mutation may already have been applied; inspect the "
-            "workbook before retrying."
+            "Graph did not provide a complete, parseable confirmation for this "
+            "non-idempotent request. The mutation may already have been applied; "
+            "inspect the workbook before retrying."
         ) from exc
 
 
@@ -192,6 +192,8 @@ def _site_segment(site_id: str) -> str:
         raise ValueError("site_id must not have leading or trailing whitespace")
     value = site_id
     if ":/" not in value:
+        if value in {".", ".."}:
+            raise ValueError("site_id must not be '.' or '..'")
         if "/" in value or ":" in value:
             raise ValueError(
                 "site_id must be 'root', a composite id, or a "

@@ -1,7 +1,7 @@
 import os
 import re
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -393,9 +393,7 @@ def test_remote_connector_builds_oauth_connectability_once_per_account(
 
         checked_providers: list[str] = []
 
-        def count_connectability_check(
-            oauth_account: object, *, provider_name: object = None
-        ) -> bool:
+        def count_connectability_check(oauth_account: object) -> bool:
             checked_providers.append(str(getattr(oauth_account, "provider")))
             return True
 
@@ -490,111 +488,6 @@ def test_oauth_account_can_connect_with_sqlite_naive_utc_expiry(
     )
 
     assert mcp_api._oauth_account_can_connect(oauth_account) is True
-
-
-def test_oauth_account_can_connect_matches_runtimes_refresh_skew() -> None:
-    """A token expiring inside runtime's 5-minute refresh skew
-    (config.py's OAUTH_TOKEN_EXPIRY_SKEW) with no refresh_token can never
-    be refreshed -- config.py raises _OAuthRefreshPermanentlyInvalid for
-    exactly this case -- so this must already report unusable, not wait
-    for the exact expiry instant to pass."""
-    now = datetime.now(timezone.utc)
-
-    within_skew = SimpleNamespace(
-        access_token="access-token",
-        refresh_token=None,
-        expires_at=now + timedelta(minutes=2),
-    )
-    assert mcp_api._oauth_account_can_connect(within_skew) is False
-
-    beyond_skew = SimpleNamespace(
-        access_token="access-token",
-        refresh_token=None,
-        expires_at=now + timedelta(minutes=10),
-    )
-    assert mcp_api._oauth_account_can_connect(beyond_skew) is True
-
-    refreshable_within_skew = SimpleNamespace(
-        access_token="access-token",
-        refresh_token="refresh-token",
-        expires_at=now + timedelta(minutes=2),
-    )
-    assert mcp_api._oauth_account_can_connect(refreshable_within_skew) is True
-
-
-def test_oauth_account_can_connect_exempts_meta_family_from_the_skew_rule() -> None:
-    """Meta's runtime refresh branch (refresh_oauth_token_if_needed's "meta"
-    case) exchanges the stored access_token itself via fb_exchange_token and
-    never looks at refresh_token or expires_at -- see
-    test_meta_expired_token_refresh_uses_fb_exchange_token, which refreshes
-    an already-*expired*, refresh_token-less Meta grant successfully. Every
-    catalog app whose provider_name is "meta" (facebook, instagram, and any
-    UserOAuth row stored under the bare "meta" key) must report connectable
-    regardless of expiry, or the API would say needs_reconnect for a normal,
-    self-healing Meta token while the real tool call would succeed."""
-    now = datetime.now(timezone.utc)
-    expired_no_refresh_token = {
-        "access_token": "old-long-token",
-        "refresh_token": None,
-        "expires_at": now - timedelta(minutes=1),
-    }
-
-    for provider in ("facebook", "instagram"):
-        account = SimpleNamespace(provider=provider, **expired_no_refresh_token)
-        assert (
-            mcp_api._oauth_account_can_connect(account, provider_name="meta") is True
-        ), provider
-
-    bare_meta = SimpleNamespace(provider="meta", **expired_no_refresh_token)
-    assert mcp_api._oauth_account_can_connect(bare_meta) is True
-
-    # A non-Meta provider in the exact same shape must still report broken --
-    # the exemption must not silently swallow the generic-provider check.
-    other_provider = SimpleNamespace(provider="hubspot", **expired_no_refresh_token)
-    assert mcp_api._oauth_account_can_connect(other_provider) is False
-
-
-def test_oauth_lookup_uses_dynamic_catalog_provider_for_meta_family() -> None:
-    """Admin-created app IDs are absent from the builtin registry, but their
-    catalog provider context is the same context runtime uses for refresh."""
-    account = SimpleNamespace(
-        provider="meta-custom",
-        access_token="old-long-token",
-        refresh_token=None,
-        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
-    )
-
-    lookup = mcp_api._build_oauth_account_lookup(
-        [account],
-        apps=[{"id": "meta-custom", "provider": "meta"}],
-    )
-
-    assert lookup == {"meta-custom": account}
-
-
-def test_oauth_lookup_keeps_provider_context_exact_across_normalized_id_collisions() -> (
-    None
-):
-    """Catalog IDs are exact persisted identities even when their display
-    lookup keys normalize to the same value. Provider readiness must follow
-    the exact ID runtime resolves, independent of catalog scan order."""
-    apps = [
-        {"id": "Meta Custom", "provider": "hubspot"},
-        {"id": "meta-custom", "provider": "meta"},
-    ]
-    expired = {
-        "access_token": "old-token",
-        "refresh_token": None,
-        "expires_at": datetime.now(timezone.utc) - timedelta(minutes=1),
-    }
-
-    non_meta_account = SimpleNamespace(provider="Meta Custom", **expired)
-    meta_account = SimpleNamespace(provider="meta-custom", **expired)
-
-    assert mcp_api._build_oauth_account_lookup([non_meta_account], apps=apps) == {}
-    assert mcp_api._build_oauth_account_lookup([meta_account], apps=apps) == {
-        "meta-custom": meta_account
-    }
 
 
 def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
@@ -1507,11 +1400,7 @@ def test_mixed_case_oauth_transport_app_is_marked_connected(
         assert resp.status_code == 200
 
         _connect_oauth_account_for_user("regular", "microsoft")
-        monkeypatch.setattr(
-            mcp_api,
-            "_oauth_account_can_connect",
-            lambda _a, **_kwargs: True,
-        )
+        monkeypatch.setattr(mcp_api, "_oauth_account_can_connect", lambda _a: True)
 
         db = next(get_db())
         try:

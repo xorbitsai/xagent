@@ -96,7 +96,6 @@ from ..services.user_oauth import (
     normalize_user_oauth_resource_owner_key,
     scoped_user_oauth_query,
 )
-from ..tools.config import OAUTH_TOKEN_EXPIRY_SKEW
 
 if TYPE_CHECKING:
     # Type-checking only: a real module-level import here would be a
@@ -226,15 +225,13 @@ class MCPServerResponse(BaseModel):
     connected_account: Optional[str] = None
     app_id: Optional[str] = None
     provider: Optional[str] = None
-    connection_status: Optional[Literal["connected", "needs_reconnect", "unknown"]] = (
-        Field(
-            default=None,
-            description=(
-                "OAuth runtime readiness: connected, needs_reconnect, or unknown when "
-                "a deployment resolver hook owns credential readiness. Null means no "
-                "persisted grant exists when no resolver hook is installed."
-            ),
-        )
+    connection_status: Optional[Literal["connected", "needs_reconnect"]] = Field(
+        default=None,
+        description=(
+            "Persisted OAuth grant state: connected when the selected grant has an "
+            "access token, needs_reconnect when its token was cleared, or null when "
+            "no persisted grant exists. This is not a runtime readiness probe."
+        ),
     )
 
     class Config:
@@ -2168,12 +2165,11 @@ def _oauth_account_summaries(
     """Per-provider ``(email, connection_status, account_id)`` for the user's
     OAuth grants.
 
-    ``connection_status`` is "connected" when the stored grant has a usable
-    token and "needs_reconnect" when a grant row exists but its token was
-    cleared or expired (e.g. a scope-migration invalidation, or a refresh
-    that started failing) -- distinct from never having connected at all,
-    which simply has no entry here. Actor credentials are not personal
-    server connections, so this only looks at the user's own scope.
+    ``connection_status`` describes only persisted grant state: "connected"
+    when the selected row has an access token and "needs_reconnect" when the
+    row exists but its token was cleared (for example by a scope migration).
+    It deliberately does not predict refreshability or resolver-hook output.
+    No entry means no persisted personal grant exists.
 
     ``email`` is nullable on ``UserOAuth`` (some providers never return one,
     or it was never backfilled) -- a grant missing it is still a grant, so
@@ -2200,9 +2196,6 @@ def _oauth_account_summaries(
         user_id=user_id,
         resource_owner_key=None,
     )
-    if not oauth_accounts:
-        return {}
-    provider_by_grant_key = _oauth_provider_by_grant_key(get_all_mcp_apps(db))
     summaries: dict[str, tuple[Optional[str], str, int]] = {}
     for oauth in oauth_accounts:
         provider = str(oauth.provider)
@@ -2211,14 +2204,7 @@ def _oauth_account_summaries(
         if existing is not None and existing[2] >= account_id:
             continue
         email = str(oauth.email) if oauth.email else None
-        status = (
-            "connected"
-            if _oauth_account_can_connect(
-                oauth,
-                provider_name=provider_by_grant_key.get(provider),
-            )
-            else "needs_reconnect"
-        )
+        status = "connected" if oauth.access_token else "needs_reconnect"
         summaries[provider] = (email, status, account_id)
     return summaries
 
@@ -2227,8 +2213,6 @@ def _enrich_oauth_server_info(
     db: Session,
     server: MCPServer,
     oauth_accounts: dict[str, tuple[Optional[str], str, int]],
-    *,
-    token_resolver_installed: bool = False,
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
     Return (app_id, provider, connected_account, connection_status) for an
@@ -2249,16 +2233,6 @@ def _enrich_oauth_server_info(
 
     provider = app_info.get("provider")
     app_id = app_info.get("id")
-
-    # A process-wide resolver hook may supply or reject credentials per user,
-    # provider, scope, and resource. Merely knowing that the hook is installed
-    # cannot prove either outcome for this connector, and invoking it from a
-    # synchronous listing GET would cross the hook's runtime boundary and may
-    # have side effects. Do not mislabel hook-owned credentials as never
-    # connected, or let a stored grant claim authority over a hook that runtime
-    # consults first: expose the uncertainty explicitly.
-    if token_resolver_installed:
-        return app_id, provider, None, "unknown"
 
     connected_account: Optional[str] = None
     connection_status: Optional[str] = None
@@ -2360,49 +2334,10 @@ def _is_reserved_catalog_name(db: Session, name: object) -> bool:
     return any(key in _catalog_app_keys(app) for app in get_all_mcp_apps(db))
 
 
-def _oauth_account_can_connect(
-    oauth_account: object, *, provider_name: object = None
-) -> bool:
-    """Whether this grant's stored token is currently usable.
-
-    Matches runtime's own readiness rule instead of a plain "not yet
-    expired" check: ``config.py``'s ``refresh_oauth_token_if_needed``
-    treats a token as needing refresh once it is within
-    ``OAUTH_TOKEN_EXPIRY_SKEW`` (5 minutes) of ``expires_at``, and a token
-    with no ``refresh_token`` can never complete that refresh -- it raises
-    ``_OAuthRefreshPermanentlyInvalid`` for exactly that case. Without the
-    same skew here, a token expiring in, say, two minutes with no
-    refresh_token would report "connected" and then fail a real tool call
-    minutes later with ``oauth_token_required``.
-
-    Shares the ``OAUTH_TOKEN_EXPIRY_SKEW`` constant with runtime, but keeps
-    its own comparison rather than calling ``config.py``'s
-    ``_oauth_token_expires_after_cache_window`` (same predicate, different
-    module): that helper reads the wall clock via its own module's
-    ``datetime.now()``, and this file's own naive-vs-aware expiry test
-    monkeypatches ``datetime`` on *this* module specifically -- delegating
-    across modules silently starts reading the real clock underneath a
-    test that believes it has frozen it. Not worth that footgun to remove
-    one more copy of a two-line comparison.
-
-    Meta (Facebook Pages, Instagram, Meta Ads, WhatsApp) is a deliberate
-    exception to the ``refresh_token``/skew rule above: its runtime refresh
-    branch exchanges the stored ``access_token`` itself via Facebook's
-    ``fb_exchange_token`` grant and never looks at ``refresh_token`` or
-    ``expires_at`` at all -- see
-    ``test_meta_expired_token_refresh_uses_fb_exchange_token``, which
-    refreshes an already-*expired*, ``refresh_token``-less Meta grant
-    successfully. Treating Meta like every other provider would report
-    ``needs_reconnect`` the moment a normal, self-healing Meta token's
-    stored ``expires_at`` lapses, which is routine for Meta and not an
-    actual problem.
-    """
+def _oauth_account_can_connect(oauth_account: object) -> bool:
     access_token = getattr(oauth_account, "access_token", None)
     if not access_token:
         return False
-
-    if _is_meta_family_oauth_account(oauth_account, provider_name=provider_name):
-        return True
 
     expires_at = getattr(oauth_account, "expires_at", None)
     if not isinstance(expires_at, datetime):
@@ -2414,39 +2349,8 @@ def _oauth_account_can_connect(
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
 
-    return expires_at > datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW
-
-
-def _is_meta_family_oauth_account(
-    oauth_account: object, *, provider_name: object = None
-) -> bool:
-    """Whether runtime will refresh this grant through Meta's token exchange.
-
-    App-scoped grants store the catalog ``app_id`` in ``UserOAuth.provider``,
-    including arbitrary IDs of admin-created apps. Runtime instead refreshes
-    using the catalog app's resolved ``provider_name``. The caller therefore
-    supplies that catalog context; falling back to the stored key only covers
-    a bare provider-level grant such as ``provider == "meta"``.
-    """
-    resolved_provider = provider_name or getattr(oauth_account, "provider", None)
-    return bool(resolved_provider and str(resolved_provider).strip().lower() == "meta")
-
-
-def _oauth_provider_by_grant_key(apps: Sequence[dict]) -> dict[str, object]:
-    """Map exact app-scoped grant keys to runtime provider names.
-
-    ``PublicMCPApp.app_id`` and ``UserOAuth.provider`` are persisted stable
-    identities. Admin-created IDs may collide after display-key normalization,
-    so normalizing here could let an unrelated catalog row overwrite the
-    provider context runtime resolves from the exact app ID.
-    """
-    provider_by_key: dict[str, object] = {}
-    for app in apps:
-        key = app.get("id")
-        provider = app.get("provider")
-        if isinstance(key, str) and key and provider:
-            provider_by_key[key] = provider
-    return provider_by_key
+    now = datetime.now(timezone.utc)
+    return expires_at > now
 
 
 def _oauth_keys_for_app(app: dict) -> list[str]:
@@ -2504,26 +2408,11 @@ def _connected_oauth_server_for_app(
     return cast(int, server.id), str(email) if email else None
 
 
-def _build_oauth_account_lookup(
-    oauth_accounts: list[object], *, apps: Sequence[dict] = ()
-) -> dict[str, object]:
-    provider_by_grant_key = _oauth_provider_by_grant_key(apps)
+def _build_oauth_account_lookup(oauth_accounts: list[object]) -> dict[str, object]:
     lookup: dict[str, object] = {}
     for account in oauth_accounts:
-        provider_key = getattr(account, "provider", None)
-        key = normalize_catalog_key(provider_key)
-        if (
-            key
-            and key not in lookup
-            and _oauth_account_can_connect(
-                account,
-                provider_name=(
-                    provider_by_grant_key.get(provider_key)
-                    if isinstance(provider_key, str)
-                    else None
-                ),
-            )
-        ):
+        key = normalize_catalog_key(getattr(account, "provider", None))
+        if key and key not in lookup and _oauth_account_can_connect(account):
             lookup[key] = account
     return lookup
 
@@ -2903,9 +2792,7 @@ def list_mcp_apps(
     library_apps = (
         get_all_mcp_apps(db) if location in ["remote", "local", "all"] else []
     )
-    oauth_account_lookup = _build_oauth_account_lookup(
-        list(oauth_accounts), apps=library_apps
-    )
+    oauth_account_lookup = _build_oauth_account_lookup(list(oauth_accounts))
     oauth_server_lookup = _build_active_oauth_server_lookup(user_mcps)
     non_oauth_server_lookup = _build_active_non_oauth_server_lookup(user_mcps)
 
@@ -3299,25 +3186,13 @@ def get_mcp_servers(
             .all()
         )
 
-        from ..tools.config import oauth_token_resolver_installed
-
-        token_resolver_installed = oauth_token_resolver_installed()
-        oauth_account_summaries = (
-            {}
-            if token_resolver_installed
-            else _oauth_account_summaries(db, effective_user_id)
-        )
+        oauth_account_summaries = _oauth_account_summaries(db, effective_user_id)
 
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
             app_id, provider, connected_account, connection_status = (
-                _enrich_oauth_server_info(
-                    db,
-                    server,
-                    oauth_account_summaries,
-                    token_resolver_installed=token_resolver_installed,
-                )
+                _enrich_oauth_server_info(db, server, oauth_account_summaries)
             )
             responses.append(
                 _db_server_to_response(
@@ -3356,12 +3231,7 @@ def get_mcp_servers(
                 db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
             ):
                 app_id, provider, connected_account, connection_status = (
-                    _enrich_oauth_server_info(
-                        db,
-                        server,
-                        oauth_account_summaries,
-                        token_resolver_installed=token_resolver_installed,
-                    )
+                    _enrich_oauth_server_info(db, server, oauth_account_summaries)
                 )
                 responses.append(
                     _db_server_to_response(
@@ -3424,21 +3294,9 @@ def get_mcp_server(
 
         user_mcp, server = result
 
-        from ..tools.config import oauth_token_resolver_installed
-
-        token_resolver_installed = oauth_token_resolver_installed()
-        oauth_account_summaries = (
-            {}
-            if token_resolver_installed
-            else _oauth_account_summaries(db, int(user_id))
-        )
+        oauth_account_summaries = _oauth_account_summaries(db, int(user_id))
         app_id, provider, connected_account, connection_status = (
-            _enrich_oauth_server_info(
-                db,
-                server,
-                oauth_account_summaries,
-                token_resolver_installed=token_resolver_installed,
-            )
+            _enrich_oauth_server_info(db, server, oauth_account_summaries)
         )
 
         return _db_server_to_response(

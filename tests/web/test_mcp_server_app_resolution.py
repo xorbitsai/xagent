@@ -16,8 +16,6 @@ two failure modes, both fixed here and pinned below:
   check and its later use.
 """
 
-from datetime import datetime, timedelta, timezone
-
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -344,66 +342,6 @@ class TestTheChangedCallers:
         [response] = get_mcp_servers(current_user=user, db=db)
 
         assert response.id == server_id
-        assert response.connection_status == "connected"
-        assert response.connected_account == "someone@acme.example"
-
-    def test_listing_reports_unknown_when_a_resolver_hook_owns_readiness(self, db):
-        """A resolver may supply the usable runtime token without writing a
-        ``UserOAuth`` row. Hook presence is process-wide and cannot prove its
-        answer for one connector without invoking it, so the synchronous list
-        endpoint must expose that uncertainty instead of claiming the user
-        never connected."""
-        from xagent.web.api.mcp import get_mcp_server, get_mcp_servers
-        from xagent.web.models.user_oauth import UserOAuth
-        from xagent.web.tools.config import (
-            ResolvedToken,
-            set_oauth_token_resolver_hook,
-        )
-
-        user, server_id = self._connected_id_named_app(db)
-        db.query(UserOAuth).filter(UserOAuth.user_id == user.id).delete()
-        db.commit()
-
-        set_oauth_token_resolver_hook(
-            lambda _request: ResolvedToken(access_token="hook-owned-token")
-        )
-        try:
-            [response] = get_mcp_servers(current_user=user, db=db)
-            detail_response = get_mcp_server(
-                server_id=server_id, current_user=user, db=db
-            )
-        finally:
-            set_oauth_token_resolver_hook(None)
-
-        assert response.id == server_id
-        assert response.connection_status == "unknown"
-        assert response.connected_account is None
-        assert detail_response.connection_status == "unknown"
-        assert detail_response.connected_account is None
-
-    def test_listing_uses_dynamic_catalog_provider_for_meta_refresh_readiness(self, db):
-        """An admin-created app has an arbitrary app_id that the static
-        builtin registry cannot classify. Runtime refreshes it by the catalog
-        provider_name (``meta``), so an expired grant without refresh_token is
-        still self-healing and must not be reported as needing reconnect."""
-        from xagent.web.api.mcp import get_mcp_servers
-        from xagent.web.models.user_oauth import UserOAuth
-
-        user, server_id = self._connected_id_named_app(db)
-        app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "acme-mail").one()
-        app.provider_name = "meta"
-        db.query(UserOAuth).filter(UserOAuth.user_id == user.id).update(
-            {
-                "expires_at": datetime.now(timezone.utc) - timedelta(minutes=1),
-                "refresh_token": None,
-            }
-        )
-        db.commit()
-
-        [response] = get_mcp_servers(current_user=user, db=db)
-
-        assert response.id == server_id
-        assert response.provider == "meta"
         assert response.connection_status == "connected"
         assert response.connected_account == "someone@acme.example"
 

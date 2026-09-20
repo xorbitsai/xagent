@@ -590,6 +590,26 @@ def test_update_issue_rejects_whitespace_only_priority(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_summary_and_priority_rejection_does_not_log_an_error(monkeypatch, caplog):
+    # A caller-input validation rejection is a routine, expected outcome
+    # (not a connector/API failure) -- it must not surface as an ERROR log
+    # for either field, consistently.
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with caplog.at_level("ERROR", logger="jira-mcp"):
+        create_result = json.loads(
+            jira.jira_create_issue(project_key="ENG", summary="")
+        )
+        update_result = json.loads(
+            jira.jira_update_issue("ENG-1", summary="", priority="")
+        )
+
+    assert create_result["status"] == "error"
+    assert update_result["status"] == "error"
+    assert caplog.records == []
+
+
 def test_list_transitions_returns_id_and_name(monkeypatch):
     monkeypatch.setattr(
         jira.requests,

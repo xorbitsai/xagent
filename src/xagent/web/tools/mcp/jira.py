@@ -8,7 +8,7 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import clamp_limit, clamp_offset, setup_proxy_env
+from .utils import clamp_limit, clamp_offset, require_clean_text, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-mcp")
@@ -52,19 +52,21 @@ def _headers() -> dict[str, str]:
     }
 
 
-def _require_clean_text(value: str, field_name: str) -> None:
-    """Reject an empty or whitespace-padded free-text value (e.g. an issue's
-    summary or priority name).
+def _clean_text_error(value: str, field_name: str, *, hint: str = "") -> str | None:
+    """Return an _error(...) payload if `value` fails require_clean_text,
+    else None -- callers do `if (err := _clean_text_error(...)): return err`.
 
-    utils.require_clean_identifier does the same underlying check but is
-    documented for ids that go into a request body, and its error message
-    ("must be a non-empty id...") reads as confusing/wrong for a
-    human-authored free-text field that was never an id to begin with.
+    A caller-input validation failure here is a routine, expected rejection
+    (an agent will retry with a fixed value), not a connector/API error, so
+    it's handled the same way for every field: caught locally and returned
+    directly, never left to propagate into the surrounding try/except's
+    `logger.error` -- which is reserved for genuine request failures.
     """
-    if not isinstance(value, str) or not value or value.strip() != value:
-        raise ValueError(
-            f"{field_name} cannot be empty or have leading/trailing whitespace"
-        )
+    try:
+        require_clean_text(value, field_name)
+    except ValueError as exc:
+        return _error(f"{exc}{hint}")
+    return None
 
 
 def _truncate(text: str) -> str:
@@ -383,7 +385,8 @@ def jira_create_issue(
     be one of the site's configured priorities.
     """
     try:
-        _require_clean_text(summary, "summary")
+        if err := _clean_text_error(summary, "summary"):
+            return err
         fields: dict[str, Any] = {
             "project": {"key": project_key},
             "summary": summary,
@@ -426,7 +429,8 @@ def jira_update_issue(
     try:
         fields: dict[str, Any] = {}
         if summary is not None:
-            _require_clean_text(summary, "summary")
+            if err := _clean_text_error(summary, "summary"):
+                return err
             fields["summary"] = summary
         if description is not None:
             fields["description"] = description
@@ -435,13 +439,15 @@ def jira_update_issue(
                 {"accountId": assignee_account_id} if assignee_account_id else None
             )
         if priority is not None:
-            try:
-                _require_clean_text(priority, "priority")
-            except ValueError as exc:
-                return _error(
-                    f"{exc} -- Jira also has no way to clear priority through "
-                    "this field; omit the parameter instead"
-                )
+            if err := _clean_text_error(
+                priority,
+                "priority",
+                hint=(
+                    " -- Jira also has no way to clear priority through this "
+                    "field; omit the parameter instead"
+                ),
+            ):
+                return err
             fields["priority"] = {"name": priority}
         if not fields:
             return _error("No fields provided to update")

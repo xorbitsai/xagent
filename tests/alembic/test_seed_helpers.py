@@ -1,5 +1,7 @@
 """Tests for the shared seed-migration downgrade guard helper."""
 
+import logging
+
 import sqlalchemy as sa
 from sqlalchemy import create_engine, text
 
@@ -65,7 +67,7 @@ def test_deletes_row_matching_the_seed_snapshot(tmp_path):
         assert "widget" not in _app_ids(connection)
 
 
-def test_preserves_row_with_same_id_but_different_fields(tmp_path):
+def test_preserves_row_with_same_id_but_different_fields(tmp_path, caplog):
     """A row that reuses the seed's app_id but was created or edited by an
     operator (any field differs from the seed snapshot) must not be deleted."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
@@ -79,8 +81,40 @@ def test_preserves_row_with_same_id_but_different_fields(tmp_path):
                 " 'stdio', NULL, 'Custom')"
             )
         )
-        delete_unmodified_seeded_rows(connection, PUBLIC_MCP_APPS_TABLE, SEED_ROWS)
+        accepted_rows = [{**SEED_ROWS[0], "name": "Normalized Widget"}]
+        with caplog.at_level(logging.WARNING):
+            delete_unmodified_seeded_rows(
+                connection,
+                PUBLIC_MCP_APPS_TABLE,
+                SEED_ROWS,
+                accepted_seed_rows=accepted_rows,
+            )
         assert "widget" in _app_ids(connection)
+        assert "differs from every accepted seed snapshot" in caplog.text
+
+
+def test_deletes_row_matching_an_accepted_seed_snapshot(tmp_path):
+    """A sanctioned representation left by a descendant migration is still
+    owned by the seed migration and may be deleted on downgrade."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, description, transport,"
+                " provider_name, category)"
+                " VALUES ('widget', 'Normalized Widget',"
+                " 'A seeded widget connector.', 'oauth', 'widget-co', 'Productivity')"
+            )
+        )
+        accepted_rows = [{**SEED_ROWS[0], "name": "Normalized Widget"}]
+        delete_unmodified_seeded_rows(
+            connection,
+            PUBLIC_MCP_APPS_TABLE,
+            SEED_ROWS,
+            accepted_seed_rows=accepted_rows,
+        )
+        assert "widget" not in _app_ids(connection)
 
 
 def test_noop_when_table_missing(tmp_path):

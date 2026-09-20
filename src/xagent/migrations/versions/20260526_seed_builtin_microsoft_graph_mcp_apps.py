@@ -79,14 +79,10 @@ def _microsoft_provider_row() -> dict[str, object]:
 
 
 def _microsoft_app_rows() -> list[dict[str, object]]:
-    # launch_config.command is "python" here (not the original "uv") to match
-    # what 20260715_normalize_builtin_mcp_launch.py's irreversible normalization
-    # leaves behind - see that migration's CANONICAL_EXECUTION_FIELDS comment.
-    # This narrows a downgrade-cleanup window in the other direction: a DB
-    # seeded by this migration but downgraded *before* 20260715 ever ran will
-    # now look "operator-modified" (command still "uv") and be preserved
-    # instead of removed. That fails safe (no data loss, just a stale row)
-    # and is a narrow, non-standard ordering to hit in practice.
+    # This is the immutable payload this historical migration originally
+    # inserted. 20260715_normalize_builtin_mcp_launch.py later rewrites the
+    # launch_config; downgrade accepts that sanctioned representation
+    # separately without changing this migration's own snapshot.
     return [
         {
             "app_id": "teams",
@@ -106,8 +102,8 @@ def _microsoft_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "python",
-                "args": ["-m", "xagent.web.tools.mcp.teams"],
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.teams"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -127,8 +123,8 @@ def _microsoft_app_rows() -> list[dict[str, object]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "python",
-                "args": ["-m", "xagent.web.tools.mcp.outlook"],
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.outlook"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -143,12 +139,25 @@ def _microsoft_app_rows() -> list[dict[str, object]]:
             "oauth_scopes": ["Files.ReadWrite"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "python",
-                "args": ["-m", "xagent.web.tools.mcp.onedrive"],
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.onedrive"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
     ]
+
+
+def _normalized_microsoft_app_rows() -> list[dict[str, object]]:
+    """Return the sanctioned representation left by the 20260715 migration."""
+    rows = _microsoft_app_rows()
+    for row in rows:
+        app_id = str(row["app_id"])
+        row["launch_config"] = {
+            "command": "python",
+            "args": ["-m", f"xagent.web.tools.mcp.{app_id}"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        }
+    return rows
 
 
 def upgrade() -> None:
@@ -195,7 +204,10 @@ def downgrade() -> None:
         # so an operator's pre-existing custom "teams"/"outlook"/"onedrive"
         # app_id is left in place.
         delete_unmodified_seeded_rows(
-            bind, PUBLIC_MCP_APPS_TABLE, _microsoft_app_rows()
+            bind,
+            PUBLIC_MCP_APPS_TABLE,
+            _microsoft_app_rows(),
+            accepted_seed_rows=_normalized_microsoft_app_rows(),
         )
 
     if "oauth_providers" not in existing_tables:

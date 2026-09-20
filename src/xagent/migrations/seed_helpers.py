@@ -72,6 +72,7 @@ def delete_unmodified_seeded_rows(
     seed_rows: Iterable[dict[str, Any]],
     match_columns: Sequence[str] = PUBLIC_MCP_APPS_SEED_MATCH_COLUMNS,
     id_column: str = "app_id",
+    accepted_seed_rows: Iterable[dict[str, Any]] = (),
 ) -> None:
     """Delete rows a migration seeded, but only the ones that still match its
     seed snapshot exactly (id plus ``match_columns``).
@@ -104,6 +105,12 @@ def delete_unmodified_seeded_rows(
     same backend-fragile comparison being avoided above), so that specific
     narrow race remains: a concurrent write that changes only a JSON column
     between the two statements is not caught.
+
+    ``accepted_seed_rows`` may contain alternate, sanctioned snapshots left by
+    later migrations. They are considered only for an id also present in
+    ``seed_rows``. This lets a historical seed downgrade accept both the exact
+    row it inserted and a known descendant-migration representation without
+    weakening comparison for arbitrary operator changes.
 
     A JSON-typed column only compares structurally when ``table`` declares
     it with ``sa.JSON``. A ``table`` that leaves a JSON column untyped (the
@@ -143,6 +150,18 @@ def delete_unmodified_seeded_rows(
         for column, ref in match_column_refs
         if not isinstance(ref.type, sa.JSON)
     ]
+
+    accepted_rows_by_id: dict[Any, list[dict[str, Any]]] = {}
+    for accepted_row in accepted_seed_rows:
+        if id_column not in accepted_row:
+            logger.warning(
+                "delete_unmodified_seeded_rows: ignoring an accepted seed row for "
+                "%s missing id_column %r",
+                table.name,
+                id_column,
+            )
+            continue
+        accepted_rows_by_id.setdefault(accepted_row[id_column], []).append(accepted_row)
 
     for row in seed_rows:
         if id_column not in row:
@@ -185,26 +204,49 @@ def delete_unmodified_seeded_rows(
             )
             if candidate is None:
                 continue
-            mismatched_columns = [
-                column
-                for column, _ in match_column_refs
-                if column in row and candidate[column] != row[column]
-            ]
-            if mismatched_columns:
-                logger.info(
+            accepted_rows = [row, *accepted_rows_by_id.get(row_id, ())]
+            matching_row = None
+            mismatched_columns: set[str] = set()
+            for accepted_row in accepted_rows:
+                supplied_columns = [
+                    column for column, _ in match_column_refs if column in accepted_row
+                ]
+                if not supplied_columns:
+                    logger.warning(
+                        "delete_unmodified_seeded_rows: ignoring an accepted seed "
+                        "snapshot for %s row %s=%r; it supplies none of "
+                        "match_columns %s",
+                        table.name,
+                        id_column,
+                        row_id,
+                        columns_to_match,
+                    )
+                    continue
+                current_mismatches = {
+                    column
+                    for column in supplied_columns
+                    if candidate[column] != accepted_row[column]
+                }
+                if not current_mismatches:
+                    matching_row = accepted_row
+                    break
+                mismatched_columns.update(current_mismatches)
+
+            if matching_row is None:
+                logger.warning(
                     "delete_unmodified_seeded_rows: preserving %s row %s=%r; "
-                    "current value differs from the seed snapshot on %s "
+                    "current value differs from every accepted seed snapshot on %s "
                     "(likely operator-modified)",
                     table.name,
                     id_column,
                     row_id,
-                    mismatched_columns,
+                    sorted(mismatched_columns),
                 )
                 continue
             delete_conditions.extend(
-                ref == row[column]
+                ref == matching_row[column]
                 for column, ref in scalar_column_refs
-                if column in row
+                if column in matching_row
             )
 
         bind.execute(sa.delete(table).where(sa.and_(*delete_conditions)))

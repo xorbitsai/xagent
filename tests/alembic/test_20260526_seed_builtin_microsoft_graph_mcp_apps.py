@@ -1,6 +1,7 @@
 """Tests for the Microsoft Graph MCP registry seed migration."""
 
 import importlib.util
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -107,6 +108,14 @@ def _provider_names(connection):
     )
 
 
+def _launch_config(connection, app_id):
+    value = connection.execute(
+        text("SELECT launch_config FROM public_mcp_apps WHERE app_id=:app_id"),
+        {"app_id": app_id},
+    ).scalar_one()
+    return json.loads(value) if isinstance(value, str) else value
+
+
 def test_upgrade_inserts_microsoft_provider_and_apps(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
@@ -194,6 +203,7 @@ def test_downgrade_removes_provider_and_apps(tmp_path):
         _create_tables(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
+            assert _launch_config(connection, "teams")["command"] == "uv"
             migration.downgrade()
         assert not {"teams", "outlook", "onedrive"} & _app_ids(connection)
         assert "microsoft" not in _provider_names(connection)

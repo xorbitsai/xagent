@@ -96,6 +96,7 @@ from ..services.user_oauth import (
     normalize_user_oauth_resource_owner_key,
     scoped_user_oauth_query,
 )
+from ..tools.config import OAUTH_TOKEN_EXPIRY_SKEW
 
 if TYPE_CHECKING:
     # Type-checking only: a real module-level import here would be a
@@ -2339,6 +2340,16 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
     same skew here, a token expiring in, say, two minutes with no
     refresh_token would report "connected" and then fail a real tool call
     minutes later with ``oauth_token_required``.
+
+    Shares the ``OAUTH_TOKEN_EXPIRY_SKEW`` constant with runtime, but keeps
+    its own comparison rather than calling ``config.py``'s
+    ``_oauth_token_expires_after_cache_window`` (same predicate, different
+    module): that helper reads the wall clock via its own module's
+    ``datetime.now()``, and this file's own naive-vs-aware expiry test
+    monkeypatches ``datetime`` on *this* module specifically -- delegating
+    across modules silently starts reading the real clock underneath a
+    test that believes it has frozen it. Not worth that footgun to remove
+    one more copy of a two-line comparison.
     """
     access_token = getattr(oauth_account, "access_token", None)
     if not access_token:
@@ -2354,10 +2365,7 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
 
-    from ..tools.config import OAUTH_TOKEN_EXPIRY_SKEW
-
-    now = datetime.now(timezone.utc)
-    return expires_at > now + OAUTH_TOKEN_EXPIRY_SKEW
+    return expires_at > datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW
 
 
 def _oauth_keys_for_app(app: dict) -> list[str]:

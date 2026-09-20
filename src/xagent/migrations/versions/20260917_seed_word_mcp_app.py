@@ -93,10 +93,13 @@ def upgrade() -> None:
     if existing is not None:
         if _has_provenance(existing["launch_config"]):
             return
-        raise RuntimeError(
-            "Cannot seed builtin Word connector: an existing public_mcp_apps "
-            "row with app_id='word' has no matching builtin_provenance"
+        logger.warning(
+            "Preserving existing public_mcp_apps row with app_id=%r because it "
+            "has no matching builtin_provenance; the builtin Word connector "
+            "will not be seeded",
+            APP_ID,
         )
+        return
 
     dropped_keys = sorted(set(ROW) - columns)
     if dropped_keys:

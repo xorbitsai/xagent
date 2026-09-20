@@ -109,7 +109,7 @@ def test_upgrade_accepts_provenance_owned_row(tmp_path):
         assert "word" in _app_ids(connection)
 
 
-def test_upgrade_refuses_unowned_custom_word_row(tmp_path):
+def test_upgrade_preserves_unowned_custom_word_row(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -122,8 +122,7 @@ def test_upgrade_refuses_unowned_custom_word_row(tmp_path):
             )
         )
         with patch.object(migration, "op", _operations(connection)):
-            with pytest.raises(RuntimeError, match="builtin_provenance"):
-                migration.upgrade()
+            migration.upgrade()
         row = connection.execute(
             text("SELECT name FROM public_mcp_apps WHERE app_id='word'")
         ).scalar_one()

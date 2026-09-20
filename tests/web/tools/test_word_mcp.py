@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 from unittest.mock import Mock
@@ -235,7 +236,15 @@ def test_set_paragraph_text_rejects_content_control():
 
 @pytest.mark.parametrize(
     "tag",
-    ["w:smartTag", "w:customXml", "w:fldSimple"],
+    [
+        "w:smartTag",
+        "w:customXml",
+        "w:fldSimple",
+        "w:bdo",
+        "w:dir",
+        "w14:conflictIns",
+        "w14:conflictDel",
+    ],
 )
 def test_set_paragraph_text_rejects_other_run_owning_wrappers(tag):
     """w:smartTag (a legacy Office smart tag), w:customXml (a custom XML
@@ -258,6 +267,23 @@ def test_set_paragraph_text_rejects_other_run_owning_wrappers(tag):
     assert not paragraph.runs  # confirms the wrapped run is invisible to .runs
 
     with pytest.raises(ValueError):
+        word._set_paragraph_text(paragraph, "New text")
+
+
+def test_set_paragraph_text_rejects_office_math():
+    from docx.oxml.shared import OxmlElement
+
+    document = Document()
+    paragraph = document.add_paragraph()
+    math = OxmlElement("m:oMath")
+    math_run = OxmlElement("m:r")
+    math_text = OxmlElement("m:t")
+    math_text.text = "x + y"
+    math_run.append(math_text)
+    math.append(math_run)
+    paragraph._p.append(math)
+
+    with pytest.raises(ValueError, match="Office Math"):
         word._set_paragraph_text(paragraph, "New text")
 
 
@@ -602,6 +628,58 @@ def test_list_paragraphs_includes_style(monkeypatch):
     assert result["has_more"] is False
 
 
+def test_read_generation_rejects_changed_document_on_continuation(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("changed"))
+    monkeypatch.setattr(
+        word.requests, "request", Mock(return_value=MockResponse(content=content))
+    )
+
+    result = json.loads(
+        word.word_get_document_text(
+            "Report.docx", offset=1, expected_generation="stale-generation"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "changed" in result["message"]
+
+
+def test_read_continuation_requires_generation():
+    result = json.loads(word.word_get_document_text("Report.docx", offset=1))
+
+    assert result["status"] == "error"
+    assert "expected_generation" in result["message"]
+
+
+def test_low_output_cap_still_returns_valid_json(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("x" * 1_000))
+    monkeypatch.setattr(
+        word.requests, "request", Mock(return_value=MockResponse(content=content))
+    )
+    monkeypatch.setattr(word, "get_tool_max_output_length", lambda: 100)
+
+    encoded = word.word_get_document_text("Report.docx")
+
+    assert len(encoded) <= 100
+    assert json.loads(encoded)["status"] == "error"
+
+
+def test_get_document_text_is_explicitly_main_body_only(monkeypatch):
+    def build(document):
+        document.add_paragraph("body")
+        document.sections[0].header.paragraphs[0].text = "header"
+        document.sections[0].footer.paragraphs[0].text = "footer"
+
+    content = _docx_bytes(build)
+    monkeypatch.setattr(
+        word.requests, "request", Mock(return_value=MockResponse(content=content))
+    )
+
+    result = json.loads(word.word_get_document_text("Report.docx"))
+
+    assert result["text"] == "body"
+
+
 def test_get_document_text_pages_are_valid_json_and_recover_all_text(monkeypatch):
     expected = ('quote " and slash \\ and text ' * 80).strip()
     content = _docx_bytes(lambda d: d.add_paragraph(expected))
@@ -610,9 +688,15 @@ def test_get_document_text_pages_are_valid_json_and_recover_all_text(monkeypatch
     monkeypatch.setattr(word, "get_tool_max_output_length", lambda: 320)
 
     offset = 0
+    generation = None
     chunks = []
     while True:
-        encoded = word.word_get_document_text("Report.docx", offset=offset, limit=500)
+        encoded = word.word_get_document_text(
+            "Report.docx",
+            offset=offset,
+            limit=500,
+            expected_generation=generation,
+        )
         assert len(encoded) <= 320
         page = json.loads(encoded)
         assert page["status"] == "success"
@@ -621,6 +705,7 @@ def test_get_document_text_pages_are_valid_json_and_recover_all_text(monkeypatch
             break
         assert page["next_offset"] > offset
         offset = page["next_offset"]
+        generation = page["generation"]
 
     assert "".join(chunks) == expected
 
@@ -639,6 +724,7 @@ def test_list_paragraphs_paginates_without_skipping(monkeypatch):
             offset=first["next_offset"],
             text_offset=first["next_text_offset"],
             limit=2,
+            expected_generation=first["generation"],
         )
     )
 
@@ -657,10 +743,15 @@ def test_list_paragraphs_splits_one_oversized_paragraph_recoverably(monkeypatch)
 
     offset = 0
     text_offset = 0
+    generation = None
     chunks = []
     while True:
         encoded = word.word_list_paragraphs(
-            "Report.docx", offset=offset, text_offset=text_offset, limit=1
+            "Report.docx",
+            offset=offset,
+            text_offset=text_offset,
+            limit=1,
+            expected_generation=generation,
         )
         assert len(encoded) <= 420
         page = json.loads(encoded)
@@ -671,6 +762,7 @@ def test_list_paragraphs_splits_one_oversized_paragraph_recoverably(monkeypatch)
         assert page["next_text_offset"] > text_offset
         offset = page["next_offset"]
         text_offset = page["next_text_offset"]
+        generation = page["generation"]
 
     assert "".join(chunks) == expected
 
@@ -685,10 +777,22 @@ def test_set_paragraph_text_out_of_range(monkeypatch):
     mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
-    result = json.loads(word.word_set_paragraph_text("Report.docx", 5, "New text"))
+    generation = hashlib.sha256(content).hexdigest()
+    result = json.loads(
+        word.word_set_paragraph_text(
+            "Report.docx", 5, "New text", expected_generation=generation
+        )
+    )
 
     assert result["status"] == "error"
     assert "out of range" in result["message"]
+
+
+def test_set_paragraph_text_requires_read_generation():
+    result = json.loads(word.word_set_paragraph_text("Report.docx", 0, "New text"))
+
+    assert result["status"] == "error"
+    assert "expected_generation" in result["message"]
 
 
 def test_set_paragraph_text_uploads_updated_document(monkeypatch):
@@ -705,7 +809,12 @@ def test_set_paragraph_text_uploads_updated_document(monkeypatch):
     mock_put = Mock(return_value=MockResponse({"id": "item-1"}, status_code=200))
     monkeypatch.setattr(word.requests, "put", mock_put)
 
-    result = json.loads(word.word_set_paragraph_text("Report.docx", 0, "New text"))
+    generation = hashlib.sha256(content).hexdigest()
+    result = json.loads(
+        word.word_set_paragraph_text(
+            "Report.docx", 0, "New text", expected_generation=generation
+        )
+    )
 
     assert result["status"] == "success"
     session_call = mock_request.call_args_list[2]
@@ -1343,6 +1452,45 @@ def test_validate_docx_archive_bounds_part_count(monkeypatch):
         word._validate_docx_archive(buffer.getvalue())
 
 
+def test_validate_docx_archive_bounds_xml_elements(monkeypatch):
+    import zipfile
+
+    buffer = io.BytesIO()
+    xml = b"<root><a/><b/><c/></root>"
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", xml)
+    monkeypatch.setattr(word, "_MAX_XML_ELEMENTS", 3)
+
+    with pytest.raises(ValueError, match="too many XML elements"):
+        word._validate_docx_archive(buffer.getvalue())
+
+
+def test_validate_docx_archive_bounds_paragraph_count(monkeypatch):
+    import zipfile
+
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xml = f'<w:document xmlns:w="{namespace}"><w:p/><w:p/></w:document>'.encode()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", xml)
+    monkeypatch.setattr(word, "_MAX_DOCUMENT_PARAGRAPHS", 1)
+
+    with pytest.raises(ValueError, match="too many paragraphs"):
+        word._validate_docx_archive(buffer.getvalue())
+
+
+def test_validate_docx_archive_rejects_dtd_entities():
+    import zipfile
+
+    xml = b'<!DOCTYPE root [<!ENTITY x "boom">]><root>&x;</root>'
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", xml)
+
+    with pytest.raises(ValueError, match="not a valid Word document"):
+        word._validate_docx_archive(buffer.getvalue())
+
+
 def test_validate_docx_archive_rejects_non_zip_content():
     with pytest.raises(ValueError, match="not a valid Word document"):
         word._validate_docx_archive(b"not a zip file")
@@ -1425,6 +1573,92 @@ def test_upload_document_rejects_stale_etag_at_content_put(monkeypatch):
         )
 
 
+def test_upload_document_reconciles_committed_timeout(monkeypatch):
+    document = Document()
+    buffer = io.BytesIO()
+    document.save(buffer)
+    uploaded = buffer.getvalue()
+    responses = iter(
+        [
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+            MockResponse(content=uploaded),
+            MockResponse({"id": "item-1", "eTag": '"new"'}),
+        ]
+    )
+    monkeypatch.setattr(
+        word.requests, "request", Mock(side_effect=lambda *a, **k: next(responses))
+    )
+    monkeypatch.setattr(
+        word.requests,
+        "put",
+        Mock(side_effect=requests.ConnectionError("connection dropped")),
+    )
+
+    result = word._upload_document(
+        document,
+        "Report.docx",
+        word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
+    )
+
+    assert result["id"] == "item-1"
+    assert result["eTag"] == '"new"'
+
+
+def test_upload_document_resumes_from_server_offset(monkeypatch):
+    monkeypatch.setattr(
+        word.requests,
+        "request",
+        Mock(
+            return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+        ),
+    )
+    put = Mock(
+        side_effect=[
+            MockResponse({"nextExpectedRanges": ["10-"]}, status_code=202),
+            MockResponse({"id": "item-1"}, status_code=201),
+        ]
+    )
+    monkeypatch.setattr(word.requests, "put", put)
+
+    word._upload_document(
+        Document(),
+        "Report.docx",
+        word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
+    )
+
+    assert (
+        put.call_args_list[1].kwargs["headers"]["Content-Range"].startswith("bytes 10-")
+    )
+    assert (
+        put.call_args_list[1].kwargs["data"]
+        == put.call_args_list[0].kwargs["data"][10:]
+    )
+
+
+def test_upload_document_reports_unresolved_ambiguous_outcome(monkeypatch):
+    monkeypatch.setattr(
+        word.requests,
+        "request",
+        Mock(
+            return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+        ),
+    )
+    monkeypatch.setattr(
+        word.requests, "put", Mock(side_effect=requests.ConnectionError("dropped"))
+    )
+    monkeypatch.setattr(word, "_reconcile_uploaded_document", Mock(return_value=None))
+    monkeypatch.setattr(
+        word.requests, "get", Mock(side_effect=requests.ConnectionError("dropped"))
+    )
+
+    with pytest.raises(RuntimeError, match="outcome is unknown.*before retrying"):
+        word._upload_document(
+            Document(),
+            "Report.docx",
+            word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
+        )
+
+
 def test_download_document_returns_etag_from_metadata(monkeypatch):
     content = _docx_bytes()
     responses = iter(
@@ -1433,9 +1667,10 @@ def test_download_document_returns_etag_from_metadata(monkeypatch):
     mock_request = Mock(side_effect=lambda *a, **k: next(responses))
     monkeypatch.setattr(word.requests, "request", mock_request)
 
-    _document, snapshot = word._download_document("Report.docx", None, None)
+    _document, snapshot, generation = word._download_document("Report.docx", None, None)
 
     assert snapshot == word._EditSnapshot("/drives/drive-1/items/item-1", '"xyz"')
+    assert generation == hashlib.sha256(content).hexdigest()
     metadata_call = mock_request.call_args_list[0]
     assert metadata_call.kwargs["params"] == {"$select": "id,eTag,parentReference"}
     content_call = mock_request.call_args_list[1]
@@ -1469,7 +1704,7 @@ def test_download_document_skips_etag_metadata_when_not_needed(monkeypatch):
     mock_request = Mock(return_value=MockResponse(content=content))
     monkeypatch.setattr(word.requests, "request", mock_request)
 
-    _document, etag = word._download_document(
+    _document, etag, _generation = word._download_document(
         "Report.docx", None, None, need_etag=False
     )
 

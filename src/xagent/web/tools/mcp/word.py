@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import logging
@@ -6,8 +7,11 @@ import zipfile
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
+from xml.etree.ElementTree import ParseError
 
 import requests
+from defusedxml import ElementTree as DefusedElementTree
+from defusedxml.common import DefusedXmlException
 from docx import Document
 from docx.document import Document as DocumentType
 from docx.oxml.ns import qn
@@ -51,12 +55,13 @@ _WORD_MIME_TYPE = (
 # _read_capped_content guard on the compressed-size half of this hazard.
 _MAX_DOWNLOAD_BYTES = 10_000_000
 
-# The decompressed-size half of the same hazard: matches powerpoint.py's
-# identical _MAX_PRESENTATION_UNCOMPRESSED_BYTES/_MAX_PRESENTATION_PARTS
-# guard (via _validate_presentation_archive) for the same OOXML
-# ZIP-archive structure a .docx shares with a .pptx.
-_MAX_DECOMPRESSED_BYTES = 500_000_000
+# Layered expansion, XML-part, element, and paragraph ceilings keep both
+# archive inflation and python-docx's later object graph bounded.
+_MAX_DECOMPRESSED_BYTES = 100_000_000
 _MAX_ARCHIVE_PARTS = 10_000
+_MAX_XML_PART_BYTES = 20_000_000
+_MAX_XML_ELEMENTS = 250_000
+_MAX_DOCUMENT_PARAGRAPHS = 50_000
 
 # _upload_document sends the whole edited document in a single PUT to an
 # upload-session URL (not Graph's separate small-file content PUT), for
@@ -99,7 +104,19 @@ def _error(message: str, *, details: Any = None) -> str:
     payload: dict[str, Any] = {"status": "error", "message": message}
     if details is not None:
         payload["details"] = details
-    return json.dumps(payload, ensure_ascii=False)
+    encoded = json.dumps(payload, ensure_ascii=False)
+    max_length = get_tool_max_output_length()
+    if len(encoded) <= max_length:
+        return encoded
+    for fallback in (
+        {"status": "error", "message": "Word tool error exceeds output limit"},
+        {"status": "error"},
+        {},
+    ):
+        encoded = json.dumps(fallback, ensure_ascii=False)
+        if len(encoded) <= max_length:
+            return encoded
+    return "0"
 
 
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -350,13 +367,57 @@ def _validate_docx_archive(content: bytes) -> None:
                 raise ValueError(
                     "The document expands beyond the safe OOXML processing limit"
                 )
-    except zipfile.BadZipFile as exc:
+            xml_infos = [
+                info
+                for info in infos
+                if info.filename.lower().endswith((".xml", ".rels"))
+            ]
+            if any(info.file_size > _MAX_XML_PART_BYTES for info in xml_infos):
+                raise ValueError(
+                    "The document contains an XML part beyond the safe processing limit"
+                )
+
+            element_count = 0
+            paragraph_count = 0
+            paragraph_tag = (
+                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
+            )
+            for info in xml_infos:
+                with archive.open(info) as part:
+                    for _event, element in DefusedElementTree.iterparse(
+                        part,
+                        events=("end",),
+                        forbid_dtd=True,
+                        forbid_entities=True,
+                        forbid_external=True,
+                    ):
+                        element_count += 1
+                        if element_count > _MAX_XML_ELEMENTS:
+                            raise ValueError(
+                                "The document contains too many XML elements to process safely"
+                            )
+                        if (
+                            info.filename == "word/document.xml"
+                            and element.tag == paragraph_tag
+                        ):
+                            paragraph_count += 1
+                            if paragraph_count > _MAX_DOCUMENT_PARAGRAPHS:
+                                raise ValueError(
+                                    "The document contains too many paragraphs to process safely"
+                                )
+                        element.clear()
+    except (zipfile.BadZipFile, ParseError, DefusedXmlException) as exc:
         raise ValueError("The file is not a valid Word document OOXML archive") from exc
 
 
 def _download_document(
-    file_path: str, site_id: str | None, drive_id: str | None, *, need_etag: bool = True
-) -> tuple[DocumentType, _EditSnapshot | None]:
+    file_path: str,
+    site_id: str | None,
+    drive_id: str | None,
+    *,
+    need_etag: bool = True,
+    expected_generation: str | None = None,
+) -> tuple[DocumentType, _EditSnapshot | None, str]:
     """Download file_path and parse it, also returning the driveItem's
     stable driveItem identity and current eTag for edit callers. An edit
     fails closed if Graph omits any required identity/version field: silently
@@ -399,9 +460,15 @@ def _download_document(
         snapshot = _EditSnapshot(item_path=stable_item_path, etag=etag)
         download_path = f"{stable_item_path}/content"
     content = _graph_request("GET", download_path, raw=True)
+    generation = hashlib.sha256(content).hexdigest()
+    if expected_generation is not None and generation != expected_generation:
+        raise ValueError(
+            f"{file_path!r} changed since the referenced paragraph page was read; "
+            "restart pagination and retry with its new generation"
+        )
     _validate_docx_archive(content)
     try:
-        return Document(io.BytesIO(content)), snapshot
+        return Document(io.BytesIO(content)), snapshot, generation
     except Exception as exc:
         raise ValueError(
             f"Could not open {file_path!r} as a Word document -- it may not be a "
@@ -462,35 +529,99 @@ def _upload_document(
     if not isinstance(upload_url, str) or not upload_url:
         raise RuntimeError("Graph did not return an upload session URL")
 
-    # See _create_only_upload's identical comment: the upload-session URL
-    # is itself a bearer secret, so neither requests.put's own exception
-    # nor the HTTPError from raise_for_status() is stringified into a
-    # message here, and each is re-raised "from None".
+    offset = 0
+    for _attempt in range(3):
+        response: requests.Response | None = None
+        try:
+            response = requests.put(
+                upload_url,
+                data=content[offset:],
+                headers={
+                    "Content-Range": (
+                        f"bytes {offset}-{len(content) - 1}/{len(content)}"
+                    ),
+                    "Content-Type": _WORD_MIME_TYPE,
+                },
+                timeout=_BINARY_TIMEOUT_SECONDS,
+            )
+            if response.status_code == 412:
+                raise ValueError(conflict_message)
+            if response.status_code in (200, 201):
+                try:
+                    result = response.json()
+                except ValueError:
+                    result = None
+                if isinstance(result, dict) and result.get("id"):
+                    safe_item = dict(result)
+                    safe_item.pop("@microsoft.graph.downloadUrl", None)
+                    return safe_item
+            elif response.status_code == 202:
+                try:
+                    progress = response.json()
+                except ValueError:
+                    progress = None
+                next_offset = _next_upload_offset(progress, len(content))
+                if next_offset is not None:
+                    offset = next_offset
+                    continue
+            elif response.status_code < 500:
+                raise _GraphRequestError(
+                    f"Word document upload failed with HTTP {response.status_code}",
+                    status_code=response.status_code,
+                )
+        except requests.RequestException:
+            pass
+
+        reconciled = _reconcile_uploaded_document(snapshot, content)
+        if reconciled is not None:
+            return reconciled
+        try:
+            status = requests.get(upload_url, timeout=_BINARY_TIMEOUT_SECONDS)
+            if status.status_code == 200:
+                try:
+                    progress = status.json()
+                except ValueError:
+                    progress = None
+                next_offset = _next_upload_offset(progress, len(content))
+                if next_offset is not None:
+                    offset = next_offset
+                    continue
+        except requests.RequestException:
+            pass
+
+    raise RuntimeError(
+        "Word document upload outcome is unknown; verify the document before "
+        "retrying to avoid applying the edit twice"
+    )
+
+
+def _next_upload_offset(payload: Any, total_bytes: int) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    ranges = payload.get("nextExpectedRanges")
+    if not isinstance(ranges, list) or not ranges or not isinstance(ranges[0], str):
+        return None
+    start = ranges[0].split("-", 1)[0]
+    if not start.isdigit():
+        return None
+    offset = int(start)
+    return offset if 0 <= offset < total_bytes else None
+
+
+def _reconcile_uploaded_document(
+    snapshot: _EditSnapshot, content: bytes
+) -> dict[str, Any] | None:
+    """Prove an ambiguous upload committed by comparing its exact bytes."""
     try:
-        response = requests.put(
-            upload_url,
-            data=content,
-            headers={
-                "Content-Range": f"bytes 0-{len(content) - 1}/{len(content)}",
-                "Content-Type": _WORD_MIME_TYPE,
-            },
-            timeout=_BINARY_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-    except requests.HTTPError:
-        status_code = response.status_code
-        if status_code == 412:
-            raise ValueError(conflict_message) from None
-        raise _GraphRequestError(
-            f"Word document upload failed with HTTP {status_code}",
-            status_code=status_code,
-        ) from None
-    except requests.RequestException:
-        raise RuntimeError("Word document upload failed") from None
-    result = response.json()
-    if not isinstance(result, dict) or not result.get("id"):
-        raise RuntimeError("Graph did not confirm the document upload completed")
-    safe_item = dict(result)
+        remote = _graph_request("GET", f"{snapshot.item_path}/content", raw=True)
+        if remote != content:
+            return None
+        item = _graph_request("GET", snapshot.item_path, params={"$select": "id,eTag"})
+    except (ValueError, requests.RequestException, _GraphRequestError):
+        return None
+    if not isinstance(item, dict) or not item.get("id"):
+        return None
+    safe_item = dict(item)
     safe_item.pop("@microsoft.graph.downloadUrl", None)
     return safe_item
 
@@ -683,34 +814,25 @@ def _iter_replaceable_runs(paragraph: Any, field_depth_stack: list[bool]) -> Any
         yield r, field_protected
 
 
-# Elements that hold their own runs outside paragraph.runs' direct-children
-# view, the same way a hyperlink does: w:ins/w:del/w:moveFrom/w:moveTo (a
-# tracked-change insertion, deletion, or move), w:sdt (a content control),
-# w:smartTag (a legacy Office smart tag), w:customXml (a custom XML markup
-# region), and w:fldSimple (a simple field, e.g. PAGE/DATE/a TOC entry --
-# its cached display text lives in a run here). _set_paragraph_text only
-# rewrites paragraph.runs[0] and empties the rest, so any of these left
-# untouched keeps its old text -- verified directly for each: the old text
-# is still physically present in the saved XML (readable via ".//w:t", just
-# not reflected in paragraph.text), and Word would render it alongside the
-# new text. Excludes ones inside a text box, which is a separate content
-# stream this rewrite never touches anyway.
-_UNSUPPORTED_NESTED_ELEMENT_TAGS = (
-    "w:hyperlink",
-    "w:ins",
-    "w:del",
-    "w:moveFrom",
-    "w:moveTo",
-    "w:sdt",
-    "w:smartTag",
-    "w:customXml",
-    "w:fldSimple",
-)
-
-
 def _paragraph_has_unsupported_structure(paragraph: Any) -> bool:
-    predicate = " or ".join(f"self::{tag}" for tag in _UNSUPPORTED_NESTED_ELEMENT_TAGS)
-    return bool(paragraph._p.xpath(f".//*[{predicate}][not(ancestor::w:txbxContent)]"))
+    """Return whether visible flow exists outside ``paragraph.runs``.
+
+    python-docx exposes only direct ``w:r`` children through paragraph.runs.
+    Checking that invariant, rather than maintaining a denylist of wrapper
+    names, also covers extension elements and future WordprocessingML wrappers.
+    Office Math uses its own run vocabulary, so it is rejected explicitly.
+    Text boxes are a separate content stream and are checked by the containing
+    drawing run's non-text-content guard.
+    """
+    for run in paragraph._p.xpath(".//w:r[not(ancestor::w:txbxContent)]"):
+        if run.getparent() is not paragraph._p:
+            return True
+    return bool(
+        paragraph._p.xpath(
+            ".//m:oMath[not(ancestor::w:txbxContent)] | "
+            ".//m:oMathPara[not(ancestor::w:txbxContent)]"
+        )
+    )
 
 
 def _set_paragraph_text(paragraph: Any, text: str) -> None:
@@ -720,19 +842,19 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
     doesn't expose a supported run-removal API; an empty run has no visible
     effect but a paragraph with zero runs to begin with needs one added.
 
-    Refuses (rather than silently corrupting the document) a paragraph
-    containing a hyperlink, a tracked-change insertion/deletion/move, a
-    content control, a smart tag, custom XML markup, or a simple field --
-    each holds its own runs outside paragraph.runs, so the rewrite below
-    would leave their old text stale rather than replacing it -- or a
+    Refuses (rather than silently corrupting the document) a paragraph with
+    visible content outside paragraph.runs (including wrappers, tracked
+    changes, hyperlinks, content controls, extension markup, or Office Math),
+    which the rewrite below would leave stale rather than replacing, or a
     paragraph containing a run with an image, break, or field character,
     which the plain-text runs[0].text assignment below would silently
     delete.
     """
     if _paragraph_has_unsupported_structure(paragraph):
         raise ValueError(
-            "paragraph contains a hyperlink, tracked change, content "
-            "control, smart tag, custom XML region, or field; "
+            "paragraph contains wrapped or mathematical content outside "
+            "python-docx's paragraph.runs (for example a hyperlink, tracked "
+            "change, content control, extension wrapper, or Office Math); "
             "word_set_paragraph_text does not support editing it here "
             "(its own run text is outside python-docx's paragraph.runs, "
             "so it would be left stale rather than replaced) -- edit this "
@@ -754,7 +876,9 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
         run.text = ""
 
 
-def _text_page_response(text: str, *, offset: int, limit: int, table_count: int) -> str:
+def _text_page_response(
+    text: str, *, offset: int, limit: int, table_count: int, generation: str
+) -> str:
     """Return a recoverable character page that fits the tool output cap."""
     start = min(clamp_offset(offset), len(text))
     requested = clamp_limit(limit, max_limit=_MAX_TEXT_PAGE_CHARS)
@@ -770,6 +894,7 @@ def _text_page_response(text: str, *, offset: int, limit: int, table_count: int)
             has_more=has_more,
             next_offset=page_end if has_more else None,
             table_count=table_count,
+            generation=generation,
         )
 
     response = _build(end)
@@ -785,7 +910,12 @@ def _text_page_response(text: str, *, offset: int, limit: int, table_count: int)
 
 
 def _paragraph_page_response(
-    paragraphs: list[Any], *, offset: int, limit: int, text_offset: int
+    paragraphs: list[Any],
+    *,
+    offset: int,
+    limit: int,
+    text_offset: int,
+    generation: str,
 ) -> str:
     """Return paragraph records without ever emitting unrecoverable JSON.
 
@@ -816,6 +946,7 @@ def _paragraph_page_response(
             has_more=has_more,
             next_offset=resume_index,
             next_text_offset=resume_text_offset if has_more else None,
+            generation=generation,
         )
 
     while index < total and len(items) < page_limit:
@@ -919,19 +1050,32 @@ def word_get_document_text(
     drive_id: str | None = None,
     offset: int = 0,
     limit: int = _DEFAULT_TEXT_PAGE_CHARS,
+    expected_generation: str | None = None,
 ) -> str:
-    """Get a page of a Word document's paragraph text joined by newlines.
+    """Get a page of top-level paragraph text from the main document body.
 
-    Table contents are not included. Pass next_offset from a response with
-    has_more=true back as offset to continue without losing content. limit
-    is a character count and is capped to a safe maximum."""
+    Tables, headers, footers, text boxes, notes, and tracked-change content
+    are not included. Pass next_offset and generation from a response with
+    has_more=true back as offset/expected_generation. A changed document is
+    rejected instead of mixing pages from different versions. limit is a
+    character count and is capped to a safe maximum."""
     try:
-        document, _snapshot = _download_document(
-            file_path, site_id, drive_id, need_etag=False
+        if clamp_offset(offset) and not expected_generation:
+            raise ValueError("expected_generation is required to continue pagination")
+        document, _snapshot, generation = _download_document(
+            file_path,
+            site_id,
+            drive_id,
+            need_etag=False,
+            expected_generation=expected_generation,
         )
         text = "\n".join(paragraph.text for paragraph in document.paragraphs)
         return _text_page_response(
-            text, offset=offset, limit=limit, table_count=len(document.tables)
+            text,
+            offset=offset,
+            limit=limit,
+            table_count=len(document.tables),
+            generation=generation,
         )
     except Exception as e:
         logger.error("Error getting text for Word document %s: %s", file_path, e)
@@ -946,22 +1090,33 @@ def word_list_paragraphs(
     offset: int = 0,
     limit: int = _DEFAULT_PARAGRAPH_PAGE_SIZE,
     text_offset: int = 0,
+    expected_generation: str | None = None,
 ) -> str:
-    """List a recoverable page of paragraphs with index, text, and style.
+    """List top-level main-body paragraphs with index, text, and style.
 
-    Pass next_offset and next_text_offset from a response with has_more=true
-    back as offset/text_offset. next_text_offset is non-zero only when one
-    unusually large paragraph had to be split to keep the JSON valid. The
-    paragraph index is used by word_set_paragraph_text."""
+    Tables, headers, footers, text boxes, notes, and tracked-change content
+    are excluded. Pass next_offset, next_text_offset, and generation from a
+    response with has_more=true back as offset/text_offset/expected_generation.
+    next_text_offset is non-zero only when one unusually large paragraph had
+    to be split. Pass generation to word_set_paragraph_text with the index."""
     try:
-        document, _snapshot = _download_document(
-            file_path, site_id, drive_id, need_etag=False
+        if (
+            clamp_offset(offset) or clamp_offset(text_offset)
+        ) and not expected_generation:
+            raise ValueError("expected_generation is required to continue pagination")
+        document, _snapshot, generation = _download_document(
+            file_path,
+            site_id,
+            drive_id,
+            need_etag=False,
+            expected_generation=expected_generation,
         )
         return _paragraph_page_response(
             document.paragraphs,
             offset=offset,
             limit=limit,
             text_offset=text_offset,
+            generation=generation,
         )
     except Exception as e:
         logger.error("Error listing paragraphs for Word document %s: %s", file_path, e)
@@ -975,13 +1130,25 @@ def word_set_paragraph_text(
     text: str,
     site_id: str | None = None,
     drive_id: str | None = None,
+    expected_generation: str | None = None,
 ) -> str:
     """Replace a Word document paragraph's text by index (from
     word_list_paragraphs). Keeps the paragraph's style and its first run's
     character formatting; does not preserve formatting that varied across
-    multiple runs within the paragraph."""
+    multiple runs within the paragraph. expected_generation is required from
+    the word_list_paragraphs response that supplied paragraph_index, preventing
+    an intervening edit from redirecting the index to different content."""
     try:
-        document, snapshot = _download_document(file_path, site_id, drive_id)
+        if not expected_generation:
+            raise ValueError(
+                "expected_generation from word_list_paragraphs is required"
+            )
+        document, snapshot, _generation = _download_document(
+            file_path,
+            site_id,
+            drive_id,
+            expected_generation=expected_generation,
+        )
         assert snapshot is not None
         paragraphs = document.paragraphs
         if not 0 <= paragraph_index < len(paragraphs):
@@ -1015,7 +1182,9 @@ def word_append_paragraph(
     invalid names raise an error rather than silently falling back to
     Normal."""
     try:
-        document, snapshot = _download_document(file_path, site_id, drive_id)
+        document, snapshot, _generation = _download_document(
+            file_path, site_id, drive_id
+        )
         assert snapshot is not None
         document.add_paragraph(text, style=style)
         item = _upload_document(document, file_path, snapshot)
@@ -1038,7 +1207,9 @@ def word_add_heading(
     try:
         if not 0 <= level <= 9:
             raise ValueError("level must be between 0 and 9")
-        document, snapshot = _download_document(file_path, site_id, drive_id)
+        document, snapshot, _generation = _download_document(
+            file_path, site_id, drive_id
+        )
         assert snapshot is not None
         document.add_heading(text, level=level)
         item = _upload_document(document, file_path, snapshot)
@@ -1056,7 +1227,10 @@ def word_replace_text(
     site_id: str | None = None,
     drive_id: str | None = None,
 ) -> str:
-    """Find and replace text across a Word document's paragraphs.
+    """Find and replace text across top-level main-body paragraphs only.
+
+    Headers, footers, tables, text boxes, notes, and tracked-change content
+    are outside this tool's scope.
 
     Best-effort: a match is only found when it falls entirely within one
     run (python-docx exposes text at the run level, and Word frequently
@@ -1085,7 +1259,9 @@ def word_replace_text(
     try:
         if not find:
             raise ValueError("find must not be empty")
-        document, snapshot = _download_document(file_path, site_id, drive_id)
+        document, snapshot, _generation = _download_document(
+            file_path, site_id, drive_id
+        )
         assert snapshot is not None
         replacements = 0
         field_depth_stack: list[bool] = []

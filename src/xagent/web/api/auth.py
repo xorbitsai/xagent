@@ -392,6 +392,123 @@ def _merged_oauth_scopes(
     return scopes, scope_str
 
 
+def _build_microsoft_admin_consent_url(
+    db: Session, db_provider: Any, app_id: str | None
+) -> str | None:
+    """Build a tenant-wide admin consent link for the Microsoft provider.
+
+    Several Microsoft Graph scopes used by builtin apps (e.g. teams'
+    Team.ReadBasic.All) are classified by Entra ID as requiring org admin
+    approval -- a non-admin user hitting the ordinary authorize endpoint is
+    blocked outright (redirected back with error=access_denied&
+    error_subcode=cancel) with no way to consent themselves. The v2.0
+    /adminconsent endpoint is the documented way to let a tenant admin grant
+    that approval once for the whole org, after which ordinary users can
+    complete the normal login flow. `organizations` (not `common`) is used
+    as the tenant segment: consumer Microsoft accounts have no concept of
+    admin consent, and this link is only ever useful for a work/school
+    tenant. Returns None when the provider isn't configured yet, so the
+    caller can fall back to the plain error page instead of linking to a
+    request Microsoft would reject.
+    """
+    from urllib.parse import urlencode
+
+    from ..mcp_apps import get_app_by_id
+
+    client_id = _resolve_oauth_secret("microsoft", db_provider.client_id, "CLIENT_ID")
+    if not client_id:
+        return None
+
+    app_scopes: list[str] | None = None
+    if app_id:
+        app_info = get_app_by_id(db, app_id)
+        if app_info and "oauth_scopes" in app_info:
+            app_scopes = app_info["oauth_scopes"]
+
+    _, scope_str = _merged_oauth_scopes(
+        db_provider.default_scopes, app_scopes, "microsoft"
+    )
+    redirect_uri = _resolve_oauth_redirect_uri("microsoft", db_provider)
+    state = create_access_token(
+        {"type": "admin_consent_state", "app_id": app_id},
+        expires_delta=timedelta(minutes=30),
+    )
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
+    if scope_str:
+        params["scope"] = scope_str
+    return (
+        "https://login.microsoftonline.com/organizations/v2.0/adminconsent?"
+        f"{urlencode(params)}"
+    )
+
+
+def _microsoft_admin_consent_required_response(admin_consent_url: str) -> HTMLResponse:
+    """Explain the admin-consent block and hand over a link to send to IT.
+
+    Replaces the generic "Error: access_denied" page for this one specific,
+    expected Microsoft flow: it's not a bug the user can retry their way out
+    of, so the page says what to do instead of just reporting failure.
+    """
+    escaped_url = html.escape(admin_consent_url, quote=True)
+    return HTMLResponse(
+        content=(
+            "<h1>Admin approval required</h1>"
+            "<p>Your Microsoft 365 organization requires an administrator "
+            "to approve this connector before anyone in your organization "
+            "can use it. This is a one-time approval done by Microsoft, "
+            "not by Xagent.</p>"
+            "<p>Send this link to your Microsoft 365 administrator, or open "
+            "it yourself if you are one:</p>"
+            f'<p><a href="{escaped_url}">{escaped_url}</a></p>'
+            "<p>Once an administrator approves it, everyone in your "
+            "organization can connect this app normally.</p>"
+        ),
+        status_code=400,
+    )
+
+
+def _handle_microsoft_admin_consent_return(request: Request) -> HTMLResponse:
+    """Render the landing page Entra ID redirects an admin to after /adminconsent.
+
+    This return trip carries admin_consent=True/False and the original
+    `state` instead of the usual authorization `code` -- generic_oauth_
+    callback's ordinary code/state handling would otherwise reject it as
+    "Missing code or state". Decoding the app_id from state is best-effort
+    only (a stale or tampered state must not block showing the outcome,
+    since nothing here is written to the database either way -- the tenant
+    grant itself lives entirely on Microsoft's side).
+    """
+    app_id = None
+    state = request.query_params.get("state")
+    if state:
+        payload = verify_token(state)
+        if payload and payload.get("type") == "admin_consent_state":
+            app_id = payload.get("app_id")
+    app_label = html.escape(str(app_id)) if app_id else "this connector"
+    if request.query_params.get("admin_consent") == "True":
+        return HTMLResponse(
+            content=(
+                "<h1>Admin consent granted</h1>"
+                f"<p>Thank you. Your organization has approved {app_label}. "
+                "Ask your team members to connect it again from Xagent -- "
+                "it will now complete without the admin approval prompt.</p>"
+            )
+        )
+    return HTMLResponse(
+        content=(
+            "<h1>Admin consent was not granted</h1>"
+            f"<p>Your administrator did not approve {app_label}. Team "
+            "members will not be able to connect it until an administrator "
+            "grants approval.</p>"
+        ),
+        status_code=400,
+    )
+
+
 # Under Facebook Login for Business (config_id mode), the Meta Login
 # Configuration named by config_id is the *sole* source of truth for granted
 # permissions -- see _generic_oauth_login below, which sends config_id
@@ -3096,6 +3213,15 @@ def generic_oauth_callback(
     is_myob = provider.lower() == "myob"
     if db is None:
         raise RuntimeError("db session is required")
+    if (
+        provider.lower() == "microsoft"
+        and request.query_params.get("admin_consent") is not None
+    ):
+        # Entra ID's /adminconsent return trip carries admin_consent=True/
+        # False and the original `state`, never a `code` -- must be handled
+        # before the code/state checks below, which would otherwise reject
+        # it as "Missing code or state".
+        return _handle_microsoft_admin_consent_return(request)
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
@@ -3139,6 +3265,17 @@ def generic_oauth_callback(
     actor_owner_claim = payload.get("resource_owner_key")
     is_actor_flow = actor_flow_nonce is not None or actor_owner_claim is not None
     if provider_error_response is not None and not is_actor_flow:
+        if (
+            provider.lower() == "microsoft"
+            and error == "access_denied"
+            and request.query_params.get("error_subcode") == "cancel"
+            and db_provider is not None
+        ):
+            admin_consent_url = _build_microsoft_admin_consent_url(
+                db, db_provider, payload.get("app_id")
+            )
+            if admin_consent_url:
+                return _microsoft_admin_consent_required_response(admin_consent_url)
         return provider_error_response
 
     user_id_claim = payload.get("user_id")

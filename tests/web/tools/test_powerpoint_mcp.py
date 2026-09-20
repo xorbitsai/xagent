@@ -480,24 +480,45 @@ def test_get_presentation_text_returns_resumable_bounded_pages(monkeypatch):
     assert slide_indices == list(range(5))
 
 
-def test_get_presentation_text_rejects_one_oversized_slide_with_valid_json(
+def test_get_presentation_text_skips_oversized_slide_and_continues(
     monkeypatch,
 ):
     def build(prs):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
         box.text_frame.text = "x" * 1000
+        later = prs.slides.add_slide(prs.slide_layouts[6])
+        later.shapes.add_textbox(
+            Inches(1), Inches(1), Inches(3), Inches(1)
+        ).text_frame.text = "Later slide"
 
     content = _pptx_bytes(build)
     _mock_download(monkeypatch, content)
-    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 300)
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 430)
 
-    result_text = powerpoint.powerpoint_get_presentation_text("Deck.pptx")
-    result = json.loads(result_text)
+    first_text = powerpoint.powerpoint_get_presentation_text("Deck.pptx")
+    first = json.loads(first_text)
 
-    assert len(result_text) <= 300
-    assert result["status"] == "error"
-    assert "single PowerPoint slide" in result["message"]
+    assert len(first_text) <= 430
+    assert first["status"] == "success"
+    assert first["slides"] == []
+    assert first["omitted_item"] == {
+        "item_index": 0,
+        "item_type": "slide",
+        "reason": "item_exceeds_output_limit",
+        "output_limit": 430,
+    }
+    assert first["truncated"] is True
+
+    second = json.loads(
+        powerpoint.powerpoint_get_presentation_text(
+            "Deck.pptx", cursor=first["next_cursor"]
+        )
+    )
+    assert second["slides"] == [
+        {"slide_index": 1, "shapes": ["Later slide"], "notes": None}
+    ]
+    assert second["truncated"] is False
 
 
 def test_list_slides_cursor_is_rejected_after_presentation_changes(monkeypatch):
@@ -620,22 +641,38 @@ def test_list_slides(monkeypatch):
     assert result["slides"][0]["layout_name"] == "Title and Content"
 
 
-def test_get_slide_text_rejects_one_oversized_shape_with_valid_json(monkeypatch):
+def test_get_slide_text_skips_oversized_shape_and_continues(monkeypatch):
     def build(prs):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
         box.text_frame.text = "x" * 1000
+        slide.shapes.add_textbox(
+            Inches(1), Inches(2), Inches(3), Inches(1)
+        ).text_frame.text = "Later shape"
 
     content = _pptx_bytes(build)
     _mock_download(monkeypatch, content)
-    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 300)
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 430)
 
-    result_text = powerpoint.powerpoint_get_slide_text("Deck.pptx", 0)
-    result = json.loads(result_text)
+    first_text = powerpoint.powerpoint_get_slide_text("Deck.pptx", 0)
+    first = json.loads(first_text)
 
-    assert len(result_text) <= 300
-    assert result["status"] == "error"
-    assert "single PowerPoint shape" in result["message"]
+    assert len(first_text) <= 430
+    assert first["status"] == "success"
+    assert first["shapes"] == []
+    assert first["omitted_item"]["item_index"] == 0
+    assert first["omitted_item"]["item_type"] == "shape"
+    assert first["truncated"] is True
+
+    second = json.loads(
+        powerpoint.powerpoint_get_slide_text(
+            "Deck.pptx", 0, cursor=first["next_cursor"]
+        )
+    )
+    assert len(second["shapes"]) == 1
+    assert second["shapes"][0]["shape_index"] == 1
+    assert second["shapes"][0]["text"] == "Later shape"
+    assert second["truncated"] is False
 
 
 def test_get_slide_text_out_of_range(monkeypatch):
@@ -1253,19 +1290,41 @@ def test_replace_text_frame_text_preserves_paragraph_alignment():
 
 
 def test_replace_text_frame_text_handles_paragraph_count_change():
-    """More or fewer lines than existing paragraphs must not crash --
-    a paragraph with nothing to carry formatting from/to just gets none."""
+    """New paragraphs inherit the final old paragraph's formatting."""
     presentation = Presentation()
     slide = presentation.slides.add_slide(presentation.slide_layouts[6])
     box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
     box.text_frame.text = "Only line"
     box.text_frame.paragraphs[0].runs[0].font.bold = True
+    box.text_frame.paragraphs[0].runs[0].font.size = Pt(24)
+    box.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
 
     powerpoint._replace_text_frame_text(box.text_frame, "Line one\nLine two")
 
     paragraphs = box.text_frame.paragraphs
     assert [p.text for p in paragraphs] == ["Line one", "Line two"]
-    assert paragraphs[0].runs[0].font.bold is True
+    for paragraph in paragraphs:
+        assert paragraph.alignment == PP_ALIGN.CENTER
+        assert paragraph.runs[0].font.bold is True
+        assert paragraph.runs[0].font.size == Pt(24)
+
+
+def test_replace_text_frame_text_preserves_formatting_across_soft_break():
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+    run = box.text_frame.paragraphs[0].add_run()
+    run.text = "Old"
+    run.font.bold = True
+    run.font.size = Pt(24)
+
+    powerpoint._replace_text_frame_text(box.text_frame, "Line one\vLine two")
+
+    runs = box.text_frame.paragraphs[0].runs
+    assert [run.text for run in runs] == ["Line one", "Line two"]
+    for result_run in runs:
+        assert result_run.font.bold is True
+        assert result_run.font.size == Pt(24)
 
 
 def test_set_shape_text_preserves_formatting(monkeypatch):
@@ -1289,6 +1348,40 @@ def test_set_shape_text_preserves_formatting(monkeypatch):
     run = uploaded.slides[0].shapes[0].text_frame.paragraphs[0].runs[0]
     assert run.text == "New"
     assert run.font.bold is True
+
+
+def test_set_shape_text_preserves_formatting_across_structural_breaks(monkeypatch):
+    def build(prs):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+        paragraph = box.text_frame.paragraphs[0]
+        paragraph.alignment = PP_ALIGN.CENTER
+        run = paragraph.add_run()
+        run.text = "Old"
+        run.font.bold = True
+        run.font.size = Pt(24)
+
+    content = _pptx_bytes(build)
+    _, _, mock_put = _mock_versioned_write(monkeypatch, content)
+
+    result = json.loads(
+        powerpoint.powerpoint_set_shape_text(
+            "Deck.pptx", 0, 0, "Line one\nLine two\vLine three", '"etag-1"'
+        )
+    )
+
+    assert result["status"] == "success"
+    uploaded = Presentation(io.BytesIO(mock_put.call_args.kwargs["data"]))
+    paragraphs = uploaded.slides[0].shapes[0].text_frame.paragraphs
+    assert [paragraph.text for paragraph in paragraphs] == [
+        "Line one",
+        "Line two\vLine three",
+    ]
+    for paragraph in paragraphs:
+        assert paragraph.alignment == PP_ALIGN.CENTER
+        for run in paragraph.runs:
+            assert run.font.bold is True
+            assert run.font.size == Pt(24)
 
 
 def test_set_shape_text_allows_equivalently_formatted_runs(monkeypatch):

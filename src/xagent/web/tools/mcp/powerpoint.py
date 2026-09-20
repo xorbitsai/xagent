@@ -203,8 +203,8 @@ def _bounded_page_response(
     MCP results are transported as a single string and the platform applies a
     per-string output cap after the tool returns. Building the page here keeps
     that outer filter from cutting a JSON document in half. If one atomic item
-    cannot fit, return a small structured error instead of an unrecoverable
-    partial value.
+    cannot fit, return an explicit ``omitted_item`` record and a cursor past it
+    instead of stranding all later items behind an unrecoverable value.
     """
     max_chars = get_tool_max_output_length()
 
@@ -236,14 +236,33 @@ def _bounded_page_response(
         candidate = render([*items, item], next_index + 1)
         if len(candidate) > max_chars:
             if not items:
+                # Do not strand every later item behind one value that can never
+                # fit. Explicitly report the omission and issue a forward cursor;
+                # the cursor is emitted even when this is the final item so the
+                # caller can observe a terminal, non-truncated page next.
+                omitted_index = next_index
+                next_index += 1
+                omitted_response = _compact_json(
+                    {
+                        "status": "success",
+                        field_name: [],
+                        "etag": etag,
+                        "truncated": True,
+                        "next_cursor": _encode_read_cursor(next_index, etag, scope),
+                        "total_count": total_count,
+                        "omitted_item": {
+                            "item_index": omitted_index,
+                            "item_type": item_label,
+                            "reason": "item_exceeds_output_limit",
+                            "output_limit": max_chars,
+                        },
+                    }
+                )
+                if len(omitted_response) <= max_chars:
+                    return omitted_response
                 return _bounded_error(
-                    f"A single PowerPoint {item_label} at index {next_index} cannot "
-                    f"fit within the {max_chars}-character tool output limit",
-                    details={
-                        "item_index": next_index,
-                        "item_type": item_label,
-                        "output_limit": max_chars,
-                    },
+                    "PowerPoint oversized-item metadata exceeds the configured "
+                    "output limit"
                 )
             break
         items.append(item)
@@ -886,13 +905,13 @@ def _replace_text_frame_text(text_frame: Any, text: str) -> None:
     color) by position.
 
     TextFrame.text's own setter (python-pptx) clears every <a:p> and
-    rebuilds one new paragraph per "\n"-separated line, each holding a
-    single run with no <a:pPr>/<a:rPr> at all -- verified directly against
-    its source (CT_TextBody.clear_content / CT_TextParagraph.append_text)
-    -- so a plain assignment silently discards all of that. A paragraph
-    added or removed by this call (the new text has more/fewer lines than
-    the frame had paragraphs) has nothing to carry formatting over
-    to/from, so it gets/loses it; every other paragraph keeps its look.
+    rebuilds one new paragraph per "\n"-separated line, with additional
+    runs around a "\v" soft break. Those generated elements have no
+    <a:pPr>/<a:rPr> at all. Existing paragraphs keep their formatting by
+    position; additional paragraphs inherit the final old paragraph's
+    formatting, and every generated run in a paragraph receives that old
+    paragraph's first-run formatting. Removed paragraphs have no output
+    counterpart and are discarded.
     """
     saved: list[tuple[Any, Any]] = []
     for paragraph in text_frame.paragraphs:
@@ -908,18 +927,19 @@ def _replace_text_frame_text(text_frame: Any, text: str) -> None:
 
     text_frame.text = text
 
-    for (p_pr, r_pr), paragraph in zip(saved, text_frame.paragraphs):
+    for index, paragraph in enumerate(text_frame.paragraphs):
+        p_pr, r_pr = saved[min(index, len(saved) - 1)]
         if p_pr is not None:
             existing_p_pr = paragraph._p.find(qn("a:pPr"))
             if existing_p_pr is not None:
                 paragraph._p.remove(existing_p_pr)
-            paragraph._p.insert(0, p_pr)
-        if r_pr is not None and paragraph.runs:
-            run = paragraph.runs[0]
-            existing_r_pr = run._r.find(qn("a:rPr"))
-            if existing_r_pr is not None:
-                run._r.remove(existing_r_pr)
-            run._r.insert(0, r_pr)
+            paragraph._p.insert(0, deepcopy(p_pr))
+        if r_pr is not None:
+            for run in paragraph.runs:
+                existing_r_pr = run._r.find(qn("a:rPr"))
+                if existing_r_pr is not None:
+                    run._r.remove(existing_r_pr)
+                run._r.insert(0, deepcopy(r_pr))
 
 
 def _require_slide(presentation: PresentationType, slide_index: int) -> Any:
@@ -996,7 +1016,9 @@ def powerpoint_get_presentation_text(
     nested inside a group, and each cell of a table) plus that slide's
     speaker notes, if any. Large decks are returned as bounded pages; pass
     next_cursor back as cursor to continue. The cursor is tied to the current
-    eTag, so pagination fails with conflict if the presentation changes."""
+    eTag, so pagination fails with conflict if the presentation changes. A
+    single slide that cannot fit is reported as omitted_item and the returned
+    cursor advances to the following slide."""
     try:
         snapshot = _download_presentation(file_path, site_id, drive_id)
         presentation = snapshot.presentation
@@ -1089,7 +1111,9 @@ def powerpoint_get_slide_text(
     """Get one slide's shapes with their index, type, and text (needed by
     powerpoint_set_shape_text). Returns an etag that must be passed to that
     tool together with the positional indices. Large shape lists are returned
-    as bounded pages; pass next_cursor back as cursor to continue."""
+    as bounded pages; pass next_cursor back as cursor to continue. A single
+    shape that cannot fit is reported as omitted_item and the returned cursor
+    advances to the following shape."""
     try:
         slide_index = _require_int(slide_index, "slide_index")
         snapshot = _download_presentation(file_path, site_id, drive_id)
@@ -1147,12 +1171,12 @@ def powerpoint_set_shape_text(
     has a text frame (a title, body, or plain text box); errors otherwise.
     Preserves each existing paragraph's alignment/bullet/indent formatting
     and its single run's character formatting (bold, italic, font, size,
-    color) by position; a paragraph this call adds or removes (a "\\n" in
-    text starts a new paragraph) has no corresponding old/new paragraph to
-    carry that formatting from/to. Errors rather than silently discarding
-    multiple differently formatted runs, hyperlinks, or dynamic fields such
-    as an auto-updating slide number or date; edit those shapes directly in
-    PowerPoint instead."""
+    color) by position. Additional paragraphs (a "\\n" in text starts a new
+    paragraph) inherit the final existing paragraph's formatting, and runs
+    generated around a "\\v" soft break inherit their paragraph's character
+    formatting. Errors rather than silently discarding multiple differently
+    formatted runs, hyperlinks, or dynamic fields such as an auto-updating
+    slide number or date; edit those shapes directly in PowerPoint instead."""
     try:
         slide_index = _require_int(slide_index, "slide_index")
         shape_index = _require_int(shape_index, "shape_index")

@@ -181,6 +181,34 @@ def test_set_paragraph_text_rejects_content_control():
         word._set_paragraph_text(paragraph, "New text")
 
 
+@pytest.mark.parametrize(
+    "tag",
+    ["w:smartTag", "w:customXml", "w:fldSimple"],
+)
+def test_set_paragraph_text_rejects_other_run_owning_wrappers(tag):
+    """w:smartTag (a legacy Office smart tag), w:customXml (a custom XML
+    markup region), and w:fldSimple (a simple field's cached result, e.g.
+    PAGE/DATE/a TOC entry) all hold their own runs outside paragraph.runs
+    the same way a hyperlink or content control does -- verified directly:
+    the wrapped text is still physically present in the saved XML after a
+    rewrite, stale alongside the new text."""
+    from docx.oxml.shared import OxmlElement
+
+    document = Document()
+    paragraph = document.add_paragraph()
+    wrapper = OxmlElement(tag)
+    run_elm = OxmlElement("w:r")
+    text_elm = OxmlElement("w:t")
+    text_elm.text = "wrapped value"
+    run_elm.append(text_elm)
+    wrapper.append(run_elm)
+    paragraph._p.append(wrapper)
+    assert not paragraph.runs  # confirms the wrapped run is invisible to .runs
+
+    with pytest.raises(ValueError):
+        word._set_paragraph_text(paragraph, "New text")
+
+
 def test_set_paragraph_text_rejects_run_with_image():
     import base64
 
@@ -542,6 +570,111 @@ def test_replace_text_rejects_match_in_run_with_image(monkeypatch):
     assert result["status"] == "error"
     assert "non-text content" in result["message"]
     # Only the download GET happened -- no upload was attempted.
+    assert mock_request.call_count == 1
+
+
+def test_replace_text_rejects_match_inside_content_control(monkeypatch):
+    """A match inside a <w:sdt>'s run must be refused, not silently
+    rewritten -- doing so would desync the control's data binding, which
+    this tool has no way to update to match."""
+    from docx.oxml.shared import OxmlElement
+
+    def build(d):
+        p = d.add_paragraph()
+        sdt = OxmlElement("w:sdt")
+        sdt_content = OxmlElement("w:sdtContent")
+        run_elm = OxmlElement("w:r")
+        text_elm = OxmlElement("w:t")
+        text_elm.text = "foo bar"
+        run_elm.append(text_elm)
+        sdt_content.append(run_elm)
+        sdt.append(sdt_content)
+        p._p.append(sdt)
+
+    content = _docx_bytes(build)
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "error"
+    assert "content control" in result["message"]
+    assert mock_request.call_count == 1
+
+
+def test_replace_text_rejects_match_inside_simple_field(monkeypatch):
+    """A <w:fldSimple>'s cached result (e.g. a PAGE/DATE field or a TOC
+    entry) must be refused -- rewriting the cached text leaves the field's
+    own instruction unchanged, so Word's next refresh can revert it."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+
+    def build(d):
+        p = d.add_paragraph()
+        fld_simple = OxmlElement("w:fldSimple")
+        fld_simple.set(qn("w:instr"), "PAGE")
+        run_elm = OxmlElement("w:r")
+        text_elm = OxmlElement("w:t")
+        text_elm.text = "foo bar"
+        run_elm.append(text_elm)
+        fld_simple.append(run_elm)
+        p._p.append(fld_simple)
+
+    content = _docx_bytes(build)
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "error"
+    assert "field" in result["message"]
+    assert mock_request.call_count == 1
+
+
+def test_replace_text_rejects_match_inside_complex_field_result(monkeypatch):
+    """A complex field (begin/instrText/separate/result/end run sequence)
+    has no single wrapper element -- its cached result run must still be
+    recognized and refused via the fldChar state machine."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+
+    def build(d):
+        p = d.add_paragraph()
+
+        def add_run_with(*children):
+            run_elm = OxmlElement("w:r")
+            for child in children:
+                run_elm.append(child)
+            p._p.append(run_elm)
+
+        begin = OxmlElement("w:fldChar")
+        begin.set(qn("w:fldCharType"), "begin")
+        add_run_with(begin)
+
+        instr = OxmlElement("w:instrText")
+        instr.text = " PAGEREF _Toc123 "
+        add_run_with(instr)
+
+        separate = OxmlElement("w:fldChar")
+        separate.set(qn("w:fldCharType"), "separate")
+        add_run_with(separate)
+
+        result_text = OxmlElement("w:t")
+        result_text.text = "foo bar"
+        add_run_with(result_text)
+
+        end = OxmlElement("w:fldChar")
+        end.set(qn("w:fldCharType"), "end")
+        add_run_with(end)
+
+    content = _docx_bytes(build)
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "error"
+    assert "field" in result["message"]
     assert mock_request.call_count == 1
 
 

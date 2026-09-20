@@ -336,22 +336,52 @@ _PARAGRAPH_FLOW_PREDICATE = (
 )
 
 
-def _paragraph_flow_elements(paragraph: Any, local_tag: str) -> Any:
-    """Descendants of paragraph matching local_tag (e.g. "w:r", "w:hyperlink"),
-    excluding ones nested in tracked-change markup or a text box -- see
-    _PARAGRAPH_FLOW_PREDICATE."""
-    return paragraph._p.xpath(f".//{local_tag}[{_PARAGRAPH_FLOW_PREDICATE}]")
+def _iter_replaceable_runs(paragraph: Any) -> Any:
+    """Yield (run_element, is_field_protected) for each <w:r> in
+    paragraph's own flow (excluding tracked-change/text-box content, per
+    _PARAGRAPH_FLOW_PREDICATE) -- a single pass over one xpath() call, so
+    every run's identity stays valid for the whole loop, unlike comparing
+    id()s collected from two separate xpath() calls: lxml only guarantees a
+    node's proxy object identity for as long as something still holds a
+    reference to it, and a set of bare id() ints doesn't -- verified
+    directly, this silently mismatched two different runs after the
+    resulting document was saved and reloaded.
+
+    Tracks complex-field state (a <w:fldChar w:fldCharType="begin"/>, the
+    field's instruction text, a "separate" marker, its cached display-text
+    runs, then an "end" marker) along the way, since a complex field's
+    result run has no distinguishing wrapper element of its own the way
+    w:sdt/w:fldSimple do."""
+    in_field_result = False
+    for r in paragraph._p.xpath(".//w:r"):
+        fld_char = r.find(qn("w:fldChar"))
+        if fld_char is not None:
+            fld_type = fld_char.get(qn("w:fldCharType"))
+            if fld_type == "separate":
+                in_field_result = True
+            elif fld_type == "end":
+                in_field_result = False
+            continue
+        if not r.xpath(_PARAGRAPH_FLOW_PREDICATE):
+            continue
+        field_protected = in_field_result or bool(
+            r.xpath("boolean(ancestor::w:sdt or ancestor::w:fldSimple)")
+        )
+        yield r, field_protected
 
 
 # Elements that hold their own runs outside paragraph.runs' direct-children
 # view, the same way a hyperlink does: w:ins/w:del/w:moveFrom/w:moveTo (a
-# tracked-change insertion, deletion, or move) and w:sdt (a content
-# control). _set_paragraph_text only rewrites paragraph.runs[0] and empties
-# the rest, so any of these left untouched keeps its old text -- verified
-# directly: the old text is still physically present in the saved XML
-# (readable via ".//w:t", just not reflected in paragraph.text), and Word
-# would render it alongside the new text. Excludes ones inside a text box,
-# which is a separate content stream this rewrite never touches anyway.
+# tracked-change insertion, deletion, or move), w:sdt (a content control),
+# w:smartTag (a legacy Office smart tag), w:customXml (a custom XML markup
+# region), and w:fldSimple (a simple field, e.g. PAGE/DATE/a TOC entry --
+# its cached display text lives in a run here). _set_paragraph_text only
+# rewrites paragraph.runs[0] and empties the rest, so any of these left
+# untouched keeps its old text -- verified directly for each: the old text
+# is still physically present in the saved XML (readable via ".//w:t", just
+# not reflected in paragraph.text), and Word would render it alongside the
+# new text. Excludes ones inside a text box, which is a separate content
+# stream this rewrite never touches anyway.
 _UNSUPPORTED_NESTED_ELEMENT_TAGS = (
     "w:hyperlink",
     "w:ins",
@@ -359,6 +389,9 @@ _UNSUPPORTED_NESTED_ELEMENT_TAGS = (
     "w:moveFrom",
     "w:moveTo",
     "w:sdt",
+    "w:smartTag",
+    "w:customXml",
+    "w:fldSimple",
 )
 
 
@@ -375,18 +408,20 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
     effect but a paragraph with zero runs to begin with needs one added.
 
     Refuses (rather than silently corrupting the document) a paragraph
-    containing a hyperlink, a tracked-change insertion/deletion/move, or a
-    content control -- each holds its own runs outside paragraph.runs, so
-    the rewrite below would leave their old text stale rather than
-    replacing it -- or a paragraph containing a run with an image, break,
-    or field character, which the plain-text runs[0].text assignment below
-    would silently delete.
+    containing a hyperlink, a tracked-change insertion/deletion/move, a
+    content control, a smart tag, custom XML markup, or a simple field --
+    each holds its own runs outside paragraph.runs, so the rewrite below
+    would leave their old text stale rather than replacing it -- or a
+    paragraph containing a run with an image, break, or field character,
+    which the plain-text runs[0].text assignment below would silently
+    delete.
     """
     if _paragraph_has_unsupported_structure(paragraph):
         raise ValueError(
-            "paragraph contains a hyperlink, tracked change, or content "
-            "control; word_set_paragraph_text does not support editing it "
-            "here (its own run text is outside python-docx's paragraph.runs, "
+            "paragraph contains a hyperlink, tracked change, content "
+            "control, smart tag, custom XML region, or field; "
+            "word_set_paragraph_text does not support editing it here "
+            "(its own run text is outside python-docx's paragraph.runs, "
             "so it would be left stale rather than replaced) -- edit this "
             "paragraph directly in Word instead"
         )
@@ -557,24 +592,28 @@ def word_replace_text(
     paragraph.
 
     Searches every run in a paragraph, including ones nested inside a
-    hyperlink or other wrapper (a content control, a smart tag) --
-    paragraph.runs itself only sees direct children, which would otherwise
-    make hyperlink text invisible to this tool even though it's included
-    when reading the document back with word_get_document_text. Does not
-    search inside a text box or a tracked-change insertion/deletion/move,
-    since neither is visible through this module's read tools either.
+    hyperlink -- paragraph.runs itself only sees direct children, which
+    would otherwise make hyperlink text invisible to this tool even though
+    it's included when reading the document back with
+    word_get_document_text. Does not search inside a text box or a
+    tracked-change insertion/deletion/move, since neither is visible
+    through this module's read tools either.
 
-    Refuses (rather than silently corrupting the document) a match found in
-    a run that also holds non-text content -- an image, break, or field --
-    since assigning that run's text would delete it the same way
-    word_set_paragraph_text's identical guard prevents."""
+    Refuses (rather than silently corrupting the document or leaving it
+    inconsistent) a match found in: a run that also holds non-text content
+    -- an image, break, or field character -- since assigning that run's
+    text would delete it the same way word_set_paragraph_text's identical
+    guard prevents; or a content control or field's cached result, since
+    rewriting that text in place would desync it from the control's data
+    binding or the field's own instruction, with no way for this tool to
+    update either to match."""
     try:
         if not find:
             raise ValueError("find must not be empty")
         document = _download_document(file_path, site_id, drive_id)
         replacements = 0
         for paragraph in document.paragraphs:
-            for r in _paragraph_flow_elements(paragraph, "w:r"):
+            for r, field_protected in _iter_replaceable_runs(paragraph):
                 run = Run(r, paragraph)
                 if find in run.text:
                     if _run_has_non_text_content(run):
@@ -583,6 +622,14 @@ def word_replace_text(
                             "content (an image, break, or field) that replacing "
                             "its text would silently delete -- edit this "
                             "paragraph directly in Word instead"
+                        )
+                    if field_protected:
+                        raise ValueError(
+                            "found a match inside a content control or a "
+                            "field's cached result; replacing it here would "
+                            "leave the control's data binding or the field's "
+                            "instruction out of sync -- edit this paragraph "
+                            "directly in Word instead"
                         )
                     replacements += run.text.count(find)
                     run.text = run.text.replace(find, replace)

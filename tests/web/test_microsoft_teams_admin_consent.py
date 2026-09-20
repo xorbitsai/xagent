@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -205,10 +206,86 @@ def test_other_providers_are_not_affected(db_session):
     assert "Error: access_denied" in response.body.decode()
 
 
-def test_admin_consent_return_trip_success(db_session):
+def test_bare_microsoft_cancellation_keeps_the_generic_page(db_session):
+    """error=access_denied&error_subcode=cancel is Entra ID's generic signal
+    for a cancelled sign-in/consent step -- it fires just as much for a user
+    simply declining an ordinary, self-consentable request as it does for a
+    genuine admin-required block, and Microsoft does not distinguish the two
+    in this redirect. A bare login (no app_id) only ever requests the
+    provider's own default_scopes (User.Read), which is not in
+    _MICROSOFT_ADMIN_CONSENT_SCOPES, so this must not be misread as
+    "needs an admin" and must not hand an admin a request to grant broader,
+    unrelated org-wide access nobody asked for."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "microsoft",
+            "app_id": None,
+            "redirect": None,
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(
+        query_params={
+            "error": "access_denied",
+            "error_subcode": "cancel",
+            "state": state,
+        }
+    )
+
+    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+
+    assert response.status_code == 400
+    body = response.body.decode()
+    assert "Error: access_denied" in body
+    assert "adminconsent" not in body
+
+
+def test_hidden_connector_blocks_the_admin_consent_link(db_session):
+    """The admin-consent branch returns earlier in generic_oauth_callback
+    than the existing hidden-app release gate (_reject_hidden_catalog_app),
+    so it must apply that same gate itself -- otherwise a connector an
+    admin just took offline could still have a tenant-wide admin-consent
+    URL minted and shown for it, and Microsoft could receive (and an admin
+    could approve) an org-wide grant request for an app Xagent has
+    intentionally made unavailable."""
+    db, user = db_session
+    db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "teams").update(
+        {"is_visible_in_connector": False}
+    )
+    db.commit()
+
+    request = SimpleNamespace(
+        query_params={
+            "error": "access_denied",
+            "error_subcode": "cancel",
+            "state": _oauth_state(user),
+        }
+    )
+
+    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+
+    assert response.status_code == 404
+    body = response.body.decode()
+    assert "not currently available" in body
+    assert "adminconsent" not in body
+
+
+def test_admin_consent_return_trip_does_not_assert_a_verified_grant(db_session):
     """Entra ID's /adminconsent redirect carries admin_consent=True and the
     original `state`, never a `code` -- this must not fall into the ordinary
-    "Missing code or state" branch."""
+    "Missing code or state" branch.
+
+    The `state` here is exactly what the admin-consent page displays and
+    tells the user to forward -- so this same request (mint state, call the
+    callback with admin_consent=True) is also what anyone holding that link
+    could send directly, without ever visiting Microsoft. The response must
+    therefore never claim a verified grant occurred (no "granted"/"approved"
+    language), only that a response was received -- see the docstring on
+    _handle_microsoft_admin_consent_return for why nothing here can prove a
+    tenant grant actually happened."""
     db, _user = db_session
     state = create_access_token(
         data={"type": "admin_consent_state", "app_id": "teams"},
@@ -226,8 +303,13 @@ def test_admin_consent_return_trip_success(db_session):
 
     assert response.status_code == 200
     body = response.body.decode()
-    assert "granted" in body.lower()
-    assert "approved Teams" in body
+    body_lower = body.lower()
+    assert "Teams" in body
+    # The old wording asserted the grant as settled fact; the fix must not
+    # merely reword it while keeping the same affirmative claim.
+    assert "<h1>admin consent granted</h1>" not in body_lower
+    assert "your organization has approved" not in body_lower
+    assert "no way to independently confirm" in body_lower
 
 
 def test_admin_consent_return_trip_denied(db_session):
@@ -287,5 +369,31 @@ def test_admin_consent_return_trip_rejects_invalid_state(db_session, state):
 
     assert response.status_code == 400
     body = response.body.decode().lower()
-    assert "invalid or expired state" in body
+    assert "expired" in body
+    # A stale/tampered state must not roll back or contradict a real
+    # Microsoft-side grant that may already have happened -- the page must
+    # not claim the approval itself failed, only that Xagent's own link did.
     assert "consent granted" not in body
+    assert "still stands" in body
+
+
+def test_admin_consent_state_lifetime_suits_asynchronous_admin_approval(db_session):
+    """The handoff link is meant to be forwarded to an org admin who may act
+    on it hours later (an IT approval queue), not the 10-minute lifetime an
+    ordinary oauth_state uses for a same-session redirect round trip."""
+    db, user = db_session
+    request = SimpleNamespace(
+        query_params={
+            "error": "access_denied",
+            "error_subcode": "cancel",
+            "state": _oauth_state(user),
+        }
+    )
+
+    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+    admin_consent_url = _extract_admin_consent_url(response.body.decode())
+    state_token = parse_qs(urlparse(admin_consent_url).query)["state"][0]
+
+    payload = verify_token(state_token)
+    minted_lifetime = payload["exp"] - int(time.time())
+    assert minted_lifetime > timedelta(hours=1).total_seconds()

@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import time
 import zipfile
 from dataclasses import dataclass
 from typing import Any
@@ -74,6 +75,9 @@ _MAX_DOCUMENT_PARAGRAPHS = 50_000
 # exactly the prior behavior when this constant was a leftover 4 MB from
 # before this function used an upload session.
 _MAX_UPLOAD_BYTES = _MAX_DOWNLOAD_BYTES
+_UPLOAD_RETRY_ATTEMPTS = 3
+_UPLOAD_RETRY_BASE_SECONDS = 1.0
+_UPLOAD_RETRY_MAX_SECONDS = 4.0
 _DEFAULT_TEXT_PAGE_CHARS = 20_000
 _MAX_TEXT_PAGE_CHARS = 40_000
 _DEFAULT_PARAGRAPH_PAGE_SIZE = 100
@@ -307,10 +311,10 @@ def _site_subresource_base(site_id: str) -> str:
 
 def _normalize_relative_path(path: str) -> str:
     """Normalize a drive-relative file path for a root:/{path}: request URL,
-    rejecting '.'/'..' segments, a trailing folder separator, and a filename
-    ending in a period (Graph/SharePoint's backing storage can silently
-    normalize a trailing dot away, so "Report.docx." could silently resolve
-    to a real, different "Report.docx")."""
+    requiring a .docx filename and rejecting '.'/'..' segments, a trailing
+    folder separator, and a filename ending in a period (Graph/SharePoint's
+    backing storage can silently normalize a trailing dot away, so
+    "Report.docx." could silently resolve to a different "Report.docx")."""
     value = path.strip().strip("/")
     if not value:
         raise ValueError("file_path is required")
@@ -324,6 +328,8 @@ def _normalize_relative_path(path: str) -> str:
         raise ValueError(f"file_path must not contain '.' or '..' segments: {path!r}")
     if value.rsplit("/", 1)[-1].endswith("."):
         raise ValueError(f"file_path filename must not end with a period: {path!r}")
+    if not value.casefold().endswith(".docx"):
+        raise ValueError("file_path must name a .docx Word document")
     return value
 
 
@@ -530,7 +536,7 @@ def _upload_document(
         raise RuntimeError("Graph did not return an upload session URL")
 
     offset = 0
-    for _attempt in range(3):
+    for attempt in range(_UPLOAD_RETRY_ATTEMPTS):
         response: requests.Response | None = None
         try:
             response = requests.put(
@@ -585,14 +591,28 @@ def _upload_document(
                 next_offset = _next_upload_offset(progress, len(content))
                 if next_offset is not None:
                     offset = next_offset
+                    _sleep_before_upload_retry(attempt)
                     continue
         except requests.RequestException:
             pass
+
+        _sleep_before_upload_retry(attempt)
 
     raise RuntimeError(
         "Word document upload outcome is unknown; verify the document before "
         "retrying to avoid applying the edit twice"
     )
+
+
+def _sleep_before_upload_retry(attempt: int) -> None:
+    """Apply bounded exponential backoff before another upload attempt."""
+    if attempt >= _UPLOAD_RETRY_ATTEMPTS - 1:
+        return
+    delay = min(
+        _UPLOAD_RETRY_BASE_SECONDS * (2.0**attempt),
+        _UPLOAD_RETRY_MAX_SECONDS,
+    )
+    time.sleep(delay)
 
 
 def _next_upload_offset(payload: Any, total_bytes: int) -> int | None:

@@ -51,7 +51,7 @@ ROW = {
     "transport": "oauth",
     "provider_name": "microsoft",
     "category": "Productivity",
-    "oauth_scopes": ["Files.ReadWrite"],
+    "oauth_scopes": ["Files.ReadWrite.All"],
     "is_visible_in_connector": True,
     "launch_config": {
         "command": "python",

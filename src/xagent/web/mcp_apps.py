@@ -63,7 +63,7 @@ from .models.public_mcp import PublicMCPApp
 # be treated as satisfying it.
 #
 # sharepoint/word: same reasoning as facebook -- their functional scopes
-# ("Sites.ReadWrite.All"/"Files.ReadWrite") aren't part of the microsoft
+# ("Sites.ReadWrite.All"/"Files.ReadWrite.All") aren't part of the microsoft
 # provider's default_scopes (["User.Read"]), and both connectors are brand
 # new. A pre-existing bare "microsoft" grant (e.g. one created by connecting
 # Outlook/Teams/OneDrive) therefore cannot satisfy either connector.

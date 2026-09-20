@@ -123,6 +123,16 @@ def test_normalize_relative_path_rejects_dot_segments():
         word._normalize_relative_path("../secret.docx")
 
 
+@pytest.mark.parametrize("path", ["Report", "Report.txt", "Report.docm"])
+def test_normalize_relative_path_requires_docx(path):
+    with pytest.raises(ValueError, match=r"\.docx"):
+        word._normalize_relative_path(path)
+
+
+def test_normalize_relative_path_accepts_case_insensitive_docx():
+    assert word._normalize_relative_path("Reports/Q3.DOCX") == "Reports/Q3.DOCX"
+
+
 def test_set_paragraph_text_adds_run_when_empty():
     document = Document()
     paragraph = document.add_paragraph()
@@ -1647,6 +1657,8 @@ def test_upload_document_reports_unresolved_ambiguous_outcome(monkeypatch):
         word.requests, "put", Mock(side_effect=requests.ConnectionError("dropped"))
     )
     monkeypatch.setattr(word, "_reconcile_uploaded_document", Mock(return_value=None))
+    sleep = Mock()
+    monkeypatch.setattr(word.time, "sleep", sleep)
     monkeypatch.setattr(
         word.requests, "get", Mock(side_effect=requests.ConnectionError("dropped"))
     )
@@ -1657,6 +1669,41 @@ def test_upload_document_reports_unresolved_ambiguous_outcome(monkeypatch):
             "Report.docx",
             word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
         )
+    assert [call.args[0] for call in sleep.call_args_list] == [1.0, 2.0]
+
+
+def test_upload_document_backs_off_before_resuming_5xx(monkeypatch):
+    monkeypatch.setattr(
+        word.requests,
+        "request",
+        Mock(
+            return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+        ),
+    )
+    put = Mock(
+        side_effect=[
+            MockResponse({}, status_code=503),
+            MockResponse({"id": "item-1"}, status_code=201),
+        ]
+    )
+    monkeypatch.setattr(word.requests, "put", put)
+    monkeypatch.setattr(word, "_reconcile_uploaded_document", Mock(return_value=None))
+    monkeypatch.setattr(
+        word.requests,
+        "get",
+        Mock(return_value=MockResponse({"nextExpectedRanges": ["0-"]})),
+    )
+    sleep = Mock()
+    monkeypatch.setattr(word.time, "sleep", sleep)
+
+    result = word._upload_document(
+        Document(),
+        "Report.docx",
+        word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
+    )
+
+    assert result["id"] == "item-1"
+    sleep.assert_called_once_with(1.0)
 
 
 def test_download_document_returns_etag_from_metadata(monkeypatch):

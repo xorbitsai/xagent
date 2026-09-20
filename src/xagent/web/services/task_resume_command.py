@@ -32,6 +32,7 @@ from .task_command_transport import (
     TaskCommandKind,
     TaskCommandRejected,
     command_identity_matches_task,
+    command_processing_predicates,
     finish_task_command_no_commit,
     notify_task_command_dispatcher,
     stage_task_command,
@@ -284,9 +285,13 @@ def _handoff(
         claim_predicates = (
             TaskExecutionCommand.id == command.id,
             TaskExecutionCommand.status == COMMAND_PROCESSING,
-            TaskExecutionCommand.claimed_by == runner,
-            TaskExecutionCommand.attempt_count == command.attempt_count,
-            TaskExecutionCommand.claim_expires_at > datetime.now(timezone.utc),
+            *command_processing_predicates(
+                db,
+                command.id,
+                runner,
+                expected_attempt_count=command.attempt_count,
+                owner_lease=owner_lease,
+            ),
         )
         row = db.execute(
             select(TaskExecutionCommand).where(*claim_predicates).with_for_update()
@@ -333,6 +338,7 @@ def _handoff(
             runner,
             result=state,
             expected_attempt_count=command.attempt_count,
+            owner_lease=owner_lease,
             require_live_claim=True,
         ):
             raise TaskCommandRejected("Reply claim changed", reason="stale_claim")
@@ -357,12 +363,21 @@ def _handoff(
         return payload, lease, owner_id, state
 
 
-def _record_outcome(command: ClaimedTaskCommand, state: dict, outcome: str) -> None:
+def _record_outcome(
+    command: ClaimedTaskCommand, state: dict, outcome: str, owner_lease: TaskOwnerLease
+) -> None:
     with get_session_local()() as db:
-        # The immutable handoff attempt, not the task's now-possibly-released
-        # lease, owns this command's preparation result.
+        # Preparation remains part of the owner-managed command lifecycle even
+        # though its atomic execution handoff already committed completion.
+        if not lock_task_lease_no_commit(db, owner_lease):
+            return
         row = db.get(TaskExecutionCommand, command.id)
-        if row is not None and row.status == COMMAND_COMPLETED and row.result == state:
+        if (
+            row is not None
+            and row.status == COMMAND_COMPLETED
+            and row.attempt_count == command.attempt_count
+            and row.result == state
+        ):
             setattr(row, "result", {**state, "outcome": outcome})
             db.commit()
 
@@ -440,6 +455,6 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
             )
         finally:
             await run_db_io_cancellation_safe(
-                lambda: _record_outcome(command, state, outcome)
+                lambda: _record_outcome(command, state, outcome, owner_lease)
             )
         return SettledTaskCommand({**state, "outcome": outcome})

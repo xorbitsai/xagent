@@ -51,6 +51,14 @@ DEEPSEEK_API_KEY="your-deepseek-api-key"
 POSTGRES_PASSWORD="xagent_password"
 ```
 
+Backend images built from the current source start one web process and two Agent
+workers. If `ENCRYPTION_KEY` is empty, the image creates one in the persistent
+`xagent_secrets` volume; keep that volume with database backups. The checked-in
+Compose file uses fixed release image tags, so this behavior begins when those
+tags are bumped to a release containing the worker-pool default. To run that
+image as a local single-process backend instead, set `XAGENT_WORKER_COUNT=` and
+`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` in `.env`.
+
 Optional Gmail incoming-email trigger provisioning:
 
 ```bash

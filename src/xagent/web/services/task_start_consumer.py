@@ -34,6 +34,7 @@ from .task_command_transport import (
     SettledTaskCommand,
     TaskCommandRejected,
     command_identity_matches_task,
+    command_processing_predicates,
     finish_task_command_no_commit,
 )
 from .task_coordinator_service import TaskLease as TaskOwnerLease
@@ -145,9 +146,7 @@ def _reject_start(
     owned = db.query(TaskExecutionCommand).filter(
         TaskExecutionCommand.id == row.id,
         TaskExecutionCommand.status == COMMAND_PROCESSING,
-        TaskExecutionCommand.claimed_by == row.claimed_by,
         TaskExecutionCommand.attempt_count == row.attempt_count,
-        TaskExecutionCommand.claim_expires_at > datetime.now(timezone.utc),
     )
     result = {"rejection_reason": reason}
     if (
@@ -247,9 +246,13 @@ def _commit_handoff(
             .where(
                 TaskExecutionCommand.id == command.id,
                 TaskExecutionCommand.status == COMMAND_PROCESSING,
-                TaskExecutionCommand.claimed_by == runner,
-                TaskExecutionCommand.attempt_count == command.attempt_count,
-                TaskExecutionCommand.claim_expires_at > datetime.now(timezone.utc),
+                *command_processing_predicates(
+                    db,
+                    command.id,
+                    runner,
+                    expected_attempt_count=command.attempt_count,
+                    owner_lease=owner_lease,
+                ),
             )
             .with_for_update()
         ).scalar_one_or_none()
@@ -338,6 +341,7 @@ def _commit_handoff(
             runner,
             result=result,
             expected_attempt_count=command.attempt_count,
+            owner_lease=owner_lease,
             require_live_claim=True,
         ):
             db.rollback()

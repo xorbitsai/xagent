@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
 
-from ...config import get_compact_threshold_ratio
+from ...config import COMPACT_THRESHOLD_DEFAULT
 from ..agent.trace import (
     TraceAction,
     TraceCategory,
@@ -35,11 +35,93 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
-from .context.execution import COMPACT_SUMMARY_FALLBACK_BUDGETS, CompactResult
+from .context.execution import (
+    COMPACT_SUMMARY_FALLBACK_BUDGETS,
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    COMPACT_THRESHOLD_SOURCE_UNKNOWN,
+    LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY,
+    LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY,
+    CompactResult,
+    derive_compact_threshold,
+)
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
 logger = logging.getLogger(__name__)
+
+# Keys already warned about running compaction without a usable context
+# window (see ``warn_once_per_model``). One line per model per process is
+# enough to point at the missing column; one per task or per iteration would
+# bury it.
+_COMPACT_WINDOW_WARNED_MODELS: set[str] = set()
+
+# Roles a model can be warned about; the same model can hold both.
+THRESHOLD_WARNING_KEY_PREFIX = "threshold:"
+COMPACT_MODEL_WARNING_KEY_PREFIX = "compact:"
+
+
+def compact_model_key(llm: Any) -> str:
+    """Name a model for the once-per-model compaction warnings.
+
+    Prefers the stable ``model_id`` so identically-named rows under two
+    providers each get their own warning; falls back to the model name, then
+    the class name for test doubles and wrappers that carry neither.
+    """
+    for attribute in ("model_id", "model_name"):
+        value = getattr(llm, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+    return type(llm).__name__
+
+
+def warn_once_per_model(key: str, message: str, *args: Any) -> None:
+    """Log ``message`` at WARNING the first time ``key`` is seen in this process.
+
+    ``key`` should combine the warning's role with ``compact_model_key`` so the
+    same model can be reported once as the agent model and once as the compact
+    model; the two messages describe different failures.
+    """
+    if key in _COMPACT_WINDOW_WARNED_MODELS:
+        return
+    _COMPACT_WINDOW_WARNED_MODELS.add(key)
+    logger.warning(message, *args)
+
+
+def warn_restored_compact_threshold(context: Any, llm: Any) -> None:
+    """Re-issue the fallback warning for a context restored from a checkpoint.
+
+    ``AgentRunner`` only resolves the threshold at task start, so a task
+    resumed in a fresh process would otherwise run on the default threshold
+    with no line in this process's log saying so. Checkpoints written before
+    ``threshold_source`` existed restore as ``unknown`` and are warned about
+    too, on the same terms, when the live model still has no window.
+    """
+    compact_config = getattr(context, "compact_config", None)
+    if llm is None or compact_config is None:
+        return
+    # The live model row may have been populated since the checkpoint was
+    # written, and a virtual model resolves its window per call; neither is
+    # running on the fallback for lack of a window.
+    if derive_compact_threshold(getattr(llm, "context_window", None)) is not None:
+        return
+    if callable(getattr(llm, "prepare_for_call", None)):
+        return
+    if getattr(compact_config, "threshold_source", None) not in (
+        COMPACT_THRESHOLD_SOURCE_DEFAULT,
+        COMPACT_THRESHOLD_SOURCE_UNKNOWN,
+    ):
+        return
+    model_key = compact_model_key(llm)
+    warn_once_per_model(
+        THRESHOLD_WARNING_KEY_PREFIX + model_key,
+        "Model %s has no context_window; the resumed task keeps its context "
+        "compaction threshold of %s tokens (%s). Set context_window on the "
+        "model so new tasks compact at a fraction of its real window instead.",
+        model_key,
+        getattr(compact_config, "threshold", None),
+        COMPACT_THRESHOLD_DEFAULT,
+    )
+
 
 # Fixed final_answer stream close reasons. ReAct's fail() call sites import
 # these names directly (react.py already imports this module at module
@@ -165,17 +247,30 @@ async def prepare_llm_for_context(
 
     context_window = getattr(prepared, "context_window", None)
     compact_config = getattr(context, "compact_config", None)
+    derived = derive_compact_threshold(context_window)
     # Fixed-model thresholds are initialized once by AgentRunner and restored
     # verbatim from checkpoints. Recompute only when a virtual model resolves to
     # a concrete per-call wrapper whose window was unavailable at task start.
-    if (
-        prepared is not llm
-        and isinstance(context_window, int)
-        and context_window > 0
-        and compact_config is not None
-    ):
-        compact_config.threshold = max(
-            1, int(context_window * get_compact_threshold_ratio())
+    if prepared is not llm and compact_config is not None and derived is not None:
+        compact_config.threshold, compact_config.threshold_source = derived
+    elif prepared is not llm and compact_config is not None:
+        # The standing threshold may have been derived from an earlier selection;
+        # it no longer describes the active model, so stop claiming that source.
+        compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_UNKNOWN
+        # The virtual model was exempt from AgentRunner's warning because its
+        # window is only known here, and the concrete model it picked has
+        # none. The threshold is left as it was -- the fallback, or one
+        # derived from an earlier selection -- and the message says which.
+        model_key = compact_model_key(prepared)
+        warn_once_per_model(
+            THRESHOLD_WARNING_KEY_PREFIX + model_key,
+            "Model %s (selected by a virtual model) has no context_window; "
+            "the context compaction threshold stays at %s tokens "
+            "(threshold_source=%s). Set context_window on the model so "
+            "compaction triggers at a fraction of its real window instead.",
+            model_key,
+            getattr(compact_config, "threshold", None),
+            getattr(compact_config, "threshold_source", None),
         )
 
     return prepared
@@ -1453,13 +1548,37 @@ class PatternRuntime:
                             "fallback_suppressed": True,
                         },
                     )
-                    logger.warning(
-                        "Context compaction request cannot fit the compact "
-                        "model window without discarding unrecoverable "
-                        "messages; preserving the original context. "
-                        "execution_id=%s",
-                        getattr(context, "execution_id", None),
-                    )
+                    if request_metadata.get(LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY):
+                        # Not a fit problem: the compact model row has no
+                        # context_window, so no summary request can be sized
+                        # and compaction stays off until the column is set.
+                        # Once per model: the context stays over threshold, so
+                        # this branch recurs on every iteration otherwise.
+                        model_key = compact_model_key(llm)
+                        warn_once_per_model(
+                            COMPACT_MODEL_WARNING_KEY_PREFIX + model_key,
+                            "Compact model %s has no context_window; context "
+                            "compaction is disabled until it is set on the "
+                            "model. First seen on execution_id=%s",
+                            model_key,
+                            getattr(context, "execution_id", None),
+                        )
+                    elif request_metadata.get(LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY):
+                        logger.warning(
+                            "Context compaction could not count the compact "
+                            "request's tokens (%s); preserving the original "
+                            "context. execution_id=%s",
+                            request_metadata.get("compact_tokenizer_error_type"),
+                            getattr(context, "execution_id", None),
+                        )
+                    else:
+                        logger.warning(
+                            "Context compaction request cannot fit the compact "
+                            "model window without discarding unrecoverable "
+                            "messages; preserving the original context. "
+                            "execution_id=%s",
+                            getattr(context, "execution_id", None),
+                        )
                 else:
                     llm_metadata = {
                         **request_metadata,

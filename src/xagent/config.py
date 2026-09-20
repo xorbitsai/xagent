@@ -773,8 +773,16 @@ def get_redis_url() -> str | None:
 
 
 def get_shared_task_execution_enabled() -> bool:
-    """Enable durable task handoff and the shared event bridge by default."""
-    return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, True)
+    """Enable durable handoff for an explicitly shared deployment topology.
+
+    Explicit configuration always wins.  Without it, preserve the established
+    shared behavior for managed worker pools and split web/worker hosts, while
+    keeping an unconfigured combined wheel or container self-contained.
+    """
+    configured = os.getenv(SHARED_TASK_EXECUTION_ENABLED)
+    if configured is not None and configured.strip():
+        return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+    return get_worker_count() is not None or get_task_execution_role() != "combined"
 
 
 def get_task_execution_role() -> Literal["combined", "web", "worker"]:
@@ -807,9 +815,11 @@ def get_channel_ingress_enabled() -> bool:
     """Open bot connections only on the designated shared ingress host."""
     if get_shared_task_execution_enabled() and get_task_execution_role() == "worker":
         return False
-    return _get_bool_env(
-        CHANNEL_INGRESS_ENABLED, not get_shared_task_execution_enabled()
+    shared_setting = os.getenv(SHARED_TASK_EXECUTION_ENABLED)
+    explicitly_local = bool(shared_setting and shared_setting.strip()) and not (
+        _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
     )
+    return _get_bool_env(CHANNEL_INGRESS_ENABLED, explicitly_local)
 
 
 def validate_task_execution_host_config() -> None:

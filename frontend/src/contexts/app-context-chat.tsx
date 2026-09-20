@@ -2812,14 +2812,38 @@ export function AppProvider({
         const envelope = extractTaskControlEnvelope(message)
         if (!acceptTaskControlVersion(message, envelope, taskStateVersionsRef.current)) return
         const data = asMessageRecord(message.data)
+        // A new run starting can't have inherited an interruption from
+        // whatever run preceded it - carrying a stale `true` forward would
+        // flag the very first snapshot of a brand-new, healthy run. But
+        // going from "no run known yet" to "this run" is NOT a run change:
+        // stream.runId starts undefined, and the backend reports `null` for
+        // a task that hasn't started running yet (both mean "nothing to
+        // compare against" the same way) - an explicit stream_unavailable/
+        // stream_resync_required for the CURRENT run can set interrupted
+        // before its first snapshot with a real run id ever arrives. Only a
+        // known-to-different-known transition is a genuine new run.
+        const isNewRun =
+          stream.runId != null && envelope.runId != null && stream.runId !== envelope.runId
         if (stream.runId !== envelope.runId) {
           stream.runId = envelope.runId
           stream.prefixSeen = false
           stream.complete = false
+          if (isNewRun) stream.interrupted = false
         }
         stream.attemptId = typeof data.lease_attempt_id === "string" ? data.lease_attempt_id : null
+        // "running with no prefix seen yet" is the ordinary state of every task
+        // between the run starting and its final-answer text beginning to
+        // stream (planning, tool calls, etc.) - it is NOT evidence anything
+        // was missed. This periodic snapshot fires every 5s for every
+        // connected task regardless of stream health, so treating that as an
+        // interruption flagged the recovery banner on almost every run.
+        // Genuine misses are already caught elsewhere: an explicit
+        // stream_unavailable/stream_resync_required message above, or a
+        // final_answer_delta arriving before its prefix below - both leave
+        // positive evidence content was produced without us. Leave
+        // stream.interrupted as carried over from those instead of deriving
+        // a new value from status alone.
         const active = envelope.status === "running"
-        stream.interrupted = stream.interrupted || (active && !stream.prefixSeen)
         if (envelope.status) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: {
             status: envelope.status, runId: envelope.runId,

@@ -8,7 +8,7 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import clamp_limit, clamp_offset, require_clean_identifier, setup_proxy_env
+from .utils import clamp_limit, clamp_offset, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-mcp")
@@ -50,6 +50,21 @@ def _headers() -> dict[str, str]:
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+
+
+def _require_clean_text(value: str, field_name: str) -> None:
+    """Reject an empty or whitespace-padded free-text value (e.g. an issue's
+    summary or priority name).
+
+    utils.require_clean_identifier does the same underlying check but is
+    documented for ids that go into a request body, and its error message
+    ("must be a non-empty id...") reads as confusing/wrong for a
+    human-authored free-text field that was never an id to begin with.
+    """
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError(
+            f"{field_name} cannot be empty or have leading/trailing whitespace"
+        )
 
 
 def _truncate(text: str) -> str:
@@ -368,7 +383,7 @@ def jira_create_issue(
     be one of the site's configured priorities.
     """
     try:
-        require_clean_identifier(summary, "summary")
+        _require_clean_text(summary, "summary")
         fields: dict[str, Any] = {
             "project": {"key": project_key},
             "summary": summary,
@@ -411,7 +426,7 @@ def jira_update_issue(
     try:
         fields: dict[str, Any] = {}
         if summary is not None:
-            require_clean_identifier(summary, "summary")
+            _require_clean_text(summary, "summary")
             fields["summary"] = summary
         if description is not None:
             fields["description"] = description
@@ -421,7 +436,7 @@ def jira_update_issue(
             )
         if priority is not None:
             try:
-                require_clean_identifier(priority, "priority")
+                _require_clean_text(priority, "priority")
             except ValueError as exc:
                 return _error(
                     f"{exc} -- Jira also has no way to clear priority through "

@@ -747,6 +747,10 @@ def word_replace_text(
                         )
                     replacements += run.text.count(find)
                     run.text = run.text.replace(find, replace)
+        if replacements == 0:
+            # Nothing changed -- uploading the unmodified document would
+            # still create a new version/last-modified entry for no reason.
+            return _success(replacements=0)
         item = _upload_document(document, file_path, site_id, drive_id)
         return _success(item=item, replacements=replacements)
     except Exception as e:

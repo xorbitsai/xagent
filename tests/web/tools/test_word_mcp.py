@@ -671,6 +671,21 @@ def test_replace_text_rejects_empty_find():
     assert result["status"] == "error"
 
 
+def test_replace_text_skips_upload_when_nothing_matches(monkeypatch):
+    """A no-op request must not still create a new document version --
+    uploading an unmodified document has no reason to happen."""
+    content = _docx_bytes(lambda d: d.add_paragraph("nothing relevant here"))
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "absent", "x"))
+
+    assert result["status"] == "success"
+    assert result["replacements"] == 0
+    assert "item" not in result
+    assert mock_request.call_count == 1
+
+
 def test_replace_text_rejects_match_in_run_with_image(monkeypatch):
     """A match inside a run that also holds a drawing must be refused, not
     silently applied -- run.text = ... would delete the drawing too."""
@@ -857,18 +872,15 @@ def test_replace_text_ignores_match_inside_tracked_insertion(monkeypatch):
         p.add_run(" after")
 
     content = _docx_bytes(build)
-    responses = iter([MockResponse(content=content), MockResponse({"id": "item-1"})])
-    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    mock_request = Mock(return_value=MockResponse(content=content))
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
 
     assert result["status"] == "success"
     assert result["replacements"] == 0
-    put_call = mock_request.call_args_list[1]
-    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
-    # The tracked insertion's text is untouched.
-    assert uploaded.paragraphs[0]._p.xpath(".//w:ins//w:t")[0].text == "foo bar"
+    # No match means no change -- only the download GET happened.
+    assert mock_request.call_count == 1
 
 
 def test_replace_text_ignores_match_inside_text_box(monkeypatch):
@@ -894,18 +906,15 @@ def test_replace_text_ignores_match_inside_text_box(monkeypatch):
         anchor._r.append(drawing)
 
     content = _docx_bytes(build)
-    responses = iter([MockResponse(content=content), MockResponse({"id": "item-1"})])
-    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    mock_request = Mock(return_value=MockResponse(content=content))
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
 
     assert result["status"] == "success"
     assert result["replacements"] == 0
-    put_call = mock_request.call_args_list[1]
-    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
-    # The text box's content is untouched.
-    assert uploaded.paragraphs[0]._p.xpath(".//w:txbxContent//w:t")[0].text == "foo bar"
+    # No match means no change -- only the download GET happened.
+    assert mock_request.call_count == 1
 
 
 def test_set_paragraph_text_ignores_hyperlink_inside_text_box():

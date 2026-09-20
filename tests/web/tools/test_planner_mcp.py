@@ -352,6 +352,20 @@ def test_create_plan_unreadable_success_is_indeterminate(monkeypatch):
     assert result["status"] == "indeterminate"
 
 
+@pytest.mark.parametrize("response_body", [{}, [], {"id": ""}])
+def test_create_plan_anomalous_success_is_indeterminate(monkeypatch, response_body):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(return_value=MockResponse(response_body)),
+    )
+
+    result = json.loads(planner.planner_create_plan("group-1", "New plan"))
+
+    assert result["status"] == "indeterminate"
+    assert result["mutation_may_have_completed"] is True
+
+
 def test_create_plan_server_failure_is_indeterminate(monkeypatch):
     monkeypatch.setattr(
         planner.requests,
@@ -420,6 +434,22 @@ def test_get_plan_caps_and_redacts_large_graph_error(monkeypatch):
     assert len(serialized) <= 300
     assert result["status"] == "error"
     assert "secret-token" not in serialized
+
+
+def test_get_plan_rejects_and_bounds_non_object_response(monkeypatch):
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "300")
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(return_value=MockResponse(["x" * 10_000])),
+    )
+
+    serialized = planner.planner_get_plan("plan-1")
+    result = json.loads(serialized)
+
+    assert len(serialized) <= 300
+    assert result["status"] == "error"
+    assert "invalid plan object" in result["message"]
 
 
 # ---------------------------------------------------------------------------

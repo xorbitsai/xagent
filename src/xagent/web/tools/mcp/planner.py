@@ -107,6 +107,33 @@ def _indeterminate(message: str) -> str:
     )
 
 
+def _graph_object(result: Any, resource_name: str) -> dict[str, Any]:
+    """Validate the object shape promised by a singleton Graph endpoint."""
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Planner returned an invalid {resource_name} object")
+    return result
+
+
+def _created_object(result: Any, resource_name: str) -> dict[str, Any]:
+    """Validate a create response without treating an anomalous 2xx as failure.
+
+    Graph may have committed the mutation even when a proxy or service defect
+    replaces the documented response object. Without a stable returned id, the
+    caller must inspect the relevant collection instead of retrying blindly.
+    """
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("id"), str)
+        or not result["id"]
+    ):
+        raise _MutationOutcomeIndeterminate(
+            f"Planner accepted the create request but did not return a valid "
+            f"{resource_name} object; do not retry automatically. Read the "
+            "relevant collection first to determine whether it was created."
+        )
+    return result
+
+
 _LIST_PROJECTION_FIELDS: dict[str, tuple[str, ...]] = {
     "plans": ("id", "title", "owner", "createdDateTime"),
     "buckets": ("id", "name", "planId", "orderHint"),
@@ -490,7 +517,7 @@ def planner_get_plan(plan_id: str) -> str:
         result = _graph_request(
             "GET", f"/planner/plans/{url_path_id(plan_id, 'plan_id')}"
         )
-        return success_with_capped_dict("plan", result)
+        return success_with_capped_dict("plan", _graph_object(result, "plan"))
     except Exception as e:
         logger.error("Error getting Planner plan %s: %s", plan_id, e)
         return _error(str(e))
@@ -513,7 +540,7 @@ def planner_create_plan(group_id: str, title: str) -> str:
             "title": title,
         }
         result = _graph_request("POST", "/planner/plans", body=body, mutation=True)
-        return success_with_capped_dict("plan", result)
+        return success_with_capped_dict("plan", _created_object(result, "plan"))
     except _MutationOutcomeIndeterminate as e:
         return _indeterminate(str(e))
     except Exception as e:
@@ -556,7 +583,7 @@ def planner_create_bucket(plan_id: str, name: str) -> str:
             "planId": require_clean_identifier(plan_id, "plan_id"),
         }
         result = _graph_request("POST", "/planner/buckets", body=body, mutation=True)
-        return success_with_capped_dict("bucket", result)
+        return success_with_capped_dict("bucket", _created_object(result, "bucket"))
     except _MutationOutcomeIndeterminate as e:
         return _indeterminate(str(e))
     except Exception as e:
@@ -615,7 +642,7 @@ def planner_get_task(task_id: str) -> str:
         result = _graph_request(
             "GET", f"/planner/tasks/{url_path_id(task_id, 'task_id')}"
         )
-        return success_with_capped_dict("task", result)
+        return success_with_capped_dict("task", _graph_object(result, "task"))
     except Exception as e:
         logger.error("Error getting Planner task %s: %s", task_id, e)
         return _error(str(e))
@@ -657,7 +684,7 @@ def planner_create_task(
         if assignments:
             body["assignments"] = assignments
         result = _graph_request("POST", "/planner/tasks", body=body, mutation=True)
-        return success_with_capped_dict("task", result)
+        return success_with_capped_dict("task", _created_object(result, "task"))
     except _MutationOutcomeIndeterminate as e:
         return _indeterminate(str(e))
     except Exception as e:
@@ -810,7 +837,9 @@ def planner_get_task_details(task_id: str) -> str:
         result = _graph_request(
             "GET", f"/planner/tasks/{url_path_id(task_id, 'task_id')}/details"
         )
-        return success_with_capped_dict("details", result)
+        return success_with_capped_dict(
+            "details", _graph_object(result, "task details")
+        )
     except Exception as e:
         logger.error("Error getting Planner task details for %s: %s", task_id, e)
         return _error(str(e))

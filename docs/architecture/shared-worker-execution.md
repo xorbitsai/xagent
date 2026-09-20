@@ -38,7 +38,11 @@ The frontend handles unavailable/resync notifications and exact-run snapshots. I
 
 `XAGENT_TASK_EVENT_CHANNEL_PREFIX` defaults to `xagent:task-events:v1`. Redis logical DB numbers do not isolate Pub/Sub; separate deployments need different prefixes.
 
-Follow-up changes will implement START handoff and lease fencing, resume/existing-task and ingress adapters, channel bots, and worker/web lifecycle integration. The final integration will enable shared execution by default, after those paths are complete. No intermediate PR should turn it on prematurely.
+Follow-up changes delivered START handoff and lease fencing,
+resume/existing-task and ingress adapters, channel bots, and worker/web lifecycle
+integration. Unconfigured standalone artifacts now use local execution, while
+worker pools and split web/worker roles retain shared execution compatibility;
+the current activation contract is documented in the deployment guide above.
 
 ## Validation
 

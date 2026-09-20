@@ -10,12 +10,10 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 
+from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from tests.web.services.test_task_coordinator_service import (
     database as database_fixture,
-)
-from tests.web.services.test_task_execution_event_store import engine as engine_fixture
-from tests.web.services.test_task_execution_event_store import (
-    task_id as task_id_fixture,
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import task_coordinator_runtime as runtime
@@ -64,12 +62,12 @@ async def test_repeated_wake_shares_acquisition_and_heartbeat(registry, database
     )
     coordinator = coordinators[0]
     assert all(c is coordinator for c in coordinators)
-    heartbeat = coordinator._heartbeat_task
+    heartbeat = coordinator._heartbeat_done
     token = coordinator.lease.attempt_id
     coordinator.wakeup.clear()
     assert await registry.ensure(database[1]) is coordinator
     assert coordinator.wakeup.is_set()
-    assert coordinator._heartbeat_task is heartbeat
+    assert coordinator._heartbeat_done is heartbeat
     assert coordinator.lease.attempt_id == token
 
 
@@ -232,7 +230,7 @@ async def test_close_during_acquisition_cannot_start_heartbeat(
         unblock.set()
     assert await waiter is None
     await closer
-    assert coordinator._heartbeat_task is None
+    assert coordinator._heartbeat_done is None
     assert await registry.ensure(database[1]) is None
 
 
@@ -257,10 +255,10 @@ async def test_two_entry_admissions_share_one_handle_and_one_lease(registry, dat
     coordinator.wakeup.clear()
     assert await registry.ensure(database[1]) is coordinator
     assert coordinator.wakeup.is_set()
-    heartbeat = coordinator._heartbeat_task
+    heartbeat = coordinator._heartbeat_done
     finish.set()
     await first
-    assert coordinator._heartbeat_task is heartbeat
+    assert coordinator._heartbeat_done is heartbeat
     with database[0]() as db:
         task = db.get(Task, database[1])
         assert task.status == TaskStatus.COMPLETED
@@ -320,14 +318,14 @@ async def test_close_keeps_heartbeat_until_execution_cleanup_settles(
     coordinator = await registry.ensure(database[1])
     started, draining, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
     renewed = Event()
-    original = coordinator._renew
+    original = registry._renew
 
-    def renew():
-        result = original()
+    def renew(leases):
+        result = original(leases)
         renewed.set()
         return result
 
-    monkeypatch.setattr(coordinator, "_renew", renew)
+    monkeypatch.setattr(registry, "_renew", renew)
 
     async def execute(context):
         started.set()
@@ -361,7 +359,7 @@ async def test_close_keeps_heartbeat_until_execution_cleanup_settles(
     with pytest.raises(asyncio.CancelledError):
         await closer
     await coordinator.close()
-    assert coordinator._heartbeat_task.done()
+    assert coordinator._heartbeat_done.done()
     assert coordinator._execution_task is None
     with database[0]() as db:
         assert db.get(Task, database[1]).runner_id is None
@@ -401,14 +399,14 @@ async def test_pool_timeout_does_not_mean_lost_or_busy_retry(
     failed = Event()
     calls = 0
 
-    def timeout():
+    def timeout(leases):
         nonlocal calls
         calls += 1
         failed.set()
         raise PoolTimeout("pool exhausted")
 
     monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.1)
-    monkeypatch.setattr(coordinator, "_renew", timeout)
+    monkeypatch.setattr(registry, "_renew", timeout)
     await wait_thread_event(failed)
     # The heartbeat handles the thread result on its next event-loop turn.
     async with asyncio.timeout(5):
@@ -444,13 +442,13 @@ async def test_heartbeat_crash_closes_and_drains_execution(
     coordinator.submit_execution(admit=admit, execute=execute, settle=settle)
     await asyncio.wait_for(started.wait(), 5)
 
-    def crash():
+    def crash(leases):
         raise RuntimeError("connection failed")
 
-    monkeypatch.setattr(coordinator, "_renew", crash)
+    monkeypatch.setattr(registry, "_renew", crash)
     await asyncio.wait_for(drained.wait(), 5)
     await coordinator.close()
-    assert coordinator._heartbeat_task.done()
+    assert coordinator._heartbeat_done.done()
     with database[0]() as db:
         assert (
             db.get(Task, database[1]).lease_attempt_id == coordinator.lease.attempt_id
@@ -531,7 +529,7 @@ async def test_unknown_commit_stops_heartbeat_and_retains_recovery_evidence(
         with pytest.raises(RuntimeError, match="commit acknowledgement lost"):
             await handle
     await coordinator.close()
-    assert coordinator._heartbeat_task.done()
+    assert coordinator._heartbeat_done.done()
     if stage == "admission":
         execute.assert_not_awaited()
     with database[0]() as db:
@@ -544,20 +542,20 @@ async def test_unknown_commit_stops_heartbeat_and_retains_recovery_evidence(
 
 async def test_renewal_recovers_after_pool_timeout(registry, database, monkeypatch):
     coordinator = await registry.ensure(database[1])
-    original = coordinator._renew
+    original = registry._renew
     recovered = Event()
     calls = 0
 
-    def renew():
+    def renew(leases):
         nonlocal calls
         calls += 1
         if calls == 1:
             raise PoolTimeout("transient exhaustion")
-        result = original()
+        result = original(leases)
         recovered.set()
         return result
 
-    monkeypatch.setattr(coordinator, "_renew", renew)
+    monkeypatch.setattr(registry, "_renew", renew)
     await wait_thread_event(recovered)
     async with asyncio.timeout(5):
         while not coordinator._healthy:

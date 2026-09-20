@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,12 +15,15 @@ from xagent.core.agent import (
     PatternRuntime,
     TraceEventCallback,
 )
+from xagent.core.agent import runtime as runtime_module
 from xagent.core.agent.attachments import build_image_context_references
 from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
 from xagent.core.agent.context.execution import (
+    COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     tool_evidence_state,
 )
@@ -39,6 +43,12 @@ def reset_context_manager() -> None:
     manager._contexts.clear()  # type: ignore[attr-defined]
     yield
     manager._contexts.clear()  # type: ignore[attr-defined]
+
+
+@pytest.fixture(autouse=True)
+def reset_compact_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The once-per-model warning set is process-global; isolate it per test.
+    monkeypatch.setattr(runtime_module, "_COMPACT_WINDOW_WARNED_MODELS", set())
 
 
 @dataclass
@@ -1856,41 +1866,209 @@ async def test_trace_callback_unwraps_final_answer_and_omits_success_context(
 
 
 class _FakeLLM:
-    def __init__(self, context_window: Any) -> None:
+    def __init__(self, context_window: Any, model_name: str = "fake-model") -> None:
         self.context_window = context_window
+        self.model_name = model_name
 
 
-def _threshold_runner(context_window: Any) -> AgentRunner:
-    agent = Agent(name="t", patterns=[FakePattern({})], llm=_FakeLLM(context_window))
+def _threshold_runner(
+    context_window: Any, model_name: str = "fake-model"
+) -> AgentRunner:
+    agent = Agent(
+        name="t",
+        patterns=[FakePattern({})],
+        llm=_FakeLLM(context_window, model_name),
+    )
     return AgentRunner(agent=agent)
 
 
 def test_resolve_compact_threshold_uses_window_ratio(monkeypatch) -> None:
     monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_RATIO", raising=False)
     # 128000 * 0.75
-    assert _threshold_runner(128000)._resolve_compact_threshold() == 96000
+    assert _threshold_runner(128000)._resolve_compact_threshold() == (
+        96000,
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    )
 
 
 def test_resolve_compact_threshold_respects_ratio_env(monkeypatch) -> None:
     monkeypatch.setenv("XAGENT_COMPACT_THRESHOLD_RATIO", "0.8")
-    assert _threshold_runner(200000)._resolve_compact_threshold() == 160000
+    assert _threshold_runner(200000)._resolve_compact_threshold() == (
+        160000,
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    )
 
 
 @pytest.mark.parametrize("window", [None, 0, -1, "128000"])
 def test_resolve_compact_threshold_falls_back_to_default(monkeypatch, window) -> None:
     monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", raising=False)
     # None / non-positive / non-int all fall back to the global default.
-    assert _threshold_runner(window)._resolve_compact_threshold() == 32000
+    assert _threshold_runner(window)._resolve_compact_threshold() == (
+        32000,
+        COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    )
 
 
 def test_resolve_compact_threshold_default_env_override(monkeypatch) -> None:
     monkeypatch.setenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", "50000")
-    assert _threshold_runner(None)._resolve_compact_threshold() == 50000
+    assert _threshold_runner(None)._resolve_compact_threshold() == (
+        50000,
+        COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    )
 
 
 def test_resolve_compact_threshold_missing_llm() -> None:
     agent = Agent(name="t", patterns=[FakePattern({})], llm=None)
-    assert AgentRunner(agent=agent)._resolve_compact_threshold() == 32000
+    assert AgentRunner(agent=agent)._resolve_compact_threshold() == (
+        32000,
+        COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    )
+
+
+def test_resolve_compact_threshold_warns_once_per_model_on_fallback(
+    monkeypatch, caplog
+) -> None:
+    monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", raising=False)
+    runner = _threshold_runner(None, model_name="moonshotai.kimi-k2.5")
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runner._resolve_compact_threshold()
+        runner._resolve_compact_threshold()
+        _threshold_runner(None, model_name="other-model")._resolve_compact_threshold()
+        _threshold_runner(128000, model_name="sized")._resolve_compact_threshold()
+
+    fallback_records = [
+        record
+        for record in caplog.records
+        if "context_window" in record.getMessage()
+        and "compaction threshold" in record.getMessage()
+    ]
+    assert len(fallback_records) == 2
+    assert "moonshotai.kimi-k2.5" in fallback_records[0].getMessage()
+    assert "32000" in fallback_records[0].getMessage()
+    assert "other-model" in fallback_records[1].getMessage()
+
+
+def test_resolve_compact_threshold_does_not_warn_for_virtual_models(
+    monkeypatch, caplog
+) -> None:
+    monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", raising=False)
+
+    class VirtualLLM:
+        model_name = "auto"
+        context_window = None
+
+        async def prepare_for_call(self, messages: Any, **_: Any) -> Any:
+            return self
+
+    agent = Agent(name="t", patterns=[FakePattern({})], llm=VirtualLLM())
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        resolved = AgentRunner(agent=agent)._resolve_compact_threshold()
+
+    # The window is resolved per call and the threshold recomputed then.
+    assert resolved == (32000, COMPACT_THRESHOLD_SOURCE_DEFAULT)
+    assert not any("compaction threshold" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_run_records_compact_threshold_source_on_context(monkeypatch) -> None:
+    monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_RATIO", raising=False)
+    captured: dict[str, Any] = {}
+
+    class CapturingPattern(FakePattern):
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            context = kwargs["context"]
+            captured["threshold"] = context.compact_config.threshold
+            captured["source"] = context.compact_config.threshold_source
+            return await super().run(**kwargs)
+
+    agent = Agent(name="t", patterns=[CapturingPattern({})], llm=_FakeLLM(128000))
+    await AgentRunner(agent=agent).run("hello")
+
+    assert captured == {
+        "threshold": 96000,
+        "source": COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_resume_warns_when_restored_threshold_is_the_default(
+    tmp_path: Path, caplog
+) -> None:
+    """A task resumed in a fresh process has no in-memory record of why its
+    compaction threshold is what it is; ``AgentRunner.run`` re-issues the
+    fallback warning from the restored checkpoint so the missing
+    ``context_window`` column is still visible in this process's log."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-resume-warn"
+    checkpoint_context = ExecutionContext(execution_id=execution_id)
+    checkpoint_context.add_user_message("Original task")
+    assert (
+        checkpoint_context.compact_config.threshold_source
+        == COMPACT_THRESHOLD_SOURCE_DEFAULT
+    )
+    tracer.by_execution_id[execution_id] = {
+        "execution_id": execution_id,
+        "context": checkpoint_context.to_dict(),
+    }
+
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": True, "message": "ok"})],
+        llm=_FakeLLM(None, "moonshotai.kimi-k2.5"),
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await runner.run(task=None, execution_id=execution_id, resume=True)
+
+    assert result["success"] is True
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "resumed task" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "moonshotai.kimi-k2.5" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_run_resume_stays_silent_when_model_now_has_a_window(
+    tmp_path: Path, caplog
+) -> None:
+    """The model row backing this resumed task now has a ``context_window``
+    (populated after the checkpoint was written, or simply since a fresh
+    process last saw it), so the restored default threshold is not running
+    blind and must not be re-warned about."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-resume-silent"
+    checkpoint_context = ExecutionContext(execution_id=execution_id)
+    checkpoint_context.add_user_message("Original task")
+    tracer.by_execution_id[execution_id] = {
+        "execution_id": execution_id,
+        "context": checkpoint_context.to_dict(),
+    }
+
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": True, "message": "ok"})],
+        llm=_FakeLLM(256_000, "sized"),
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await runner.run(task=None, execution_id=execution_id, resume=True)
+
+    assert result["success"] is True
+    assert not any("resumed task" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio

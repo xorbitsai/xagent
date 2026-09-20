@@ -7,10 +7,8 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import DataError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from tests.web.services.test_task_execution_event_store import engine as engine_fixture
-from tests.web.services.test_task_execution_event_store import (
-    task_id as task_id_fixture,
-)
+from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import task_lease_service as ls

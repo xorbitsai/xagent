@@ -6,10 +6,8 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 
-from tests.web.services.test_task_execution_event_store import engine as engine_fixture
-from tests.web.services.test_task_execution_event_store import (
-    task_id as task_id_fixture,
-)
+from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.core.agent.trace import ACTION_END_TOOL
 from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
 from xagent.web.api.tools import _tool_usage_query, get_tool_usage

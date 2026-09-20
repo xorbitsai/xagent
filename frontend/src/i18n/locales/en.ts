@@ -1992,6 +1992,7 @@ Build when you need.`,
         created: "Created",
         updated: "Updated",
         unknown: "Unknown",
+        contextWindowUnset: "Context window not set",
       },
       actions: {
         edit: "Edit",

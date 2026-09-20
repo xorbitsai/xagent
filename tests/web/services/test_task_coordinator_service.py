@@ -15,10 +15,8 @@ import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
 from tests.shared.postgres_disposable import psycopg2_kwargs
-from tests.web.services.test_task_execution_event_store import engine as engine_fixture
-from tests.web.services.test_task_execution_event_store import (
-    task_id as task_id_fixture,
-)
+from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.services import task_coordinator_service as coordinator
 from xagent.web.services.task_execution_controller import (

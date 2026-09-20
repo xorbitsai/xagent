@@ -10,11 +10,11 @@ from .lancedb_maintenance import (
     MaintenanceOutcome,
     MaintenanceStatus,
     lancedb_lock_path,
+    validate_lock_timeout,
 )
 from .vector_compatibility import (
     EmbeddingIdentity,
     VectorCompatibility,
-    _inspect_lancedb_vector_state,
     _lancedb_table_exists,
     canonical_embedding_identity,
     prepare_lancedb_memory_table,
@@ -102,6 +102,10 @@ def admit_lancedb_memory_storage(
     batch_size: int = DEFAULT_BATCH_SIZE,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
 ) -> StorageAdmissionOutcome:
+    # A caller that asks for an unbounded wait has a bug, not a busy database:
+    # rejecting it here keeps every lock this function takes bounded, so
+    # contention always surfaces as RETRYABLE_UNAVAILABLE instead of a hang.
+    validate_lock_timeout(lock_timeout)
     if writers_quiesced is not True:
         return _unavailable(
             StorageAdmissionState.QUIESCENCE_REQUIRED,
@@ -146,14 +150,12 @@ def admit_lancedb_memory_storage(
                     ADMISSION_FAILED_DETAIL,
                     maintenance,
                 )
-            # The persisted vector space is read back from the committed table,
-            # never inferred from a snapshot taken before maintenance ran. A
-            # concurrent recreation may have installed another identity's
-            # vectors, and only this read under the still-held admission lock
-            # reports the space the caller would actually be admitted over.
-            _has_vector, compatibility = _inspect_lancedb_vector_state(
-                dormant.connection, dormant.table_name, identity
-            )
+            # Maintenance classified the vector space from the schema it
+            # committed, while it still held the maintenance lock. Re-opening
+            # the table here would reclassify a state this call no longer
+            # controls, and a backend failure in that read would be reported as
+            # if nothing had been mutated.
+            compatibility = maintenance.vector_compatibility
     except Timeout:
         return _unavailable(
             StorageAdmissionState.RETRYABLE_UNAVAILABLE,
@@ -167,6 +169,13 @@ def admit_lancedb_memory_storage(
             ADMISSION_FAILED_DETAIL,
         )
 
+    if compatibility is None:
+        # Unreachable for a COMPLETE outcome: every path that produces one
+        # classifies the table it committed or verified. Degrading to a
+        # retryable outcome would hide the contract break behind a retry loop.
+        raise AssertionError(
+            "completed memory maintenance must carry a vector-space classification"
+        )
     mode = (
         MemoryStorageMode.TEXT_ONLY
         if compatibility is VectorCompatibility.MISMATCHING

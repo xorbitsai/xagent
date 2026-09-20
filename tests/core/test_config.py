@@ -2882,14 +2882,63 @@ def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
     assert config.get_toby_personal_stdio_enabled() is True
 
 
-@pytest.mark.parametrize(
-    "value,expected", [(None, True), ("true", True), ("false", False)]
-)
-def test_shared_task_execution_is_enabled_by_default(monkeypatch, value, expected):
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
+def test_shared_task_execution_explicit_setting_wins(monkeypatch, value, expected):
     monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
-    if value is not None:
-        monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
+    monkeypatch.setenv(config.WORKER_COUNT, "4")
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
     assert config.get_shared_task_execution_enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["", " "])
+@pytest.mark.parametrize(
+    "role,worker_count",
+    [("combined", "4"), ("web", None), ("worker", None)],
+)
+def test_blank_shared_task_execution_setting_uses_topology(
+    monkeypatch, value, role, worker_count
+):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if worker_count is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, worker_count)
+
+    assert config.get_shared_task_execution_enabled() is True
+
+
+@pytest.mark.parametrize(
+    "role,worker_count,expected",
+    [
+        ("combined", None, False),
+        ("combined", "4", True),
+        ("web", None, True),
+        ("worker", None, True),
+    ],
+)
+def test_shared_task_execution_default_follows_topology(
+    monkeypatch, role, worker_count, expected
+):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if worker_count is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, worker_count)
+
+    assert config.get_shared_task_execution_enabled() is expected
+
+
+def test_default_task_execution_host_configuration_is_self_contained(monkeypatch):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    monkeypatch.delenv(config.TASK_EXECUTION_ROLE, raising=False)
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    monkeypatch.delenv(config.REDIS_URL, raising=False)
+    monkeypatch.delenv(config.ENCRYPTION_KEY, raising=False)
+
+    assert config.get_shared_task_execution_enabled() is False
+    assert config.get_task_execution_role() == "combined"
+    assert config.get_channel_ingress_enabled() is False
+    config.validate_task_execution_host_config()
 
 
 @pytest.mark.parametrize("value", ["", " ", "deployment/channel"])

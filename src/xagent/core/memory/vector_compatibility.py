@@ -393,7 +393,15 @@ def prepare_lancedb_memory_table(
     batch_size: int,
     lock_timeout: float,
 ) -> maintenance.MaintenanceOutcome:
-    """Atomically add scope/vector columns using one bounded-memory scan."""
+    """Atomically add scope/vector columns using one bounded-memory scan.
+
+    A ``COMPLETE`` outcome carries the vector-space classification of the table
+    this call committed or verified, derived under the maintenance lock from the
+    schema it actually wrote. Callers must read it from the outcome: re-opening
+    the table afterwards would reclassify a state this call no longer controls,
+    and a failure there could not be told apart from one that mutated nothing.
+    """
+    maintenance.validate_lock_timeout(lock_timeout)
     identity = canonical_embedding_identity(expected_identity)
     if not _lancedb_table_exists(connection, table_name):
         return maintenance.MaintenanceOutcome(maintenance.MaintenanceStatus.ABSENT)
@@ -407,8 +415,13 @@ def prepare_lancedb_memory_table(
         seen_path = ""
         try:
             if _is_fully_admitted(table):
+                # This table is already the committed state, so its own schema
+                # is what a caller would be admitted over.
                 return maintenance.MaintenanceOutcome(
-                    maintenance.MaintenanceStatus.COMPLETE
+                    maintenance.MaintenanceStatus.COMPLETE,
+                    vector_compatibility=classify_vector_compatibility(
+                        table.schema, identity
+                    ),
                 )
             required = {"id": pa.string(), "text": pa.string(), "metadata": pa.string()}
             if any(
@@ -473,9 +486,17 @@ def prepare_lancedb_memory_table(
                         yield reader.get_batch(index)
                         _checkpoint("commit_batch", index + 1)
 
+                # Supported LanceDB versions pull the first batch out of a
+                # generator before they honour ``schema``, so an empty one
+                # raises instead of writing the zero-row table it describes.
+                data: Any = (
+                    batches()
+                    if reader.num_record_batches
+                    else pa.Table.from_batches([], schema)
+                )
                 rewritten = connection.create_table(
                     table_name,
-                    data=batches(),
+                    data=data,
                     schema=schema,
                     mode="overwrite",
                     on_bad_vectors="null",
@@ -484,13 +505,25 @@ def prepare_lancedb_memory_table(
                     actual_version = int(rewritten.version)
                 finally:
                     _safe_close_table(rewritten)
+            # A converted vectorless table carries this identity's space by
+            # construction; an existing vector column survives the schema-only
+            # rewrite unchanged, so classifying the schema just written reports
+            # the space the table now holds. An INCOMPLETE outcome certifies
+            # nothing, and a concurrent commit may own that state, so it carries
+            # no classification.
+            complete = actual_version == expected_version
             return maintenance.MaintenanceOutcome(
                 maintenance.MaintenanceStatus.COMPLETE
-                if actual_version == expected_version
+                if complete
                 else maintenance.MaintenanceStatus.INCOMPLETE,
                 scanned_rows=stats["rows"],
                 updated_rows=stats["rows"],
                 batches_committed=1,
+                vector_compatibility=(
+                    classify_vector_compatibility(schema, identity)
+                    if complete
+                    else None
+                ),
             )
         finally:
             _safe_close_table(table)

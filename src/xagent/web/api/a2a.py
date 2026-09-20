@@ -203,6 +203,7 @@ async def _start_a2a_turn(
     agent_execution_mode: str,
     text: str,
     message_id: str,
+    key_prefix: str,
     context_id: str | None,
     task_id: int | None,
 ) -> A2ATaskSnapshot:
@@ -213,12 +214,23 @@ async def _start_a2a_turn(
             agent_execution_mode=agent_execution_mode,
             text=text,
             message_id=message_id,
+            key_prefix=key_prefix,
             context_id=context_id,
             task_id=task_id,
         )
     except TaskTurnNotFoundError as exc:
         raise a2a_error("task_not_found", "Task not found.", status_code=404) from exc
     except task_start_service.TaskStartRejected as exc:
+        if exc.reason == "a2a_input_conflict":
+            raise a2a_error(
+                "invalid_argument",
+                "messageId was already accepted with different input.",
+                status_code=400,
+            ) from exc
+        if exc.reason == "a2a_input_unavailable":
+            raise a2a_error(
+                "task_not_found", "Task not found.", status_code=404
+            ) from exc
         if exc.reason == "a2a_context_mismatch":
             raise a2a_error(
                 "invalid_argument",
@@ -565,6 +577,7 @@ async def send_message(
         agent_execution_mode=agent_execution_mode,
         text=text,
         message_id=message_id,
+        key_prefix=key_prefix,
         context_id=context_id,
         task_id=task_id,
     )
@@ -601,6 +614,7 @@ async def stream_message(
         agent_execution_mode=agent_execution_mode,
         text=text,
         message_id=message_id,
+        key_prefix=key_prefix,
         context_id=context_id,
         task_id=task_id,
     )

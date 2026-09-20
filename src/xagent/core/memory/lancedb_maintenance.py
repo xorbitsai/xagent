@@ -7,7 +7,7 @@ import math
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow as pa  # type: ignore
 from filelock import FileLock, Timeout
@@ -18,6 +18,9 @@ from .scope_columns import (
     USER_ID_COLUMN,
     derive_scope_columns,
 )
+
+if TYPE_CHECKING:  # ``vector_compatibility`` imports this module at runtime.
+    from .vector_compatibility import VectorCompatibility
 
 MAINTENANCE_METADATA_KEY = b"xagent.memory.scope_maintenance"
 MAINTENANCE_TABLE_VERSION_KEY = b"xagent.memory.scope_maintenance_table_version"
@@ -44,10 +47,33 @@ class MaintenanceOutcome:
     cas_skipped_rows: int = 0
     batches_committed: int = 0
     detail: str | None = None
+    # How the committed table's vector space compares with the identity the
+    # caller asked for, classified by the producer of this outcome while it
+    # still held the maintenance lock. Only outcomes that certify a table a
+    # caller may be admitted over carry it; it is ``None`` everywhere else,
+    # including scope-only maintenance, which never inspects a vector space.
+    vector_compatibility: VectorCompatibility | None = None
 
 
 class MaintenanceLockTimeout(RuntimeError):
     """Raised when another process holds a table's maintenance lock too long."""
+
+
+def validate_lock_timeout(lock_timeout: Any) -> None:
+    """Reject any timeout that would leave a lock acquisition unbounded.
+
+    ``FileLock`` treats a negative or infinite timeout as "wait forever", so an
+    unvalidated value turns contention into a hang instead of the typed
+    retryable outcome callers rely on. Booleans are rejected as well: ``True``
+    is a numerically valid one-second timeout that no caller means to pass.
+    """
+    if (
+        isinstance(lock_timeout, bool)
+        or not isinstance(lock_timeout, (int, float))
+        or not math.isfinite(lock_timeout)
+        or lock_timeout <= 0
+    ):
+        raise ValueError("lock_timeout must be a finite positive duration")
 
 
 def _checkpoint(_stage: str, _batch: int | None = None) -> None:
@@ -215,13 +241,7 @@ def maintain_lancedb_memory_table(
     """
     if type(batch_size) is not int or batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
-    if (
-        isinstance(lock_timeout, bool)
-        or not isinstance(lock_timeout, (int, float))
-        or not math.isfinite(lock_timeout)
-        or lock_timeout <= 0
-    ):
-        raise ValueError("lock_timeout must be a finite positive duration")
+    validate_lock_timeout(lock_timeout)
 
     lock = FileLock(_lock_path(connection, table_name), timeout=lock_timeout)
     try:

@@ -155,6 +155,7 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
     import asyncio
     from unittest.mock import AsyncMock, Mock
 
+    from tests.web.services.coordinator_command_shared import claim_task_command
     from xagent.web.services import (
         agent_service_manager,
         task_command_execution,
@@ -162,7 +163,6 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         task_execution,
         task_orchestrator,
     )
-    from xagent.web.services.task_command_transport import claim_task_command
     from xagent.web.services.task_execution_context_service import (
         TaskExecutionRecoverySnapshot,
     )
@@ -175,7 +175,9 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         selected, TaskTurnPayload("hello"), "ingress"
     )
     with get_session_local()() as db:
-        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
     tracer = SimpleNamespace(add_handler=Mock(), remove_handler=Mock())
     service = SimpleNamespace(
         tracer=tracer,
@@ -296,11 +298,9 @@ def test_wait_for_queued_channel_and_failed_acceptance(selected):
 
 
 def test_worker_revalidates_channel_after_acceptance(selected):
+    from tests.web.services.coordinator_command_shared import claim_for_owner
     from xagent.web.services import task_start_consumer
-    from xagent.web.services.task_command_transport import (
-        SettledTaskCommand,
-        claim_task_command,
-    )
+    from xagent.web.services.task_command_transport import SettledTaskCommand
     from xagent.web.services.task_coordinator_service import (
         acquire_task_lease_no_commit,
     )
@@ -311,11 +311,11 @@ def test_worker_revalidates_channel_after_acceptance(selected):
     with get_session_local()() as db:
         db.get(UserChannel, selected.selection.channel_id).is_active = False
         db.commit()
-        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
         lease = acquire_task_lease_no_commit(
             db, task_id=selected.selection.task_id, runner_id="worker-1"
         )
         db.commit()
+        command = claim_for_owner(db, lease, command_id)
     result = task_start_consumer._commit_handoff(command, lease)
     assert isinstance(result, SettledTaskCommand)
     with get_session_local()() as db:

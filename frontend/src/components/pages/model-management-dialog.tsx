@@ -47,6 +47,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { toast } from "@/components/ui/sonner"
 import { Model, ModelCreate, ProviderConfig, generateModelId, getModelDetailUrl } from "./models"
+import { isContextWindowUnset } from "./model-display-capabilities"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { Stepper } from "@/components/ui/stepper"
 
@@ -780,6 +781,15 @@ export function ModelManagementDialog({
                             {!model.is_owner && !isBuiltinModel(model) && (
                               <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-orange-500">
                                 {t('models.defaults.shared_from_others')}
+                              </Badge>
+                            )}
+                            {isContextWindowUnset(model) && (
+                              <Badge
+                                variant="secondary"
+                                className="text-xs px-2 py-0.5 h-auto whitespace-normal bg-amber-500/10 text-amber-600"
+                                title={t('models.form.contextWindowHint')}
+                              >
+                                {t('models.card.fields.contextWindowUnset')}
                               </Badge>
                             )}
                             {defaultTypes

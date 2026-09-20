@@ -1018,12 +1018,12 @@ async def test_user_oauth_refresh_transient_failure_retains_unavailable_without_
 
 
 @pytest.mark.asyncio
-async def test_user_oauth_refresh_permanently_invalid_deletes_record(
+async def test_user_oauth_refresh_permanently_invalid_keeps_reconnect_tombstone(
     db_session,
     monkeypatch,
 ):
-    """Only a confirmed-dead refresh token (_OAuthRefreshPermanentlyInvalid)
-    should cost the user their stored connection.
+    """A confirmed-dead refresh token clears secrets but keeps the account
+    identity so callers can distinguish reconnect-required from never connected.
     """
     db, user = db_session
     oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
@@ -1052,7 +1052,12 @@ async def test_user_oauth_refresh_permanently_invalid_deletes_record(
         oauth_token_required=True,
     )
     with isolated_session_factory() as verification_db:
-        assert verification_db.get(UserOAuth, account_id) is None
+        tombstone = verification_db.get(UserOAuth, account_id)
+        assert tombstone is not None
+        assert tombstone.access_token == ""
+        assert tombstone.refresh_token is None
+        assert tombstone.expires_at is None
+        assert tombstone.provider == "google"
 
 
 @pytest.mark.asyncio

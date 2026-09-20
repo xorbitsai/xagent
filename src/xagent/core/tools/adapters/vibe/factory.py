@@ -775,13 +775,7 @@ class ToolFactory:
             release = getattr(config, "release_db_connection", None)
             if callable(release):
                 release()
-            workspace = (
-                config.get_task_runtime_workspace()
-                if isinstance(config, BaseToolConfig)
-                else None
-            )
-            if workspace is None:
-                workspace = ToolFactory.create_workspace(config.get_workspace_config())
+            workspace = ToolFactory.get_or_create_runtime_workspace(config)
             if workspace is not None:
                 directories = workspace.get_allowed_dirs()
                 # Mount coverage is sufficient only when the backend-side
@@ -958,6 +952,48 @@ class ToolFactory:
             return None
 
     @staticmethod
+    def get_or_create_runtime_workspace(
+        config: BaseToolConfig,
+    ) -> TaskWorkspace | None:
+        """Return the one workspace shared by every creator in a factory run."""
+
+        config_attributes = getattr(config, "__dict__", {})
+        instance_workspace_getter = config_attributes.get("get_task_runtime_workspace")
+        workspace_getter = getattr(type(config), "get_task_runtime_workspace", None)
+        if callable(instance_workspace_getter):
+            workspace = instance_workspace_getter()
+        elif callable(workspace_getter):
+            workspace = workspace_getter(config)
+        else:
+            workspace = config_attributes.get("_task_runtime_workspace")
+        if workspace is None:
+            instance_config_getter = config_attributes.get("get_workspace_config")
+            workspace_config_getter = getattr(
+                type(config), "get_workspace_config", None
+            )
+            if callable(instance_config_getter):
+                workspace_config = instance_config_getter()
+            elif callable(workspace_config_getter):
+                workspace_config = workspace_config_getter(config)
+            else:
+                workspace_config = None
+            workspace = ToolFactory.create_workspace(workspace_config)
+            if workspace is not None:
+                instance_workspace_setter = config_attributes.get(
+                    "set_task_runtime_workspace"
+                )
+                workspace_setter = getattr(
+                    type(config), "set_task_runtime_workspace", None
+                )
+                if callable(instance_workspace_setter):
+                    instance_workspace_setter(workspace)
+                elif callable(workspace_setter):
+                    workspace_setter(config, workspace)
+                else:
+                    setattr(config, "_task_runtime_workspace", workspace)
+        return workspace
+
+    @staticmethod
     def _create_workspace(
         workspace_config: dict[str, Any] | None,
     ) -> TaskWorkspace | None:
@@ -1041,6 +1077,7 @@ class ToolFactory:
         sandbox: Optional["Sandbox"] = None,
         actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
         actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
+        workspace: Any = None,
     ) -> list[Tool]:
         """Create MCP tools while keeping actor session identity host-only."""
         try:
@@ -1173,6 +1210,23 @@ class ToolFactory:
                                 (server_name, connection_config, session_identity)
                             )
                             continue
+                        if (
+                            workspace is not None
+                            and inner_config.get("workspace_file_ref_env")
+                            and inner_config.get("_trusted_workspace_file_ref") is True
+                        ):
+                            from .sandboxed_tool.sandboxed_mcp_tool_helper import (
+                                should_sandbox_mcp_connection,
+                            )
+
+                            will_run_in_sandbox = bool(
+                                sandbox is not None
+                                and should_sandbox_mcp_connection(connection_config)
+                            )
+                            if not will_run_in_sandbox:
+                                # Host-only capability for a trusted direct
+                                # connector; never serialize it into a sandbox.
+                                connection_config["_workspace"] = workspace
                         connections[server_name] = connection_config
 
                     for server_name, connection, identity in session_requests:

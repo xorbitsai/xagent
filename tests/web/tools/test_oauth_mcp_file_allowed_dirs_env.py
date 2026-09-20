@@ -14,17 +14,17 @@ _READ_ALLOWLIST_ENV_VARS = (
     "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS",
     "XAGENT_GMAIL_FILE_ALLOWED_DIRS",
     "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS",
-    "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS",
 )
 
 
 def _app_info(module: str, access_token_env: str) -> dict:
     return {
+        "id": module.replace("_", "-"),
         "launch_config": {
             "command": "python",
             "args": ["-m", f"xagent.web.tools.mcp.{module}"],
             "env_mapping": {access_token_env: "access_token"},
-        }
+        },
     }
 
 
@@ -67,7 +67,7 @@ def test_transport_config_omits_allowlist_vars_without_a_task_id() -> None:
     assert "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GMAIL_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
-    assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
+    assert "workspace_file_ref_env" not in transport_config
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
 
 
@@ -102,6 +102,74 @@ def test_drive_output_dir_excludes_external_dirs_unlike_the_read_allowlists(
         assert str(external_dir.resolve()) in json.loads(
             transport_config["env"][env_var]
         )
+
+
+def test_drive_transport_declares_the_scoped_file_ref_binding(tmp_path):
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        task_id="task-123",
+        workspace_base_dir=str(tmp_path),
+    )
+
+    transport_config = cfg._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Google Drive"),
+        app_info=_app_info("google_drive", "GOOGLE_ACCESS_TOKEN"),
+        access_token="user-access-token",
+    )
+
+    assert transport_config["workspace_file_ref_env"] == {
+        "google_drive_upload_file": "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE"
+    }
+    assert transport_config["_trusted_workspace_file_ref"] is True
+    assert transport_config["env"]["GOOGLE_ACCESS_TOKEN"] == "user-access-token"
+    assert "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE" not in transport_config["env"]
+    assert "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE_ID" not in transport_config["env"]
+
+
+def test_custom_app_cannot_claim_drive_workspace_file_capability(tmp_path) -> None:
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        task_id="task-123",
+        workspace_base_dir=str(tmp_path),
+    )
+    app_info = _app_info("google_drive", "GOOGLE_ACCESS_TOKEN")
+    app_info["id"] = "custom-drive"
+
+    transport_config = cfg._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Custom Drive"),
+        app_info=app_info,
+        access_token="user-access-token",
+    )
+
+    assert "workspace_file_ref_env" not in transport_config
+    assert "_trusted_workspace_file_ref" not in transport_config
+
+
+def test_tampered_canonical_drive_launcher_cannot_claim_workspace_capability(
+    tmp_path,
+) -> None:
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        task_id="task-123",
+        workspace_base_dir=str(tmp_path),
+    )
+    app_info = _app_info("google_drive", "GOOGLE_ACCESS_TOKEN")
+    app_info["launch_config"] = {
+        **app_info["launch_config"],
+        "args": ["-m", "untrusted.drive_launcher"],
+    }
+
+    transport_config = cfg._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Google Drive"),
+        app_info=app_info,
+        access_token="user-access-token",
+    )
+
+    assert "workspace_file_ref_env" not in transport_config
+    assert "_trusted_workspace_file_ref" not in transport_config
 
 
 def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(

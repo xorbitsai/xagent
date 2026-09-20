@@ -7,24 +7,19 @@ import os
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import ParseResult, parse_qs, urlparse
 
 from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build  # type: ignore[import-not-found]
-from googleapiclient.http import (  # type: ignore[import-not-found]
+from googleapiclient.discovery import build  # type: ignore
+from googleapiclient.http import (  # type: ignore
     MediaIoBaseDownload,
     MediaIoBaseUpload,
 )
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import (
-    allowed_dirs_from_env,
-    clamp_limit,
-    require_clean_identifier,
-    setup_proxy_env,
-)
+from .utils import clamp_limit, require_clean_identifier, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-drive-mcp")
@@ -843,57 +838,39 @@ def _unique_output_path(output_dir: Path, filename: str) -> Path:
     return candidate
 
 
-_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
+_WORKSPACE_UPLOAD_ENV_VAR = "XAGENT_GOOGLE_DRIVE_UPLOAD_FILE"
 
 
-def _upload_allowed_dirs() -> list[Path]:
+class _WorkspaceUpload(NamedTuple):
+    file_id: str
+    path: Path
+    filename: str
+    mime_type: str
+    size: int
+    device: int
+    inode: int
+
+
+def _resolve_workspace_upload(file_id: str) -> _WorkspaceUpload:
+    """Consume the adapter's one-call, task-scoped FileRef resolution."""
+    prefix = _WORKSPACE_UPLOAD_ENV_VAR
+    values = [
+        os.environ.get(f"{prefix}_{suffix}", "")
+        for suffix in ("ID", "NAME", "MIME", "SIZE", "DEVICE", "INODE")
+    ]
+    resolved_path = os.environ.get(prefix, "")
+    if not file_id or file_id != values[0] or not resolved_path or not all(values):
+        raise ValueError("Workspace file is unavailable for this task")
     try:
-        return allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
-    except ValueError as exc:
-        logger.warning("Invalid Google Drive upload directory configuration: %s", exc)
-        raise ValueError("Upload directory configuration is invalid") from None
-
-
-def _resolve_upload_file_path(file_path: str) -> Path:
-    """Resolve ``file_path`` and ensure it falls under one of the upload
-    allowlist's directories — without this, google_drive_upload_file
-    could be tricked into reading arbitrary host files.
-
-    Pass an absolute path — a relative path resolves against this
-    process's own working directory, not the allowed directory, and will
-    not find a file written to the task workspace.
-
-    Containment is checked *before* existence, so a path that is both
-    outside the allowlist and nonexistent reports the allowlist message,
-    not "not found" — the latter would leak whether that host path exists
-    at all to a caller who has no business finding out.
-    """
-    local_path = Path(file_path).expanduser()
-    if not local_path.is_absolute():
-        local_path = Path.cwd() / local_path
-    local_path = local_path.resolve()
-
-    allowed_dirs = _upload_allowed_dirs()
-    if not any(local_path.is_relative_to(d) for d in allowed_dirs):
-        # The absolute host path is deliberately kept out of the raised
-        # message: it reaches the caller/LLM unfiltered via the error
-        # payload otherwise, and host filesystem layout has no business in
-        # a model transcript. Full detail (including the allowed
-        # directories) is logged server-side.
-        logger.warning(
-            "Rejected file path %s outside allowed directories: %s",
-            local_path,
-            ", ".join(str(path) for path in allowed_dirs),
-        )
-        raise PermissionError(
-            "file path is outside the allowed directories; ask the user "
-            "for a file inside the task workspace or another allowed "
-            "location"
-        )
-
-    if not local_path.is_file():
-        raise FileNotFoundError(f"File not found: {file_path}")
-    return local_path
+        local_path = Path(resolved_path).resolve(strict=True)
+        size, device, inode = map(int, values[3:])
+    except (OSError, TypeError, ValueError):
+        raise ValueError("Workspace file is unavailable for this task")
+    if not local_path.is_file() or size < 0:
+        raise ValueError("Workspace file is unavailable for this task")
+    return _WorkspaceUpload(
+        file_id, local_path, values[1], values[2], size, device, inode
+    )
 
 
 # Extensions of formats confidently known to be plain UTF-8 text. Default
@@ -1287,49 +1264,19 @@ def google_drive_download_file(
 
 
 @mcp.tool()
-def google_drive_upload_file(
-    file_path: str, name: str = "", mime_type: str = "", parent_id: str | None = None
-) -> str:
+def google_drive_upload_file(file_id: str, parent_id: str | None = None) -> str:
     """
-    Upload a local file's real bytes to Google Drive — use this (not
-    google_drive_create_file) for a PDF, image, Office document, or any
-    other binary content, including a file this agent already generated
-    into the task workspace (e.g. an exported PDF report).
+    Upload a current-task workspace file's original bytes to Google Drive.
 
-    file_path: path to a file already on disk, e.g. something written to
-    the task workspace. Must be inside an allowed directory (automatically
-    scoped to the current task workspace), which is meant to keep this
-    tool from reading arbitrary host files — not an absolute guarantee
-    (see this function's own symlink-timing comment on the `with
-    local_path.open("rb")` line below). Pass an absolute path — a relative
-    path resolves against this process's own working directory, not the
-    allowed directory, and will not find a file written to the task
-    workspace.
-    name: the file name to give it in Drive; defaults to file_path's own
-    basename.
-    mime_type: defaults to a guess from the file's extension via the
-    standard mimetypes module, falling back to "application/octet-stream"
-    when it can't be guessed. This guess is informational only — Drive's
-    displayed file type may be wrong on a host whose mimetypes database
-    doesn't recognize the extension (see the _KNOWN_TEXT_EXTENSIONS
-    comment above for why that's host-dependent), but the uploaded bytes
-    are always exactly file_path's real content either way. Pass mime_type
-    explicitly for a reliable label, especially for an extension outside
-    the common formats mimetypes ships with by default.
+    file_id must be the opaque FileRef/file_id returned for an uploaded or
+    generated workspace file. Filesystem paths are not accepted. The file's
+    name, MIME type, size, and bytes are derived from the resolved workspace
+    file and cannot be overridden by tool arguments.
     """
     try:
-        local_path = _resolve_upload_file_path(file_path)
-
-        resolved_name = name.strip() or local_path.name
-        # Normalized the same way google_drive_create_file's mime_type is,
-        # so an explicit "Application/PDF" or "application/pdf; foo=bar"
-        # doesn't land on Drive uncanonicalized just because this tool
-        # (unlike create_file) has no text-safety gate to normalize for.
-        resolved_mime_type = (
-            _normalize_mime_type(mime_type)
-            or mimetypes.guess_type(local_path.name)[0]
-            or "application/octet-stream"
-        )
+        binding = _resolve_workspace_upload(file_id)
+        resolved_name = binding.filename
+        resolved_mime_type = binding.mime_type
 
         file_metadata: dict[str, Any] = {
             "name": resolved_name,
@@ -1341,31 +1288,26 @@ def google_drive_upload_file(
 
         service = get_drive_service()
 
-        # local_path.open() here is a fresh by-path open, not the same
-        # descriptor _resolve_upload_file_path used for its allowlist
-        # check — a symlink swapped in during that window wouldn't be
-        # caught. Accepted risk: closing it would mean holding a file
-        # descriptor open across the whole allowlist resolution, which
-        # isn't worth it for a local, non-shared task workspace. Size is
-        # checked from this same handle the upload reads from (rather
-        # than a separate stat() call before opening) so at least those
-        # two agree with each other. No maximum size cap: MediaIoBaseUpload
-        # streams the file in chunks rather than buffering it whole, and
-        # Drive's own per-account storage quota is the real limit.
         try:
-            fh_ctx = local_path.open("rb")
+            fh_ctx = binding.path.open("rb")
         except OSError as e:
             # str(OSError) embeds the absolute path (e.g. "[Errno 13]
-            # Permission denied: '/full/host/path'") -- the same detail
-            # _resolve_upload_file_path's own error deliberately scrubs.
-            # A permission error or a TOCTOU race (the allowlist-checked
-            # path got swapped/removed between the check and this open)
-            # would otherwise leak it straight into the caller/LLM-facing
-            # message through the generic `except Exception` below.
-            logger.warning("Failed to open upload file %s: %s", local_path, e)
-            raise ValueError("Could not read the file at the given path") from e
+            # Permission denied: '/full/host/path'"). A permission error
+            # or TOCTOU race would otherwise leak it into the caller-facing
+            # message through the generic exception handler below.
+            logger.warning(
+                "Failed to open workspace upload file (%s)", type(e).__name__
+            )
+            raise ValueError("Workspace file could not be read") from e
         with fh_ctx as fh:
-            file_size = os.fstat(fh.fileno()).st_size
+            stat = os.fstat(fh.fileno())
+            file_size = stat.st_size
+            if (file_size, stat.st_dev, stat.st_ino) != (
+                binding.size,
+                binding.device,
+                binding.inode,
+            ):
+                raise ValueError("Workspace file changed before upload")
             if file_size == 0:
                 # Drive's API itself accepts 0-byte files; rejecting one
                 # here is a deliberate product choice (an agent uploading
@@ -1373,23 +1315,46 @@ def google_drive_upload_file(
                 # a generation step that silently produced nothing) rather
                 # than an API constraint, unlike Gmail/Slack's matching
                 # rejects.
-                raise ValueError(f"File is empty: {file_path}")
+                raise ValueError("Workspace file is empty")
 
-            media = MediaIoBaseUpload(fh, mimetype=resolved_mime_type, resumable=True)
-
-            create_request = service.files().create(
-                body=file_metadata,
-                media_body=media,
-                supportsAllDrives=True,
-                fields="id, name, webViewLink, mimeType",
-            )
-            if resolved_parent_id is not None:
-                _attach_resource_key(
-                    create_request, resolved_parent_id, parent_resource_key
+            try:
+                media = MediaIoBaseUpload(
+                    fh, mimetype=resolved_mime_type, resumable=True
                 )
-            file = create_request.execute()
 
-        return json.dumps({"status": "success", "file": file}, ensure_ascii=False)
+                create_request = service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    supportsAllDrives=True,
+                    fields="id, name, webViewLink, mimeType, size",
+                )
+                if resolved_parent_id is not None:
+                    _attach_resource_key(
+                        create_request, resolved_parent_id, parent_resource_key
+                    )
+                file = create_request.execute()
+            except Exception as e:
+                # Google client/media exceptions can include local paths,
+                # credentials, or response bodies. Preserve only the type in
+                # host logs and return a stable credential-free tool error.
+                logger.error(
+                    "Google Drive workspace upload failed (%s)", type(e).__name__
+                )
+                raise RuntimeError("Google Drive upload failed") from e
+
+        return json.dumps(
+            {
+                "status": "success",
+                "file": file,
+                "source": {
+                    "file_id": binding.file_id,
+                    "name": resolved_name,
+                    "mime_type": resolved_mime_type,
+                    "size": file_size,
+                },
+            },
+            ensure_ascii=False,
+        )
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -1410,7 +1375,7 @@ def google_drive_create_file(
     name like "report.pdf" would get a file with that name but text/plain
     content, not an actual PDF. To upload an already-generated file's real
     bytes (a PDF exported earlier, an image, a .docx, etc.), use
-    google_drive_upload_file with the file's path instead.
+    google_drive_upload_file with its workspace file_id instead.
 
     mime_type left unset also gates `name` against a fixed guess-the-format
     check: a name whose extension isn't recognized as a text format (this
@@ -1429,7 +1394,7 @@ def google_drive_create_file(
         # trailing-space name like "notes.txt " would pass the guard (the
         # suffix check sees ".txt") yet still land in Drive with the
         # literal trailing space intact — inconsistent with
-        # google_drive_upload_file's matching `name.strip()`.
+        # google_drive_upload_file's authoritative workspace basename.
         name = name.strip()
         # None/omitted vs. an explicit value are distinguished on purpose
         # (rather than defaulting the parameter itself to "text/plain"):
@@ -1499,7 +1464,7 @@ def google_drive_create_file(
                     'explicit mime_type (e.g. "text/plain") to confirm '
                     "that. If you already generated a real binary file "
                     "(e.g. as a task output), use google_drive_upload_file "
-                    "with its file path to upload the real binary content "
+                    "with its workspace file_id to upload the real binary content "
                     "instead."
                 )
             else:
@@ -1509,7 +1474,7 @@ def google_drive_create_file(
                     "text — either use a text-safe mime_type (e.g. "
                     '"text/plain"), or if this is genuinely binary '
                     "content, write it to a file first and use "
-                    "google_drive_upload_file with that file's path "
+                    "google_drive_upload_file with that workspace file_id "
                     "instead."
                 )
             return json.dumps(

@@ -456,7 +456,7 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
     )
     # SFTP tools resolve/containment-check local paths against the task
     # workspace; None (e.g. tool-listing) disables transfers, not execute.
-    workspace = ToolFactory.create_workspace(config.get_workspace_config())
+    workspace = ToolFactory.get_or_create_runtime_workspace(config)
     return [
         SshListTargetsTool(provider=provider, context=context),
         SshExecuteTool(executor=executor, context=context),

@@ -2,6 +2,8 @@
 agent setup (or pin resources) indefinitely."""
 
 import asyncio
+import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -235,6 +237,7 @@ async def test_create_mcp_tools_releases_db_before_network_init(monkeypatch):
     from xagent.core.tools.adapters.vibe.mcp_tools import create_mcp_tools
 
     calls: list[str] = []
+    workspace = object()
 
     class FakeConfig:
         def get_tool_selection_spec(self):
@@ -259,7 +262,11 @@ async def test_create_mcp_tools_releases_db_before_network_init(monkeypatch):
         def get_sandbox(self):
             return None
 
-    async def fake_create(mcp_configs, sandbox=None):
+        def get_task_runtime_workspace(self):
+            return workspace
+
+    async def fake_create(mcp_configs, sandbox=None, **kwargs):
+        assert kwargs["workspace"] is workspace
         calls.append("network_init")
         return []
 
@@ -272,3 +279,75 @@ async def test_create_mcp_tools_releases_db_before_network_init(monkeypatch):
     await create_mcp_tools(FakeConfig())
 
     assert calls == ["load_configs", "release_db", "network_init"]
+
+
+@pytest.mark.asyncio
+async def test_generic_stdio_connection_never_serializes_live_workspace(monkeypatch):
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    serialized = []
+
+    async def fake_load(connections, **_kwargs):
+        json.dumps(connections)
+        assert "_workspace" not in connections["custom"]
+        serialized.append(True)
+        return SimpleNamespace(tools=(), failures=())
+
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools_as_agent_tools", fake_load)
+    await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "name": "custom",
+                "transport": "stdio",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "custom-mcp"],
+                    "workspace_file_ref_env": {"upload": "PRIVATE_BINDING"},
+                },
+            }
+        ],
+        workspace=object(),
+    )
+    assert serialized == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_enabled", [False, True])
+async def test_trusted_workspace_capability_follows_actual_sandbox_path(
+    monkeypatch, sandbox_enabled
+):
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    workspace = object()
+    captured = {}
+
+    async def fake_load(connections, **kwargs):
+        captured.update(connections["drive"])
+        captured["sandbox"] = kwargs.get("sandbox")
+        return SimpleNamespace(tools=(), failures=())
+
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools_as_agent_tools", fake_load)
+    sandbox = object() if sandbox_enabled else None
+    await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "name": "drive",
+                "transport": "stdio",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "trusted-drive-launcher"],
+                    "workspace_file_ref_env": {"upload": "PRIVATE_BINDING"},
+                    "_trusted_workspace_file_ref": True,
+                },
+            }
+        ],
+        sandbox=sandbox,
+        workspace=workspace,
+    )
+
+    if sandbox_enabled:
+        assert "_workspace" not in captured
+        assert captured["sandbox"] is sandbox
+    else:
+        assert captured["_workspace"] is workspace
+        assert captured["sandbox"] is None

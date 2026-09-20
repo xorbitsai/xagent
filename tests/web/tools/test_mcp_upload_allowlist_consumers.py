@@ -11,11 +11,6 @@ import pytest
         ("gmail", "_allowed_file_dirs", "XAGENT_GMAIL_FILE_ALLOWED_DIRS"),
         ("slack", "_allowed_file_dirs", "XAGENT_SLACK_FILE_ALLOWED_DIRS"),
         ("linkedin", "_allowed_image_dirs", "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"),
-        (
-            "google_drive",
-            "_upload_allowed_dirs",
-            "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS",
-        ),
     ],
 )
 def test_connectors_delegate_configured_upload_roots_to_shared_parser(
@@ -38,11 +33,6 @@ def test_connectors_delegate_configured_upload_roots_to_shared_parser(
         ("gmail", "_allowed_file_dirs", "XAGENT_GMAIL_FILE_ALLOWED_DIRS"),
         ("slack", "_allowed_file_dirs", "XAGENT_SLACK_FILE_ALLOWED_DIRS"),
         ("linkedin", "_allowed_image_dirs", "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"),
-        (
-            "google_drive",
-            "_upload_allowed_dirs",
-            "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS",
-        ),
     ],
 )
 def test_connectors_scrub_invalid_upload_root_configuration(

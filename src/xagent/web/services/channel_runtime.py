@@ -1188,7 +1188,10 @@ def _register_channel_uploaded_files_sync(
         metadata_committed = False
         try:
             registration: WorkspaceFileRegistration = (
-                workspace.describe_file_registration(str(downloaded.path))
+                workspace.describe_file_registration(
+                    str(downloaded.path),
+                    mime_type=downloaded.mime_type,
+                )
             )
             file_id = str(uuid4())
             storage_key = build_task_output_storage_key(

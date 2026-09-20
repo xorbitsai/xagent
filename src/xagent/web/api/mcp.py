@@ -2211,14 +2211,11 @@ def _oauth_account_summaries(
         if existing is not None and existing[2] >= account_id:
             continue
         email = str(oauth.email) if oauth.email else None
-        grant_key = normalize_catalog_key(provider)
         status = (
             "connected"
             if _oauth_account_can_connect(
                 oauth,
-                provider_name=(
-                    provider_by_grant_key.get(grant_key) if grant_key else None
-                ),
+                provider_name=provider_by_grant_key.get(provider),
             )
             else "needs_reconnect"
         )
@@ -2436,12 +2433,18 @@ def _is_meta_family_oauth_account(
 
 
 def _oauth_provider_by_grant_key(apps: Sequence[dict]) -> dict[str, object]:
-    """Map normalized app-scoped grant keys to runtime provider names."""
+    """Map exact app-scoped grant keys to runtime provider names.
+
+    ``PublicMCPApp.app_id`` and ``UserOAuth.provider`` are persisted stable
+    identities. Admin-created IDs may collide after display-key normalization,
+    so normalizing here could let an unrelated catalog row overwrite the
+    provider context runtime resolves from the exact app ID.
+    """
     provider_by_key: dict[str, object] = {}
     for app in apps:
-        key = normalize_catalog_key(app.get("id"))
+        key = app.get("id")
         provider = app.get("provider")
-        if key and provider:
+        if isinstance(key, str) and key and provider:
             provider_by_key[key] = provider
     return provider_by_key
 
@@ -2507,12 +2510,18 @@ def _build_oauth_account_lookup(
     provider_by_grant_key = _oauth_provider_by_grant_key(apps)
     lookup: dict[str, object] = {}
     for account in oauth_accounts:
-        key = normalize_catalog_key(getattr(account, "provider", None))
+        provider_key = getattr(account, "provider", None)
+        key = normalize_catalog_key(provider_key)
         if (
             key
             and key not in lookup
             and _oauth_account_can_connect(
-                account, provider_name=provider_by_grant_key.get(key)
+                account,
+                provider_name=(
+                    provider_by_grant_key.get(provider_key)
+                    if isinstance(provider_key, str)
+                    else None
+                ),
             )
         ):
             lookup[key] = account

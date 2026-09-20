@@ -572,6 +572,31 @@ def test_oauth_lookup_uses_dynamic_catalog_provider_for_meta_family() -> None:
     assert lookup == {"meta-custom": account}
 
 
+def test_oauth_lookup_keeps_provider_context_exact_across_normalized_id_collisions() -> (
+    None
+):
+    """Catalog IDs are exact persisted identities even when their display
+    lookup keys normalize to the same value. Provider readiness must follow
+    the exact ID runtime resolves, independent of catalog scan order."""
+    apps = [
+        {"id": "Meta Custom", "provider": "hubspot"},
+        {"id": "meta-custom", "provider": "meta"},
+    ]
+    expired = {
+        "access_token": "old-token",
+        "refresh_token": None,
+        "expires_at": datetime.now(timezone.utc) - timedelta(minutes=1),
+    }
+
+    non_meta_account = SimpleNamespace(provider="Meta Custom", **expired)
+    meta_account = SimpleNamespace(provider="meta-custom", **expired)
+
+    assert mcp_api._build_oauth_account_lookup([non_meta_account], apps=apps) == {}
+    assert mcp_api._build_oauth_account_lookup([meta_account], apps=apps) == {
+        "meta-custom": meta_account
+    }
+
+
 def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
     temp_dir = _setup_test_db()
     try:

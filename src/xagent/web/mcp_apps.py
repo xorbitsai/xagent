@@ -62,14 +62,13 @@ from .models.public_mcp import PublicMCPApp
 # "meta" grant could ever have carried them), so a bare connect must never
 # be treated as satisfying it.
 #
-# sharepoint: same reasoning as facebook -- its "Sites.ReadWrite.All" scope
-# isn't part of the microsoft provider's default_scopes (["User.Read"]),
-# and the connector is brand new (no pre-existing bare "microsoft" grant,
-# e.g. one created by connecting Outlook/Teams/OneDrive, could ever have
-# carried it), so a bare connect -- or a grant scoped to one of those other
-# Microsoft apps -- must never be treated as satisfying it.
+# sharepoint/word: same reasoning as facebook -- their functional scopes
+# ("Sites.ReadWrite.All"/"Files.ReadWrite") aren't part of the microsoft
+# provider's default_scopes (["User.Read"]), and both connectors are brand
+# new. A pre-existing bare "microsoft" grant (e.g. one created by connecting
+# Outlook/Teams/OneDrive) therefore cannot satisfy either connector.
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
-    {"facebook", "github", "myob", "meta-ads", "whatsapp", "sharepoint"}
+    {"facebook", "github", "myob", "meta-ads", "whatsapp", "sharepoint", "word"}
 )
 
 

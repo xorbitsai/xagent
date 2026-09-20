@@ -1,4 +1,4 @@
-"""Regression coverage for whatsapp's and sharepoint's membership in
+"""Regression coverage for whatsapp's, sharepoint's, and word's membership in
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
 
 That set is hand-maintained (src/xagent/web/mcp_apps.py) with no mechanical
@@ -28,7 +28,7 @@ from xagent.web.mcp_apps import requires_app_scoped_oauth_grant
 # pinned here so a regression in any of them -- not just whatsapp/sharepoint
 # -- is caught the same way.
 _EXPECTED_APP_SCOPED_APPS = frozenset(
-    {"facebook", "github", "myob", "meta-ads", "whatsapp", "sharepoint"}
+    {"facebook", "github", "myob", "meta-ads", "whatsapp", "sharepoint", "word"}
 )
 
 
@@ -72,6 +72,17 @@ def test_sharepoint_scopes_actually_exceed_the_microsoft_providers_default_scope
     against the microsoft provider's default_scopes (["User.Read"])."""
     assert _app_scopes_beyond_provider_defaults("sharepoint"), (
         "sharepoint's oauth_scopes are now fully covered by the microsoft "
+        "provider's default_scopes -- if that's genuinely true, it no "
+        "longer needs to be in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT and "
+        "this test (and the set) should be updated together, not left to "
+        "silently drift."
+    )
+
+
+def test_word_scopes_actually_exceed_the_microsoft_providers_default_scopes():
+    """Word requires Files.ReadWrite, which a bare User.Read grant lacks."""
+    assert _app_scopes_beyond_provider_defaults("word"), (
+        "word's oauth_scopes are now fully covered by the microsoft "
         "provider's default_scopes -- if that's genuinely true, it no "
         "longer needs to be in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT and "
         "this test (and the set) should be updated together, not left to "

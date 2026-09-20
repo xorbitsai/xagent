@@ -18,6 +18,21 @@ def _docx_bytes(build_fn=None) -> bytes:
     return buffer.getvalue()
 
 
+def _edit_metadata(etag='"abc"') -> dict:
+    return {
+        "id": "item-1",
+        "eTag": etag,
+        "parentReference": {"driveId": "drive-1"},
+    }
+
+
+def _edit_download_mock(content: bytes, *, etag='"abc"') -> Mock:
+    responses = iter(
+        [MockResponse(_edit_metadata(etag)), MockResponse(content=content)]
+    )
+    return Mock(side_effect=lambda *a, **k: next(responses))
+
+
 class MockResponse:
     def __init__(
         self,
@@ -578,7 +593,86 @@ def test_list_paragraphs_includes_style(monkeypatch):
     result = json.loads(word.word_list_paragraphs("Report.docx"))
 
     assert result["status"] == "success"
-    assert result["paragraphs"] == [{"index": 0, "text": "Title", "style": "Heading 1"}]
+    paragraph = result["paragraphs"][0]
+    assert {key: paragraph[key] for key in ("index", "text", "style")} == {
+        "index": 0,
+        "text": "Title",
+        "style": "Heading 1",
+    }
+    assert result["has_more"] is False
+
+
+def test_get_document_text_pages_are_valid_json_and_recover_all_text(monkeypatch):
+    expected = ('quote " and slash \\ and text ' * 80).strip()
+    content = _docx_bytes(lambda d: d.add_paragraph(expected))
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(word, "get_tool_max_output_length", lambda: 320)
+
+    offset = 0
+    chunks = []
+    while True:
+        encoded = word.word_get_document_text("Report.docx", offset=offset, limit=500)
+        assert len(encoded) <= 320
+        page = json.loads(encoded)
+        assert page["status"] == "success"
+        chunks.append(page["text"])
+        if not page["has_more"]:
+            break
+        assert page["next_offset"] > offset
+        offset = page["next_offset"]
+
+    assert "".join(chunks) == expected
+
+
+def test_list_paragraphs_paginates_without_skipping(monkeypatch):
+    content = _docx_bytes(
+        lambda d: [d.add_paragraph(text) for text in ("first", "second", "third")]
+    )
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    first = json.loads(word.word_list_paragraphs("Report.docx", limit=2))
+    second = json.loads(
+        word.word_list_paragraphs(
+            "Report.docx",
+            offset=first["next_offset"],
+            text_offset=first["next_text_offset"],
+            limit=2,
+        )
+    )
+
+    assert [p["text"] for p in first["paragraphs"]] == ["first", "second"]
+    assert first["has_more"] is True
+    assert [p["text"] for p in second["paragraphs"]] == ["third"]
+    assert second["has_more"] is False
+
+
+def test_list_paragraphs_splits_one_oversized_paragraph_recoverably(monkeypatch):
+    expected = "x" * 2_000
+    content = _docx_bytes(lambda d: d.add_paragraph(expected))
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(word, "get_tool_max_output_length", lambda: 420)
+
+    offset = 0
+    text_offset = 0
+    chunks = []
+    while True:
+        encoded = word.word_list_paragraphs(
+            "Report.docx", offset=offset, text_offset=text_offset, limit=1
+        )
+        assert len(encoded) <= 420
+        page = json.loads(encoded)
+        chunks.append(page["paragraphs"][0]["text"])
+        if not page["has_more"]:
+            break
+        assert page["next_offset"] == 0
+        assert page["next_text_offset"] > text_offset
+        offset = page["next_offset"]
+        text_offset = page["next_text_offset"]
+
+    assert "".join(chunks) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +682,7 @@ def test_list_paragraphs_includes_style(monkeypatch):
 
 def test_set_paragraph_text_out_of_range(monkeypatch):
     content = _docx_bytes(lambda d: d.add_paragraph("Only paragraph"))
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_set_paragraph_text("Report.docx", 5, "New text"))
@@ -601,7 +695,7 @@ def test_set_paragraph_text_uploads_updated_document(monkeypatch):
     content = _docx_bytes(lambda d: d.add_paragraph("Old text"))
     responses = iter(
         [
-            MockResponse({"eTag": '"abc"'}),
+            MockResponse(_edit_metadata()),
             MockResponse(content=content),
             MockResponse({"uploadUrl": "https://upload.example/session"}),
         ]
@@ -624,7 +718,7 @@ def test_append_paragraph(monkeypatch):
     content = _docx_bytes()
     responses = iter(
         [
-            MockResponse({"eTag": '"abc"'}),
+            MockResponse(_edit_metadata()),
             MockResponse(content=content),
             MockResponse({"uploadUrl": "https://upload.example/session"}),
         ]
@@ -651,7 +745,7 @@ def test_add_heading_uploads_updated_document(monkeypatch):
     content = _docx_bytes()
     responses = iter(
         [
-            MockResponse({}),
+            MockResponse(_edit_metadata()),
             MockResponse(content=content),
             MockResponse({"uploadUrl": "https://upload.example/session"}),
         ]
@@ -677,7 +771,7 @@ def test_replace_text_counts_matches_within_runs(monkeypatch):
     content = _docx_bytes(build)
     responses = iter(
         [
-            MockResponse({}),
+            MockResponse(_edit_metadata()),
             MockResponse(content=content),
             MockResponse({"uploadUrl": "https://upload.example/session"}),
         ]
@@ -704,7 +798,7 @@ def test_replace_text_skips_upload_when_nothing_matches(monkeypatch):
     """A no-op request must not still create a new document version --
     uploading an unmodified document has no reason to happen."""
     content = _docx_bytes(lambda d: d.add_paragraph("nothing relevant here"))
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "absent", "x"))
@@ -734,7 +828,7 @@ def test_replace_text_rejects_match_in_run_with_image(monkeypatch):
         run.add_picture(io.BytesIO(png_bytes), width=Inches(0.1))
 
     content = _docx_bytes(build)
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
@@ -764,7 +858,7 @@ def test_replace_text_rejects_match_inside_content_control(monkeypatch):
         p._p.append(sdt)
 
     content = _docx_bytes(build)
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
@@ -794,7 +888,7 @@ def test_replace_text_rejects_match_inside_simple_field(monkeypatch):
         p._p.append(fld_simple)
 
     content = _docx_bytes(build)
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
@@ -823,7 +917,7 @@ def test_replace_text_rejects_match_inside_smart_tag_or_custom_xml(monkeypatch, 
         p._p.append(wrapper)
 
     content = _docx_bytes(build)
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
@@ -869,7 +963,7 @@ def test_replace_text_rejects_match_inside_complex_field_result(monkeypatch):
         add_run_with(end)
 
     content = _docx_bytes(build)
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
@@ -919,7 +1013,7 @@ def test_replace_text_rejects_match_inside_field_spanning_paragraphs(monkeypatch
         add_run_with(p2, end)
 
     content = _docx_bytes(build)
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
@@ -961,7 +1055,7 @@ def test_replace_text_edits_ordinary_text_after_a_field_ends(monkeypatch):
     content = _docx_bytes(build)
     responses = iter(
         [
-            MockResponse({}),
+            MockResponse(_edit_metadata()),
             MockResponse(content=content),
             MockResponse({"uploadUrl": "https://upload.example/session"}),
         ]
@@ -1015,7 +1109,7 @@ def test_replace_text_rejects_match_in_outer_field_result_after_nested_field(
         add_run_with(p, fld_char("end"))  # outer end
 
     content = _docx_bytes(build)
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
@@ -1057,7 +1151,7 @@ def test_replace_text_ignores_field_state_from_tracked_insertion(monkeypatch):
     content = _docx_bytes(build)
     responses = iter(
         [
-            MockResponse({}),
+            MockResponse(_edit_metadata()),
             MockResponse(content=content),
             MockResponse({"uploadUrl": "https://upload.example/session"}),
         ]
@@ -1093,7 +1187,7 @@ def test_replace_text_finds_match_inside_hyperlink_run(monkeypatch):
     content = _docx_bytes(build)
     responses = iter(
         [
-            MockResponse({}),
+            MockResponse(_edit_metadata()),
             MockResponse(content=content),
             MockResponse({"uploadUrl": "https://upload.example/session"}),
         ]
@@ -1132,7 +1226,7 @@ def test_replace_text_ignores_match_inside_tracked_insertion(monkeypatch):
         p.add_run(" after")
 
     content = _docx_bytes(build)
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
@@ -1167,7 +1261,7 @@ def test_replace_text_ignores_match_inside_text_box(monkeypatch):
         anchor._r.append(drawing)
 
     content = _docx_bytes(build)
-    mock_request = Mock(return_value=MockResponse(content=content))
+    mock_request = _edit_download_mock(content)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
@@ -1213,7 +1307,11 @@ def test_upload_document_rejects_oversized_content(monkeypatch):
     monkeypatch.setattr(word, "_MAX_UPLOAD_BYTES", 10)
 
     with pytest.raises(ValueError, match="MB limit"):
-        word._upload_document(document, "Report.docx", None, None)
+        word._upload_document(
+            document,
+            "Report.docx",
+            word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
+        )
 
 
 def test_validate_docx_archive_bounds_expanded_size(monkeypatch):
@@ -1278,24 +1376,17 @@ def test_upload_document_sends_if_match_when_etag_given(monkeypatch):
     mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
     monkeypatch.setattr(word.requests, "put", mock_put)
 
-    word._upload_document(Document(), "Report.docx", None, None, etag='"abc123"')
+    word._upload_document(
+        Document(),
+        "Report.docx",
+        word._EditSnapshot("/drives/drive-1/items/item-1", '"abc123"'),
+    )
 
     session_call = mock_request.call_args
     assert session_call.kwargs["headers"]["If-Match"] == '"abc123"'
-
-
-def test_upload_document_omits_if_match_when_no_etag(monkeypatch):
-    mock_request = Mock(
-        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+    assert session_call.kwargs["url"].endswith(
+        "/drives/drive-1/items/item-1/createUploadSession"
     )
-    monkeypatch.setattr(word.requests, "request", mock_request)
-    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
-    monkeypatch.setattr(word.requests, "put", mock_put)
-
-    word._upload_document(Document(), "Report.docx", None, None, etag=None)
-
-    session_call = mock_request.call_args
-    assert "If-Match" not in session_call.kwargs["headers"]
 
 
 def test_upload_document_rejects_stale_etag_at_session_creation(monkeypatch):
@@ -1308,7 +1399,11 @@ def test_upload_document_rejects_stale_etag_at_session_creation(monkeypatch):
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     with pytest.raises(ValueError, match="changed by someone else"):
-        word._upload_document(Document(), "Report.docx", None, None, etag='"stale"')
+        word._upload_document(
+            Document(),
+            "Report.docx",
+            word._EditSnapshot("/drives/drive-1/items/item-1", '"stale"'),
+        )
 
 
 def test_upload_document_rejects_stale_etag_at_content_put(monkeypatch):
@@ -1323,31 +1418,47 @@ def test_upload_document_rejects_stale_etag_at_content_put(monkeypatch):
     monkeypatch.setattr(word.requests, "put", mock_put)
 
     with pytest.raises(ValueError, match="changed by someone else"):
-        word._upload_document(Document(), "Report.docx", None, None, etag='"stale"')
+        word._upload_document(
+            Document(),
+            "Report.docx",
+            word._EditSnapshot("/drives/drive-1/items/item-1", '"stale"'),
+        )
 
 
 def test_download_document_returns_etag_from_metadata(monkeypatch):
     content = _docx_bytes()
-    responses = iter([MockResponse({"eTag": '"xyz"'}), MockResponse(content=content)])
+    responses = iter(
+        [MockResponse(_edit_metadata('"xyz"')), MockResponse(content=content)]
+    )
     mock_request = Mock(side_effect=lambda *a, **k: next(responses))
     monkeypatch.setattr(word.requests, "request", mock_request)
 
-    _document, etag = word._download_document("Report.docx", None, None)
+    _document, snapshot = word._download_document("Report.docx", None, None)
 
-    assert etag == '"xyz"'
+    assert snapshot == word._EditSnapshot("/drives/drive-1/items/item-1", '"xyz"')
     metadata_call = mock_request.call_args_list[0]
-    assert metadata_call.kwargs["params"] == {"$select": "eTag"}
+    assert metadata_call.kwargs["params"] == {"$select": "id,eTag,parentReference"}
+    content_call = mock_request.call_args_list[1]
+    assert content_call.kwargs["url"].endswith("/drives/drive-1/items/item-1/content")
 
 
-def test_download_document_tolerates_missing_etag(monkeypatch):
-    content = _docx_bytes()
-    responses = iter([MockResponse({}), MockResponse(content=content)])
-    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"id": "item-1", "parentReference": {"driveId": "drive-1"}},
+        {"id": "item-1", "eTag": '"abc"', "parentReference": {}},
+    ],
+)
+def test_download_document_fails_closed_on_incomplete_edit_identity(
+    monkeypatch, metadata
+):
+    mock_request = Mock(return_value=MockResponse(metadata))
     monkeypatch.setattr(word.requests, "request", mock_request)
 
-    _document, etag = word._download_document("Report.docx", None, None)
-
-    assert etag is None
+    with pytest.raises(RuntimeError, match="concurrency-safe"):
+        word._download_document("Report.docx", None, None)
+    assert mock_request.call_count == 1
 
 
 def test_download_document_skips_etag_metadata_when_not_needed(monkeypatch):

@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import zipfile
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -13,7 +14,8 @@ from docx.oxml.ns import qn
 from docx.text.run import Run
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env, url_path_id
+from ....config import get_tool_max_output_length
+from .utils import clamp_limit, clamp_offset, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("word-mcp")
@@ -67,6 +69,10 @@ _MAX_ARCHIVE_PARTS = 10_000
 # exactly the prior behavior when this constant was a leftover 4 MB from
 # before this function used an upload session.
 _MAX_UPLOAD_BYTES = _MAX_DOWNLOAD_BYTES
+_DEFAULT_TEXT_PAGE_CHARS = 20_000
+_MAX_TEXT_PAGE_CHARS = 40_000
+_DEFAULT_PARAGRAPH_PAGE_SIZE = 100
+_MAX_PARAGRAPH_PAGE_SIZE = 500
 
 
 class _GraphRequestError(RuntimeError):
@@ -75,6 +81,14 @@ class _GraphRequestError(RuntimeError):
     def __init__(self, message: str, *, status_code: int) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class _EditSnapshot:
+    """Stable Graph identity and version observed for an edit download."""
+
+    item_path: str
+    etag: str
 
 
 def _success(**payload: Any) -> str:
@@ -342,23 +356,52 @@ def _validate_docx_archive(content: bytes) -> None:
 
 def _download_document(
     file_path: str, site_id: str | None, drive_id: str | None, *, need_etag: bool = True
-) -> tuple[DocumentType, str | None]:
+) -> tuple[DocumentType, _EditSnapshot | None]:
     """Download file_path and parse it, also returning the driveItem's
-    current eTag (None if Graph didn't report one, or if need_etag is
-    False) for _upload_document to bind the write to via If-Match -- see
-    _upload_document. need_etag=False skips that extra metadata GET
-    entirely for the read-only tools, which have no write to bind."""
+    stable driveItem identity and current eTag for edit callers. An edit
+    fails closed if Graph omits any required identity/version field: silently
+    falling back to a path-addressed unconditional upload would reintroduce
+    the stale-write race this snapshot exists to prevent. need_etag=False
+    skips the metadata GET entirely for read-only tools."""
     item_path = _item_path(file_path, site_id, drive_id)
-    etag = None
+    snapshot = None
+    download_path = _content_path(file_path, site_id, drive_id)
     if need_etag:
-        metadata = _graph_request("GET", item_path, params={"$select": "eTag"})
+        metadata = _graph_request(
+            "GET", item_path, params={"$select": "id,eTag,parentReference"}
+        )
+        item_id = metadata.get("id") if isinstance(metadata, dict) else None
         etag = metadata.get("eTag") if isinstance(metadata, dict) else None
-    content = _graph_request(
-        "GET", _content_path(file_path, site_id, drive_id), raw=True
-    )
+        parent_reference = (
+            metadata.get("parentReference") if isinstance(metadata, dict) else None
+        )
+        metadata_drive_id = (
+            parent_reference.get("driveId")
+            if isinstance(parent_reference, dict)
+            else None
+        )
+        if (
+            not isinstance(item_id, str)
+            or not item_id.strip()
+            or not isinstance(etag, str)
+            or not etag.strip()
+            or not isinstance(metadata_drive_id, str)
+            or not metadata_drive_id.strip()
+        ):
+            raise RuntimeError(
+                "Graph did not return the driveItem id, drive id, and eTag "
+                "required for a concurrency-safe Word edit"
+            )
+        stable_item_path = (
+            f"/drives/{url_path_id(metadata_drive_id, 'drive_id')}/items/"
+            f"{url_path_id(item_id, 'item_id')}"
+        )
+        snapshot = _EditSnapshot(item_path=stable_item_path, etag=etag)
+        download_path = f"{stable_item_path}/content"
+    content = _graph_request("GET", download_path, raw=True)
     _validate_docx_archive(content)
     try:
-        return Document(io.BytesIO(content)), etag
+        return Document(io.BytesIO(content)), snapshot
     except Exception as exc:
         raise ValueError(
             f"Could not open {file_path!r} as a Word document -- it may not be a "
@@ -369,10 +412,7 @@ def _download_document(
 def _upload_document(
     document: DocumentType,
     file_path: str,
-    site_id: str | None,
-    drive_id: str | None,
-    *,
-    etag: str | None = None,
+    snapshot: _EditSnapshot,
 ) -> dict[str, Any]:
     """Save document and upload it in place of file_path's current content.
 
@@ -384,8 +424,10 @@ def _upload_document(
     Without this, two callers racing a download-mutate-upload cycle on the
     same file could have the later one silently overwrite the earlier
     one's change; a stale etag now fails the write with 412 instead.
-    etag is optional (skips the guard, matching the prior unconditional
-    behavior) since not every caller has one to offer.
+    Both fields in snapshot are mandatory. The upload session is addressed
+    by the immutable driveItem id rather than by the caller's path, so a
+    concurrent rename or delete-and-recreate cannot redirect the write to a
+    different item.
     """
     buffer = io.BytesIO()
     document.save(buffer)
@@ -396,7 +438,6 @@ def _upload_document(
             f"{_MAX_UPLOAD_BYTES // 1_000_000} MB limit this tool currently "
             "supports"
         )
-    item_path = _item_path(file_path, site_id, drive_id)
     conflict_message = (
         f"{file_path!r} was changed by someone else since this edit "
         "started; re-read it and retry"
@@ -404,14 +445,14 @@ def _upload_document(
     try:
         session = _graph_request(
             "POST",
-            f"{item_path}/createUploadSession",
+            f"{snapshot.item_path}/createUploadSession",
             # "replace" (rather than the "fail" default) is required here:
             # this path always resolves to the file already being edited,
             # so the default's job -- refusing to silently clobber an
             # unrelated file that happens to share this name -- is instead
             # done by the If-Match check below.
             body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
-            extra_headers={"If-Match": etag} if etag else None,
+            extra_headers={"If-Match": snapshot.etag},
         )
     except _GraphRequestError as exc:
         if exc.status_code == 412:
@@ -713,6 +754,147 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
         run.text = ""
 
 
+def _text_page_response(text: str, *, offset: int, limit: int, table_count: int) -> str:
+    """Return a recoverable character page that fits the tool output cap."""
+    start = min(clamp_offset(offset), len(text))
+    requested = clamp_limit(limit, max_limit=_MAX_TEXT_PAGE_CHARS)
+    end = min(start + requested, len(text))
+    max_output_length = get_tool_max_output_length()
+
+    def _build(page_end: int) -> str:
+        has_more = page_end < len(text)
+        return _success(
+            text=text[start:page_end],
+            offset=start,
+            total_characters=len(text),
+            has_more=has_more,
+            next_offset=page_end if has_more else None,
+            table_count=table_count,
+        )
+
+    response = _build(end)
+    while len(response) > max_output_length and end > start:
+        end = start + (end - start) // 2
+        response = _build(end)
+    if len(response) > max_output_length or (end == start and start < len(text)):
+        raise ValueError(
+            "The configured tool output limit is too small to return a "
+            "recoverable Word text page"
+        )
+    return response
+
+
+def _paragraph_page_response(
+    paragraphs: list[Any], *, offset: int, limit: int, text_offset: int
+) -> str:
+    """Return paragraph records without ever emitting unrecoverable JSON.
+
+    Pages normally advance by paragraph index. If one paragraph alone is too
+    large, its text is split and next_offset/next_text_offset resume within
+    that same paragraph, so no content is silently discarded.
+    """
+    total = len(paragraphs)
+    page_start = min(clamp_offset(offset), total)
+    index = page_start
+    first_text_offset = clamp_offset(text_offset)
+    page_limit = clamp_limit(limit, max_limit=_MAX_PARAGRAPH_PAGE_SIZE)
+    max_output_length = get_tool_max_output_length()
+    items: list[dict[str, Any]] = []
+    next_offset: int | None = None
+    next_text_offset: int | None = None
+
+    def _build(
+        page_items: list[dict[str, Any]],
+        resume_index: int | None,
+        resume_text_offset: int | None,
+    ) -> str:
+        has_more = resume_index is not None
+        return _success(
+            paragraphs=page_items,
+            offset=page_start,
+            total_paragraphs=total,
+            has_more=has_more,
+            next_offset=resume_index,
+            next_text_offset=resume_text_offset if has_more else None,
+        )
+
+    while index < total and len(items) < page_limit:
+        paragraph = paragraphs[index]
+        full_text = paragraph.text
+        start = min(first_text_offset if index == page_start else 0, len(full_text))
+        item = {
+            "index": index,
+            "text": full_text[start:],
+            "style": paragraph.style.name if paragraph.style else None,
+            "text_offset": start,
+            "total_text_characters": len(full_text),
+            "text_truncated": False,
+        }
+        following_index = index + 1
+        trial_resume = following_index if following_index < total else None
+        trial = _build(items + [item], trial_resume, 0 if trial_resume else None)
+        if len(trial) <= max_output_length:
+            items.append(item)
+            index = following_index
+            first_text_offset = 0
+            continue
+
+        if items:
+            next_offset = index
+            next_text_offset = start
+            break
+
+        # A single paragraph is larger than the output cap. Find the largest
+        # prefix that fits and make continuation resume inside that paragraph.
+        low = 0
+        high = len(full_text) - start
+        best_item: dict[str, Any] | None = None
+        while low <= high:
+            length = (low + high) // 2
+            candidate = {**item, "text": full_text[start : start + length]}
+            candidate["text_truncated"] = start + length < len(full_text)
+            resume_index: int | None = (
+                index if candidate["text_truncated"] else following_index
+            )
+            if resume_index is not None and resume_index >= total:
+                resume_index = None
+            resume_text = start + length if candidate["text_truncated"] else 0
+            encoded = _build(
+                [candidate],
+                resume_index,
+                resume_text if resume_index is not None else None,
+            )
+            if len(encoded) <= max_output_length:
+                best_item = candidate
+                low = length + 1
+            else:
+                high = length - 1
+        if best_item is None or not best_item["text"] and start < len(full_text):
+            raise ValueError(
+                "The configured tool output limit is too small to return a "
+                "recoverable Word paragraph page"
+            )
+        items.append(best_item)
+        if best_item["text_truncated"]:
+            next_offset = index
+            next_text_offset = start + len(best_item["text"])
+        elif following_index < total:
+            next_offset = following_index
+            next_text_offset = 0
+        break
+
+    if next_offset is None and index < total:
+        next_offset = index
+        next_text_offset = 0
+    response = _build(items, next_offset, next_text_offset)
+    if len(response) > max_output_length:
+        raise ValueError(
+            "The configured tool output limit is too small to return Word "
+            "paragraph pagination metadata"
+        )
+    return response
+
+
 @mcp.tool()
 def word_create_document(
     file_path: str, site_id: str | None = None, drive_id: str | None = None
@@ -732,17 +914,25 @@ def word_create_document(
 
 @mcp.tool()
 def word_get_document_text(
-    file_path: str, site_id: str | None = None, drive_id: str | None = None
+    file_path: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    offset: int = 0,
+    limit: int = _DEFAULT_TEXT_PAGE_CHARS,
 ) -> str:
-    """Get a Word document's full text, as its paragraphs joined by
-    newlines. Table contents are not included -- see word_list_paragraphs
-    for per-paragraph detail."""
+    """Get a page of a Word document's paragraph text joined by newlines.
+
+    Table contents are not included. Pass next_offset from a response with
+    has_more=true back as offset to continue without losing content. limit
+    is a character count and is capped to a safe maximum."""
     try:
-        document, _etag = _download_document(
+        document, _snapshot = _download_document(
             file_path, site_id, drive_id, need_etag=False
         )
         text = "\n".join(paragraph.text for paragraph in document.paragraphs)
-        return _success(text=text, table_count=len(document.tables))
+        return _text_page_response(
+            text, offset=offset, limit=limit, table_count=len(document.tables)
+        )
     except Exception as e:
         logger.error("Error getting text for Word document %s: %s", file_path, e)
         return _error(str(e))
@@ -750,23 +940,29 @@ def word_get_document_text(
 
 @mcp.tool()
 def word_list_paragraphs(
-    file_path: str, site_id: str | None = None, drive_id: str | None = None
+    file_path: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    offset: int = 0,
+    limit: int = _DEFAULT_PARAGRAPH_PAGE_SIZE,
+    text_offset: int = 0,
 ) -> str:
-    """List a Word document's paragraphs with their index, text, and
-    style name. The index is needed by word_set_paragraph_text."""
+    """List a recoverable page of paragraphs with index, text, and style.
+
+    Pass next_offset and next_text_offset from a response with has_more=true
+    back as offset/text_offset. next_text_offset is non-zero only when one
+    unusually large paragraph had to be split to keep the JSON valid. The
+    paragraph index is used by word_set_paragraph_text."""
     try:
-        document, _etag = _download_document(
+        document, _snapshot = _download_document(
             file_path, site_id, drive_id, need_etag=False
         )
-        paragraphs = [
-            {
-                "index": index,
-                "text": paragraph.text,
-                "style": paragraph.style.name if paragraph.style else None,
-            }
-            for index, paragraph in enumerate(document.paragraphs)
-        ]
-        return _success(paragraphs=paragraphs)
+        return _paragraph_page_response(
+            document.paragraphs,
+            offset=offset,
+            limit=limit,
+            text_offset=text_offset,
+        )
     except Exception as e:
         logger.error("Error listing paragraphs for Word document %s: %s", file_path, e)
         return _error(str(e))
@@ -785,7 +981,8 @@ def word_set_paragraph_text(
     character formatting; does not preserve formatting that varied across
     multiple runs within the paragraph."""
     try:
-        document, etag = _download_document(file_path, site_id, drive_id)
+        document, snapshot = _download_document(file_path, site_id, drive_id)
+        assert snapshot is not None
         paragraphs = document.paragraphs
         if not 0 <= paragraph_index < len(paragraphs):
             raise ValueError(
@@ -793,7 +990,7 @@ def word_set_paragraph_text(
                 f"with {len(paragraphs)} paragraphs"
             )
         _set_paragraph_text(paragraphs[paragraph_index], text)
-        item = _upload_document(document, file_path, site_id, drive_id, etag=etag)
+        item = _upload_document(document, file_path, snapshot)
         return _success(item=item)
     except Exception as e:
         logger.error(
@@ -818,9 +1015,10 @@ def word_append_paragraph(
     invalid names raise an error rather than silently falling back to
     Normal."""
     try:
-        document, etag = _download_document(file_path, site_id, drive_id)
+        document, snapshot = _download_document(file_path, site_id, drive_id)
+        assert snapshot is not None
         document.add_paragraph(text, style=style)
-        item = _upload_document(document, file_path, site_id, drive_id, etag=etag)
+        item = _upload_document(document, file_path, snapshot)
         return _success(item=item)
     except Exception as e:
         logger.error("Error appending paragraph to Word document %s: %s", file_path, e)
@@ -840,9 +1038,10 @@ def word_add_heading(
     try:
         if not 0 <= level <= 9:
             raise ValueError("level must be between 0 and 9")
-        document, etag = _download_document(file_path, site_id, drive_id)
+        document, snapshot = _download_document(file_path, site_id, drive_id)
+        assert snapshot is not None
         document.add_heading(text, level=level)
-        item = _upload_document(document, file_path, site_id, drive_id, etag=etag)
+        item = _upload_document(document, file_path, snapshot)
         return _success(item=item)
     except Exception as e:
         logger.error("Error adding heading to Word document %s: %s", file_path, e)
@@ -886,7 +1085,8 @@ def word_replace_text(
     try:
         if not find:
             raise ValueError("find must not be empty")
-        document, etag = _download_document(file_path, site_id, drive_id)
+        document, snapshot = _download_document(file_path, site_id, drive_id)
+        assert snapshot is not None
         replacements = 0
         field_depth_stack: list[bool] = []
         for paragraph in document.paragraphs:
@@ -916,7 +1116,7 @@ def word_replace_text(
             # Nothing changed -- uploading the unmodified document would
             # still create a new version/last-modified entry for no reason.
             return _success(replacements=0)
-        item = _upload_document(document, file_path, site_id, drive_id, etag=etag)
+        item = _upload_document(document, file_path, snapshot)
         return _success(item=item, replacements=replacements)
     except Exception as e:
         logger.error("Error replacing text in Word document %s: %s", file_path, e)

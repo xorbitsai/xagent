@@ -1,7 +1,7 @@
 """seed built-in Excel (OAuth) MCP connector
 
 Revision ID: 20260917_seed_excel_mcp_app
-Revises: 20260919_task_input_receipts
+Revises: 91899e1d97d3
 Create Date: 2026-09-17 00:00:00.000000
 
 """
@@ -12,13 +12,16 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-from xagent.builtin_identity import builtin_provenance_identity
+from xagent.builtin_identity import (
+    builtin_provenance_identity,
+    canonicalize_builtin_identity,
+)
 
 logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260917_seed_excel_mcp_app"
-down_revision: Union[str, None] = "20260919_task_input_receipts"
+down_revision: Union[str, None] = "91899e1d97d3"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -51,7 +54,7 @@ ROW = {
     "transport": "oauth",
     "provider_name": "microsoft",
     "category": "Productivity",
-    "oauth_scopes": ["Files.ReadWrite"],
+    "oauth_scopes": ["Files.ReadWrite", "offline_access"],
     "is_visible_in_connector": True,
     "launch_config": {
         "command": "python",
@@ -80,23 +83,37 @@ def upgrade() -> None:
             "Cannot seed builtin Excel identity: public_mcp_apps.launch_config "
             "is required for provenance"
         )
-    existing = (
+    existing_rows = (
         bind.execute(
             sa.select(
                 PUBLIC_MCP_APPS_TABLE.c.app_id,
+                PUBLIC_MCP_APPS_TABLE.c.name,
                 PUBLIC_MCP_APPS_TABLE.c.launch_config,
-            ).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+            )
         )
         .mappings()
-        .first()
+        .all()
     )
-    if existing is not None:
-        if _has_provenance(existing["launch_config"]):
+    canonical_app_id = canonicalize_builtin_identity(APP_ID)
+    collisions = [
+        row
+        for row in existing_rows
+        if canonicalize_builtin_identity(row["app_id"]) == canonical_app_id
+        or canonicalize_builtin_identity(row["name"]) == canonical_app_id
+    ]
+    if collisions:
+        if (
+            len(collisions) == 1
+            and collisions[0]["app_id"] == APP_ID
+            and _has_provenance(collisions[0]["launch_config"])
+        ):
             return
+        identities = ", ".join(
+            f"app_id={row['app_id']!r}, name={row['name']!r}" for row in collisions
+        )
         raise RuntimeError(
-            "Cannot seed builtin Excel connector: an existing "
-            "public_mcp_apps row with app_id='excel' has no matching "
-            "builtin_provenance"
+            "Cannot seed builtin Excel connector: existing public_mcp_apps "
+            f"identities collide with the reserved Excel identity ({identities})"
         )
 
     dropped_keys = sorted(set(ROW) - columns)

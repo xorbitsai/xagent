@@ -297,6 +297,7 @@ def test_list_worksheets_exposes_next_link(monkeypatch):
     result = json.loads(excel.excel_list_worksheets("book.xlsx"))
 
     assert result["next_link"] == "https://graph.microsoft.com/v1.0/next-page"
+    assert mock_request.call_args.kwargs["params"] == {"$top": 20}
 
 
 def test_list_worksheets_next_link_is_none_on_last_page(monkeypatch):
@@ -322,6 +323,29 @@ def test_list_worksheets_consumes_valid_next_link(monkeypatch):
 
     assert result["worksheets"] == [{"id": "2"}]
     assert mock_request.call_args.kwargs["url"] == next_link
+    assert mock_request.call_args.kwargs["params"] is None
+
+
+def test_list_worksheets_applies_requested_page_size(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": []}))
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_list_worksheets("book.xlsx", page_size=5))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["params"] == {"$top": 5}
+
+
+@pytest.mark.parametrize("page_size", [True, 0, 101, "5"])
+def test_list_worksheets_rejects_invalid_page_size(monkeypatch, page_size):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_list_worksheets("book.xlsx", page_size=page_size))
+
+    assert result["status"] == "error"
+    assert "page_size" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_list_worksheets_rejects_next_link_for_another_collection(monkeypatch):
@@ -609,7 +633,7 @@ def test_list_table_rows_consumes_equivalently_encoded_next_link(monkeypatch):
     assert mock_request.call_args.kwargs["url"] == next_link
 
 
-def test_list_table_rows_caps_oversized_response_and_keeps_next_link(monkeypatch):
+def test_list_table_rows_rejects_oversized_page_without_advancing_cursor(monkeypatch):
     max_output_length = get_tool_max_output_length()
     next_link = (
         "https://graph.microsoft.com/v1.0/me/drive/root:/book.xlsx:/workbook/"
@@ -627,9 +651,33 @@ def test_list_table_rows_caps_oversized_response_and_keeps_next_link(monkeypatch
 
     result = json.loads(excel.excel_list_table_rows("book.xlsx", "Table1"))
 
-    assert result["status"] == "success"
-    assert result["truncated"] is True
-    assert result["next_link"] == next_link
+    assert result["status"] == "error"
+    assert "smaller page_size" in result["message"]
+    assert "next_link" not in result
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("excel_list_worksheets", ("book.xlsx",)),
+        ("excel_list_tables", ("book.xlsx",)),
+        ("excel_list_table_rows", ("book.xlsx", "Table1")),
+    ],
+)
+def test_list_collections_reject_oversized_final_page(monkeypatch, tool_name, args):
+    max_output_length = get_tool_max_output_length()
+    mock_request = Mock(
+        return_value=MockResponse(
+            {"value": [{"values": [["x" * (max_output_length + 1000)]]}]}
+        )
+    )
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(getattr(excel, tool_name)(*args))
+
+    assert result["status"] == "error"
+    assert "smaller page_size" in result["message"]
+    assert "next_link" not in result
 
 
 def test_add_table_rows_with_index(monkeypatch):
@@ -651,6 +699,102 @@ def test_add_table_rows_without_index_omits_field(monkeypatch):
     json.loads(excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]"))
 
     assert "index" not in mock_request.call_args.kwargs["json"]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "excel_add_table_rows",
+            {
+                "file_path": "book.xlsx",
+                "table": "Table1",
+                "values_json": "[[1]]",
+                "index": True,
+            },
+        ),
+        (
+            "excel_add_table_rows",
+            {
+                "file_path": "book.xlsx",
+                "table": "Table1",
+                "values_json": "[[1]]",
+                "index": "3",
+            },
+        ),
+        (
+            "excel_add_table_rows",
+            {
+                "file_path": "book.xlsx",
+                "table": "Table1",
+                "values_json": "[[1]]",
+                "index": 1.0,
+            },
+        ),
+        (
+            "excel_delete_table_row",
+            {"file_path": "book.xlsx", "table": "Table1", "row_index": True},
+        ),
+        (
+            "excel_delete_table_row",
+            {"file_path": "book.xlsx", "table": "Table1", "row_index": "3"},
+        ),
+        (
+            "excel_delete_table_row",
+            {"file_path": "book.xlsx", "table": "Table1", "row_index": 1.0},
+        ),
+    ],
+)
+async def test_row_indexes_are_strict_at_mcp_ingress(monkeypatch, tool_name, arguments):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    with pytest.raises(ToolError, match="validation error"):
+        await excel.mcp.call_tool(tool_name, arguments)
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("call", "side_effect"),
+    [
+        (
+            lambda: excel.excel_add_worksheet("book.xlsx"),
+            requests.ReadTimeout("response timed out"),
+        ),
+        (
+            lambda: excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]"),
+            requests.ConnectionError("connection dropped"),
+        ),
+    ],
+)
+def test_non_idempotent_mutation_transport_failure_is_indeterminate(
+    monkeypatch, call, side_effect
+):
+    monkeypatch.setattr(excel.requests, "request", Mock(side_effect=side_effect))
+
+    result = json.loads(call())
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+    assert "may already have been applied" in result["message"]
+
+
+def test_non_idempotent_mutation_server_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(return_value=MockResponse({"error": "gateway"}, status_code=504)),
+    )
+
+    result = json.loads(
+        excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]")
+    )
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+    assert "HTTP 504" in result["message"]
 
 
 def test_add_table_rows_caps_oversized_response(monkeypatch):

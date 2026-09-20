@@ -89,5 +89,6 @@ def test_excel_scopes_actually_exceed_the_microsoft_providers_default_scopes():
     )
 
     assert set(excel["oauth_scopes"]) - provider_default_scopes["microsoft"] == {
-        "Files.ReadWrite"
+        "Files.ReadWrite",
+        "offline_access",
     }

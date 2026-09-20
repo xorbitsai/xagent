@@ -124,12 +124,41 @@ def test_upgrade_refuses_unowned_custom_excel_row(tmp_path):
             )
         )
         with patch.object(migration, "op", _operations(connection)):
-            with pytest.raises(RuntimeError, match="builtin_provenance"):
+            with pytest.raises(RuntimeError, match="reserved Excel identity"):
                 migration.upgrade()
         row = connection.execute(
             text("SELECT name FROM public_mcp_apps WHERE app_id='excel'")
         ).scalar_one()
         assert row == "Operator Excel"
+
+
+@pytest.mark.parametrize(
+    ("app_id", "name"),
+    [
+        ("Excel", "Custom connector"),
+        (" excel ", "Custom connector"),
+        ("custom-excel", "Excel"),
+        ("custom-excel", " EXCEL "),
+    ],
+)
+def test_upgrade_refuses_normalized_excel_identity_collisions(tmp_path, app_id, name):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, launch_config) "
+                "VALUES (:app_id, :name, 'custom', 'stdio', NULL)"
+            ),
+            {"app_id": app_id, "name": name},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="reserved Excel identity"):
+                migration.upgrade()
+        assert "excel" not in _app_ids(connection)
+        assert app_id in _app_ids(connection)
 
 
 def test_seed_row_matches_registry(tmp_path):

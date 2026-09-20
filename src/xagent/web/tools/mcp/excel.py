@@ -1,12 +1,14 @@
 import json
 import logging
 import os
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote, unquote, urlsplit
 
 import requests
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
+from ....config import get_tool_max_output_length
 from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +20,11 @@ mcp = FastMCP("excel-mcp")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_COLLECTION_PAGE_SIZE = 20
+MAX_COLLECTION_PAGE_SIZE = 100
+
+StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+StrictPageSize = Annotated[int, Field(strict=True, ge=1, le=MAX_COLLECTION_PAGE_SIZE)]
 
 _VALID_CLEAR_APPLY_TO = frozenset({"All", "Formats", "Contents"})
 
@@ -30,25 +37,42 @@ class _GraphRequestError(RuntimeError):
         self.status_code = status_code
 
 
+class _GraphMutationIndeterminateError(RuntimeError):
+    """A mutation may have committed even though no response was received."""
+
+
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
 
-def _success_with_capped_collection(
-    field_name: str, values: list[Any], *, next_link: str | None
+def _success_with_bounded_collection(
+    field_name: str,
+    values: list[Any],
+    *,
+    next_link: str | None,
 ) -> str:
-    """Keep list responses valid JSON while preserving their continuation."""
-    capped = json.loads(
-        success_with_capped_dict(
-            field_name,
-            {"items": values},
-            extra_fields={"next_link": next_link},
-        )
+    """Return a complete Graph page or fail without advancing its cursor.
+
+    A Graph nextLink resumes after the complete server page. Locally dropping
+    values while retaining that cursor would make the dropped values
+    unreachable, so collection pages are never truncated here. Callers can
+    request a smaller server page instead.
+    """
+    response = json.dumps(
+        {
+            "status": "success",
+            field_name: values,
+            "next_link": next_link,
+            "truncated": False,
+        },
+        ensure_ascii=False,
     )
-    field = capped.get(field_name)
-    if isinstance(field, dict):
-        capped[field_name] = field.get("items", [])
-    return json.dumps(capped, ensure_ascii=False)
+    if len(response) <= get_tool_max_output_length():
+        return response
+    return _error(
+        "The Graph page exceeds the tool output limit; retry the collection "
+        "from the beginning with a smaller page_size."
+    )
 
 
 def _error(message: str, *, details: Any = None) -> str:
@@ -56,6 +80,17 @@ def _error(message: str, *, details: Any = None) -> str:
     if details is not None:
         payload["details"] = details
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _indeterminate(message: str) -> str:
+    return json.dumps(
+        {
+            "status": "indeterminate",
+            "message": message,
+            "retry_safe": False,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -102,6 +137,38 @@ def _graph_request(
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
+
+
+def _graph_mutation_request(
+    path: str,
+    *,
+    body: dict[str, Any],
+) -> Any:
+    """POST a non-idempotent mutation without masking unknown outcomes."""
+    try:
+        return _graph_request("POST", path, body=body)
+    except _GraphRequestError as exc:
+        if exc.status_code >= 500:
+            raise _GraphMutationIndeterminateError(
+                f"Graph returned HTTP {exc.status_code} after a non-idempotent "
+                "request. The mutation may already have been applied; inspect "
+                "the workbook before retrying."
+            ) from exc
+        raise
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        raise _GraphMutationIndeterminateError(
+            "The connection ended before Graph confirmed this non-idempotent "
+            "request. The mutation may already have been applied; inspect the "
+            "workbook before retrying."
+        ) from exc
+
+
+def _validate_page_size(page_size: int) -> int:
+    if not isinstance(page_size, int) or isinstance(page_size, bool):
+        raise TypeError("page_size must be an integer")
+    if not 1 <= page_size <= MAX_COLLECTION_PAGE_SIZE:
+        raise ValueError(f"page_size must be between 1 and {MAX_COLLECTION_PAGE_SIZE}")
+    return page_size
 
 
 def _site_segment(site_id: str) -> str:
@@ -302,6 +369,7 @@ def excel_list_worksheets(
     site_id: str | None = None,
     drive_id: str | None = None,
     next_link: str | None = None,
+    page_size: StrictPageSize = DEFAULT_COLLECTION_PAGE_SIZE,
 ) -> str:
     """List the worksheets in an Excel workbook (.xlsx file).
 
@@ -310,8 +378,10 @@ def excel_list_worksheets(
     site id -- "root" for the tenant's root site, or a site's own id/path)
     to address a SharePoint site's document library instead, optionally
     with drive_id for a non-default library. Pass a returned next_link to
-    retrieve the next page."""
+    retrieve the next page. page_size bounds each server page and applies
+    when starting a listing."""
     try:
+        validated_page_size = _validate_page_size(page_size)
         base = _workbook_base(file_path, site_id, drive_id)
         collection_path = f"{base}/worksheets"
         path = (
@@ -319,8 +389,12 @@ def excel_list_worksheets(
             if next_link is None
             else _next_page_path(next_link, collection_path)
         )
-        result = _graph_request("GET", path)
-        return _success_with_capped_collection(
+        result = _graph_request(
+            "GET",
+            path,
+            params={"$top": validated_page_size} if next_link is None else None,
+        )
+        return _success_with_bounded_collection(
             "worksheets",
             result.get("value", []),
             next_link=result.get("@odata.nextLink"),
@@ -349,8 +423,13 @@ def excel_add_worksheet(
             if not name.strip():
                 raise ValueError("name must not be empty or whitespace")
             body = {"name": name}
-        result = _graph_request("POST", f"{base}/worksheets/add", body=body)
+        result = _graph_mutation_request(f"{base}/worksheets/add", body=body)
         return _success(worksheet=result)
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Worksheet creation outcome is indeterminate for %s: %s", file_path, e
+        )
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding worksheet to %s: %s", file_path, e)
         return _error(str(e))
@@ -514,11 +593,14 @@ def excel_list_tables(
     site_id: str | None = None,
     drive_id: str | None = None,
     next_link: str | None = None,
+    page_size: StrictPageSize = DEFAULT_COLLECTION_PAGE_SIZE,
 ) -> str:
     """List the tables (structured ranges) defined in an Excel workbook.
 
-    Pass a returned next_link to retrieve the next page."""
+    Pass a returned next_link to retrieve the next page. page_size bounds
+    each server page and applies when starting a listing."""
     try:
+        validated_page_size = _validate_page_size(page_size)
         base = _workbook_base(file_path, site_id, drive_id)
         collection_path = f"{base}/tables"
         path = (
@@ -526,8 +608,12 @@ def excel_list_tables(
             if next_link is None
             else _next_page_path(next_link, collection_path)
         )
-        result = _graph_request("GET", path)
-        return _success_with_capped_collection(
+        result = _graph_request(
+            "GET",
+            path,
+            params={"$top": validated_page_size} if next_link is None else None,
+        )
+        return _success_with_bounded_collection(
             "tables",
             result.get("value", []),
             next_link=result.get("@odata.nextLink"),
@@ -553,8 +639,11 @@ def excel_add_table(
             raise TypeError("has_headers must be a boolean")
         base = _workbook_base(file_path, site_id, drive_id)
         body = {"address": address, "hasHeaders": has_headers}
-        result = _graph_request("POST", f"{base}/tables/add", body=body)
+        result = _graph_mutation_request(f"{base}/tables/add", body=body)
         return _success(table=result)
+    except _GraphMutationIndeterminateError as e:
+        logger.error("Table creation outcome is indeterminate for %s: %s", file_path, e)
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding table %s in %s: %s", address, file_path, e)
         return _error(str(e))
@@ -567,11 +656,14 @@ def excel_list_table_rows(
     site_id: str | None = None,
     drive_id: str | None = None,
     next_link: str | None = None,
+    page_size: StrictPageSize = DEFAULT_COLLECTION_PAGE_SIZE,
 ) -> str:
     """List the rows in an Excel table. table is either the table's Graph
     id or its display name. Pass a returned next_link to retrieve the next
-    page of a large table."""
+    page of a large table. page_size bounds each server page and applies
+    when starting a listing."""
     try:
+        validated_page_size = _validate_page_size(page_size)
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)
         collection_path = f"{base}/{segment}/rows"
@@ -580,8 +672,12 @@ def excel_list_table_rows(
             if next_link is None
             else _next_page_path(next_link, collection_path)
         )
-        result = _graph_request("GET", path)
-        return _success_with_capped_collection(
+        result = _graph_request(
+            "GET",
+            path,
+            params={"$top": validated_page_size} if next_link is None else None,
+        )
+        return _success_with_bounded_collection(
             "rows",
             result.get("value", []),
             next_link=result.get("@odata.nextLink"),
@@ -596,7 +692,7 @@ def excel_add_table_rows(
     file_path: str,
     table: str,
     values_json: str,
-    index: int | None = None,
+    index: StrictNonNegativeInt | None = None,
     site_id: str | None = None,
     drive_id: str | None = None,
 ) -> str:
@@ -618,8 +714,16 @@ def excel_add_table_rows(
         body: dict[str, Any] = {"values": values}
         if index is not None:
             body["index"] = index
-        result = _graph_request("POST", f"{base}/{segment}/rows", body=body)
+        result = _graph_mutation_request(f"{base}/{segment}/rows", body=body)
         return success_with_capped_dict("row", result)
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Table row insertion outcome is indeterminate for %s in %s: %s",
+            table,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding rows to table %s in %s: %s", table, file_path, e)
         return _error(str(e))
@@ -629,7 +733,7 @@ def excel_add_table_rows(
 def excel_delete_table_row(
     file_path: str,
     table: str,
-    row_index: int,
+    row_index: StrictNonNegativeInt,
     site_id: str | None = None,
     drive_id: str | None = None,
 ) -> str:

@@ -771,7 +771,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "microsoft",
             "category": "Productivity",
-            "oauth_scopes": ["Files.ReadWrite"],
+            "oauth_scopes": ["Files.ReadWrite", "offline_access"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",

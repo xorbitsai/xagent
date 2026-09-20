@@ -837,6 +837,33 @@ def test_bare_login_for_unrestricted_provider_still_proceeds(db_session):
     assert resp.status_code == 307
 
 
+def test_excel_login_requests_refresh_permission(db_session):
+    db, user = db_session
+    token = _token_for(user)
+    excel_row = get_builtin_public_mcp_app("excel")
+    assert excel_row is not None
+    db.add(PublicMCPApp(**excel_row))
+    db.commit()
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/api/auth/microsoft/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id="excel",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 307
+    scopes = parse_qs(urlparse(_location(resp)).query)["scope"][0].split()
+    assert set(scopes) == {"User.Read", "Files.ReadWrite", "offline_access"}
+
+
 def test_bare_microsoft_callback_skips_excel_but_connects_eligible_sibling(
     db_session, monkeypatch
 ):

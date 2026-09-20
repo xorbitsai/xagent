@@ -30,8 +30,26 @@ class TriggerType(str, enum.Enum):
 class TriggerRunStatus(str, enum.Enum):
     PENDING = "pending"
     RUNNING = "running"
+    # Non-terminal resting state: the run's task parked at ``PAUSED`` /
+    # ``WAITING_FOR_USER``. Both collapse here on purpose -- the distinction
+    # belongs to the task, and every extra run value has to be handled by the
+    # projection's row selector, the resume flip, and the UI. Without this value
+    # a parked task's run had no state to project onto and kept reading as
+    # "running" forever (#2177).
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
+
+    @classmethod
+    def terminal_values(cls) -> frozenset[str]:
+        """The values a run never leaves.
+
+        Callers that need "every non-terminal run" (the trigger projection) ask
+        for the complement of this set rather than listing the other members, so
+        a value added here can never be silently excluded from that sweep.
+        """
+
+        return frozenset({cls.COMPLETED.value, cls.FAILED.value})
 
 
 class TriggerProvisioningStatus(str, enum.Enum):

@@ -436,7 +436,10 @@ def _terminal_task_error_payload(
 
         task = db.query(Task).filter(Task.id == task_id).first()
         if task is not None:
+            from .task_orchestrator import sync_trigger_run_status
+
             sync_workforce_run_status(db, task, TaskStatus.FAILED)
+            sync_trigger_run_status(db, task, TaskStatus.FAILED)
             # Persist the error as an assistant message so failures that
             # happen before agent execution starts (no trace events, e.g.
             # sandbox capacity rejection) survive a history reload instead
@@ -1597,6 +1600,9 @@ def _finalize_task_execution_result_isolated(
         terminal_state_committed = False
         final_control_snapshot: TaskControlSnapshot | None = None
         final_task_status = pre_run_status.value
+        # Local import: the orchestrator module pulls in this one. Every settle
+        # point below projects both run twins so neither can lag the other.
+        from .task_orchestrator import sync_trigger_run_status
 
         if task_updated is not None:
             task_agent_config: dict[str, Any] = (
@@ -1629,6 +1635,11 @@ def _finalize_task_execution_result_isolated(
                     task_updated,
                     task_updated.status,
                 )
+                sync_trigger_run_status(
+                    finalize_db,
+                    task_updated,
+                    task_updated.status,
+                )
                 finalize_db.commit()
                 metadata_committed = True
                 terminal_state_committed = True
@@ -1647,6 +1658,11 @@ def _finalize_task_execution_result_isolated(
                     expected_run_id=expected_run_id,
                 )
                 sync_workforce_run_status(
+                    finalize_db,
+                    task_updated,
+                    task_updated.status,
+                )
+                sync_trigger_run_status(
                     finalize_db,
                     task_updated,
                     task_updated.status,
@@ -1682,6 +1698,11 @@ def _finalize_task_execution_result_isolated(
                         or CLIENT_SAFE_TASK_FAILURE,
                     )
                 sync_workforce_run_status(
+                    finalize_db,
+                    task_updated,
+                    task_updated.status,
+                )
+                sync_trigger_run_status(
                     finalize_db,
                     task_updated,
                     task_updated.status,
@@ -2219,9 +2240,14 @@ def _acquire_resume_task_lease(
             db.commit()
             return None
         if task is not None:
+            from .task_orchestrator import sync_trigger_run_status
+
             db.expire(task)
             db.refresh(task)
             sync_workforce_run_status(db, task, TaskStatus.RUNNING)
+            # Resume half of #2177: a task claimed back out of PAUSED /
+            # WAITING_FOR_USER must not leave its run reading as parked.
+            sync_trigger_run_status(db, task, TaskStatus.RUNNING)
         db.commit()
         return lease
 
@@ -2405,6 +2431,9 @@ def _finalize_resumed_task(
             )
 
         sync_workforce_run_status(db, task, final_task_status)
+        from .task_orchestrator import sync_trigger_run_status
+
+        sync_trigger_run_status(db, task, final_task_status)
         lease_released = release_task_lease_no_commit(
             db,
             task_lease,

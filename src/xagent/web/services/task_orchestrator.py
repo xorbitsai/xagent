@@ -1246,9 +1246,11 @@ def _accept_turn_no_commit(
             )
         except WorkforceTurnRejectedError as exc:
             raise TaskTurnError(exc.reason) from exc
-        # Keep the WorkforceRun projection in the same transaction as the
-        # Task RUNNING acceptance. A later best-effort worker can
-        # otherwise arrive after completion and resurrect the projection.
+        # Keep both run projections in the same transaction as the Task RUNNING
+        # acceptance. A later best-effort worker can otherwise arrive after
+        # completion and resurrect the projection. The trigger projection also
+        # carries the resume half of #2177: a run parked with its task must read
+        # as running again once that task is claimed onto a new turn.
         from .workforce_runtime import sync_workforce_run_status
 
         if not queued:
@@ -1256,6 +1258,7 @@ def _accept_turn_no_commit(
                 db.query(Task).filter(Task.id == task_id, Task.run_id == run_id).one()
             )
             sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
+            sync_trigger_run_status(db, claimed_task, TaskStatus.RUNNING)
     if queued:
         return replace(result, run_id=run_id, status=TaskStatus.PENDING)
     return result
@@ -1895,10 +1898,44 @@ def finish_turn(
         return committed
 
     # PAUSED / WAITING_FOR_USER / other: preserve the control status while
-    # releasing this exact run's lease. Legacy callers still leave it alone.
+    # releasing this exact run's lease, and project the parked state onto any
+    # trigger run in the same transaction. That projection is the only writer
+    # this state will ever get: the parked task has already released its lease,
+    # so it is never an expired-lease recovery candidate (#2177). Legacy callers
+    # still leave it alone.
     if task_lease is not None:
+        sync_trigger_run_status(bg_db, fresh, status)
         return commit_terminal(status)
     return False
+
+
+def _trigger_run_status_for_task_status(status: Any) -> str | None:
+    """Map a task status onto the trigger run status that mirrors it.
+
+    ``None`` means the projection owns no value for that state: PENDING belongs
+    to preparation/dispatch (``_claim_pending_trigger_run``, which also stamps
+    ``started_at``), so the projection must not write it.
+
+    Parked states share one value. A run whose task waits on the user and a run
+    whose task was paused are both "not progressing", and keeping the run enum
+    small matters because every value has to be handled by the row selector, the
+    resume flip, and the UI (#2177).
+    """
+
+    from ..models.trigger import TriggerRunStatus
+
+    if isinstance(status, str):
+        try:
+            status = TaskStatus(status)
+        except ValueError:
+            return None
+    return {
+        TaskStatus.RUNNING: TriggerRunStatus.RUNNING.value,
+        TaskStatus.PAUSED: TriggerRunStatus.PAUSED.value,
+        TaskStatus.WAITING_FOR_USER: TriggerRunStatus.PAUSED.value,
+        TaskStatus.COMPLETED: TriggerRunStatus.COMPLETED.value,
+        TaskStatus.FAILED: TriggerRunStatus.FAILED.value,
+    }.get(status)
 
 
 def sync_trigger_run_status(
@@ -1908,16 +1945,37 @@ def sync_trigger_run_status(
     *,
     error_message: str | None = None,
 ) -> bool:
-    """Best-effort mirror from task terminal state to trigger run history."""
+    """Best-effort mirror from task lifecycle state to trigger run history.
+
+    Covers every task state the run has an answer for, not only the terminal
+    ones. A task that parks at PAUSED / WAITING_FOR_USER has released its lease
+    and is therefore never an expired-lease recovery candidate, so if the parked
+    state were not projected here the run would keep reading as "running" until
+    -- and unless -- the task was resumed and terminated (#2177).
+
+    The projection is monotonic in two ways:
+
+      - terminal rows are never selected, so a late or replayed projection
+        cannot resurrect a finished run
+      - PENDING projects onto nothing (see the mapping helper), so a stale
+        caller cannot push an already-claimed run back to "pending"
+    """
+
     from ..models.trigger import TriggerRun, TriggerRunStatus
 
+    target = _trigger_run_status_for_task_status(status)
+    if target is None:
+        return False
+
+    terminal = TriggerRunStatus.terminal_values()
+    # Selected as "not terminal" rather than by listing the non-terminal values:
+    # a value added to TriggerRunStatus must not be able to fall outside the
+    # projection again, which is exactly how #2177 happened.
     rows = (
         bg_db.query(TriggerRun)
         .filter(
             TriggerRun.task_id == int(task.id),
-            TriggerRun.status.in_(
-                [TriggerRunStatus.PENDING.value, TriggerRunStatus.RUNNING.value]
-            ),
+            TriggerRun.status.notin_(sorted(terminal)),
         )
         .all()
     )
@@ -1925,18 +1983,23 @@ def sync_trigger_run_status(
         return False
 
     now = datetime.now(timezone.utc)
-    run_status = (
-        TriggerRunStatus.COMPLETED.value
-        if status == TaskStatus.COMPLETED
-        else TriggerRunStatus.FAILED.value
-    )
     for run in rows:
-        run.status = run_status
-        run.finished_at = now
-        if status in {TaskStatus.FAILED, TaskStatus.PAUSED}:
-            run.error_message = error_message or task.error_message
+        run.status = target
+        if target in terminal:
+            run.finished_at = now
+            run.error_message = (
+                (error_message or task.error_message)
+                if target == TriggerRunStatus.FAILED.value
+                else None
+            )
         else:
-            run.error_message = None
+            # Parked is neither finished nor an error. Both fields are cleared
+            # rather than left untouched: a run that recovery previously failed
+            # can be resumed and parked again, and a pre-#2171 row can still
+            # carry a stale finished_at from when that finalizer stamped it
+            # unconditionally.
+            run.finished_at = None
+            run.error_message = error_message
         bg_db.add(run)
     return True
 

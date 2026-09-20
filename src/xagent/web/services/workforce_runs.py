@@ -32,6 +32,7 @@ from .task_orchestrator import (
     TaskTurnOrchestrator,
     TaskTurnPayload,
     _PreparedTurn,
+    sync_trigger_run_status,
     timezone_schedule_context,
 )
 from .workforce_access import ensure_workforce_access, get_workforce_policy
@@ -609,6 +610,7 @@ def _create_claimed_workforce_run_isolated(
             context=timezone_schedule_context(request.timezone),
         )
         sync_workforce_run_status(db, record.task, claimed_turn.status)
+        sync_trigger_run_status(db, record.task, claimed_turn.status)
         db.flush()
         task_snapshot, run_snapshot = _build_start_snapshots(
             db,
@@ -697,6 +699,7 @@ def _create_claimed_preview_run_isolated(
             context=timezone_schedule_context(request.timezone),
         )
         sync_workforce_run_status(db, record.task, claimed_turn.status)
+        sync_trigger_run_status(db, record.task, claimed_turn.status)
         db.flush()
         task_snapshot, run_snapshot = _build_start_snapshots(
             db,

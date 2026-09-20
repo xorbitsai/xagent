@@ -1554,10 +1554,13 @@ def _attach_workforce_task_to_trigger_run(
         setattr(run, "task_id", task_id)
         db.add(run)
     # Arm only a run that has not moved past preparation; a replay must not
-    # regress a RUNNING/COMPLETED run, and re-writing an already-PENDING run
-    # is a no-op we skip.
+    # regress a RUNNING/PAUSED/COMPLETED run, and re-writing an already-PENDING
+    # run is a no-op we skip. PAUSED belongs on that list for the same reason as
+    # RUNNING: a parked run is past preparation, and resetting it to PENDING
+    # would re-enter the dispatch path while its task is already parked (#2177).
     if str(run.status) not in (
         TriggerRunStatus.RUNNING.value,
+        TriggerRunStatus.PAUSED.value,
         TriggerRunStatus.COMPLETED.value,
         TriggerRunStatus.PENDING.value,
     ):
@@ -1872,14 +1875,13 @@ def _finish_trigger_run_after_task(
             setattr(run, "error_message", task.error_message)
         else:
             # The task is not terminal yet (pending/running/paused/
-            # waiting_for_user). Leave the run untouched. If the task later
-            # terminates (or lease recovery reclaims a crashed RUNNING
-            # lease), sync_trigger_run_status finalizes the run; a task
-            # parked at PAUSED/WAITING_FOR_USER that never resumes leaves
-            # the run at "running" indefinitely (#2177). Stamping
-            # finished_at here would instead strand the run as "running"
-            # with a finish timestamp, because this finalizer only runs
-            # once.
+            # waiting_for_user). Leave the run untouched: the parked states are
+            # projected by sync_trigger_run_status at every task settle point
+            # (finish_turn's tail, task_execution, managed leases), which is what
+            # keeps a task parked at PAUSED/WAITING_FOR_USER from leaving its run
+            # at "running" indefinitely (#2177). This finalizer only runs once,
+            # so stamping finished_at here would instead strand the run as
+            # "running" with a finish timestamp.
             return
         setattr(run, "finished_at", _now())
         db.add(run)

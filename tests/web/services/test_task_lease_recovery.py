@@ -248,9 +248,14 @@ def test_expired_lease_with_checkpoint_pauses_all_lifecycle_projections(
     assert task.error_message is None
     assert workforce_run.status == "paused"
     assert workforce_run.completed_at is None
-    assert trigger_run.status == TriggerRunStatus.FAILED.value
+    # The trigger projection now agrees with the other two: a task recovered to
+    # PAUSED is resumable, so its run parks instead of being reported as a
+    # terminal failure. "failed" here was worse than inconsistent -- terminal
+    # rows are never re-selected by the projection, so a later successful resume
+    # could never have corrected it (#2177).
+    assert trigger_run.status == TriggerRunStatus.PAUSED.value
     assert trigger_run.error_message == TASK_LEASE_PAUSED_TRIGGER_ERROR
-    assert trigger_run.finished_at is not None
+    assert trigger_run.finished_at is None
 
 
 def test_expired_lease_without_checkpoint_fails_and_clears_stale_output(

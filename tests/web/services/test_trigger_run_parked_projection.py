@@ -1,0 +1,372 @@
+"""Regression tests for #2177: a parked trigger task must not strand its run.
+
+A ``TriggerRun`` is a projection of its ``Task``. When the task parks at
+``PAUSED`` / ``WAITING_FOR_USER`` its turn still finalizes through
+``task_orchestrator.finish_turn`` -- whose park tail releases that turn's lease --
+so the projection has to carry the parked state too:
+
+  - ``finish_turn``'s park tail projects the parked state before releasing the
+    lease (``sync_trigger_run_status``)
+  - ``sync_trigger_run_status`` maps parked task states onto
+    ``TriggerRunStatus.PAUSED`` and clears ``finished_at``
+  - the row selector takes every non-terminal run, so the same run is still
+    picked up when the task resumes and terminates
+
+Before the fix none of that existed: the park tail only called
+``commit_terminal(status)``, the projector could only write ``completed`` /
+``failed``, and the lease release clears ``lease_expires_at`` -- so the parked
+task was never an expired-lease recovery candidate either, and the run stayed
+``running`` with ``finished_at IS NULL`` until the task was resumed and
+terminated (or forever).
+
+These tests drive the real production functions (``finish_turn``,
+``sync_trigger_run_status``, the recovery candidate query) rather than
+hand-written SQL, so a failure here reports the product gap instead of a fixture
+artefact. Three kinds of test live here:
+
+  - ``REPRO``: the reproduction. Every one of them failed before the fix.
+  - ``GUARD``: the monotonicity rules the projection must keep, so that
+    narrowing the row selector or resurrecting a finished run fails loudly.
+  - ``TRAP``: the structural facts that explain why the run cannot be repaired
+    later. These must keep holding, or the fix has changed the recovery
+    contract without saying so.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from xagent.web.models.agent import Agent
+from xagent.web.models.database import Base
+from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.trigger import (
+    AgentTrigger,
+    TriggerRun,
+    TriggerRunStatus,
+    TriggerType,
+)
+from xagent.web.models.user import User
+from xagent.web.services.task_execution_controller import control_state_for_status
+from xagent.web.services.task_lease_service import (
+    TaskLease,
+    get_expired_task_lease_candidates,
+    utc_now,
+)
+from xagent.web.services.task_orchestrator import finish_turn, sync_trigger_run_status
+
+RUNNER_ID = "parked-runner"
+RUN_ID = "parked-run"
+ATTEMPT_ID = "parked-attempt"
+
+# The value a parked run is projected onto. Parked task states collapse onto it:
+# the distinction between "paused" and "waiting on the user" belongs to the task.
+PARKED_RUN_STATUS = TriggerRunStatus.PAUSED.value
+
+PARKED_TASK_STATUSES = (TaskStatus.WAITING_FOR_USER, TaskStatus.PAUSED)
+_parked_ids = pytest.mark.parametrize(
+    "parked_status", PARKED_TASK_STATUSES, ids=lambda status: status.value
+)
+
+
+@pytest.fixture()
+def db_session():
+    """A private in-memory database: these tests need no filesystem fixtures."""
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def _create_user(db) -> User:
+    user = User(username="parked-trigger-user", password_hash="hash", is_admin=False)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def _seed_parked_run(
+    db, *, parked_status: TaskStatus
+) -> tuple[Task, TriggerRun, TaskLease]:
+    """Seed the exact row state a parked turn leaves behind.
+
+    Mirrors production ordering: the park branch in ``task_execution`` commits
+    the task's parked status while the turn's lease is still held, and
+    ``finish_turn`` runs afterwards from ``_schedule_bg._runner``'s finally with
+    that same lease.
+    """
+
+    user = _create_user(db)
+    agent = Agent(user_id=int(user.id), name="parked trigger agent")
+    db.add(agent)
+    db.flush()
+    trigger = AgentTrigger(
+        user_id=int(user.id),
+        agent_id=int(agent.id),
+        type=TriggerType.WEBHOOK.value,
+        name="parked trigger",
+        config={},
+    )
+    db.add(trigger)
+    db.flush()
+    task = Task(
+        user_id=int(user.id),
+        title="Parked trigger task",
+        description="parked trigger projection reproduction",
+        status=parked_status,
+        control_state=control_state_for_status(parked_status).value,
+        execution_mode="auto",
+        source="trigger",
+        runner_id=RUNNER_ID,
+        run_id=RUN_ID,
+        lease_attempt_id=ATTEMPT_ID,
+        lease_expires_at=utc_now() + timedelta(minutes=5),
+        state_version=1,
+    )
+    db.add(task)
+    db.flush()
+    run = TriggerRun(
+        trigger_id=int(trigger.id),
+        task_id=int(task.id),
+        status=TriggerRunStatus.RUNNING.value,
+        idempotency_key=f"parked-run-{parked_status.value}",
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(task)
+    db.refresh(run)
+
+    lease = TaskLease(
+        task_id=int(task.id),
+        runner_id=RUNNER_ID,
+        run_id=RUN_ID,
+        attempt_id=ATTEMPT_ID,
+    )
+    return task, run, lease
+
+
+# ---------------------------------------------------------------------------
+# REPRO: the parked turn must stop presenting the run as actively running
+# ---------------------------------------------------------------------------
+
+
+@_parked_ids
+def test_parked_turn_keeps_trigger_run_running_reproduction(db_session, parked_status):
+    """REPRO (#2177): a parked turn leaves its trigger run reading "running"."""
+
+    task, run, lease = _seed_parked_run(db_session, parked_status=parked_status)
+    task_id = int(task.id)
+    run_id = int(run.id)
+
+    assert finish_turn(db_session, task_id, task_lease=lease) is True
+
+    db_session.expire_all()
+    task_after = db_session.get(Task, task_id)
+    run_after = db_session.get(TriggerRun, run_id)
+
+    # Sanity: the park tail really ran -- the lease was released and the parked
+    # control status was preserved. Without this the assertions below could pass
+    # for the wrong reason (e.g. a fence mismatch returning early).
+    assert task_after.status == parked_status
+    assert task_after.runner_id is None
+    assert task_after.lease_expires_at is None
+
+    assert run_after.status != TriggerRunStatus.RUNNING.value, (
+        f"a TriggerRun whose task parked at {parked_status.value} still reads as "
+        "'running' after the turn finalized; the lease is already released and "
+        "the task is not a recovery candidate, so nothing repairs it (#2177)"
+    )
+    assert run_after.finished_at is None, (
+        "a parked run must not carry finished_at: the task is not finished"
+    )
+    assert run_after.error_message is None, "waiting for the user is not an error"
+
+
+@_parked_ids
+def test_parked_turn_projects_the_paused_run_status(db_session, parked_status):
+    """REPRO (#2177): the parked projection is the value the fix introduces."""
+
+    task, run, lease = _seed_parked_run(db_session, parked_status=parked_status)
+    run_id = int(run.id)
+
+    assert finish_turn(db_session, int(task.id), task_lease=lease) is True
+
+    db_session.expire_all()
+    run_after = db_session.get(TriggerRun, run_id)
+    assert run_after.status == PARKED_RUN_STATUS
+
+
+# ---------------------------------------------------------------------------
+# REPRO: the projector must not fabricate a terminal failure for a parked task
+# ---------------------------------------------------------------------------
+
+
+@_parked_ids
+def test_projector_must_not_report_terminal_failure_for_a_parked_task(
+    db_session, parked_status
+):
+    """REPRO (#2177): projecting a parked task must not create a false failure.
+
+    ``sync_trigger_run_status`` collapses every non-COMPLETED status into
+    ``failed`` + ``finished_at``. Lease recovery depends on that for an
+    unrecoverable crash, but applied to a task that is merely waiting it makes a
+    resumable run terminal -- and because the row selector skips terminal rows,
+    a later successful resume can never correct it.
+    """
+
+    task, run, _lease = _seed_parked_run(db_session, parked_status=parked_status)
+    run_id = int(run.id)
+
+    # The projector only stages its writes; every production caller commits in
+    # the same transaction as the status transition it mirrors.
+    assert sync_trigger_run_status(db_session, task, parked_status) is True
+    db_session.commit()
+
+    db_session.expire_all()
+    run_after = db_session.get(TriggerRun, run_id)
+    assert run_after.status != TriggerRunStatus.FAILED.value, (
+        f"a task parked at {parked_status.value} was projected onto its run as a "
+        "terminal failure"
+    )
+    assert run_after.finished_at is None
+
+
+# ---------------------------------------------------------------------------
+# TRAP: why nothing repairs the run while the task stays parked
+# ---------------------------------------------------------------------------
+
+
+def test_parked_task_is_not_a_recovery_candidate_but_a_crashed_one_is(db_session):
+    """TRAP (#2177): lease recovery structurally cannot see a parked task.
+
+    The candidate query requires ``status == RUNNING`` *and* a non-NULL
+    ``lease_expires_at`` older than the cutoff. The park release NULLs
+    ``lease_expires_at``, so a parked task is never re-selected -- which is why
+    the run must be projected at park time rather than relying on a later sweep.
+    A crashed RUNNING task with an expired lease stays the control case.
+    """
+
+    parked, _run, _lease = _seed_parked_run(
+        db_session, parked_status=TaskStatus.WAITING_FOR_USER
+    )
+    parked.runner_id = None
+    parked.lease_attempt_id = None
+    parked.lease_expires_at = None
+    db_session.add(parked)
+
+    crashed = Task(
+        user_id=int(parked.user_id),
+        title="Crashed task",
+        description="expired lease control case",
+        status=TaskStatus.RUNNING,
+        control_state=control_state_for_status(TaskStatus.RUNNING).value,
+        execution_mode="auto",
+        source="trigger",
+        runner_id="dead-runner",
+        run_id="dead-run",
+        lease_attempt_id="dead-attempt",
+        lease_expires_at=utc_now() - timedelta(minutes=5),
+        state_version=1,
+    )
+    db_session.add(crashed)
+    db_session.commit()
+
+    candidates = get_expired_task_lease_candidates(
+        db_session, cutoff=utc_now(), limit=100
+    )
+    candidate_ids = {candidate.task_id for candidate in candidates}
+
+    assert int(crashed.id) in candidate_ids, (
+        "control case failed: an expired RUNNING lease is no longer selected, so "
+        "this TRAP test no longer describes the recovery contract"
+    )
+    assert int(parked.id) not in candidate_ids, (
+        "a parked task became a recovery candidate; if that is intentional the "
+        "fix must explain what the sweep now does with it (#2177)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# GUARD: the monotonicity rules the projection must keep
+# ---------------------------------------------------------------------------
+
+
+@_parked_ids
+def test_parked_run_is_still_finalized_after_the_task_resumes(
+    db_session, parked_status
+):
+    """GUARD: the row selector must keep covering the parked value.
+
+    This is the trap that makes the parked value dangerous: if the selector goes
+    back to listing only ``pending`` / ``running``, a run parked here is never
+    selected again and stays ``paused`` forever -- the same lie as staying
+    ``running``, just a different value.
+    """
+
+    task, run, lease = _seed_parked_run(db_session, parked_status=parked_status)
+    task_id = int(task.id)
+    run_id = int(run.id)
+
+    assert finish_turn(db_session, task_id, task_lease=lease) is True
+    db_session.expire_all()
+    assert db_session.get(TriggerRun, run_id).status == PARKED_RUN_STATUS
+
+    # The resume: the task is claimed onto a new run and then terminates.
+    task_after = db_session.get(Task, task_id)
+    assert sync_trigger_run_status(db_session, task_after, TaskStatus.RUNNING) is True
+    db_session.commit()
+    db_session.expire_all()
+    assert db_session.get(TriggerRun, run_id).status == TriggerRunStatus.RUNNING.value
+
+    task_after = db_session.get(Task, task_id)
+    assert sync_trigger_run_status(db_session, task_after, TaskStatus.COMPLETED) is True
+    db_session.commit()
+
+    db_session.expire_all()
+    final_run = db_session.get(TriggerRun, run_id)
+    assert final_run.status == TriggerRunStatus.COMPLETED.value
+    assert final_run.finished_at is not None
+    assert final_run.error_message is None
+
+
+def test_terminal_run_is_never_reopened_by_a_late_projection(db_session):
+    """GUARD: a finished run must not be resurrected into a parked state.
+
+    Terminal rows are excluded by the selector rather than by a caller check, so
+    this holds for a stale projection arriving after the task finished -- for
+    example a late settle from a session that was fenced out of the row.
+    """
+
+    task, run, _lease = _seed_parked_run(
+        db_session, parked_status=TaskStatus.WAITING_FOR_USER
+    )
+    run_id = int(run.id)
+
+    assert sync_trigger_run_status(db_session, task, TaskStatus.COMPLETED) is True
+    db_session.commit()
+    db_session.expire_all()
+    finished_run = db_session.get(TriggerRun, run_id)
+    assert finished_run.status == TriggerRunStatus.COMPLETED.value
+    finished_at = finished_run.finished_at
+    assert finished_at is not None
+
+    # A late parked projection must be a no-op, not a regression.
+    assert (
+        sync_trigger_run_status(db_session, task, TaskStatus.WAITING_FOR_USER) is False
+    )
+    db_session.commit()
+
+    db_session.expire_all()
+    reopened = db_session.get(TriggerRun, run_id)
+    assert reopened.status == TriggerRunStatus.COMPLETED.value
+    assert reopened.finished_at == finished_at

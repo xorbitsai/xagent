@@ -1000,6 +1000,12 @@ def prepare_channel_task_no_commit(
         ):
             return None
     sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
+    # The trigger projection rides along with the workforce one: a parked run
+    # whose task is claimed back out of PAUSED / WAITING_FOR_USER has to read as
+    # running again (#2177).
+    from .task_orchestrator import sync_trigger_run_status
+
+    sync_trigger_run_status(db, claimed_task, TaskStatus.RUNNING)
     return _ChannelTaskClaimSnapshot(
         user_id=owner_id,
         task_id=task_id,

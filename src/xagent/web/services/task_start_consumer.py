@@ -325,9 +325,11 @@ def _commit_handoff(
             return _reject_start(db, row, "start_state_changed")
         db.refresh(task)
         setattr(task, "input", start.message)
+        from .task_orchestrator import sync_trigger_run_status
         from .workforce_runtime import sync_workforce_run_status
 
         sync_workforce_run_status(db, task, TaskStatus.RUNNING)
+        sync_trigger_run_status(db, task, TaskStatus.RUNNING)
         lease = TaskLease(
             task_id=owner_lease.task_id,
             runner_id=owner_lease.runner_id,

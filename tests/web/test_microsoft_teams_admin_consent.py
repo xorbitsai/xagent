@@ -22,9 +22,9 @@ from xagent.web.models.user import User
 
 # Entra ID blocks a non-admin user outright when the requested delegated
 # scopes include any that are classified as requiring org admin approval --
-# the Teams connector's own scopes (see builtin_mcp_registry.py) are exactly
-# such a set. The user never sees a consent screen at all; the redirect back
-# to us carries error=access_denied&error_subcode=cancel with no `code`.
+# the Teams connector requests TeamMember.Read.All and ChannelMessage.Read.All,
+# among other scopes. The user never sees a consent screen at all; the redirect
+# back to us carries error=access_denied&error_subcode=cancel with no `code`.
 ADMIN_CONSENT_LINK_RE = re.compile(r'href="([^"]+)"')
 
 
@@ -241,3 +241,44 @@ def test_admin_consent_return_trip_denied(db_session):
 
     assert response.status_code == 400
     assert "not" in response.body.decode().lower()
+
+
+def test_admin_consent_return_trip_error_is_not_reported_as_success(db_session):
+    """Microsoft documents admin-consent failures that still carry
+    admin_consent=True, so the error parameter must take precedence."""
+    db, _user = db_session
+    state = create_access_token(
+        data={"type": "admin_consent_state", "app_id": "teams"},
+        expires_delta=timedelta(minutes=30),
+    )
+    request = SimpleNamespace(
+        query_params={
+            "admin_consent": "True",
+            "error": "consent_required",
+            "error_description": "The resource owner denied the request.",
+            "state": state,
+        }
+    )
+
+    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+
+    assert response.status_code == 400
+    body = response.body.decode().lower()
+    assert "not granted" in body
+    assert "consent granted" not in body
+
+
+@pytest.mark.parametrize("state", [None, "tampered-state"])
+def test_admin_consent_return_trip_rejects_invalid_state(db_session, state):
+    db, _user = db_session
+    query_params = {"admin_consent": "True"}
+    if state is not None:
+        query_params["state"] = state
+    request = SimpleNamespace(query_params=query_params)
+
+    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+
+    assert response.status_code == 400
+    body = response.body.decode().lower()
+    assert "invalid or expired state" in body
+    assert "consent granted" not in body

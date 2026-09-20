@@ -398,7 +398,7 @@ def _build_microsoft_admin_consent_url(
     """Build a tenant-wide admin consent link for the Microsoft provider.
 
     Several Microsoft Graph scopes used by builtin apps (e.g. teams'
-    Team.ReadBasic.All) are classified by Entra ID as requiring org admin
+    TeamMember.Read.All) are classified by Entra ID as requiring org admin
     approval -- a non-admin user hitting the ordinary authorize endpoint is
     blocked outright (redirected back with error=access_denied&
     error_subcode=cancel) with no way to consent themselves. The v2.0
@@ -477,19 +477,25 @@ def _handle_microsoft_admin_consent_return(request: Request) -> HTMLResponse:
     This return trip carries admin_consent=True/False and the original
     `state` instead of the usual authorization `code` -- generic_oauth_
     callback's ordinary code/state handling would otherwise reject it as
-    "Missing code or state". Decoding the app_id from state is best-effort
-    only (a stale or tampered state must not block showing the outcome,
-    since nothing here is written to the database either way -- the tenant
-    grant itself lives entirely on Microsoft's side).
+    "Missing code or state". The state must still be valid before reporting
+    the outcome: otherwise a caller could forge a success-looking callback
+    page without ever completing Microsoft's consent flow.
     """
-    app_id = None
     state = request.query_params.get("state")
-    if state:
-        payload = verify_token(state)
-        if payload and payload.get("type") == "admin_consent_state":
-            app_id = payload.get("app_id")
+    payload = verify_token(state) if state else None
+    if not payload or payload.get("type") != "admin_consent_state":
+        return HTMLResponse(
+            content="<h1>Error: Invalid or expired state</h1>", status_code=400
+        )
+
+    app_id = payload.get("app_id")
     app_label = html.escape(str(app_id)) if app_id else "this connector"
-    if request.query_params.get("admin_consent") == "True":
+    error = request.query_params.get("error")
+    admin_consent = request.query_params.get("admin_consent", "").casefold()
+    # Microsoft's documented admin-consent error response can include
+    # admin_consent=True alongside error=consent_required. An explicit error
+    # must therefore take precedence over the success marker.
+    if not error and admin_consent == "true":
         return HTMLResponse(
             content=(
                 "<h1>Admin consent granted</h1>"

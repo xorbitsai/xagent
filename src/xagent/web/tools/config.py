@@ -760,7 +760,7 @@ class _OAuthRefreshPermanentlyInvalid(Exception):
     refresh token is dead -- revoked, expired, or the token/config it needs
     to refresh is simply missing -- as opposed to a transient failure
     (timeout, network error, provider 5xx) that may well succeed on a later
-    retry. Only this case should cost the user their stored connection.
+    retry. Only this case should invalidate the user's stored credentials.
     """
 
 
@@ -3871,7 +3871,7 @@ class WebToolConfig(BaseToolConfig):
         if permanently_invalid:
             logger.warning(
                 "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
-                "Deleting OAuth record to prompt user for reconnection.",
+                "Clearing stored credentials to prompt user for reconnection.",
                 provider_name,
             )
             if resource_owner_key is None:
@@ -3886,7 +3886,13 @@ class WebToolConfig(BaseToolConfig):
                     resource_owner_key=None,
                 )
             if oauth_account is not None:
-                oauth_db.delete(oauth_account)
+                # Keep the account identity as a reconnect tombstone. Deleting
+                # the row makes a permanently invalid connection
+                # indistinguishable from one that was never authorized, while
+                # retaining either token would keep dead credentials at rest.
+                oauth_account.access_token = ""
+                oauth_account.refresh_token = None
+                oauth_account.expires_at = None
                 oauth_db.commit()
             return _LegacyOAuthTokenResolution(
                 access_token=None,

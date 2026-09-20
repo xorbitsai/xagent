@@ -34,6 +34,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from ...builtin_identity import builtin_provenance_identity
 from ...config import get_app_base_url, get_password_reset_expire_minutes
 from ...core.agent.voice_policy import VALID_VOICES as _CORE_VALID_VOICES
 from ...core.runtime_performance import (
@@ -3002,11 +3003,23 @@ def _ensure_user_mcp_server(
             "connected via the OAuth flow."
         )
 
-    def _oauth_auth_metadata() -> dict[str, str]:
-        metadata = {"app_id": str(app_info["id"])}
+    def _oauth_auth_metadata() -> dict[str, Any]:
+        metadata: dict[str, Any] = {"app_id": str(app_info["id"])}
         provider = app_info.get("provider")
         if provider:
             metadata["provider"] = str(provider)
+        launch_config = app_info.get("launch_config")
+        provenance = (
+            launch_config.get("builtin_provenance")
+            if isinstance(launch_config, dict)
+            else None
+        )
+        provenance_identity = builtin_provenance_identity(provenance)
+        if isinstance(provenance, dict) and provenance_identity == (
+            "xagent",
+            str(app_info["id"]),
+        ):
+            metadata["builtin_provenance"] = dict(provenance)
         return metadata
 
     def _ensure_server_matches_oauth_app(server: MCPServer) -> None:

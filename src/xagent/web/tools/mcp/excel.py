@@ -41,6 +41,10 @@ class _GraphMutationIndeterminateError(RuntimeError):
     """A mutation may have committed even though no response was received."""
 
 
+class _GraphResponseTooLargeError(RuntimeError):
+    """Graph confirmed the request but its response exceeded the ingress cap."""
+
+
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
@@ -50,6 +54,8 @@ def _success_with_bounded_collection(
     values: list[Any],
     *,
     next_link: str | None,
+    extra_fields: dict[str, Any] | None = None,
+    oversized_message: str | None = None,
 ) -> str:
     """Return a complete Graph page or fail without advancing its cursor.
 
@@ -58,20 +64,25 @@ def _success_with_bounded_collection(
     unreachable, so collection pages are never truncated here. Callers can
     request a smaller server page instead.
     """
+    extras = extra_fields or {}
     response = json.dumps(
         {
             "status": "success",
             field_name: values,
             "next_link": next_link,
             "truncated": False,
+            **extras,
         },
         ensure_ascii=False,
     )
     if len(response) <= get_tool_max_output_length():
         return response
     return _error(
-        "The Graph page exceeds the tool output limit; retry the collection "
-        "from the beginning with a smaller page_size."
+        oversized_message
+        or (
+            "The Graph page exceeds the tool output limit; retry the collection "
+            "from the beginning with a smaller page_size."
+        )
     )
 
 
@@ -116,6 +127,7 @@ def _graph_request(
     body: dict[str, Any] | None = None,
     extra_headers: dict[str, str] | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    max_response_bytes: int | None = None,
 ) -> Any:
     response = requests.request(
         method=method,
@@ -124,7 +136,44 @@ def _graph_request(
         params=params,
         json=body,
         timeout=timeout,
+        stream=max_response_bytes is not None,
     )
+    if max_response_bytes is not None:
+        chunks: list[bytes] = []
+        size = 0
+        oversized = False
+        try:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > max_response_bytes:
+                    oversized = True
+                    break
+                chunks.append(chunk)
+        finally:
+            response.close()
+        raw = b"".join(chunks)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            response_text = raw.decode("utf-8", errors="replace").strip()
+            message = str(exc)
+            if response_text:
+                message = f"{message} - {response_text}"
+            if oversized:
+                message = f"{message} - response body truncated at ingress limit"
+            raise _GraphRequestError(message, status_code=response.status_code) from exc
+        if oversized:
+            raise _GraphResponseTooLargeError(
+                "Graph response exceeded the Excel range ingress limit"
+            )
+        if response.status_code == 204:
+            return {}
+        if not raw:
+            return {}
+        return json.loads(raw)
+
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -133,8 +182,9 @@ def _graph_request(
         if response_text:
             message = f"{message} - {response_text}"
         raise _GraphRequestError(message, status_code=response.status_code) from exc
-
-    if response.status_code == 204 or not response.content:
+    if response.status_code == 204:
+        return {}
+    if not response.content:
         return {}
     return response.json()
 
@@ -169,6 +219,44 @@ def _validate_page_size(page_size: int) -> int:
     if not 1 <= page_size <= MAX_COLLECTION_PAGE_SIZE:
         raise ValueError(f"page_size must be between 1 and {MAX_COLLECTION_PAGE_SIZE}")
     return page_size
+
+
+def _validate_non_negative_int(value: int, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{field_name} must be zero or a positive integer")
+    return value
+
+
+def _success_with_bounded_range(result: dict[str, Any]) -> str:
+    """Return a complete range or omit every aligned matrix together.
+
+    Graph range matrices (values, formulas, text, formats, and value types)
+    describe the same rectangle. Independently trimming top-level fields would
+    corrupt that relationship, so an oversized parsed response retains only
+    scalar range metadata and explicitly reports that all matrices were
+    omitted.
+    """
+    response = _success(range=result, truncated=False)
+    if len(response) <= get_tool_max_output_length():
+        return response
+    metadata = {
+        key: result[key]
+        for key in ("address", "addressLocal", "rowCount", "columnCount", "cellCount")
+        if isinstance(result.get(key), (str, int, float, bool))
+    }
+    bounded = _success(
+        range=metadata,
+        truncated=True,
+        message=(
+            "The aligned range matrices were omitted because the response exceeds "
+            "the tool output limit; request a smaller address."
+        ),
+    )
+    if len(bounded) <= get_tool_max_output_length():
+        return bounded
+    return _error("The Graph range response exceeds the tool output limit")
 
 
 def _site_segment(site_id: str) -> str:
@@ -474,8 +562,15 @@ def excel_get_range(
         path = f"{base}/{segment}/range"
         if address is not None:
             path += f"(address='{_odata_string_literal(address)}')"
-        result = _graph_request("GET", path)
-        return success_with_capped_dict("range", result)
+        result = _graph_request(
+            "GET", path, max_response_bytes=get_tool_max_output_length()
+        )
+        return _success_with_bounded_range(result)
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph range response exceeds the ingress limit; request a "
+            "smaller address."
+        )
     except Exception as e:
         logger.error(
             "Error getting range %s on worksheet %s in %s: %s",
@@ -508,8 +603,21 @@ def excel_update_range(
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("worksheets", worksheet)
         path = f"{base}/{segment}/range(address='{_odata_string_literal(address)}')"
-        result = _graph_request("PATCH", path, body={"values": values})
-        return success_with_capped_dict("range", result)
+        result = _graph_request(
+            "PATCH",
+            path,
+            body={"values": values},
+            max_response_bytes=get_tool_max_output_length(),
+        )
+        return _success_with_bounded_range(result)
+    except _GraphResponseTooLargeError:
+        return _success(
+            message=(
+                "Range updated successfully, but Graph's response was omitted "
+                "because it exceeded the ingress limit."
+            ),
+            response_omitted=True,
+        )
     except Exception as e:
         logger.error(
             "Error updating range %s on worksheet %s in %s: %s",
@@ -577,8 +685,15 @@ def excel_get_used_range(
         path = f"{base}/{segment}/usedRange"
         if values_only:
             path += "(valuesOnly=true)"
-        result = _graph_request("GET", path)
-        return success_with_capped_dict("range", result)
+        result = _graph_request(
+            "GET", path, max_response_bytes=get_tool_max_output_length()
+        )
+        return _success_with_bounded_range(result)
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph used-range response exceeds the ingress limit; request "
+            "smaller explicit addresses with excel_get_range."
+        )
     except Exception as e:
         logger.error(
             "Error getting used range for worksheet %s in %s: %s",
@@ -659,13 +774,18 @@ def excel_list_table_rows(
     drive_id: str | None = None,
     next_link: str | None = None,
     page_size: StrictPageSize = DEFAULT_COLLECTION_PAGE_SIZE,
+    skip: StrictNonNegativeInt = 0,
 ) -> str:
     """List the rows in an Excel table. table is either the table's Graph
     id or its display name. Pass a returned next_link to retrieve the next
-    page of a large table. page_size bounds each server page and applies
-    when starting a listing."""
+    page of a large table. page_size bounds each server page. Use the returned
+    next_skip as skip to retrieve the next offset page when Graph omits a
+    next_link."""
     try:
         validated_page_size = _validate_page_size(page_size)
+        validated_skip = _validate_non_negative_int(skip, "skip")
+        if next_link is not None and validated_skip != 0:
+            raise ValueError("skip must be 0 when next_link is provided")
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)
         collection_path = f"{base}/{segment}/rows"
@@ -677,12 +797,28 @@ def excel_list_table_rows(
         result = _graph_request(
             "GET",
             path,
-            params={"$top": validated_page_size} if next_link is None else None,
+            params=(
+                {"$top": validated_page_size, "$skip": validated_skip}
+                if next_link is None
+                else None
+            ),
+        )
+        rows = result.get("value", [])
+        graph_next_link = result.get("@odata.nextLink")
+        next_skip = (
+            validated_skip + len(rows)
+            if next_link is None and graph_next_link is None and rows
+            else None
         )
         return _success_with_bounded_collection(
             "rows",
-            result.get("value", []),
-            next_link=result.get("@odata.nextLink"),
+            rows,
+            next_link=graph_next_link,
+            extra_fields={"next_skip": next_skip},
+            oversized_message=(
+                "The Graph row page exceeds the tool output limit; retry the same "
+                "skip with a smaller page_size."
+            ),
         )
     except Exception as e:
         logger.error("Error listing rows for table %s in %s: %s", table, file_path, e)
@@ -707,10 +843,7 @@ def excel_add_table_rows(
     try:
         values = _parse_values_json(values_json)
         if index is not None:
-            if not isinstance(index, int) or isinstance(index, bool):
-                raise TypeError("index must be an integer")
-            if index < 0:
-                raise ValueError("index must be zero or a positive integer")
+            _validate_non_negative_int(index, "index")
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)
         body: dict[str, Any] = {"values": values}
@@ -741,10 +874,7 @@ def excel_delete_table_row(
 ) -> str:
     """Delete a row from an Excel table by its zero-based row index."""
     try:
-        if not isinstance(row_index, int) or isinstance(row_index, bool):
-            raise TypeError("row_index must be an integer")
-        if row_index < 0:
-            raise ValueError("row_index must be zero or a positive integer")
+        _validate_non_negative_int(row_index, "row_index")
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)
         _graph_request("DELETE", f"{base}/{segment}/rows/{row_index}")

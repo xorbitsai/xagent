@@ -17,9 +17,17 @@ class MockResponse:
         )
         self.text = self.content.decode("utf-8", errors="replace")
         self.url = url or "https://graph.microsoft.com/v1.0/example"
+        self.closed = False
 
     def json(self):
         return self._json_data
+
+    def iter_content(self, chunk_size):
+        for offset in range(0, len(self.content), chunk_size):
+            yield self.content[offset : offset + chunk_size]
+
+    def close(self):
+        self.closed = True
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -431,7 +439,7 @@ def test_update_range_sends_parsed_values(monkeypatch):
     assert kwargs["json"] == {"values": [["Name", "Score"]]}
 
 
-def test_update_range_caps_oversized_response(monkeypatch):
+def test_update_range_omits_oversized_confirmed_response(monkeypatch):
     max_output_length = get_tool_max_output_length()
     mock_request = Mock(
         return_value=MockResponse({"values": [["x" * (max_output_length + 1000)]]})
@@ -443,7 +451,8 @@ def test_update_range_caps_oversized_response(monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert result["truncated"] is True
+    assert result["response_omitted"] is True
+    assert "updated successfully" in result["message"]
 
 
 def test_update_range_rejects_invalid_values_json():
@@ -482,7 +491,7 @@ def test_clear_range_success(monkeypatch):
     assert kwargs["json"] == {"applyTo": "Contents"}
 
 
-def test_get_range_caps_oversized_response(monkeypatch):
+def test_get_range_rejects_oversized_ingress(monkeypatch):
     max_output_length = get_tool_max_output_length()
     oversized_row = ["x" * (max_output_length + 1000)]
     mock_request = Mock(
@@ -494,8 +503,26 @@ def test_get_range_caps_oversized_response(monkeypatch):
 
     result = json.loads(excel.excel_get_range("book.xlsx", "Sheet1", address="A1:B2"))
 
-    assert result["status"] == "success"
-    assert result["truncated"] is True
+    assert result["status"] == "error"
+    assert "smaller address" in result["message"]
+    assert mock_request.return_value.closed is True
+
+
+def test_get_range_bounds_streamed_http_error_body(monkeypatch):
+    response = MockResponse(
+        status_code=429,
+        content=b"rate limited: " + (b"x" * 1_000),
+    )
+    monkeypatch.setattr(excel, "get_tool_max_output_length", lambda: 64)
+    monkeypatch.setattr(excel.requests, "request", Mock(return_value=response))
+
+    result = json.loads(excel.excel_get_range("book.xlsx", "Sheet1", address="A1"))
+
+    assert result["status"] == "error"
+    assert "429" in result["message"]
+    assert "response body truncated" in result["message"]
+    assert len(result["message"]) < 250
+    assert response.closed is True
 
 
 def test_get_used_range_with_values_only(monkeypatch):
@@ -523,7 +550,7 @@ def test_get_used_range_rejects_non_boolean_values_only(monkeypatch):
     mock_request.assert_not_called()
 
 
-def test_get_used_range_caps_oversized_response(monkeypatch):
+def test_get_used_range_rejects_oversized_ingress(monkeypatch):
     max_output_length = get_tool_max_output_length()
     oversized_row = ["x" * (max_output_length + 1000)]
     mock_request = Mock(
@@ -535,8 +562,36 @@ def test_get_used_range_caps_oversized_response(monkeypatch):
 
     result = json.loads(excel.excel_get_used_range("book.xlsx", "Sheet1"))
 
+    assert result["status"] == "error"
+    assert "smaller explicit addresses" in result["message"]
+
+
+def test_bounded_range_omits_all_aligned_matrices_together(monkeypatch):
+    monkeypatch.setattr(excel, "get_tool_max_output_length", lambda: 500)
+    matrix = [["x" * 100], ["y" * 100]]
+    result = json.loads(
+        excel._success_with_bounded_range(
+            {
+                "address": "Sheet1!A1:A2",
+                "rowCount": 2,
+                "columnCount": 1,
+                "values": matrix,
+                "formulas": matrix,
+                "text": matrix,
+                "numberFormat": matrix,
+                "valueTypes": matrix,
+            }
+        )
+    )
+
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["range"] == {
+        "address": "Sheet1!A1:A2",
+        "rowCount": 2,
+        "columnCount": 1,
+    }
+    assert "matrices were omitted" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +659,78 @@ def test_list_table_rows_success(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["url"].endswith("tables('Table1')/rows")
+    assert mock_request.call_args.kwargs["params"] == {"$top": 20, "$skip": 0}
     assert result["next_link"] is None
+    assert result["next_skip"] == 1
+
+
+def test_list_table_rows_exposes_offset_continuation_for_full_page(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"value": [{"index": index} for index in range(2)]})
+    )
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_list_table_rows("book.xlsx", "Table1", page_size=2, skip=4)
+    )
+
+    assert result["next_skip"] == 6
+    assert mock_request.call_args.kwargs["params"] == {"$top": 2, "$skip": 4}
+
+
+def test_list_table_rows_advances_after_short_nonempty_offset_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"index": 6}]}))
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_list_table_rows("book.xlsx", "Table1", page_size=2, skip=6)
+    )
+
+    assert result["rows"] == [{"index": 6}]
+    assert result["next_skip"] == 7
+    assert mock_request.call_args.kwargs["params"] == {"$top": 2, "$skip": 6}
+
+
+def test_list_table_rows_stops_offset_paging_on_empty_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": []}))
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_list_table_rows("book.xlsx", "Table1", page_size=2, skip=7)
+    )
+
+    assert result["rows"] == []
+    assert result["next_skip"] is None
+
+
+@pytest.mark.parametrize("skip", [True, -1, "1"])
+def test_list_table_rows_rejects_invalid_skip(monkeypatch, skip):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_list_table_rows("book.xlsx", "Table1", skip=skip))
+
+    assert result["status"] == "error"
+    assert "skip" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_list_table_rows_rejects_skip_with_next_link(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_list_table_rows(
+            "book.xlsx",
+            "Table1",
+            next_link="https://graph.microsoft.com/v1.0/next-page",
+            skip=1,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "skip must be 0" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_list_table_rows_exposes_next_link(monkeypatch):
@@ -621,6 +747,7 @@ def test_list_table_rows_exposes_next_link(monkeypatch):
     result = json.loads(excel.excel_list_table_rows("book.xlsx", "Table1"))
 
     assert result["next_link"] == "https://graph.microsoft.com/v1.0/next-page"
+    assert result["next_skip"] is None
 
 
 def test_list_table_rows_consumes_equivalently_encoded_next_link(monkeypatch):

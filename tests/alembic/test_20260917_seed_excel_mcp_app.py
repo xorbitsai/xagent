@@ -9,6 +9,7 @@ import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 
 def _load_migration_module():
@@ -45,6 +46,20 @@ def _create_table(connection):
                 oauth_scopes JSON,
                 is_visible_in_connector BOOLEAN NOT NULL DEFAULT 1,
                 launch_config JSON
+            )
+            """
+        )
+    )
+
+
+def _create_mcp_servers_table(connection):
+    connection.execute(
+        text(
+            """
+            CREATE TABLE mcp_servers (
+                id INTEGER PRIMARY KEY,
+                name VARCHAR(100) NOT NULL UNIQUE,
+                auth JSON
             )
             """
         )
@@ -159,6 +174,126 @@ def test_upgrade_refuses_normalized_excel_identity_collisions(tmp_path, app_id, 
                 migration.upgrade()
         assert "excel" not in _app_ids(connection)
         assert app_id in _app_ids(connection)
+
+
+@pytest.mark.parametrize("name", ["Excel", "excel", " EXCEL "])
+def test_upgrade_refuses_normalized_mcp_server_collisions(tmp_path, name):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        _create_mcp_servers_table(connection)
+        connection.execute(
+            text("INSERT INTO mcp_servers (name, auth) VALUES (:name, '{}')"),
+            {"name": name},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="custom mcp_servers"):
+                migration.upgrade()
+        assert "excel" not in _app_ids(connection)
+
+
+def test_upgrade_accepts_provenance_owned_server_after_downgrade(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        _create_mcp_servers_table(connection)
+        connection.execute(
+            text("INSERT INTO mcp_servers (name, auth) VALUES ('Excel', :auth)"),
+            {
+                "auth": json.dumps(
+                    {
+                        "app_id": "excel",
+                        "provider": "microsoft",
+                        "builtin_provenance": migration.BUILTIN_PROVENANCE,
+                    }
+                )
+            },
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+            migration.upgrade()
+        assert "excel" in _app_ids(connection)
+
+
+def test_upgrade_rechecks_server_namespace_when_catalog_row_is_owned(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        _create_mcp_servers_table(connection)
+        connection.execute(
+            text("INSERT INTO mcp_servers (name, auth) VALUES ('Excel', '{}')")
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="custom mcp_servers"):
+                migration.upgrade()
+
+
+def test_fresh_registry_seed_rejects_normalized_custom_server_collision(tmp_path):
+    from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+    from xagent.web.models.database import Base
+    from xagent.web.models.mcp import MCPServer
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh-seed.sqlite'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    db.add(
+        MCPServer(
+            name=" Excel ",
+            managed="external",
+            transport="stdio",
+            command="custom",
+        )
+    )
+    db.commit()
+    db.close()
+
+    with engine.begin() as connection:
+        with pytest.raises(RuntimeError, match="custom mcp_servers identity"):
+            seed_builtin_oauth_and_public_mcp_apps(connection)
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='excel'")
+        ).scalar_one()
+
+    assert count == 0
+
+
+def test_fresh_registry_seed_accepts_owned_server_from_older_version(tmp_path):
+    from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+    from xagent.web.models.database import Base
+    from xagent.web.models.mcp import MCPServer
+
+    migration = _load_migration_module()
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh-owned.sqlite'}")
+    Base.metadata.create_all(engine)
+    old_marker = dict(migration.BUILTIN_PROVENANCE)
+    old_marker["version"] = 0
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    db.add(
+        MCPServer(
+            name="Excel",
+            managed="external",
+            transport="oauth",
+            auth={"builtin_provenance": old_marker},
+        )
+    )
+    db.commit()
+    db.close()
+
+    with engine.begin() as connection:
+        seed_builtin_oauth_and_public_mcp_apps(connection)
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='excel'")
+        ).scalar_one()
+
+    assert count == 1
 
 
 def test_seed_row_matches_registry(tmp_path):

@@ -1849,8 +1849,13 @@ def _filter_row(row: dict[str, Any], allowed_columns: set[str]) -> dict[str, Any
     return {key: value for key, value in row.items() if key in allowed_columns}
 
 
-def _validate_shopify_seed_server_identity(
-    bind: Connection, existing_tables: set[str]
+def _validate_builtin_seed_server_identity(
+    bind: Connection,
+    existing_tables: set[str],
+    *,
+    app_id: str,
+    display_name: str,
+    official_server_name: str,
 ) -> None:
     """Reject a fresh-seed server collision unless it is provably official."""
     if "mcp_servers" not in existing_tables:
@@ -1859,12 +1864,12 @@ def _validate_shopify_seed_server_identity(
     server_columns = {column["name"] for column in inspector.get_columns("mcp_servers")}
     if "auth" not in server_columns:
         raise RuntimeError(
-            "Cannot verify builtin Shopify server provenance: mcp_servers.auth "
+            f"Cannot verify builtin {display_name} server provenance: mcp_servers.auth "
             "is required"
         )
-    shopify_keys = {
-        canonicalize_builtin_identity("shopify"),
-        canonicalize_builtin_identity("Shopify"),
+    reserved_keys = {
+        canonicalize_builtin_identity(app_id),
+        canonicalize_builtin_identity(display_name),
     }
     collisions = [
         row
@@ -1874,22 +1879,22 @@ def _validate_shopify_seed_server_identity(
                 MCP_SERVERS_IDENTITY_TABLE.c.auth,
             )
         ).mappings()
-        if canonicalize_builtin_identity(row["name"]) in shopify_keys
+        if canonicalize_builtin_identity(row["name"]) in reserved_keys
     ]
     official_identity = builtin_provenance_identity(
-        {"registry": "xagent", "app_id": "shopify"}
+        {"registry": "xagent", "app_id": app_id}
     )
     trusted = (
         len(collisions) == 1
-        and collisions[0]["name"] == "shopify"
+        and collisions[0]["name"] == official_server_name
         and isinstance(collisions[0]["auth"], dict)
         and builtin_provenance_identity(collisions[0]["auth"].get("builtin_provenance"))
         == official_identity
     )
     if collisions and not trusted:
         raise RuntimeError(
-            "Cannot seed builtin Shopify connector: custom mcp_servers identity "
-            "collides with 'shopify'"
+            f"Cannot seed builtin {display_name} connector: custom mcp_servers "
+            f"identity collides with {app_id!r}"
         )
 
 
@@ -1934,10 +1939,20 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
             bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars()
         )
         builtin_app_rows = get_builtin_public_mcp_app_rows()
-        if "shopify" not in existing_app_ids and any(
-            row["app_id"] == "shopify" for row in builtin_app_rows
-        ):
-            _validate_shopify_seed_server_identity(bind, existing_tables)
+        protected_server_identities = (
+            ("shopify", "Shopify", "shopify"),
+            ("excel", "Excel", "Excel"),
+        )
+        builtin_app_ids = {row["app_id"] for row in builtin_app_rows}
+        for app_id, display_name, official_server_name in protected_server_identities:
+            if app_id not in existing_app_ids and app_id in builtin_app_ids:
+                _validate_builtin_seed_server_identity(
+                    bind,
+                    existing_tables,
+                    app_id=app_id,
+                    display_name=display_name,
+                    official_server_name=official_server_name,
+                )
         app_rows_to_insert = [
             _filter_row(row, app_columns)
             for row in builtin_app_rows

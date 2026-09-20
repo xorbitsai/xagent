@@ -754,6 +754,37 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "sharepoint",
+            "name": "SharePoint",
+            "description": "Connect to SharePoint to search sites, browse and manage document libraries, and read and write list items.",
+            "icon": "https://www.google.com/s2/favicons?domain=sharepoint.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "microsoft",
+            "category": "Storage",
+            "oauth_scopes": ["Sites.ReadWrite.All"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.sharepoint"],
+                "env_mapping": {"AUTH_TOKEN": "access_token"},
+                # Stable ownership marker used by the seed migration, same
+                # mechanism the whatsapp/shopify rows above adopt. It is
+                # intentionally inside launch_config because current main has
+                # no dedicated catalog-provenance column; a pre-existing
+                # custom app_id "sharepoint" (created via POST
+                # /admin/mcp/apps before this migration ran) lacks this
+                # marker, so the builtin execution overlay
+                # (_matches_builtin_provenance) leaves it alone as the
+                # operator's own row instead of silently reinterpreting it
+                # as the Microsoft OAuth connector.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "sharepoint",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "facebook",
             "name": "Facebook Pages",
             "description": "Connect to Facebook Pages to discover managed pages and publish page posts.",

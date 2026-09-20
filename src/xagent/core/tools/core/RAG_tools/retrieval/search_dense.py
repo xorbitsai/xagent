@@ -2,7 +2,7 @@
 Dense vector search implementation for RAG retrieval.
 
 This module provides the main entry point for dense vector search operations,
-handling input validation and delegating to the KB coordinator facade.
+handling input validation and delegating to the KB coordinator.
 
 Phase 1A Option C: Provides both sync and async search functions.
 """
@@ -15,16 +15,16 @@ from ..core.schemas import DenseSearchResponse
 from ..vector_storage.vector_manager import validate_query_vector
 
 if TYPE_CHECKING:
-    from ..kb import KBLegacyStepCompatibilityFacade
+    from ..kb import KBCoordinator
 
 logger = logging.getLogger(__name__)
 
 
-def _get_legacy_step_compatibility_facade() -> "KBLegacyStepCompatibilityFacade":
-    """Return the coordinator-owned legacy step compatibility facade."""
+def _get_coordinator() -> "KBCoordinator":
+    """Return the process-wide KB coordinator that owns search routing."""
     from ..kb import get_kb_coordinator
 
-    return get_kb_coordinator().legacy_step_compatibility
+    return get_kb_coordinator()
 
 
 def _validate_dense_inputs(
@@ -67,7 +67,7 @@ def search_dense(
     # Input validation at the public boundary.
     _validate_dense_inputs(collection, model_tag, top_k, query_vector)
 
-    return _get_legacy_step_compatibility_facade().search_dense(
+    return _get_coordinator().search_dense_sync(
         collection=collection,
         model_tag=model_tag,
         query_vector=query_vector,
@@ -105,7 +105,7 @@ async def search_dense_async(
     """
     # Input validation at the public boundary (shared with the sync path).
     _validate_dense_inputs(collection, model_tag, top_k, query_vector)
-    return await _get_legacy_step_compatibility_facade().search_dense_async(
+    return await _get_coordinator().search_dense(
         collection=collection,
         model_tag=model_tag,
         query_vector=query_vector,

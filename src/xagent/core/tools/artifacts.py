@@ -272,7 +272,7 @@ _UNRESOLVABLE_FILE_REF_KEYS = {
 
 
 def _safe_tool_result_items(value: dict[str, Any]) -> Iterable[tuple[str, Any]]:
-    if _is_file_ref_like(value):
+    if is_file_ref_like(value):
         keys = SAFE_FILE_REF_KEYS
         if is_sandbox_local_file_id(value.get("file_id")):
             keys = keys - _UNRESOLVABLE_FILE_REF_KEYS
@@ -280,7 +280,7 @@ def _safe_tool_result_items(value: dict[str, Any]) -> Iterable[tuple[str, Any]]:
     return ((key, item) for key, item in value.items() if key not in LOCAL_PATH_KEYS)
 
 
-def _is_file_ref_like(value: dict[str, Any]) -> bool:
+def is_file_ref_like(value: dict[str, Any]) -> bool:
     return (
         "file_id" in value
         and "filename" in value

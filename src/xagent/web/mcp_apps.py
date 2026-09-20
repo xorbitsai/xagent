@@ -66,8 +66,15 @@ from .models.public_mcp import PublicMCPApp
 # Planner app requires Tasks.ReadWrite. A bare Microsoft login must not batch
 # connect Planner or satisfy its runtime token lookup with that under-scoped
 # provider grant.
+#
+# sharepoint: same reasoning as facebook -- its "Sites.ReadWrite.All" scope
+# isn't part of the microsoft provider's default_scopes (["User.Read"]),
+# and the connector is brand new (no pre-existing bare "microsoft" grant,
+# e.g. one created by connecting Outlook/Teams/OneDrive, could ever have
+# carried it), so a bare connect -- or a grant scoped to one of those other
+# Microsoft apps -- must never be treated as satisfying it.
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
-    {"facebook", "github", "myob", "meta-ads", "planner", "whatsapp"}
+    {"facebook", "github", "myob", "meta-ads", "planner", "sharepoint", "whatsapp"}
 )
 
 

@@ -1,21 +1,19 @@
 """Shared fixtures for driving the public ``search_*`` functions through the
-coordinator-opened collection handle (#511).
+coordinator-opened collection handle (#511, re-pointed in #796).
 
-After the search facade was re-routed (Task 6) the public
-``retrieval.search_dense/search_sparse/search_hybrid`` functions no longer touch
-the ``search_engine`` free functions. They go:
+The public ``retrieval.search_dense/search_sparse/search_hybrid`` functions go:
 
-    public search_*()  ->  facade.search_*()  ->  facade._open_collection_handle()
+    public search_*()  ->  coordinator.search_*()
                        ->  coordinator.open_collection_sync()  ->  LanceDBCollectionHandle
                        ->  handle.search_*()  (runs against context.vector_index_store)
 
 These fixtures build a real ``LanceDBCollectionHandle`` whose context carries a
 MOCK ``vector_index_store`` (the canonical store-mock seam used by
 ``tests/core/tools/core/RAG_tools/kb/test_collection_handle_search.py``), wrap it
-in a facade, and return that facade from ``_get_legacy_step_compatibility_facade``
-on the target retrieval module. The real handle logic (index-status mapping,
-score conversion, filter building, FTS fallback, fusion) runs unchanged against
-the mock store, so the existing behavioral assertions stay valid.
+in a coordinator, and return that coordinator from ``_get_coordinator`` on the
+target retrieval module. The real handle logic (index-status mapping, score
+conversion, filter building, FTS fallback, fusion) runs unchanged against the
+mock store, so the existing behavioral assertions stay valid.
 """
 
 from __future__ import annotations
@@ -29,9 +27,7 @@ import pytest
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     LanceDBCollectionHandle,
 )
-from xagent.core.tools.core.RAG_tools.kb.legacy_step_compatibility import (
-    KBLegacyStepCompatibilityFacade,
-)
+from xagent.core.tools.core.RAG_tools.kb.coordinator import KBCoordinator
 
 
 def _make_handle(
@@ -52,18 +48,17 @@ def _make_handle(
     return handle, store, caps
 
 
-def _facade_for_handle(
-    handle: LanceDBCollectionHandle,
-) -> KBLegacyStepCompatibilityFacade:
-    facade = KBLegacyStepCompatibilityFacade()
-    facade._open_collection_handle = MagicMock(return_value=handle)  # type: ignore[method-assign]
+def _coordinator_for_handle(handle: LanceDBCollectionHandle) -> KBCoordinator:
+    # Bare instance: only the search entry points run, and both handle-opening
+    # calls are stubbed, so no store/facade wiring is needed.
+    coordinator = KBCoordinator.__new__(KBCoordinator)
+    coordinator.open_collection_sync = MagicMock(return_value=handle)  # type: ignore[method-assign]
 
-    @contextmanager
-    def _noop_storage_context() -> Iterator[None]:
-        yield
+    async def _open_collection(_request: object) -> LanceDBCollectionHandle:
+        return handle
 
-    facade._storage_context = _noop_storage_context  # type: ignore[method-assign]
-    return facade
+    coordinator.open_collection = _open_collection  # type: ignore[method-assign]
+    return coordinator
 
 
 @pytest.fixture
@@ -78,27 +73,23 @@ def make_handle():
 
 
 @pytest.fixture
-def routed_facade():
+def routed_coordinator():
     """Context manager: route a retrieval module's public ``search_*`` to a handle.
 
     Usage::
 
-        with routed_facade(search_dense_module, handle):
+        with routed_coordinator(search_dense_module, handle):
             response = search_dense(...)
 
-    Patches ``module._get_legacy_step_compatibility_facade`` to a facade whose
-    ``_open_collection_handle`` returns ``handle``, so the public function runs
-    the real handle logic against the handle's mock store.
+    Patches ``module._get_coordinator`` to a coordinator whose handle-opening
+    calls return ``handle``, so the public function runs the real handle logic
+    against the handle's mock store.
     """
 
     @contextmanager
-    def _routed(
-        module, handle: LanceDBCollectionHandle
-    ) -> Iterator[KBLegacyStepCompatibilityFacade]:
-        facade = _facade_for_handle(handle)
-        with patch.object(
-            module, "_get_legacy_step_compatibility_facade", return_value=facade
-        ):
-            yield facade
+    def _routed(module, handle: LanceDBCollectionHandle) -> Iterator[KBCoordinator]:
+        coordinator = _coordinator_for_handle(handle)
+        with patch.object(module, "_get_coordinator", return_value=coordinator):
+            yield coordinator
 
     return _routed

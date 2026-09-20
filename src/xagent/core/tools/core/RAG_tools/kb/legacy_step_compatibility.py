@@ -174,24 +174,19 @@ class KBLegacyStepCompatibilityFacade:
         *,
         user_id: Optional[int],
         is_admin: bool,
-        access_mode: "KBAccessMode" = KBAccessMode.WRITE,
     ) -> "LanceDBCollectionHandle":
         """Open the collection handle that owns parse/chunk storage (#509).
 
         Routed through the active coordinator so an injected shim keeps
         parse/chunk storage bound to that shim (preserves the facade's
         injection boundary).
-
-        ``access_mode`` defaults to WRITE so existing parse/chunk callers
-        keep their behaviour without any call-site changes.  Search methods
-        pass ``KBAccessMode.READ``.
         """
         return self._active_coordinator().open_collection_sync(
             KBContextRequest(
                 collection=collection,
                 user_id=user_id,
                 is_admin=is_admin,
-                access_mode=access_mode,
+                access_mode=KBAccessMode.WRITE,
                 hide_missing=True,
             )
         )
@@ -572,24 +567,18 @@ class KBLegacyStepCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> DenseSearchResponse:
-        with self._storage_context():
-            handle = self._open_collection_handle(
-                collection,
-                user_id=user_id,
-                is_admin=is_admin,
-                access_mode=KBAccessMode.READ,
-            )
-            return handle.search_dense(
-                model_tag,
-                query_vector,
-                top_k=top_k,
-                filters=filters,
-                readonly=readonly,
-                nprobes=nprobes,
-                refine_factor=refine_factor,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
+        return self._active_coordinator().search_dense_sync(
+            collection,
+            model_tag,
+            query_vector,
+            top_k=top_k,
+            filters=filters,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
     async def search_dense_async(
         self,
@@ -605,27 +594,18 @@ class KBLegacyStepCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> DenseSearchResponse:
-        with self._storage_context():
-            handle = await self._active_coordinator().open_collection(
-                KBContextRequest(
-                    collection=collection,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    access_mode=KBAccessMode.READ,
-                    hide_missing=True,
-                )
-            )
-            return await handle.search_dense_async(
-                model_tag,
-                query_vector,
-                top_k=top_k,
-                filters=filters,
-                readonly=readonly,
-                nprobes=nprobes,
-                refine_factor=refine_factor,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
+        return await self._active_coordinator().search_dense(
+            collection,
+            model_tag,
+            query_vector,
+            top_k=top_k,
+            filters=filters,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
     def search_sparse(
         self,
@@ -641,24 +621,18 @@ class KBLegacyStepCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> SparseSearchResponse:
-        with self._storage_context():
-            handle = self._open_collection_handle(
-                collection,
-                user_id=user_id,
-                is_admin=is_admin,
-                access_mode=KBAccessMode.READ,
-            )
-            return handle.search_sparse(
-                model_tag,
-                query_text,
-                top_k=top_k,
-                filters=filters,
-                readonly=readonly,
-                nprobes=nprobes,
-                refine_factor=refine_factor,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
+        return self._active_coordinator().search_sparse_sync(
+            collection,
+            model_tag,
+            query_text,
+            top_k=top_k,
+            filters=filters,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
     async def search_sparse_async(
         self,
@@ -674,27 +648,18 @@ class KBLegacyStepCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> SparseSearchResponse:
-        with self._storage_context():
-            handle = await self._active_coordinator().open_collection(
-                KBContextRequest(
-                    collection=collection,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    access_mode=KBAccessMode.READ,
-                    hide_missing=True,
-                )
-            )
-            return await handle.search_sparse_async(
-                model_tag,
-                query_text,
-                top_k=top_k,
-                filters=filters,
-                readonly=readonly,
-                nprobes=nprobes,
-                refine_factor=refine_factor,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
+        return await self._active_coordinator().search_sparse(
+            collection,
+            model_tag,
+            query_text,
+            top_k=top_k,
+            filters=filters,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
     def search_hybrid(
         self,
@@ -712,23 +677,17 @@ class KBLegacyStepCompatibilityFacade:
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> HybridSearchResponse:
-        with self._storage_context():
-            handle = self._open_collection_handle(
-                collection,
-                user_id=user_id,
-                is_admin=is_admin,
-                access_mode=KBAccessMode.READ,
-            )
-            return handle.search_hybrid(
-                model_tag,
-                query_text,
-                query_vector,
-                top_k=top_k,
-                filters=filters,
-                fusion_config=fusion_config,
-                readonly=readonly,
-                nprobes=nprobes,
-                refine_factor=refine_factor,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
+        return self._active_coordinator().search_hybrid_sync(
+            collection,
+            model_tag,
+            query_text,
+            query_vector,
+            top_k=top_k,
+            filters=filters,
+            fusion_config=fusion_config,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )

@@ -1,7 +1,7 @@
-"""seed built-in Planner (OAuth) MCP connector
+"""seed built-in SharePoint (OAuth) MCP connector
 
-Revision ID: 20260917_seed_planner_mcp_app
-Revises: 91899e1d97d3
+Revision ID: 20260917_seed_sharepoint_mcp_app
+Revises: 20260916_update_hubspot_description
 Create Date: 2026-09-17 00:00:00.000000
 
 """
@@ -17,8 +17,8 @@ from xagent.builtin_identity import builtin_provenance_identity
 logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
-revision: str = "20260917_seed_planner_mcp_app"
-down_revision: Union[str, None] = "91899e1d97d3"
+revision: str = "20260917_seed_sharepoint_mcp_app"
+down_revision: Union[str, None] = "20260916_update_hubspot_description"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -36,7 +36,7 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
     sa.column("launch_config", sa.JSON),
 )
 
-APP_ID = "planner"
+APP_ID = "sharepoint"
 BUILTIN_PROVENANCE = {
     "registry": "xagent",
     "app_id": APP_ID,
@@ -45,17 +45,17 @@ BUILTIN_PROVENANCE = {
 
 ROW = {
     "app_id": APP_ID,
-    "name": "Planner",
-    "description": "Connect a Microsoft 365 work or school account to manage basic Planner plans, buckets, and tasks, including checklists and assignments. Personal Microsoft accounts and Premium plans are not supported.",
-    "icon": "https://www.google.com/s2/favicons?domain=tasks.office.com&sz=128",
+    "name": "SharePoint",
+    "description": "Connect to SharePoint to search sites, browse and manage document libraries, and read and write list items.",
+    "icon": "https://www.google.com/s2/favicons?domain=sharepoint.com&sz=128",
     "transport": "oauth",
     "provider_name": "microsoft",
-    "category": "Productivity",
-    "oauth_scopes": ["Tasks.ReadWrite"],
+    "category": "Storage",
+    "oauth_scopes": ["Sites.ReadWrite.All"],
     "is_visible_in_connector": True,
     "launch_config": {
         "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.planner"],
+        "args": ["-m", "xagent.web.tools.mcp.sharepoint"],
         "env_mapping": {"AUTH_TOKEN": "access_token"},
         "builtin_provenance": BUILTIN_PROVENANCE,
     },
@@ -77,26 +77,38 @@ def upgrade() -> None:
     columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
     if "launch_config" not in columns:
         raise RuntimeError(
-            "Cannot seed builtin Planner identity: "
-            "public_mcp_apps.launch_config is required for provenance"
+            "Cannot seed builtin SharePoint identity: public_mcp_apps."
+            "launch_config is required for provenance"
         )
 
-    existing = (
-        bind.execute(
-            sa.select(
-                PUBLIC_MCP_APPS_TABLE.c.app_id,
-                PUBLIC_MCP_APPS_TABLE.c.launch_config,
-            ).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+    # .first() (a Row, or None only when zero rows match), not
+    # .scalar_one_or_none() -- a matching row whose launch_config happens to
+    # be NULL must still be treated as "the row exists" (fail closed below),
+    # not conflated with "no row at all" (scalar_one_or_none() returns None
+    # for both, which would let this fall through to the INSERT and crash
+    # on the app_id unique constraint instead of raising the intended,
+    # clearer error).
+    existing_row = bind.execute(
+        sa.select(PUBLIC_MCP_APPS_TABLE.c.launch_config).where(
+            PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
         )
-        .mappings()
-        .one_or_none()
-    )
-    if existing is not None:
-        if _has_provenance(existing["launch_config"]):
+    ).first()
+    if existing_row is not None:
+        # Idempotent re-run over a row this migration (or a prior version of
+        # it) already owns: accept and stop.
+        if _has_provenance(existing_row[0]):
             return
+        # app_id="sharepoint" is what the builtin execution overlay actually
+        # keys off of, so an unprovenanced row already squatting on it (e.g.
+        # a custom connector an admin created via POST /admin/mcp/apps
+        # before this migration ever ran) is a genuine misidentification
+        # risk worth failing the whole run over -- seeding our own row
+        # alongside it isn't possible (app_id is the primary key), and
+        # silently skipping would leave that ambiguity unresolved and
+        # unreported.
         raise RuntimeError(
-            "Cannot seed builtin Planner connector: an existing "
-            "public_mcp_apps row with app_id='planner' has no matching "
+            "Cannot seed builtin SharePoint connector: an existing "
+            "public_mcp_apps row with app_id='sharepoint' has no matching "
             "builtin_provenance"
         )
 
@@ -118,12 +130,16 @@ def downgrade() -> None:
     if "public_mcp_apps" not in set(inspector.get_table_names()):
         return
     columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
-    if not {"app_id", "launch_config"}.issubset(columns):
+    if "launch_config" not in columns:
         return
-    # Only the catalog entry is removed. The shared "microsoft" oauth_providers
-    # row is left untouched since it is reused by Outlook/Teams/OneDrive. Any
-    # MCPServer/UserMCPServer rows created by users who already connected are
-    # intentionally left in place -- connect-driven rows are not owned by
+    # Only the catalog entry is removed, and only if this migration (or a
+    # prior version of it) is the one that owns it -- a row that collided
+    # with app_id="sharepoint" before this migration ever ran (see upgrade's
+    # fail-closed check above) or was never seeded is left untouched rather
+    # than deleted by identifier alone. The shared "microsoft" oauth_providers
+    # row is left untouched too, since it is reused by Outlook/Teams/OneDrive.
+    # Any MCPServer/UserMCPServer rows created by users who already connected
+    # are intentionally left in place -- connect-driven rows are not owned by
     # this migration and are cleaned up through the normal disconnect path.
     existing = bind.execute(
         sa.select(PUBLIC_MCP_APPS_TABLE.c.launch_config).where(

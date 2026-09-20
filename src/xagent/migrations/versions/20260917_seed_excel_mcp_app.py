@@ -12,6 +12,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.builtin_identity import builtin_provenance_identity
+
 logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
@@ -35,6 +37,11 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 )
 
 APP_ID = "excel"
+BUILTIN_PROVENANCE = {
+    "registry": "xagent",
+    "app_id": APP_ID,
+    "version": 1,
+}
 
 ROW = {
     "app_id": APP_ID,
@@ -50,8 +57,15 @@ ROW = {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.excel"],
         "env_mapping": {"AUTH_TOKEN": "access_token"},
+        "builtin_provenance": BUILTIN_PROVENANCE,
     },
 }
+
+
+def _has_provenance(launch_config: object) -> bool:
+    return isinstance(launch_config, dict) and builtin_provenance_identity(
+        launch_config.get("builtin_provenance")
+    ) == builtin_provenance_identity(BUILTIN_PROVENANCE)
 
 
 def upgrade() -> None:
@@ -61,9 +75,29 @@ def upgrade() -> None:
         return
 
     columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
-    existing = set(bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars())
-    if APP_ID in existing:
-        return
+    if "launch_config" not in columns:
+        raise RuntimeError(
+            "Cannot seed builtin Excel identity: public_mcp_apps.launch_config "
+            "is required for provenance"
+        )
+    existing = (
+        bind.execute(
+            sa.select(
+                PUBLIC_MCP_APPS_TABLE.c.app_id,
+                PUBLIC_MCP_APPS_TABLE.c.launch_config,
+            ).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        )
+        .mappings()
+        .first()
+    )
+    if existing is not None:
+        if _has_provenance(existing["launch_config"]):
+            return
+        raise RuntimeError(
+            "Cannot seed builtin Excel connector: an existing "
+            "public_mcp_apps row with app_id='excel' has no matching "
+            "builtin_provenance"
+        )
 
     dropped_keys = sorted(set(ROW) - columns)
     if dropped_keys:
@@ -81,6 +115,16 @@ def downgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     if "public_mcp_apps" not in set(inspector.get_table_names()):
+        return
+    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+    if "launch_config" not in columns:
+        return
+    existing = bind.execute(
+        sa.select(PUBLIC_MCP_APPS_TABLE.c.launch_config).where(
+            PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
+        )
+    ).scalar_one_or_none()
+    if not _has_provenance(existing):
         return
     # Only the catalog entry is removed. The shared "microsoft" oauth_providers
     # row is left untouched since it is reused by Outlook/Teams/OneDrive/

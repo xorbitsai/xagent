@@ -28,7 +28,7 @@ from xagent.web.mcp_apps import requires_app_scoped_oauth_grant
 # pinned here so a regression in any of them -- not just whatsapp/sharepoint
 # -- is caught the same way.
 _EXPECTED_APP_SCOPED_APPS = frozenset(
-    {"facebook", "github", "myob", "meta-ads", "whatsapp", "sharepoint"}
+    {"excel", "facebook", "github", "myob", "meta-ads", "sharepoint", "whatsapp"}
 )
 
 
@@ -77,3 +77,17 @@ def test_sharepoint_scopes_actually_exceed_the_microsoft_providers_default_scope
         "this test (and the set) should be updated together, not left to "
         "silently drift."
     )
+
+
+def test_excel_scopes_actually_exceed_the_microsoft_providers_default_scopes():
+    provider_default_scopes = {
+        row["provider_name"]: set(row.get("default_scopes") or [])
+        for row in get_builtin_oauth_provider_rows()
+    }
+    excel = next(
+        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "excel"
+    )
+
+    assert set(excel["oauth_scopes"]) - provider_default_scopes["microsoft"] == {
+        "Files.ReadWrite"
+    }

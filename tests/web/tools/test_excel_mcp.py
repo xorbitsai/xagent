@@ -67,6 +67,22 @@ def test_workbook_base_uses_site_default_drive():
     )
 
 
+def test_workbook_base_terminates_path_form_site_before_default_drive():
+    assert (
+        excel._workbook_base("book.xlsx", "contoso.sharepoint.com:/teams/finance", None)
+        == "/sites/contoso.sharepoint.com:/teams/finance:/drive/root:/book.xlsx:/workbook"
+    )
+
+
+def test_workbook_base_terminates_path_form_site_before_specific_drive():
+    assert (
+        excel._workbook_base(
+            "book.xlsx", "contoso.sharepoint.com:/teams/finance", "drive-1"
+        )
+        == "/sites/contoso.sharepoint.com:/teams/finance:/drives/drive-1/root:/book.xlsx:/workbook"
+    )
+
+
 def test_workbook_base_rejects_dot_segments():
     with pytest.raises(ValueError, match="must not contain"):
         excel._workbook_base("../secret.xlsx", None, None)
@@ -95,28 +111,19 @@ def test_workbook_base_rejects_malicious_site_id():
         excel._workbook_base("book.xlsx", "contoso.sharepoint.com:/../etc", None)
 
 
-def test_workbook_base_treats_empty_string_site_id_as_absent():
-    """An empty-string site_id must not silently fall through to the
-    caller's own OneDrive -- a write tool called with site_id="" should
-    still address /me/drive explicitly, not by accident."""
-    assert (
+def test_workbook_base_rejects_empty_string_site_id():
+    with pytest.raises(ValueError, match="site_id is required"):
         excel._workbook_base("book.xlsx", "", None)
-        == "/me/drive/root:/book.xlsx:/workbook"
-    )
 
 
-def test_workbook_base_treats_whitespace_only_drive_id_as_absent():
-    assert (
+def test_workbook_base_rejects_whitespace_only_drive_id():
+    with pytest.raises(ValueError, match="drive_id"):
         excel._workbook_base("book.xlsx", None, "   ")
-        == "/me/drive/root:/book.xlsx:/workbook"
-    )
 
 
-def test_workbook_base_treats_whitespace_only_site_id_as_absent():
-    assert (
+def test_workbook_base_rejects_whitespace_only_site_id():
+    with pytest.raises(ValueError, match="site_id"):
         excel._workbook_base("book.xlsx", "   ", "drive-1")
-        == "/drives/drive-1/root:/book.xlsx:/workbook"
-    )
 
 
 def test_workbook_base_rejects_trailing_period_on_intermediate_segment():
@@ -137,6 +144,17 @@ def test_workbook_base_rejects_segment_with_leading_whitespace():
         excel._workbook_base("Reports/ Q1.xlsx", None, None)
 
 
+@pytest.mark.parametrize("path", [" Reports/Q1.xlsx", "Reports/Q1.xlsx "])
+def test_workbook_base_rejects_boundary_whitespace(path):
+    with pytest.raises(ValueError, match="whitespace"):
+        excel._workbook_base(path, None, None)
+
+
+def test_workbook_base_rejects_leading_separator():
+    with pytest.raises(ValueError, match="must be relative"):
+        excel._workbook_base("/Reports/Q1.xlsx", None, None)
+
+
 def test_site_segment_rejects_empty_segment():
     with pytest.raises(ValueError, match="empty segments"):
         excel._site_segment("contoso.sharepoint.com:/a//b")
@@ -146,6 +164,12 @@ def test_odata_key_segment_escapes_quote():
     assert (
         excel._odata_key_segment("worksheets", "O'Brien")
         == "worksheets('O%27%27Brien')"
+    )
+
+
+def test_odata_key_segment_preserves_padded_worksheet_name():
+    assert (
+        excel._odata_key_segment("worksheets", " Sheet ") == "worksheets('%20Sheet%20')"
     )
 
 
@@ -234,6 +258,18 @@ def test_add_worksheet_without_name_sends_empty_body(monkeypatch):
     assert mock_request.call_args.kwargs["json"] == {}
 
 
+@pytest.mark.parametrize("name", ["", "   "])
+def test_add_worksheet_rejects_explicit_blank_name_without_request(monkeypatch, name):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_add_worksheet("book.xlsx", name=name))
+
+    assert result["status"] == "error"
+    assert "name" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_list_worksheets_exposes_next_link(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -259,6 +295,35 @@ def test_list_worksheets_next_link_is_none_on_last_page(monkeypatch):
     result = json.loads(excel.excel_list_worksheets("book.xlsx"))
 
     assert result["next_link"] is None
+
+
+def test_list_worksheets_consumes_valid_next_link(monkeypatch):
+    next_link = (
+        "https://graph.microsoft.com/v1.0/me/drive/root:/book.xlsx:/workbook/"
+        "worksheets?$skiptoken=page-2"
+    )
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "2"}]}))
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_list_worksheets("book.xlsx", next_link=next_link))
+
+    assert result["worksheets"] == [{"id": "2"}]
+    assert mock_request.call_args.kwargs["url"] == next_link
+
+
+def test_list_worksheets_rejects_next_link_for_another_collection(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_list_worksheets(
+            "book.xlsx",
+            next_link="https://graph.microsoft.com/v1.0/me/messages?$skiptoken=x",
+        )
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_delete_worksheet_uses_odata_key_segment(monkeypatch):
@@ -298,6 +363,17 @@ def test_get_range_without_address_omits_function_call(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith("worksheets('Sheet1')/range")
 
 
+def test_get_range_rejects_explicit_empty_address(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_get_range("book.xlsx", "Sheet1", address=""))
+
+    assert result["status"] == "error"
+    assert "address is required" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_update_range_sends_parsed_values(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"address": "Sheet1!A1:B1"}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
@@ -310,6 +386,21 @@ def test_update_range_sends_parsed_values(monkeypatch):
     kwargs = mock_request.call_args.kwargs
     assert kwargs["method"] == "PATCH"
     assert kwargs["json"] == {"values": [["Name", "Score"]]}
+
+
+def test_update_range_caps_oversized_response(monkeypatch):
+    max_output_length = get_tool_max_output_length()
+    mock_request = Mock(
+        return_value=MockResponse({"values": [["x" * (max_output_length + 1000)]]})
+    )
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_update_range("book.xlsx", "Sheet1", "A1", '[["x"]]')
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_update_range_rejects_invalid_values_json():
@@ -455,6 +546,45 @@ def test_list_table_rows_exposes_next_link(monkeypatch):
     assert result["next_link"] == "https://graph.microsoft.com/v1.0/next-page"
 
 
+def test_list_table_rows_consumes_equivalently_encoded_next_link(monkeypatch):
+    next_link = (
+        "https://graph.microsoft.com/v1.0/me/drive/root:/book.xlsx:/workbook/"
+        "tables(%27Table1%27)/rows?$skiptoken=page-2"
+    )
+    mock_request = Mock(return_value=MockResponse({"value": [{"index": 1}]}))
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_list_table_rows("book.xlsx", "Table1", next_link=next_link)
+    )
+
+    assert result["rows"] == [{"index": 1}]
+    assert mock_request.call_args.kwargs["url"] == next_link
+
+
+def test_list_table_rows_caps_oversized_response_and_keeps_next_link(monkeypatch):
+    max_output_length = get_tool_max_output_length()
+    next_link = (
+        "https://graph.microsoft.com/v1.0/me/drive/root:/book.xlsx:/workbook/"
+        "tables('Table1')/rows?$skiptoken=page-2"
+    )
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "value": [{"values": [["x" * (max_output_length + 1000)]]}],
+                "@odata.nextLink": next_link,
+            }
+        )
+    )
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_list_table_rows("book.xlsx", "Table1"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["next_link"] == next_link
+
+
 def test_add_table_rows_with_index(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"index": 0}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
@@ -474,6 +604,19 @@ def test_add_table_rows_without_index_omits_field(monkeypatch):
     json.loads(excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]"))
 
     assert "index" not in mock_request.call_args.kwargs["json"]
+
+
+def test_add_table_rows_caps_oversized_response(monkeypatch):
+    max_output_length = get_tool_max_output_length()
+    mock_request = Mock(
+        return_value=MockResponse({"values": [["x" * (max_output_length + 1000)]]})
+    )
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_add_table_rows("book.xlsx", "Table1", '[["x"]]'))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_add_table_rows_rejects_negative_index():
@@ -550,6 +693,7 @@ def test_graph_error_response_is_surfaced_as_error(monkeypatch):
     result = json.loads(excel.excel_list_worksheets("book.xlsx"))
 
     assert result["status"] == "error"
+    assert "Not Found" in result["message"]
 
 
 def test_missing_auth_token_is_reported(monkeypatch):

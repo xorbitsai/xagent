@@ -777,6 +777,11 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.excel"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "excel",
+                    "version": 1,
+                },
             },
         },
         {

@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -32,6 +32,23 @@ class _GraphRequestError(RuntimeError):
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
+
+
+def _success_with_capped_collection(
+    field_name: str, values: list[Any], *, next_link: str | None
+) -> str:
+    """Keep list responses valid JSON while preserving their continuation."""
+    capped = json.loads(
+        success_with_capped_dict(
+            field_name,
+            {"items": values},
+            extra_fields={"next_link": next_link},
+        )
+    )
+    field = capped.get(field_name)
+    if isinstance(field, dict):
+        capped[field_name] = field.get("items", [])
+    return json.dumps(capped, ensure_ascii=False)
 
 
 def _error(message: str, *, details: Any = None) -> str:
@@ -100,9 +117,13 @@ def _site_segment(site_id: str) -> str:
     "/sites/{id}/..." and onto a different Graph endpoint under the same
     OAuth token.
     """
-    if not isinstance(site_id, str) or not site_id.strip():
+    if not isinstance(site_id, str):
+        raise TypeError("site_id must be a string")
+    if not site_id:
         raise ValueError("site_id is required")
-    value = site_id.strip()
+    if site_id != site_id.strip():
+        raise ValueError("site_id must not have leading or trailing whitespace")
+    value = site_id
     if any(segment in (".", "..", "") for segment in value.split("/")):
         raise ValueError(
             f"site_id must not contain '.', '..', or empty segments: {site_id!r}"
@@ -138,13 +159,15 @@ def _normalize_relative_path(path: str) -> str:
     """
     if not isinstance(path, str):
         raise TypeError("file_path must be a string")
-    value = path.strip().strip("/")
-    if not value:
+    if not path.strip():
         raise ValueError("file_path is required")
-    if path.strip().endswith("/"):
+    if path.startswith("/"):
+        raise ValueError("file_path must be relative and must not start with '/'")
+    if path.endswith("/"):
         raise ValueError(
             "file_path must include a filename, not end with a folder separator"
         )
+    value = path
     if "\\" in value:
         raise ValueError("file_path must use '/' separators and must not contain '\\'")
     segments = value.split("/")
@@ -172,8 +195,29 @@ def _odata_key_segment(collection: str, value: str) -> str:
     """
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{collection} identifier is required")
-    escaped = value.strip().replace("'", "''")
+    escaped = value.replace("'", "''")
     return f"{collection}('{quote(escaped, safe='')}')"
+
+
+def _next_page_path(next_link: str, expected_path: str) -> str:
+    """Validate an Excel collection continuation before reusing its token."""
+    if not isinstance(next_link, str):
+        raise TypeError("next_link must be a string")
+    parsed = urlsplit(next_link)
+    expected = urlsplit(f"{GRAPH_BASE_URL}{expected_path}")
+    graph_base_path = urlsplit(GRAPH_BASE_URL).path
+    if (
+        parsed.scheme != expected.scheme
+        or parsed.netloc != expected.netloc
+        or not parsed.path.startswith(f"{graph_base_path}/")
+        or unquote(parsed.path) != unquote(expected.path)
+        or parsed.fragment
+        or not parsed.query
+    ):
+        raise ValueError("next_link is not valid for this Excel collection")
+    if any(segment in {".", ".."} for segment in unquote(parsed.path).split("/")):
+        raise ValueError("next_link is not valid for this Excel collection")
+    return f"{parsed.path[len(graph_base_path) :]}?{parsed.query}"
 
 
 def _odata_string_literal(value: str) -> str:
@@ -195,14 +239,16 @@ def _workbook_base(file_path: str, site_id: str | None, drive_id: str | None) ->
     library).
     """
     normalized = _normalize_relative_path(file_path)
-    if site_id and site_id.strip():
+    if site_id is not None:
         site_segment = _site_segment(site_id)
+        if ":/" in site_segment and not site_segment.endswith(":"):
+            site_segment += ":"
         drive_base = (
             f"/sites/{site_segment}/drives/{url_path_id(drive_id, 'drive_id')}"
-            if drive_id and drive_id.strip()
+            if drive_id is not None
             else f"/sites/{site_segment}/drive"
         )
-    elif drive_id and drive_id.strip():
+    elif drive_id is not None:
         drive_base = f"/drives/{url_path_id(drive_id, 'drive_id')}"
     else:
         drive_base = "/me/drive"
@@ -231,7 +277,10 @@ def _parse_values_json(values_json: str) -> list:
 
 @mcp.tool()
 def excel_list_worksheets(
-    file_path: str, site_id: str | None = None, drive_id: str | None = None
+    file_path: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    next_link: str | None = None,
 ) -> str:
     """List the worksheets in an Excel workbook (.xlsx file).
 
@@ -239,13 +288,20 @@ def excel_list_worksheets(
     default this addresses the caller's own OneDrive; pass site_id (a Graph
     site id -- "root" for the tenant's root site, or a site's own id/path)
     to address a SharePoint site's document library instead, optionally
-    with drive_id for a non-default library. next_link is set when Graph
-    paginates and more worksheets remain beyond this page."""
+    with drive_id for a non-default library. Pass a returned next_link to
+    retrieve the next page."""
     try:
         base = _workbook_base(file_path, site_id, drive_id)
-        result = _graph_request("GET", f"{base}/worksheets")
-        return _success(
-            worksheets=result.get("value", []),
+        collection_path = f"{base}/worksheets"
+        path = (
+            collection_path
+            if next_link is None
+            else _next_page_path(next_link, collection_path)
+        )
+        result = _graph_request("GET", path)
+        return _success_with_capped_collection(
+            "worksheets",
+            result.get("value", []),
             next_link=result.get("@odata.nextLink"),
         )
     except Exception as e:
@@ -264,7 +320,14 @@ def excel_add_worksheet(
     existing worksheets. name is optional; if omitted, Excel assigns one."""
     try:
         base = _workbook_base(file_path, site_id, drive_id)
-        body = {"name": name} if name else {}
+        if name is None:
+            body = {}
+        else:
+            if not isinstance(name, str):
+                raise TypeError("name must be a string")
+            if not name.strip():
+                raise ValueError("name must not be empty or whitespace")
+            body = {"name": name}
         result = _graph_request("POST", f"{base}/worksheets/add", body=body)
         return _success(worksheet=result)
     except Exception as e:
@@ -307,7 +370,7 @@ def excel_get_range(
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("worksheets", worksheet)
         path = f"{base}/{segment}/range"
-        if address:
+        if address is not None:
             path += f"(address='{_odata_string_literal(address)}')"
         result = _graph_request("GET", path)
         return success_with_capped_dict("range", result)
@@ -344,7 +407,7 @@ def excel_update_range(
         segment = _odata_key_segment("worksheets", worksheet)
         path = f"{base}/{segment}/range(address='{_odata_string_literal(address)}')"
         result = _graph_request("PATCH", path, body={"values": values})
-        return _success(range=result)
+        return success_with_capped_dict("range", result)
     except Exception as e:
         logger.error(
             "Error updating range %s on worksheet %s in %s: %s",
@@ -422,17 +485,26 @@ def excel_get_used_range(
 
 @mcp.tool()
 def excel_list_tables(
-    file_path: str, site_id: str | None = None, drive_id: str | None = None
+    file_path: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    next_link: str | None = None,
 ) -> str:
     """List the tables (structured ranges) defined in an Excel workbook.
 
-    next_link is set when Graph paginates and more tables remain beyond
-    this page."""
+    Pass a returned next_link to retrieve the next page."""
     try:
         base = _workbook_base(file_path, site_id, drive_id)
-        result = _graph_request("GET", f"{base}/tables")
-        return _success(
-            tables=result.get("value", []),
+        collection_path = f"{base}/tables"
+        path = (
+            collection_path
+            if next_link is None
+            else _next_page_path(next_link, collection_path)
+        )
+        result = _graph_request("GET", path)
+        return _success_with_capped_collection(
+            "tables",
+            result.get("value", []),
             next_link=result.get("@odata.nextLink"),
         )
     except Exception as e:
@@ -463,17 +535,28 @@ def excel_add_table(
 
 @mcp.tool()
 def excel_list_table_rows(
-    file_path: str, table: str, site_id: str | None = None, drive_id: str | None = None
+    file_path: str,
+    table: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    next_link: str | None = None,
 ) -> str:
     """List the rows in an Excel table. table is either the table's Graph
-    id or its display name. Graph may page this endpoint for a large
-    table; next_link is set when more rows remain beyond this page."""
+    id or its display name. Pass a returned next_link to retrieve the next
+    page of a large table."""
     try:
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)
-        result = _graph_request("GET", f"{base}/{segment}/rows")
-        return _success(
-            rows=result.get("value", []),
+        collection_path = f"{base}/{segment}/rows"
+        path = (
+            collection_path
+            if next_link is None
+            else _next_page_path(next_link, collection_path)
+        )
+        result = _graph_request("GET", path)
+        return _success_with_capped_collection(
+            "rows",
+            result.get("value", []),
             next_link=result.get("@odata.nextLink"),
         )
     except Exception as e:
@@ -509,7 +592,7 @@ def excel_add_table_rows(
         if index is not None:
             body["index"] = index
         result = _graph_request("POST", f"{base}/{segment}/rows", body=body)
-        return _success(row=result)
+        return success_with_capped_dict("row", result)
     except Exception as e:
         logger.error("Error adding rows to table %s in %s: %s", table, file_path, e)
         return _error(str(e))

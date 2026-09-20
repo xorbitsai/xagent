@@ -89,20 +89,22 @@ def downgrade() -> None:
     # before this migration ever ran (upgrade() no-ops on that collision
     # rather than overwriting it), and an unconditional delete-by-app_id here
     # would then destroy that unrelated row on a later rollback.
-    snapshot_columns = {"app_id", "name", "description", "transport"} & columns
-    if not snapshot_columns:
-        # sa.delete(...).where() with no conditions compiles to an
-        # unconditional DELETE FROM public_mcp_apps -- if none of the
-        # snapshot columns exist on this table, there is nothing safe to
-        # match on, so skip the delete rather than wiping every connector's
-        # catalog row (Outlook/Teams/OneDrive and any operator-added apps).
+    #
+    # All three snapshot columns must exist before matching on any of them:
+    # partial matching (e.g. app_id alone) is exactly the coincidence this
+    # guard exists to rule out, and sa.delete(...).where() with zero
+    # conditions compiles to an unconditional DELETE FROM public_mcp_apps.
+    if not {"name", "description", "transport"}.issubset(columns):
         return
-    conditions = [
-        PUBLIC_MCP_APPS_TABLE.c[key] == ROW[key] for key in sorted(snapshot_columns)
-    ]
     # Only the catalog entry is removed. The shared "microsoft" oauth_providers
     # row is left untouched since it is reused by Outlook/Teams/OneDrive. Any
     # MCPServer/UserMCPServer rows created by users who already connected are
     # intentionally left in place -- connect-driven rows are not owned by
     # this migration and are cleaned up through the normal disconnect path.
-    bind.execute(sa.delete(PUBLIC_MCP_APPS_TABLE).where(*conditions))
+    bind.execute(
+        sa.delete(PUBLIC_MCP_APPS_TABLE)
+        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        .where(PUBLIC_MCP_APPS_TABLE.c.name == ROW["name"])
+        .where(PUBLIC_MCP_APPS_TABLE.c.description == ROW["description"])
+        .where(PUBLIC_MCP_APPS_TABLE.c.transport == ROW["transport"])
+    )

@@ -152,11 +152,16 @@ def _etag_guarded_write(
     latency optimization, not a weaker safety guarantee. When omitted, a
     fresh etag is fetched immediately before the write, as before.
 
-    A 412 response is this mechanism's designed outcome (a concurrent edit
-    won the race), not a generic failure, so it's raised as _EtagConflictError
-    rather than left as an opaque _GraphRequestError -- every caller catches
-    it separately to return a structured conflict_stale_version response,
-    mirroring outlook.py's handling of the same status code.
+    A 412 or 409 response is this mechanism's designed outcome (a
+    concurrent edit won the race), not a generic failure, so it's raised
+    as _EtagConflictError rather than left as an opaque _GraphRequestError
+    -- every caller catches it separately to return a structured
+    conflict_stale_version response. Microsoft's own "Planner resource
+    versioning" docs state both codes must be handled this way ("client
+    apps are expected to handle versioning related error codes 409 and
+    412 by reading the latest version of the item and resolving the
+    conflicting changes"), not just 412 the way outlook.py's single-code
+    precedent (for a different resource type) handles it.
     """
     resolved_etag = etag or _current_etag(path)
     try:
@@ -164,7 +169,7 @@ def _etag_guarded_write(
             method, path, body=body, extra_headers={"If-Match": resolved_etag}
         )
     except _GraphRequestError as exc:
-        if exc.status_code == 412:
+        if exc.status_code in (409, 412):
             raise _EtagConflictError(
                 "This item changed before the update could be applied. Read "
                 "it again and retry."
@@ -242,6 +247,8 @@ def _resolve_list_path(default_path: str, next_link: str | None) -> str:
 
 
 def _validated_user_ids(user_ids: list[str]) -> list[str]:
+    if not isinstance(user_ids, list):
+        raise TypeError("user_ids must be a list of strings")
     return [require_clean_identifier(user_id, "user_id") for user_id in user_ids]
 
 
@@ -428,6 +435,8 @@ def planner_create_task(
             if not due_date_time:
                 raise ValueError("due_date_time cannot be empty")
             body["dueDateTime"] = due_date_time
+        if assignee_user_ids is not None and not isinstance(assignee_user_ids, list):
+            raise TypeError("assignee_user_ids must be a list of strings")
         assignments = _build_assignments(assignee_user_ids)
         if assignments:
             body["assignments"] = assignments

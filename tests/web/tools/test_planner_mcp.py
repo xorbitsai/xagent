@@ -90,7 +90,18 @@ def test_etag_guarded_write_raises_conflict_on_412(monkeypatch):
         planner._etag_guarded_write("/planner/tasks/task-1", "DELETE", etag='W/"stale"')
 
 
-def test_etag_guarded_write_reraises_non_412_graph_error(monkeypatch):
+def test_etag_guarded_write_raises_conflict_on_409(monkeypatch):
+    """Microsoft's own "Planner resource versioning" docs state client
+    apps must handle both 409 and 412 as versioning conflicts, not just
+    412 -- outlook.py's single-code precedent doesn't apply here."""
+    mock_request = Mock(return_value=MockResponse({}, status_code=409))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    with pytest.raises(planner._EtagConflictError):
+        planner._etag_guarded_write("/planner/tasks/task-1", "DELETE", etag='W/"stale"')
+
+
+def test_etag_guarded_write_reraises_other_graph_error(monkeypatch):
     mock_request = Mock(return_value=MockResponse({}, status_code=404))
     monkeypatch.setattr(planner.requests, "request", mock_request)
 
@@ -487,6 +498,20 @@ def test_create_task_rejects_malformed_assignee_id(monkeypatch):
 
     assert result["status"] == "error"
     assert "user_id" in result["message"]
+
+
+def test_create_task_rejects_non_list_assignee_user_ids():
+    """A bare string would otherwise be iterated character-by-character by
+    _build_assignments, silently assigning to single-character "user ids"
+    instead of raising -- matches the isinstance(list) guard already on
+    planner_assign_task/planner_unassign_task."""
+    result = json.loads(
+        planner.planner_create_task(
+            "plan-1", "Write report", assignee_user_ids="user-1"
+        )
+    )
+    assert result["status"] == "error"
+    assert "assignee_user_ids" in result["message"]
 
 
 def test_update_task_fetches_etag_and_sends_if_match(monkeypatch):

@@ -131,11 +131,11 @@ def test_downgrade_preserves_operator_modified_row(tmp_path):
 
 
 def test_downgrade_skips_delete_when_snapshot_columns_missing(tmp_path):
-    """sa.delete(table).where(*conditions) with an empty conditions list
-    compiles to an unconditional DELETE FROM public_mcp_apps -- if none of
-    the snapshot columns (app_id/name/description/transport) exist on the
-    live table, downgrade() must skip the delete entirely rather than
-    wiping every row in the shared catalog table."""
+    """downgrade() must skip the delete entirely (never fall back to
+    app_id-only matching, and never run a delete with zero WHERE
+    conditions -- sa.delete(table).where() with no conditions compiles to
+    an unconditional DELETE FROM public_mcp_apps) when none of
+    name/description/transport exist on the live table."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -158,6 +158,33 @@ def test_downgrade_skips_delete_when_snapshot_columns_missing(tmp_path):
             text("SELECT COUNT(*) FROM public_mcp_apps")
         ).scalar()
         assert remaining == 1
+
+
+def test_downgrade_skips_delete_when_only_app_id_column_present(tmp_path):
+    """A table with app_id but none of name/description/transport must not
+    fall back to matching on app_id alone -- that's exactly the coincidence
+    the multi-column snapshot guard exists to rule out (it would delete an
+    operator's own row hand-created under the same app_id before this
+    migration ever ran)."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE
+                )
+                """
+            )
+        )
+        connection.execute(
+            text("INSERT INTO public_mcp_apps (id, app_id) VALUES (1, 'planner')")
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert "planner" in _app_ids(connection)
 
 
 def test_upgrade_warns_and_skips_missing_columns(tmp_path):

@@ -345,6 +345,22 @@ def test_list_projects_reports_next_start_at_when_truncated(monkeypatch):
     assert project_call.kwargs["params"]["startAt"] == 5
 
 
+def test_list_projects_clamps_limit_and_offset(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"values": [], "isLast": True}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    json.loads(jira.jira_list_projects(limit=9999, start_at=-5))
+
+    project_call = mock_request.call_args_list[1]
+    assert project_call.kwargs["params"]["maxResults"] == jira.MAX_LIMIT
+    assert project_call.kwargs["params"]["startAt"] == 0
+
+
 def test_list_projects_empty_page_never_repeats_offset(monkeypatch):
     mock_request = Mock(
         side_effect=[
@@ -413,6 +429,21 @@ def test_search_issues_passes_next_page_token_when_provided(monkeypatch):
     assert result["next_page_token"] is None
     search_call = mock_request.call_args_list[1]
     assert search_call.kwargs["params"]["nextPageToken"] == "token-2"
+
+
+def test_search_issues_clamps_limit(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": []}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    json.loads(jira.jira_search_issues("project = ENG", limit=0))
+
+    search_call = mock_request.call_args_list[1]
+    assert search_call.kwargs["params"]["maxResults"] == 1
 
 
 def test_get_issue_returns_issue(monkeypatch):
@@ -498,7 +529,18 @@ def test_create_issue_rejects_empty_summary(monkeypatch):
     result = json.loads(jira.jira_create_issue(project_key="ENG", summary=""))
 
     assert result["status"] == "error"
-    assert "summary cannot be empty" in result["message"]
+    assert "summary" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_create_issue_rejects_whitespace_only_summary(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_create_issue(project_key="ENG", summary="   "))
+
+    assert result["status"] == "error"
+    assert "summary" in result["message"]
     mock_request.assert_not_called()
 
 
@@ -509,7 +551,18 @@ def test_update_issue_rejects_empty_summary(monkeypatch):
     result = json.loads(jira.jira_update_issue("ENG-1", summary=""))
 
     assert result["status"] == "error"
-    assert "summary cannot be empty" in result["message"]
+    assert "summary" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_issue_rejects_whitespace_only_summary(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_update_issue("ENG-1", summary="  padded  "))
+
+    assert result["status"] == "error"
+    assert "summary" in result["message"]
     mock_request.assert_not_called()
 
 
@@ -520,7 +573,20 @@ def test_update_issue_rejects_empty_priority(monkeypatch):
     result = json.loads(jira.jira_update_issue("ENG-1", priority=""))
 
     assert result["status"] == "error"
-    assert "priority cannot be empty" in result["message"]
+    assert "priority" in result["message"]
+    assert "omit the parameter instead" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_issue_rejects_whitespace_only_priority(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_update_issue("ENG-1", priority=" High "))
+
+    assert result["status"] == "error"
+    assert "priority" in result["message"]
+    assert "omit the parameter instead" in result["message"]
     mock_request.assert_not_called()
 
 
@@ -658,6 +724,22 @@ def test_list_comments_empty_page_never_repeats_offset(monkeypatch):
     assert result["next_start_at"] is None
 
 
+def test_list_comments_clamps_limit_and_offset(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"comments": [], "total": 0}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    json.loads(jira.jira_list_comments("ENG-1", limit=9999, start_at=-5))
+
+    comment_call = mock_request.call_args_list[1]
+    assert comment_call.kwargs["params"]["maxResults"] == jira.MAX_LIMIT
+    assert comment_call.kwargs["params"]["startAt"] == 0
+
+
 def test_list_comments_ignores_non_int_total(monkeypatch):
     mock_request = Mock(
         side_effect=[
@@ -744,6 +826,22 @@ def test_search_users_reports_truncated_on_full_page(monkeypatch):
     assert result["next_start_at"] == 4
     user_call = mock_request.call_args_list[1]
     assert user_call.kwargs["params"]["startAt"] == 2
+
+
+def test_search_users_clamps_limit_and_offset(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=[]),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    json.loads(jira.jira_search_users("ada", limit=9999, start_at=-5))
+
+    user_call = mock_request.call_args_list[1]
+    assert user_call.kwargs["params"]["maxResults"] == jira.MAX_LIMIT
+    assert user_call.kwargs["params"]["startAt"] == 0
 
 
 def test_search_users_returns_error_on_non_list_response(monkeypatch):

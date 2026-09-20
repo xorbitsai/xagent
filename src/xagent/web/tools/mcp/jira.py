@@ -8,7 +8,7 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import clamp_limit, clamp_offset, require_clean_identifier, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-mcp")
@@ -50,10 +50,6 @@ def _headers() -> dict[str, str]:
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-
-
-def _clamp_limit(limit: int) -> int:
-    return max(1, min(int(limit), MAX_LIMIT))
 
 
 def _truncate(text: str) -> str:
@@ -261,8 +257,8 @@ def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -
     response's next_start_at to fetch the next page (0 to start over).
     """
     try:
-        max_results = _clamp_limit(limit)
-        offset = max(0, int(start_at))
+        max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
+        offset = clamp_offset(start_at)
         result = _request(
             "GET",
             cloud_id,
@@ -300,7 +296,7 @@ def jira_search_issues(
     the next page.
     """
     try:
-        max_results = _clamp_limit(limit)
+        max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
         # /rest/api/2/search and /rest/api/3/search are deprecated (removed
         # by Atlassian on Jira Cloud); /rest/api/3/search/jql is the
         # replacement and pages via nextPageToken instead of startAt/total.
@@ -372,8 +368,7 @@ def jira_create_issue(
     be one of the site's configured priorities.
     """
     try:
-        if not summary:
-            return _error("summary cannot be empty")
+        require_clean_identifier(summary, "summary")
         fields: dict[str, Any] = {
             "project": {"key": project_key},
             "summary": summary,
@@ -416,8 +411,7 @@ def jira_update_issue(
     try:
         fields: dict[str, Any] = {}
         if summary is not None:
-            if not summary:
-                return _error("summary cannot be empty")
+            require_clean_identifier(summary, "summary")
             fields["summary"] = summary
         if description is not None:
             fields["description"] = description
@@ -426,10 +420,12 @@ def jira_update_issue(
                 {"accountId": assignee_account_id} if assignee_account_id else None
             )
         if priority is not None:
-            if not priority:
+            try:
+                require_clean_identifier(priority, "priority")
+            except ValueError as exc:
                 return _error(
-                    "priority cannot be empty -- Jira has no way to clear "
-                    "priority through this field; omit the parameter instead"
+                    f"{exc} -- Jira also has no way to clear priority through "
+                    "this field; omit the parameter instead"
                 )
             fields["priority"] = {"name": priority}
         if not fields:
@@ -542,8 +538,8 @@ def jira_list_comments(
     response's next_start_at to fetch the next page (0 to start over).
     """
     try:
-        max_results = _clamp_limit(limit)
-        offset = max(0, int(start_at))
+        max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
+        offset = clamp_offset(start_at)
         result = _request(
             "GET",
             cloud_id,
@@ -599,8 +595,8 @@ def jira_search_users(
     response's next_start_at to fetch the next page (0 to start over).
     """
     try:
-        max_results = _clamp_limit(limit)
-        offset = max(0, int(start_at))
+        max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
+        offset = clamp_offset(start_at)
         result = _request(
             "GET",
             cloud_id,

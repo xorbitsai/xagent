@@ -53,6 +53,20 @@ def test_item_path_defaults_to_own_onedrive():
     assert word._item_path("Report.docx", None, None) == "/me/drive/root:/Report.docx:"
 
 
+def test_item_path_closes_colon_for_path_shaped_site_id():
+    """A "hostname:/relative-path" site id must be closed with a second
+    colon before appending "/drive", per Graph's sharepoint-addressing
+    docs -- otherwise "/drive" is parsed as part of the site's own
+    server-relative path instead of as a sub-resource name."""
+    path = word._item_path("Report.docx", "contoso.sharepoint.com:/teams/hr", None)
+    assert path == ("/sites/contoso.sharepoint.com:/teams/hr:/drive/root:/Report.docx:")
+
+
+def test_item_path_leaves_composite_site_id_unchanged():
+    path = word._item_path("Report.docx", "contoso.sharepoint.com,site,web", None)
+    assert path == ("/sites/contoso.sharepoint.com,site,web/drive/root:/Report.docx:")
+
+
 def test_content_path_appends_content():
     assert (
         word._content_path("Report.docx", None, None)

@@ -137,6 +137,24 @@ def _site_segment(site_id: str) -> str:
     return quote(value, safe=":/,")
 
 
+def _site_subresource_base(site_id: str) -> str:
+    """Site path prefix for appending a further path segment (e.g. "/drive").
+    A path-addressed site id ("hostname:/path") must be closed with a
+    second colon before appending more segments -- confirmed against
+    Graph's own sharepoint-addressing documentation, which shows
+    "/sites/{hostname}:/{path}:/drive" as the one-call compound form -- or
+    Graph parses the appended segment as part of the site's own
+    server-relative path instead of as a sub-resource name (matching
+    sharepoint.py's identical _site_subresource_base). The "root" and
+    composite-id ("hostname,siteId,webId") forms contain no colon and are
+    returned unchanged."""
+    value = site_id.strip()
+    segment = _site_segment(site_id)
+    if ":" in value and not value.endswith(":"):
+        return f"/sites/{segment}:"
+    return f"/sites/{segment}"
+
+
 def _normalize_relative_path(path: str) -> str:
     """Normalize a drive-relative file path for a root:/{path}: request URL,
     rejecting '.'/'..' segments, a trailing folder separator, and a filename
@@ -162,11 +180,11 @@ def _normalize_relative_path(path: str) -> str:
 def _item_path(file_path: str, site_id: str | None, drive_id: str | None) -> str:
     normalized = _normalize_relative_path(file_path)
     if site_id:
-        site_segment = _site_segment(site_id)
+        site_base = _site_subresource_base(site_id)
         drive_base = (
-            f"/sites/{site_segment}/drives/{url_path_id(drive_id, 'drive_id')}"
+            f"{site_base}/drives/{url_path_id(drive_id, 'drive_id')}"
             if drive_id
-            else f"/sites/{site_segment}/drive"
+            else f"{site_base}/drive"
         )
     elif drive_id:
         drive_base = f"/drives/{url_path_id(drive_id, 'drive_id')}"

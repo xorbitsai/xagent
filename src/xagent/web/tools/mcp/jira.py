@@ -79,10 +79,18 @@ def _path_segment(value: str) -> str:
     sending -- collapsing e.g. ".../issue/.." to ".../issue" (or further),
     a different endpoint than the one requested. Rejected explicitly,
     matching utils.py's url_path_id, since encoding can't close this off.
+
+    Also rejects a blank or whitespace-padded value (url_path_id's
+    require_clean_identifier half) -- an empty issue_key (e.g. an
+    unresolved templated variable from an LLM caller) would otherwise
+    silently build /rest/api/2/issue/, hitting the issue-collection
+    endpoint instead of a clear local error naming the actual mistake.
     """
     text = str(value)
     if text in (".", ".."):
         raise ValueError(f"invalid path segment: {text!r}")
+    if not text or text.strip() != text:
+        raise ValueError(f"path segment must not be blank or padded: {text!r}")
     return quote(text, safe="")
 
 
@@ -405,12 +413,19 @@ def _cap_text_field(payload: dict[str, Any], field: str, max_chars: int) -> bool
 
 def _flatten_adf(value: Any) -> str | None:
     """Render a Jira ADF (Atlassian Document Format) rich-text field --
-    used by an issue's description and a comment's body on Jira Cloud --
-    down to plain text.
+    used by an issue's description and a comment's body -- down to
+    plain text.
 
-    Falls back to returning a plain string unchanged (Jira Server/Data
-    Center can still return wiki-markup strings for the same field), so
-    this is safe to call unconditionally on either shape.
+    Falls back to returning a plain string unchanged, so this is safe
+    to call unconditionally on either shape. That fallback isn't just a
+    Server/Data Center accommodation: per Atlassian's own migration
+    docs, ADF is a v3-API-only representation -- REST API v2 (which
+    every request in this file uses; see _issue_path) returns
+    description/comment body as a plain wiki-markup STRING even on
+    Jira Cloud. The ADF-object branches below exist for forward
+    compatibility (a future move to v3, or a Jira change to v2's
+    default) rather than because v2 is expected to send one today; the
+    plain-string fallback is what today's requests actually exercise.
     """
     if value is None:
         return None
@@ -489,8 +504,9 @@ def _summarize_mini_issue(entry: dict[str, Any]) -> dict[str, Any]:
     """Extract key/summary/status from a Jira "mini issue" shape --
     {key, fields: {summary, status: {name}}} -- the same shape Jira uses
     both for a subtasks entry and for issuelinks' linked-issue object.
-    Shared by _summarize_subtask and _summarize_issue_link so the two
-    don't drift if a field is added to one and not the other.
+    Called directly for subtasks and via _summarize_issue_link for
+    issuelinks, so the two don't drift if a field is added to one and
+    not the other.
     """
     fields = _as_dict(entry.get("fields"))
     return {
@@ -520,10 +536,6 @@ def _summarize_issue_link(link: dict[str, Any]) -> dict[str, Any]:
         "relationship": link_type.get("outward" if is_outward else "inward"),
         **_summarize_mini_issue(_as_dict(linked)),
     }
-
-
-def _summarize_subtask(subtask: dict[str, Any]) -> dict[str, Any]:
-    return _summarize_mini_issue(subtask)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -596,7 +608,7 @@ def _summarize_full_issue(issue: dict[str, Any]) -> dict[str, Any]:
             if isinstance(link, dict)
         ],
         "subtasks": [
-            _summarize_subtask(subtask)
+            _summarize_mini_issue(subtask)
             for subtask in fields.get("subtasks") or []
             if isinstance(subtask, dict)
         ],
@@ -666,8 +678,9 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
     extra_field_values in the result, so you can reach any field this
     tool doesn't summarize by name. An ADF-shaped (rich text) value is
     flattened to plain text first, matching description; any resulting
-    large value (text or otherwise) is capped the same way, with
-    extra_field_values_truncated set to true if any entry was cut.
+    large value (text or otherwise) is capped the same way, with a
+    top-level extra_field_values_truncated (a sibling of "issue", like
+    description_truncated) set to true if any entry was cut.
     Use this, not jira_search_issues, when you need an issue's
     dependencies or full description: issue_links/subtasks/description
     are only returned here. A description longer than
@@ -691,6 +704,16 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira issue API")
         issue = _summarize_full_issue(result)
+        # Collected separately from `issue` (rather than nested inside
+        # it, as extra_field_values_truncated used to be) so both
+        # survive together when success_with_capped_dict's fallback
+        # below has to shrink `issue` -- a truncation flag nested
+        # inside the field it describes can get dropped along with
+        # that field by the very shrink pass it exists to signal,
+        # exactly when the signal matters most. description_truncated
+        # already worked this way; extra_field_values_truncated now
+        # matches it instead of being the one exception.
+        top_level_truncation_flags: dict[str, Any] = {}
         if requested_extra:
             raw_fields = _as_dict(result.get("fields"))
             extra_field_values: dict[str, Any] = {}
@@ -704,12 +727,17 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
                     extra_field_values_truncated or was_truncated
                 )
             issue["extra_field_values"] = extra_field_values
-            issue["extra_field_values_truncated"] = extra_field_values_truncated
+            top_level_truncation_flags["extra_field_values_truncated"] = (
+                extra_field_values_truncated
+            )
         description_truncated = _cap_text_field(
             issue, "description", _ISSUE_DESCRIPTION_MAX_CHARS
         )
         response = _success(
-            issue=issue, description_truncated=description_truncated, truncated=False
+            issue=issue,
+            description_truncated=description_truncated,
+            truncated=False,
+            **top_level_truncation_flags,
         )
         max_output_length = get_tool_max_output_length()
         if len(response) > max_output_length:
@@ -721,7 +749,10 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
             response = success_with_capped_dict(
                 "issue",
                 issue,
-                extra_fields={"description_truncated": description_truncated},
+                extra_fields={
+                    "description_truncated": description_truncated,
+                    **top_level_truncation_flags,
+                },
             )
         return response
     except Exception as e:
@@ -919,6 +950,7 @@ def _summarize_comment(comment: dict[str, Any]) -> dict[str, Any]:
     """
     raw_visibility = comment.get("visibility")
     visibility = _as_dict(raw_visibility)
+    jsd_public = comment.get("jsdPublic")
     summarized = {
         "id": comment.get("id"),
         "author": _summarize_person(comment.get("author")),
@@ -935,6 +967,15 @@ def _summarize_comment(comment: dict[str, Any]) -> dict[str, Any]:
             if raw_visibility is not None
             else None
         ),
+        # jsdPublic is a SEPARATE mechanism from visibility, injected by
+        # Jira Service Management on a service-desk request's comments:
+        # a JSM agent can mark a comment internal-only (jsdPublic=false)
+        # with no role/group visibility restriction set at all, so
+        # visibility alone can silently report a JSM-internal comment as
+        # public. None (not False) when the issue isn't a JSM request,
+        # since this key is simply absent there -- not itself a public/
+        # internal signal.
+        "jsd_public": jsd_public if isinstance(jsd_public, bool) else None,
         "created": comment.get("created"),
         "updated": comment.get("updated"),
     }
@@ -972,9 +1013,9 @@ def _fit_comments_page(
     trying every raw entry first and only shrinking if that overflows.
 
     Returns None if not even an empty page (0 comments, pointing
-    next_start_at at the first one) fits -- the caller should treat
-    that as a bounded error, the same way jira_search_issues does when
-    its minimal page still doesn't fit.
+    next_start_at just past the one comment that couldn't fit) fits --
+    the caller should treat that as a bounded error, the same way
+    jira_search_issues does when its minimal page still doesn't fit.
 
     next_start_at is computed from the RAW position of (or immediately
     after) the last comment actually kept -- not from the filtered/kept
@@ -1000,10 +1041,18 @@ def _fit_comments_page(
             # exactly right, size aside.
             return (offset + len(raw_comments)) if has_more_raw else None
         if count == 0:
-            # Nothing kept yet -- resume at the first comment this page
-            # actually has, rather than the "-1 + 1" arithmetic below,
-            # which has no count-1 to read when count is 0.
-            return offset + kept[0][0]
+            # Nothing kept -- the one comment this page has doesn't fit
+            # even alone. Resuming AT it (offset + kept[0][0], with no
+            # "+1") would equal the caller's own start_at whenever that
+            # comment is the first entry on its raw page, so a caller
+            # mechanically following next_start_at would re-fetch this
+            # exact position forever: the same "must never equal
+            # start_at" invariant jira_list_comments already checks for
+            # its own raw-page case. Skip past it instead -- a page this
+            # tool can never actually deliver is not recoverable by
+            # retrying, and forward progress matters more than not
+            # dropping an unfittable entry.
+            return offset + kept[0][0] + 1
         return offset + kept[count - 1][0] + 1
 
     def response_for(count: int) -> str:
@@ -1031,9 +1080,13 @@ def jira_list_comments(
     issue_key: str, cloud_id: str = "", limit: int = 50, start_at: int = 0
 ) -> str:
     """
-    List comments on an issue (id, body, author, visibility, timestamps).
-    visibility is set (role/group) when a comment is restricted, so it's
-    not mistaken for a normal public one.
+    List comments on an issue (id, body, author, visibility, jsd_public,
+    timestamps). visibility is set (role/group) when a comment is
+    restricted; jsd_public is set (true/false) on a Jira Service
+    Management request's comments independent of visibility -- false
+    means an agent marked it internal-only, not visible to the
+    customer. Neither should be assumed public just because the other
+    is null.
     start_at: offset into the full comment list -- pass the previous
     response's next_start_at to fetch the next page (0 to start over).
     A comment body longer than _COMMENT_BODY_MAX_CHARS is truncated
@@ -1041,7 +1094,9 @@ def jira_list_comments(
     still doesn't fit the tool output limit even after that, fewer
     comments than requested are returned (down to zero) with
     next_start_at pointing at the first one left out, so pagination
-    stays valid. Only if even a single empty page doesn't fit is an
+    stays valid -- except when a single comment doesn't fit even alone,
+    where next_start_at skips past it instead, since retrying would
+    never succeed. Only if even a single empty page doesn't fit is an
     error returned instead.
     """
     try:

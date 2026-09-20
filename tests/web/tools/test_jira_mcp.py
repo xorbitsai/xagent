@@ -503,10 +503,17 @@ def test_get_issue_returns_issue(monkeypatch):
 
 
 def test_get_issue_flattens_description_and_surfaces_dependencies(monkeypatch):
+    # This fixture's ADF-shaped description is a defensive-path test,
+    # not a claim about what this tool's actual v2 request returns in
+    # production: _issue_path hardcodes /rest/api/2/..., and per
+    # Atlassian's own migration docs, only v3 returns ADF objects by
+    # default -- v2 returns wiki-markup strings (the plain-string branch
+    # _flatten_adf already handles). Kept as a real self URL, not a v3
+    # one, so this fixture doesn't contradict which endpoint is called.
     raw_issue = {
         "expand": "renderedFields,names,schema,operations,editmeta,changelog",
         "id": "34280",
-        "self": "https://api.atlassian.com/ex/jira/site-a/rest/api/3/issue/34280",
+        "self": "https://api.atlassian.com/ex/jira/site-a/rest/api/2/issue/34280",
         "key": "DW-782",
         "fields": {
             "summary": "[Connectify][6thman] Persist customer configuration",
@@ -692,8 +699,10 @@ def test_get_issue_falls_back_to_capped_dict_when_still_too_big(monkeypatch):
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 2000)
     monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 2000)
 
-    result = json.loads(jira.jira_get_issue("ENG-1"))
+    raw_response = jira.jira_get_issue("ENG-1")
+    result = json.loads(raw_response)
 
+    assert len(raw_response) <= 2000
     assert result["status"] == "success"
     assert result.get("truncated") is True
 
@@ -1145,6 +1154,7 @@ def test_list_comments_flattens_adf_body_and_drops_avatar_urls(monkeypatch):
             "author": {"account_id": "u1", "display_name": "Bruce"},
             "body": "Looks good",
             "visibility": None,
+            "jsd_public": None,
             "body_truncated": False,
             "created": "2026-09-11T10:00:00.000+0000",
             "updated": "2026-09-11T10:00:00.000+0000",
@@ -1226,8 +1236,10 @@ def test_list_comments_returns_bounded_error_when_single_comment_too_big(monkeyp
 def test_list_comments_returns_empty_page_when_only_one_comment_overflows(monkeypatch):
     # When there's room for an empty page but not for the single
     # comment on it, that's a valid bounded page (0 comments,
-    # next_start_at pointing right back at the comment left out) --
-    # not the hard error the too-small-for-even-that case above hits.
+    # next_start_at pointing PAST the comment left out, not at it --
+    # equal to start_at would make a caller following it re-fetch this
+    # exact position forever) -- not the hard error the too-small-for-
+    # even-that case above hits.
     raw_comment = {"id": "1", "body": "x" * 50}
     mock_request = Mock(
         side_effect=[
@@ -1236,14 +1248,37 @@ def test_list_comments_returns_empty_page_when_only_one_comment_overflows(monkey
         ]
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
-    empty_page_size = len(jira._build_comments_response([], 1, 0))
+    empty_page_size = len(jira._build_comments_response([], 1, 1))
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: empty_page_size + 5)
 
     result = json.loads(jira.jira_list_comments("ENG-1"))
 
     assert result["status"] == "success"
     assert result["comments"] == []
-    assert result["next_start_at"] == 0
+    assert result["next_start_at"] == 1
+    assert result["next_start_at"] != 0  # must not equal start_at (the default 0)
+
+
+def test_fit_comments_page_advances_past_a_single_unfittable_comment():
+    # A single comment that doesn't fit even alone, preceded by a
+    # malformed (non-dict) raw entry -- next_start_at must skip past the
+    # unfittable comment's own raw position (offset + 2), not just the
+    # malformed entry's, and must never equal offset (a caller
+    # mechanically resuming from it would otherwise re-fetch this exact
+    # position forever).
+    raw_comments = ["not-a-dict", {"id": "1", "body": "x" * 50}]
+    offset = 10
+    empty_page_size = len(jira._build_comments_response([], 5, offset + 2))
+
+    response = jira._fit_comments_page(
+        raw_comments, offset, 5, False, empty_page_size + 5
+    )
+
+    assert response is not None
+    result = json.loads(response)
+    assert result["comments"] == []
+    assert result["next_start_at"] == offset + 2
+    assert result["next_start_at"] != offset
 
 
 def test_list_comments_next_start_at_counts_raw_page_not_filtered(monkeypatch):
@@ -1301,6 +1336,33 @@ def test_list_comments_surfaces_restricted_visibility(monkeypatch):
         "type": "role",
         "value": "Administrators",
     }
+
+
+def test_list_comments_surfaces_jsd_internal_flag_with_no_visibility_set(monkeypatch):
+    # Jira Service Management marks a comment internal-only via
+    # jsdPublic, a mechanism separate from (and not mirrored into)
+    # visibility -- a JSM agent can mark a comment internal with no
+    # visibility restriction set at all, so visibility alone would
+    # silently report it as public.
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={
+                    "comments": [
+                        {"id": "1", "body": "agent-only note", "jsdPublic": False}
+                    ],
+                    "total": 1,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_comments("ENG-1"))
+
+    assert result["comments"][0]["visibility"] is None
+    assert result["comments"][0]["jsd_public"] is False
 
 
 def test_get_issue_requests_exact_field_list(monkeypatch):
@@ -1381,7 +1443,7 @@ def test_get_issue_caps_an_oversized_extra_field_value(monkeypatch):
     value = result["issue"]["extra_field_values"]["customfield_10099"]
     assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
     assert value.endswith("[truncated]")
-    assert result["issue"]["extra_field_values_truncated"] is True
+    assert result["extra_field_values_truncated"] is True
 
 
 def test_get_issue_flattens_and_caps_an_adf_shaped_extra_field(monkeypatch):
@@ -1425,7 +1487,7 @@ def test_get_issue_flattens_and_caps_an_adf_shaped_extra_field(monkeypatch):
     value = result["issue"]["extra_field_values"]["customfield_10050"]
     assert isinstance(value, str)
     assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
-    assert result["issue"]["extra_field_values_truncated"] is True
+    assert result["extra_field_values_truncated"] is True
 
 
 def test_get_issue_caps_an_oversized_list_shaped_extra_field(monkeypatch):
@@ -1453,7 +1515,7 @@ def test_get_issue_caps_an_oversized_list_shaped_extra_field(monkeypatch):
     value = result["issue"]["extra_field_values"]["customfield_10060"]
     assert isinstance(value, str)
     assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
-    assert result["issue"]["extra_field_values_truncated"] is True
+    assert result["extra_field_values_truncated"] is True
 
 
 def test_path_segment_rejects_bare_dot_segments():
@@ -1466,6 +1528,31 @@ def test_path_segment_rejects_bare_dot_segments():
     with pytest.raises(ValueError):
         jira._path_segment("..")
     assert jira._path_segment("ENG-1") == "ENG-1"
+
+
+def test_path_segment_rejects_blank_or_padded_values():
+    # An empty issue_key (e.g. an unresolved templated variable from an
+    # LLM caller) would otherwise silently build /rest/api/2/issue/,
+    # hitting the issue-collection endpoint instead of a clear local
+    # error naming the actual mistake.
+    with pytest.raises(ValueError):
+        jira._path_segment("")
+    with pytest.raises(ValueError):
+        jira._path_segment(" ENG-1")
+    with pytest.raises(ValueError):
+        jira._path_segment("ENG-1 ")
+
+
+def test_get_issue_rejects_a_blank_issue_key(monkeypatch):
+    # _path_segment raises before _request ever makes a network call --
+    # no site-resolution call happens either.
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue(""))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_get_issue_response_always_has_a_truncated_key(monkeypatch):
@@ -1487,6 +1574,40 @@ def test_get_issue_response_always_has_a_truncated_key(monkeypatch):
     result = json.loads(jira.jira_get_issue("ENG-1"))
 
     assert result["truncated"] is False
+
+
+def test_get_issue_extra_field_values_truncated_survives_capped_dict_fallback(
+    monkeypatch,
+):
+    # Nested inside `issue`, this flag could be dropped by
+    # success_with_capped_dict's phase-2 key-dropping along with
+    # extra_field_values itself -- routed as a top-level field instead
+    # (matching how description_truncated is already protected), it
+    # must survive even when the fallback shrinks `issue` down to just
+    # its id.
+    long_value = "x" * (jira._ISSUE_DESCRIPTION_MAX_CHARS + 500)
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_10099": long_value},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 200)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 200)
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_10099"))
+
+    assert result["status"] == "success"
+    assert "extra_field_values" not in result.get("issue", {})
+    assert result["extra_field_values_truncated"] is True
 
 
 def test_flatten_adf_mention_falls_back_to_account_id_without_text():

@@ -116,7 +116,7 @@ class TestSearchDense:
                 is_admin=True,
             )
 
-    def test_search_dense_success_path(self, make_handle, routed_facade):
+    def test_search_dense_success_path(self, make_handle, routed_coordinator):
         """Test successful search_dense execution through the routed handle.
 
         Re-pointed (#511): the public ``search_dense`` now runs the real handle
@@ -141,7 +141,7 @@ class TestSearchDense:
             }
         ]
 
-        with routed_facade(search_dense_module, handle):
+        with routed_coordinator(search_dense_module, handle):
             response = search_dense(
                 collection="test_collection",
                 model_tag="test_model",
@@ -166,7 +166,7 @@ class TestSearchDense:
         assert kwargs["top_k"] == 5
         assert kwargs["is_admin"] is True
 
-    def test_search_dense_validation_fallback(self, make_handle, routed_facade):
+    def test_search_dense_validation_fallback(self, make_handle, routed_coordinator):
         """Test search_dense returns cleanly when the store yields no rows."""
         search_dense_module = self._patch_search_dense_module()
         handle, store, _ = make_handle()
@@ -175,7 +175,7 @@ class TestSearchDense:
         )
         store.search_vectors_by_model.return_value = []
 
-        with routed_facade(search_dense_module, handle):
+        with routed_coordinator(search_dense_module, handle):
             response = search_dense(
                 collection="test_collection",
                 model_tag="test_model",
@@ -193,7 +193,7 @@ class TestSearchDense:
             store.search_vectors_by_model.call_args.kwargs["model_tag"] == "test_model"
         )
 
-    def test_search_dense_index_status_mapping(self, make_handle, routed_facade):
+    def test_search_dense_index_status_mapping(self, make_handle, routed_coordinator):
         """Test index status mapping in search_dense via the routed handle."""
         search_dense_module = self._patch_search_dense_module()
 
@@ -213,7 +213,7 @@ class TestSearchDense:
             )
             store.search_vectors_by_model.return_value = []
 
-            with routed_facade(search_dense_module, handle):
+            with routed_coordinator(search_dense_module, handle):
                 response = search_dense(
                     "col", "model", [1.0], top_k=1, user_id=None, is_admin=True
                 )

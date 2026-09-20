@@ -39,6 +39,28 @@ def test_require_clean_identifier_rejects_non_string():
         utils.require_clean_identifier(12345, "record_id")
 
 
+def test_require_clean_text_rejects_empty_and_whitespace():
+    with pytest.raises(ValueError, match="summary"):
+        utils.require_clean_text("", "summary")
+    with pytest.raises(ValueError, match="summary"):
+        utils.require_clean_text("  padded  ", "summary")
+    assert utils.require_clean_text("Fix the bug", "summary") == "Fix the bug"
+
+
+def test_require_clean_text_rejects_non_string():
+    with pytest.raises(ValueError, match="summary"):
+        utils.require_clean_text(12345, "summary")
+
+
+def test_require_clean_text_message_does_not_call_the_field_an_id():
+    # The whole point of this helper (vs. require_clean_identifier) is a
+    # message phrased for a human-facing field like a title or name, not an
+    # id -- regressing back to "id" wording defeats that.
+    with pytest.raises(ValueError) as excinfo:
+        utils.require_clean_text("", "summary")
+    assert "id" not in str(excinfo.value)
+
+
 def test_url_path_id_percent_encodes_reserved_characters():
     # A literal ".." blocklist misses "/" and "?", which redirect the
     # request to a different endpoint or inject query params without ever

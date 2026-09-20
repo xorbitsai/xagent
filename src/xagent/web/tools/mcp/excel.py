@@ -124,11 +124,30 @@ def _site_segment(site_id: str) -> str:
     if site_id != site_id.strip():
         raise ValueError("site_id must not have leading or trailing whitespace")
     value = site_id
-    if any(segment in (".", "..", "") for segment in value.split("/")):
+    if ":/" not in value:
+        if "/" in value or ":" in value:
+            raise ValueError(
+                "site_id must be 'root', a composite id, or a "
+                "hostname:/server-relative-path value"
+            )
+        return quote(value, safe=",")
+
+    if value.count(":/") != 1:
+        raise ValueError("site_id contains more than one hostname/path separator")
+    hostname, relative_path = value.split(":/", 1)
+    terminated = relative_path.endswith(":")
+    if terminated:
+        relative_path = relative_path[:-1]
+    if not hostname or not relative_path or ":" in hostname or ":" in relative_path:
+        raise ValueError("site_id has an invalid hostname/path form")
+    segments = relative_path.split("/")
+    if any(segment in (".", "..", "") for segment in segments):
         raise ValueError(
             f"site_id must not contain '.', '..', or empty segments: {site_id!r}"
         )
-    return quote(value, safe=":/,")
+    encoded_path = "/".join(quote(segment, safe="") for segment in segments)
+    suffix = ":" if terminated else ""
+    return f"{quote(hostname, safe='')}:/{encoded_path}{suffix}"
 
 
 def _normalize_relative_path(path: str) -> str:
@@ -193,7 +212,9 @@ def _odata_key_segment(collection: str, value: str) -> str:
     worksheet or table addressed by either its Graph id or its display name
     -- Graph accepts both interchangeably in this form.
     """
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str):
+        raise TypeError(f"{collection} identifier must be a string")
+    if not value.strip():
         raise ValueError(f"{collection} identifier is required")
     escaped = value.replace("'", "''")
     return f"{collection}('{quote(escaped, safe='')}')"
@@ -432,6 +453,8 @@ def excel_clear_range(
     "Formats", or "Contents" (default: clears cell values only, keeping
     formatting)."""
     try:
+        if not isinstance(apply_to, str):
+            raise TypeError("apply_to must be a string")
         if apply_to not in _VALID_CLEAR_APPLY_TO:
             raise ValueError(
                 f"apply_to must be one of {sorted(_VALID_CLEAR_APPLY_TO)}, got {apply_to!r}"
@@ -466,6 +489,8 @@ def excel_get_used_range(
     with a value or formatting. values_only=True considers only cells with
     values (ignoring formatting-only cells)."""
     try:
+        if not isinstance(values_only, bool):
+            raise TypeError("values_only must be a boolean")
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("worksheets", worksheet)
         path = f"{base}/{segment}/usedRange"
@@ -524,6 +549,8 @@ def excel_add_table(
     worksheet name, e.g. "Sheet1!A1:D5". has_headers indicates whether the
     range's first row already contains column headers."""
     try:
+        if not isinstance(has_headers, bool):
+            raise TypeError("has_headers must be a boolean")
         base = _workbook_base(file_path, site_id, drive_id)
         body = {"address": address, "hasHeaders": has_headers}
         result = _graph_request("POST", f"{base}/tables/add", body=body)

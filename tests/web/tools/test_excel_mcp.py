@@ -160,6 +160,19 @@ def test_site_segment_rejects_empty_segment():
         excel._site_segment("contoso.sharepoint.com:/a//b")
 
 
+@pytest.mark.parametrize("site_id", ["foo/bar", "foo:bar", "host:/a:/b"])
+def test_site_segment_rejects_malformed_structural_delimiters(site_id):
+    with pytest.raises(ValueError, match="site_id"):
+        excel._site_segment(site_id)
+
+
+def test_site_segment_encodes_each_path_component_without_losing_structure():
+    assert (
+        excel._site_segment("contoso.sharepoint.com:/teams/Finance & Legal")
+        == "contoso.sharepoint.com:/teams/Finance%20%26%20Legal"
+    )
+
+
 def test_odata_key_segment_escapes_quote():
     assert (
         excel._odata_key_segment("worksheets", "O'Brien")
@@ -419,6 +432,14 @@ def test_clear_range_validates_apply_to():
     assert "apply_to must be one of" in result["message"]
 
 
+def test_clear_range_rejects_non_string_apply_to():
+    result = json.loads(
+        excel.excel_clear_range("book.xlsx", "Sheet1", "A1:B1", apply_to=["Contents"])
+    )
+    assert result["status"] == "error"
+    assert "apply_to must be a string" in result["message"]
+
+
 def test_clear_range_success(monkeypatch):
     mock_request = Mock(return_value=MockResponse({}, status_code=204, content=b""))
     monkeypatch.setattr(excel.requests, "request", mock_request)
@@ -457,6 +478,19 @@ def test_get_used_range_with_values_only(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["url"].endswith("usedRange(valuesOnly=true)")
+
+
+def test_get_used_range_rejects_non_boolean_values_only(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_get_used_range("book.xlsx", "Sheet1", values_only="false")
+    )
+
+    assert result["status"] == "error"
+    assert "values_only must be a boolean" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_get_used_range_caps_oversized_response(monkeypatch):
@@ -517,6 +551,19 @@ def test_add_table_sends_address_and_has_headers(monkeypatch):
     kwargs = mock_request.call_args.kwargs
     assert kwargs["url"].endswith("/workbook/tables/add")
     assert kwargs["json"] == {"address": "Sheet1!A1:C5", "hasHeaders": True}
+
+
+def test_add_table_rejects_non_boolean_has_headers(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_add_table("book.xlsx", "Sheet1!A1:C5", has_headers="false")
+    )
+
+    assert result["status"] == "error"
+    assert "has_headers must be a boolean" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_list_table_rows_success(monkeypatch):

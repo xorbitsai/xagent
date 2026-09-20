@@ -127,6 +127,66 @@ def test_build_assignments_rejects_malformed_user_id():
         planner._build_assignments([" user-1 "])
 
 
+def test_bounded_list_response_projects_all_items_and_preserves_next_link(
+    monkeypatch,
+):
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: 12_000)
+    assignments = {
+        f"user-{index:02d}": {"@odata.type": "#microsoft.graph.plannerAssignment"}
+        for index in range(20)
+    }
+    tasks = [
+        {
+            "id": f"task-{index:02d}",
+            "title": f"Task {index}",
+            "planId": "plan-1",
+            "bucketId": "bucket-1",
+            "assignments": assignments,
+            "percentComplete": 0,
+            "largeFutureField": "x" * 500,
+        }
+        for index in range(30)
+    ]
+    server_next_link = f"{planner.GRAPH_BASE_URL}/me/planner/tasks?%24skiptoken=next"
+
+    response = planner._bounded_list_response(
+        "tasks",
+        tasks,
+        next_link=server_next_link,
+        retry_next_link=None,
+    )
+    result = json.loads(response)
+
+    assert len(response) <= 12_000
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["projection"] == "summary_fields"
+    assert len(result["tasks"]) == len(tasks)
+    assert result["tasks"][0]["assignee_count"] == 20
+    assert "assignments" not in result["tasks"][0]
+    assert result["next_link"] == server_next_link
+
+
+def test_bounded_list_response_does_not_advance_when_page_cannot_fit(monkeypatch):
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: 300)
+    current_page = f"{planner.GRAPH_BASE_URL}/me/planner/tasks?%24skiptoken=current"
+    server_next_page = f"{planner.GRAPH_BASE_URL}/me/planner/tasks?%24skiptoken=next"
+    tasks = [{"id": f"task-{index}", "title": "x" * 256} for index in range(50)]
+
+    response = planner._bounded_list_response(
+        "tasks",
+        tasks,
+        next_link=server_next_page,
+        retry_next_link=current_page,
+    )
+    result = json.loads(response)
+
+    assert len(response) <= 300
+    assert result["status"] == "error"
+    assert result["retry_next_link"] == current_page
+    assert result.get("retry_next_link") != server_next_page
+
+
 def test_resolve_list_path_defaults_when_no_next_link():
     assert planner._resolve_list_path("/planner/plans/plan-1/tasks", None) == (
         "/planner/plans/plan-1/tasks"

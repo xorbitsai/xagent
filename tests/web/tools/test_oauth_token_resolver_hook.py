@@ -2209,6 +2209,38 @@ async def test_hook_ignores_bare_meta_token_for_app_scoped_facebook(db_session):
 
 
 @pytest.mark.asyncio
+async def test_hook_ignores_bare_microsoft_token_for_planner(db_session):
+    db, user = db_session
+    server = _add_oauth_server(
+        db,
+        user,
+        name="Planner",
+        app_id="planner",
+        provider="microsoft",
+        launch_config=_launch_config(env_key="AUTH_TOKEN"),
+    )
+    seen_providers: list[str] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        seen_providers.append(request.provider)
+        if request.provider == "microsoft":
+            return ResolvedToken(
+                access_token="bare-microsoft-hook-token", expires_at=None
+            )
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert seen_providers == ["planner"]
+    _assert_unavailable_mcp_config(
+        configs[0], server, reason="oauth_token_required", oauth_token_required=True
+    )
+
+
+@pytest.mark.asyncio
 async def test_hook_still_accepts_bare_meta_token_for_instagram(db_session):
     """Negative counterpart to the Facebook filtering test above: Instagram is
     deliberately absent from APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT (its

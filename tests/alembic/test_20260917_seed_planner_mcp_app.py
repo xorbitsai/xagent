@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -70,6 +71,7 @@ def test_upgrade_inserts_planner(tmp_path):
         assert row[0] == "oauth"
         assert row[1] == "microsoft"
         assert "xagent.web.tools.mcp.planner" in str(row[2])
+        assert "builtin_provenance" in str(row[2])
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -109,33 +111,47 @@ def test_downgrade_removes_planner(tmp_path):
         assert "planner" not in _app_ids(connection)
 
 
-def test_downgrade_preserves_operator_modified_row(tmp_path):
-    """downgrade() must not delete a row that no longer matches the
-    snapshot this migration seeded -- an operator could have hand-edited
-    it (or hand-created a different app under the same app_id before
-    upgrade() ever ran, since upgrade() no-ops on that collision)."""
+def test_upgrade_rejects_unmarked_existing_planner_row(tmp_path):
+    """A custom row cannot be silently reclassified as the builtin Planner."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
         _create_table(connection)
-        with patch.object(migration, "op", _operations(connection)):
-            migration.upgrade()
-            connection.execute(
-                text(
-                    "UPDATE public_mcp_apps SET name='Custom Planner' "
-                    "WHERE app_id='planner'"
-                )
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) VALUES "
+                "('planner', 'Custom Planner', 'stdio', '{}')"
             )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="no matching builtin_provenance"):
+                migration.upgrade()
+        assert "planner" in _app_ids(connection)
+
+
+def test_downgrade_preserves_row_without_planner_provenance(tmp_path):
+    """Rollback deletes only the row carrying this migration's ownership marker."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) VALUES "
+                "('planner', 'Planner', 'oauth', "
+                '\'{"builtin_provenance": {"registry": "custom", '
+                '"app_id": "planner", "version": 1}}\')'
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()
         assert "planner" in _app_ids(connection)
 
 
 def test_downgrade_skips_delete_when_snapshot_columns_missing(tmp_path):
-    """downgrade() must skip the delete entirely (never fall back to
-    app_id-only matching, and never run a delete with zero WHERE
-    conditions -- sa.delete(table).where() with no conditions compiles to
-    an unconditional DELETE FROM public_mcp_apps) when none of
-    name/description/transport exist on the live table."""
+    """downgrade() must skip deletion without ownership columns."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -161,11 +177,7 @@ def test_downgrade_skips_delete_when_snapshot_columns_missing(tmp_path):
 
 
 def test_downgrade_skips_delete_when_only_app_id_column_present(tmp_path):
-    """A table with app_id but none of name/description/transport must not
-    fall back to matching on app_id alone -- that's exactly the coincidence
-    the multi-column snapshot guard exists to rule out (it would delete an
-    operator's own row hand-created under the same app_id before this
-    migration ever ran)."""
+    """A table with app_id but no provenance storage must fail closed."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:

@@ -27,7 +27,7 @@ from xagent.web.mcp_apps import requires_app_scoped_oauth_grant
 # pinned here so a regression in any of them -- not just whatsapp -- is
 # caught the same way.
 _EXPECTED_APP_SCOPED_APPS = frozenset(
-    {"facebook", "github", "myob", "meta-ads", "whatsapp"}
+    {"facebook", "github", "myob", "meta-ads", "planner", "whatsapp"}
 )
 
 
@@ -61,3 +61,17 @@ def test_whatsapp_scopes_actually_exceed_the_meta_providers_default_scopes():
         "this test (and the set) should be updated together, not left to "
         "silently drift."
     )
+
+
+def test_planner_scopes_exceed_the_microsoft_providers_default_scopes():
+    provider_default_scopes = {
+        row["provider_name"]: set(row.get("default_scopes") or [])
+        for row in get_builtin_oauth_provider_rows()
+    }
+    planner = next(
+        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "planner"
+    )
+
+    assert set(planner["oauth_scopes"]) - provider_default_scopes["microsoft"] == {
+        "Tasks.ReadWrite"
+    }

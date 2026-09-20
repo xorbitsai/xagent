@@ -735,7 +735,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "planner",
             "name": "Planner",
-            "description": "Connect to Microsoft Planner to manage plans, buckets, and tasks, including checklists and assignments.",
+            "description": "Connect a Microsoft 365 work or school account to manage basic Planner plans, buckets, and tasks, including checklists and assignments. Personal Microsoft accounts and Premium plans are not supported.",
             "icon": "https://www.google.com/s2/favicons?domain=tasks.office.com&sz=128",
             "transport": "oauth",
             "provider_name": "microsoft",
@@ -746,6 +746,11 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.planner"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "planner",
+                    "version": 1,
+                },
             },
         },
         {

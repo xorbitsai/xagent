@@ -1201,6 +1201,38 @@ def test_shopify_foreign_provenance_is_not_owned_but_is_reported() -> None:
             pass
 
 
+def test_unmarked_planner_catalog_collision_keeps_custom_execution_fields() -> None:
+    """An operator-owned app_id collision must not receive builtin execution."""
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+    )
+    from xagent.web.mcp_apps import _app_to_dict
+
+    custom_launch = {
+        "command": "custom-planner",
+        "args": ["--serve"],
+        "required_env": ["CUSTOM_TOKEN"],
+    }
+    custom = PublicMCPApp(
+        app_id="planner",
+        name="Internal Planning",
+        description="Operator-owned planning connector",
+        transport="stdio",
+        provider_name=None,
+        category="Custom",
+        oauth_scopes=None,
+        is_visible_in_connector=True,
+        launch_config=custom_launch,
+    )
+
+    assert _persisted_builtin_provenance_matches("planner", custom_launch) is False
+    projected = _app_to_dict(custom)
+    assert projected["name"] == "Internal Planning"
+    assert projected["transport"] == "stdio"
+    assert projected["provider"] is None
+    assert projected["launch_config"] == custom_launch
+
+
 def test_init_db_logs_safe_builtin_registry_drift_without_repairing(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

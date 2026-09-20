@@ -9,6 +9,7 @@ from urllib.parse import unquote
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from .utils import require_clean_identifier, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +59,125 @@ def _conflict(message: str) -> str:
     return json.dumps(
         {"status": "conflict_stale_version", "message": message}, ensure_ascii=False
     )
+
+
+_LIST_PROJECTION_FIELDS: dict[str, tuple[str, ...]] = {
+    "plans": ("id", "title", "owner", "createdDateTime"),
+    "buckets": ("id", "name", "planId", "orderHint"),
+    "tasks": (
+        "id",
+        "title",
+        "planId",
+        "bucketId",
+        "percentComplete",
+        "priority",
+        "startDateTime",
+        "dueDateTime",
+        "completedDateTime",
+        "hasDescription",
+        "activeChecklistItemCount",
+        "checklistItemCount",
+        "referenceCount",
+        "previewType",
+        "createdDateTime",
+    ),
+}
+
+
+def _bounded_list_response(
+    list_field: str,
+    items: Any,
+    *,
+    next_link: Any,
+    retry_next_link: str | None,
+) -> str:
+    """Return one complete Graph page without letting the output filter cut JSON.
+
+    The unmodified page is preferred. If it is too large, every item is kept
+    but projected to the stable summary fields useful in a list view; task
+    assignments become a count and can be fetched in full with
+    ``planner_get_task``. If even a minimal identity/title projection cannot
+    fit, return a valid error that points back to the current page rather than
+    advancing to Graph's next page and silently skipping records.
+    """
+    if not isinstance(items, list):
+        raise RuntimeError("Planner returned a non-list value collection")
+    if next_link is not None and not isinstance(next_link, str):
+        raise RuntimeError("Planner returned an invalid @odata.nextLink")
+    if list_field not in _LIST_PROJECTION_FIELDS:
+        raise ValueError(f"unsupported Planner list field: {list_field}")
+
+    max_output_length = get_tool_max_output_length()
+
+    def _serialize(values: list[Any], *, truncated: bool, mode: str | None) -> str:
+        payload: dict[str, Any] = {
+            "status": "success",
+            list_field: values,
+            "next_link": next_link,
+            "truncated": truncated,
+        }
+        if mode is not None:
+            payload["projection"] = mode
+        return json.dumps(payload, ensure_ascii=False)
+
+    response = _serialize(items, truncated=False, mode=None)
+    if len(response) <= max_output_length:
+        return response
+
+    fields = _LIST_PROJECTION_FIELDS[list_field]
+    projected: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            projected.append(item)
+            continue
+        summary = {field: item[field] for field in fields if field in item}
+        if list_field == "tasks" and isinstance(item.get("assignments"), dict):
+            summary["assignee_count"] = len(item["assignments"])
+        projected.append(summary)
+
+    response = _serialize(projected, truncated=True, mode="summary_fields")
+    if len(response) <= max_output_length:
+        return response
+
+    label_field = "name" if list_field == "buckets" else "title"
+    compact: list[Any] = []
+    for item in projected:
+        if not isinstance(item, dict):
+            compact.append(item)
+            continue
+        identity = {"id": item["id"]} if "id" in item else {}
+        label = item.get(label_field)
+        if isinstance(label, str):
+            identity[label_field] = label[:256]
+        compact.append(identity)
+
+    response = _serialize(compact, truncated=True, mode="identity_and_label")
+    if len(response) <= max_output_length:
+        return response
+
+    error_payloads = (
+        {
+            "status": "error",
+            "message": (
+                "This Planner page cannot fit the configured output limit even "
+                "after projection; increase TOOL_MAX_OUTPUT_LENGTH and retry the "
+                "same page. No records from this page were returned."
+            ),
+            "retry_next_link": retry_next_link,
+            "retry_same_page": True,
+        },
+        {
+            "status": "error",
+            "message": "Planner page exceeds the output limit; retry the same page.",
+            "retry_next_link": retry_next_link,
+        },
+        {"status": "error"},
+    )
+    for payload in error_payloads:
+        response = json.dumps(payload, ensure_ascii=False)
+        if len(response) <= max_output_length:
+            return response
+    return json.dumps({"status": "error"}, ensure_ascii=False)
 
 
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -272,8 +392,11 @@ def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
             f"/groups/{url_path_id(group_id, 'group_id')}/planner/plans", next_link
         )
         result = _graph_request("GET", path)
-        return _success(
-            plans=result.get("value", []), next_link=result.get("@odata.nextLink")
+        return _bounded_list_response(
+            "plans",
+            result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+            retry_next_link=next_link,
         )
     except Exception as e:
         logger.error("Error listing Planner plans for group %s: %s", group_id, e)
@@ -327,8 +450,11 @@ def planner_list_buckets(plan_id: str, next_link: str | None = None) -> str:
             f"/planner/plans/{url_path_id(plan_id, 'plan_id')}/buckets", next_link
         )
         result = _graph_request("GET", path)
-        return _success(
-            buckets=result.get("value", []), next_link=result.get("@odata.nextLink")
+        return _bounded_list_response(
+            "buckets",
+            result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+            retry_next_link=next_link,
         )
     except Exception as e:
         logger.error("Error listing Planner buckets for plan %s: %s", plan_id, e)
@@ -365,8 +491,11 @@ def planner_list_tasks(plan_id: str, next_link: str | None = None) -> str:
             f"/planner/plans/{url_path_id(plan_id, 'plan_id')}/tasks", next_link
         )
         result = _graph_request("GET", path)
-        return _success(
-            tasks=result.get("value", []), next_link=result.get("@odata.nextLink")
+        return _bounded_list_response(
+            "tasks",
+            result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+            retry_next_link=next_link,
         )
     except Exception as e:
         logger.error("Error listing Planner tasks for plan %s: %s", plan_id, e)
@@ -382,8 +511,11 @@ def planner_list_my_tasks(next_link: str | None = None) -> str:
     try:
         path = _resolve_list_path("/me/planner/tasks", next_link)
         result = _graph_request("GET", path)
-        return _success(
-            tasks=result.get("value", []), next_link=result.get("@odata.nextLink")
+        return _bounded_list_response(
+            "tasks",
+            result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+            retry_next_link=next_link,
         )
     except Exception as e:
         logger.error("Error listing the signed-in user's Planner tasks: %s", e)

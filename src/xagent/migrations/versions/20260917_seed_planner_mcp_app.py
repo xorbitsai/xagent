@@ -12,6 +12,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.builtin_identity import builtin_provenance_identity
+
 logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
@@ -35,11 +37,16 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 )
 
 APP_ID = "planner"
+BUILTIN_PROVENANCE = {
+    "registry": "xagent",
+    "app_id": APP_ID,
+    "version": 1,
+}
 
 ROW = {
     "app_id": APP_ID,
     "name": "Planner",
-    "description": "Connect to Microsoft Planner to manage plans, buckets, and tasks, including checklists and assignments.",
+    "description": "Connect a Microsoft 365 work or school account to manage basic Planner plans, buckets, and tasks, including checklists and assignments. Personal Microsoft accounts and Premium plans are not supported.",
     "icon": "https://www.google.com/s2/favicons?domain=tasks.office.com&sz=128",
     "transport": "oauth",
     "provider_name": "microsoft",
@@ -50,8 +57,15 @@ ROW = {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.planner"],
         "env_mapping": {"AUTH_TOKEN": "access_token"},
+        "builtin_provenance": BUILTIN_PROVENANCE,
     },
 }
+
+
+def _has_provenance(launch_config: object) -> bool:
+    return isinstance(launch_config, dict) and builtin_provenance_identity(
+        launch_config.get("builtin_provenance")
+    ) == builtin_provenance_identity(BUILTIN_PROVENANCE)
 
 
 def upgrade() -> None:
@@ -61,9 +75,30 @@ def upgrade() -> None:
         return
 
     columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
-    existing = set(bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars())
-    if APP_ID in existing:
-        return
+    if "launch_config" not in columns:
+        raise RuntimeError(
+            "Cannot seed builtin Planner identity: "
+            "public_mcp_apps.launch_config is required for provenance"
+        )
+
+    existing = (
+        bind.execute(
+            sa.select(
+                PUBLIC_MCP_APPS_TABLE.c.app_id,
+                PUBLIC_MCP_APPS_TABLE.c.launch_config,
+            ).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if existing is not None:
+        if _has_provenance(existing["launch_config"]):
+            return
+        raise RuntimeError(
+            "Cannot seed builtin Planner connector: an existing "
+            "public_mcp_apps row with app_id='planner' has no matching "
+            "builtin_provenance"
+        )
 
     dropped_keys = sorted(set(ROW) - columns)
     if dropped_keys:
@@ -83,28 +118,20 @@ def downgrade() -> None:
     if "public_mcp_apps" not in set(inspector.get_table_names()):
         return
     columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
-    # Only delete a row that still looks like the one this migration seeded
-    # (matched on name/description/transport, not just app_id): an operator
-    # could have hand-created a custom app under this same free-form app_id
-    # before this migration ever ran (upgrade() no-ops on that collision
-    # rather than overwriting it), and an unconditional delete-by-app_id here
-    # would then destroy that unrelated row on a later rollback.
-    #
-    # All three snapshot columns must exist before matching on any of them:
-    # partial matching (e.g. app_id alone) is exactly the coincidence this
-    # guard exists to rule out, and sa.delete(...).where() with zero
-    # conditions compiles to an unconditional DELETE FROM public_mcp_apps.
-    if not {"name", "description", "transport"}.issubset(columns):
+    if not {"app_id", "launch_config"}.issubset(columns):
         return
     # Only the catalog entry is removed. The shared "microsoft" oauth_providers
     # row is left untouched since it is reused by Outlook/Teams/OneDrive. Any
     # MCPServer/UserMCPServer rows created by users who already connected are
     # intentionally left in place -- connect-driven rows are not owned by
     # this migration and are cleaned up through the normal disconnect path.
+    existing = bind.execute(
+        sa.select(PUBLIC_MCP_APPS_TABLE.c.launch_config).where(
+            PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
+        )
+    ).scalar_one_or_none()
+    if not _has_provenance(existing):
+        return
     bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE)
-        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        .where(PUBLIC_MCP_APPS_TABLE.c.name == ROW["name"])
-        .where(PUBLIC_MCP_APPS_TABLE.c.description == ROW["description"])
-        .where(PUBLIC_MCP_APPS_TABLE.c.transport == ROW["transport"])
+        sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
     )

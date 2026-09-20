@@ -61,8 +61,13 @@ from .models.public_mcp import PublicMCPApp
 # default_scopes, and the connector is brand new (no pre-existing bare
 # "meta" grant could ever have carried them), so a bare connect must never
 # be treated as satisfying it.
+#
+# planner: the shared Microsoft provider requests only User.Read, while the
+# Planner app requires Tasks.ReadWrite. A bare Microsoft login must not batch
+# connect Planner or satisfy its runtime token lookup with that under-scoped
+# provider grant.
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
-    {"facebook", "github", "myob", "meta-ads", "whatsapp"}
+    {"facebook", "github", "myob", "meta-ads", "planner", "whatsapp"}
 )
 
 

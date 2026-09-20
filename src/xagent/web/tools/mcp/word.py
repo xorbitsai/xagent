@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import os
+import zipfile
 from typing import Any
 from urllib.parse import quote
 
@@ -39,12 +40,21 @@ _WORD_MIME_TYPE = (
 # to enforce -- unlike onedrive_upload_file/sharepoint_upload_file, which
 # upload a real local file a caller points at.
 #
-# A caller-supplied file_path is downloaded, and its full uncompressed
-# bytes handed to python-docx's ZIP/XML parser, before any check runs on
-# the result -- an unbounded download here means an unbounded parse too.
-# Matches sharepoint.py's identical _MAX_DOWNLOAD_BYTES/_read_capped_content
-# guard on the same hazard for its own document downloads.
+# Bounds the compressed bytes read off the wire (see _read_capped_content).
+# On its own this does not bound what python-docx's ZIP/XML parser expands
+# those bytes into -- a small, highly compressible .docx can still pass
+# this cap and exhaust memory once unpacked, which is what
+# _validate_docx_archive checks separately, before Document() unpacks
+# anything. Matches sharepoint.py's identical _MAX_DOWNLOAD_BYTES/
+# _read_capped_content guard on the compressed-size half of this hazard.
 _MAX_DOWNLOAD_BYTES = 10_000_000
+
+# The decompressed-size half of the same hazard: matches powerpoint.py's
+# identical _MAX_PRESENTATION_UNCOMPRESSED_BYTES/_MAX_PRESENTATION_PARTS
+# guard (via _validate_presentation_archive) for the same OOXML
+# ZIP-archive structure a .docx shares with a .pptx.
+_MAX_DECOMPRESSED_BYTES = 500_000_000
+_MAX_ARCHIVE_PARTS = 10_000
 
 # _upload_document sends the whole edited document in a single PUT to an
 # upload-session URL (not Graph's separate small-file content PUT), for
@@ -306,6 +316,30 @@ def _content_path(file_path: str, site_id: str | None, drive_id: str | None) -> 
     return f"{_item_path(file_path, site_id, drive_id)}/content"
 
 
+def _validate_docx_archive(content: bytes) -> None:
+    """Reject a .docx whose ZIP entries would expand far beyond what a
+    legitimate Word document needs, before Document() unpacks any of them.
+    _read_capped_content only bounds the compressed bytes read off the
+    wire; a small, highly compressible archive can still pass that check
+    and exhaust memory once decompressed. Matches powerpoint.py's identical
+    _validate_presentation_archive guard on the same OOXML ZIP-archive
+    structure."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            infos = archive.infolist()
+            if len(infos) > _MAX_ARCHIVE_PARTS:
+                raise ValueError(
+                    "The document contains too many OOXML parts to process safely"
+                )
+            expanded_size = sum(info.file_size for info in infos)
+            if expanded_size > _MAX_DECOMPRESSED_BYTES:
+                raise ValueError(
+                    "The document expands beyond the safe OOXML processing limit"
+                )
+    except zipfile.BadZipFile as exc:
+        raise ValueError("The file is not a valid Word document OOXML archive") from exc
+
+
 def _download_document(
     file_path: str, site_id: str | None, drive_id: str | None, *, need_etag: bool = True
 ) -> tuple[DocumentType, str | None]:
@@ -322,6 +356,7 @@ def _download_document(
     content = _graph_request(
         "GET", _content_path(file_path, site_id, drive_id), raw=True
     )
+    _validate_docx_archive(content)
     try:
         return Document(io.BytesIO(content)), etag
     except Exception as exc:

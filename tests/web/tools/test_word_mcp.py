@@ -1216,6 +1216,60 @@ def test_upload_document_rejects_oversized_content(monkeypatch):
         word._upload_document(document, "Report.docx", None, None)
 
 
+def test_validate_docx_archive_bounds_expanded_size(monkeypatch):
+    """_read_capped_content only bounds the compressed bytes read off the
+    wire -- a small, highly compressible archive can still pass that check
+    and exhaust memory once python-docx unpacks it. This is the separate,
+    decompressed-size guard that runs before that happens."""
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"x" * 100)
+    monkeypatch.setattr(word, "_MAX_DECOMPRESSED_BYTES", 50)
+
+    with pytest.raises(ValueError, match="expands beyond"):
+        word._validate_docx_archive(buffer.getvalue())
+
+
+def test_validate_docx_archive_bounds_part_count(monkeypatch):
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", b"x")
+        archive.writestr("word/extra.xml", b"x")
+    monkeypatch.setattr(word, "_MAX_ARCHIVE_PARTS", 1)
+
+    with pytest.raises(ValueError, match="too many"):
+        word._validate_docx_archive(buffer.getvalue())
+
+
+def test_validate_docx_archive_rejects_non_zip_content():
+    with pytest.raises(ValueError, match="not a valid Word document"):
+        word._validate_docx_archive(b"not a zip file")
+
+
+def test_get_document_text_rejects_zip_bomb(monkeypatch):
+    """End-to-end: a document that passes the compressed-size cap but
+    would expand far beyond a legitimate .docx is still refused before
+    python-docx ever unpacks it."""
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"x" * 1_000_000)
+    content = buffer.getvalue()
+    monkeypatch.setattr(word, "_MAX_DECOMPRESSED_BYTES", 100)
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_get_document_text("Report.docx"))
+
+    assert result["status"] == "error"
+    assert "expands beyond" in result["message"]
+
+
 def test_upload_document_sends_if_match_when_etag_given(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse({"uploadUrl": "https://upload.example/session"})

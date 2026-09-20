@@ -701,9 +701,12 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
     sibling of "issue", not nested inside it), so you can reach any
     field this tool doesn't summarize by name. An ADF-shaped (rich
     text) value is flattened to plain text first, matching description;
-    any resulting large value (text or otherwise) is capped the same
-    way, with extra_field_values_truncated set to true if any entry was
-    cut.
+    a value (of any type) still too large after that is turned into a
+    truncated JSON-text string instead -- so a list/dict-valued custom
+    field can come back as a string once it's cut, not its original
+    shape. extra_field_values_truncated is set to true if any entry was
+    cut, including one entirely omitted because too many fields were
+    requested to fit even a fair share of the output budget.
     Use this, not jira_search_issues, when you need an issue's
     dependencies or full description: issue_links/subtasks/description
     are only returned here. A description longer than
@@ -712,11 +715,21 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
     how large the real description is.
     """
     try:
+        # Jira's `fields` query param treats a leading "-" as "exclude
+        # this field" and "*" as a wildcard selector (e.g. "*all"), not
+        # just a literal field id -- passed through unfiltered, either
+        # could override the tool's own guaranteed default field set
+        # (e.g. extra_fields="-description" would suppress the very
+        # field this tool's docstring promises is always returned).
+        # Rejected the same way an already-default name is: silently
+        # dropped rather than erroring, since a caller only ever loses
+        # an invalid/malicious token, never a legitimate field id.
         requested_extra = [
-            name.strip() for name in extra_fields.split(",") if name.strip()
-        ]
-        requested_extra = [
-            name for name in requested_extra if name not in _GET_ISSUE_FIELD_NAMES
+            stripped
+            for name in extra_fields.split(",")
+            if (stripped := name.strip())
+            and stripped not in _GET_ISSUE_FIELD_NAMES
+            and not stripped.startswith(("-", "*"))
         ]
         fields_param = _GET_ISSUE_FIELDS
         if requested_extra:
@@ -738,13 +751,13 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
         # touches `issue` itself, so a flag (or extra_field_values
         # itself) nested inside it could be dropped along with the data
         # it describes by the very shrink pass it exists to signal --
-        # exactly when the signal matters most. Keeping extra_field_
-        # values here too (not just its truncated flag) matters doubly:
-        # each value is already capped above, so its total footprint is
-        # bounded, and shrinking it via the generic pass would collapse
-        # it to {} in a single step regardless (halving a dict shrinks
-        # its KEY COUNT, so a single-key dict has nowhere to go but
-        # empty, unlike a list, which degrades gradually).
+        # exactly when the signal matters most. This also means nothing
+        # else ever shrinks extra_field_values gradually, so it needs
+        # its own aggregate cap below: each value is capped
+        # individually by _cap_extra_field_value, but that alone doesn't
+        # bound the total -- two ordinary custom fields near that
+        # per-field cap can already exceed a default-sized output
+        # budget on their own, before `issue` is even considered.
         top_level_extra: dict[str, Any] = {
             "description_truncated": description_truncated
         }
@@ -752,14 +765,29 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
             raw_fields = _as_dict(result.get("fields"))
             extra_field_values: dict[str, Any] = {}
             extra_field_values_truncated = False
+            # Half the configured budget (but never less than a single
+            # field's own cap, so requesting just one field still gets
+            # the full _ISSUE_DESCRIPTION_MAX_CHARS it always has),
+            # reserved for the combined extra_field_values dict -- this
+            # leaves the other half for `issue` and the rest of the
+            # envelope under the default budget, and bounds the
+            # aggregate proportionately for a differently-configured one.
+            remaining_budget = max(
+                get_tool_max_output_length() // 2, _ISSUE_DESCRIPTION_MAX_CHARS
+            )
             for name in requested_extra:
+                if remaining_budget <= 0:
+                    extra_field_values_truncated = True
+                    break
                 value, was_truncated = _cap_extra_field_value(
-                    raw_fields.get(name), _ISSUE_DESCRIPTION_MAX_CHARS
+                    raw_fields.get(name),
+                    min(_ISSUE_DESCRIPTION_MAX_CHARS, remaining_budget),
                 )
                 extra_field_values[name] = value
                 extra_field_values_truncated = (
                     extra_field_values_truncated or was_truncated
                 )
+                remaining_budget -= len(json.dumps(value, ensure_ascii=False))
             top_level_extra["extra_field_values"] = extra_field_values
             top_level_extra["extra_field_values_truncated"] = (
                 extra_field_values_truncated

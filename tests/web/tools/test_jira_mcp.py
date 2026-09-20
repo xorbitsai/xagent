@@ -763,6 +763,72 @@ def test_get_issue_extra_fields_ignores_a_name_already_in_the_default_set(monkey
     assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
 
 
+def test_get_issue_bounds_the_aggregate_extra_field_values_size(monkeypatch):
+    # Two custom fields each individually under _ISSUE_DESCRIPTION_MAX_
+    # CHARS can still combine to exceed the output budget -- an entirely
+    # ordinary multi-field request, not a pathological one. Without an
+    # aggregate cap, extra_field_values (passed as a protected top-level
+    # extra, immune to success_with_capped_dict's gradual shrinking)
+    # would push the whole response past budget and get dropped
+    # entirely by the extreme fallback -- reporting success with no
+    # sign the requested fields were ever there.
+    near_cap_value = "x" * (jira._ISSUE_DESCRIPTION_MAX_CHARS - 100)
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "customfield_a": near_cap_value,
+            "customfield_b": near_cap_value,
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    raw_response = jira.jira_get_issue(
+        "ENG-1", extra_fields="customfield_a,customfield_b"
+    )
+    result = json.loads(raw_response)
+
+    assert result["status"] == "success"
+    assert "extra_field_values" in result
+    assert result["extra_field_values_truncated"] is True
+    total_extra_size = len(json.dumps(result["extra_field_values"]))
+    assert total_extra_size <= jira._ISSUE_DESCRIPTION_MAX_CHARS + 1000
+
+
+def test_get_issue_rejects_jira_field_selector_syntax_in_extra_fields(monkeypatch):
+    # Jira's `fields` query param treats a leading "-" as "exclude this
+    # field" and "*" as a wildcard, not a literal field id -- passed
+    # through unfiltered, "-description" could suppress the very field
+    # this tool's docstring promises is always returned.
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "description": "the real description"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="-description,*all"))
+
+    assert result["issue"]["description"] == "the real description"
+    assert "extra_field_values" not in result
+    issue_call = mock_request.call_args_list[1]
+    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+
+
 def test_cap_text_field_marks_truncation():
     payload = {"body": "x" * 20}
     assert jira._cap_text_field(payload, "body", 10) is True

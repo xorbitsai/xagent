@@ -12,7 +12,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
-from .utils import allowed_dirs_from_env, setup_proxy_env, url_path_id
+from .utils import allowed_dirs_from_env, clamp_limit, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sharepoint-mcp")
@@ -219,29 +219,38 @@ def _read_capped_content(response: requests.Response, *, max_bytes: int) -> byte
     gzip/deflate body, making that header describe the wire size rather than
     the size actually buffered here) -- the Content-Encoding check below is
     a fallback for a server that ignores the request header anyway.
+
+    ``with response`` releases the connection on every exit path, not just
+    a fully-consumed one: a stream=True response left un-closed on a
+    rejection (compressed encoding, an oversized Content-Length, or a body
+    that exceeds max_bytes mid-read) would otherwise hold its connection
+    until garbage collection gets to it, rather than returning it to the
+    pool immediately. Matches mixpanel.py's identical response.close()
+    discipline for its own stream=True requests.
     """
-    encoding = response.headers.get("Content-Encoding", "identity")
-    if encoding.lower() != "identity":
-        raise ValueError(f"unsupported compressed content encoding: {encoding!r}")
+    with response:
+        encoding = response.headers.get("Content-Encoding", "identity")
+        if encoding.lower() != "identity":
+            raise ValueError(f"unsupported compressed content encoding: {encoding!r}")
 
-    content_length = response.headers.get("Content-Length")
-    if content_length is not None and content_length.isdigit():
-        if int(content_length) > max_bytes:
-            raise ValueError(
-                f"file is too large to download ({content_length} bytes, "
-                f"limit is {max_bytes} bytes)"
-            )
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None and content_length.isdigit():
+            if int(content_length) > max_bytes:
+                raise ValueError(
+                    f"file is too large to download ({content_length} bytes, "
+                    f"limit is {max_bytes} bytes)"
+                )
 
-    chunks: list[bytes] = []
-    total = 0
-    for chunk in response.iter_content(chunk_size=65536):
-        total += len(chunk)
-        if total > max_bytes:
-            raise ValueError(
-                f"file is too large to download (limit is {max_bytes} bytes)"
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(
+                    f"file is too large to download (limit is {max_bytes} bytes)"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def _graph_request(
@@ -602,7 +611,7 @@ def sharepoint_search_sites(query: str, top: int = 25) -> str:
     try:
         if not query.strip():
             raise ValueError("query is required")
-        capped_top = max(1, min(top, 100))
+        capped_top = clamp_limit(top, max_limit=100)
         sites, truncated = _graph_paginate(
             "/sites", {"search": query, "$top": capped_top}, limit=capped_top
         )
@@ -659,7 +668,7 @@ def sharepoint_list_items(
     under a folder path. Uses the site's default document library unless
     drive_id (from sharepoint_list_drives) is given."""
     try:
-        capped_top = max(1, min(top, 200))
+        capped_top = clamp_limit(top, max_limit=200)
         items, truncated = _graph_paginate(
             _drive_children_path(site_id, folder_path, drive_id),
             {"$top": capped_top},
@@ -690,7 +699,7 @@ def sharepoint_search_files(
             raise ValueError("query is required")
         escaped_query = query.replace("'", "''")
         base = _drive_base(site_id, drive_id)
-        capped_top = max(1, min(top, 100))
+        capped_top = clamp_limit(top, max_limit=100)
         items, truncated = _graph_paginate(
             f"{base}/root/search(q='{quote(escaped_query, safe='')}')",
             {"$top": capped_top},
@@ -813,8 +822,8 @@ def sharepoint_upload_text_file(
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
 def sharepoint_upload_file(
-    local_file_path: str,
     site_id: str,
+    local_file_path: str,
     remote_path: str = "",
     drive_id: str | None = None,
     mime_type: str = "",
@@ -911,7 +920,7 @@ def sharepoint_list_lists(site_id: str, top: int = 50) -> str:
     """List the SharePoint lists (e.g. custom lists, document metadata
     lists) in a site."""
     try:
-        capped_top = max(1, min(top, 200))
+        capped_top = clamp_limit(top, max_limit=200)
         lists, truncated = _graph_paginate(
             f"/sites/{_site_segment(site_id)}/lists",
             {"$top": capped_top},
@@ -929,7 +938,7 @@ def sharepoint_list_list_items(site_id: str, list_id: str, top: int = 50) -> str
 
     list_id accepts either the list's Graph id or its display name."""
     try:
-        capped_top = max(1, min(top, 200))
+        capped_top = clamp_limit(top, max_limit=200)
         items, truncated = _graph_paginate(
             f"/sites/{_site_segment(site_id)}/lists/{url_path_id(list_id, 'list_id')}/items",
             {"$top": capped_top, "$expand": "fields"},

@@ -24,6 +24,7 @@ class MockResponse:
         self.text = self.content.decode("utf-8", errors="replace")
         self.url = url or "https://graph.microsoft.com/v1.0/example"
         self.headers = headers if headers is not None else {}
+        self.closed = False
 
     def json(self):
         return self._json_data
@@ -34,6 +35,15 @@ class MockResponse:
                 f"{self.status_code} Client Error: Error for url: {self.url}",
                 response=self,
             )
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
 
     def iter_content(self, chunk_size=1):
         content = self.content
@@ -94,6 +104,26 @@ def test_graph_paginate_stops_and_reports_truncated_at_limit(monkeypatch):
     assert truncated is True
     # The limit was already reached by the first page -- no nextLink fetch.
     assert mock_request.call_count == 1
+
+
+def test_graph_paginate_stops_at_max_pages_even_under_limit(monkeypatch):
+    # A pathological nextLink chain that never runs out on its own (e.g. a
+    # misbehaving or malicious server) must not make _graph_paginate loop
+    # forever just because `limit` hasn't been reached yet.
+    monkeypatch.setattr(sharepoint, "_MAX_PAGINATION_PAGES", 3)
+    next_link = "https://graph.microsoft.com/v1.0/sites/root/lists?$skiptoken=abc"
+    mock_request = Mock(
+        return_value=MockResponse(
+            {"value": [{"id": "x"}], "@odata.nextLink": next_link}
+        )
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    items, truncated = sharepoint._graph_paginate("/sites/root/lists", {}, limit=1000)
+
+    assert len(items) == 3
+    assert truncated is True
+    assert mock_request.call_count == 3
 
 
 def test_graph_paginate_not_truncated_when_collection_exactly_exhausted(monkeypatch):
@@ -258,6 +288,34 @@ def test_get_root_site_success(monkeypatch):
     assert result["status"] == "success"
     assert result["site"]["id"] == "root-site"
     assert mock_request.call_args.kwargs["url"].endswith("/sites/root")
+
+
+def test_get_site_success(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"id": "contoso.sharepoint.com,abc,def"})
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(
+        sharepoint.sharepoint_get_site("contoso.sharepoint.com,abc,def")
+    )
+
+    assert result["status"] == "success"
+    assert result["site"]["id"] == "contoso.sharepoint.com,abc,def"
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/sites/contoso.sharepoint.com,abc,def"
+    )
+
+
+def test_get_site_surfaces_graph_error(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"error": {"message": "Not Found"}}, status_code=404)
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_site("root"))
+
+    assert result["status"] == "error"
 
 
 def test_list_drives_success(monkeypatch):
@@ -463,6 +521,22 @@ def test_get_file_content_rejects_compressed_content_encoding(monkeypatch):
     assert "compressed" in result["message"]
 
 
+def test_get_file_content_closes_connection_on_rejection(monkeypatch):
+    # A stream=True response left open on a rejection path holds its
+    # connection until garbage collection instead of returning it to the
+    # pool immediately -- every rejection branch in _read_capped_content
+    # must close the response, not just a fully-consumed one.
+    response = MockResponse(
+        content=b"compressed-bytes", headers={"Content-Encoding": "gzip"}
+    )
+    mock_request = Mock(return_value=response)
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    sharepoint.sharepoint_get_file_content("root", "notes.txt")
+
+    assert response.closed is True
+
+
 def test_get_file_content_redacts_url_on_http_error(monkeypatch):
     # Graph's /content redirects to a short-lived preauthenticated download
     # URL; a failure on that final host must not leak it (it's a bearer
@@ -618,17 +692,57 @@ def test_upload_file_rejects_path_outside_allowlist(monkeypatch, tmp_path):
     outside_file = tmp_path / "outside.bin"
     outside_file.write_bytes(b"\x00\x01")
 
-    result = json.loads(sharepoint.sharepoint_upload_file(str(outside_file), "root"))
+    result = json.loads(sharepoint.sharepoint_upload_file("root", str(outside_file)))
 
     assert result["status"] == "error"
     assert "allowed" in result["message"]
+
+
+def test_resolve_upload_file_path_rejects_missing_file(_upload_allowed_dirs_env):
+    missing = _upload_allowed_dirs_env / "does_not_exist.bin"
+
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        sharepoint._resolve_upload_file_path(str(missing))
+
+
+def test_resolve_upload_file_path_rejects_symlink_escaping_allowlist(
+    _upload_allowed_dirs_env, tmp_path
+):
+    outside_target = tmp_path / "outside.bin"
+    outside_target.write_bytes(b"\x00\x01")
+    symlink_path = _upload_allowed_dirs_env / "link.bin"
+    symlink_path.symlink_to(outside_target)
+
+    # The symlink itself sits inside the allowlisted directory, but it must
+    # be rejected based on where it actually resolves to, not where it's
+    # named -- otherwise the allowlist is trivially bypassed.
+    with pytest.raises(PermissionError, match="allowed"):
+        sharepoint._resolve_upload_file_path(str(symlink_path))
+
+
+def test_upload_file_scrubs_host_path_from_open_failure(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "locked.bin"
+    local_file.write_bytes(b"\x00\x01")
+
+    def _raise_permission_error(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(sharepoint.Path, "open", _raise_permission_error)
+
+    result = json.loads(sharepoint.sharepoint_upload_file("root", str(local_file)))
+
+    assert result["status"] == "error"
+    assert str(local_file) not in result["message"]
+    assert "Could not read the file" in result["message"]
 
 
 def test_upload_file_rejects_over_size_limit(monkeypatch, _upload_allowed_dirs_env):
     big_file = _upload_allowed_dirs_env / "big.bin"
     big_file.write_bytes(b"0" * (sharepoint._SIMPLE_UPLOAD_MAX_BYTES + 1))
 
-    result = json.loads(sharepoint.sharepoint_upload_file(str(big_file), "root"))
+    result = json.loads(sharepoint.sharepoint_upload_file("root", str(big_file)))
 
     assert result["status"] == "error"
     assert "MB limit" in result["message"]
@@ -649,7 +763,7 @@ def test_upload_file_rejects_content_emptied_after_size_check(
 
     monkeypatch.setattr(sharepoint.os, "fstat", lambda fd: _FakeStat())
 
-    result = json.loads(sharepoint.sharepoint_upload_file(str(local_file), "root"))
+    result = json.loads(sharepoint.sharepoint_upload_file("root", str(local_file)))
 
     assert result["status"] == "error"
     assert "empty" in result["message"]
@@ -665,7 +779,7 @@ def test_upload_file_names_remote_path_in_path_errors(
     local_file.write_bytes(b"\x00\x01")
 
     result = json.loads(
-        sharepoint.sharepoint_upload_file(str(local_file), "root", remote_path="Docs/")
+        sharepoint.sharepoint_upload_file("root", str(local_file), remote_path="Docs/")
     )
 
     assert result["status"] == "error"
@@ -681,7 +795,7 @@ def test_upload_file_success(monkeypatch, _upload_allowed_dirs_env):
 
     result = json.loads(
         sharepoint.sharepoint_upload_file(
-            str(local_file), "root", remote_path="Docs/data.bin"
+            "root", str(local_file), remote_path="Docs/data.bin"
         )
     )
 
@@ -817,6 +931,38 @@ def test_graph_error_response_is_surfaced_as_error(monkeypatch):
     monkeypatch.setattr(sharepoint.requests, "request", mock_request)
 
     result = json.loads(sharepoint.sharepoint_get_root_site())
+
+    assert result["status"] == "error"
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: sharepoint.sharepoint_list_lists("root"),
+        lambda: sharepoint.sharepoint_list_list_items("root", "Tasks"),
+        lambda: sharepoint.sharepoint_create_list_item("root", "Tasks", "{}"),
+        lambda: sharepoint.sharepoint_update_list_item(
+            "root", "Tasks", "item-1", '{"Title": "x"}'
+        ),
+        lambda: sharepoint.sharepoint_delete_list_item("root", "Tasks", "item-1"),
+    ],
+    ids=[
+        "list_lists",
+        "list_list_items",
+        "create_list_item",
+        "update_list_item",
+        "delete_list_item",
+    ],
+)
+def test_list_crud_tools_surface_graph_errors(monkeypatch, call):
+    mock_request = Mock(
+        return_value=MockResponse(
+            {"error": {"message": "Internal Server Error"}}, status_code=500
+        )
+    )
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(call())
 
     assert result["status"] == "error"
 

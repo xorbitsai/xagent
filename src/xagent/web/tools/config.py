@@ -3782,7 +3782,7 @@ class WebToolConfig(BaseToolConfig):
             # _build_mcp_task_output_dir's docstring for why that would be
             # wrong, not just differently-shaped). google_drive_upload_file
             # reads from XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS above instead,
-            # like the other four read allowlists.
+            # like the other five read allowlists.
             task_output_dir = self._build_mcp_task_output_dir()
             if task_output_dir:
                 env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir

@@ -859,6 +859,71 @@ def test_search_issues_first_page_with_more_results_still_calls_approximate_coun
     assert mock_request.call_count == 3
 
 
+def test_search_issues_skips_approximate_count_when_no_headroom_left(monkeypatch):
+    # The already-fitting page (without a count) is close enough to the
+    # budget that even the smallest plausible total_count addition
+    # wouldn't fit -- the count endpoint must not be called at all for
+    # a result that's certain to be discarded.
+    page = {
+        "issues": [{"key": "ENG-1", "fields": {"summary": "a"}}],
+        "nextPageToken": "next-token",
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=page),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    fitting_length = len(
+        jira._build_search_response(
+            [jira._summarize_issue(page["issues"][0])], None, "next-token"
+        )
+    )
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: fitting_length + 5)
+
+    result = json.loads(jira.jira_search_issues("project = ENG"))
+
+    assert result["total_count"] is None
+    # Only 2 calls total (sites + search) -- no approximate-count call.
+    assert mock_request.call_count == 2
+
+
+def test_search_issues_drops_total_count_and_reuses_fitting_response_on_overflow(
+    monkeypatch, caplog
+):
+    # If the actual count value (an unusually large number of digits)
+    # ends up bigger than the reserved headroom estimate, the response
+    # actually returned must drop total_count -- and the log line must
+    # report the same thing that was actually returned, not the value
+    # that got discarded.
+    page = {
+        "issues": [{"key": "ENG-1", "fields": {"summary": "a"}}],
+        "nextPageToken": "next-token",
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=page),
+            MockResponse(json_data={"count": 10**29}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    fitting_length = len(
+        jira._build_search_response(
+            [jira._summarize_issue(page["issues"][0])], None, "next-token"
+        )
+    )
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: fitting_length + 25)
+
+    with caplog.at_level(logging.INFO, logger="jira-mcp"):
+        result = json.loads(jira.jira_search_issues("project = ENG"))
+
+    assert result["total_count"] is None
+    assert mock_request.call_count == 3
+    assert "approx_total=None" in caplog.text
+
+
 def test_search_issues_raw_fields_returns_the_unslimmed_jira_shape(monkeypatch):
     # An existing integration written against the pre-projection schema
     # (issue["fields"]["status"]["id"], etc.) can opt back into it
@@ -977,6 +1042,29 @@ def test_summarize_issue_tolerates_malformed_nested_fields():
     assert result["assignee"] is None
     assert result["status"] is None
     assert result["priority"] is None
+
+
+def test_summarize_issue_tolerates_a_non_list_labels_field():
+    # Every other nested field goes through an _as_dict-style guard;
+    # labels must degrade the same way instead of propagating a
+    # malformed non-list value straight through.
+    raw_issue = {"key": "ENG-1", "fields": {"summary": "ok", "labels": "not-a-list"}}
+    result = jira._summarize_issue(raw_issue)
+    assert result["labels"] == []
+
+
+def test_approximate_count_warns_on_non_dict_response(monkeypatch, caplog):
+    # A proxy/gateway reshaping the WHOLE response body (not just the
+    # count field) to a non-dict must not degrade to total_count=None
+    # with zero log signal.
+    mock_request = Mock(side_effect=[MockResponse(json_data=["not", "a", "dict"])])
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with caplog.at_level(logging.WARNING, logger="jira-mcp"):
+        result = jira._approximate_count("site-a", "project = ENG")
+
+    assert result is None
+    assert "unexpected" in caplog.text.lower()
 
 
 def test_search_issues_fallback_attempts_use_a_shorter_bounded_timeout(monkeypatch):

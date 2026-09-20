@@ -359,7 +359,9 @@ def _summarize_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "priority": priority.get("name"),
         "issue_type": issuetype.get("name"),
         "project_key": project.get("key"),
-        "labels": fields.get("labels") or [],
+        "labels": (
+            fields.get("labels") if isinstance(fields.get("labels"), list) else []
+        ),
         "parent_key": parent.get("key"),
         "resolution": resolution.get("name"),
         "created": fields.get("created"),
@@ -394,6 +396,16 @@ _RETRY_PAGE_SIZE = 10
 #: already applied to _approximate_count, just for a different reason
 #: (bounding a self-inflicted retry instead of skipping optional data).
 _FALLBACK_ATTEMPT_TIMEOUT_SECONDS = 10
+
+#: Rough upper bound on how many extra characters replacing a page's
+#: "total_count": null with an actual number can add (the field's key,
+#: comma, and quoting are already present in the null-count page, so the
+#: only real delta is null (4 chars) -> up to a many-digit integer).
+#: Checked before calling _approximate_count so a page already close to
+#: max_output_length skips the network round trip for a count that's
+#: about to be discarded anyway, rather than fetching it and finding out
+#: after the fact.
+_TOTAL_COUNT_RESERVE_CHARS = 20
 
 #: Fields requested for jira_search_issues. Kept in one place so every
 #: page-size attempt in jira_search_issues' fallback loop below requests
@@ -478,6 +490,16 @@ def _approximate_count(cloud_id: str, jql: str) -> int | None:
                     "Approximate count endpoint returned a non-integer "
                     f"count: {type(count).__name__}"
                 )
+        else:
+            # Same "leave a breadcrumb" reasoning as the non-integer-count
+            # case above: a proxy/gateway reshaping the whole body (not
+            # just the count field) to a non-dict must not degrade to
+            # total_count=None with zero log signal, indistinguishable
+            # from "endpoint healthy, count genuinely unavailable".
+            logger.warning(
+                "Approximate count endpoint returned an unexpected "
+                f"response shape: {type(result).__name__}"
+            )
     except Exception as e:
         _log_metadata_only(logger.warning, "Could not get an approximate count", e)
     return None
@@ -562,8 +584,12 @@ def _build_search_response(
 
 def _bounded_search_error(message: str, max_output_length: int) -> str:
     """Build an _error(...) response for jira_search_issues that's
-    guaranteed to fit max_output_length, trying progressively shorter
-    text.
+    guaranteed to fit max_output_length whenever that's structurally
+    possible, trying progressively shorter text -- and preferring a
+    candidate that still has a "message" key over one that doesn't,
+    since every _error(...) response elsewhere in this file (and a
+    generic `if result["status"] == "error": show(result["message"])`
+    caller) can otherwise assume that key is always present.
 
     XAGENT_TOOL_MAX_OUTPUT_LENGTH has no enforced minimum (see
     config.get_tool_max_output_length), so a deployment could configure
@@ -571,10 +597,10 @@ def _bounded_search_error(message: str, max_output_length: int) -> str:
     message would itself get sliced mid-JSON by the downstream
     OutputValueFilter -- exactly the invalid-output failure mode this
     whole fallback path exists to avoid. The last candidate ({"status":
-    "error"}) is the smallest valid envelope this module can produce;
-    below that there's no budget left to signal failure in valid JSON at
-    all, which is a systemic gap in the cap itself, not something a
-    single tool's error path can close.
+    "error"}, no message key at all) is the smallest valid envelope this
+    module can produce; below that there's no budget left to signal
+    failure in valid JSON at all, which is a systemic gap in the cap
+    itself, not something a single tool's error path can close.
     """
     full = _error(message)
     if len(full) <= max_output_length:
@@ -582,8 +608,14 @@ def _bounded_search_error(message: str, max_output_length: int) -> str:
     # Trim the message text itself (not _truncate's fixed 1000-char
     # cap, which does nothing for a configured budget smaller than
     # that) down to whatever's left after the envelope's own overhead.
+    # budget=0 degrades this to _error("") -- a "message" key that's
+    # present but empty -- which is as close to preserving that key as
+    # any cap under len(_error(message)) can get; below len(_error(""))
+    # (34 chars) there is no valid JSON this can produce that both fits
+    # and still has a "message" key, so the bare envelope below is the
+    # true floor, not a choice this function is making.
     budget = max_output_length - len(_error(""))
-    if budget > 0:
+    if budget >= 0:
         short = _error(message[:budget])
         if len(short) <= max_output_length:
             return short
@@ -675,6 +707,9 @@ def jira_search_issues(
             # and/or labels alone exceed the budget. Fail safely rather
             # than return invalid (cut-mid-JSON) output or a token that
             # would skip rows.
+            logger.warning(
+                "jira_search_issues: minimal page still exceeds the output limit"
+            )
             return _bounded_search_error(
                 "A Jira search result page exceeds the tool output limit "
                 "even at a minimal page size; narrow the JQL query",
@@ -687,6 +722,7 @@ def jira_search_issues(
             # the same page forever -- fail instead of handing back a
             # token that goes nowhere (mirrors shopify.py's
             # _success_paginated cursor-safety check).
+            logger.warning("jira_search_issues: pagination cursor did not advance")
             return _bounded_search_error(
                 "Jira returned a pagination cursor that did not advance; "
                 "pagination stopped to prevent an infinite loop",
@@ -704,16 +740,31 @@ def jira_search_issues(
         # "don't do wasted work" reason.
         if next_page_token:
             total_count = None
-        elif next_token:
-            total_count = _approximate_count(resolved_cloud_id, jql)
-        else:
+        elif not next_token:
             total_count = len(issues)
-        response = _build_search_response(issues, total_count, next_token)
-        if len(response) > max_output_length:
-            # total_count is advisory; if adding it is ever what tips an
-            # already-fitting page over budget, drop it rather than
-            # fail a search that otherwise fit.
-            response = _build_search_response(issues, None, next_token)
+        elif len(response) + _TOTAL_COUNT_RESERVE_CHARS > max_output_length:
+            # `response` is the already-fitting page the loop above just
+            # built -- if there's not even enough headroom left for a
+            # plausible total_count value, skip the network round trip
+            # (and the count endpoint's own rate-limit budget) for a
+            # result that's about to be discarded as soon as it comes
+            # back anyway.
+            total_count = None
+        else:
+            total_count = _approximate_count(resolved_cloud_id, jql)
+
+        if total_count is not None:
+            with_count = _build_search_response(issues, total_count, next_token)
+            if len(with_count) <= max_output_length:
+                response = with_count
+            else:
+                # total_count is advisory; if adding it is ever what
+                # tips an already-fitting page over budget, drop it
+                # rather than fail a search that otherwise fit -- reuse
+                # `response` (the loop's already-fitting, already-built
+                # page) instead of paying for another full serialization
+                # of `issues` just to reproduce the same page again.
+                total_count = None
 
         logger.info(
             f"jira_search_issues: returned={len(issues)} "

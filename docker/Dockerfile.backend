@@ -97,6 +97,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --group backend-image \
     ${PYPI_INDEX_URL:+--default-index $PYPI_INDEX_URL}
 
+# A raw backend image must reach its local combined-mode startup admission
+# without deployment-only Redis or encryption configuration. A configured
+# worker pool or split host still selects shared execution and strict validation.
+RUN env -u XAGENT_SHARED_TASK_EXECUTION_ENABLED \
+        -u XAGENT_TASK_EXECUTION_ROLE \
+        -u XAGENT_WORKER_COUNT \
+        -u XAGENT_REDIS_URL \
+        -u ENCRYPTION_KEY \
+        /opt/venv/bin/python -c \
+        'from xagent.config import get_shared_task_execution_enabled, validate_task_execution_host_config; assert not get_shared_task_execution_enabled(); validate_task_execution_host_config()'
+
 ############################
 # Runtime
 ############################
@@ -292,6 +303,12 @@ ARG XAGENT_BUILD_TIME=""
 ENV XAGENT_VERSION=${XAGENT_VERSION}
 ENV XAGENT_GIT_COMMIT=${XAGENT_GIT_COMMIT}
 ENV XAGENT_BUILD_TIME=${XAGENT_BUILD_TIME}
+
+# The published backend image is the team/self-hosting artifact: run one web
+# process plus two Agent workers by default.  The entrypoint creates or reuses a
+# private key at this path; Compose mounts it on the persistent secrets volume.
+ENV XAGENT_WORKER_COUNT=2
+ENV XAGENT_ENCRYPTION_KEY_FILE=/run/xagent-secrets/encryption.key
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/xagent/deploy/entrypoint.sh"]

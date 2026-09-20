@@ -745,6 +745,89 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("messages").textContent).toContain("second visible answer")
   })
 
+  it("does not flag recovery for a running task that simply hasn't started streaming yet", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    // The periodic reconciliation snapshot fires every few seconds for every
+    // connected task regardless of stream health. A task still planning or
+    // calling tools is legitimately "running" with no final-answer prefix
+    // seen yet - several such pings in a row must not trip the recovery
+    // banner, since nothing has actually been missed.
+    send({ run_id: "run-1", state_version: 1, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+    send({ run_id: "run-1", state_version: 2, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+    send({ type: "final_answer_start", stream_run_id: "run-1", data: { message_id: "final_answer_1" } })
+    send({ type: "final_answer_delta", stream_run_id: "run-1", data: { message_id: "final_answer_1", delta: "on time answer" } })
+    expect(screen.getByTestId("messages").textContent).toContain("on time answer")
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
+  it("clears recovery once a new run's snapshot supersedes an interrupted one", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    send({ run_id: "run-1", state_version: 1, control_state: "running", status: "running", data: {} })
+    send({ type: "stream_unavailable" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    // A brand-new run cannot have inherited the previous run's interruption -
+    // its very first snapshot must not carry the stale flag forward.
+    send({ run_id: "run-2", state_version: 2, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("")
+  })
+
+  it("keeps recovery when the first-ever snapshot for a run arrives after an interruption with no run known yet", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    // An explicit resync signal can arrive before this stream has ever seen
+    // a snapshot, so stream.runId is still undefined here.
+    send({ type: "stream_unavailable" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    // The first-ever snapshot for the CURRENT run is an undefined -> defined
+    // transition, not a run change - it must not silently clear the
+    // still-unresolved interruption before any real recovery happened.
+    send({ run_id: "run-1", state_version: 1, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+  })
+
+  it("keeps recovery when a pending task's null run id transitions to its first real run", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: Partial<TestWebSocketMessage>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_stream_snapshot", task_id: 1,
+        timestamp: "2026-05-27T05:00:00Z", ...message,
+      })
+    })
+    // extractTaskControlEnvelope only resolves a literal `null` run id
+    // through its innermost fallback (data.data.run_id) - a flat top-level
+    // `run_id: null`, the shape a real pending-task snapshot actually sends,
+    // collapses to `undefined` through the `??` chain instead. Exercise the
+    // guard against an actual `null`, which stream.runId's `string | null`
+    // type allows for.
+    send({ state_version: 1, control_state: "idle", status: "pending", data: { data: { run_id: null } } })
+    send({ type: "stream_unavailable" })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+    // A known-null run transitioning to the task's first real run is not a
+    // change between two known runs - it must not silently clear the
+    // still-unresolved interruption before anything confirms recovery.
+    send({ run_id: "run-1", state_version: 2, control_state: "running", status: "running", data: {} })
+    expect(screen.getByTestId("stream-recovery").textContent).toBe("1")
+  })
+
   it("reconciles a gapped shared stream without appending later deltas or accepting an old run", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (message: Partial<TestWebSocketMessage>) => act(() => {

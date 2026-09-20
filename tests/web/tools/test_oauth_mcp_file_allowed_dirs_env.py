@@ -1,7 +1,8 @@
 """Tests for injecting the file-upload allowlist directory into OAuth-transport
 MCP subprocess environments (LinkedIn's image upload, Slack's file upload,
-Gmail's message attachments, OneDrive's file upload, Google Drive's file
-upload) and Google Drive's dedicated write-target output directory."""
+Gmail's message attachments, OneDrive's file upload, SharePoint's file
+upload, Google Drive's file upload) and Google Drive's dedicated
+write-target output directory."""
 
 import json
 from pathlib import Path
@@ -14,6 +15,7 @@ _READ_ALLOWLIST_ENV_VARS = (
     "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS",
     "XAGENT_GMAIL_FILE_ALLOWED_DIRS",
     "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS",
+    "XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS",
     "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS",
 )
 
@@ -67,6 +69,7 @@ def test_transport_config_omits_allowlist_vars_without_a_task_id() -> None:
     assert "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GMAIL_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
+    assert "XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
 

@@ -1987,6 +1987,7 @@ const zh = {
         created: "创建时间",
         updated: "更新时间",
         unknown: "未知",
+        contextWindowUnset: "未设置上下文窗口",
       },
       actions: {
         edit: "编辑",

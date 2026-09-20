@@ -56,5 +56,18 @@ jobs:
             || { echo "::error::wheel is missing the bundled frontend (frontend_dist)"; exit 1; }
           echo "Frontend bundle present in wheel."
 
+      - name: Verify the wheel has self-contained startup defaults
+        run: |
+          set -e
+          smoke_root="$RUNNER_TEMP/xagent-wheel-smoke"
+          python -m pip install --no-deps --target "$smoke_root" dist/*.whl
+          env -u XAGENT_SHARED_TASK_EXECUTION_ENABLED \
+              -u XAGENT_TASK_EXECUTION_ROLE \
+              -u XAGENT_WORKER_COUNT \
+              -u XAGENT_REDIS_URL \
+              -u ENCRYPTION_KEY \
+              PYTHONPATH="$smoke_root" \
+              python -c 'from xagent.config import get_shared_task_execution_enabled, validate_task_execution_host_config; assert not get_shared_task_execution_enabled(); validate_task_execution_host_config()'
+
       - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1

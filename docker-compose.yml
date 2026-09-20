@@ -60,6 +60,7 @@ services:
       - .env
     volumes:
       - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
     depends_on:
       postgres:
         condition: service_healthy
@@ -105,6 +106,7 @@ services:
       - .env
     volumes:
       - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
     depends_on:
       postgres:
         condition: service_healthy
@@ -137,6 +139,7 @@ services:
       - .env
     volumes:
       - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
     depends_on:
       postgres:
         condition: service_healthy
@@ -185,6 +188,8 @@ volumes:
   postgres_data:
     driver: local
   xagent_data:
+    driver: local
+  xagent_secrets:
     driver: local
   redis_data:
     driver: local

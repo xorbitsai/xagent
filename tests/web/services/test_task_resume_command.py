@@ -5,6 +5,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.web.services.coordinator_command_shared import (
+    claim_task_command,
+    settle_command,
+)
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -17,10 +21,7 @@ from xagent.web.services import (
 )
 from xagent.web.services import task_resume_command as module
 from xagent.web.services.task_command_execution import execute_durable_task_command
-from xagent.web.services.task_command_transport import (
-    TaskCommandRejected,
-    claim_task_command,
-)
+from xagent.web.services.task_command_transport import TaskCommandRejected
 from xagent.web.services.task_resume import TaskReplyInput, TaskResumeBusyError
 
 
@@ -81,10 +82,12 @@ async def reply(tmp_path, monkeypatch):
     Base.metadata.drop_all(bind=get_engine())
 
 
-def claim(ctx):
+async def claim(ctx):
     command_id = module._admit_reply(ctx, "sdk", "", "reply-1")
     with get_session_local()() as db:
-        return claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+        return await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
 
 
 def test_reply_is_durable_without_acquiring_a_request_lease(reply):
@@ -100,8 +103,10 @@ def test_reply_is_durable_without_acquiring_a_request_lease(reply):
         module._admit_reply(reply, "sdk", "", "reply-2")
 
 
-def test_reply_handoff_and_command_completion_are_one_transaction(reply, monkeypatch):
-    command = claim(reply)
+async def test_reply_handoff_and_command_completion_are_one_transaction(
+    reply, monkeypatch
+):
+    command = await claim(reply)
     monkeypatch.setattr(
         module, "finish_task_command_no_commit", lambda *args, **kwargs: False
     )
@@ -114,19 +119,22 @@ def test_reply_handoff_and_command_completion_are_one_transaction(reply, monkeyp
         assert db.get(TaskExecutionCommand, command.id).status == "processing"
 
 
-def test_old_reply_claim_cannot_acquire_or_restore_a_new_attempt(reply):
-    command = claim(reply)
+async def test_old_reply_claim_cannot_acquire_or_restore_a_new_attempt(reply):
+    command = await claim(reply)
     old = replace(command, attempt_count=command.attempt_count - 1)
     with pytest.raises(TaskCommandRejected):
         commit_handoff(old)
     from xagent.web.services.task_command_transport import fail_task_command
 
-    assert not fail_task_command(
-        old.id,
-        "worker-1",
-        "stale",
-        force_terminal=True,
-        expected_attempt_count=old.attempt_count,
+    assert not await settle_command(
+        old,
+        lambda: fail_task_command(
+            old.id,
+            "worker-1",
+            "stale",
+            force_terminal=True,
+            expected_attempt_count=old.attempt_count,
+        ),
     )
     with get_session_local()() as db:
         assert db.get(Task, reply.task_id).control_state == "waiting_for_user"
@@ -134,7 +142,7 @@ def test_old_reply_claim_cannot_acquire_or_restore_a_new_attempt(reply):
     assert lease.run_id == reply.run_id
     assert state["lease_attempt_id"] == lease.attempt_id
     assert module._read_reply_outcome(command.id) is None
-    module._record_outcome(command, state, "accepted")
+    module._record_outcome(command, state, "accepted", owner_lease(command.task_id))
     assert module._read_reply_outcome(command.id)["outcome"] == "accepted"
 
 
@@ -142,7 +150,7 @@ def test_old_reply_claim_cannot_acquire_or_restore_a_new_attempt(reply):
 async def test_worker_uses_preacquired_lease_and_stable_turn_identity(
     reply, monkeypatch
 ):
-    command = claim(reply)
+    command = await claim(reply)
     prepare = AsyncMock()
     monkeypatch.setattr(task_resume, "resume_task_reply", prepare)
     await execute_durable_task_command(command)
@@ -153,13 +161,13 @@ async def test_worker_uses_preacquired_lease_and_stable_turn_identity(
 
 
 @pytest.mark.parametrize("replaced", [False, True])
-def test_terminal_reply_failure_restores_only_its_admission(reply, replaced):
+async def test_terminal_reply_failure_restores_only_its_admission(reply, replaced):
     from xagent.web.services.task_command_transport import (
         MAX_COMMAND_FAILURES,
         fail_task_command,
     )
 
-    command = claim(reply)
+    command = await claim(reply)
     with get_session_local()() as db:
         db.get(TaskExecutionCommand, command.id).failure_count = (
             MAX_COMMAND_FAILURES - 1
@@ -167,12 +175,16 @@ def test_terminal_reply_failure_restores_only_its_admission(reply, replaced):
         if replaced:
             db.get(Task, reply.task_id).state_version += 1
         db.commit()
-    assert fail_task_command(
-        command.id,
-        "worker-1",
-        "unavailable",
-        expected_attempt_count=command.attempt_count,
+    assert await settle_command(
+        command,
+        lambda: fail_task_command(
+            command.id,
+            "worker-1",
+            "unavailable",
+            expected_attempt_count=command.attempt_count,
+        ),
     )
+    await task_coordinator_runtime.close_task_coordinators()
     with get_session_local()() as db:
         task = db.get(Task, reply.task_id)
         assert task.runner_id is None
@@ -184,8 +196,8 @@ def test_terminal_reply_failure_restores_only_its_admission(reply, replaced):
     "invalid",
     [{"version": True}, {"agent_id": 0}, {"run_id": ""}, {"prior_status": "paused"}],
 )
-def test_invalid_reply_payload_cannot_acquire_lease(reply, invalid):
-    command = claim(reply)
+async def test_invalid_reply_payload_cannot_acquire_lease(reply, invalid):
+    command = await claim(reply)
     command = replace(command, payload={**command.payload, **invalid})
     with pytest.raises(TaskCommandRejected):
         commit_handoff(command)
@@ -201,7 +213,9 @@ def test_invalid_reply_payload_cannot_acquire_lease(reply, invalid):
         ("a2a", TaskStatus.PAUSED),
     ],
 )
-def test_reply_waits_for_previous_execution_to_release_lease(reply, source, status):
+async def test_reply_waits_for_previous_execution_to_release_lease(
+    reply, source, status
+):
     from datetime import datetime, timedelta, timezone
 
     from xagent.web.services.task_lease_service import TaskLease
@@ -223,7 +237,7 @@ def test_reply_waits_for_previous_execution_to_release_lease(reply, source, stat
         assert db.query(TaskExecutionCommand).count() == 1
         assert db.get(Task, ctx.task_id).lease_attempt_id == "old-attempt"
         assert (
-            claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+            await claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
             is None
         )
         assert db.get(Task, ctx.task_id).control_state == status.value
@@ -237,7 +251,9 @@ def test_reply_waits_for_previous_execution_to_release_lease(reply, source, stat
     )
     command_id = module._admit_reply(ctx, source, "message", "reply")
     with get_session_local()() as db:
-        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
     _, lease, _, _ = commit_handoff(command)
     assert lease.run_id == ctx.run_id
 
@@ -279,7 +295,9 @@ async def test_a2a_retries_checkpoint_read_failure_with_same_message_id(
     monkeypatch.setattr(task_resume, "_schedule_waiting_a2a_resume", scheduled)
     original_id = module._admit_reply(reply, "a2a", "message-1", "original-command")
     with get_session_local()() as db:
-        first = claim_task_command(db, runner_id="worker-1", command_db_id=original_id)
+        first = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=original_id
+        )
         original_version = db.get(
             TaskExecutionCommand, original_id
         ).target_state_version
@@ -295,7 +313,9 @@ async def test_a2a_retries_checkpoint_read_failure_with_same_message_id(
         module._admit_reply(reply, "a2a", "message-1", "original-command") == retry_id
     )
     with get_session_local()() as db:
-        second = claim_task_command(db, runner_id="worker-1", command_db_id=retry_id)
+        second = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=retry_id
+        )
     await execute_durable_task_command(second)
     assert module._read_reply_outcome(retry_id)["outcome"] == "accepted"
     assert (
@@ -315,23 +335,25 @@ async def test_a2a_retries_checkpoint_read_failure_with_same_message_id(
 
 
 @pytest.mark.parametrize("outcome", ["unavailable", "accepted", "not_resumable"])
-def test_a2a_does_not_retry_unknown_or_terminal_outcome(reply, outcome):
+async def test_a2a_does_not_retry_unknown_or_terminal_outcome(reply, outcome):
     with get_session_local()() as db:
         db.get(Task, reply.task_id).source = "a2a"
         db.commit()
     command_id = module._admit_reply(reply, "a2a", "message", "original")
     with get_session_local()() as db:
-        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
     _, lease, _, state = commit_handoff(command)
     assert task_resume._restore_a2a_resume_prelease_sync(
         lease, status=TaskStatus.WAITING_FOR_USER
     )
-    module._record_outcome(command, state, outcome)
+    module._record_outcome(command, state, outcome, owner_lease(command.task_id))
     assert module._admit_reply(reply, "a2a", "message", "original") == command_id
     with get_session_local()() as db:
         assert db.query(TaskExecutionCommand).count() == 1
         assert (
-            claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+            await claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
             is None
         )
 
@@ -372,7 +394,9 @@ async def test_a2a_unsafe_checkpoint_failure_cannot_create_retry(
         )
     command_id = module._admit_reply(reply, "a2a", "message", "original")
     with get_session_local()() as db:
-        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
     await execute_durable_task_command(command)
     assert module._read_reply_outcome(command_id)["outcome"] == (
         "unknown" if failure_stage == "after_injection" else "unavailable"
@@ -391,7 +415,7 @@ async def test_a2a_unsafe_checkpoint_failure_cannot_create_retry(
         ("a2a", TaskStatus.PAUSED),
     ],
 )
-def test_reply_reclaims_expired_resting_lease_atomically(
+async def test_reply_reclaims_expired_resting_lease_atomically(
     reply, monkeypatch, source, status
 ):
     from datetime import datetime, timedelta, timezone
@@ -447,7 +471,9 @@ def test_reply_reclaims_expired_resting_lease_atomically(
         assert task.lease_attempt_id == old_lease.attempt_id
         assert task.control_state == status.value
         assert task.state_version == original_version
-        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
     _, lease, _, state = commit_handoff(command)
     assert lease.run_id == ctx.run_id
     assert lease.attempt_id != old_lease.attempt_id
@@ -479,7 +505,9 @@ async def test_following_command_waits_for_reply_registration(
         db.commit()
     command_id = module._admit_reply(reply, source, "message", "reply")
     with get_session_local()() as db:
-        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
     committed, release = threading.Event(), threading.Event()
     original = module._handoff
     registered = False
@@ -524,7 +552,7 @@ async def test_following_command_waits_for_reply_registration(
                 payload={"message": "next"},
             )
             db.commit()
-            following = claim_task_command(
+            following = await claim_task_command(
                 db, runner_id="worker-1", command_db_id=staged.staged_db_id
             )
             assert following is not None
@@ -576,12 +604,14 @@ async def test_reply_timeout_retains_accepted_command_for_later_execution(
         prepare,
     )
     with get_session_local()() as db:
-        command = claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
     await execute_durable_task_command(command)
     prepare.assert_awaited_once()
     assert module._read_reply_outcome(command_id)["outcome"] == "accepted"
     with get_session_local()() as db:
         assert (
-            claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
+            await claim_task_command(db, runner_id="worker-1", command_db_id=command_id)
             is None
         )

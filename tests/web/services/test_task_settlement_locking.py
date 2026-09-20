@@ -8,10 +8,8 @@ from sqlalchemy import delete, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Query, sessionmaker
 
-from tests.web.services.test_task_execution_event_store import engine as engine_fixture
-from tests.web.services.test_task_execution_event_store import (
-    task_id as task_id_fixture,
-)
+from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
 from xagent.core.agent.trace import TraceEvent
 from xagent.web.models.chat_message import TaskChatMessage

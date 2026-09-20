@@ -430,6 +430,7 @@ def test_get_presentation_text(monkeypatch):
     ]
     assert result["etag"] == '"etag-1"'
     assert mock_get.call_args.kwargs["timeout"] == powerpoint._BINARY_TIMEOUT_SECONDS
+    assert "headers" not in mock_get.call_args.kwargs
 
 
 def test_get_presentation_text_includes_group_table_and_notes(monkeypatch):
@@ -591,6 +592,19 @@ def test_add_slide_sets_title_and_body(monkeypatch):
     slide = uploaded.slides[0]
     assert slide.shapes.title.text == "New Title"
     assert slide.placeholders[1].text_frame.text == "New Body"
+    assert result["title_applied"] is True
+    assert result["body_applied"] is True
+
+
+def test_add_slide_reports_unrequested_content_as_not_applied(monkeypatch):
+    content = _pptx_bytes()
+    _mock_versioned_write(monkeypatch, content)
+
+    result = json.loads(powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"'))
+
+    assert result["status"] == "success"
+    assert result["title_applied"] is False
+    assert result["body_applied"] is False
 
 
 def test_add_slide_rejects_out_of_range_layout(monkeypatch):

@@ -1025,7 +1025,7 @@ def powerpoint_add_slide(
                 f"presentation's {len(layouts)} slide layouts"
             )
         slide = presentation.slides.add_slide(layouts[layout_index])
-        title_applied = title is None
+        title_applied = False
         if title is not None:
             if slide.shapes.title is None:
                 raise ValueError(
@@ -1034,7 +1034,7 @@ def powerpoint_add_slide(
                 )
             slide.shapes.title.text = title
             title_applied = True
-        body_applied = body_text is None
+        body_applied = False
         if body_text is not None:
             body_placeholder = _select_body_placeholder(slide)
             if body_placeholder is None:

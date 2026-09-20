@@ -1,7 +1,7 @@
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -488,6 +488,36 @@ def test_oauth_account_can_connect_with_sqlite_naive_utc_expiry(
     )
 
     assert mcp_api._oauth_account_can_connect(oauth_account) is True
+
+
+def test_oauth_account_can_connect_matches_runtimes_refresh_skew() -> None:
+    """A token expiring inside runtime's 5-minute refresh skew
+    (config.py's OAUTH_TOKEN_EXPIRY_SKEW) with no refresh_token can never
+    be refreshed -- config.py raises _OAuthRefreshPermanentlyInvalid for
+    exactly this case -- so this must already report unusable, not wait
+    for the exact expiry instant to pass."""
+    now = datetime.now(timezone.utc)
+
+    within_skew = SimpleNamespace(
+        access_token="access-token",
+        refresh_token=None,
+        expires_at=now + timedelta(minutes=2),
+    )
+    assert mcp_api._oauth_account_can_connect(within_skew) is False
+
+    beyond_skew = SimpleNamespace(
+        access_token="access-token",
+        refresh_token=None,
+        expires_at=now + timedelta(minutes=10),
+    )
+    assert mcp_api._oauth_account_can_connect(beyond_skew) is True
+
+    refreshable_within_skew = SimpleNamespace(
+        access_token="access-token",
+        refresh_token="refresh-token",
+        expires_at=now + timedelta(minutes=2),
+    )
+    assert mcp_api._oauth_account_can_connect(refreshable_within_skew) is True
 
 
 def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:

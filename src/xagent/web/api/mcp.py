@@ -2328,6 +2328,18 @@ def _is_reserved_catalog_name(db: Session, name: object) -> bool:
 
 
 def _oauth_account_can_connect(oauth_account: object) -> bool:
+    """Whether this grant's stored token is currently usable.
+
+    Matches runtime's own readiness rule instead of a plain "not yet
+    expired" check: ``config.py``'s ``refresh_oauth_token_if_needed``
+    treats a token as needing refresh once it is within
+    ``OAUTH_TOKEN_EXPIRY_SKEW`` (5 minutes) of ``expires_at``, and a token
+    with no ``refresh_token`` can never complete that refresh -- it raises
+    ``_OAuthRefreshPermanentlyInvalid`` for exactly that case. Without the
+    same skew here, a token expiring in, say, two minutes with no
+    refresh_token would report "connected" and then fail a real tool call
+    minutes later with ``oauth_token_required``.
+    """
     access_token = getattr(oauth_account, "access_token", None)
     if not access_token:
         return False
@@ -2342,8 +2354,10 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
 
+    from ..tools.config import OAUTH_TOKEN_EXPIRY_SKEW
+
     now = datetime.now(timezone.utc)
-    return expires_at > now
+    return expires_at > now + OAUTH_TOKEN_EXPIRY_SKEW
 
 
 def _oauth_keys_for_app(app: dict) -> list[str]:

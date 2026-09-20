@@ -2,7 +2,9 @@ import io
 import json
 import logging
 import os
+import zipfile
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -40,20 +42,18 @@ _POWERPOINT_MIME_TYPE = (
 # file, edits it in memory with python-pptx, and re-uploads the whole file.
 # Kept entirely in memory (io.BytesIO, never written to local disk).
 #
-# Above this, the simple content PUT gives way to the resumable
-# upload-session API instead of failing outright -- matching onedrive.py's
-# own use of the same threshold to pick between the two, since a deck with
-# embedded media routinely exceeds this.
-_SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
-
 # A deliberately arbitrary product ceiling (independent of any Graph-side
-# limit) on the *edited* presentation's serialized size -- unlike
+# limit) on a presentation's compressed size -- unlike
 # onedrive.py's file upload, which streams a chunk at a time straight from
-# disk, this module's whole download-edit-reupload cycle already holds the
-# serialized bytes in memory at least twice over (the downloaded bytes, the
-# python-pptx object graph, and the re-saved buffer), so an unbounded size
-# here is an unbounded memory commitment, not just a slow upload.
+# disk, this module's whole download-edit-reupload cycle holds the
+# serialized bytes plus python-pptx's object graph in memory.
 _MAX_PRESENTATION_BYTES = 200_000_000
+
+# A small .pptx can still be a zip bomb. Bound the total declared size of
+# OOXML members before python-pptx expands them into objects.
+_MAX_PRESENTATION_UNCOMPRESSED_BYTES = 500_000_000
+_MAX_PRESENTATION_PARTS = 10_000
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 # Graph requires every upload-session fragment but the last to be a
 # multiple of 320 KiB, and documents a 60 MiB hard maximum per PUT; 5 MiB
@@ -77,6 +77,20 @@ class _GraphRequestError(RuntimeError):
         self.status_code = status_code
 
 
+class _ConflictError(RuntimeError):
+    """The caller's presentation version is no longer current."""
+
+
+class _IndeterminateWriteError(RuntimeError):
+    """Graph may have committed a write whose final response was lost."""
+
+
+@dataclass(frozen=True)
+class _PresentationSnapshot:
+    presentation: PresentationType
+    etag: str
+
+
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
@@ -86,6 +100,21 @@ def _error(message: str, *, details: Any = None) -> str:
     if details is not None:
         payload["details"] = details
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _conflict(message: str) -> str:
+    return json.dumps({"status": "conflict", "message": message}, ensure_ascii=False)
+
+
+def _indeterminate(message: str) -> str:
+    return json.dumps(
+        {
+            "status": "indeterminate",
+            "message": message,
+            "safe_to_retry": False,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -109,24 +138,13 @@ def _graph_request(
     *,
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
-    data: bytes | None = None,
     extra_headers: dict[str, str] | None = None,
-    raw: bool = False,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
-    # Graph's /content GET 302s to a preauthenticated download URL (a
-    # bearer secret in its own query string), which requests follows
-    # automatically -- so *any* failure once that redirect has happened,
-    # not just an HTTP error status, can carry that signed URL: a
-    # connection-layer failure (timeout, reset, TLS error) raises a
-    # RequestException whose own str() embeds it exactly like HTTPError's
-    # does. Both branches below build their own message from method/path
-    # (this function's own input, never the possibly-redirected
-    # response/request URL) instead of str(exc), and raise "from None"
-    # rather than chaining the original exception as __cause__ -- chaining
-    # would still let a future traceback/log/APM capture surface that URL
-    # even with a clean top-level message, matching _create_only_upload's
-    # identical guard on its own upload-session URL.
+    # Never stringify request exceptions or forward raw response bodies.
+    # Graph and its backing storage may place preauthenticated URLs in either;
+    # those URLs are short-lived bearer secrets. Build errors only from this
+    # function's caller-controlled method/path and a parsed Graph error code.
     try:
         response = requests.request(
             method=method,
@@ -134,7 +152,6 @@ def _graph_request(
             headers=_graph_headers(extra_headers),
             params=params,
             json=body,
-            data=data,
             timeout=timeout,
         )
     except requests.RequestException:
@@ -143,14 +160,20 @@ def _graph_request(
     try:
         response.raise_for_status()
     except requests.HTTPError:
-        response_text = response.text.strip()
         message = f"Graph {method} {path} failed with HTTP {response.status_code}"
-        if response_text:
-            message = f"{message} - {response_text}"
+        # Never forward the raw response body. /content redirects to a
+        # preauthenticated URL, and storage error bodies are allowed to echo
+        # that bearer URL. A Graph error code is useful and safe enough.
+        try:
+            payload = response.json()
+            error = payload.get("error") if isinstance(payload, dict) else None
+            code = error.get("code") if isinstance(error, dict) else None
+        except (ValueError, TypeError):
+            code = None
+        if isinstance(code, str) and code:
+            message = f"{message} ({code})"
         raise _GraphRequestError(message, status_code=response.status_code) from None
 
-    if raw:
-        return response.content
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
@@ -240,22 +263,128 @@ def _content_path(file_path: str, site_id: str | None, drive_id: str | None) -> 
     return f"{_item_path(file_path, site_id, drive_id)}/content"
 
 
-def _download_presentation(
+def _require_etag(value: Any, field_name: str = "expected_etag") -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} is required")
+    normalized = value.strip()
+    if "\r" in normalized or "\n" in normalized:
+        raise ValueError(f"{field_name} must not contain line breaks")
+    return normalized
+
+
+def _presentation_metadata(
     file_path: str, site_id: str | None, drive_id: str | None
-) -> PresentationType:
-    content = _graph_request(
+) -> dict[str, Any]:
+    item = _graph_request(
         "GET",
-        _content_path(file_path, site_id, drive_id),
-        raw=True,
-        timeout=_BINARY_TIMEOUT_SECONDS,
+        _item_path(file_path, site_id, drive_id),
+        params={"$select": "id,size,eTag,@microsoft.graph.downloadUrl"},
     )
+    if not isinstance(item, dict) or not item.get("id"):
+        raise RuntimeError("Graph did not return presentation metadata")
+    size = item.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise RuntimeError("Graph returned an invalid presentation size")
+    if size > _MAX_PRESENTATION_BYTES:
+        raise ValueError(
+            f"The presentation is {size} bytes, over the "
+            f"{_MAX_PRESENTATION_BYTES // 1_000_000} MB limit this tool supports"
+        )
+    _require_etag(item.get("eTag"), "Graph presentation eTag")
+    download_url = item.get("@microsoft.graph.downloadUrl")
+    if not isinstance(download_url, str) or not download_url:
+        raise RuntimeError("Graph did not return a presentation download URL")
+    return item
+
+
+def _download_preauthenticated_content(download_url: str, expected_size: int) -> bytes:
+    """Download a signed Graph URL without exposing it or buffering past limits."""
     try:
-        return Presentation(io.BytesIO(content))
+        response = requests.get(
+            download_url,
+            stream=True,
+            timeout=_BINARY_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        raise RuntimeError("PowerPoint presentation download failed") from None
+
+    try:
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            raise _GraphRequestError(
+                "PowerPoint presentation download failed with HTTP "
+                f"{response.status_code}",
+                status_code=response.status_code,
+            ) from None
+
+        content = bytearray()
+        try:
+            for chunk in response.iter_content(chunk_size=_DOWNLOAD_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                if len(content) + len(chunk) > _MAX_PRESENTATION_BYTES:
+                    raise ValueError(
+                        "The presentation download exceeded the "
+                        f"{_MAX_PRESENTATION_BYTES // 1_000_000} MB limit"
+                    )
+                content.extend(chunk)
+        except requests.RequestException:
+            raise RuntimeError("PowerPoint presentation download failed") from None
+    finally:
+        response.close()
+
+    if len(content) != expected_size:
+        raise RuntimeError(
+            "PowerPoint presentation size changed while it was being downloaded"
+        )
+    return bytes(content)
+
+
+def _validate_presentation_archive(content: bytes) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            infos = archive.infolist()
+            if len(infos) > _MAX_PRESENTATION_PARTS:
+                raise ValueError(
+                    "The presentation contains too many OOXML parts to process safely"
+                )
+            expanded_size = sum(info.file_size for info in infos)
+            if expanded_size > _MAX_PRESENTATION_UNCOMPRESSED_BYTES:
+                raise ValueError(
+                    "The presentation expands beyond the safe OOXML processing limit"
+                )
+    except zipfile.BadZipFile as exc:
+        raise ValueError(
+            "The file is not a valid PowerPoint presentation OOXML archive"
+        ) from exc
+
+
+def _download_presentation(
+    file_path: str,
+    site_id: str | None,
+    drive_id: str | None,
+    *,
+    expected_etag: str | None = None,
+) -> _PresentationSnapshot:
+    item = _presentation_metadata(file_path, site_id, drive_id)
+    etag = _require_etag(item["eTag"], "Graph presentation eTag")
+    if expected_etag is not None and etag != _require_etag(expected_etag):
+        raise _ConflictError(
+            "The presentation changed after it was read; fetch it again before editing"
+        )
+    content = _download_preauthenticated_content(
+        item["@microsoft.graph.downloadUrl"], item["size"]
+    )
+    _validate_presentation_archive(content)
+    try:
+        presentation = Presentation(io.BytesIO(content))
     except Exception as exc:
         raise ValueError(
             f"Could not open {file_path!r} as a PowerPoint presentation -- it may "
             "not be a valid .pptx file"
         ) from exc
+    return _PresentationSnapshot(presentation=presentation, etag=etag)
 
 
 def _upload_presentation(
@@ -263,6 +392,7 @@ def _upload_presentation(
     file_path: str,
     site_id: str | None,
     drive_id: str | None,
+    expected_etag: str,
 ) -> dict[str, Any]:
     buffer = io.BytesIO()
     presentation.save(buffer)
@@ -273,42 +403,40 @@ def _upload_presentation(
             f"{_MAX_PRESENTATION_BYTES // 1_000_000} MB limit this tool currently "
             "supports"
         )
-    if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
-        return _upload_presentation_session(content, file_path, site_id, drive_id)
-    result = _graph_request(
-        "PUT",
-        _content_path(file_path, site_id, drive_id),
-        extra_headers={"Content-Type": _POWERPOINT_MIME_TYPE},
-        data=content,
-        timeout=_BINARY_TIMEOUT_SECONDS,
+    # Graph's simple content PUT does not document conditional writes. Use
+    # an upload session for every replacement so the eTag read with the
+    # caller's snapshot can be enforced atomically with If-Match.
+    return _upload_presentation_session(
+        content, file_path, site_id, drive_id, _require_etag(expected_etag)
     )
-    if not isinstance(result, dict) or not result.get("id"):
-        raise RuntimeError("Graph did not confirm the presentation upload completed")
-    safe_item = dict(result)
-    safe_item.pop("@microsoft.graph.downloadUrl", None)
-    return safe_item
 
 
 def _upload_presentation_session(
-    content: bytes, file_path: str, site_id: str | None, drive_id: str | None
+    content: bytes,
+    file_path: str,
+    site_id: str | None,
+    drive_id: str | None,
+    expected_etag: str,
 ) -> dict[str, Any]:
-    """Upload content over _SIMPLE_UPLOAD_MAX_BYTES via Graph's
-    upload-session API instead of the simple content PUT, in
-    _UPLOAD_SESSION_CHUNK_BYTES-aligned fragments.
+    """Replace a presentation through a version-fenced Graph upload session.
 
-    Unlike onedrive.py's own use of this API, content here is always
-    already fully resident in memory (python-pptx has no streaming save),
-    so this has no need for that module's disk-streaming/resume-on-
-    reconnect machinery -- a fragment failure simply fails the whole
-    upload, matching this module's existing _create_only_upload, which
-    takes the same no-retry stance on the same API for its own (always
-    single-fragment) use of it.
+    Content is already resident in memory because python-pptx cannot stream a
+    save. Progress follows Graph's nextExpectedRanges so a partially accepted
+    fragment resumes from the server-reported offset.
     """
-    session = _graph_request(
-        "POST",
-        f"{_item_path(file_path, site_id, drive_id)}/createUploadSession",
-        body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
-    )
+    try:
+        session = _graph_request(
+            "POST",
+            f"{_item_path(file_path, site_id, drive_id)}/createUploadSession",
+            body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+            extra_headers={"If-Match": _require_etag(expected_etag)},
+        )
+    except _GraphRequestError as exc:
+        if exc.status_code == 412:
+            raise _ConflictError(
+                "The presentation changed before the update could be committed"
+            ) from None
+        raise
     upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
     if not isinstance(upload_url, str) or not upload_url:
         raise RuntimeError("Graph did not return an upload session URL")
@@ -323,8 +451,10 @@ def _upload_presentation_session(
     # is re-raised "from None" rather than "from exc" so a future
     # traceback/log/APM capture can never surface this URL as __cause__.
     with requests.Session() as http:
-        for start in range(0, total, _UPLOAD_SESSION_CHUNK_BYTES):
+        start = 0
+        while start < total:
             end = min(start + _UPLOAD_SESSION_CHUNK_BYTES, total)
+            is_final_local_fragment = end == total
             try:
                 response = http.put(
                     upload_url,
@@ -337,21 +467,60 @@ def _upload_presentation_session(
                 )
                 response.raise_for_status()
             except requests.HTTPError:
+                if is_final_local_fragment and response.status_code >= 500:
+                    raise _IndeterminateWriteError(
+                        "Graph may have committed the PowerPoint update, but its "
+                        "final response was lost; do not retry without reading the "
+                        "presentation again"
+                    ) from None
                 raise _GraphRequestError(
                     "PowerPoint presentation upload failed with HTTP "
                     f"{response.status_code}",
                     status_code=response.status_code,
                 ) from None
             except requests.RequestException:
+                if is_final_local_fragment:
+                    raise _IndeterminateWriteError(
+                        "Graph may have committed the PowerPoint update, but its "
+                        "final response was lost; do not retry without reading the "
+                        "presentation again"
+                    ) from None
                 raise RuntimeError("PowerPoint presentation upload failed") from None
-            if end == total:
+
+            if response.status_code in (200, 201):
                 try:
                     result = response.json()
                 except ValueError:
-                    result = None
+                    raise _IndeterminateWriteError(
+                        "Graph accepted the final PowerPoint upload but did not return "
+                        "a confirmation item; read the presentation before retrying"
+                    ) from None
+                break
+
+            try:
+                payload = response.json()
+                ranges = payload["nextExpectedRanges"]
+                offsets = [int(value.split("-", 1)[0]) for value in ranges]
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                raise RuntimeError(
+                    "Graph returned invalid PowerPoint upload-session progress"
+                ) from exc
+            if not offsets:
+                raise RuntimeError(
+                    "Graph returned empty PowerPoint upload-session progress"
+                )
+            next_start = min(offsets)
+            if not start < next_start <= end:
+                raise RuntimeError(
+                    "Graph returned inconsistent PowerPoint upload-session progress"
+                )
+            start = next_start
 
     if not isinstance(result, dict) or not result.get("id"):
-        raise RuntimeError("Graph did not confirm the presentation upload completed")
+        raise _IndeterminateWriteError(
+            "Graph did not confirm whether the PowerPoint update completed; read the "
+            "presentation before retrying"
+        )
     safe_item = dict(result)
     safe_item.pop("@microsoft.graph.downloadUrl", None)
     return safe_item
@@ -539,8 +708,14 @@ def _text_frame_has_dynamic_content(text_frame: Any) -> bool:
     tx_body = text_frame._txBody
     return (
         tx_body.find(".//" + qn("a:hlinkClick")) is not None
+        or tx_body.find(".//" + qn("a:hlinkMouseOver")) is not None
         or tx_body.find(".//" + qn("a:fld")) is not None
     )
+
+
+def _text_frame_has_multiple_runs(text_frame: Any) -> bool:
+    """Whether replacement would collapse distinct run-level formatting."""
+    return any(len(paragraph.runs) > 1 for paragraph in text_frame.paragraphs)
 
 
 def _replace_text_frame_text(text_frame: Any, text: str) -> None:
@@ -655,7 +830,8 @@ def powerpoint_get_presentation_text(
     nested inside a group, and each cell of a table) plus that slide's
     speaker notes, if any."""
     try:
-        presentation = _download_presentation(file_path, site_id, drive_id)
+        snapshot = _download_presentation(file_path, site_id, drive_id)
+        presentation = snapshot.presentation
         slides = [
             {
                 "slide_index": slide_index,
@@ -664,7 +840,7 @@ def powerpoint_get_presentation_text(
             }
             for slide_index, slide in enumerate(presentation.slides)
         ]
-        return _success(slides=slides)
+        return _success(slides=slides, etag=snapshot.etag)
     except Exception as e:
         logger.error(
             "Error getting text for PowerPoint presentation %s: %s", file_path, e
@@ -677,9 +853,11 @@ def powerpoint_list_slides(
     file_path: str, site_id: str | None = None, drive_id: str | None = None
 ) -> str:
     """List a PowerPoint presentation's slides, with each slide's index,
-    layout name, and shape count."""
+    layout name, and shape count. Returns an etag that must be supplied to
+    mutating tools so positional indices cannot target a newer snapshot."""
     try:
-        presentation = _download_presentation(file_path, site_id, drive_id)
+        snapshot = _download_presentation(file_path, site_id, drive_id)
+        presentation = snapshot.presentation
         slides = [
             {
                 "slide_index": slide_index,
@@ -688,7 +866,7 @@ def powerpoint_list_slides(
             }
             for slide_index, slide in enumerate(presentation.slides)
         ]
-        return _success(slides=slides)
+        return _success(slides=slides, etag=snapshot.etag)
     except Exception as e:
         logger.error(
             "Error listing slides for PowerPoint presentation %s: %s", file_path, e
@@ -704,10 +882,12 @@ def powerpoint_get_slide_text(
     drive_id: str | None = None,
 ) -> str:
     """Get one slide's shapes with their index, type, and text (needed by
-    powerpoint_set_shape_text)."""
+    powerpoint_set_shape_text). Returns an etag that must be passed to that
+    tool together with the positional indices."""
     try:
         slide_index = _require_int(slide_index, "slide_index")
-        presentation = _download_presentation(file_path, site_id, drive_id)
+        snapshot = _download_presentation(file_path, site_id, drive_id)
+        presentation = snapshot.presentation
         slide = _require_slide(presentation, slide_index)
         shapes = [
             {
@@ -718,7 +898,7 @@ def powerpoint_get_slide_text(
             }
             for shape_index, shape in enumerate(slide.shapes)
         ]
-        return _success(shapes=shapes)
+        return _success(shapes=shapes, etag=snapshot.etag)
     except Exception as e:
         logger.error(
             "Error getting slide %s text for PowerPoint presentation %s: %s",
@@ -735,25 +915,30 @@ def powerpoint_set_shape_text(
     slide_index: int,
     shape_index: int,
     text: str,
+    expected_etag: str,
     site_id: str | None = None,
     drive_id: str | None = None,
 ) -> str:
     """Replace a shape's text on a slide, by slide_index and shape_index
-    (from powerpoint_get_slide_text). Only works on a shape that already
+    (from powerpoint_get_slide_text), together with that tool's etag as
+    expected_etag. Only works on a shape that already
     has a text frame (a title, body, or plain text box); errors otherwise.
     Preserves each existing paragraph's alignment/bullet/indent formatting
-    and its first run's character formatting (bold, italic, font, size,
+    and its single run's character formatting (bold, italic, font, size,
     color) by position; a paragraph this call adds or removes (a "\\n" in
     text starts a new paragraph) has no corresponding old/new paragraph to
-    carry that formatting from/to. Also errors (rather than silently
-    discarding it) if the shape's text contains a hyperlink or a dynamic
-    field such as an auto-updating slide number or date, since replacing
-    the whole frame's text has no way to carry those over -- edit that
-    shape directly in PowerPoint instead."""
+    carry that formatting from/to. Errors rather than silently discarding
+    multiple differently formatted runs, hyperlinks, or dynamic fields such
+    as an auto-updating slide number or date; edit those shapes directly in
+    PowerPoint instead."""
     try:
         slide_index = _require_int(slide_index, "slide_index")
         shape_index = _require_int(shape_index, "shape_index")
-        presentation = _download_presentation(file_path, site_id, drive_id)
+        expected_etag = _require_etag(expected_etag)
+        snapshot = _download_presentation(
+            file_path, site_id, drive_id, expected_etag=expected_etag
+        )
+        presentation = snapshot.presentation
         slide = _require_slide(presentation, slide_index)
         shape_count = len(slide.shapes)
         if not 0 <= shape_index < shape_count:
@@ -774,9 +959,21 @@ def powerpoint_set_shape_text(
                 "text would silently delete -- edit this shape directly in "
                 "PowerPoint instead"
             )
+        if _text_frame_has_multiple_runs(shape.text_frame):
+            raise ValueError(
+                f"shape {shape_index} on slide {slide_index} contains multiple text "
+                "runs whose formatting cannot be preserved by whole-frame "
+                "replacement -- edit this shape directly in PowerPoint instead"
+            )
         _replace_text_frame_text(shape.text_frame, text)
-        item = _upload_presentation(presentation, file_path, site_id, drive_id)
+        item = _upload_presentation(
+            presentation, file_path, site_id, drive_id, expected_etag
+        )
         return _success(item=item)
+    except _ConflictError as e:
+        return _conflict(str(e))
+    except _IndeterminateWriteError as e:
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error(
             "Error setting shape %s text on slide %s in PowerPoint presentation %s: %s",
@@ -791,6 +988,7 @@ def powerpoint_set_shape_text(
 @mcp.tool()
 def powerpoint_add_slide(
     file_path: str,
+    expected_etag: str,
     title: str | None = None,
     body_text: str | None = None,
     layout_index: int = _DEFAULT_SLIDE_LAYOUT_INDEX,
@@ -799,8 +997,10 @@ def powerpoint_add_slide(
 ) -> str:
     """Add a new slide at the end of a PowerPoint presentation.
 
-    layout_index selects a slide layout from the presentation's slide
-    master (0 is usually "Title Slide", 1 "Title and Content", 6 "Blank" --
+    expected_etag must come from powerpoint_list_slides or
+    powerpoint_list_slide_layouts. layout_index selects a slide layout from
+    the presentation's slide master (0 is usually "Title Slide", 1 "Title
+    and Content", 6 "Blank" --
     use powerpoint_list_slide_layouts to see what this presentation
     actually has, since layouts vary by template). title, if given, is set
     on the layout's title placeholder when present. body_text, if given, is
@@ -813,7 +1013,11 @@ def powerpoint_add_slide(
     confirm where each piece of text actually landed."""
     try:
         layout_index = _require_int(layout_index, "layout_index")
-        presentation = _download_presentation(file_path, site_id, drive_id)
+        expected_etag = _require_etag(expected_etag)
+        snapshot = _download_presentation(
+            file_path, site_id, drive_id, expected_etag=expected_etag
+        )
+        presentation = snapshot.presentation
         layouts = presentation.slide_layouts
         if not 0 <= layout_index < len(layouts):
             raise ValueError(
@@ -821,14 +1025,38 @@ def powerpoint_add_slide(
                 f"presentation's {len(layouts)} slide layouts"
             )
         slide = presentation.slides.add_slide(layouts[layout_index])
-        if title is not None and slide.shapes.title is not None:
+        title_applied = title is None
+        if title is not None:
+            if slide.shapes.title is None:
+                raise ValueError(
+                    f"slide layout {layout_index} has no title placeholder; "
+                    "title was not applied"
+                )
             slide.shapes.title.text = title
+            title_applied = True
+        body_applied = body_text is None
         if body_text is not None:
             body_placeholder = _select_body_placeholder(slide)
-            if body_placeholder is not None:
-                body_placeholder.text_frame.text = body_text
-        item = _upload_presentation(presentation, file_path, site_id, drive_id)
-        return _success(item=item, slide_index=len(presentation.slides) - 1)
+            if body_placeholder is None:
+                raise ValueError(
+                    f"slide layout {layout_index} has no body text placeholder; "
+                    "body_text was not applied"
+                )
+            body_placeholder.text_frame.text = body_text
+            body_applied = True
+        item = _upload_presentation(
+            presentation, file_path, site_id, drive_id, expected_etag
+        )
+        return _success(
+            item=item,
+            slide_index=len(presentation.slides) - 1,
+            title_applied=title_applied,
+            body_applied=body_applied,
+        )
+    except _ConflictError as e:
+        return _conflict(str(e))
+    except _IndeterminateWriteError as e:
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error(
             "Error adding slide to PowerPoint presentation %s: %s", file_path, e
@@ -841,14 +1069,16 @@ def powerpoint_list_slide_layouts(
     file_path: str, site_id: str | None = None, drive_id: str | None = None
 ) -> str:
     """List the slide layouts available in a presentation's template, with
-    the index powerpoint_add_slide's layout_index expects."""
+    the index powerpoint_add_slide's layout_index expects, plus the etag that
+    tool requires for a version-fenced mutation."""
     try:
-        presentation = _download_presentation(file_path, site_id, drive_id)
+        snapshot = _download_presentation(file_path, site_id, drive_id)
+        presentation = snapshot.presentation
         layouts = [
             {"layout_index": index, "name": layout.name}
             for index, layout in enumerate(presentation.slide_layouts)
         ]
-        return _success(layouts=layouts)
+        return _success(layouts=layouts, etag=snapshot.etag)
     except Exception as e:
         logger.error(
             "Error listing slide layouts for PowerPoint presentation %s: %s",
@@ -862,16 +1092,27 @@ def powerpoint_list_slide_layouts(
 def powerpoint_delete_slide(
     file_path: str,
     slide_index: int,
+    expected_etag: str,
     site_id: str | None = None,
     drive_id: str | None = None,
 ) -> str:
-    """Delete a slide from a PowerPoint presentation by index."""
+    """Delete a slide by index from the snapshot identified by expected_etag."""
     try:
         slide_index = _require_int(slide_index, "slide_index")
-        presentation = _download_presentation(file_path, site_id, drive_id)
+        expected_etag = _require_etag(expected_etag)
+        snapshot = _download_presentation(
+            file_path, site_id, drive_id, expected_etag=expected_etag
+        )
+        presentation = snapshot.presentation
         _delete_slide(presentation, slide_index)
-        item = _upload_presentation(presentation, file_path, site_id, drive_id)
+        item = _upload_presentation(
+            presentation, file_path, site_id, drive_id, expected_etag
+        )
         return _success(item=item)
+    except _ConflictError as e:
+        return _conflict(str(e))
+    except _IndeterminateWriteError as e:
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error(
             "Error deleting slide %s from PowerPoint presentation %s: %s",

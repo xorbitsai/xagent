@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -70,6 +71,7 @@ def test_upgrade_inserts_powerpoint(tmp_path):
         assert row[0] == "oauth"
         assert row[1] == "microsoft"
         assert "xagent.web.tools.mcp.powerpoint" in str(row[2])
+        assert "builtin_provenance" in str(row[2])
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -84,6 +86,41 @@ def test_upgrade_is_idempotent(tmp_path):
             text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='powerpoint'")
         ).scalar()
         assert rows == 1
+
+
+def test_upgrade_rejects_unprovenanced_app_id_collision(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) "
+                "VALUES ('powerpoint', 'Operator app', 'stdio', '{}')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="no matching builtin_provenance"):
+                migration.upgrade()
+
+
+def test_downgrade_preserves_unprovenanced_app_id_collision(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) "
+                "VALUES ('powerpoint', 'Operator app', 'stdio', '{}')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+
+        assert "powerpoint" in _app_ids(connection)
 
 
 def test_seed_row_matches_registry(tmp_path):

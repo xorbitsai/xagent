@@ -46,6 +46,13 @@ _WORD_MIME_TYPE = (
 # implementing a resumable upload session.
 _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 
+# A caller-supplied file_path is downloaded, and its full uncompressed
+# bytes handed to python-docx's ZIP/XML parser, before any check runs on
+# the result -- an unbounded download here means an unbounded parse too.
+# Matches sharepoint.py's identical _MAX_DOWNLOAD_BYTES/_read_capped_content
+# guard on the same hazard for its own document downloads.
+_MAX_DOWNLOAD_BYTES = 10_000_000
+
 
 class _GraphRequestError(RuntimeError):
     """Graph HTTP failure that retains its status without response parsing."""
@@ -81,6 +88,44 @@ def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str
     return headers
 
 
+def _read_capped_content(response: requests.Response, *, max_bytes: int) -> bytes:
+    """Read a streamed response body, rejecting it once it exceeds ``max_bytes``.
+
+    The caller sends Accept-Encoding: identity so Content-Length reflects the
+    actual byte count (requests would otherwise transparently decompress a
+    gzip/deflate body, making that header describe the wire size rather than
+    the size actually buffered here) -- the Content-Encoding check below is
+    a fallback for a server that ignores the request header anyway.
+
+    ``with response`` releases the connection on every exit path, not just
+    a fully-consumed one -- matching sharepoint.py's identical
+    _read_capped_content for the same reasoning.
+    """
+    with response:
+        encoding = response.headers.get("Content-Encoding", "identity")
+        if encoding.lower() != "identity":
+            raise ValueError(f"unsupported compressed content encoding: {encoding!r}")
+
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None and content_length.isdigit():
+            if int(content_length) > max_bytes:
+                raise ValueError(
+                    f"file is too large to download ({content_length} bytes, "
+                    f"limit is {max_bytes} bytes)"
+                )
+
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(
+                    f"file is too large to download (limit is {max_bytes} bytes)"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+
 def _graph_request(
     method: str,
     path: str,
@@ -92,10 +137,63 @@ def _graph_request(
     raw: bool = False,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
+    request_headers = _graph_headers(extra_headers)
+    if raw:
+        request_headers["Accept-Encoding"] = "identity"
+
+    if raw:
+        # Graph's /content redirects to a short-lived preauthenticated
+        # download URL -- itself a bearer credential, since whoever has it
+        # can download the file with no further auth until it expires.
+        # requests follows that redirect transparently, so both a
+        # RequestException raised while connecting to (or reading from) the
+        # final host (its message embeds the URL it was trying to reach)
+        # and response.url/str(HTTPError) after a failed response (same
+        # reason) would leak that credential into the returned/logged
+        # error -- matching sharepoint.py's identical guard on the same
+        # hazard for its own document downloads. response.text is not the
+        # same risk -- it's Graph's own JSON error body -- so it's kept for
+        # diagnostic detail (matching the non-raw branch below) while the
+        # URL-bearing exception/response.url are not.
+        try:
+            response = requests.request(
+                method=method,
+                url=f"{GRAPH_BASE_URL}{path}",
+                headers=request_headers,
+                params=params,
+                json=body,
+                data=data,
+                timeout=timeout,
+                stream=True,
+            )
+        except requests.RequestException as exc:
+            raise _GraphRequestError(
+                "network error downloading file content", status_code=0
+            ) from exc
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            response_text = response.text.strip()
+            message = f"{response.status_code} error downloading file content"
+            if response_text:
+                message = f"{message} - {response_text}"
+            raise _GraphRequestError(message, status_code=response.status_code) from exc
+        try:
+            return _read_capped_content(response, max_bytes=_MAX_DOWNLOAD_BYTES)
+        except requests.RequestException as exc:
+            # A connection drop mid-body (after the 200 OK, while streaming
+            # via response.iter_content() inside _read_capped_content) isn't
+            # covered by the try/except above it -- redact it the same way
+            # rather than letting it propagate with the download URL
+            # embedded in its own message.
+            raise _GraphRequestError(
+                "network error downloading file content", status_code=0
+            ) from exc
+
     response = requests.request(
         method=method,
         url=f"{GRAPH_BASE_URL}{path}",
-        headers=_graph_headers(extra_headers),
+        headers=request_headers,
         params=params,
         json=body,
         data=data,
@@ -110,8 +208,6 @@ def _graph_request(
             message = f"{message} - {response_text}"
         raise _GraphRequestError(message, status_code=response.status_code) from exc
 
-    if raw:
-        return response.content
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()

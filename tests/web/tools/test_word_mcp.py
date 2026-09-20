@@ -19,7 +19,14 @@ def _docx_bytes(build_fn=None) -> bytes:
 
 
 class MockResponse:
-    def __init__(self, json_data=None, status_code=200, content=None, url=None):
+    def __init__(
+        self,
+        json_data=None,
+        status_code=200,
+        content=None,
+        url=None,
+        headers=None,
+    ):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
         self.content = (
@@ -27,6 +34,8 @@ class MockResponse:
         )
         self.text = self.content.decode("utf-8", errors="replace")
         self.url = url or "https://graph.microsoft.com/v1.0/example"
+        self.headers = headers if headers is not None else {}
+        self.closed = False
 
     def json(self):
         return self._json_data
@@ -37,6 +46,20 @@ class MockResponse:
                 f"{self.status_code} Client Error: Error for url: {self.url}",
                 response=self,
             )
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    def iter_content(self, chunk_size=1):
+        content = self.content
+        for i in range(0, len(content), chunk_size):
+            yield content[i : i + chunk_size]
 
 
 @pytest.fixture(autouse=True)
@@ -451,6 +474,96 @@ def test_get_document_text_rejects_non_docx_content(monkeypatch):
 
     assert result["status"] == "error"
     assert "Word document" in result["message"]
+
+
+def test_get_document_text_streams_with_identity_encoding(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("hello"))
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    word.word_get_document_text("Report.docx")
+
+    _, kwargs = mock_request.call_args
+    assert kwargs["stream"] is True
+    assert kwargs["headers"]["Accept-Encoding"] == "identity"
+
+
+def test_get_document_text_rejects_declared_content_length_over_limit(monkeypatch):
+    oversized = word._MAX_DOWNLOAD_BYTES + 1
+    mock_request = Mock(
+        return_value=MockResponse(
+            content=b"irrelevant",
+            headers={"Content-Length": str(oversized)},
+        )
+    )
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_get_document_text("Report.docx"))
+
+    assert result["status"] == "error"
+    assert "too large" in result["message"]
+
+
+def test_get_document_text_rejects_streamed_body_over_limit(monkeypatch):
+    # No (or a wrong) Content-Length header must not bypass the cap -- the
+    # streamed byte count is the source of truth.
+    oversized_content = b"x" * (word._MAX_DOWNLOAD_BYTES + 1)
+    mock_request = Mock(return_value=MockResponse(content=oversized_content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_get_document_text("Report.docx"))
+
+    assert result["status"] == "error"
+    assert "too large" in result["message"]
+
+
+def test_get_document_text_rejects_compressed_content_encoding(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            content=b"compressed-bytes",
+            headers={"Content-Encoding": "gzip"},
+        )
+    )
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_get_document_text("Report.docx"))
+
+    assert result["status"] == "error"
+    assert "compressed" in result["message"]
+
+
+def test_get_document_text_closes_connection_on_rejection(monkeypatch):
+    # A stream=True response left open on a rejection path holds its
+    # connection until garbage collection instead of returning it to the
+    # pool immediately -- every rejection branch in _read_capped_content
+    # must close the response, not just a fully-consumed one.
+    response = MockResponse(
+        content=b"compressed-bytes", headers={"Content-Encoding": "gzip"}
+    )
+    mock_request = Mock(return_value=response)
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    word.word_get_document_text("Report.docx")
+
+    assert response.closed is True
+
+
+def test_get_document_text_download_error_does_not_leak_redirect_url(monkeypatch):
+    """Graph's /content redirects to a pre-authenticated download URL --
+    itself a bearer secret. A connection failure while following that
+    redirect embeds the URL in requests' own exception message, so it must
+    not be stringified into the returned error."""
+    secret_url = "https://download.example/blob?token=super-secret-value"
+    mock_request = Mock(
+        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
+    )
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_get_document_text("Report.docx"))
+
+    assert result["status"] == "error"
+    assert "super-secret-value" not in result["message"]
+    assert secret_url not in result["message"]
 
 
 def test_list_paragraphs_includes_style(monkeypatch):

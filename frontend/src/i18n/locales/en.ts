@@ -4080,6 +4080,7 @@ Build when you need.`,
     runStatus: {
       pending: "Pending",
       running: "Running",
+      paused: "Paused",
       completed: "Completed",
       failed: "Failed"
     },

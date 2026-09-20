@@ -6,6 +6,7 @@ import {
   resolveTranslation,
   translations,
 } from "./translations"
+import { AGENT_TRIGGER_RUN_STATUSES } from "../lib/agent-triggers-api"
 
 function isTranslationBranch(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value)
@@ -65,6 +66,24 @@ function assertTranslationLeavesNonEmpty(
 describe("translations", () => {
   it("keeps locale trees structurally identical", () => {
     assertTranslationTreeParity(translations.en, translations.zh)
+  })
+
+  it("labels every trigger run status in both locales", () => {
+    // The run status is rendered through a dynamic key, so a status added
+    // without its labels would not fail type-checking at the call site -- but it
+    // would render the raw key, and a missing `en` entry breaks `next build`.
+    // Indexing by the union also makes this a compile-time check: adding a value
+    // to AGENT_TRIGGER_RUN_STATUSES without labelling it fails here.
+    for (const status of AGENT_TRIGGER_RUN_STATUSES) {
+      expect(
+        translations.en.triggers.runStatus[status],
+        `en label for trigger run status ${status}`,
+      ).toBeTruthy()
+      expect(
+        translations.zh.triggers.runStatus[status],
+        `zh label for trigger run status ${status}`,
+      ).toBeTruthy()
+    }
   })
 
   it("describes the admin account label and searchable identities", () => {

@@ -495,6 +495,9 @@ function runStatusClass(status: string): string {
   if (status === "completed") return "text-emerald-600"
   if (status === "failed") return "text-destructive"
   if (status === "running") return "text-blue-600"
+  // Parked is a resting state, not a failure: without its own branch it would
+  // fall through to the muted default and read like a run that never started.
+  if (status === "paused") return "text-amber-600"
   return "text-muted-foreground"
 }
 

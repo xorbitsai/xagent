@@ -314,6 +314,23 @@ def test_create_presentation_rejects_when_session_creation_conflicts(monkeypatch
     assert mock_request.call_args.kwargs["url"].endswith("createUploadSession")
 
 
+def test_create_presentation_keeps_final_upload_conflict_definite(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+    )
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "put",
+        Mock(return_value=MockResponse({}, status_code=409)),
+    )
+
+    result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptx"))
+
+    assert result["status"] == "error"
+    assert "already exists" in result["message"]
+
+
 def test_create_presentation_upload_failure_does_not_leak_session_url(monkeypatch):
     """The upload-session URL is a pre-authenticated bearer secret (a token
     in its own query string) -- a failed upload must never let that URL
@@ -327,7 +344,8 @@ def test_create_presentation_upload_failure_does_not_leak_session_url(monkeypatc
 
     result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptx"))
 
-    assert result["status"] == "error"
+    assert result["status"] == "indeterminate"
+    assert result["safe_to_retry"] is False
     assert "super-secret-value" not in result["message"]
     assert secret_url not in result["message"]
 
@@ -345,7 +363,8 @@ def test_create_presentation_upload_connection_error_does_not_leak_session_url(
 
     result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptx"))
 
-    assert result["status"] == "error"
+    assert result["status"] == "indeterminate"
+    assert result["safe_to_retry"] is False
     assert "super-secret-value" not in result["message"]
     assert secret_url not in result["message"]
 
@@ -361,7 +380,7 @@ def test_create_only_upload_does_not_chain_secret_bearing_exception(monkeypatch)
     mock_put = Mock(return_value=MockResponse({}, status_code=500, url=secret_url))
     monkeypatch.setattr(powerpoint.requests, "put", mock_put)
 
-    with pytest.raises(powerpoint._GraphRequestError) as exc_info:
+    with pytest.raises(powerpoint._IndeterminateWriteError) as exc_info:
         powerpoint._create_only_upload(b"content", "Deck.pptx", None, None)
 
     assert exc_info.value.__cause__ is None
@@ -376,7 +395,7 @@ def test_create_only_upload_connection_error_does_not_chain_exception(monkeypatc
     )
     monkeypatch.setattr(powerpoint.requests, "put", mock_put)
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(powerpoint._IndeterminateWriteError) as exc_info:
         powerpoint._create_only_upload(b"content", "Deck.pptx", None, None)
 
     assert exc_info.value.__cause__ is None
@@ -431,6 +450,74 @@ def test_get_presentation_text(monkeypatch):
     assert result["etag"] == '"etag-1"'
     assert mock_get.call_args.kwargs["timeout"] == powerpoint._BINARY_TIMEOUT_SECONDS
     assert "headers" not in mock_get.call_args.kwargs
+
+
+def test_get_presentation_text_returns_resumable_bounded_pages(monkeypatch):
+    def build(prs):
+        for index in range(5):
+            slide = prs.slides.add_slide(prs.slide_layouts[1])
+            slide.shapes.title.text = f"Slide {index} " + "x" * 55
+
+    content = _pptx_bytes(build)
+    _mock_download(monkeypatch, content)
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 430)
+
+    cursor = None
+    slide_indices = []
+    while True:
+        result_text = powerpoint.powerpoint_get_presentation_text(
+            "Deck.pptx", cursor=cursor
+        )
+        assert len(result_text) <= 430
+        result = json.loads(result_text)
+        assert result["status"] == "success"
+        slide_indices.extend(slide["slide_index"] for slide in result["slides"])
+        if not result["truncated"]:
+            assert result["next_cursor"] is None
+            break
+        cursor = result["next_cursor"]
+
+    assert slide_indices == list(range(5))
+
+
+def test_get_presentation_text_rejects_one_oversized_slide_with_valid_json(
+    monkeypatch,
+):
+    def build(prs):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+        box.text_frame.text = "x" * 1000
+
+    content = _pptx_bytes(build)
+    _mock_download(monkeypatch, content)
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 300)
+
+    result_text = powerpoint.powerpoint_get_presentation_text("Deck.pptx")
+    result = json.loads(result_text)
+
+    assert len(result_text) <= 300
+    assert result["status"] == "error"
+    assert "single PowerPoint slide" in result["message"]
+
+
+def test_list_slides_cursor_is_rejected_after_presentation_changes(monkeypatch):
+    def build(prs):
+        for index in range(4):
+            prs.slides.add_slide(prs.slide_layouts[1]).shapes.title.text = str(index)
+
+    content = _pptx_bytes(build)
+    _mock_download(monkeypatch, content)
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 300)
+    first = json.loads(powerpoint.powerpoint_list_slides("Deck.pptx"))
+    assert first["truncated"] is True
+
+    _mock_download(monkeypatch, content, etag='"etag-2"')
+    second = json.loads(
+        powerpoint.powerpoint_list_slides("Deck.pptx", cursor=first["next_cursor"])
+    )
+
+    assert second["status"] == "conflict"
+    assert "changed while reading" in second["message"]
 
 
 def test_get_presentation_text_includes_group_table_and_notes(monkeypatch):
@@ -533,6 +620,24 @@ def test_list_slides(monkeypatch):
     assert result["slides"][0]["layout_name"] == "Title and Content"
 
 
+def test_get_slide_text_rejects_one_oversized_shape_with_valid_json(monkeypatch):
+    def build(prs):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+        box.text_frame.text = "x" * 1000
+
+    content = _pptx_bytes(build)
+    _mock_download(monkeypatch, content)
+    monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: 300)
+
+    result_text = powerpoint.powerpoint_get_slide_text("Deck.pptx", 0)
+    result = json.loads(result_text)
+
+    assert len(result_text) <= 300
+    assert result["status"] == "error"
+    assert "single PowerPoint shape" in result["message"]
+
+
 def test_get_slide_text_out_of_range(monkeypatch):
     content = _pptx_bytes()
     _mock_download(monkeypatch, content)
@@ -609,12 +714,15 @@ def test_add_slide_reports_unrequested_content_as_not_applied(monkeypatch):
 
 def test_add_slide_rejects_out_of_range_layout(monkeypatch):
     _mock_download(monkeypatch, _pptx_bytes())
+    mock_session_cls = MagicMock()
+    monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
 
     result = json.loads(
         powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"', layout_index=999)
     )
     assert result["status"] == "error"
-    assert "out of range" in result["message"]
+    assert result["message"].startswith("layout_index 999 is out of range")
+    mock_session_cls.assert_not_called()
 
 
 def test_add_slide_rejects_stale_etag_before_download(monkeypatch):
@@ -744,14 +852,29 @@ def test_text_frame_has_dynamic_content_detects_mouseover_hyperlink():
     assert powerpoint._text_frame_has_dynamic_content(box.text_frame)
 
 
-def test_text_frame_multiple_runs_are_detected():
+def test_text_frame_distinct_run_formatting_is_detected():
     presentation = Presentation()
     slide = presentation.slides.add_slide(presentation.slide_layouts[6])
     box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
-    box.text_frame.paragraphs[0].add_run().text = "Bold"
+    bold_run = box.text_frame.paragraphs[0].add_run()
+    bold_run.text = "Bold"
+    bold_run.font.bold = True
     box.text_frame.paragraphs[0].add_run().text = "Plain"
 
-    assert powerpoint._text_frame_has_multiple_runs(box.text_frame)
+    assert powerpoint._text_frame_has_distinct_run_formatting(box.text_frame)
+
+
+def test_text_frame_equivalent_run_formatting_is_not_rejected():
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+    for text in ("First", "Second"):
+        run = box.text_frame.paragraphs[0].add_run()
+        run.text = text
+        run.font.bold = True
+        run.font.size = Pt(24)
+
+    assert not powerpoint._text_frame_has_distinct_run_formatting(box.text_frame)
 
 
 def test_text_frame_has_dynamic_content_false_for_plain_text():
@@ -1077,8 +1200,26 @@ def test_create_only_upload_handles_non_json_final_response(monkeypatch):
     mock_put = Mock(return_value=_non_json_success_response())
     monkeypatch.setattr(powerpoint.requests, "put", mock_put)
 
-    with pytest.raises(RuntimeError, match="did not confirm"):
+    with pytest.raises(powerpoint._IndeterminateWriteError, match="did not confirm"):
         powerpoint._create_only_upload(b"content", "Deck.pptx", None, None)
+
+
+def test_create_presentation_reports_non_json_final_response_as_indeterminate(
+    monkeypatch,
+):
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+    )
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    monkeypatch.setattr(
+        powerpoint.requests, "put", Mock(return_value=_non_json_success_response())
+    )
+
+    result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptx"))
+
+    assert result["status"] == "indeterminate"
+    assert result["safe_to_retry"] is False
+    assert "check whether the file exists" in result["message"]
 
 
 def test_replace_text_frame_text_preserves_run_formatting():
@@ -1148,6 +1289,32 @@ def test_set_shape_text_preserves_formatting(monkeypatch):
     run = uploaded.slides[0].shapes[0].text_frame.paragraphs[0].runs[0]
     assert run.text == "New"
     assert run.font.bold is True
+
+
+def test_set_shape_text_allows_equivalently_formatted_runs(monkeypatch):
+    def build(prs):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+        for value in ("Old ", "text"):
+            run = box.text_frame.paragraphs[0].add_run()
+            run.text = value
+            run.font.bold = True
+            run.font.size = Pt(24)
+
+    content = _pptx_bytes(build)
+    _, _, mock_put = _mock_versioned_write(monkeypatch, content)
+
+    result = json.loads(
+        powerpoint.powerpoint_set_shape_text("Deck.pptx", 0, 0, "New", '"etag-1"')
+    )
+
+    assert result["status"] == "success"
+    uploaded = Presentation(io.BytesIO(mock_put.call_args.kwargs["data"]))
+    runs = uploaded.slides[0].shapes[0].text_frame.paragraphs[0].runs
+    assert len(runs) == 1
+    assert runs[0].text == "New"
+    assert runs[0].font.bold is True
+    assert runs[0].font.size == Pt(24)
 
 
 def test_missing_auth_token_is_reported(monkeypatch):

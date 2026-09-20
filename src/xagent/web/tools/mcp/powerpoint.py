@@ -1,3 +1,5 @@
+import base64
+import binascii
 import io
 import json
 import logging
@@ -5,7 +7,7 @@ import os
 import zipfile
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import requests
@@ -14,6 +16,7 @@ from pptx import Presentation
 from pptx.oxml.ns import qn
 from pptx.presentation import Presentation as PresentationType
 
+from ....config import get_tool_max_output_length
 from ....core.tools.core.file_analysis import iter_pptx_shapes
 from .utils import setup_proxy_env, url_path_id
 
@@ -115,6 +118,138 @@ def _indeterminate(message: str) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _compact_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bounded_error(message: str, *, details: Any = None) -> str:
+    """Return a valid error envelope that fits the platform's string cap."""
+    max_chars = get_tool_max_output_length()
+    candidates = []
+    if details is not None:
+        candidates.append({"status": "error", "message": message, "details": details})
+    candidates.extend(
+        [
+            {"status": "error", "message": message},
+            {"status": "error", "message": "Tool output limit is too small"},
+            {"status": "error"},
+            {},
+        ]
+    )
+    for payload in candidates:
+        response = _compact_json(payload)
+        if len(response) <= max_chars:
+            return response
+    # A configured limit below two characters cannot carry any valid JSON.
+    # Returning the smallest valid document is still preferable to emitting a
+    # knowingly malformed partial envelope.
+    return "{}"
+
+
+def _encode_read_cursor(index: int, etag: str, scope: str) -> str:
+    payload = _compact_json({"index": index, "etag": etag, "scope": scope})
+    return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def _decode_read_cursor(
+    cursor: str | None, *, etag: str, scope: str, total_count: int
+) -> int:
+    if cursor is None:
+        return 0
+    if not isinstance(cursor, str) or not cursor:
+        raise ValueError("cursor must be a non-empty string")
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(cursor + padding).decode())
+        index = payload["index"]
+        cursor_etag = payload["etag"]
+        cursor_scope = payload["scope"]
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+    ) as exc:
+        raise ValueError("cursor is invalid") from exc
+    if cursor_etag != etag:
+        raise _ConflictError(
+            "The presentation changed while reading a paginated result; restart "
+            "without a cursor"
+        )
+    if cursor_scope != scope:
+        raise ValueError("cursor does not belong to this PowerPoint read operation")
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise ValueError("cursor is invalid")
+    if not 0 <= index <= total_count:
+        raise ValueError("cursor is out of range")
+    return index
+
+
+def _bounded_page_response(
+    *,
+    field_name: str,
+    total_count: int,
+    start_index: int,
+    item_at: Callable[[int], Any],
+    item_label: str,
+    etag: str,
+    scope: str,
+) -> str:
+    """Serialize one resumable page without relying on destructive filtering.
+
+    MCP results are transported as a single string and the platform applies a
+    per-string output cap after the tool returns. Building the page here keeps
+    that outer filter from cutting a JSON document in half. If one atomic item
+    cannot fit, return a small structured error instead of an unrecoverable
+    partial value.
+    """
+    max_chars = get_tool_max_output_length()
+
+    def render(items: list[Any], next_index: int) -> str:
+        truncated = next_index < total_count
+        return _compact_json(
+            {
+                "status": "success",
+                field_name: items,
+                "etag": etag,
+                "truncated": truncated,
+                "next_cursor": (
+                    _encode_read_cursor(next_index, etag, scope) if truncated else None
+                ),
+                "total_count": total_count,
+            }
+        )
+
+    items: list[Any] = []
+    next_index = start_index
+    empty_page = render(items, next_index)
+    if len(empty_page) > max_chars:
+        return _bounded_error(
+            "PowerPoint pagination metadata exceeds the configured output limit"
+        )
+
+    while next_index < total_count:
+        item = item_at(next_index)
+        candidate = render([*items, item], next_index + 1)
+        if len(candidate) > max_chars:
+            if not items:
+                return _bounded_error(
+                    f"A single PowerPoint {item_label} at index {next_index} cannot "
+                    f"fit within the {max_chars}-character tool output limit",
+                    details={
+                        "item_index": next_index,
+                        "item_type": item_label,
+                        "output_limit": max_chars,
+                    },
+                )
+            break
+        items.append(item)
+        next_index += 1
+
+    return render(items, next_index)
 
 
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -590,18 +725,29 @@ def _create_only_upload(
                 f"{file_path!r} already exists; use the other powerpoint_* "
                 "tools to edit it instead of recreating it"
             ) from None
+        if status_code >= 500:
+            raise _IndeterminateWriteError(
+                "Graph may have created the PowerPoint presentation, but its final "
+                "response was lost; check whether the file exists before retrying"
+            ) from None
         raise _GraphRequestError(
             f"PowerPoint presentation upload failed with HTTP {status_code}",
             status_code=status_code,
         ) from None
     except requests.RequestException:
-        raise RuntimeError("PowerPoint presentation upload failed") from None
+        raise _IndeterminateWriteError(
+            "Graph may have created the PowerPoint presentation, but its final "
+            "response was lost; check whether the file exists before retrying"
+        ) from None
     try:
         result = response.json()
     except ValueError:
         result = None
     if not isinstance(result, dict) or not result.get("id"):
-        raise RuntimeError("Graph did not confirm the presentation upload completed")
+        raise _IndeterminateWriteError(
+            "Graph did not confirm whether the PowerPoint presentation was created; "
+            "check whether the file exists before retrying"
+        )
     safe_item = dict(result)
     safe_item.pop("@microsoft.graph.downloadUrl", None)
     return safe_item
@@ -713,9 +859,24 @@ def _text_frame_has_dynamic_content(text_frame: Any) -> bool:
     )
 
 
-def _text_frame_has_multiple_runs(text_frame: Any) -> bool:
-    """Whether replacement would collapse distinct run-level formatting."""
-    return any(len(paragraph.runs) > 1 for paragraph in text_frame.paragraphs)
+def _text_frame_has_distinct_run_formatting(text_frame: Any) -> bool:
+    """Whether replacement would collapse genuinely distinct run formatting.
+
+    Multiple adjacent runs are common even when their direct formatting is
+    identical. Collapsing those runs is safe because replacement preserves the
+    first run's ``a:rPr``. Remain conservative when the direct XML differs: it
+    can carry properties python-pptx does not expose through ``Font``.
+    """
+    for paragraph in text_frame.paragraphs:
+        formatting: set[str | None] = set()
+        for run in paragraph.runs:
+            run_properties = run._r.find(qn("a:rPr"))
+            formatting.add(
+                str(run_properties.xml) if run_properties is not None else None
+            )
+        if len(formatting) > 1:
+            return True
+    return False
 
 
 def _replace_text_frame_text(text_frame: Any, text: str) -> None:
@@ -816,6 +977,8 @@ def powerpoint_create_presentation(
         Presentation().save(buffer)
         item = _create_only_upload(buffer.getvalue(), file_path, site_id, drive_id)
         return _success(item=item)
+    except _IndeterminateWriteError as e:
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error creating PowerPoint presentation %s: %s", file_path, e)
         return _error(str(e))
@@ -823,24 +986,45 @@ def powerpoint_create_presentation(
 
 @mcp.tool()
 def powerpoint_get_presentation_text(
-    file_path: str, site_id: str | None = None, drive_id: str | None = None
+    file_path: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    cursor: str | None = None,
 ) -> str:
     """Get all text in a PowerPoint presentation, as a list of slides each
     with the text of every text-bearing shape on it (including a shape
     nested inside a group, and each cell of a table) plus that slide's
-    speaker notes, if any."""
+    speaker notes, if any. Large decks are returned as bounded pages; pass
+    next_cursor back as cursor to continue. The cursor is tied to the current
+    eTag, so pagination fails with conflict if the presentation changes."""
     try:
         snapshot = _download_presentation(file_path, site_id, drive_id)
         presentation = snapshot.presentation
-        slides = [
-            {
+        total_count = len(presentation.slides)
+        scope = "presentation_text"
+        start_index = _decode_read_cursor(
+            cursor, etag=snapshot.etag, scope=scope, total_count=total_count
+        )
+
+        def slide_at(slide_index: int) -> dict[str, Any]:
+            slide = presentation.slides[slide_index]
+            return {
                 "slide_index": slide_index,
                 "shapes": _slide_texts(slide),
                 "notes": _slide_notes(slide),
             }
-            for slide_index, slide in enumerate(presentation.slides)
-        ]
-        return _success(slides=slides, etag=snapshot.etag)
+
+        return _bounded_page_response(
+            field_name="slides",
+            total_count=total_count,
+            start_index=start_index,
+            item_at=slide_at,
+            item_label="slide",
+            etag=snapshot.etag,
+            scope=scope,
+        )
+    except _ConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error(
             "Error getting text for PowerPoint presentation %s: %s", file_path, e
@@ -850,23 +1034,43 @@ def powerpoint_get_presentation_text(
 
 @mcp.tool()
 def powerpoint_list_slides(
-    file_path: str, site_id: str | None = None, drive_id: str | None = None
+    file_path: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    cursor: str | None = None,
 ) -> str:
     """List a PowerPoint presentation's slides, with each slide's index,
     layout name, and shape count. Returns an etag that must be supplied to
-    mutating tools so positional indices cannot target a newer snapshot."""
+    mutating tools so positional indices cannot target a newer snapshot. Pass
+    next_cursor back as cursor when truncated is true."""
     try:
         snapshot = _download_presentation(file_path, site_id, drive_id)
         presentation = snapshot.presentation
-        slides = [
-            {
+        total_count = len(presentation.slides)
+        scope = "slide_list"
+        start_index = _decode_read_cursor(
+            cursor, etag=snapshot.etag, scope=scope, total_count=total_count
+        )
+
+        def slide_at(slide_index: int) -> dict[str, Any]:
+            slide = presentation.slides[slide_index]
+            return {
                 "slide_index": slide_index,
                 "layout_name": slide.slide_layout.name,
                 "shape_count": len(slide.shapes),
             }
-            for slide_index, slide in enumerate(presentation.slides)
-        ]
-        return _success(slides=slides, etag=snapshot.etag)
+
+        return _bounded_page_response(
+            field_name="slides",
+            total_count=total_count,
+            start_index=start_index,
+            item_at=slide_at,
+            item_label="slide",
+            etag=snapshot.etag,
+            scope=scope,
+        )
+    except _ConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error(
             "Error listing slides for PowerPoint presentation %s: %s", file_path, e
@@ -880,25 +1084,43 @@ def powerpoint_get_slide_text(
     slide_index: int,
     site_id: str | None = None,
     drive_id: str | None = None,
+    cursor: str | None = None,
 ) -> str:
     """Get one slide's shapes with their index, type, and text (needed by
     powerpoint_set_shape_text). Returns an etag that must be passed to that
-    tool together with the positional indices."""
+    tool together with the positional indices. Large shape lists are returned
+    as bounded pages; pass next_cursor back as cursor to continue."""
     try:
         slide_index = _require_int(slide_index, "slide_index")
         snapshot = _download_presentation(file_path, site_id, drive_id)
         presentation = snapshot.presentation
         slide = _require_slide(presentation, slide_index)
-        shapes = [
-            {
+        total_count = len(slide.shapes)
+        scope = f"slide_text:{slide_index}"
+        start_index = _decode_read_cursor(
+            cursor, etag=snapshot.etag, scope=scope, total_count=total_count
+        )
+
+        def shape_at(shape_index: int) -> dict[str, Any]:
+            shape = slide.shapes[shape_index]
+            return {
                 "shape_index": shape_index,
                 "shape_type": str(shape.shape_type),
                 "is_placeholder": shape.is_placeholder,
                 "text": _shape_text(shape),
             }
-            for shape_index, shape in enumerate(slide.shapes)
-        ]
-        return _success(shapes=shapes, etag=snapshot.etag)
+
+        return _bounded_page_response(
+            field_name="shapes",
+            total_count=total_count,
+            start_index=start_index,
+            item_at=shape_at,
+            item_label="shape",
+            etag=snapshot.etag,
+            scope=scope,
+        )
+    except _ConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error(
             "Error getting slide %s text for PowerPoint presentation %s: %s",
@@ -959,7 +1181,7 @@ def powerpoint_set_shape_text(
                 "text would silently delete -- edit this shape directly in "
                 "PowerPoint instead"
             )
-        if _text_frame_has_multiple_runs(shape.text_frame):
+        if _text_frame_has_distinct_run_formatting(shape.text_frame):
             raise ValueError(
                 f"shape {shape_index} on slide {slide_index} contains multiple text "
                 "runs whose formatting cannot be preserved by whole-frame "
@@ -1066,19 +1288,41 @@ def powerpoint_add_slide(
 
 @mcp.tool()
 def powerpoint_list_slide_layouts(
-    file_path: str, site_id: str | None = None, drive_id: str | None = None
+    file_path: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    cursor: str | None = None,
 ) -> str:
     """List the slide layouts available in a presentation's template, with
     the index powerpoint_add_slide's layout_index expects, plus the etag that
-    tool requires for a version-fenced mutation."""
+    tool requires for a version-fenced mutation. Pass next_cursor back as
+    cursor when truncated is true."""
     try:
         snapshot = _download_presentation(file_path, site_id, drive_id)
         presentation = snapshot.presentation
-        layouts = [
-            {"layout_index": index, "name": layout.name}
-            for index, layout in enumerate(presentation.slide_layouts)
-        ]
-        return _success(layouts=layouts, etag=snapshot.etag)
+        total_count = len(presentation.slide_layouts)
+        scope = "slide_layouts"
+        start_index = _decode_read_cursor(
+            cursor, etag=snapshot.etag, scope=scope, total_count=total_count
+        )
+
+        def layout_at(layout_index: int) -> dict[str, Any]:
+            return {
+                "layout_index": layout_index,
+                "name": presentation.slide_layouts[layout_index].name,
+            }
+
+        return _bounded_page_response(
+            field_name="layouts",
+            total_count=total_count,
+            start_index=start_index,
+            item_at=layout_at,
+            item_label="layout",
+            etag=snapshot.etag,
+            scope=scope,
+        )
+    except _ConflictError as e:
+        return _conflict(str(e))
     except Exception as e:
         logger.error(
             "Error listing slide layouts for PowerPoint presentation %s: %s",

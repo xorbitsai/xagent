@@ -728,14 +728,39 @@ def test_get_issue_extra_fields_returns_raw_custom_field_values(monkeypatch):
         jira.jira_get_issue("ENG-1", extra_fields="customfield_10010,customfield_10020")
     )
 
-    assert result["issue"]["extra_field_values"] == {
+    assert result["extra_field_values"] == {
         "customfield_10010": "Sprint 42",
         "customfield_10020": 8,
     }
+    assert "extra_field_values" not in result["issue"]
     issue_call = mock_request.call_args_list[1]
     assert issue_call.kwargs["params"]["fields"] == (
         f"{jira._GET_ISSUE_FIELDS},customfield_10010,customfield_10020"
     )
+
+
+def test_get_issue_extra_fields_ignores_a_name_already_in_the_default_set(monkeypatch):
+    # duedate is already fetched/summarized by default -- naming it in
+    # extra_fields must not re-fetch, re-cap, or duplicate it under
+    # extra_field_values.
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "duedate": "2026-01-01"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="duedate"))
+
+    assert result["issue"]["due_date"] == "2026-01-01"
+    assert "extra_field_values" not in result
+    issue_call = mock_request.call_args_list[1]
+    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
 
 
 def test_cap_text_field_marks_truncation():
@@ -1421,6 +1446,16 @@ def test_summarize_comment_reports_restricted_for_empty_but_present_visibility()
     assert summarized["visibility"] == {"type": None, "value": None}
 
 
+def test_summarize_person_reports_present_for_empty_but_present_person():
+    # Same presence-vs-truthiness bug class: a permission-redacted
+    # assignee/reporter/creator/author can come back as a present but
+    # empty {} rather than an absent key. Truthiness would collapse
+    # that into the same None used for "genuinely unassigned", hiding
+    # "assigned to someone you can't see" as "unassigned".
+    assert jira._summarize_person({}) == {"account_id": None, "display_name": None}
+    assert jira._summarize_person(None) is None
+
+
 def test_get_issue_caps_an_oversized_extra_field_value(monkeypatch):
     long_value = "x" * (jira._ISSUE_DESCRIPTION_MAX_CHARS + 500)
     raw_issue = {
@@ -1440,7 +1475,7 @@ def test_get_issue_caps_an_oversized_extra_field_value(monkeypatch):
 
     result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_10099"))
 
-    value = result["issue"]["extra_field_values"]["customfield_10099"]
+    value = result["extra_field_values"]["customfield_10099"]
     assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
     assert value.endswith("[truncated]")
     assert result["extra_field_values_truncated"] is True
@@ -1484,7 +1519,7 @@ def test_get_issue_flattens_and_caps_an_adf_shaped_extra_field(monkeypatch):
 
     result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_10050"))
 
-    value = result["issue"]["extra_field_values"]["customfield_10050"]
+    value = result["extra_field_values"]["customfield_10050"]
     assert isinstance(value, str)
     assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
     assert result["extra_field_values_truncated"] is True
@@ -1512,7 +1547,7 @@ def test_get_issue_caps_an_oversized_list_shaped_extra_field(monkeypatch):
 
     result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_10060"))
 
-    value = result["issue"]["extra_field_values"]["customfield_10060"]
+    value = result["extra_field_values"]["customfield_10060"]
     assert isinstance(value, str)
     assert len(value) <= jira._ISSUE_DESCRIPTION_MAX_CHARS + len("... [truncated]")
     assert result["extra_field_values_truncated"] is True
@@ -1541,6 +1576,14 @@ def test_path_segment_rejects_blank_or_padded_values():
         jira._path_segment(" ENG-1")
     with pytest.raises(ValueError):
         jira._path_segment("ENG-1 ")
+
+
+def test_path_segment_rejects_none():
+    # str(None) is "None" -- non-blank, non-padded, so it would
+    # otherwise sail through the blank/padded check above and silently
+    # become a literal path segment instead of raising.
+    with pytest.raises(ValueError):
+        jira._path_segment(None)
 
 
 def test_get_issue_rejects_a_blank_issue_key(monkeypatch):
@@ -1576,19 +1619,35 @@ def test_get_issue_response_always_has_a_truncated_key(monkeypatch):
     assert result["truncated"] is False
 
 
-def test_get_issue_extra_field_values_truncated_survives_capped_dict_fallback(
-    monkeypatch,
-):
-    # Nested inside `issue`, this flag could be dropped by
-    # success_with_capped_dict's phase-2 key-dropping along with
-    # extra_field_values itself -- routed as a top-level field instead
-    # (matching how description_truncated is already protected), it
-    # must survive even when the fallback shrinks `issue` down to just
-    # its id.
+def test_get_issue_extra_field_values_survives_capped_dict_fallback(monkeypatch):
+    # extra_field_values is a top-level field (a sibling of "issue"),
+    # not nested inside it, specifically so success_with_capped_dict's
+    # shrink pass -- which only touches `issue` -- can't collapse it.
+    # This matters beyond just the *_truncated flag: each value here is
+    # already capped before this point, so nesting the dict itself
+    # inside `issue` would let the generic pass's dict-shrinking (which
+    # halves a dict's KEY COUNT) collapse a single-key extra_field_values
+    # straight to {} in one step once `issue` needs to shrink at all --
+    # unlike a list, which degrades gradually, a 1-key dict has nowhere
+    # to go but empty. It must survive fully even when the fallback
+    # shrinks `issue` itself down to just its id.
     long_value = "x" * (jira._ISSUE_DESCRIPTION_MAX_CHARS + 500)
     raw_issue = {
         "key": "ENG-1",
-        "fields": {"summary": "ok", "customfield_10099": long_value},
+        "fields": {
+            "summary": "ok",
+            "customfield_10099": long_value,
+            "issuelinks": [
+                {
+                    "type": {"outward": "blocks"},
+                    "outwardIssue": {
+                        "key": f"ENG-{i}",
+                        "fields": {"summary": "x" * 200, "status": {"name": "Open"}},
+                    },
+                }
+                for i in range(50)
+            ],
+        },
     }
     monkeypatch.setattr(
         jira.requests,
@@ -1600,14 +1659,21 @@ def test_get_issue_extra_field_values_truncated_survives_capped_dict_fallback(
             ]
         ),
     )
-    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 200)
-    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 200)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 40000)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 40000)
 
-    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_10099"))
+    raw_response = jira.jira_get_issue("ENG-1", extra_fields="customfield_10099")
+    result = json.loads(raw_response)
 
+    assert len(raw_response) <= 40000
     assert result["status"] == "success"
-    assert "extra_field_values" not in result.get("issue", {})
+    assert "extra_field_values" not in result["issue"]
+    assert result["extra_field_values"]["customfield_10099"].endswith("[truncated]")
     assert result["extra_field_values_truncated"] is True
+    # `issue` (its issuelinks, specifically) is what had to shrink here,
+    # not extra_field_values -- confirming the two are protected
+    # independently rather than the whole response degrading together.
+    assert len(result["issue"].get("issue_links", [])) < 50
 
 
 def test_flatten_adf_mention_falls_back_to_account_id_without_text():
@@ -1622,6 +1688,24 @@ def test_flatten_adf_mention_falls_back_to_account_id_without_text():
         ],
     }
     assert jira._flatten_adf(adf) == "@u1"
+
+
+def test_flatten_adf_mention_falls_back_to_at_sign_for_empty_but_present_id():
+    # Presence, not truthiness: an empty-but-present id (a plausible
+    # broken/deleted-user mention reference) must still render as "@",
+    # not silently collapse to "" the same way a genuinely absent id
+    # would.
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [{"type": "mention", "attrs": {"id": ""}}],
+            }
+        ],
+    }
+    assert jira._flatten_adf(adf) == "@"
 
 
 def test_flatten_adf_inline_card_falls_back_to_data_when_no_url():

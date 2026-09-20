@@ -85,7 +85,13 @@ def _path_segment(value: str) -> str:
     unresolved templated variable from an LLM caller) would otherwise
     silently build /rest/api/2/issue/, hitting the issue-collection
     endpoint instead of a clear local error naming the actual mistake.
+    Rejects None explicitly for the same reason, ahead of the str()
+    coercion below: str(None) is the non-blank, non-padded string
+    "None", which would otherwise sail through both checks above and
+    silently become a literal path segment instead of raising.
     """
+    if value is None:
+        raise ValueError("path segment must not be None")
     text = str(value)
     if text in (".", ".."):
         raise ValueError(f"invalid path segment: {text!r}")
@@ -466,7 +472,10 @@ def _flatten_adf(value: Any) -> str | None:
             # instead of the mention vanishing when text is omitted.
             mention_id = attrs.get("id")
             out.append(
-                str(attrs.get("text") or (f"@{mention_id}" if mention_id else ""))
+                str(
+                    attrs.get("text")
+                    or (f"@{mention_id}" if mention_id is not None else "")
+                )
             )
             return
         if node_type == "emoji":
@@ -553,9 +562,15 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _summarize_person(person: Any) -> dict[str, Any] | None:
-    person = _as_dict(person)
-    if not person:
+    """Presence, not truthiness: Jira can send a present-but-redacted
+    "{}" for a permission-restricted assignee/reporter/creator/author,
+    which must still be reported as "someone, details unavailable"
+    rather than silently collapsed into the same None used for a
+    genuinely unassigned field.
+    """
+    if person is None:
         return None
+    person = _as_dict(person)
     return {
         "account_id": person.get("accountId"),
         "display_name": person.get("displayName"),
@@ -631,6 +646,12 @@ _GET_ISSUE_FIELDS = (
     "issuelinks,subtasks"
 )
 
+#: Parsed once for jira_get_issue's extra_fields dedup: a caller-named
+#: field already in the default set would otherwise be fetched, ADF-
+#: flattened, and capped a second time under extra_field_values, wasting
+#: both work and output budget on data already visible in `issue`.
+_GET_ISSUE_FIELD_NAMES = frozenset(_GET_ISSUE_FIELDS.split(","))
+
 
 def _cap_extra_field_value(value: Any, max_chars: int) -> tuple[Any, bool]:
     """Bound one extra_fields raw value the same way description/comment
@@ -674,13 +695,15 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
     extra_fields: optional comma-separated Jira field ids not in the
     default set above -- standard (e.g. "votes") or custom (e.g.
     "customfield_10010", found via your Jira admin's field
-    configuration). Returned as {field_id: raw_value} under
-    extra_field_values in the result, so you can reach any field this
-    tool doesn't summarize by name. An ADF-shaped (rich text) value is
-    flattened to plain text first, matching description; any resulting
-    large value (text or otherwise) is capped the same way, with a
-    top-level extra_field_values_truncated (a sibling of "issue", like
-    description_truncated) set to true if any entry was cut.
+    configuration); a name already in the default set is ignored, since
+    it's already visible under its own summarized key. Returned as
+    {field_id: raw_value} under a top-level extra_field_values (a
+    sibling of "issue", not nested inside it), so you can reach any
+    field this tool doesn't summarize by name. An ADF-shaped (rich
+    text) value is flattened to plain text first, matching description;
+    any resulting large value (text or otherwise) is capped the same
+    way, with extra_field_values_truncated set to true if any entry was
+    cut.
     Use this, not jira_search_issues, when you need an issue's
     dependencies or full description: issue_links/subtasks/description
     are only returned here. A description longer than
@@ -691,6 +714,9 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
     try:
         requested_extra = [
             name.strip() for name in extra_fields.split(",") if name.strip()
+        ]
+        requested_extra = [
+            name for name in requested_extra if name not in _GET_ISSUE_FIELD_NAMES
         ]
         fields_param = _GET_ISSUE_FIELDS
         if requested_extra:
@@ -704,16 +730,24 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira issue API")
         issue = _summarize_full_issue(result)
-        # Collected separately from `issue` (rather than nested inside
-        # it, as extra_field_values_truncated used to be) so both
-        # survive together when success_with_capped_dict's fallback
-        # below has to shrink `issue` -- a truncation flag nested
-        # inside the field it describes can get dropped along with
-        # that field by the very shrink pass it exists to signal,
-        # exactly when the signal matters most. description_truncated
-        # already worked this way; extra_field_values_truncated now
-        # matches it instead of being the one exception.
-        top_level_truncation_flags: dict[str, Any] = {}
+        description_truncated = _cap_text_field(
+            issue, "description", _ISSUE_DESCRIPTION_MAX_CHARS
+        )
+        # Fixed top-level fields alongside "issue", not nested inside
+        # it: success_with_capped_dict's generic shrink pass only
+        # touches `issue` itself, so a flag (or extra_field_values
+        # itself) nested inside it could be dropped along with the data
+        # it describes by the very shrink pass it exists to signal --
+        # exactly when the signal matters most. Keeping extra_field_
+        # values here too (not just its truncated flag) matters doubly:
+        # each value is already capped above, so its total footprint is
+        # bounded, and shrinking it via the generic pass would collapse
+        # it to {} in a single step regardless (halving a dict shrinks
+        # its KEY COUNT, so a single-key dict has nowhere to go but
+        # empty, unlike a list, which degrades gradually).
+        top_level_extra: dict[str, Any] = {
+            "description_truncated": description_truncated
+        }
         if requested_extra:
             raw_fields = _as_dict(result.get("fields"))
             extra_field_values: dict[str, Any] = {}
@@ -726,35 +760,14 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
                 extra_field_values_truncated = (
                     extra_field_values_truncated or was_truncated
                 )
-            issue["extra_field_values"] = extra_field_values
-            top_level_truncation_flags["extra_field_values_truncated"] = (
+            top_level_extra["extra_field_values"] = extra_field_values
+            top_level_extra["extra_field_values_truncated"] = (
                 extra_field_values_truncated
             )
-        description_truncated = _cap_text_field(
-            issue, "description", _ISSUE_DESCRIPTION_MAX_CHARS
-        )
-        response = _success(
-            issue=issue,
-            description_truncated=description_truncated,
-            truncated=False,
-            **top_level_truncation_flags,
-        )
-        max_output_length = get_tool_max_output_length()
-        if len(response) > max_output_length:
-            # Capping the one known hot-spot field wasn't enough (e.g.
-            # an unusually large number of dependencies/labels, or a
-            # large extra_field_values value) -- fall back to the
-            # generic shrink-until-bounded helper rather than return
-            # invalid (cut-mid-JSON) output.
-            response = success_with_capped_dict(
-                "issue",
-                issue,
-                extra_fields={
-                    "description_truncated": description_truncated,
-                    **top_level_truncation_flags,
-                },
-            )
-        return response
+        # success_with_capped_dict already tries the full response first
+        # and only shrinks `issue` if that doesn't fit -- no need to
+        # separately build and measure a plain response here first.
+        return success_with_capped_dict("issue", issue, extra_fields=top_level_extra)
     except Exception as e:
         logger.error(f"Error fetching Jira issue {issue_key}: {e}")
         return _error(str(e))
@@ -1008,9 +1021,15 @@ def _fit_comments_page(
     has_more_raw: bool,
     max_output_length: int,
 ) -> str | None:
-    """Build the largest whole-comment prefix (each comment already
-    body-capped by _summarize_comment) that fits max_output_length,
-    trying every raw entry first and only shrinking if that overflows.
+    """Build a whole-comment prefix (each comment already body-capped by
+    _summarize_comment) that fits max_output_length, trying every raw
+    entry first and halving the count until it fits if that overflows.
+    Halving can under-deliver relative to the true largest fitting
+    prefix (e.g. 8 kept comments where the full page and half (4) both
+    overflow but 6 would fit tries 8/4/2/1/0, never 6) -- accepted for
+    consistency with the same halving strategy every sibling connector
+    uses for this "shrink a list until the response fits" problem,
+    rather than this being the one bespoke exact-fit search in the file.
 
     Returns None if not even an empty page (0 comments, pointing
     next_start_at just past the one comment that couldn't fit) fits --
@@ -1040,20 +1059,24 @@ def _fit_comments_page(
             # existing "is there more beyond this raw page" signal is
             # exactly right, size aside.
             return (offset + len(raw_comments)) if has_more_raw else None
-        if count == 0:
-            # Nothing kept -- the one comment this page has doesn't fit
-            # even alone. Resuming AT it (offset + kept[0][0], with no
-            # "+1") would equal the caller's own start_at whenever that
-            # comment is the first entry on its raw page, so a caller
-            # mechanically following next_start_at would re-fetch this
-            # exact position forever: the same "must never equal
-            # start_at" invariant jira_list_comments already checks for
-            # its own raw-page case. Skip past it instead -- a page this
-            # tool can never actually deliver is not recoverable by
-            # retrying, and forward progress matters more than not
-            # dropping an unfittable entry.
-            return offset + kept[0][0] + 1
-        return offset + kept[count - 1][0] + 1
+        # One past the last comment actually kept -- or, when count is 0
+        # (nothing kept, the one comment this page has doesn't fit even
+        # alone), one past that comment instead. Using max(count-1, 0)
+        # rather than a separate count==0 branch means there's only one
+        # formula to verify, not two that must independently agree: the
+        # negative-index wraparound `kept[count-1]` at count=0 would
+        # otherwise silently read kept[-1] (the LAST kept comment) if a
+        # future edit merged the branches without noticing the trap.
+        # Skipping past the unfittable entry (not resuming AT it) matters
+        # because resuming at it would equal the caller's own start_at
+        # whenever that comment is first on its raw page -- a caller
+        # mechanically following next_start_at would re-fetch this exact
+        # position forever, the same "must never equal start_at"
+        # invariant jira_list_comments already checks for its own
+        # raw-page case. A page this tool can never actually deliver
+        # isn't recoverable by retrying, so forward progress matters more
+        # than not dropping an unfittable entry.
+        return offset + kept[max(count - 1, 0)][0] + 1
 
     def response_for(count: int) -> str:
         comments = [comment for _, comment in kept[:count]]

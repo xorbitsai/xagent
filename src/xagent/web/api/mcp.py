@@ -2400,7 +2400,9 @@ def _is_meta_family_oauth_account(oauth_account: object) -> bool:
     if provider.lower() == "meta":
         return True
     app_row = get_builtin_public_mcp_app(provider)
-    return bool(app_row) and str(app_row.get("provider_name", "")).lower() == "meta"
+    if app_row is None:
+        return False
+    return str(app_row.get("provider_name", "")).lower() == "meta"
 
 
 def _oauth_keys_for_app(app: dict) -> list[str]:

@@ -51,6 +51,20 @@ def _load_hubspot_deals_write_scope_migration_module():
     return module
 
 
+def _load_hubspot_description_update_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260916_update_hubspot_description.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "update_hubspot_description_migration", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -172,12 +186,13 @@ def test_upgrade_is_idempotent(tmp_path):
 
 
 def test_downgrade_cleans_up_after_descendant_scope_migrations(tmp_path):
-    """20260810_add_hubspot_marketing_scopes and
-    20260914_add_hubspot_deals_write_scope both run after this migration and
+    """20260810_add_hubspot_marketing_scopes,
+    20260914_add_hubspot_deals_write_scope, and
+    20260916_update_hubspot_description all run after this migration and
     expand hubspot's description/oauth_scopes -- unlike a normalization-style
     migration, each of those DOES revert its change on its own downgrade
     (guarded by an "only overwrite if unchanged" check). A downgrade chain
-    that runs both of those descendant migrations' downgrades (in reverse
+    that runs all three descendant migrations' downgrades (in reverse
     revision order, as Alembic would) and then back through this migration
     must still remove the seeded apps and provider, not preserve them as if
     an operator had edited them.
@@ -192,6 +207,7 @@ def test_downgrade_cleans_up_after_descendant_scope_migrations(tmp_path):
     migration = _load_migration_module()
     marketing_scopes_migration = _load_hubspot_marketing_scopes_migration_module()
     deals_write_scope_migration = _load_hubspot_deals_write_scope_migration_module()
+    description_update_migration = _load_hubspot_description_update_migration_module()
     with engine.begin() as connection:
         _create_tables(connection)
         with patch.object(migration, "op", _operations(connection)):
@@ -200,6 +216,10 @@ def test_downgrade_cleans_up_after_descendant_scope_migrations(tmp_path):
             marketing_scopes_migration.upgrade()
         with patch.object(deals_write_scope_migration, "op", _operations(connection)):
             deals_write_scope_migration.upgrade()
+        with patch.object(description_update_migration, "op", _operations(connection)):
+            description_update_migration.upgrade()
+            description_update_migration.downgrade()
+        with patch.object(deals_write_scope_migration, "op", _operations(connection)):
             deals_write_scope_migration.downgrade()
         with patch.object(marketing_scopes_migration, "op", _operations(connection)):
             marketing_scopes_migration.downgrade()

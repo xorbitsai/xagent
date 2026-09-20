@@ -53,6 +53,7 @@ from ..auth_config import (
 )
 from ..auth_dependencies import get_current_user
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
+from ..mcp_apps import get_app_by_id
 from ..models.actor_oauth_flow import ActorOAuthFlowState
 from ..models.auth_database import (
     SyncAuthSessionFactory,
@@ -413,8 +414,6 @@ def _build_microsoft_admin_consent_url(
     """
     from urllib.parse import urlencode
 
-    from ..mcp_apps import get_app_by_id
-
     client_id = _resolve_oauth_secret("microsoft", db_provider.client_id, "CLIENT_ID")
     if not client_id:
         return None
@@ -493,8 +492,6 @@ def _handle_microsoft_admin_consent_return(
     app_id = payload.get("app_id")
     app_label = "this connector"
     if app_id:
-        from ..mcp_apps import get_app_by_id
-
         app_info = get_app_by_id(db, str(app_id))
         app_label = html.escape(
             str(app_info["name"]) if app_info and app_info.get("name") else str(app_id)
@@ -512,6 +509,16 @@ def _handle_microsoft_admin_consent_return(
                 "Ask your team members to connect it again from Xagent -- "
                 "it will now complete without the admin approval prompt.</p>"
             )
+        )
+    if error:
+        error_text = truncate_error_text(str(error), limit=200)
+        description_text = truncate_error_text(
+            str(request.query_params.get("error_description") or ""), limit=500
+        )
+        logger.warning(
+            "Microsoft admin consent callback failed: error=%r, description=%r",
+            error_text,
+            description_text,
         )
     return HTMLResponse(
         content=(

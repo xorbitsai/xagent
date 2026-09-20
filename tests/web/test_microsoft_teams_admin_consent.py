@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import re
 from datetime import timedelta
 from types import SimpleNamespace
@@ -243,7 +244,7 @@ def test_admin_consent_return_trip_denied(db_session):
     assert "not" in response.body.decode().lower()
 
 
-def test_admin_consent_return_trip_error_is_not_reported_as_success(db_session):
+def test_admin_consent_return_trip_error_is_not_reported_as_success(db_session, caplog):
     """Microsoft documents admin-consent failures that still carry
     admin_consent=True, so the error parameter must take precedence."""
     db, _user = db_session
@@ -260,12 +261,18 @@ def test_admin_consent_return_trip_error_is_not_reported_as_success(db_session):
         }
     )
 
-    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+    with caplog.at_level(logging.WARNING, logger="xagent.web.api.auth"):
+        response = generic_oauth_callback(
+            "microsoft", request, db, _microsoft_provider()
+        )
 
     assert response.status_code == 400
     body = response.body.decode().lower()
     assert "not granted" in body
     assert "consent granted" not in body
+    assert "Microsoft admin consent callback failed" in caplog.text
+    assert "consent_required" in caplog.text
+    assert "The resource owner denied the request." in caplog.text
 
 
 @pytest.mark.parametrize("state", [None, "tampered-state"])

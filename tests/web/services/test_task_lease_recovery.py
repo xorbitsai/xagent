@@ -49,6 +49,7 @@ from xagent.web.services.task_lease_service import (
     resolve_checkpoint_recovery,
     utc_now,
 )
+from xagent.web.services.task_orchestrator import sync_trigger_run_status
 
 
 @pytest.fixture()
@@ -256,6 +257,61 @@ def test_expired_lease_with_checkpoint_pauses_all_lifecycle_projections(
     assert trigger_run.status == TriggerRunStatus.PAUSED.value
     assert trigger_run.error_message == TASK_LEASE_PAUSED_TRIGGER_ERROR
     assert trigger_run.finished_at is None
+
+
+def test_recoverable_recovery_history_can_still_be_corrected_by_a_resume(
+    db_session,
+) -> None:
+    """#2177: a recovered-to-PAUSED run stays correctable by a later resume.
+
+    Recovery used to project this run as a terminal ``failed`` + ``finished_at``,
+    and later synchronization only ever selects non-terminal rows -- so a task the
+    user then resumed and completed could never correct that history. This walks
+    the whole trajectory on the recovery fixtures: the run parks, comes back to
+    running when the task is claimed, and finalizes when the task terminates.
+    """
+
+    user = _create_user(db_session, suffix="resume-after-recovery")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="resume-after-recovery",
+        with_checkpoint=True,
+    )
+    _workforce_run, trigger_run = _attach_workforce_and_trigger(
+        db_session, task=task, user=user
+    )
+    trigger_run_id = int(trigger_run.id)
+    task_id = int(task.id)
+
+    assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
+
+    db_session.refresh(trigger_run)
+    assert trigger_run.status == TriggerRunStatus.PAUSED.value
+    assert trigger_run.finished_at is None
+
+    # The user answers: the task is claimed onto a new run ...
+    resumed_task = db_session.get(Task, task_id)
+    assert sync_trigger_run_status(db_session, resumed_task, TaskStatus.RUNNING) is True
+    db_session.commit()
+    db_session.expire_all()
+    assert (
+        db_session.get(TriggerRun, trigger_run_id).status
+        == TriggerRunStatus.RUNNING.value
+    )
+
+    # ... and terminates.
+    finished_task = db_session.get(Task, task_id)
+    assert (
+        sync_trigger_run_status(db_session, finished_task, TaskStatus.COMPLETED) is True
+    )
+    db_session.commit()
+    db_session.expire_all()
+
+    corrected = db_session.get(TriggerRun, trigger_run_id)
+    assert corrected.status == TriggerRunStatus.COMPLETED.value
+    assert corrected.finished_at is not None
+    assert corrected.error_message is None
 
 
 def test_expired_lease_without_checkpoint_fails_and_clears_stale_output(

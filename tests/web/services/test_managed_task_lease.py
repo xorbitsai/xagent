@@ -18,6 +18,12 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.models.trigger import (
+    AgentTrigger,
+    TriggerRun,
+    TriggerRunStatus,
+    TriggerType,
+)
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services.managed_task_lease import (
@@ -836,3 +842,53 @@ def test_finalize_without_execution_result_creates_no_interaction_row_in_native_
     )
 
     assert db_session.query(TaskInteractionRequest).count() == 0
+
+
+def test_finalize_to_parked_projects_the_trigger_run(db_session) -> None:
+    """#2177: this call site parks a task without going through finish_turn.
+
+    Channels finalize with PAUSED / WAITING_FOR_USER here, so a trigger run whose
+    task is parked must be projected to the parked value at this call site --
+    removing the projection here leaves the run reading "running" forever.
+    """
+
+    task = _create_task(db_session)
+    agent = Agent(user_id=int(task.user_id), name="managed-lease-agent")
+    db_session.add(agent)
+    db_session.flush()
+    trigger = AgentTrigger(
+        user_id=int(task.user_id),
+        agent_id=int(agent.id),
+        type=TriggerType.WEBHOOK.value,
+        name="managed lease trigger",
+        config={},
+    )
+    db_session.add(trigger)
+    db_session.flush()
+    run = TriggerRun(
+        trigger_id=int(trigger.id),
+        task_id=int(task.id),
+        status=TriggerRunStatus.RUNNING.value,
+        idempotency_key="managed-lease-parked",
+    )
+    db_session.add(run)
+    db_session.commit()
+    run_id = int(run.id)
+
+    lease = acquire_task_lease(db_session, int(task.id), new_run=True)
+    assert lease is not None
+
+    assert (
+        finalize_managed_task_lease_result(
+            db_session,
+            lease,
+            status=TaskStatus.WAITING_FOR_USER,
+            assistant_content="Waiting on the user",
+        )
+        is True
+    )
+
+    db_session.expire_all()
+    parked = db_session.get(TriggerRun, run_id)
+    assert parked.status == TriggerRunStatus.PAUSED.value
+    assert parked.finished_at is None

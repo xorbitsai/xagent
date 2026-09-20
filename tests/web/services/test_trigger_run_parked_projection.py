@@ -50,6 +50,7 @@ from xagent.web.models.trigger import (
     TriggerType,
 )
 from xagent.web.models.user import User
+from xagent.web.services import triggers as triggers_module
 from xagent.web.services.task_execution_controller import control_state_for_status
 from xagent.web.services.task_lease_service import (
     TaskLease,
@@ -370,3 +371,42 @@ def test_terminal_run_is_never_reopened_by_a_late_projection(db_session):
     reopened = db_session.get(TriggerRun, run_id)
     assert reopened.status == TriggerRunStatus.COMPLETED.value
     assert reopened.finished_at == finished_at
+
+
+def test_replayed_delivery_does_not_reset_an_advanced_run(db_session):
+    """GUARD: a duplicate delivery must not re-arm a run that already advanced.
+
+    ``prepare_trigger_run`` is the entry point a webhook replay hits. Once a run
+    has its task attached it must come back untouched -- in particular a parked
+    run must not be pushed back to ``pending``, which would re-enter the dispatch
+    path while its task is still parked.
+    """
+
+    task, run, _lease = _seed_parked_run(
+        db_session, parked_status=TaskStatus.WAITING_FOR_USER
+    )
+    trigger = db_session.get(AgentTrigger, int(run.trigger_id))
+    assert trigger is not None
+
+    source_event_id = "redelivered-event"
+    run.idempotency_key = triggers_module._trigger_run_idempotency_key(
+        trigger, event_payload={}, source_event_id=source_event_id, test=False
+    )
+    run.status = TriggerRunStatus.PAUSED.value
+    db_session.add(run)
+    db_session.commit()
+    run_id = int(run.id)
+
+    replayed, created = triggers_module.prepare_trigger_run(
+        db_session,
+        trigger=trigger,
+        event_payload={},
+        source_event_id=source_event_id,
+    )
+
+    assert created is False
+    assert int(replayed.id) == run_id
+    db_session.expire_all()
+    stored = db_session.get(TriggerRun, run_id)
+    assert stored.status == TriggerRunStatus.PAUSED.value
+    assert int(stored.task_id) == int(task.id)

@@ -4559,3 +4559,60 @@ def test_acceptance_snapshot_stages_no_execution_lease(db_session, commit):
     assert db_session.query(TaskChatMessage).filter_by(task_id=task_id).count() == int(
         commit
     )
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_accept_turn_projects_running_onto_a_parked_trigger_run(db_session, commit):
+    """#2177: the claim path is what un-parks a resumed run.
+
+    ``_accept_turn_no_commit`` is the acceptance every turn goes through, so a run
+    parked with its task has to read as running again here. The projection is
+    staged in the caller's transaction: rolled back with the acceptance, it must
+    leave the parked run exactly as it was.
+    """
+
+    from xagent.web.services.task_orchestrator import _accept_turn_no_commit
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id))
+    agent = Agent(user_id=int(user.id), name="accept turn agent")
+    db_session.add(agent)
+    db_session.flush()
+    trigger = AgentTrigger(
+        user_id=int(user.id),
+        agent_id=int(agent.id),
+        type=TriggerType.WEBHOOK.value,
+        name="accept turn trigger",
+        config={},
+    )
+    db_session.add(trigger)
+    db_session.flush()
+    run = TriggerRun(
+        trigger_id=int(trigger.id),
+        task_id=int(task.id),
+        status=TriggerRunStatus.PAUSED.value,
+        idempotency_key="accept-turn-parked",
+    )
+    db_session.add(run)
+    db_session.commit()
+    run_id = int(run.id)
+
+    accepted = _accept_turn_no_commit(
+        db_session,
+        int(task.id),
+        int(user.id),
+        payload=TaskTurnPayload(transcript_message="Accepted", turn_id="accept-parked"),
+        kind=TurnKind.CREATE,
+    )
+    assert accepted.status == TaskStatus.RUNNING
+
+    if commit:
+        db_session.commit()
+    else:
+        db_session.rollback()
+
+    db_session.expire_all()
+    stored_run = db_session.get(TriggerRun, run_id)
+    assert stored_run.status == (
+        TriggerRunStatus.RUNNING.value if commit else TriggerRunStatus.PAUSED.value
+    )

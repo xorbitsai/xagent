@@ -247,6 +247,39 @@ def test_get_issue_percent_encodes_issue_key_in_path(monkeypatch):
     )
 
 
+def test_path_segment_rejects_bare_dot_segments():
+    with pytest.raises(ValueError):
+        jira._path_segment(".")
+    with pytest.raises(ValueError):
+        jira._path_segment("..")
+
+
+def test_path_segment_rejects_blank_or_padded_values():
+    # An empty issue_key (e.g. an unresolved templated variable from an
+    # LLM caller) would otherwise silently build /rest/api/2/issue/,
+    # hitting the issue-collection endpoint instead of a clear local
+    # error naming the actual mistake.
+    with pytest.raises(ValueError):
+        jira._path_segment("")
+    with pytest.raises(ValueError):
+        jira._path_segment(" ENG-1")
+    with pytest.raises(ValueError):
+        jira._path_segment("ENG-1 ")
+    assert jira._path_segment("ENG-1") == "ENG-1"
+
+
+def test_get_issue_rejects_a_blank_issue_key(monkeypatch):
+    # _path_segment raises before _request ever makes a network call --
+    # no site-resolution call happens either.
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue(""))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_path_segment_rejects_bare_dot_and_dot_dot():
     # "." and ".." are always-unreserved per RFC 3986, so quote() never
     # touches them, and requests/urllib3 normalize dot-segments out of
@@ -695,6 +728,22 @@ def test_search_issues_bounded_error_degrades_to_minimal_envelope_below_overhead
     result = json.loads(raw_response)
 
     assert result == {"status": "error"}
+
+
+def test_bounded_search_error_shrinks_further_when_escaping_inflates_the_slice():
+    # A message containing a JSON-escapable character (a quote, here)
+    # costs more than one output character per source character, so a
+    # single budget-sized slice can land just past max_output_length --
+    # this must retry with a smaller slice instead of giving up on any
+    # message content the moment the first attempt overflows.
+    message = 'bad query near "login bug" here'
+
+    response = jira._bounded_search_error(message, 50)
+
+    assert len(response) <= 50
+    result = json.loads(response)
+    assert result["status"] == "error"
+    assert result["message"] == "bad query near "
 
 
 def test_search_issues_cursor_stuck_error_is_also_bounded(monkeypatch):

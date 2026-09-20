@@ -79,10 +79,19 @@ def _path_segment(value: str) -> str:
     ".../issue/../secrets" -- a completely different, still-valid
     endpoint). Rejecting the value outright, exactly as url_path_id
     does, is what actually closes this off; encoding alone can't.
+
+    Also rejects a blank or whitespace-padded value (url_path_id's
+    require_clean_identifier half, which this file's own copy had been
+    missing) -- an empty issue_key (e.g. an unresolved templated
+    variable from an LLM caller) would otherwise silently build
+    /rest/api/2/issue/, hitting the issue-collection endpoint instead
+    of a clear local error naming the actual mistake.
     """
     value = str(value)
     if value in (".", ".."):
         raise ValueError(f"path segment must not be '.' or '..': {value!r}")
+    if not value or value.strip() != value:
+        raise ValueError(f"path segment must not be blank or padded: {value!r}")
     return quote(value, safe="")
 
 
@@ -614,11 +623,25 @@ def _bounded_search_error(message: str, max_output_length: int) -> str:
     # (34 chars) there is no valid JSON this can produce that both fits
     # and still has a "message" key, so the bare envelope below is the
     # true floor, not a choice this function is making.
+    #
+    # message is often str(exception) -- e.g. Jira's own JQL-syntax-
+    # error text, which can quote the offending clause -- so it isn't
+    # guaranteed plain ASCII with no JSON-escapable characters. A `"`,
+    # `\`, or control character costs MORE than one output character
+    # per source character, so a single budget-sized slice can still
+    # overflow; shrink by exactly the overshoot and retry rather than
+    # giving up on any message content the moment one slice attempt
+    # doesn't fit. Bounded to a handful of iterations since each retry
+    # strictly reduces the remaining budget.
     budget = max_output_length - len(_error(""))
-    if budget >= 0:
+    for _ in range(50):
+        if budget <= 0:
+            break
         short = _error(message[:budget])
-        if len(short) <= max_output_length:
+        overflow = len(short) - max_output_length
+        if overflow <= 0:
             return short
+        budget -= overflow
     return json.dumps({"status": "error"}, ensure_ascii=False)
 
 
@@ -648,10 +671,18 @@ def jira_search_issues(
     "fields", e.g. issue["fields"]["status"]["id"]) instead of the
     compact projection -- for an existing integration written against
     the raw shape this tool returned before compact projection was
-    added. Bigger per-issue payload, so a raw page can need more/smaller
-    fallback pages to fit the output budget than the same query would
-    at the default setting; prefer the default projection for new
-    integrations.
+    added. Still only the same field subset the compact projection
+    covers (see above); it changes how those fields are shaped, not
+    which ones are fetched -- use jira_get_issue for a field not in
+    that list either way. Bigger per-issue payload, so a raw page can
+    need more/smaller fallback pages to fit the output budget than the
+    same query would at the default setting; prefer the default
+    projection for new integrations.
+    A search error (invalid JQL, a page too big even at minimal size, a
+    stuck pagination cursor) always has a "message" key describing it,
+    except under an extremely small configured output cap where even
+    that can't fit -- there, the response is the bare
+    {"status": "error"} envelope with no message key at all.
     Returns total_count: an approximate count of ALL issues matching the
     JQL (independent of pagination; null if unavailable, e.g. the count
     endpoint failed, OR because including it would have pushed an

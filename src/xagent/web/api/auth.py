@@ -471,7 +471,9 @@ def _microsoft_admin_consent_required_response(admin_consent_url: str) -> HTMLRe
     )
 
 
-def _handle_microsoft_admin_consent_return(request: Request) -> HTMLResponse:
+def _handle_microsoft_admin_consent_return(
+    request: Request, db: Session
+) -> HTMLResponse:
     """Render the landing page Entra ID redirects an admin to after /adminconsent.
 
     This return trip carries admin_consent=True/False and the original
@@ -489,7 +491,14 @@ def _handle_microsoft_admin_consent_return(request: Request) -> HTMLResponse:
         )
 
     app_id = payload.get("app_id")
-    app_label = html.escape(str(app_id)) if app_id else "this connector"
+    app_label = "this connector"
+    if app_id:
+        from ..mcp_apps import get_app_by_id
+
+        app_info = get_app_by_id(db, str(app_id))
+        app_label = html.escape(
+            str(app_info["name"]) if app_info and app_info.get("name") else str(app_id)
+        )
     error = request.query_params.get("error")
     admin_consent = request.query_params.get("admin_consent", "").casefold()
     # Microsoft's documented admin-consent error response can include
@@ -3227,7 +3236,7 @@ def generic_oauth_callback(
         # False and the original `state`, never a `code` -- must be handled
         # before the code/state checks below, which would otherwise reject
         # it as "Missing code or state".
-        return _handle_microsoft_admin_consent_return(request)
+        return _handle_microsoft_admin_consent_return(request, db)
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")

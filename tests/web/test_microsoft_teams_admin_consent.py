@@ -226,7 +226,7 @@ def test_admin_consent_return_trip_success(db_session):
     assert response.status_code == 200
     body = response.body.decode()
     assert "granted" in body.lower()
-    assert "teams" in body.lower()
+    assert "approved Teams" in body
 
 
 def test_admin_consent_return_trip_denied(db_session):

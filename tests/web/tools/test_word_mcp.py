@@ -554,9 +554,13 @@ def test_get_document_text_download_error_does_not_leak_redirect_url(monkeypatch
     redirect embeds the URL in requests' own exception message, so it must
     not be stringified into the returned error."""
     secret_url = "https://download.example/blob?token=super-secret-value"
-    mock_request = Mock(
-        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
-    )
+
+    def side_effect(*args, **kwargs):
+        if kwargs.get("params") == {"$select": "eTag"}:
+            return MockResponse({})
+        raise requests.ConnectionError(f"Connection refused: {secret_url}")
+
+    mock_request = Mock(side_effect=side_effect)
     monkeypatch.setattr(word.requests, "request", mock_request)
 
     result = json.loads(word.word_get_document_text("Report.docx"))
@@ -597,32 +601,43 @@ def test_set_paragraph_text_uploads_updated_document(monkeypatch):
     content = _docx_bytes(lambda d: d.add_paragraph("Old text"))
     responses = iter(
         [
+            MockResponse({"eTag": '"abc"'}),
             MockResponse(content=content),
-            MockResponse({"id": "item-1"}, status_code=200),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
         ]
     )
     mock_request = Mock(side_effect=lambda *a, **k: next(responses))
     monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}, status_code=200))
+    monkeypatch.setattr(word.requests, "put", mock_put)
 
     result = json.loads(word.word_set_paragraph_text("Report.docx", 0, "New text"))
 
     assert result["status"] == "success"
-    put_call = mock_request.call_args_list[1]
-    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
+    session_call = mock_request.call_args_list[2]
+    assert session_call.kwargs["headers"]["If-Match"] == '"abc"'
+    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
     assert uploaded.paragraphs[0].text == "New text"
 
 
 def test_append_paragraph(monkeypatch):
     content = _docx_bytes()
-    responses = iter([MockResponse(content=content), MockResponse({"id": "item-1"})])
+    responses = iter(
+        [
+            MockResponse({"eTag": '"abc"'}),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
     mock_request = Mock(side_effect=lambda *a, **k: next(responses))
     monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
 
     result = json.loads(word.word_append_paragraph("Report.docx", "New paragraph"))
 
     assert result["status"] == "success"
-    put_call = mock_request.call_args_list[1]
-    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
+    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
     assert uploaded.paragraphs[-1].text == "New paragraph"
 
 
@@ -634,15 +649,22 @@ def test_add_heading_validates_level():
 
 def test_add_heading_uploads_updated_document(monkeypatch):
     content = _docx_bytes()
-    responses = iter([MockResponse(content=content), MockResponse({"id": "item-1"})])
+    responses = iter(
+        [
+            MockResponse({}),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
     mock_request = Mock(side_effect=lambda *a, **k: next(responses))
     monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
 
     result = json.loads(word.word_add_heading("Report.docx", "Section", level=2))
 
     assert result["status"] == "success"
-    put_call = mock_request.call_args_list[1]
-    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
+    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
     assert uploaded.paragraphs[-1].text == "Section"
     assert uploaded.paragraphs[-1].style.name == "Heading 2"
 
@@ -653,16 +675,23 @@ def test_replace_text_counts_matches_within_runs(monkeypatch):
         p.add_run("foo bar foo")
 
     content = _docx_bytes(build)
-    responses = iter([MockResponse(content=content), MockResponse({"id": "item-1"})])
+    responses = iter(
+        [
+            MockResponse({}),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
     mock_request = Mock(side_effect=lambda *a, **k: next(responses))
     monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
 
     assert result["status"] == "success"
     assert result["replacements"] == 2
-    put_call = mock_request.call_args_list[1]
-    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
+    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
     assert uploaded.paragraphs[0].text == "baz bar baz"
 
 
@@ -683,7 +712,8 @@ def test_replace_text_skips_upload_when_nothing_matches(monkeypatch):
     assert result["status"] == "success"
     assert result["replacements"] == 0
     assert "item" not in result
-    assert mock_request.call_count == 1
+    # Only the metadata + content download GETs happened -- no upload.
+    assert mock_request.call_count == 2
 
 
 def test_replace_text_rejects_match_in_run_with_image(monkeypatch):
@@ -711,8 +741,8 @@ def test_replace_text_rejects_match_in_run_with_image(monkeypatch):
 
     assert result["status"] == "error"
     assert "non-text content" in result["message"]
-    # Only the download GET happened -- no upload was attempted.
-    assert mock_request.call_count == 1
+    # Only the metadata + content download GETs happened -- no upload.
+    assert mock_request.call_count == 2
 
 
 def test_replace_text_rejects_match_inside_content_control(monkeypatch):
@@ -741,7 +771,8 @@ def test_replace_text_rejects_match_inside_content_control(monkeypatch):
 
     assert result["status"] == "error"
     assert "content control" in result["message"]
-    assert mock_request.call_count == 1
+    # Only the metadata + content download GETs happened -- no upload.
+    assert mock_request.call_count == 2
 
 
 def test_replace_text_rejects_match_inside_simple_field(monkeypatch):
@@ -770,7 +801,8 @@ def test_replace_text_rejects_match_inside_simple_field(monkeypatch):
 
     assert result["status"] == "error"
     assert "field" in result["message"]
-    assert mock_request.call_count == 1
+    # Only the metadata + content download GETs happened -- no upload.
+    assert mock_request.call_count == 2
 
 
 def test_replace_text_rejects_match_inside_complex_field_result(monkeypatch):
@@ -817,7 +849,8 @@ def test_replace_text_rejects_match_inside_complex_field_result(monkeypatch):
 
     assert result["status"] == "error"
     assert "field" in result["message"]
-    assert mock_request.call_count == 1
+    # Only the metadata + content download GETs happened -- no upload.
+    assert mock_request.call_count == 2
 
 
 def test_replace_text_finds_match_inside_hyperlink_run(monkeypatch):
@@ -838,16 +871,23 @@ def test_replace_text_finds_match_inside_hyperlink_run(monkeypatch):
         p.add_run(" after")
 
     content = _docx_bytes(build)
-    responses = iter([MockResponse(content=content), MockResponse({"id": "item-1"})])
+    responses = iter(
+        [
+            MockResponse({}),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
     mock_request = Mock(side_effect=lambda *a, **k: next(responses))
     monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
 
     result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
 
     assert result["status"] == "success"
     assert result["replacements"] == 1
-    put_call = mock_request.call_args_list[1]
-    uploaded = Document(io.BytesIO(put_call.kwargs["data"]))
+    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
     assert uploaded.paragraphs[0].text == "before baz bar after"
 
 
@@ -880,7 +920,8 @@ def test_replace_text_ignores_match_inside_tracked_insertion(monkeypatch):
     assert result["status"] == "success"
     assert result["replacements"] == 0
     # No match means no change -- only the download GET happened.
-    assert mock_request.call_count == 1
+    # Only the metadata + content download GETs happened -- no upload.
+    assert mock_request.call_count == 2
 
 
 def test_replace_text_ignores_match_inside_text_box(monkeypatch):
@@ -914,7 +955,8 @@ def test_replace_text_ignores_match_inside_text_box(monkeypatch):
     assert result["status"] == "success"
     assert result["replacements"] == 0
     # No match means no change -- only the download GET happened.
-    assert mock_request.call_count == 1
+    # Only the metadata + content download GETs happened -- no upload.
+    assert mock_request.call_count == 2
 
 
 def test_set_paragraph_text_ignores_hyperlink_inside_text_box():
@@ -952,6 +994,86 @@ def test_upload_document_rejects_oversized_content(monkeypatch):
 
     with pytest.raises(ValueError, match="MB limit"):
         word._upload_document(document, "Report.docx", None, None)
+
+
+def test_upload_document_sends_if_match_when_etag_given(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+    )
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    word._upload_document(Document(), "Report.docx", None, None, etag='"abc123"')
+
+    session_call = mock_request.call_args
+    assert session_call.kwargs["headers"]["If-Match"] == '"abc123"'
+
+
+def test_upload_document_omits_if_match_when_no_etag(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+    )
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    word._upload_document(Document(), "Report.docx", None, None, etag=None)
+
+    session_call = mock_request.call_args
+    assert "If-Match" not in session_call.kwargs["headers"]
+
+
+def test_upload_document_rejects_stale_etag_at_session_creation(monkeypatch):
+    """A 412 at createUploadSession means someone else changed the file
+    since it was downloaded for this edit -- surfaced as a clear conflict,
+    not the generic upload-failure message."""
+    mock_request = Mock(
+        return_value=MockResponse({"error": {"code": "..."}}, status_code=412)
+    )
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    with pytest.raises(ValueError, match="changed by someone else"):
+        word._upload_document(Document(), "Report.docx", None, None, etag='"stale"')
+
+
+def test_upload_document_rejects_stale_etag_at_content_put(monkeypatch):
+    """Graph can also reject the conditional write at the content PUT step
+    rather than session creation, depending on timing -- both paths must
+    surface the same clear conflict message."""
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+    )
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({}, status_code=412))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    with pytest.raises(ValueError, match="changed by someone else"):
+        word._upload_document(Document(), "Report.docx", None, None, etag='"stale"')
+
+
+def test_download_document_returns_etag_from_metadata(monkeypatch):
+    content = _docx_bytes()
+    responses = iter([MockResponse({"eTag": '"xyz"'}), MockResponse(content=content)])
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    _document, etag = word._download_document("Report.docx", None, None)
+
+    assert etag == '"xyz"'
+    metadata_call = mock_request.call_args_list[0]
+    assert metadata_call.kwargs["params"] == {"$select": "eTag"}
+
+
+def test_download_document_tolerates_missing_etag(monkeypatch):
+    content = _docx_bytes()
+    responses = iter([MockResponse({}), MockResponse(content=content)])
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    _document, etag = word._download_document("Report.docx", None, None)
+
+    assert etag is None
 
 
 # ---------------------------------------------------------------------------

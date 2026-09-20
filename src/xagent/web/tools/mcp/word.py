@@ -295,12 +295,18 @@ def _content_path(file_path: str, site_id: str | None, drive_id: str | None) -> 
 
 def _download_document(
     file_path: str, site_id: str | None, drive_id: str | None
-) -> DocumentType:
+) -> tuple[DocumentType, str | None]:
+    """Download file_path and parse it, also returning the driveItem's
+    current eTag (None if Graph didn't report one) for _upload_document to
+    bind the write to via If-Match -- see _upload_document."""
+    item_path = _item_path(file_path, site_id, drive_id)
+    metadata = _graph_request("GET", item_path, params={"$select": "eTag"})
+    etag = metadata.get("eTag") if isinstance(metadata, dict) else None
     content = _graph_request(
         "GET", _content_path(file_path, site_id, drive_id), raw=True
     )
     try:
-        return Document(io.BytesIO(content))
+        return Document(io.BytesIO(content)), etag
     except Exception as exc:
         raise ValueError(
             f"Could not open {file_path!r} as a Word document -- it may not be a "
@@ -309,8 +315,26 @@ def _download_document(
 
 
 def _upload_document(
-    document: DocumentType, file_path: str, site_id: str | None, drive_id: str | None
+    document: DocumentType,
+    file_path: str,
+    site_id: str | None,
+    drive_id: str | None,
+    *,
+    etag: str | None = None,
 ) -> dict[str, Any]:
+    """Save document and upload it in place of file_path's current content.
+
+    Goes through an upload session (like _create_only_upload) instead of
+    the simpler content PUT this used before, specifically to attach
+    If-Match: etag on session creation -- confirmed in Graph's
+    createUploadSession reference, unlike the plain content-PUT endpoint's
+    own reference, which documents no conditional-write header at all.
+    Without this, two callers racing a download-mutate-upload cycle on the
+    same file could have the later one silently overwrite the earlier
+    one's change; a stale etag now fails the write with 412 instead.
+    etag is optional (skips the guard, matching the prior unconditional
+    behavior) since not every caller has one to offer.
+    """
     buffer = io.BytesIO()
     document.save(buffer)
     content = buffer.getvalue()
@@ -320,13 +344,57 @@ def _upload_document(
             f"{_SIMPLE_UPLOAD_MAX_BYTES // 1_000_000} MB limit this tool currently "
             "supports"
         )
-    result = _graph_request(
-        "PUT",
-        _content_path(file_path, site_id, drive_id),
-        extra_headers={"Content-Type": _WORD_MIME_TYPE},
-        data=content,
-        timeout=_BINARY_TIMEOUT_SECONDS,
+    item_path = _item_path(file_path, site_id, drive_id)
+    conflict_message = (
+        f"{file_path!r} was changed by someone else since this edit "
+        "started; re-read it and retry"
     )
+    try:
+        session = _graph_request(
+            "POST",
+            f"{item_path}/createUploadSession",
+            # "replace" (rather than the "fail" default) is required here:
+            # this path always resolves to the file already being edited,
+            # so the default's job -- refusing to silently clobber an
+            # unrelated file that happens to share this name -- is instead
+            # done by the If-Match check below.
+            body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
+            extra_headers={"If-Match": etag} if etag else None,
+        )
+    except _GraphRequestError as exc:
+        if exc.status_code == 412:
+            raise ValueError(conflict_message) from exc
+        raise
+    upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
+    if not isinstance(upload_url, str) or not upload_url:
+        raise RuntimeError("Graph did not return an upload session URL")
+
+    # See _create_only_upload's identical comment: the upload-session URL
+    # is itself a bearer secret, so neither requests.put's own exception
+    # nor the HTTPError from raise_for_status() is stringified into a
+    # message here, and each is re-raised "from None".
+    try:
+        response = requests.put(
+            upload_url,
+            data=content,
+            headers={
+                "Content-Range": f"bytes 0-{len(content) - 1}/{len(content)}",
+                "Content-Type": _WORD_MIME_TYPE,
+            },
+            timeout=_BINARY_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except requests.HTTPError:
+        status_code = response.status_code
+        if status_code == 412:
+            raise ValueError(conflict_message) from None
+        raise _GraphRequestError(
+            f"Word document upload failed with HTTP {status_code}",
+            status_code=status_code,
+        ) from None
+    except requests.RequestException:
+        raise RuntimeError("Word document upload failed") from None
+    result = response.json()
     if not isinstance(result, dict) or not result.get("id"):
         raise RuntimeError("Graph did not confirm the document upload completed")
     safe_item = dict(result)
@@ -580,7 +648,7 @@ def word_get_document_text(
     newlines. Table contents are not included -- see word_list_paragraphs
     for per-paragraph detail."""
     try:
-        document = _download_document(file_path, site_id, drive_id)
+        document, _etag = _download_document(file_path, site_id, drive_id)
         text = "\n".join(paragraph.text for paragraph in document.paragraphs)
         return _success(text=text, table_count=len(document.tables))
     except Exception as e:
@@ -595,7 +663,7 @@ def word_list_paragraphs(
     """List a Word document's paragraphs with their index, text, and
     style name. The index is needed by word_set_paragraph_text."""
     try:
-        document = _download_document(file_path, site_id, drive_id)
+        document, _etag = _download_document(file_path, site_id, drive_id)
         paragraphs = [
             {
                 "index": index,
@@ -623,7 +691,7 @@ def word_set_paragraph_text(
     character formatting; does not preserve formatting that varied across
     multiple runs within the paragraph."""
     try:
-        document = _download_document(file_path, site_id, drive_id)
+        document, etag = _download_document(file_path, site_id, drive_id)
         paragraphs = document.paragraphs
         if not 0 <= paragraph_index < len(paragraphs):
             raise ValueError(
@@ -631,7 +699,7 @@ def word_set_paragraph_text(
                 f"with {len(paragraphs)} paragraphs"
             )
         _set_paragraph_text(paragraphs[paragraph_index], text)
-        item = _upload_document(document, file_path, site_id, drive_id)
+        item = _upload_document(document, file_path, site_id, drive_id, etag=etag)
         return _success(item=item)
     except Exception as e:
         logger.error(
@@ -656,9 +724,9 @@ def word_append_paragraph(
     invalid names raise an error rather than silently falling back to
     Normal."""
     try:
-        document = _download_document(file_path, site_id, drive_id)
+        document, etag = _download_document(file_path, site_id, drive_id)
         document.add_paragraph(text, style=style)
-        item = _upload_document(document, file_path, site_id, drive_id)
+        item = _upload_document(document, file_path, site_id, drive_id, etag=etag)
         return _success(item=item)
     except Exception as e:
         logger.error("Error appending paragraph to Word document %s: %s", file_path, e)
@@ -678,9 +746,9 @@ def word_add_heading(
     try:
         if not 0 <= level <= 9:
             raise ValueError("level must be between 0 and 9")
-        document = _download_document(file_path, site_id, drive_id)
+        document, etag = _download_document(file_path, site_id, drive_id)
         document.add_heading(text, level=level)
-        item = _upload_document(document, file_path, site_id, drive_id)
+        item = _upload_document(document, file_path, site_id, drive_id, etag=etag)
         return _success(item=item)
     except Exception as e:
         logger.error("Error adding heading to Word document %s: %s", file_path, e)
@@ -724,7 +792,7 @@ def word_replace_text(
     try:
         if not find:
             raise ValueError("find must not be empty")
-        document = _download_document(file_path, site_id, drive_id)
+        document, etag = _download_document(file_path, site_id, drive_id)
         replacements = 0
         for paragraph in document.paragraphs:
             for r, field_protected in _iter_replaceable_runs(paragraph):
@@ -751,7 +819,7 @@ def word_replace_text(
             # Nothing changed -- uploading the unmodified document would
             # still create a new version/last-modified entry for no reason.
             return _success(replacements=0)
-        item = _upload_document(document, file_path, site_id, drive_id)
+        item = _upload_document(document, file_path, site_id, drive_id, etag=etag)
         return _success(item=item, replacements=replacements)
     except Exception as e:
         logger.error("Error replacing text in Word document %s: %s", file_path, e)

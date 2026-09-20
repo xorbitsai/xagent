@@ -805,6 +805,33 @@ def test_replace_text_rejects_match_inside_simple_field(monkeypatch):
     assert mock_request.call_count == 2
 
 
+@pytest.mark.parametrize("tag", ["w:smartTag", "w:customXml"])
+def test_replace_text_rejects_match_inside_smart_tag_or_custom_xml(monkeypatch, tag):
+    """word_set_paragraph_text already refuses a paragraph containing
+    w:smartTag/w:customXml -- word_replace_text's own, separate per-run
+    guard must refuse a match inside one too, not just w:sdt/w:fldSimple."""
+    from docx.oxml.shared import OxmlElement
+
+    def build(d):
+        p = d.add_paragraph()
+        wrapper = OxmlElement(tag)
+        run_elm = OxmlElement("w:r")
+        text_elm = OxmlElement("w:t")
+        text_elm.text = "foo bar"
+        run_elm.append(text_elm)
+        wrapper.append(run_elm)
+        p._p.append(wrapper)
+
+    content = _docx_bytes(build)
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "error"
+    assert mock_request.call_count == 2
+
+
 def test_replace_text_rejects_match_inside_complex_field_result(monkeypatch):
     """A complex field (begin/instrText/separate/result/end run sequence)
     has no single wrapper element -- its cached result run must still be
@@ -851,6 +878,199 @@ def test_replace_text_rejects_match_inside_complex_field_result(monkeypatch):
     assert "field" in result["message"]
     # Only the metadata + content download GETs happened -- no upload.
     assert mock_request.call_count == 2
+
+
+def test_replace_text_rejects_match_inside_field_spanning_paragraphs(monkeypatch):
+    """A complex field commonly opens in one paragraph and closes several
+    paragraphs later -- a multi-entry table of contents has its own begin/
+    separate in the first entry's paragraph, one entry per paragraph, and
+    end in the last. Tracking field state fresh per paragraph call would
+    lose protection for every entry after the first; it must be threaded
+    across the whole document instead."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+
+    def add_run_with(paragraph, *children):
+        run_elm = OxmlElement("w:r")
+        for child in children:
+            run_elm.append(child)
+        paragraph._p.append(run_elm)
+
+    def build(d):
+        p0 = d.add_paragraph()
+        begin = OxmlElement("w:fldChar")
+        begin.set(qn("w:fldCharType"), "begin")
+        add_run_with(p0, begin)
+        instr = OxmlElement("w:instrText")
+        instr.text = " TOC "
+        add_run_with(p0, instr)
+        separate = OxmlElement("w:fldChar")
+        separate.set(qn("w:fldCharType"), "separate")
+        add_run_with(p0, separate)
+
+        p1 = d.add_paragraph()
+        entry_text = OxmlElement("w:t")
+        entry_text.text = "foo bar"
+        add_run_with(p1, entry_text)
+
+        p2 = d.add_paragraph()
+        end = OxmlElement("w:fldChar")
+        end.set(qn("w:fldCharType"), "end")
+        add_run_with(p2, end)
+
+    content = _docx_bytes(build)
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "error"
+    assert "field" in result["message"]
+
+
+def test_replace_text_edits_ordinary_text_after_a_field_ends(monkeypatch):
+    """State must not leak past a field's own "end" marker -- a paragraph
+    with nothing but ordinary text, appearing after a completed field,
+    must remain freely editable."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+
+    def add_run_with(paragraph, *children):
+        run_elm = OxmlElement("w:r")
+        for child in children:
+            run_elm.append(child)
+        paragraph._p.append(run_elm)
+
+    def build(d):
+        p0 = d.add_paragraph()
+        begin = OxmlElement("w:fldChar")
+        begin.set(qn("w:fldCharType"), "begin")
+        add_run_with(p0, begin)
+        separate = OxmlElement("w:fldChar")
+        separate.set(qn("w:fldCharType"), "separate")
+        add_run_with(p0, separate)
+        result_text = OxmlElement("w:t")
+        result_text.text = "cached result"
+        add_run_with(p0, result_text)
+        end = OxmlElement("w:fldChar")
+        end.set(qn("w:fldCharType"), "end")
+        add_run_with(p0, end)
+
+        d.add_paragraph("foo bar")
+
+    content = _docx_bytes(build)
+    responses = iter(
+        [
+            MockResponse({}),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "success"
+    assert result["replacements"] == 1
+
+
+def test_replace_text_rejects_match_in_outer_field_result_after_nested_field(
+    monkeypatch,
+):
+    """A field nested inside another field's result region (e.g. a TOC
+    entry's page number is itself a nested PAGEREF field) must not let its
+    own "end" prematurely un-protect the outer field's remaining result --
+    a single boolean flag gets this wrong; a depth stack doesn't."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+
+    def add_run_with(paragraph, *children):
+        run_elm = OxmlElement("w:r")
+        for child in children:
+            run_elm.append(child)
+        paragraph._p.append(run_elm)
+
+    def fld_char(fld_type):
+        elm = OxmlElement("w:fldChar")
+        elm.set(qn("w:fldCharType"), fld_type)
+        return elm
+
+    def text_run(text):
+        elm = OxmlElement("w:t")
+        elm.text = text
+        return elm
+
+    def build(d):
+        p = d.add_paragraph()
+        add_run_with(p, fld_char("begin"))  # outer begin
+        add_run_with(p, fld_char("separate"))  # outer separate
+        add_run_with(p, fld_char("begin"))  # nested begin
+        add_run_with(p, fld_char("separate"))  # nested separate
+        add_run_with(p, text_run("nested result"))
+        add_run_with(p, fld_char("end"))  # nested end
+        add_run_with(p, text_run("foo bar"))  # outer's own trailing result
+        add_run_with(p, fld_char("end"))  # outer end
+
+    content = _docx_bytes(build)
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "error"
+    assert "field" in result["message"]
+
+
+def test_replace_text_ignores_field_state_from_tracked_insertion(monkeypatch):
+    """A complex field entirely inside a tracked-change insertion is
+    correctly skipped (it's not visible through this module's read tools
+    either) -- but its fldChar markers must not leak field-protected state
+    onto ordinary text later in the same paragraph."""
+    from docx.oxml.ns import qn
+    from docx.oxml.shared import OxmlElement
+
+    def build(d):
+        p = d.add_paragraph()
+        ins = OxmlElement("w:ins")
+        for fld_type in ("begin", "separate"):
+            run_elm = OxmlElement("w:r")
+            fld = OxmlElement("w:fldChar")
+            fld.set(qn("w:fldCharType"), fld_type)
+            run_elm.append(fld)
+            ins.append(run_elm)
+        result_run = OxmlElement("w:r")
+        result_text = OxmlElement("w:t")
+        result_text.text = "tracked field result"
+        result_run.append(result_text)
+        ins.append(result_run)
+        end_run = OxmlElement("w:r")
+        end_fld = OxmlElement("w:fldChar")
+        end_fld.set(qn("w:fldCharType"), "end")
+        end_run.append(end_fld)
+        ins.append(end_run)
+        p._p.append(ins)
+        p.add_run("foo bar")
+
+    content = _docx_bytes(build)
+    responses = iter(
+        [
+            MockResponse({}),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(word.word_replace_text("Report.docx", "foo", "baz"))
+
+    assert result["status"] == "success"
+    assert result["replacements"] == 1
 
 
 def test_replace_text_finds_match_inside_hyperlink_run(monkeypatch):
@@ -990,7 +1210,7 @@ def test_set_paragraph_text_ignores_hyperlink_inside_text_box():
 
 def test_upload_document_rejects_oversized_content(monkeypatch):
     document = Document()
-    monkeypatch.setattr(word, "_SIMPLE_UPLOAD_MAX_BYTES", 10)
+    monkeypatch.setattr(word, "_MAX_UPLOAD_BYTES", 10)
 
     with pytest.raises(ValueError, match="MB limit"):
         word._upload_document(document, "Report.docx", None, None)
@@ -1074,6 +1294,45 @@ def test_download_document_tolerates_missing_etag(monkeypatch):
     _document, etag = word._download_document("Report.docx", None, None)
 
     assert etag is None
+
+
+def test_download_document_skips_etag_metadata_when_not_needed(monkeypatch):
+    """word_get_document_text/word_list_paragraphs never upload, so they
+    have no use for the etag -- need_etag=False must skip that extra Graph
+    round trip entirely rather than fetching and discarding it."""
+    content = _docx_bytes()
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    _document, etag = word._download_document(
+        "Report.docx", None, None, need_etag=False
+    )
+
+    assert etag is None
+    assert mock_request.call_count == 1
+
+
+def test_get_document_text_does_not_fetch_etag(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("hello"))
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_get_document_text("Report.docx"))
+
+    assert result["status"] == "success"
+    # Only the content GET happened -- no separate eTag metadata GET.
+    assert mock_request.call_count == 1
+
+
+def test_list_paragraphs_does_not_fetch_etag(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("hello"))
+    mock_request = Mock(return_value=MockResponse(content=content))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(word.word_list_paragraphs("Report.docx"))
+
+    assert result["status"] == "success"
+    assert mock_request.call_count == 1
 
 
 # ---------------------------------------------------------------------------

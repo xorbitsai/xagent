@@ -39,19 +39,24 @@ _WORD_MIME_TYPE = (
 # to enforce -- unlike onedrive_upload_file/sharepoint_upload_file, which
 # upload a real local file a caller points at.
 #
-# Graph's simple content PUT is documented inconsistently -- see
-# sharepoint.py's _SIMPLE_UPLOAD_MAX_BYTES for the same ambiguity between
-# the OneDrive concepts page (< 4 MB) and the v1.0 API reference (< 250 MB)
-# -- so this module keeps the same conservative 4 MB bound rather than
-# implementing a resumable upload session.
-_SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
-
 # A caller-supplied file_path is downloaded, and its full uncompressed
 # bytes handed to python-docx's ZIP/XML parser, before any check runs on
 # the result -- an unbounded download here means an unbounded parse too.
 # Matches sharepoint.py's identical _MAX_DOWNLOAD_BYTES/_read_capped_content
 # guard on the same hazard for its own document downloads.
 _MAX_DOWNLOAD_BYTES = 10_000_000
+
+# _upload_document sends the whole edited document in a single PUT to an
+# upload-session URL (not Graph's separate small-file content PUT), for
+# which Graph's own upload-session guidance recommends staying under 60
+# MiB per request. Set equal to _MAX_DOWNLOAD_BYTES rather than some
+# smaller, independently-chosen figure: any document this module can
+# successfully read back must also be re-uploadable after an edit, or
+# every document between the two limits would download and parse
+# successfully only to fail on every single write -- verified this was
+# exactly the prior behavior when this constant was a leftover 4 MB from
+# before this function used an upload session.
+_MAX_UPLOAD_BYTES = _MAX_DOWNLOAD_BYTES
 
 
 class _GraphRequestError(RuntimeError):
@@ -166,21 +171,29 @@ def _graph_request(
                 timeout=timeout,
                 stream=True,
             )
-        except requests.RequestException as exc:
+        except requests.RequestException:
+            # "from None": chaining the original exception would still
+            # attach it as __cause__, which embeds the same download URL
+            # this branch exists to keep out of the raised message -- a
+            # future traceback/log/APM capture could surface it from there
+            # instead, matching the same guard already applied to the
+            # upload-session path in _create_only_upload/_upload_document.
             raise _GraphRequestError(
                 "network error downloading file content", status_code=0
-            ) from exc
+            ) from None
         try:
             response.raise_for_status()
-        except requests.HTTPError as exc:
+        except requests.HTTPError:
             response_text = response.text.strip()
             message = f"{response.status_code} error downloading file content"
             if response_text:
                 message = f"{message} - {response_text}"
-            raise _GraphRequestError(message, status_code=response.status_code) from exc
+            raise _GraphRequestError(
+                message, status_code=response.status_code
+            ) from None
         try:
             return _read_capped_content(response, max_bytes=_MAX_DOWNLOAD_BYTES)
-        except requests.RequestException as exc:
+        except requests.RequestException:
             # A connection drop mid-body (after the 200 OK, while streaming
             # via response.iter_content() inside _read_capped_content) isn't
             # covered by the try/except above it -- redact it the same way
@@ -188,7 +201,7 @@ def _graph_request(
             # embedded in its own message.
             raise _GraphRequestError(
                 "network error downloading file content", status_code=0
-            ) from exc
+            ) from None
 
     response = requests.request(
         method=method,
@@ -294,14 +307,18 @@ def _content_path(file_path: str, site_id: str | None, drive_id: str | None) -> 
 
 
 def _download_document(
-    file_path: str, site_id: str | None, drive_id: str | None
+    file_path: str, site_id: str | None, drive_id: str | None, *, need_etag: bool = True
 ) -> tuple[DocumentType, str | None]:
     """Download file_path and parse it, also returning the driveItem's
-    current eTag (None if Graph didn't report one) for _upload_document to
-    bind the write to via If-Match -- see _upload_document."""
+    current eTag (None if Graph didn't report one, or if need_etag is
+    False) for _upload_document to bind the write to via If-Match -- see
+    _upload_document. need_etag=False skips that extra metadata GET
+    entirely for the read-only tools, which have no write to bind."""
     item_path = _item_path(file_path, site_id, drive_id)
-    metadata = _graph_request("GET", item_path, params={"$select": "eTag"})
-    etag = metadata.get("eTag") if isinstance(metadata, dict) else None
+    etag = None
+    if need_etag:
+        metadata = _graph_request("GET", item_path, params={"$select": "eTag"})
+        etag = metadata.get("eTag") if isinstance(metadata, dict) else None
     content = _graph_request(
         "GET", _content_path(file_path, site_id, drive_id), raw=True
     )
@@ -338,10 +355,10 @@ def _upload_document(
     buffer = io.BytesIO()
     document.save(buffer)
     content = buffer.getvalue()
-    if len(content) > _SIMPLE_UPLOAD_MAX_BYTES:
+    if len(content) > _MAX_UPLOAD_BYTES:
         raise ValueError(
             f"The updated document is {len(content)} bytes, over the "
-            f"{_SIMPLE_UPLOAD_MAX_BYTES // 1_000_000} MB limit this tool currently "
+            f"{_MAX_UPLOAD_BYTES // 1_000_000} MB limit this tool currently "
             "supports"
         )
     item_path = _item_path(file_path, site_id, drive_id)
@@ -518,7 +535,25 @@ _PARAGRAPH_FLOW_PREDICATE = (
 )
 
 
-def _iter_replaceable_runs(paragraph: Any) -> Any:
+# Runs protected from word_replace_text's in-place rewrite the same way
+# _UNSUPPORTED_NESTED_ELEMENT_TAGS protects word_set_paragraph_text's whole
+# paragraph: a content control, a legacy smart tag, a custom XML region, or
+# a simple field's cached result -- rewriting any of these in place would
+# desync it from a data binding or a field instruction this tool has no way
+# to update. w:hyperlink is deliberately absent here: unlike
+# word_set_paragraph_text (which must replace a paragraph's entire text at
+# once and so cannot handle a hyperlink's separately-addressed run at all),
+# word_replace_text only rewrites the one matched run in place, and a
+# hyperlink's run is an ordinary <w:r> once reached -- safe to edit.
+_PROTECTED_RUN_ANCESTOR_TAGS = ("w:sdt", "w:fldSimple", "w:smartTag", "w:customXml")
+_PROTECTED_RUN_ANCESTOR_XPATH = (
+    "boolean("
+    + " or ".join(f"ancestor::{tag}" for tag in _PROTECTED_RUN_ANCESTOR_TAGS)
+    + ")"
+)
+
+
+def _iter_replaceable_runs(paragraph: Any, field_depth_stack: list[bool]) -> Any:
     """Yield (run_element, is_field_protected) for each <w:r> in
     paragraph's own flow (excluding tracked-change/text-box content, per
     _PARAGRAPH_FLOW_PREDICATE) -- a single pass over one xpath() call, so
@@ -531,23 +566,43 @@ def _iter_replaceable_runs(paragraph: Any) -> Any:
 
     Tracks complex-field state (a <w:fldChar w:fldCharType="begin"/>, the
     field's instruction text, a "separate" marker, its cached display-text
-    runs, then an "end" marker) along the way, since a complex field's
-    result run has no distinguishing wrapper element of its own the way
-    w:sdt/w:fldSimple do."""
-    in_field_result = False
+    runs, then an "end" marker) via field_depth_stack, a list the *caller*
+    creates once and passes to every paragraph in the document. A field
+    commonly opens in one paragraph and closes many paragraphs later (a
+    multi-entry table of contents has its own begin/separate in the first
+    entry's paragraph, one entry per following paragraph, and end in the
+    last) -- verified directly: tracking this state fresh per paragraph
+    call, as an earlier version of this function did, loses protection for
+    every entry after the first. The stack (not a single flag) also matters
+    for nesting: a field's own "end" must only close its own frame, not any
+    enclosing field's still-open result region -- verified directly: a
+    plain boolean lets a nested field's "end" prematurely un-protect the
+    outer field's remaining result text.
+
+    The exclusion check runs before the field-marker check, not after, so
+    a field marker hidden inside tracked-change/text-box markup can never
+    touch field_depth_stack -- verified directly: checking exclusion second
+    let a field marker inside an unrelated, unaccepted tracked-change
+    insertion still toggle (and leave toggled) the shared field state for
+    runs later in the same paragraph.
+    """
     for r in paragraph._p.xpath(".//w:r"):
+        if not r.xpath(_PARAGRAPH_FLOW_PREDICATE):
+            continue
         fld_char = r.find(qn("w:fldChar"))
         if fld_char is not None:
             fld_type = fld_char.get(qn("w:fldCharType"))
-            if fld_type == "separate":
-                in_field_result = True
+            if fld_type == "begin":
+                field_depth_stack.append(False)
+            elif fld_type == "separate":
+                if field_depth_stack:
+                    field_depth_stack[-1] = True
             elif fld_type == "end":
-                in_field_result = False
+                if field_depth_stack:
+                    field_depth_stack.pop()
             continue
-        if not r.xpath(_PARAGRAPH_FLOW_PREDICATE):
-            continue
-        field_protected = in_field_result or bool(
-            r.xpath("boolean(ancestor::w:sdt or ancestor::w:fldSimple)")
+        field_protected = (field_depth_stack and field_depth_stack[-1]) or bool(
+            r.xpath(_PROTECTED_RUN_ANCESTOR_XPATH)
         )
         yield r, field_protected
 
@@ -648,7 +703,9 @@ def word_get_document_text(
     newlines. Table contents are not included -- see word_list_paragraphs
     for per-paragraph detail."""
     try:
-        document, _etag = _download_document(file_path, site_id, drive_id)
+        document, _etag = _download_document(
+            file_path, site_id, drive_id, need_etag=False
+        )
         text = "\n".join(paragraph.text for paragraph in document.paragraphs)
         return _success(text=text, table_count=len(document.tables))
     except Exception as e:
@@ -663,7 +720,9 @@ def word_list_paragraphs(
     """List a Word document's paragraphs with their index, text, and
     style name. The index is needed by word_set_paragraph_text."""
     try:
-        document, _etag = _download_document(file_path, site_id, drive_id)
+        document, _etag = _download_document(
+            file_path, site_id, drive_id, need_etag=False
+        )
         paragraphs = [
             {
                 "index": index,
@@ -794,8 +853,11 @@ def word_replace_text(
             raise ValueError("find must not be empty")
         document, etag = _download_document(file_path, site_id, drive_id)
         replacements = 0
+        field_depth_stack: list[bool] = []
         for paragraph in document.paragraphs:
-            for r, field_protected in _iter_replaceable_runs(paragraph):
+            for r, field_protected in _iter_replaceable_runs(
+                paragraph, field_depth_stack
+            ):
                 run = Run(r, paragraph)
                 if find in run.text:
                     if _run_has_non_text_content(run):

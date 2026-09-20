@@ -34,10 +34,12 @@ from xagent.web.services.gmail_provisioning import (
     GMAIL_ACCOUNT_UNAVAILABLE_ERROR,
     GMAIL_INVALID_OAUTH_ACCOUNT_BINDING_ERROR,
     GMAIL_PUSH_PUBLISHER,
+    GMAIL_RECONNECT_REQUIRED_ERROR,
     GMAIL_WATCH_DISABLED_ERROR,
     ensure_gmail_mailbox_provisioned,
     gmail_subscription_path,
     gmail_topic_path,
+    mark_gmail_oauth_reconnect_required,
     reconcile_gmail_push_endpoints,
     reconcile_gmail_trigger_provisioning,
     release_gmail_mailbox_if_unused,
@@ -1747,6 +1749,44 @@ def test_reconcile_copies_watch_state_status_onto_triggers(
 
     # Idempotent: nothing to update on a second pass.
     assert reconcile_gmail_trigger_provisioning(db_session) == 0
+
+
+def test_token_cleared_gmail_account_quiesces_watch_and_trigger(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    trigger.provisioning_status = TriggerProvisioningStatus.ACTIVE.value
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="hist-1",
+        topic_name="projects/demo-project/topics/xagent-gmail-abc",
+        watch_expiration=datetime.now(timezone.utc) + timedelta(days=1),
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add_all([trigger, state])
+    db_session.commit()
+
+    account.access_token = ""
+    updated = mark_gmail_oauth_reconnect_required(
+        db_session,
+        oauth_account=account,
+    )
+    db_session.commit()
+
+    assert updated == 2
+    db_session.refresh(state)
+    db_session.refresh(trigger)
+    assert state.status == TriggerProvisioningStatus.FAILED.value
+    assert state.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
+    assert state.watch_expiration is None
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == GMAIL_RECONNECT_REQUIRED_ERROR
+    assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 0
 
 
 @pytest.mark.parametrize(

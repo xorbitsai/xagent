@@ -3893,6 +3893,18 @@ class WebToolConfig(BaseToolConfig):
                 oauth_account.access_token = ""
                 oauth_account.refresh_token = None
                 oauth_account.expires_at = None
+                if (
+                    str(oauth_account.provider) == "gmail"
+                    and oauth_account.resource_owner_key is None
+                ):
+                    from ..services.gmail_provisioning import (
+                        mark_gmail_oauth_reconnect_required,
+                    )
+
+                    mark_gmail_oauth_reconnect_required(
+                        oauth_db,
+                        oauth_account=oauth_account,
+                    )
                 oauth_db.commit()
             return _LegacyOAuthTokenResolution(
                 access_token=None,

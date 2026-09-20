@@ -76,6 +76,9 @@ GMAIL_WATCH_DISABLED_ERROR = (
     "(set XAGENT_GMAIL_WATCH_ENABLED=true to enable)"
 )
 GMAIL_ACCOUNT_UNAVAILABLE_ERROR = "Gmail account is unavailable"
+GMAIL_RECONNECT_REQUIRED_ERROR = (
+    "Gmail OAuth credentials are unavailable; reconnect required"
+)
 GMAIL_INVALID_OAUTH_ACCOUNT_BINDING_ERROR = (
     "Gmail trigger has an invalid OAuth account binding"
 )
@@ -93,6 +96,70 @@ def gmail_watch_disabled_error() -> str:
         "(set XAGENT_GMAIL_WATCH_ENABLED=true and "
         "XAGENT_GMAIL_PUBSUB_PROJECT_ID to enable)"
     )
+
+
+def mark_gmail_oauth_reconnect_required(
+    db: Session, *, oauth_account: UserOAuth
+) -> int:
+    """Quiesce local Gmail watch state after credentials become unusable.
+
+    The caller owns the transaction. Keeping the ``UserOAuth`` identity row
+    preserves reconnect status, so the old FK cascade no longer retires the
+    dependent watch. Mark both the watch and its enabled triggers failed in
+    the same transaction that clears the tokens.
+    """
+    if not is_ordinary_gmail(oauth_account):
+        return 0
+
+    account_id = int(oauth_account.id)
+    user_id = int(oauth_account.user_id)
+    updated = (
+        db.query(GmailWatchState)
+        .filter(
+            GmailWatchState.oauth_account_id == account_id,
+            GmailWatchState.user_id == user_id,
+        )
+        .update(
+            {
+                GmailWatchState.status: TriggerProvisioningStatus.FAILED.value,
+                GmailWatchState.last_error: GMAIL_RECONNECT_REQUIRED_ERROR,
+                GmailWatchState.watch_expiration: None,
+            },
+            synchronize_session=False,
+        )
+    )
+
+    email = str(oauth_account.email or "").strip().lower()
+    triggers = (
+        db.query(AgentTrigger)
+        .filter(
+            AgentTrigger.user_id == user_id,
+            AgentTrigger.type == TriggerType.GMAIL.value,
+            AgentTrigger.enabled.is_(True),
+        )
+        .all()
+    )
+    for trigger in triggers:
+        bound_account_id = gmail_binding_id(trigger.config)
+        if bound_account_id is not None:
+            matches = bound_account_id == account_id
+        else:
+            matches = bool(
+                is_legacy_gmail_binding(trigger.config)
+                and email
+                and str(trigger.resource_id or "").strip().lower() == email
+            )
+        if not matches:
+            continue
+        setattr(
+            trigger,
+            "provisioning_status",
+            TriggerProvisioningStatus.FAILED.value,
+        )
+        setattr(trigger, "provisioning_error", GMAIL_RECONNECT_REQUIRED_ERROR)
+        db.add(trigger)
+        updated += 1
+    return int(updated)
 
 
 class GmailProvisioningError(RuntimeError):
@@ -1071,6 +1138,8 @@ def ensure_gmail_mailbox_provisioned(
         raise GmailProvisioningError(
             "Gmail watch provisioning requires an ordinary Gmail account"
         )
+    if not oauth_account.access_token:
+        raise GmailProvisioningError(GMAIL_RECONNECT_REQUIRED_ERROR)
 
     oauth_account_id = int(oauth_account.id)
     oauth_account_user_id = int(oauth_account.user_id)
@@ -1087,6 +1156,8 @@ def ensure_gmail_mailbox_provisioned(
         )
         if transition_account is None or not is_ordinary_gmail(transition_account):
             raise GmailProvisioningError("ordinary Gmail account not found")
+        if not transition_account.access_token:
+            raise GmailProvisioningError(GMAIL_RECONNECT_REQUIRED_ERROR)
         state = _ensure_gmail_mailbox_provisioned_locked(
             transition_db,
             transition_account,
@@ -1542,6 +1613,10 @@ def _reconcile_gmail_trigger_batch(
         )
         .filter(
             ordinary_gmail_clause(),
+            or_(
+                UserOAuth.access_token != "",
+                GmailWatchState.status == TriggerProvisioningStatus.FAILED.value,
+            ),
             or_(*filters),
         )
         .all()
@@ -1573,6 +1648,7 @@ def _reconcile_gmail_trigger_batch(
                 .filter(
                     UserOAuth.id.in_(unresolved_bound_account_ids),
                     ordinary_gmail_clause(),
+                    UserOAuth.access_token != "",
                 )
                 .all()
             )

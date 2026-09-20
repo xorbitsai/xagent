@@ -2557,6 +2557,7 @@ def has_other_builtin_oauth_reference(
         .filter(
             UserOAuth.provider == provider,
             UserOAuth.provider_user_id == provider_user_id,
+            UserOAuth.access_token != "",
         )
         .first()
         is not None

@@ -27,6 +27,7 @@ from ...models.gmail_watch import GmailWatchState
 from ...models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ...models.user_oauth import UserOAuth
 from ..gmail_provisioning import (
+    GMAIL_RECONNECT_REQUIRED_ERROR,
     GMAIL_WATCH_DISABLED_ERROR,
     gmail_callback_url,
     provision_gmail_trigger,
@@ -523,6 +524,11 @@ class GmailProvider:
         state = _watch_state_for_callback(db, context.callback_id)
         if state is None:
             raise TriggerEventParseError("Gmail callback state was not found")
+        if (
+            str(state.status) == TriggerProvisioningStatus.FAILED.value
+            and str(state.last_error or "") == GMAIL_RECONNECT_REQUIRED_ERROR
+        ):
+            return []
 
         attested_email = _normalized_email(state.email)
         notification = _decode_pubsub_notification(
@@ -561,24 +567,23 @@ class GmailProvider:
         state = _watch_state_for_callback(db, context.callback_id)
         if state is None:
             return
-        if (
-            str(state.status) == TriggerProvisioningStatus.FAILED.value
-            and not get_gmail_watch_enabled()
-            and str(state.last_error or "") == GMAIL_WATCH_DISABLED_ERROR
+        state_error = str(state.last_error or "")
+        if str(state.status) == TriggerProvisioningStatus.FAILED.value and (
+            state_error == GMAIL_RECONNECT_REQUIRED_ERROR
+            or (
+                not get_gmail_watch_enabled()
+                and state_error == GMAIL_WATCH_DISABLED_ERROR
+            )
         ):
-            # While registration is disabled, parse_events already acked this
-            # callback (skipped, no history advance) instead of raising; the
-            # pipeline still calls finalize_callback for the acked event. Do
-            # not let a successful-looking finalize clear the FAILED/disabled
-            # marking that collect_gmail_pubsub_events just recorded.
+            # parse_events already acknowledged this locally quiesced
+            # callback without advancing history; the pipeline still calls
+            # finalize_callback for the empty event list. Do not let that
+            # successful-looking finalize clear the FAILED marking.
             #
-            # The guard keys on the exact disabled marking, not just
+            # The guard keys on explicit quiescence errors, not just
             # status+flag: a row failed for a transient reason (e.g. a prior
             # message batch error) while the flag happens to be off must keep
-            # advancing its cursor when a valid push later arrives, since the
-            # only writers of this precise last_error string are the
-            # choke-point gate (_ensure_gmail_mailbox_provisioned_locked) and
-            # the webhook disabled-ack site (collect_gmail_pubsub_events).
+            # advancing its cursor when a valid push later arrives.
             return
         notification = _decode_pubsub_notification(
             raw_body,

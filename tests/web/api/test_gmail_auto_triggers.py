@@ -29,6 +29,7 @@ from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import gmail_triggers
 from xagent.web.services.gmail_provisioning import (
+    GMAIL_RECONNECT_REQUIRED_ERROR,
     GMAIL_WATCH_DISABLED_ERROR,
     gmail_topic_path,
     reconcile_gmail_trigger_provisioning,
@@ -1996,6 +1997,23 @@ def test_build_gmail_service_rejects_actor_owned_account() -> None:
         db.close()
 
 
+def test_build_gmail_service_rejects_reconnect_tombstone() -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-tombstone-service-user")
+        oauth = _create_gmail_oauth(db, user)
+        oauth.access_token = ""
+        db.commit()
+
+        with pytest.raises(
+            GmailWatchConfigurationError,
+            match="reconnect required",
+        ):
+            build_gmail_service(db, oauth)
+    finally:
+        db.close()
+
+
 def test_build_gmail_service_persists_refreshed_expiry_as_utc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3253,6 +3271,55 @@ def test_gmail_unified_callback_acks_and_stays_disabled_when_watch_disabled(
         assert state.last_error == GMAIL_WATCH_DISABLED_ERROR
         # finalize_callback must not have advanced the cursor or cleared the
         # marking despite the callback being acked as a whole.
+        assert state.history_id == "100"
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
+
+
+def test_gmail_unified_callback_acks_reconnect_tombstone_without_gmail_api() -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-reconnect-route-user")
+        oauth = _create_gmail_oauth(db, user)
+        oauth.access_token = ""
+        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(
+            db, user, oauth, callback_id="cb-reconnect-route"
+        )
+        state.status = TriggerProvisioningStatus.FAILED.value
+        state.last_error = GMAIL_RECONNECT_REQUIRED_ERROR
+        db.commit()
+
+        def fake_verify(_token: str, audience: str) -> dict[str, object]:
+            return {"iss": "https://accounts.google.com", "aud": audience}
+
+        def unexpected_service_factory(*_args, **_kwargs):
+            raise AssertionError("tombstone callback must not call the Gmail API")
+
+        register_trigger_provider(
+            GmailProvider(
+                service_factory=unexpected_service_factory,
+                oidc_verifier=fake_verify,
+            ),
+            replace=True,
+        )
+        raw_body = _gmail_pubsub_push_body(
+            claimed_email="attacker@example.com",
+            history_id="400",
+            message_id="pubsub-reconnect-route",
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-reconnect-route",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=raw_body,
+        )
+
+        assert response.status_code == 200, response.text
+        db.refresh(state)
+        assert state.status == TriggerProvisioningStatus.FAILED.value
+        assert state.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
         assert state.history_id == "100"
     finally:
         register_trigger_provider(GmailProvider(), replace=True)

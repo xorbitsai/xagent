@@ -610,6 +610,10 @@ def _resolve_gmail_resource(
         raise TriggerServiceError("Gmail account not found")
     if not is_ordinary_gmail(account):
         raise TriggerServiceError("Selected account is not a Gmail account")
+    if not account.access_token:
+        raise TriggerServiceError(
+            "Gmail OAuth credentials are unavailable; reconnect required"
+        )
     email = str(account.email or "").strip().lower()
     if not email:
         raise TriggerServiceError("Gmail account has no email address")

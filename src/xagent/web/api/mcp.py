@@ -49,7 +49,6 @@ from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
-from ..builtin_mcp_registry import get_builtin_public_mcp_app
 from ..mcp_apps import (
     get_all_mcp_apps,
     get_app_for_mcp_server,
@@ -227,7 +226,16 @@ class MCPServerResponse(BaseModel):
     connected_account: Optional[str] = None
     app_id: Optional[str] = None
     provider: Optional[str] = None
-    connection_status: Optional[Literal["connected", "needs_reconnect"]] = None
+    connection_status: Optional[Literal["connected", "needs_reconnect", "unknown"]] = (
+        Field(
+            default=None,
+            description=(
+                "OAuth runtime readiness: connected, needs_reconnect, or unknown when "
+                "a deployment resolver hook owns credential readiness. Null means no "
+                "persisted grant exists when no resolver hook is installed."
+            ),
+        )
+    )
 
     class Config:
         from_attributes = True
@@ -2192,6 +2200,9 @@ def _oauth_account_summaries(
         user_id=user_id,
         resource_owner_key=None,
     )
+    if not oauth_accounts:
+        return {}
+    provider_by_grant_key = _oauth_provider_by_grant_key(get_all_mcp_apps(db))
     summaries: dict[str, tuple[Optional[str], str, int]] = {}
     for oauth in oauth_accounts:
         provider = str(oauth.provider)
@@ -2200,7 +2211,17 @@ def _oauth_account_summaries(
         if existing is not None and existing[2] >= account_id:
             continue
         email = str(oauth.email) if oauth.email else None
-        status = "connected" if _oauth_account_can_connect(oauth) else "needs_reconnect"
+        grant_key = normalize_catalog_key(provider)
+        status = (
+            "connected"
+            if _oauth_account_can_connect(
+                oauth,
+                provider_name=(
+                    provider_by_grant_key.get(grant_key) if grant_key else None
+                ),
+            )
+            else "needs_reconnect"
+        )
         summaries[provider] = (email, status, account_id)
     return summaries
 
@@ -2209,6 +2230,8 @@ def _enrich_oauth_server_info(
     db: Session,
     server: MCPServer,
     oauth_accounts: dict[str, tuple[Optional[str], str, int]],
+    *,
+    token_resolver_installed: bool = False,
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
     Return (app_id, provider, connected_account, connection_status) for an
@@ -2229,6 +2252,17 @@ def _enrich_oauth_server_info(
 
     provider = app_info.get("provider")
     app_id = app_info.get("id")
+
+    # A process-wide resolver hook may supply or reject credentials per user,
+    # provider, scope, and resource. Merely knowing that the hook is installed
+    # cannot prove either outcome for this connector, and invoking it from a
+    # synchronous listing GET would cross the hook's runtime boundary and may
+    # have side effects. Do not mislabel hook-owned credentials as never
+    # connected, or let a stored grant claim authority over a hook that runtime
+    # consults first: expose the uncertainty explicitly.
+    if token_resolver_installed:
+        return app_id, provider, None, "unknown"
+
     connected_account: Optional[str] = None
     connection_status: Optional[str] = None
     best_account_id = -1
@@ -2329,7 +2363,9 @@ def _is_reserved_catalog_name(db: Session, name: object) -> bool:
     return any(key in _catalog_app_keys(app) for app in get_all_mcp_apps(db))
 
 
-def _oauth_account_can_connect(oauth_account: object) -> bool:
+def _oauth_account_can_connect(
+    oauth_account: object, *, provider_name: object = None
+) -> bool:
     """Whether this grant's stored token is currently usable.
 
     Matches runtime's own readiness rule instead of a plain "not yet
@@ -2368,7 +2404,7 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
     if not access_token:
         return False
 
-    if _is_meta_family_oauth_account(oauth_account):
+    if _is_meta_family_oauth_account(oauth_account, provider_name=provider_name):
         return True
 
     expires_at = getattr(oauth_account, "expires_at", None)
@@ -2384,25 +2420,30 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
     return expires_at > datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW
 
 
-def _is_meta_family_oauth_account(oauth_account: object) -> bool:
-    """Whether this grant's provider key resolves to Meta's OAuth provider.
+def _is_meta_family_oauth_account(
+    oauth_account: object, *, provider_name: object = None
+) -> bool:
+    """Whether runtime will refresh this grant through Meta's token exchange.
 
-    ``UserOAuth.provider`` for an app-scoped connect is the catalog
-    ``app_id`` (e.g. "facebook"), not the provider itself ("meta") --
-    resolved via the static builtin registry (no DB access) rather than a
-    hardcoded app_id list, so a future Meta-family app added to the
-    catalog doesn't need a second, easy-to-forget update here.
+    App-scoped grants store the catalog ``app_id`` in ``UserOAuth.provider``,
+    including arbitrary IDs of admin-created apps. Runtime instead refreshes
+    using the catalog app's resolved ``provider_name``. The caller therefore
+    supplies that catalog context; falling back to the stored key only covers
+    a bare provider-level grant such as ``provider == "meta"``.
     """
-    provider = getattr(oauth_account, "provider", None)
-    if not provider:
-        return False
-    provider = str(provider)
-    if provider.lower() == "meta":
-        return True
-    app_row = get_builtin_public_mcp_app(provider)
-    if app_row is None:
-        return False
-    return str(app_row.get("provider_name", "")).lower() == "meta"
+    resolved_provider = provider_name or getattr(oauth_account, "provider", None)
+    return bool(resolved_provider and str(resolved_provider).strip().lower() == "meta")
+
+
+def _oauth_provider_by_grant_key(apps: Sequence[dict]) -> dict[str, object]:
+    """Map normalized app-scoped grant keys to runtime provider names."""
+    provider_by_key: dict[str, object] = {}
+    for app in apps:
+        key = normalize_catalog_key(app.get("id"))
+        provider = app.get("provider")
+        if key and provider:
+            provider_by_key[key] = provider
+    return provider_by_key
 
 
 def _oauth_keys_for_app(app: dict) -> list[str]:
@@ -2460,11 +2501,20 @@ def _connected_oauth_server_for_app(
     return cast(int, server.id), str(email) if email else None
 
 
-def _build_oauth_account_lookup(oauth_accounts: list[object]) -> dict[str, object]:
+def _build_oauth_account_lookup(
+    oauth_accounts: list[object], *, apps: Sequence[dict] = ()
+) -> dict[str, object]:
+    provider_by_grant_key = _oauth_provider_by_grant_key(apps)
     lookup: dict[str, object] = {}
     for account in oauth_accounts:
         key = normalize_catalog_key(getattr(account, "provider", None))
-        if key and key not in lookup and _oauth_account_can_connect(account):
+        if (
+            key
+            and key not in lookup
+            and _oauth_account_can_connect(
+                account, provider_name=provider_by_grant_key.get(key)
+            )
+        ):
             lookup[key] = account
     return lookup
 
@@ -2844,7 +2894,9 @@ def list_mcp_apps(
     library_apps = (
         get_all_mcp_apps(db) if location in ["remote", "local", "all"] else []
     )
-    oauth_account_lookup = _build_oauth_account_lookup(list(oauth_accounts))
+    oauth_account_lookup = _build_oauth_account_lookup(
+        list(oauth_accounts), apps=library_apps
+    )
     oauth_server_lookup = _build_active_oauth_server_lookup(user_mcps)
     non_oauth_server_lookup = _build_active_non_oauth_server_lookup(user_mcps)
 
@@ -3238,13 +3290,25 @@ def get_mcp_servers(
             .all()
         )
 
-        oauth_account_summaries = _oauth_account_summaries(db, effective_user_id)
+        from ..tools.config import oauth_token_resolver_installed
+
+        token_resolver_installed = oauth_token_resolver_installed()
+        oauth_account_summaries = (
+            {}
+            if token_resolver_installed
+            else _oauth_account_summaries(db, effective_user_id)
+        )
 
         is_admin = getattr(current_user, "is_admin", False)
         responses = []
         for user_mcp, server in user_mcps:
             app_id, provider, connected_account, connection_status = (
-                _enrich_oauth_server_info(db, server, oauth_account_summaries)
+                _enrich_oauth_server_info(
+                    db,
+                    server,
+                    oauth_account_summaries,
+                    token_resolver_installed=token_resolver_installed,
+                )
             )
             responses.append(
                 _db_server_to_response(
@@ -3283,7 +3347,12 @@ def get_mcp_servers(
                 db.query(MCPServer).filter(MCPServer.id.in_(missing_mcp)).all()
             ):
                 app_id, provider, connected_account, connection_status = (
-                    _enrich_oauth_server_info(db, server, oauth_account_summaries)
+                    _enrich_oauth_server_info(
+                        db,
+                        server,
+                        oauth_account_summaries,
+                        token_resolver_installed=token_resolver_installed,
+                    )
                 )
                 responses.append(
                     _db_server_to_response(
@@ -3346,9 +3415,21 @@ def get_mcp_server(
 
         user_mcp, server = result
 
-        oauth_account_summaries = _oauth_account_summaries(db, int(user_id))
+        from ..tools.config import oauth_token_resolver_installed
+
+        token_resolver_installed = oauth_token_resolver_installed()
+        oauth_account_summaries = (
+            {}
+            if token_resolver_installed
+            else _oauth_account_summaries(db, int(user_id))
+        )
         app_id, provider, connected_account, connection_status = (
-            _enrich_oauth_server_info(db, server, oauth_account_summaries)
+            _enrich_oauth_server_info(
+                db,
+                server,
+                oauth_account_summaries,
+                token_resolver_installed=token_resolver_installed,
+            )
         )
 
         return _db_server_to_response(

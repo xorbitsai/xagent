@@ -393,7 +393,9 @@ def test_remote_connector_builds_oauth_connectability_once_per_account(
 
         checked_providers: list[str] = []
 
-        def count_connectability_check(oauth_account: object) -> bool:
+        def count_connectability_check(
+            oauth_account: object, *, provider_name: object = None
+        ) -> bool:
             checked_providers.append(str(getattr(oauth_account, "provider")))
             return True
 
@@ -537,14 +539,37 @@ def test_oauth_account_can_connect_exempts_meta_family_from_the_skew_rule() -> N
         "expires_at": now - timedelta(minutes=1),
     }
 
-    for provider in ("facebook", "instagram", "meta"):
+    for provider in ("facebook", "instagram"):
         account = SimpleNamespace(provider=provider, **expired_no_refresh_token)
-        assert mcp_api._oauth_account_can_connect(account) is True, provider
+        assert (
+            mcp_api._oauth_account_can_connect(account, provider_name="meta") is True
+        ), provider
+
+    bare_meta = SimpleNamespace(provider="meta", **expired_no_refresh_token)
+    assert mcp_api._oauth_account_can_connect(bare_meta) is True
 
     # A non-Meta provider in the exact same shape must still report broken --
     # the exemption must not silently swallow the generic-provider check.
     other_provider = SimpleNamespace(provider="hubspot", **expired_no_refresh_token)
     assert mcp_api._oauth_account_can_connect(other_provider) is False
+
+
+def test_oauth_lookup_uses_dynamic_catalog_provider_for_meta_family() -> None:
+    """Admin-created app IDs are absent from the builtin registry, but their
+    catalog provider context is the same context runtime uses for refresh."""
+    account = SimpleNamespace(
+        provider="meta-custom",
+        access_token="old-long-token",
+        refresh_token=None,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    lookup = mcp_api._build_oauth_account_lookup(
+        [account],
+        apps=[{"id": "meta-custom", "provider": "meta"}],
+    )
+
+    assert lookup == {"meta-custom": account}
 
 
 def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
@@ -1457,7 +1482,11 @@ def test_mixed_case_oauth_transport_app_is_marked_connected(
         assert resp.status_code == 200
 
         _connect_oauth_account_for_user("regular", "microsoft")
-        monkeypatch.setattr(mcp_api, "_oauth_account_can_connect", lambda _a: True)
+        monkeypatch.setattr(
+            mcp_api,
+            "_oauth_account_can_connect",
+            lambda _a, **_kwargs: True,
+        )
 
         db = next(get_db())
         try:

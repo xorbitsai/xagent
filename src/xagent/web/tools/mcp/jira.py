@@ -271,34 +271,58 @@ def jira_get_current_user() -> str:
         return _error(str(e))
 
 
-def _summarize_project(project: dict[str, Any]) -> dict[str, Any]:
+def _summarize_project(
+    project: dict[str, Any], requested_extra: list[str] | None = None
+) -> dict[str, Any]:
     """Drop a project's avatarUrls (an id/emoji/size ladder of icon
     links) -- the id/key/name/type are all a caller ever needs to pick a
-    project for jira_create_issue/jira_search_issues.
+    project for jira_create_issue/jira_search_issues. Any other raw
+    project field named in requested_extra (e.g. "lead", "archived",
+    "isPrivate", "projectCategory") is returned under extra_field_values,
+    the same escape hatch jira_get_issue offers for its own dropped
+    fields.
     """
-    return {
+    summarized: dict[str, Any] = {
         "id": project.get("id"),
         "key": project.get("key"),
         "name": project.get("name"),
         "project_type_key": project.get("projectTypeKey"),
     }
+    if requested_extra:
+        extra_field_values, extra_field_values_truncated = _collect_extra_field_values(
+            project, requested_extra, _ISSUE_DESCRIPTION_MAX_CHARS
+        )
+        summarized["extra_field_values"] = extra_field_values
+        summarized["extra_field_values_truncated"] = extra_field_values_truncated
+    return summarized
 
 
 @mcp.tool()
-def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -> str:
+def jira_list_projects(
+    cloud_id: str = "", limit: int = 50, start_at: int = 0, extra_fields: str = ""
+) -> str:
     """
     List projects on a Jira site -- id, key (e.g. "ENG"), name, and
     project_type_key. Use the returned key with jira_create_issue and
     jira_search_issues. Other project metadata (lead, category, archived/
-    private flags) is not returned.
+    private flags) is not returned unless named via extra_fields.
     cloud_id: optional site id from jira_list_accessible_sites; omit when
     the account has only one accessible site.
     start_at: offset into the full project list -- pass the previous
     response's next_start_at to fetch the next page (0 to start over).
+    extra_fields: optional comma-separated raw Jira project field names
+    not in the summarized set above (e.g. "lead", "archived", "isPrivate",
+    "projectCategory"). Returned as {field_name: raw_value} under each
+    project's extra_field_values, so those dropped fields are still
+    reachable by name. Any resulting large value is capped the same way
+    jira_get_issue's extra_fields values are, with that project's
+    extra_field_values_truncated set to true if any of its requested
+    values were cut.
     """
     try:
         max_results = _clamp_limit(limit)
         offset = max(0, int(start_at))
+        requested_extra = _parse_extra_fields(extra_fields)
         result = _request(
             "GET",
             cloud_id,
@@ -308,7 +332,11 @@ def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira projects API")
         raw_projects = result.get("values") or []
-        projects = [_summarize_project(p) for p in raw_projects if isinstance(p, dict)]
+        projects = [
+            _summarize_project(p, requested_extra)
+            for p in raw_projects
+            if isinstance(p, dict)
+        ]
         # bool(raw_projects) guards against a server that signals more
         # pages while returning an empty page: without it next_start_at
         # would equal start_at and a caller following it would loop
@@ -659,6 +687,33 @@ def _cap_extra_field_value(value: Any, max_chars: int) -> tuple[Any, bool]:
     return value, False
 
 
+def _parse_extra_fields(extra_fields: str) -> list[str]:
+    """Split a comma-separated extra_fields parameter into field names,
+    trimming whitespace and dropping empty entries -- shared by every
+    tool that supports the extra_fields escape hatch (jira_get_issue,
+    jira_list_projects, jira_list_comments).
+    """
+    return [name.strip() for name in extra_fields.split(",") if name.strip()]
+
+
+def _collect_extra_field_values(
+    raw: dict[str, Any], requested_extra: list[str], max_chars: int
+) -> tuple[dict[str, Any], bool]:
+    """Pull requested_extra's raw values out of raw (an issue's `fields`,
+    or a project/comment's own raw payload) and cap each one via
+    _cap_extra_field_value, mirroring jira_get_issue's extra_fields
+    handling. Returns (values keyed by field name, whether any value was
+    truncated).
+    """
+    values: dict[str, Any] = {}
+    truncated_any = False
+    for name in requested_extra:
+        value, was_truncated = _cap_extra_field_value(raw.get(name), max_chars)
+        values[name] = value
+        truncated_any = truncated_any or was_truncated
+    return values, truncated_any
+
+
 @mcp.tool()
 def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -> str:
     """
@@ -689,9 +744,7 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
     how large the real description is.
     """
     try:
-        requested_extra = [
-            name.strip() for name in extra_fields.split(",") if name.strip()
-        ]
+        requested_extra = _parse_extra_fields(extra_fields)
         fields_param = _GET_ISSUE_FIELDS
         if requested_extra:
             fields_param = f"{fields_param},{','.join(requested_extra)}"
@@ -716,16 +769,11 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
         top_level_truncation_flags: dict[str, Any] = {}
         if requested_extra:
             raw_fields = _as_dict(result.get("fields"))
-            extra_field_values: dict[str, Any] = {}
-            extra_field_values_truncated = False
-            for name in requested_extra:
-                value, was_truncated = _cap_extra_field_value(
-                    raw_fields.get(name), _ISSUE_DESCRIPTION_MAX_CHARS
+            extra_field_values, extra_field_values_truncated = (
+                _collect_extra_field_values(
+                    raw_fields, requested_extra, _ISSUE_DESCRIPTION_MAX_CHARS
                 )
-                extra_field_values[name] = value
-                extra_field_values_truncated = (
-                    extra_field_values_truncated or was_truncated
-                )
+            )
             issue["extra_field_values"] = extra_field_values
             top_level_truncation_flags["extra_field_values_truncated"] = (
                 extra_field_values_truncated
@@ -942,11 +990,18 @@ def jira_transition_issue(
         return _error(str(e))
 
 
-def _summarize_comment(comment: dict[str, Any]) -> dict[str, Any]:
+def _summarize_comment(
+    comment: dict[str, Any], requested_extra: list[str] | None = None
+) -> dict[str, Any]:
     """Flatten a comment's ADF body to plain text and drop the author's
-    avatarUrls -- a long comment thread otherwise repeats that avatar
-    ladder once per comment and is a routine way jira_list_comments'
-    output ran past the per-tool-output-string cap.
+    avatarUrls/emailAddress -- a long comment thread otherwise repeats
+    that avatar ladder once per comment and is a routine way
+    jira_list_comments' output ran past the per-tool-output-string cap.
+    Any raw comment field named in requested_extra (e.g. "author" for
+    the full raw author object including emailAddress, or "body" for
+    the comment's raw, unflattened value) is returned under
+    extra_field_values, the same escape hatch jira_get_issue offers for
+    its own dropped fields.
     """
     raw_visibility = comment.get("visibility")
     visibility = _as_dict(raw_visibility)
@@ -986,6 +1041,12 @@ def _summarize_comment(comment: dict[str, Any]) -> dict[str, Any]:
     summarized["body_truncated"] = _cap_text_field(
         summarized, "body", _COMMENT_BODY_MAX_CHARS
     )
+    if requested_extra:
+        extra_field_values, extra_field_values_truncated = _collect_extra_field_values(
+            comment, requested_extra, _ISSUE_DESCRIPTION_MAX_CHARS
+        )
+        summarized["extra_field_values"] = extra_field_values
+        summarized["extra_field_values_truncated"] = extra_field_values_truncated
     return summarized
 
 
@@ -1007,6 +1068,7 @@ def _fit_comments_page(
     total: int,
     has_more_raw: bool,
     max_output_length: int,
+    requested_extra: list[str] | None = None,
 ) -> str | None:
     """Build the largest whole-comment prefix (each comment already
     body-capped by _summarize_comment) that fits max_output_length,
@@ -1029,7 +1091,7 @@ def _fit_comments_page(
     # two parallel lists so the two can't drift out of alignment under a
     # future edit to the filter below.
     kept: list[tuple[int, dict[str, Any]]] = [
-        (index, _summarize_comment(raw))
+        (index, _summarize_comment(raw, requested_extra))
         for index, raw in enumerate(raw_comments)
         if isinstance(raw, dict)
     ]
@@ -1077,7 +1139,11 @@ def _fit_comments_page(
 
 @mcp.tool()
 def jira_list_comments(
-    issue_key: str, cloud_id: str = "", limit: int = 50, start_at: int = 0
+    issue_key: str,
+    cloud_id: str = "",
+    limit: int = 50,
+    start_at: int = 0,
+    extra_fields: str = "",
 ) -> str:
     """
     List comments on an issue (id, body, author, visibility, jsd_public,
@@ -1089,6 +1155,16 @@ def jira_list_comments(
     is null.
     start_at: offset into the full comment list -- pass the previous
     response's next_start_at to fetch the next page (0 to start over).
+    extra_fields: optional comma-separated raw Jira comment field names
+    not in the summarized set above (e.g. "author" for the author's full
+    raw object including emailAddress, or "body" for the comment's raw,
+    unflattened value). Returned as {field_name: raw_value} under each
+    comment's extra_field_values, so those dropped fields are still
+    reachable by name. An ADF-shaped (rich text) value is flattened to
+    plain text first, matching body; any resulting large value is capped
+    the same way jira_get_issue's extra_fields values are, with that
+    comment's extra_field_values_truncated set to true if any of its
+    requested values were cut.
     A comment body longer than _COMMENT_BODY_MAX_CHARS is truncated
     with body_truncated set to true on that comment; if the whole page
     still doesn't fit the tool output limit even after that, fewer
@@ -1102,6 +1178,7 @@ def jira_list_comments(
     try:
         max_results = _clamp_limit(limit)
         offset = max(0, int(start_at))
+        requested_extra = _parse_extra_fields(extra_fields)
         result = _request(
             "GET",
             cloud_id,
@@ -1127,6 +1204,7 @@ def jira_list_comments(
             total,
             has_more_raw,
             get_tool_max_output_length(),
+            requested_extra,
         )
         if response is None:
             return _error(

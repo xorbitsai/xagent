@@ -400,6 +400,46 @@ def test_list_projects_drops_avatar_urls(monkeypatch):
     assert "avatarUrls" not in json.dumps(result)
 
 
+def test_list_projects_extra_fields_returns_raw_dropped_field_values(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={
+                    "values": [
+                        {
+                            "id": "10033",
+                            "key": "DW",
+                            "name": "Datapel WMS",
+                            "projectTypeKey": "software",
+                            "lead": {"accountId": "u1", "displayName": "Bruce"},
+                            "archived": False,
+                        }
+                    ],
+                    "isLast": True,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_projects(extra_fields="lead,archived"))
+
+    assert result["projects"] == [
+        {
+            "id": "10033",
+            "key": "DW",
+            "name": "Datapel WMS",
+            "project_type_key": "software",
+            "extra_field_values": {
+                "lead": {"accountId": "u1", "displayName": "Bruce"},
+                "archived": False,
+            },
+            "extra_field_values_truncated": False,
+        }
+    ]
+
+
 def test_list_projects_next_start_at_counts_raw_page_not_filtered(monkeypatch):
     # One malformed (non-dict) entry alongside two real projects. If
     # next_start_at were computed from the filtered `projects` list (2)
@@ -1161,6 +1201,45 @@ def test_list_comments_flattens_adf_body_and_drops_avatar_urls(monkeypatch):
         }
     ]
     assert "avatarUrls" not in json.dumps(result)
+
+
+def test_list_comments_extra_fields_returns_raw_dropped_field_values(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={
+                    "comments": [
+                        {
+                            "id": "10001",
+                            "author": {
+                                "accountId": "u1",
+                                "displayName": "Bruce",
+                                "emailAddress": "bruce@example.com",
+                            },
+                            "body": "Looks good",
+                            "created": "2026-09-11T10:00:00.000+0000",
+                            "updated": "2026-09-11T10:00:00.000+0000",
+                        }
+                    ],
+                    "total": 1,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_comments("ENG-1", extra_fields="author,body"))
+
+    assert result["comments"][0]["extra_field_values"] == {
+        "author": {
+            "accountId": "u1",
+            "displayName": "Bruce",
+            "emailAddress": "bruce@example.com",
+        },
+        "body": "Looks good",
+    }
+    assert result["comments"][0]["extra_field_values_truncated"] is False
 
 
 def _raw_comment_with_body(comment_id: str, body_length: int):

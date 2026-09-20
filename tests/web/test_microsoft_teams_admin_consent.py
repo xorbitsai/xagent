@@ -6,6 +6,7 @@ import re
 import time
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
+from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import (
     _MICROSOFT_ADMIN_CONSENT_SCOPES,
     create_access_token,
@@ -30,6 +32,20 @@ from xagent.web.models.user import User
 # among other scopes. The user never sees a consent screen at all; the redirect
 # back to us carries error=access_denied&error_subcode=cancel with no `code`.
 ADMIN_CONSENT_LINK_RE = re.compile(r'href="([^"]+)"')
+
+
+class MockResponse:
+    def __init__(self, json_data=None, status_code: int = 200):
+        self._json_data = json_data or {}
+        self.status_code = status_code
+        self.text = ""
+
+    def json(self):
+        return self._json_data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"status {self.status_code}")
 
 
 @pytest.fixture()
@@ -115,6 +131,42 @@ def _extract_admin_consent_url(body: str) -> str:
     # treating it as a URL, or parse_qs silently mis-splits every param
     # after the first.
     return html.unescape(match.group(1))
+
+
+def test_stray_admin_consent_param_does_not_hijack_a_real_login_callback(
+    db_session, monkeypatch
+):
+    """Entra ID's real /adminconsent return trip never carries a `code` --
+    the top-level admin_consent branch must require its absence. Without
+    that guard, an ordinary code-exchange callback that happens to also
+    carry a stray admin_consent param (a stale bookmarked URL, a restored
+    browser query string) would be misrouted into the admin-consent-return
+    handler and rejected as "no longer valid" instead of completing the
+    real login it actually is."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse({"access_token": "at", "refresh_token": "rt"})
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    mock_get = Mock(
+        return_value=MockResponse({"id": "1", "userPrincipalName": "alice@example.com"})
+    )
+    monkeypatch.setattr(auth_api.requests, "get", mock_get)
+
+    request = SimpleNamespace(
+        query_params={
+            "code": "real-microsoft-authorization-code",
+            "state": _oauth_state(user),
+            "admin_consent": "True",
+        }
+    )
+
+    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+
+    body = response.body.decode().lower()
+    assert "no longer valid" not in body
+    assert "response received" not in body
+    mock_post.assert_called_once()
 
 
 def test_teams_admin_consent_required_surfaces_a_forwardable_link(db_session):
@@ -325,7 +377,13 @@ def test_admin_consent_return_trip_denied(db_session):
     response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
 
     assert response.status_code == 400
-    assert "not" in response.body.decode().lower()
+    body = response.body.decode().lower()
+    # A bare "not" in body is too weak to catch a regression that drops the
+    # denial copy entirely or reintroduces a false "granted" claim -- assert
+    # the actual denial wording and the absence of any affirmative-grant text.
+    assert "did not approve" in body
+    assert "<h1>admin consent granted</h1>" not in body
+    assert "your organization has approved" not in body
 
 
 def test_admin_consent_return_trip_error_is_not_reported_as_success(db_session, caplog):

@@ -504,6 +504,9 @@ def _microsoft_admin_consent_required_response(admin_consent_url: str) -> HTMLRe
     of, so the page says what to do instead of just reporting failure.
     """
     escaped_url = html.escape(admin_consent_url, quote=True)
+    validity_hours = int(
+        _MICROSOFT_ADMIN_CONSENT_STATE_LIFETIME.total_seconds() // 3600
+    )
     return HTMLResponse(
         content=(
             "<h1>Admin approval required</h1>"
@@ -512,7 +515,8 @@ def _microsoft_admin_consent_required_response(admin_consent_url: str) -> HTMLRe
             "can use it. This is a one-time approval done by Microsoft, "
             "not by Xagent.</p>"
             "<p>Send this link to your Microsoft 365 administrator, or open "
-            "it yourself if you are one. It stays valid for 24 hours:</p>"
+            f"it yourself if you are one. It stays valid for {validity_hours} "
+            "hours:</p>"
             f'<p><a href="{escaped_url}">{escaped_url}</a></p>'
             "<p>Once an administrator approves it, everyone in your "
             "organization can connect this app normally.</p>"
@@ -3314,6 +3318,13 @@ def generic_oauth_callback(
     if (
         provider.lower() == "microsoft"
         and request.query_params.get("admin_consent") is not None
+        # Entra ID's real /adminconsent return trip never carries a `code`
+        # (see _handle_microsoft_admin_consent_return's own docstring) --
+        # requiring its absence keeps an ordinary code-exchange callback
+        # that happens to also carry a stray admin_consent param (a stale
+        # bookmarked URL, browser-restored query string, etc.) from being
+        # misrouted here instead of processed as the real login it is.
+        and request.query_params.get("code") is None
     ):
         # Entra ID's /adminconsent return trip carries admin_consent=True/
         # False and the original `state`, never a `code` -- must be handled
@@ -3366,7 +3377,13 @@ def generic_oauth_callback(
         if (
             provider.lower() == "microsoft"
             and error == "access_denied"
-            and request.query_params.get("error_subcode") == "cancel"
+            # Unlike `error`'s fixed OAuth2-spec lowercase vocabulary,
+            # error_subcode is a Microsoft-specific extension with no such
+            # guarantee -- casefold() the same way admin_consent is handled
+            # in _handle_microsoft_admin_consent_return below, so a
+            # differently-cased value doesn't silently miss this branch and
+            # fall back to the unhelpful generic error page.
+            and (request.query_params.get("error_subcode") or "").casefold() == "cancel"
             and db_provider is not None
         ):
             consent_app_id = payload.get("app_id")

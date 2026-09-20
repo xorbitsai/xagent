@@ -406,14 +406,19 @@ def _merged_oauth_scopes(
 # than the generic cancellation shape keeps the admin-consent page from
 # firing (and asking an admin to grant broader org-wide access) every time
 # an ordinary user just changes their mind on an unrelated Microsoft login.
-# Keep this in sync with builtin_mcp_registry.py's Microsoft app scopes if
-# a new admin-required Graph permission is ever added to one of them.
+# Keep this in sync with builtin_mcp_registry.py's Microsoft app scopes --
+# test_microsoft_admin_consent_scopes_matches_known_classification enforces
+# that every scope any builtin Microsoft app currently requests is
+# consciously classified one way or the other here, so a newly added scope
+# fails loudly instead of silently falling through to the generic error
+# page the day someone adds it.
 _MICROSOFT_ADMIN_CONSENT_SCOPES = frozenset(
     {
         "Team.ReadBasic.All",
         "Channel.ReadBasic.All",
         "TeamMember.Read.All",
         "ChannelMessage.Read.All",
+        "Sites.ReadWrite.All",
     }
 )
 
@@ -426,7 +431,11 @@ _MICROSOFT_ADMIN_CONSENT_STATE_LIFETIME = timedelta(hours=24)
 
 
 def _build_microsoft_admin_consent_url(
-    db: Session, db_provider: Any, app_id: str | None
+    db: Session,
+    db_provider: Any,
+    app_id: str | None,
+    *,
+    app_info: Dict[str, Any] | None = None,
 ) -> str | None:
     """Build a tenant-wide admin consent link for the Microsoft provider.
 
@@ -445,6 +454,11 @@ def _build_microsoft_admin_consent_url(
     _MICROSOFT_ADMIN_CONSENT_SCOPES, so the caller falls back to the plain
     error page instead of wrongly asking an admin to approve a request that
     was never blocked on their approval in the first place.
+
+    `app_info` lets a caller that already looked up the catalog row (e.g.
+    to apply the hidden-app gate before calling this) pass it straight
+    through instead of this function re-querying get_app_by_id for the
+    same app_id a second time on the same request.
     """
     from urllib.parse import urlencode
 
@@ -454,7 +468,8 @@ def _build_microsoft_admin_consent_url(
 
     app_scopes: list[str] | None = None
     if app_id:
-        app_info = get_app_by_id(db, app_id)
+        if app_info is None:
+            app_info = get_app_by_id(db, app_id)
         if app_info and "oauth_scopes" in app_info:
             app_scopes = app_info["oauth_scopes"]
 
@@ -526,11 +541,15 @@ def _handle_microsoft_admin_consent_return(
     state = request.query_params.get("state")
     payload = verify_token(state) if state else None
     if not payload or payload.get("type") != "admin_consent_state":
+        # Covers a genuinely time-expired token AND a malformed/tampered/
+        # wrong-type one -- verify_token collapses all of those to None, so
+        # this wording must not assert "expired" as the definite cause for
+        # a value that may never have been a real handoff link at all.
         return HTMLResponse(
             content=(
-                "<h1>This admin approval link has expired</h1>"
-                "<p>Xagent's own confirmation link is only valid for a "
-                "limited time, but that does not undo anything on "
+                "<h1>This admin approval link is no longer valid</h1>"
+                "<p>This can happen if the link has expired or is "
+                "otherwise invalid, but that does not undo anything on "
                 "Microsoft's side -- if an administrator already approved "
                 "this in Microsoft, that approval still stands. Ask your "
                 "team members to try connecting again to confirm.</p>"
@@ -3357,7 +3376,7 @@ def generic_oauth_callback(
             # that check, so without this a connector an admin just hid
             # could still have a tenant-wide admin-consent URL minted and
             # shown for it.
-            hidden = False
+            consent_app_info = None
             if consent_app_id:
                 from .mcp import _reject_hidden_catalog_app
 
@@ -3366,17 +3385,15 @@ def generic_oauth_callback(
                     try:
                         _reject_hidden_catalog_app(consent_app_info)
                     except HTTPException:
-                        hidden = True
-            if hidden:
-                return HTMLResponse(
-                    content=(
-                        "<h1>Cannot Connect</h1>"
-                        "<p>This app is not currently available.</p>"
-                    ),
-                    status_code=404,
-                )
+                        return HTMLResponse(
+                            content=(
+                                "<h1>Cannot Connect</h1>"
+                                "<p>This app is not currently available.</p>"
+                            ),
+                            status_code=404,
+                        )
             admin_consent_url = _build_microsoft_admin_consent_url(
-                db, db_provider, consent_app_id
+                db, db_provider, consent_app_id, app_info=consent_app_info
             )
             if admin_consent_url:
                 return _microsoft_admin_consent_required_response(admin_consent_url)

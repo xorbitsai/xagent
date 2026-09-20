@@ -14,10 +14,12 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api.auth import (
+    _MICROSOFT_ADMIN_CONSENT_SCOPES,
     create_access_token,
     generic_oauth_callback,
     verify_token,
 )
+from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
@@ -397,3 +399,58 @@ def test_admin_consent_state_lifetime_suits_asynchronous_admin_approval(db_sessi
     payload = verify_token(state_token)
     minted_lifetime = payload["exp"] - int(time.time())
     assert minted_lifetime > timedelta(hours=1).total_seconds()
+
+
+# Every scope any builtin Microsoft app currently requests, explicitly
+# classified as admin-required or not (per Microsoft's Graph permissions
+# reference at the time each was added). This is deliberately NOT derived
+# from _MICROSOFT_ADMIN_CONSENT_SCOPES itself -- the point of
+# test_microsoft_admin_consent_scopes_matches_known_classification below is
+# to catch the two lists drifting apart, which a self-referential check
+# could never do.
+_KNOWN_MICROSOFT_SCOPE_CLASSIFICATION = {
+    "User.Read": False,
+    "Team.ReadBasic.All": True,
+    "Channel.ReadBasic.All": True,
+    "TeamMember.Read.All": True,
+    "ChannelMessage.Read.All": True,
+    "ChannelMessage.Send": False,
+    "Chat.ReadWrite": False,
+    "Mail.Read": False,
+    "Mail.Send": False,
+    "Calendars.ReadWrite": False,
+    "Contacts.Read": False,
+    "Files.ReadWrite": False,
+    "Sites.ReadWrite.All": True,
+}
+
+
+def test_microsoft_admin_consent_scopes_matches_known_classification():
+    """Guards against _MICROSOFT_ADMIN_CONSENT_SCOPES silently going stale.
+
+    Without this, a new builtin Microsoft app/scope (the registry already
+    grew a "sharepoint" app with Sites.ReadWrite.All -- itself admin-required
+    and, until this fix, missing from the allowlist) could ship without
+    anyone deciding whether it needs admin consent, and a genuine
+    admin-required cancellation for it would silently fall through to the
+    generic error page -- regressing to the exact bug this feature exists
+    to fix, with nothing failing to say so."""
+    microsoft_scopes: set[str] = set()
+    for row in get_builtin_public_mcp_app_rows():
+        if row.get("provider_name") == "microsoft":
+            microsoft_scopes.update(row.get("oauth_scopes") or [])
+
+    unclassified = microsoft_scopes - set(_KNOWN_MICROSOFT_SCOPE_CLASSIFICATION)
+    assert not unclassified, (
+        f"new Microsoft scope(s) {unclassified} need a classification added "
+        "to _KNOWN_MICROSOFT_SCOPE_CLASSIFICATION (and, if admin-required, "
+        "to _MICROSOFT_ADMIN_CONSENT_SCOPES) after checking Microsoft's "
+        "Graph permissions reference"
+    )
+
+    for scope, requires_admin in _KNOWN_MICROSOFT_SCOPE_CLASSIFICATION.items():
+        if scope not in microsoft_scopes:
+            continue
+        assert (scope in _MICROSOFT_ADMIN_CONSENT_SCOPES) == requires_admin, (
+            f"{scope!r} classification drifted from _MICROSOFT_ADMIN_CONSENT_SCOPES"
+        )

@@ -130,6 +130,30 @@ def test_upgrade_rejects_unmarked_existing_planner_row(tmp_path):
         assert "planner" in _app_ids(connection)
 
 
+@pytest.mark.parametrize("colliding_app_id", ["Planner", " planner ", "PLANNER"])
+def test_upgrade_rejects_normalized_planner_app_id_collision(
+    tmp_path, colliding_app_id
+):
+    """Case/whitespace variants must fail closed instead of leaving two
+    catalog rows that runtime lookup later rejects as ambiguous."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) VALUES "
+                "(:app_id, 'Custom Planner', 'stdio', '{}')"
+            ),
+            {"app_id": colliding_app_id},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="normalized builtin identity"):
+                migration.upgrade()
+        assert _app_ids(connection) == {colliding_app_id}
+
+
 def test_downgrade_preserves_row_without_planner_provenance(tmp_path):
     """Rollback deletes only the row carrying this migration's ownership marker."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")

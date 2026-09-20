@@ -12,7 +12,10 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-from xagent.builtin_identity import builtin_provenance_identity
+from xagent.builtin_identity import (
+    builtin_provenance_identity,
+    canonicalize_builtin_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,23 +84,34 @@ def upgrade() -> None:
             "public_mcp_apps.launch_config is required for provenance"
         )
 
-    existing = (
-        bind.execute(
+    normalized_app_id = canonicalize_builtin_identity(APP_ID)
+    collisions = [
+        row
+        for row in bind.execute(
             sa.select(
                 PUBLIC_MCP_APPS_TABLE.c.app_id,
                 PUBLIC_MCP_APPS_TABLE.c.launch_config,
-            ).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if existing is not None:
-        if _has_provenance(existing["launch_config"]):
+            )
+        ).mappings()
+        if canonicalize_builtin_identity(row["app_id"]) == normalized_app_id
+    ]
+    if collisions:
+        if (
+            len(collisions) == 1
+            and collisions[0]["app_id"] == APP_ID
+            and _has_provenance(collisions[0]["launch_config"])
+        ):
             return
+        if len(collisions) == 1 and collisions[0]["app_id"] == APP_ID:
+            raise RuntimeError(
+                "Cannot seed builtin Planner connector: an existing "
+                "public_mcp_apps row with app_id='planner' has no matching "
+                "builtin_provenance"
+            )
         raise RuntimeError(
-            "Cannot seed builtin Planner connector: an existing "
-            "public_mcp_apps row with app_id='planner' has no matching "
-            "builtin_provenance"
+            "Cannot seed builtin Planner connector: public_mcp_apps contains "
+            "an app_id that conflicts with the normalized builtin identity "
+            f"'planner': {sorted(row['app_id'] for row in collisions)!r}"
         )
 
     dropped_keys = sorted(set(ROW) - columns)

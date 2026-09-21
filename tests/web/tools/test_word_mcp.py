@@ -113,6 +113,15 @@ def test_item_path_defaults_to_own_onedrive():
     assert word._item_path("Report.docx", None, None) == "/me/drive/root:/Report.docx:"
 
 
+@pytest.mark.parametrize(
+    ("site_id", "drive_id", "field_name"),
+    [("", None, "site_id"), (None, "", "drive_id"), ("site-1", "", "drive_id")],
+)
+def test_item_path_rejects_explicit_empty_scope_ids(site_id, drive_id, field_name):
+    with pytest.raises(ValueError, match=field_name):
+        word._item_path("Report.docx", site_id, drive_id)
+
+
 def test_item_path_closes_colon_for_path_shaped_site_id():
     """A "hostname:/relative-path" site id must be closed with a second
     colon before appending "/drive", per Graph's sharepoint-addressing
@@ -472,7 +481,6 @@ def test_create_only_upload_does_not_chain_secret_bearing_exception(monkeypatch)
     monkeypatch.setattr(word.requests, "request", mock_request)
     mock_put = Mock(return_value=MockResponse({}, status_code=500, url=secret_url))
     monkeypatch.setattr(word.requests, "put", mock_put)
-    monkeypatch.setattr(word, "_reconcile_created_document", Mock(return_value=None))
     monkeypatch.setattr(
         word.requests, "get", Mock(side_effect=requests.ConnectionError("dropped"))
     )
@@ -492,7 +500,6 @@ def test_create_only_upload_connection_error_does_not_chain_exception(monkeypatc
         side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
     )
     monkeypatch.setattr(word.requests, "put", mock_put)
-    monkeypatch.setattr(word, "_reconcile_created_document", Mock(return_value=None))
     monkeypatch.setattr(
         word.requests, "get", Mock(side_effect=requests.ConnectionError("dropped"))
     )
@@ -529,27 +536,33 @@ def test_create_document_uploads_blank_document(monkeypatch):
     Document(io.BytesIO(put_call.kwargs["data"]))
 
 
-def test_create_document_reconciles_commit_when_final_response_is_lost(monkeypatch):
+def test_create_document_does_not_claim_identical_destination_after_lost_response(
+    monkeypatch,
+):
     content = _docx_bytes()
-    responses = iter(
-        [
-            MockResponse({"uploadUrl": "https://upload.example/session"}),
-            MockResponse(content=content),
-            MockResponse({"id": "new-item", "eTag": '"new"'}),
-        ]
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
     )
-    monkeypatch.setattr(
-        word.requests, "request", Mock(side_effect=lambda *a, **k: next(responses))
-    )
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(side_effect=requests.ConnectionError("committed response was lost"))
     monkeypatch.setattr(
         word.requests,
         "put",
-        Mock(side_effect=requests.ConnectionError("committed response was lost")),
+        mock_put,
     )
+    monkeypatch.setattr(
+        word.requests, "get", Mock(return_value=MockResponse({}, status_code=404))
+    )
+    monkeypatch.setattr(word.time, "sleep", Mock())
 
-    result = word._create_only_upload(content, "Report.docx", None, None)
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
+        word._create_only_upload(content, "Report.docx", None, None)
 
-    assert result == {"id": "new-item", "eTag": '"new"'}
+    # Only createUploadSession is addressed through Graph. In particular, the
+    # destination path is never read and byte-compared to claim another
+    # session's indistinguishable blank document.
+    assert mock_request.call_count == 1
+    assert mock_put.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -745,11 +758,13 @@ def test_get_document_text_is_explicitly_main_body_only(monkeypatch):
 
 
 def test_get_document_text_pages_are_valid_json_and_recover_all_text(monkeypatch):
-    expected = ('quote " and slash \\ and text ' * 80).strip()
+    expected = ('quote " and slash \\ and text ' * 800).strip()
     content = _docx_bytes(lambda d: d.add_paragraph(expected))
     mock_request = Mock(return_value=MockResponse(content=content))
     monkeypatch.setattr(word.requests, "request", mock_request)
-    monkeypatch.setattr(word, "get_tool_max_output_length", lambda: 320)
+    monkeypatch.setattr(
+        word, "get_tool_max_output_length", lambda: word._MIN_PAGINATION_OUTPUT_LENGTH
+    )
 
     offset = 0
     generation = None
@@ -758,52 +773,54 @@ def test_get_document_text_pages_are_valid_json_and_recover_all_text(monkeypatch
         encoded = word.word_get_document_text(
             "Report.docx",
             offset=offset,
-            limit=500,
+            limit=1,
             expected_generation=generation,
         )
-        assert len(encoded) <= 320
+        assert len(encoded) <= word._MIN_PAGINATION_OUTPUT_LENGTH
         page = json.loads(encoded)
         assert page["status"] == "success"
         chunks.append(page["text"])
         if not page["has_more"]:
             break
         assert page["next_offset"] > offset
+        assert page["next_offset"] - offset >= word._MIN_TEXT_PAGE_CHARS
         offset = page["next_offset"]
         generation = page["generation"]
 
     assert "".join(chunks) == expected
 
 
-def test_list_paragraphs_paginates_without_skipping(monkeypatch):
-    content = _docx_bytes(
-        lambda d: [d.add_paragraph(text) for text in ("first", "second", "third")]
-    )
+def test_list_paragraphs_normalizes_tiny_limit_without_skipping(monkeypatch):
+    expected = [f"paragraph-{index}" for index in range(105)]
+    content = _docx_bytes(lambda d: [d.add_paragraph(text) for text in expected])
     mock_request = Mock(return_value=MockResponse(content=content))
     monkeypatch.setattr(word.requests, "request", mock_request)
 
-    first = json.loads(word.word_list_paragraphs("Report.docx", limit=2))
+    first = json.loads(word.word_list_paragraphs("Report.docx", limit=1))
     second = json.loads(
         word.word_list_paragraphs(
             "Report.docx",
             offset=first["next_offset"],
             text_offset=first["next_text_offset"],
-            limit=2,
+            limit=1,
             expected_generation=first["generation"],
         )
     )
 
-    assert [p["text"] for p in first["paragraphs"]] == ["first", "second"]
+    assert [p["text"] for p in first["paragraphs"]] == expected[:100]
     assert first["has_more"] is True
-    assert [p["text"] for p in second["paragraphs"]] == ["third"]
+    assert [p["text"] for p in second["paragraphs"]] == expected[100:]
     assert second["has_more"] is False
 
 
 def test_list_paragraphs_splits_one_oversized_paragraph_recoverably(monkeypatch):
-    expected = "x" * 2_000
+    expected = "x" * 40_000
     content = _docx_bytes(lambda d: d.add_paragraph(expected))
     mock_request = Mock(return_value=MockResponse(content=content))
     monkeypatch.setattr(word.requests, "request", mock_request)
-    monkeypatch.setattr(word, "get_tool_max_output_length", lambda: 420)
+    monkeypatch.setattr(
+        word, "get_tool_max_output_length", lambda: word._MIN_PAGINATION_OUTPUT_LENGTH
+    )
 
     offset = 0
     text_offset = 0
@@ -817,7 +834,7 @@ def test_list_paragraphs_splits_one_oversized_paragraph_recoverably(monkeypatch)
             limit=1,
             expected_generation=generation,
         )
-        assert len(encoded) <= 420
+        assert len(encoded) <= word._MIN_PAGINATION_OUTPUT_LENGTH
         page = json.loads(encoded)
         chunks.append(page["paragraphs"][0]["text"])
         if not page["has_more"]:
@@ -829,6 +846,25 @@ def test_list_paragraphs_splits_one_oversized_paragraph_recoverably(monkeypatch)
         generation = page["generation"]
 
     assert "".join(chunks) == expected
+
+
+@pytest.mark.parametrize(
+    "tool", [word.word_get_document_text, word.word_list_paragraphs]
+)
+def test_paginated_reads_reject_tiny_output_cap_before_download(monkeypatch, tool):
+    mock_request = Mock()
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(
+        word,
+        "get_tool_max_output_length",
+        lambda: word._MIN_PAGINATION_OUTPUT_LENGTH - 1,
+    )
+
+    result = json.loads(tool("Report.docx"))
+
+    assert result["status"] == "error"
+    assert "requires XAGENT_TOOL_MAX_OUTPUT_LENGTH" in result["message"]
+    mock_request.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

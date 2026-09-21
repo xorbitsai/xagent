@@ -87,9 +87,12 @@ _UPLOAD_RETRY_ATTEMPTS = 3
 _UPLOAD_RETRY_BASE_SECONDS = 1.0
 _UPLOAD_RETRY_MAX_SECONDS = 4.0
 _DEFAULT_TEXT_PAGE_CHARS = 20_000
+_MIN_TEXT_PAGE_CHARS = 10_000
 _MAX_TEXT_PAGE_CHARS = 40_000
 _DEFAULT_PARAGRAPH_PAGE_SIZE = 500
+_MIN_PARAGRAPH_PAGE_SIZE = 100
 _MAX_PARAGRAPH_PAGE_SIZE = 500
+_MIN_PAGINATION_OUTPUT_LENGTH = 16_384
 
 
 class _GraphRequestError(RuntimeError):
@@ -344,14 +347,14 @@ def _normalize_relative_path(path: str) -> str:
 
 def _item_path(file_path: str, site_id: str | None, drive_id: str | None) -> str:
     normalized = _normalize_relative_path(file_path)
-    if site_id:
+    if site_id is not None:
         site_base = _site_subresource_base(site_id)
         drive_base = (
             f"{site_base}/drives/{url_path_id(drive_id, 'drive_id')}"
-            if drive_id
+            if drive_id is not None
             else f"{site_base}/drive"
         )
-    elif drive_id:
+    elif drive_id is not None:
         drive_base = f"/drives/{url_path_id(drive_id, 'drive_id')}"
     else:
         drive_base = "/me/drive"
@@ -843,9 +846,10 @@ def _create_only_upload(
     # The upload-session URL is itself pre-authenticated (a token in its own
     # query string) -- never include it in an exception or chained cause.
     # A final PUT can commit server-side and then lose its response, so creation
-    # uses the same bounded status/reconciliation loop as edits instead of
+    # uses the same bounded session-status/resume loop as edits instead of
     # reporting a definite failure for an ambiguous transport outcome.
     offset = 0
+    outcome_ambiguous = False
     for attempt in range(_UPLOAD_RETRY_ATTEMPTS):
         try:
             response = requests.put(
@@ -873,6 +877,7 @@ def _create_only_upload(
                     safe_item = dict(result)
                     safe_item.pop("@microsoft.graph.downloadUrl", None)
                     return safe_item
+                outcome_ambiguous = True
             elif response.status_code == 202:
                 try:
                     progress = response.json()
@@ -883,16 +888,21 @@ def _create_only_upload(
                     offset = next_offset
                     continue
             elif response.status_code < 500 and response.status_code != 416:
+                if outcome_ambiguous:
+                    break
                 raise _GraphRequestError(
                     f"Word document upload failed with HTTP {response.status_code}",
                     status_code=response.status_code,
                 )
+            else:
+                outcome_ambiguous = True
         except requests.RequestException:
-            pass
+            outcome_ambiguous = True
 
-        reconciled = _reconcile_created_document(item_path, content)
-        if reconciled is not None:
-            return reconciled
+        # Only this upload URL can describe this caller's session. Looking up
+        # the destination and comparing bytes is not attribution: two racing
+        # blank creates have identical DOCX bytes, so that could incorrectly
+        # claim the other caller's item after this session lost a 409 response.
         try:
             status = requests.get(upload_url, timeout=_BINARY_TIMEOUT_SECONDS)
             if status.status_code == 200:
@@ -905,6 +915,8 @@ def _create_only_upload(
                     offset = next_offset
                     _sleep_before_upload_retry(attempt)
                     continue
+            if outcome_ambiguous and status.status_code in (404, 410):
+                break
         except requests.RequestException:
             pass
         _sleep_before_upload_retry(attempt)
@@ -913,24 +925,6 @@ def _create_only_upload(
         "Word document creation outcome is unknown; verify whether the file "
         "exists before retrying"
     )
-
-
-def _reconcile_created_document(
-    item_path: str, content: bytes
-) -> dict[str, Any] | None:
-    """Prove an ambiguous create committed by comparing the exact bytes."""
-    try:
-        remote = _graph_request("GET", f"{item_path}/content", raw=True)
-        if remote != content:
-            return None
-        item = _graph_request("GET", item_path, params={"$select": "id,eTag"})
-    except (ValueError, requests.RequestException, _GraphRequestError):
-        return None
-    if not isinstance(item, dict) or not item.get("id"):
-        return None
-    safe_item = dict(item)
-    safe_item.pop("@microsoft.graph.downloadUrl", None)
-    return safe_item
 
 
 _SAFE_RUN_CHILD_TAGS = (qn("w:rPr"), qn("w:t"))
@@ -1157,7 +1151,10 @@ def _text_page_response(
 ) -> str:
     """Return a recoverable character page that fits the tool output cap."""
     start = min(clamp_offset(offset), len(text))
-    requested = clamp_limit(limit, max_limit=_MAX_TEXT_PAGE_CHARS)
+    requested = max(
+        _MIN_TEXT_PAGE_CHARS,
+        clamp_limit(limit, max_limit=_MAX_TEXT_PAGE_CHARS),
+    )
     end = min(start + requested, len(text))
     max_output_length = get_tool_max_output_length()
 
@@ -1203,7 +1200,10 @@ def _paragraph_page_response(
     page_start = min(clamp_offset(offset), total)
     index = page_start
     first_text_offset = clamp_offset(text_offset)
-    page_limit = clamp_limit(limit, max_limit=_MAX_PARAGRAPH_PAGE_SIZE)
+    page_limit = max(
+        _MIN_PARAGRAPH_PAGE_SIZE,
+        clamp_limit(limit, max_limit=_MAX_PARAGRAPH_PAGE_SIZE),
+    )
     max_output_length = get_tool_max_output_length()
     items: list[dict[str, Any]] = []
     next_offset: int | None = None
@@ -1302,6 +1302,20 @@ def _paragraph_page_response(
     return response
 
 
+def _require_pagination_output_budget() -> None:
+    """Reject caps that would turn one bounded document into tiny pages.
+
+    Each MCP invocation starts a fresh process and reparses the document, so
+    allowing arbitrarily small output caps would defeat the minimum page sizes
+    above. The check runs before download/parse work in both read handlers.
+    """
+    if get_tool_max_output_length() < _MIN_PAGINATION_OUTPUT_LENGTH:
+        raise ValueError(
+            "Word pagination requires XAGENT_TOOL_MAX_OUTPUT_LENGTH to be at "
+            f"least {_MIN_PAGINATION_OUTPUT_LENGTH} characters"
+        )
+
+
 @mcp.tool()
 def word_create_document(
     file_path: str, site_id: str | None = None, drive_id: str | None = None
@@ -1334,8 +1348,10 @@ def word_get_document_text(
     are not included. Pass next_offset and generation from a response with
     has_more=true back as offset/expected_generation. A changed document is
     rejected instead of mixing pages from different versions. limit is a
-    character count and is capped to a safe maximum."""
+    character count and is normalized to a safe range of 10,000-40,000.
+    Pagination requires an output cap of at least 16,384 characters."""
     try:
+        _require_pagination_output_budget()
         if clamp_offset(offset) and not expected_generation:
             raise ValueError("expected_generation is required to continue pagination")
         document, _snapshot, generation = _download_document(
@@ -1374,8 +1390,11 @@ def word_list_paragraphs(
     are excluded. Pass next_offset, next_text_offset, and generation from a
     response with has_more=true back as offset/text_offset/expected_generation.
     next_text_offset is non-zero only when one unusually large paragraph had
-    to be split. Pass generation to word_set_paragraph_text with the index."""
+    to be split. limit is normalized to 100-500 paragraphs. Pagination
+    requires an output cap of at least 16,384 characters. Pass generation to
+    word_set_paragraph_text with the index."""
     try:
+        _require_pagination_output_budget()
         if (
             clamp_offset(offset) or clamp_offset(text_offset)
         ) and not expected_generation:

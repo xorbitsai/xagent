@@ -1639,6 +1639,97 @@ class MCPToolAdapter(AbstractBaseTool):
 
         return normalized_args
 
+    def _validate_strict_integer_args(self, args: Mapping[str, Any]) -> None:
+        """Validate declared integer inputs before Pydantic can coerce them.
+
+        MCP arguments arrive as JSON values.  Pydantic's default ``int``
+        parsing accepts booleans, numeric strings, and integral floats, which
+        changes the caller's value before a strict downstream tool can inspect
+        it.  Preserve the schema's integer contract at this shared boundary and
+        enforce its numeric bounds without changing the emitted args model.
+        """
+        schema = self.mcp_tool.inputSchema
+        if not isinstance(schema, dict):
+            return
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+
+        for field_name, field_schema in properties.items():
+            if field_name not in args or args[field_name] is None:
+                continue
+            if not self._schema_is_integer_only(field_schema):
+                continue
+
+            value = args[field_name]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{field_name} must be an integer")
+
+            for constraint, bound in self._integer_schema_bounds(field_schema):
+                if constraint == "minimum" and value < bound:
+                    raise ValueError(f"{field_name} must be at least {bound}")
+                if constraint == "maximum" and value > bound:
+                    raise ValueError(f"{field_name} must be at most {bound}")
+                if constraint == "exclusiveMinimum" and value <= bound:
+                    raise ValueError(f"{field_name} must be greater than {bound}")
+                if constraint == "exclusiveMaximum" and value >= bound:
+                    raise ValueError(f"{field_name} must be less than {bound}")
+
+    def _schema_is_integer_only(self, schema: Any) -> bool:
+        """Return True when integer is the only accepted non-null JSON type."""
+        if not isinstance(schema, dict):
+            return False
+
+        schema_type = schema.get("type")
+        if schema_type == "integer":
+            return True
+        if isinstance(schema_type, list):
+            concrete_types = [item for item in schema_type if item != "null"]
+            return bool(concrete_types) and all(
+                concrete_type == "integer" for concrete_type in concrete_types
+            )
+
+        for union_key in ("anyOf", "oneOf"):
+            options = schema.get(union_key)
+            if isinstance(options, list) and options:
+                non_null_options = [
+                    option for option in options if not self._is_null_schema(option)
+                ]
+                return bool(non_null_options) and all(
+                    self._schema_is_integer_only(option) for option in non_null_options
+                )
+
+        all_of = schema.get("allOf")
+        if isinstance(all_of, list) and all_of:
+            return any(self._schema_is_integer_only(option) for option in all_of)
+        return False
+
+    def _integer_schema_bounds(self, schema: Any) -> list[tuple[str, int | float]]:
+        """Collect valid numeric bounds from an integer schema and wrappers."""
+        if not isinstance(schema, dict):
+            return []
+
+        bounds: list[tuple[str, int | float]] = []
+        for constraint in (
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+        ):
+            bound = schema.get(constraint)
+            if isinstance(bound, (int, float)) and not isinstance(bound, bool):
+                bounds.append((constraint, bound))
+
+        for composite_key in ("anyOf", "oneOf", "allOf"):
+            options = schema.get(composite_key)
+            if not isinstance(options, list):
+                continue
+            for option in options:
+                if self._is_null_schema(option):
+                    continue
+                bounds.extend(self._integer_schema_bounds(option))
+        return bounds
+
     def _schema_accepts_array(self, schema: Any) -> bool:
         """Return True when a JSON schema allows array input."""
         if not isinstance(schema, dict):
@@ -1709,6 +1800,7 @@ class MCPToolAdapter(AbstractBaseTool):
                         self.mcp_tool.name,
                     )
                     normalized_args.pop(field_name, None)
+            self._validate_strict_integer_args(normalized_args)
             parsed_args = self._args_type(**normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
             tool_args.update(self._runtime_tool_arguments())

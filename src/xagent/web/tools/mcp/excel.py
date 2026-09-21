@@ -166,7 +166,7 @@ def _graph_request(
             raise _GraphRequestError(message, status_code=response.status_code) from exc
         if oversized:
             raise _GraphResponseTooLargeError(
-                "Graph response exceeded the Excel range ingress limit"
+                "Graph response exceeded the Excel tool ingress limit"
             )
         if response.status_code == 204:
             return {}
@@ -190,13 +190,20 @@ def _graph_request(
 
 
 def _graph_mutation_request(
+    method: str,
     path: str,
     *,
-    body: dict[str, Any],
+    body: dict[str, Any] | None = None,
+    max_response_bytes: int | None = None,
 ) -> Any:
-    """POST a non-idempotent mutation without masking unknown outcomes."""
+    """Send a non-idempotent mutation without masking unknown outcomes."""
     try:
-        return _graph_request("POST", path, body=body)
+        return _graph_request(
+            method,
+            path,
+            body=body,
+            max_response_bytes=max_response_bytes,
+        )
     except _GraphRequestError as exc:
         if exc.status_code >= 500:
             raise _GraphMutationIndeterminateError(
@@ -205,7 +212,7 @@ def _graph_mutation_request(
                 "the workbook before retrying."
             ) from exc
         raise
-    except requests.RequestException as exc:
+    except (requests.RequestException, json.JSONDecodeError) as exc:
         raise _GraphMutationIndeterminateError(
             "Graph did not provide a complete, parseable confirmation for this "
             "non-idempotent request. The mutation may already have been applied; "
@@ -513,7 +520,7 @@ def excel_add_worksheet(
             if not name.strip():
                 raise ValueError("name must not be empty or whitespace")
             body = {"name": name}
-        result = _graph_mutation_request(f"{base}/worksheets/add", body=body)
+        result = _graph_mutation_request("POST", f"{base}/worksheets/add", body=body)
         return _success(worksheet=result)
     except _GraphMutationIndeterminateError as e:
         logger.error(
@@ -756,7 +763,7 @@ def excel_add_table(
             raise TypeError("has_headers must be a boolean")
         base = _workbook_base(file_path, site_id, drive_id)
         body = {"address": address, "hasHeaders": has_headers}
-        result = _graph_mutation_request(f"{base}/tables/add", body=body)
+        result = _graph_mutation_request("POST", f"{base}/tables/add", body=body)
         return _success(table=result)
     except _GraphMutationIndeterminateError as e:
         logger.error("Table creation outcome is indeterminate for %s: %s", file_path, e)
@@ -802,6 +809,7 @@ def excel_list_table_rows(
                 if next_link is None
                 else None
             ),
+            max_response_bytes=get_tool_max_output_length(),
         )
         rows = result.get("value", [])
         graph_next_link = result.get("@odata.nextLink")
@@ -819,6 +827,11 @@ def excel_list_table_rows(
                 "The Graph row page exceeds the tool output limit; retry the same "
                 "skip with a smaller page_size."
             ),
+        )
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph row page exceeds the tool ingress limit; retry the same "
+            "skip with a smaller page_size."
         )
     except Exception as e:
         logger.error("Error listing rows for table %s in %s: %s", table, file_path, e)
@@ -849,8 +862,15 @@ def excel_add_table_rows(
         body: dict[str, Any] = {"values": values}
         if index is not None:
             body["index"] = index
-        result = _graph_mutation_request(f"{base}/{segment}/rows", body=body)
+        result = _graph_mutation_request(
+            "POST",
+            f"{base}/{segment}/rows",
+            body=body,
+            max_response_bytes=get_tool_max_output_length(),
+        )
         return success_with_capped_dict("row", result)
+    except _GraphResponseTooLargeError:
+        return _success(response_omitted=True)
     except _GraphMutationIndeterminateError as e:
         logger.error(
             "Table row insertion outcome is indeterminate for %s in %s: %s",
@@ -877,8 +897,16 @@ def excel_delete_table_row(
         _validate_non_negative_int(row_index, "row_index")
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)
-        _graph_request("DELETE", f"{base}/{segment}/rows/{row_index}")
+        _graph_mutation_request("DELETE", f"{base}/{segment}/rows/{row_index}")
         return _success(message="Table row deleted successfully")
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Table row deletion outcome is indeterminate for %s in %s: %s",
+            table,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error(
             "Error deleting row %s from table %s in %s: %s",

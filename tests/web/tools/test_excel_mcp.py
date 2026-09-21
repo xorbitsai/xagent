@@ -772,14 +772,13 @@ def test_list_table_rows_rejects_oversized_page_without_advancing_cursor(monkeyp
         "https://graph.microsoft.com/v1.0/me/drive/root:/book.xlsx:/workbook/"
         "tables('Table1')/rows?$skiptoken=page-2"
     )
-    mock_request = Mock(
-        return_value=MockResponse(
-            {
-                "value": [{"values": [["x" * (max_output_length + 1000)]]}],
-                "@odata.nextLink": next_link,
-            }
-        )
+    response = MockResponse(
+        {
+            "value": [{"values": [["x" * (max_output_length + 1000)]]}],
+            "@odata.nextLink": next_link,
+        }
     )
+    mock_request = Mock(return_value=response)
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
     result = json.loads(excel.excel_list_table_rows("book.xlsx", "Table1"))
@@ -787,6 +786,8 @@ def test_list_table_rows_rejects_oversized_page_without_advancing_cursor(monkeyp
     assert result["status"] == "error"
     assert "smaller page_size" in result["message"]
     assert "next_link" not in result
+    assert response.closed is True
+    assert mock_request.call_args.kwargs["stream"] is True
 
 
 @pytest.mark.parametrize(
@@ -962,15 +963,16 @@ def test_non_idempotent_mutation_server_failure_is_indeterminate(monkeypatch):
 
 def test_add_table_rows_caps_oversized_response(monkeypatch):
     max_output_length = get_tool_max_output_length()
-    mock_request = Mock(
-        return_value=MockResponse({"values": [["x" * (max_output_length + 1000)]]})
-    )
+    response = MockResponse({"values": [["x" * (max_output_length + 1000)]]})
+    mock_request = Mock(return_value=response)
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
     result = json.loads(excel.excel_add_table_rows("book.xlsx", "Table1", '[["x"]]'))
 
     assert result["status"] == "success"
-    assert result["truncated"] is True
+    assert result["response_omitted"] is True
+    assert response.closed is True
+    assert mock_request.call_args.kwargs["stream"] is True
 
 
 def test_add_table_rows_rejects_negative_index():
@@ -1031,6 +1033,50 @@ def test_delete_table_row_success(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["url"].endswith("tables('Table1')/rows/3")
+
+
+@pytest.mark.parametrize(
+    "side_effect",
+    [
+        requests.ReadTimeout("response timed out"),
+        requests.ConnectionError("connection dropped"),
+    ],
+)
+def test_delete_table_row_transport_failure_is_indeterminate(monkeypatch, side_effect):
+    monkeypatch.setattr(excel.requests, "request", Mock(side_effect=side_effect))
+
+    result = json.loads(excel.excel_delete_table_row("book.xlsx", "Table1", 0))
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+    assert "may already have been applied" in result["message"]
+
+
+def test_delete_table_row_server_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(return_value=MockResponse({"error": "gateway"}, status_code=504)),
+    )
+
+    result = json.loads(excel.excel_delete_table_row("book.xlsx", "Table1", 0))
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+    assert "HTTP 504" in result["message"]
+
+
+def test_delete_table_row_client_failure_is_deterministic_error(monkeypatch):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(return_value=MockResponse({"error": "not found"}, status_code=404)),
+    )
+
+    result = json.loads(excel.excel_delete_table_row("book.xlsx", "Table1", 0))
+
+    assert result["status"] == "error"
+    assert "404" in result["message"]
 
 
 # ---------------------------------------------------------------------------

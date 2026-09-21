@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.web.services.coordinator_command_shared import claim_for_owner
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
@@ -15,7 +16,6 @@ from xagent.web.services.mcp_runtime import (
     MCPActorAuthorizationPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
-from xagent.web.services.task_command_transport import claim_task_command
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload
 from xagent.web.services.task_runtime import (
     MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY,
@@ -71,12 +71,13 @@ def test_trusted_actor_reference_is_committed_before_start_and_reconstructed(
         db.commit()
         row = db.get(TaskExecutionCommand, accepted.command_db_id)
         assert "actor:test" not in str(row.payload)
-        claim = claim_task_command(db, runner_id="worker", command_db_id=row.id)
         owner_lease = ownership.acquire_task_lease_no_commit(
             db, task_id, runner_id="worker"
         )
         db.commit()
-    assert owner_lease is not None
+        assert owner_lease is not None
+        claim = claim_for_owner(db, owner_lease, row.id)
+        assert claim is not None
     handoff = task_start_consumer._commit_handoff(claim, owner_lease)
     assert handoff.actor_policy == policy
     assert handoff.actor_policy is not policy

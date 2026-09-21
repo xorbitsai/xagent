@@ -69,6 +69,8 @@ class TaskExecutionCommand(Base):  # type: ignore
     )
     claimed_by = Column(String(255), nullable=True)
     claim_expires_at = Column(DateTime(timezone=True), nullable=True)
+    # Earliest retry time; independent of task ownership and never renewed.
+    retry_available_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     failure_count = Column(Integer, nullable=False, default=0, server_default="0")
     defer_count = Column(Integer, nullable=False, default=0, server_default="0")

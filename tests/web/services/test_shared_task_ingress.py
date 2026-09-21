@@ -96,6 +96,7 @@ async def test_a2a_create_commits_start_without_local_execution(ingress):
         agent_execution_mode="balanced",
         text="hello",
         message_id="message-1",
+        key_prefix="key-one",
         context_id=None,
         task_id=None,
     )
@@ -228,8 +229,8 @@ def test_recovery_releases_expired_owner_without_mutating_business_status(
 async def test_sdk_append_records_current_actor_after_owner_transfer(
     ingress, monkeypatch
 ):
+    from tests.web.services.coordinator_command_shared import claim_for_owner
     from xagent.web.services import task_start_consumer
-    from xagent.web.services.task_command_transport import claim_task_command
 
     owner, agent_id = ingress
     first = await task_start.create_sdk_task(
@@ -269,7 +270,7 @@ async def test_sdk_append_records_current_actor_after_owner_transfer(
         assert row.actor_user_id == actor_id
         assert row.actor_subject == actor_subject
         assert row.task_owner_user_id == owner
-        command = claim_task_command(db, runner_id="worker", command_db_id=row.id)
+        command_id = row.id
     from xagent.web.services.task_coordinator_service import (
         acquire_task_lease_no_commit,
     )
@@ -278,6 +279,8 @@ async def test_sdk_append_records_current_actor_after_owner_transfer(
         owner_lease = acquire_task_lease_no_commit(
             db, first.task_id, runner_id="worker"
         )
+    with get_session_local()() as db:
+        command = claim_for_owner(db, owner_lease, command_id)
     handoff = task_start_consumer._commit_handoff(command, owner_lease)
     assert handoff.task_owner_user_id == owner
     assert handoff.claimed.task_lease.run_id == second.run_id

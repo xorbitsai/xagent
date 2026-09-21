@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
-from ...config import get_compact_threshold_default, get_compact_threshold_ratio
+from ...config import (
+    COMPACT_THRESHOLD_DEFAULT,
+    get_compact_threshold_default,
+)
 from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..inline_file_delivery import InlineFileDelivery
@@ -21,10 +24,22 @@ from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
 from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
-from .context.execution import TOOL_EVIDENCE_REMOVED_METADATA_KEY
+from .context.execution import (
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    derive_compact_threshold,
+)
 from .language import reset_output_language_to_request_context
 from .result import extract_assistant_message, set_assistant_message
-from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
+from .runtime import (
+    THRESHOLD_WARNING_KEY_PREFIX,
+    ExecutionInterrupted,
+    PatternRuntime,
+    compact_model_key,
+    load_pattern_checkpoint,
+    warn_once_per_model,
+    warn_restored_compact_threshold,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +172,7 @@ class AgentRunner:
         if checkpoint and isinstance(checkpoint.get("context"), dict):
             reset_output_language_to_request_context(checkpoint)
             context = ExecutionContext.from_dict(checkpoint["context"])
+            warn_restored_compact_threshold(context, getattr(self.agent, "llm", None))
             self._merge_context_metadata(context, metadata, restored=True)
             self.context_manager.set_context(context)
             execution_id = context.execution_id
@@ -549,6 +565,7 @@ class AgentRunner:
             cold_start_checkpoint = checkpoint
             reset_output_language_to_request_context(checkpoint)
             context = ExecutionContext.from_dict(checkpoint["context"])
+            warn_restored_compact_threshold(context, getattr(self.agent, "llm", None))
             self.context_manager.set_context(context)
 
         # Display-vs-execution split: ``execution_message`` is the prompt
@@ -847,7 +864,10 @@ class AgentRunner:
         # Snapshotted at task start. On resume the context (and this threshold)
         # is restored verbatim from the checkpoint, so a context-window or ratio
         # change made after checkpointing only affects newly started tasks.
-        context.compact_config.threshold = self._resolve_compact_threshold()
+        (
+            context.compact_config.threshold,
+            context.compact_config.threshold_source,
+        ) = self._resolve_compact_threshold()
         self._merge_context_metadata(context, metadata)
         if task:
             context.metadata.setdefault("task", task)
@@ -909,20 +929,42 @@ class AgentRunner:
         if isinstance(request_context, dict):
             self._apply_request_context(context, request_context)
 
-    def _resolve_compact_threshold(self) -> int:
+    def _resolve_compact_threshold(self) -> tuple[int, str]:
         """Derive the context-compaction threshold from the model's context window.
 
         When the model declares a context window, compact at
         ``context_window * ratio`` tokens; otherwise fall back to the configured
-        default (preserving the historical 32000 behaviour).
+        default (preserving the historical 32000 behaviour) and warn once per
+        model, because that default is far too low for long-context models and
+        the resulting early compaction is otherwise invisible.
+
+        Returns the threshold and its provenance (a ``COMPACT_THRESHOLD_SOURCE_*``
+        value) for the compaction trace metadata.
         """
         llm = getattr(self.agent, "llm", None)
         context_window = getattr(llm, "context_window", None)
         # context_window is typed int | None end to end (DB Integer -> Pydantic
         # Optional[int]); bool is not a valid value, so a plain int check suffices.
-        if isinstance(context_window, int) and context_window > 0:
-            return max(1, int(context_window * get_compact_threshold_ratio()))
-        return get_compact_threshold_default()
+        derived = derive_compact_threshold(context_window)
+        if derived is not None:
+            return derived
+        threshold = get_compact_threshold_default()
+        # A virtual model resolves its concrete window per call and
+        # ``prepare_llm_for_context`` recomputes the threshold then, so its
+        # missing window at task start is expected and not worth a warning.
+        if llm is not None and not callable(getattr(llm, "prepare_for_call", None)):
+            model_key = compact_model_key(llm)
+            warn_once_per_model(
+                THRESHOLD_WARNING_KEY_PREFIX + model_key,
+                "Model %s has no context_window; the context compaction "
+                "threshold falls back to %d tokens (%s). Set context_window "
+                "on the model so compaction triggers at a fraction of its "
+                "real window instead.",
+                model_key,
+                threshold,
+                COMPACT_THRESHOLD_DEFAULT,
+            )
+        return threshold, COMPACT_THRESHOLD_SOURCE_DEFAULT
 
     def _initial_user_message_metadata(
         self, context: ExecutionContext

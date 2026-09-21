@@ -24,14 +24,8 @@ from sqlalchemy import func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...config import (
-    get_default_task_execution_mode,
-    get_shared_task_execution_enabled,
-)
-from ...core.agent.checkpoint import (
-    CheckpointReadError,
-    CheckpointUnavailableError,
-)
+from ...config import get_default_task_execution_mode, get_shared_task_execution_enabled
+from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
 from ...core.agent.runner import UserMessageInjectionOutcome
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -40,9 +34,7 @@ from ...core.execution_scope import (
 )
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ..models.chat_message import TaskChatMessage
-from ..models.database import (
-    get_session_local,
-)
+from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
@@ -85,10 +77,7 @@ from .client_error_messages import (
     ClientErrorCode,
     client_error_message,
 )
-from .db_runtime import (
-    is_database_pool_timeout,
-    run_db_io_cancellation_safe,
-)
+from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
 from .external_task_cancel import (
     EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS,
     EXTERNAL_COMMAND_SCOPE,
@@ -156,10 +145,7 @@ from .task_interaction_close import (
     active_interaction_id_sync,
     close_legacy_resume_interaction_sync,
 )
-from .task_lease_service import (
-    TaskLease,
-    bind_task_lease_context,
-)
+from .task_lease_service import TaskLease, bind_task_lease_context
 from .task_runtime import (
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     task_extension_bindings_from_agent_config,
@@ -1215,10 +1201,7 @@ def _prepare_task_message_sync(
         execution_context["files"] = deepcopy(display_file_refs)
         persisted_attachments = _normalize_attachments_for_persistence(file_info_list)
 
-        from .task_orchestrator import (
-            TaskTurnOrchestrator,
-            TaskTurnPayload,
-        )
+        from .task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload
 
         turn_payload = TaskTurnPayload(
             transcript_message=display_user_message,
@@ -1661,9 +1644,7 @@ async def handle_task_message(
                 resolved_execution_scope = await run_db_io_cancellation_safe(
                     lambda: resolve_execution_scope(task_id)
                 )
-                from .task_setup_snapshot import (
-                    load_task_setup_snapshot_sync,
-                )
+                from .task_setup_snapshot import load_task_setup_snapshot_sync
 
                 task_setup_snapshot = await run_db_io_cancellation_safe(
                     lambda: load_task_setup_snapshot_sync(
@@ -3820,9 +3801,13 @@ async def execute_durable_task_command(
             return await _execute_and_report_task_command(command)
 
     if get_shared_task_execution_enabled():
-        from .task_coordinator_runtime import execute_coordinated_command
+        from .task_coordinator_runtime import (
+            current_task_coordinator,
+            execute_coordinated_command,
+        )
 
-        return await execute_coordinated_command(command, execute)
+        if current_task_coordinator(command.task_id) is None:
+            return await execute_coordinated_command(command, execute)
     return await execute()
 
 

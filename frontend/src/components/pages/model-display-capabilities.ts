@@ -33,3 +33,18 @@ export function getProviderDisplayCapabilities(
 
   return Array.from(capabilities)
 }
+
+export interface ContextWindowModel {
+  category: string
+  context_window?: number | null
+}
+
+/**
+ * An LLM row with no positive `context_window` makes the backend fall back to
+ * its global compaction threshold, which is far too low for long-context
+ * models. Surface it on the row so the gap is visible before it hurts.
+ */
+export function isContextWindowUnset(model: ContextWindowModel): boolean {
+  if (model.category !== "llm") return false
+  return !(typeof model.context_window === "number" && model.context_window > 0)
+}

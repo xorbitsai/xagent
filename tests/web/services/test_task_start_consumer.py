@@ -5,6 +5,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from tests.web.services.coordinator_command_shared import (
+    claim_task_command,
+    settle_command,
+)
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
@@ -15,7 +19,6 @@ from xagent.web.services.task_command_execution import execute_durable_task_comm
 from xagent.web.services.task_command_transport import (
     SettledTaskCommand,
     TaskCommandRejected,
-    claim_task_command,
 )
 from xagent.web.services.task_start_protocol import (
     TaskStartPayload,
@@ -76,7 +79,7 @@ async def accepted(tmp_path, monkeypatch):
             db, task_id=task.id, actor_user_id=user.id, start=start
         )
         db.commit()
-        command = claim_task_command(
+        command = await claim_task_command(
             db, runner_id="worker-1", command_db_id=staged.staged_db_id
         )
         assert command is not None
@@ -111,20 +114,26 @@ def test_completion_fence_failure_rolls_back_lease(accepted, monkeypatch):
         assert db.get(TaskExecutionCommand, accepted.id).status == "processing"
 
 
-@pytest.mark.parametrize("expired", [False, True])
-def test_old_or_expired_claim_cannot_acquire_lease(accepted, expired):
+def test_old_command_attempt_cannot_acquire_execution(accepted):
     with get_session_local()() as db:
-        row = db.get(TaskExecutionCommand, accepted.id)
-        if expired:
-            row.claim_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-        else:
-            row.attempt_count += 1
+        db.get(TaskExecutionCommand, accepted.id).attempt_count += 1
         db.commit()
     with pytest.raises(TaskCommandRejected):
         commit_handoff(accepted)
     with get_session_local()() as db:
         assert db.get(Task, accepted.task_id).status == TaskStatus.PENDING
         assert db.get(TaskExecutionCommand, accepted.id).status == "processing"
+
+
+def test_obsolete_command_expiry_does_not_override_task_owner(accepted):
+    with get_session_local()() as db:
+        db.get(TaskExecutionCommand, accepted.id).claim_expires_at = datetime.now(
+            timezone.utc
+        ) - timedelta(seconds=1)
+        db.commit()
+    commit_handoff(accepted)
+    with get_session_local()() as db:
+        assert db.get(TaskExecutionCommand, accepted.id).status == "completed"
 
 
 def test_old_run_rejection_does_not_fail_new_run(accepted):
@@ -189,6 +198,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
         task.output = "previous answer"
         db.get(TaskExecutionCommand, accepted.id).status = "completed"
         db.commit()
+        previous_owner = (task.runner_id, task.lease_attempt_id)
         owner_id = task.user_id
         before = db.query(TaskChatMessage).filter_by(task_id=task.id).count()
     run_id = enqueue_existing_execution(
@@ -202,7 +212,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
         task = db.get(Task, accepted.task_id)
         assert task.run_id != run_id
         assert task.output == "previous answer"
-        assert task.runner_id is None
+        assert (task.runner_id, task.lease_attempt_id) == previous_owner
         assert db.query(TaskChatMessage).filter_by(task_id=task.id).count() == before
         command = (
             db.query(TaskExecutionCommand)
@@ -269,6 +279,7 @@ def test_shared_acceptance_binds_inputs_and_start_in_one_transaction(
     monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: Mock())
     with get_session_local()() as db:
         task = db.get(Task, accepted.task_id)
+        previous_owner = (task.runner_id, task.lease_attempt_id)
         task.status = TaskStatus.COMPLETED
         db.get(TaskExecutionCommand, accepted.id).status = "completed"
         db.commit()
@@ -288,7 +299,7 @@ def test_shared_acceptance_binds_inputs_and_start_in_one_transaction(
         assert row.payload["runtime_values_ref"] == "next-turn"
         assert "synthetic" not in str(row.payload)
         assert db.query(TaskRuntimeSecret).one().run_id == prepared.run_id
-        assert task.runner_id is None
+        assert (task.runner_id, task.lease_attempt_id) == previous_owner
         db.rollback()
     with get_session_local()() as db:
         assert db.query(TaskRuntimeSecret).count() == 0
@@ -297,7 +308,9 @@ def test_shared_acceptance_binds_inputs_and_start_in_one_transaction(
 
 
 @pytest.mark.parametrize("replaced", [False, True])
-def test_terminal_transport_failure_settles_only_its_unowned_run(accepted, replaced):
+async def test_terminal_transport_failure_settles_only_its_owned_run(
+    accepted, replaced
+):
     from xagent.web.services.task_command_transport import (
         MAX_COMMAND_FAILURES,
         fail_task_command,
@@ -310,11 +323,14 @@ def test_terminal_transport_failure_settles_only_its_unowned_run(accepted, repla
         if replaced:
             db.get(Task, accepted.task_id).run_id = "replacement"
         db.commit()
-    assert fail_task_command(
-        accepted.id,
-        "worker-1",
-        "preparation failed",
-        expected_attempt_count=accepted.attempt_count,
+    assert await settle_command(
+        accepted,
+        lambda: fail_task_command(
+            accepted.id,
+            "worker-1",
+            "preparation failed",
+            expected_attempt_count=accepted.attempt_count,
+        ),
     )
     with get_session_local()() as db:
         assert db.get(TaskExecutionCommand, accepted.id).status == "failed"
@@ -323,26 +339,27 @@ def test_terminal_transport_failure_settles_only_its_unowned_run(accepted, repla
         )
 
 
-def test_expired_claim_cannot_fail_accepted_run(accepted):
+async def test_replaced_owner_cannot_fail_accepted_run(accepted):
     from xagent.web.services.task_command_transport import fail_task_command
 
     with get_session_local()() as db:
-        db.get(TaskExecutionCommand, accepted.id).claim_expires_at = datetime.now(
-            timezone.utc
-        ) - timedelta(seconds=1)
+        db.get(Task, accepted.task_id).lease_attempt_id = "replacement-owner"
         db.commit()
-    assert not fail_task_command(
-        accepted.id,
-        "worker-1",
-        "expired",
-        force_terminal=True,
-        expected_attempt_count=accepted.attempt_count,
+    assert not await settle_command(
+        accepted,
+        lambda: fail_task_command(
+            accepted.id,
+            "worker-1",
+            "stale owner",
+            force_terminal=True,
+            expected_attempt_count=accepted.attempt_count,
+        ),
     )
     with get_session_local()() as db:
         assert db.get(Task, accepted.task_id).status == TaskStatus.PENDING
 
 
-def test_live_owner_routes_controls_even_without_immutable_target(accepted):
+async def test_live_owner_routes_controls_even_without_immutable_target(accepted):
     from xagent.web.services.task_command_transport import (
         TaskCommandKind,
         stage_task_command,
@@ -362,7 +379,7 @@ def test_live_owner_routes_controls_even_without_immutable_target(accepted):
         db.get(TaskExecutionCommand, staged.staged_db_id).target_runner_id = None
         db.commit()
         assert (
-            claim_task_command(
+            await claim_task_command(
                 db, runner_id="worker-2", command_db_id=staged.staged_db_id
             )
             is None
@@ -370,14 +387,14 @@ def test_live_owner_routes_controls_even_without_immutable_target(accepted):
         row = db.get(TaskExecutionCommand, staged.staged_db_id)
         assert row.attempt_count == 0
         assert (
-            claim_task_command(
+            await claim_task_command(
                 db, runner_id="worker-1", command_db_id=staged.staged_db_id
             )
             is not None
         )
 
 
-def test_worker_death_after_handoff_recovers_without_replaying_start(accepted):
+async def test_worker_death_after_handoff_recovers_without_replaying_start(accepted):
     from xagent.web.services.task_lease_recovery import (
         recover_expired_task_leases_batch_isolated,
     )
@@ -397,7 +414,9 @@ def test_worker_death_after_handoff_recovers_without_replaying_start(accepted):
         assert db.get(Task, accepted.task_id).runner_id is None
         assert db.get(TaskExecutionCommand, accepted.id).status == "completed"
         assert (
-            claim_task_command(db, runner_id="worker-2", command_db_id=accepted.id)
+            await claim_task_command(
+                db, runner_id="worker-2", command_db_id=accepted.id
+            )
             is None
         )
 
@@ -490,7 +509,7 @@ async def test_following_command_waits_for_start_registration(accepted, monkeypa
                 payload={"message": "next"},
             )
             db.commit()
-            command = claim_task_command(
+            command = await claim_task_command(
                 db, runner_id="worker-1", command_db_id=staged.staged_db_id
             )
             assert command is not None

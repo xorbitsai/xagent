@@ -4154,6 +4154,23 @@ def test_create_event_rejects_explicit_empty_recurrence(monkeypatch):
     graph_request.assert_not_called()
 
 
+def test_create_event_rejects_non_string_recurrence(monkeypatch):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_create_event(
+            subject="Standup",
+            start_datetime="2026-08-26T09:00:00",
+            end_datetime="2026-08-26T09:15:00",
+            recurrence=123,  # type: ignore[arg-type]
+        )
+    )
+
+    assert result == {"status": "error", "message": "recurrence must be a string"}
+    graph_request.assert_not_called()
+
+
 def test_create_event_without_recurrence_has_no_recurrence_key(monkeypatch):
     graph_request = Mock(return_value={"id": "created"})
     monkeypatch.setattr(outlook, "_graph_request", graph_request)
@@ -4242,3 +4259,318 @@ def test_create_recurring_event_requires_explicit_conflict_override(monkeypatch)
     assert "complete series schedule is safe" in result["message"]
     graph_request.assert_not_called()
     find_conflicts.assert_not_called()
+
+
+def test_update_event_recurrence_requires_explicit_conflict_override(monkeypatch):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="event-1",
+            start_datetime="2026-08-26T09:00:00",
+            end_datetime="2026-08-26T09:30:00",
+            timezone="UTC",
+            recurrence="FREQ=WEEKLY;BYDAY=WE;COUNT=5",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "complete series schedule is safe" in result["message"]
+    graph_request.assert_not_called()
+
+
+@pytest.mark.parametrize("recurrence", ["", "   ", "RRULE:", " rrule:   "])
+def test_update_event_rejects_empty_recurrence_before_graph_request(
+    monkeypatch, recurrence
+):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="event-1",
+            recurrence=recurrence,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "recurrence rule must not be empty" in result["message"]
+    graph_request.assert_not_called()
+
+
+def test_update_event_rejects_non_string_recurrence(monkeypatch):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="event-1",
+            recurrence=["FREQ=DAILY"],  # type: ignore[arg-type]
+        )
+    )
+
+    assert result == {"status": "error", "message": "recurrence must be a string"}
+    graph_request.assert_not_called()
+
+
+def test_update_event_adds_recurrence_with_explicit_window(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "@odata.etag": 'W/"version-1"',
+                "start": {"dateTime": "2026-08-25T23:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-25T23:15:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+                "type": "singleInstance",
+                "originalStartTimeZone": "America/Los_Angeles",
+            },
+            {"id": "event-1"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="event-1",
+            start_datetime="2026-08-26T07:00:00",
+            end_datetime="2026-08-26T07:15:00",
+            timezone="Asia/Manila",
+            recurrence="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    get_call = graph_request.call_args_list[0]
+    assert get_call.kwargs["params"]["$select"] == ("start,end,attendees,isAllDay,type")
+    patch_call = graph_request.call_args_list[1]
+    assert patch_call.args[:2] == ("PATCH", "/me/events/event-1")
+    assert patch_call.kwargs["extra_headers"] == {"If-Match": 'W/"version-1"'}
+    translated = patch_call.kwargs["body"]["recurrence"]
+    assert translated["pattern"] == {
+        "type": "weekly",
+        "interval": 1,
+        "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+        "firstDayOfWeek": "monday",
+    }
+    assert translated["range"]["startDate"] == "2026-08-26"
+    assert translated["range"]["recurrenceTimeZone"] == "Asia/Manila"
+
+
+@pytest.mark.parametrize(
+    ("start_datetime", "end_datetime", "timezone"),
+    [
+        (None, None, None),
+        (None, None, "Asia/Manila"),
+        ("2026-08-26T07:00:00", None, "Asia/Manila"),
+        (None, "2026-08-26T07:15:00", "America/Los_Angeles"),
+        ("2026-08-26T07:00:00", "2026-08-26T07:15:00", None),
+    ],
+)
+def test_update_event_recurrence_requires_complete_explicit_window(
+    monkeypatch, start_datetime, end_datetime, timezone
+):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="event-1",
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            timezone=timezone,
+            recurrence="FREQ=WEEKLY;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "both start_datetime and end_datetime" in result["message"]
+    assert "explicit timezone" in result["message"]
+    graph_request.assert_not_called()
+
+
+@pytest.mark.parametrize("event_type", ["occurrence", "exception"])
+def test_update_event_rejects_recurrence_on_series_instance(monkeypatch, event_type):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-25T23:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-25T23:15:00", "timeZone": "UTC"},
+            "attendees": [],
+            "isAllDay": False,
+            "type": event_type,
+            "originalStartTimeZone": "Asia/Manila",
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="occurrence-1",
+            start_datetime="2026-08-26T07:00:00",
+            end_datetime="2026-08-26T07:15:00",
+            timezone="Asia/Manila",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "series master" in result["message"]
+    graph_request.assert_called_once()
+
+
+def test_update_event_rejects_malformed_recurrence_before_patch(monkeypatch):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "UTC"},
+            "attendees": [],
+            "isAllDay": False,
+            "type": "singleInstance",
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="event-1",
+            start_datetime="2026-08-26T07:00:00",
+            end_datetime="2026-08-26T07:15:00",
+            timezone="UTC",
+            recurrence="FREQ=FORTNIGHTLY",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "FORTNIGHTLY" in result["message"]
+    graph_request.assert_called_once()
+    assert graph_request.call_args.args[:2] == ("GET", "/me/events/event-1")
+
+
+def test_update_series_master_recurrence_requires_exception_risk_acknowledgement(
+    monkeypatch,
+):
+    graph_request = Mock(
+        return_value={
+            "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "UTC"},
+            "attendees": [],
+            "isAllDay": False,
+            "type": "seriesMaster",
+        }
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="series-master-1",
+            start_datetime="2026-08-26T07:00:00",
+            end_datetime="2026-08-26T07:15:00",
+            timezone="UTC",
+            recurrence="FREQ=WEEKLY;COUNT=5",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "acknowledge_recurring_exception_risk=True" in result["message"]
+    graph_request.assert_called_once()
+
+
+def test_update_series_master_replaces_recurrence_after_risk_acknowledgement(
+    monkeypatch,
+):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "@odata.etag": 'W/"version-1"',
+                "start": {"dateTime": "2026-08-26T07:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-26T07:15:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": False,
+                "type": "seriesMaster",
+            },
+            {"id": "series-master-1"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="series-master-1",
+            start_datetime="2026-08-26T07:00:00",
+            end_datetime="2026-08-26T07:15:00",
+            timezone="UTC",
+            recurrence="FREQ=WEEKLY;BYDAY=WE;COUNT=5",
+            ignore_conflicts=True,
+            acknowledge_recurring_exception_risk=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    patch_call = graph_request.call_args_list[1]
+    assert patch_call.args[:2] == ("PATCH", "/me/events/series-master-1")
+    assert patch_call.kwargs["body"]["recurrence"]["range"] == {
+        "type": "numbered",
+        "startDate": "2026-08-26",
+        "numberOfOccurrences": 5,
+        "recurrenceTimeZone": "UTC",
+    }
+
+
+def test_update_all_day_recurrence_requires_explicit_window(monkeypatch):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="event-1",
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "both start_datetime and end_datetime" in result["message"]
+    graph_request.assert_not_called()
+
+
+def test_update_all_day_recurrence_uses_explicit_date_window(monkeypatch):
+    graph_request = Mock(
+        side_effect=[
+            {
+                "@odata.etag": 'W/"version-1"',
+                "start": {"dateTime": "2026-08-26T00:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-08-27T00:00:00", "timeZone": "UTC"},
+                "attendees": [],
+                "isAllDay": True,
+                "type": "singleInstance",
+            },
+            {"id": "event-1"},
+        ]
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_update_event(
+            event_id="event-1",
+            start_datetime="2026-08-26",
+            end_datetime="2026-08-27",
+            timezone="Pacific Standard Time",
+            recurrence="FREQ=DAILY;UNTIL=20260911",
+            ignore_conflicts=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    payload = graph_request.call_args_list[1].kwargs["body"]
+    assert payload["recurrence"]["range"] == {
+        "type": "endDate",
+        "startDate": "2026-08-26",
+        "endDate": "2026-09-11",
+        "recurrenceTimeZone": "Pacific Standard Time",
+    }

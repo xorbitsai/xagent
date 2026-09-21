@@ -340,6 +340,11 @@ def test_create_plan_transport_failure_is_indeterminate(monkeypatch):
     assert result["status"] == "indeterminate"
     assert result["retryable"] is False
     assert result["mutation_may_have_completed"] is True
+    assert result["reconciliation"] == {
+        "read_tool": "planner_list_plans",
+        "group_id": "group-1",
+        "match": {"title": "New plan"},
+    }
 
 
 def test_create_plan_unreadable_success_is_indeterminate(monkeypatch):
@@ -925,6 +930,10 @@ def test_assign_task_transport_failure_is_indeterminate(monkeypatch):
 
     assert result["status"] == "indeterminate"
     assert result["mutation_may_have_completed"] is True
+    assert result["reconciliation"] == {
+        "read_tool": "planner_get_task",
+        "task_id": "task-1",
+    }
 
 
 def test_unassign_task_rejects_non_list_user_ids():
@@ -1014,6 +1023,25 @@ def test_add_checklist_item_generates_uuid(monkeypatch):
 def test_add_checklist_item_requires_title():
     result = json.loads(planner.planner_add_checklist_item("task-1", "  "))
     assert result["status"] == "error"
+
+
+def test_add_checklist_item_indeterminate_keeps_reconciliation_id(monkeypatch):
+    item_id = "00000000-0000-0000-0000-000000000001"
+    monkeypatch.setattr(planner.uuid, "uuid4", Mock(return_value=item_id))
+    monkeypatch.setattr(
+        planner.requests, "request", Mock(side_effect=requests.Timeout("timed out"))
+    )
+
+    result = json.loads(
+        planner.planner_add_checklist_item("task-1", "Step 1", etag='W/"details-etag"')
+    )
+
+    assert result["status"] == "indeterminate"
+    assert result["reconciliation"] == {
+        "read_tool": "planner_get_task_details",
+        "task_id": "task-1",
+        "checklist_item_id": item_id,
+    }
 
 
 def test_set_checklist_item_checked(monkeypatch):

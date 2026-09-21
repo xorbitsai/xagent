@@ -88,6 +88,35 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
+def test_downgrade_reupgrade_preserves_owned_row_when_legacy_alias_exists(tmp_path):
+    """A legacy alias created while older admin validation was active must not
+    turn a supported rollback/re-upgrade into a startup failure. Keeping the
+    provenance-owned exact row is safer than deleting operator-owned alias data.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            connection.execute(
+                text(
+                    "INSERT INTO public_mcp_apps "
+                    "(app_id, name, transport, launch_config) VALUES "
+                    "(' planner ', 'Legacy alias', 'stdio', '{}')"
+                )
+            )
+            migration.downgrade()
+            assert _app_ids(connection) == {"planner", " planner "}
+            migration.upgrade()
+
+        assert _app_ids(connection) == {"planner", " planner "}
+        rows = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='planner'")
+        ).scalar_one()
+        assert rows == 1
+
+
 def test_seed_row_matches_registry(tmp_path):
     """The migration snapshot and the runtime registry must define the same
     planner row (the migration is a frozen copy; this catches drift)."""

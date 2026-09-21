@@ -91,8 +91,13 @@ def _conflict(message: str) -> str:
     )
 
 
-def _indeterminate(message: str) -> str:
+def _indeterminate(
+    message: str, *, reconciliation: dict[str, Any] | None = None
+) -> str:
     message = truncate_error_text(redact_sensitive_text(str(message)))
+    reconciliation_payload = (
+        {"reconciliation": reconciliation} if reconciliation is not None else {}
+    )
     return _bounded_json(
         (
             {
@@ -100,6 +105,13 @@ def _indeterminate(message: str) -> str:
                 "retryable": False,
                 "mutation_may_have_completed": True,
                 "message": message,
+                **reconciliation_payload,
+            },
+            {
+                "status": "indeterminate",
+                "retryable": False,
+                "mutation_may_have_completed": True,
+                **reconciliation_payload,
             },
             {"status": "indeterminate", "retryable": False},
             {"status": "indeterminate"},
@@ -542,7 +554,14 @@ def planner_create_plan(group_id: str, title: str) -> str:
         result = _graph_request("POST", "/planner/plans", body=body, mutation=True)
         return success_with_capped_dict("plan", _created_object(result, "plan"))
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={
+                "read_tool": "planner_list_plans",
+                "group_id": group_id,
+                "match": {"title": title},
+            },
+        )
     except Exception as e:
         logger.error("Error creating Planner plan for group %s: %s", group_id, e)
         return _error(str(e))
@@ -585,7 +604,14 @@ def planner_create_bucket(plan_id: str, name: str) -> str:
         result = _graph_request("POST", "/planner/buckets", body=body, mutation=True)
         return success_with_capped_dict("bucket", _created_object(result, "bucket"))
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={
+                "read_tool": "planner_list_buckets",
+                "plan_id": plan_id,
+                "match": {"name": name},
+            },
+        )
     except Exception as e:
         logger.error("Error creating Planner bucket in plan %s: %s", plan_id, e)
         return _error(str(e))
@@ -686,7 +712,17 @@ def planner_create_task(
         result = _graph_request("POST", "/planner/tasks", body=body, mutation=True)
         return success_with_capped_dict("task", _created_object(result, "task"))
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={
+                "read_tool": "planner_list_tasks",
+                "plan_id": plan_id,
+                "match": {
+                    "title": title,
+                    **({"bucketId": bucket_id} if bucket_id is not None else {}),
+                },
+            },
+        )
     except Exception as e:
         logger.error("Error creating Planner task in plan %s: %s", plan_id, e)
         return _error(str(e))
@@ -757,7 +793,10 @@ def planner_update_task(
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task updated successfully")
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={"read_tool": "planner_get_task", "task_id": task_id},
+        )
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -782,7 +821,10 @@ def planner_assign_task(
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task assigned successfully")
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={"read_tool": "planner_get_task", "task_id": task_id},
+        )
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -806,7 +848,10 @@ def planner_unassign_task(
         _etag_guarded_write(task_path, "PATCH", body=body, etag=etag)
         return _success(message="Task unassigned successfully")
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={"read_tool": "planner_get_task", "task_id": task_id},
+        )
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -822,7 +867,10 @@ def planner_delete_task(task_id: str, etag: str | None = None) -> str:
         _etag_guarded_write(task_path, "DELETE", etag=etag)
         return _success(message="Task deleted successfully")
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={"read_tool": "planner_get_task", "task_id": task_id},
+        )
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -859,7 +907,13 @@ def planner_update_task_description(
         )
         return _success(message="Task description updated successfully")
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={
+                "read_tool": "planner_get_task_details",
+                "task_id": task_id,
+            },
+        )
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -874,6 +928,7 @@ def planner_add_checklist_item(
     """Add a checklist item to a Planner task. Returns the new item's id
     (needed by planner_set_checklist_item_checked/planner_delete_checklist_item).
     etag is optional -- see planner_update_task_description."""
+    item_id: str | None = None
     try:
         title = title.strip()
         if not title:
@@ -892,7 +947,14 @@ def planner_add_checklist_item(
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(checklist_item_id=item_id)
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={
+                "read_tool": "planner_get_task_details",
+                "task_id": task_id,
+                "checklist_item_id": item_id,
+            },
+        )
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -920,7 +982,14 @@ def planner_set_checklist_item_checked(
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(message="Checklist item updated successfully")
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={
+                "read_tool": "planner_get_task_details",
+                "task_id": task_id,
+                "checklist_item_id": item_id,
+            },
+        )
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:
@@ -945,7 +1014,14 @@ def planner_delete_checklist_item(
         _etag_guarded_write(details_path, "PATCH", body=body, etag=etag)
         return _success(message="Checklist item deleted successfully")
     except _MutationOutcomeIndeterminate as e:
-        return _indeterminate(str(e))
+        return _indeterminate(
+            str(e),
+            reconciliation={
+                "read_tool": "planner_get_task_details",
+                "task_id": task_id,
+                "checklist_item_id": item_id,
+            },
+        )
     except _EtagConflictError as e:
         return _conflict(str(e))
     except Exception as e:

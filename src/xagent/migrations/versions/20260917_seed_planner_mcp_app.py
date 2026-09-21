@@ -71,6 +71,20 @@ def _has_provenance(launch_config: object) -> bool:
     ) == builtin_provenance_identity(BUILTIN_PROVENANCE)
 
 
+def _identity_collisions(bind: sa.engine.Connection) -> list[dict[str, object]]:
+    normalized_app_id = canonicalize_builtin_identity(APP_ID)
+    return [
+        dict(row)
+        for row in bind.execute(
+            sa.select(
+                PUBLIC_MCP_APPS_TABLE.c.app_id,
+                PUBLIC_MCP_APPS_TABLE.c.launch_config,
+            )
+        ).mappings()
+        if canonicalize_builtin_identity(row["app_id"]) == normalized_app_id
+    ]
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
@@ -84,23 +98,27 @@ def upgrade() -> None:
             "public_mcp_apps.launch_config is required for provenance"
         )
 
-    normalized_app_id = canonicalize_builtin_identity(APP_ID)
-    collisions = [
-        row
-        for row in bind.execute(
-            sa.select(
-                PUBLIC_MCP_APPS_TABLE.c.app_id,
-                PUBLIC_MCP_APPS_TABLE.c.launch_config,
-            )
-        ).mappings()
-        if canonicalize_builtin_identity(row["app_id"]) == normalized_app_id
-    ]
+    collisions = _identity_collisions(bind)
     if collisions:
-        if (
-            len(collisions) == 1
-            and collisions[0]["app_id"] == APP_ID
-            and _has_provenance(collisions[0]["launch_config"])
-        ):
+        owned_exact = next(
+            (
+                row
+                for row in collisions
+                if row["app_id"] == APP_ID and _has_provenance(row["launch_config"])
+            ),
+            None,
+        )
+        if owned_exact is not None:
+            aliases = sorted(
+                str(row["app_id"]) for row in collisions if row["app_id"] != APP_ID
+            )
+            if aliases:
+                logger.warning(
+                    "Preserving the provenance-owned Planner row despite "
+                    "legacy normalized app_id aliases %r; new aliases are "
+                    "rejected by the admin API",
+                    aliases,
+                )
             return
         if len(collisions) == 1 and collisions[0]["app_id"] == APP_ID:
             raise RuntimeError(
@@ -145,6 +163,19 @@ def downgrade() -> None:
         )
     ).scalar_one_or_none()
     if not _has_provenance(existing):
+        return
+    aliases = sorted(
+        str(row["app_id"])
+        for row in _identity_collisions(bind)
+        if row["app_id"] != APP_ID
+    )
+    if aliases:
+        logger.warning(
+            "Preserving the provenance-owned Planner row during downgrade "
+            "because legacy normalized app_id aliases %r would otherwise "
+            "block a later re-upgrade",
+            aliases,
+        )
         return
     bind.execute(
         sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)

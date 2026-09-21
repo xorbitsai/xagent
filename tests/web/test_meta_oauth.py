@@ -1231,6 +1231,15 @@ def test_bare_meta_login_skips_whatsapp_but_still_connects_instagram(
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.whatsapp"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+                # Match the provenance-owned row seeded in production. An
+                # unmarked app_id collision is intentionally treated as an
+                # operator-owned custom connector and must not inherit the
+                # builtin WhatsApp app-scoped OAuth policy.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "whatsapp",
+                    "version": 1,
+                },
             },
         )
     )

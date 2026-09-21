@@ -6,8 +6,8 @@ link to the builtin registry it protects: an app whose oauth_scopes need
 something the provider's own default_scopes don't grant, but that's missing
 from the set, fails silently -- a bare provider-level OAuth grant is treated
 as sufficient, the app reports "connected", and every scope-gated tool call
-then fails. This pins the recently added whatsapp, Planner, and SharePoint
-connectors, so a future edit can't silently drop any of them.
+then fails. This pins the recently added whatsapp, Planner, SharePoint, and
+Excel connectors, so a future edit can't silently drop any of them.
 
 Deliberately narrow: a fully general "every builtin oauth app whose scopes
 exceed its provider's default_scopes must be listed here" test does not hold
@@ -28,7 +28,16 @@ from xagent.web.mcp_apps import requires_app_scoped_oauth_grant
 # pinned here so a regression in any of them -- not just the newest connectors
 # -- is caught the same way.
 _EXPECTED_APP_SCOPED_APPS = frozenset(
-    {"facebook", "github", "myob", "meta-ads", "planner", "sharepoint", "whatsapp"}
+    {
+        "excel",
+        "facebook",
+        "github",
+        "myob",
+        "meta-ads",
+        "planner",
+        "sharepoint",
+        "whatsapp",
+    }
 )
 
 
@@ -81,3 +90,18 @@ def test_sharepoint_scopes_actually_exceed_the_microsoft_providers_default_scope
         "this test (and the set) should be updated together, not left to "
         "silently drift."
     )
+
+
+def test_excel_scopes_actually_exceed_the_microsoft_providers_default_scopes():
+    provider_default_scopes = {
+        row["provider_name"]: set(row.get("default_scopes") or [])
+        for row in get_builtin_oauth_provider_rows()
+    }
+    excel = next(
+        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "excel"
+    )
+
+    assert set(excel["oauth_scopes"]) - provider_default_scopes["microsoft"] == {
+        "Files.ReadWrite",
+        "offline_access",
+    }

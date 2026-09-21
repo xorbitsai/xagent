@@ -6,12 +6,13 @@ app-specific oauth_scopes (e.g. pages_read_user_content). Instagram's shared
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.web.api.mcp import _oauth_keys_for_app
+from xagent.web.api.mcp import _connected_oauth_server_for_app, _oauth_keys_for_app
 from xagent.web.mcp_apps import (
     requires_app_scoped_oauth_grant,
     restrict_to_app_scoped_oauth_grant,
@@ -31,6 +32,41 @@ def test_oauth_keys_for_instagram_still_includes_bare_meta_provider():
     keys = _oauth_keys_for_app(app)
     assert "instagram" in keys
     assert "meta" in keys
+
+
+def test_oauth_keys_for_excel_excludes_bare_microsoft_provider():
+    app = {"id": "excel", "provider": "microsoft"}
+    assert _oauth_keys_for_app(app) == ["excel"]
+
+
+def test_excel_connected_state_ignores_bare_microsoft_grant():
+    app = {"id": "excel", "name": "Excel", "provider": "microsoft"}
+    server = SimpleNamespace(
+        id=7,
+        name="Excel",
+        transport="oauth",
+        auth={"app_id": "excel", "provider": "microsoft"},
+    )
+    bare_account = SimpleNamespace(email="bare@example.com")
+
+    assert _connected_oauth_server_for_app(
+        app, {"excel": [server]}, {"microsoft": bare_account}
+    ) == (None, None)
+
+
+def test_excel_connected_state_uses_app_scoped_grant():
+    app = {"id": "excel", "name": "Excel", "provider": "microsoft"}
+    server = SimpleNamespace(
+        id=7,
+        name="Excel",
+        transport="oauth",
+        auth={"app_id": "excel", "provider": "microsoft"},
+    )
+    scoped_account = SimpleNamespace(email="excel@example.com")
+
+    assert _connected_oauth_server_for_app(
+        app, {"excel": [server]}, {"excel": scoped_account}
+    ) == (7, "excel@example.com")
 
 
 def test_restrict_to_app_scoped_oauth_grant_narrows_facebook():
@@ -135,6 +171,27 @@ def test_legacy_token_resolution_still_uses_bare_meta_grant_for_instagram(db_ses
     )
 
     assert resolution.access_token == "bare-meta-token"
+
+
+def test_legacy_token_resolution_ignores_bare_microsoft_grant_for_excel(db_session):
+    db_session.add(
+        UserOAuth(
+            user_id=1,
+            provider="microsoft",
+            access_token="bare-user-read-token",
+        )
+    )
+    db_session.commit()
+
+    cfg = WebToolConfig(db=None, request=None, db_factory=lambda: db_session, user_id=1)
+
+    resolution = asyncio.run(
+        cfg._resolve_legacy_oauth_access_token(
+            provider_name="microsoft", app_id="excel"
+        )
+    )
+
+    assert resolution.access_token is None
 
 
 def test_ordinary_token_resolution_ignores_actor_owned_grant(db_session):

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -669,6 +670,34 @@ def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
             shutil.rmtree(temp_dir)
         except OSError:
             pass
+
+
+def test_builtin_oauth_server_records_catalog_provenance() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    provenance = {"registry": "xagent", "app_id": "excel", "version": 1}
+    with Session(engine) as db:
+        _ensure_user_mcp_server(
+            db,
+            1,
+            {
+                "id": "excel",
+                "name": "Excel",
+                "description": "Connect to Excel.",
+                "provider": "microsoft",
+                "auth_type": "builtin_oauth",
+                "launch_config": {"builtin_provenance": provenance},
+            },
+        )
+        db.commit()
+
+        server = db.query(MCPServer).filter(MCPServer.name == "Excel").one()
+        assert server.auth == {
+            "app_id": "excel",
+            "provider": "microsoft",
+            "builtin_provenance": provenance,
+        }
+    engine.dispose()
 
 
 def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:

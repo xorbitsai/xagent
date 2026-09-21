@@ -73,8 +73,21 @@ from .models.public_mcp import PublicMCPApp
 # e.g. one created by connecting Outlook/Teams/OneDrive, could ever have
 # carried it), so a bare connect -- or a grant scoped to one of those other
 # Microsoft apps -- must never be treated as satisfying it.
+# excel: the shared microsoft provider's default scope is identity-only
+# (User.Read), while workbook reads and writes require Files.ReadWrite from
+# the Excel app row. A bare microsoft grant may continue serving other
+# Microsoft connectors, but it must neither provision nor satisfy Excel.
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
-    {"facebook", "github", "myob", "meta-ads", "planner", "sharepoint", "whatsapp"}
+    {
+        "excel",
+        "facebook",
+        "github",
+        "myob",
+        "meta-ads",
+        "planner",
+        "sharepoint",
+        "whatsapp",
+    }
 )
 
 

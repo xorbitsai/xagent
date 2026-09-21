@@ -311,38 +311,51 @@ def _summarize_project(project: dict[str, Any]) -> dict[str, Any]:
 
 def _fit_raw_list_page(
     key: str,
-    items: list[dict[str, Any]],
+    raw_items: list[Any],
     offset: int,
     base_truncated: bool,
     base_next_start_at: int | None,
     max_output_length: int,
 ) -> str | None:
-    """Build {key: items[:count], truncated, next_start_at} at the
-    largest count (halving from len(items)) that fits max_output_length,
+    """Build {key: kept[:count], truncated, next_start_at} at the
+    largest count (halving from len(kept)) that fits max_output_length,
     for a raw (unsummarized) list page -- the summarized path's items
     are small enough per-entry that this has never been a practical
     concern, but a raw one (avatarUrls, permissions, and other metadata
     the summary drops) can be large enough to need the same
     halve-until-it-fits treatment _fit_comments_page uses.
 
-    If the count has to shrink below len(items), truncated/next_start_at
-    are recomputed from the actual included count (offset + count) --
-    not base_next_start_at, which assumed the whole raw page fit -- so a
-    caller following it resumes exactly where this page's cut left off,
-    neither skipping nor repeating an item. Returns None if not even a
-    count of 0 fits.
+    raw_items is the UNFILTERED raw page (may contain non-dict entries
+    from a malformed response) -- filtered here, pairing each kept item
+    with its RAW index, rather than by the caller pre-filtering: if the
+    count has to shrink, next_start_at is computed from the actual raw
+    position of the last item kept (mirroring _fit_comments_page's
+    `kept` pattern), not from `offset + count`, which is only correct
+    when zero entries were filtered out ahead of the cut -- otherwise a
+    caller resuming from it would either skip an already-filtered-past
+    entry or re-fetch (duplicate) one already delivered. At count=0,
+    this points one past the first kept item's raw index, not at
+    `offset` itself -- unlike a naive `offset + count`, which would
+    equal the caller's own start_at and make a caller mechanically
+    following next_start_at loop on this same page forever.
     """
+    kept: list[tuple[int, dict[str, Any]]] = [
+        (index, item) for index, item in enumerate(raw_items) if isinstance(item, dict)
+    ]
+
+    def next_start_at_for(count: int) -> int | None:
+        if count == len(kept):
+            return base_next_start_at
+        return offset + kept[max(count - 1, 0)][0] + 1
 
     def response_for(count: int) -> str:
-        if count == len(items):
-            truncated, next_start_at = base_truncated, base_next_start_at
-        else:
-            truncated, next_start_at = True, offset + count
+        truncated = base_truncated if count == len(kept) else True
+        items = [item for _, item in kept[:count]]
         return _success(
-            **{key: items[:count]}, truncated=truncated, next_start_at=next_start_at
+            **{key: items}, truncated=truncated, next_start_at=next_start_at_for(count)
         )
 
-    count = len(items)
+    count = len(kept)
     response = response_for(count)
     while len(response) > max_output_length and count > 0:
         count //= 2
@@ -397,10 +410,9 @@ def jira_list_projects(
         truncated = bool(raw_projects) and not result.get("isLast", True)
         next_start_at = (offset + len(raw_projects)) if truncated else None
         if raw_fields:
-            projects = [p for p in raw_projects if isinstance(p, dict)]
             response = _fit_raw_list_page(
                 "projects",
-                projects,
+                raw_projects,
                 offset,
                 truncated,
                 next_start_at,
@@ -1206,13 +1218,18 @@ def _fit_comments_page(
     than the fixed default assumed, and preserves its content instead
     of losing it. raw_fields skips this refinement (a raw comment's
     body is Jira's own ADF object, not the plain string _cap_text_field
-    shrinks) and falls straight to the bounded-error case below when a
+    shrinks) and falls straight to the empty-page fallback below when a
     single raw comment doesn't fit.
 
-    Returns None if not even a single comment (with an empty body, in
-    the non-raw case) fits -- the caller should treat that as a bounded
-    error, the same way jira_search_issues does when its minimal page
-    still doesn't fit.
+    If not even a body-length-zero single comment fits (or raw_fields,
+    which never attempts that retry), this falls back to a genuinely
+    empty page (0 comments, next_start_at skipping past the one that
+    couldn't fit) -- an empty envelope is smaller than even a
+    body-length-zero single comment's id/author/visibility/jsd_public/
+    timestamps overhead, so there's a real budget range where this
+    still succeeds. Returns None only if not even that empty page fits
+    -- the caller should treat that as a bounded error, the same way
+    jira_search_issues does when its minimal page still doesn't fit.
 
     next_start_at is computed from the RAW position of (or immediately
     after) the last comment actually kept -- not from the filtered/kept
@@ -1279,43 +1296,60 @@ def _fit_comments_page(
     if len(response) <= max_output_length:
         return response
 
-    if not kept or raw_fields:
-        # raw_fields: a raw comment's body is Jira's own ADF object, not
-        # the plain string _cap_text_field/_summarize_comment's
-        # body_max_chars shrinks -- there's no smaller-cap retry to
-        # attempt here, so a single unfittable raw comment goes straight
-        # to the bounded-error case below.
-        return None
+    if kept and not raw_fields:
+        # A single comment doesn't fit even at _COMMENT_BODY_MAX_CHARS.
+        # Retry the SAME comment (not a different one -- next_start_at_for
+        # must stay anchored to this raw index either way) with a smaller
+        # body cap. Binary search is valid here because _truncate's slice
+        # is a prefix of the original body, and a longer prefix can only
+        # produce an equal or longer JSON-escaped output, never a shorter
+        # one -- so response length is monotonically non-decreasing in the
+        # cap.
+        #
+        # Flattening the ADF body is the expensive part of
+        # _summarize_comment (a full tree walk), and is identical across
+        # every candidate cap tried below -- computed once here rather
+        # than inside response_at_cap, which would otherwise re-walk the
+        # same ADF tree on every one of the search's O(log
+        # _COMMENT_BODY_MAX_CHARS) iterations. `template` supplies the
+        # other, cap-independent fields (author/visibility/jsd_public/
+        # timestamps) without recomputing them either.
+        raw_comment = raw_comments[kept[0][0]]
+        flattened_body = _flatten_adf(raw_comment.get("body"))
+        template = kept[0][1]
 
-    # A single comment doesn't fit even at _COMMENT_BODY_MAX_CHARS.
-    # Retry the SAME comment (not a different one -- next_start_at_for
-    # must stay anchored to this raw index either way) with a smaller
-    # body cap. Binary search is valid here for the same reason it is
-    # in _bounded_search_error: _truncate's slice is a prefix of the
-    # original body, and a longer prefix can only produce an equal or
-    # longer JSON-escaped output, never a shorter one -- so response
-    # length is monotonically non-decreasing in the cap.
-    raw_comment = raw_comments[kept[0][0]]
+        def response_at_cap(body_max_chars: int) -> str:
+            comment = dict(template)
+            comment["body"] = flattened_body
+            comment["body_truncated"] = _cap_text_field(comment, "body", body_max_chars)
+            return _build_comments_response([comment], total, next_start_at_for(1))
 
-    def response_at_cap(body_max_chars: int) -> str:
-        comment = _summarize_comment(raw_comment, body_max_chars=body_max_chars)
-        return _build_comments_response([comment], total, next_start_at_for(1))
+        lo, hi = 0, _COMMENT_BODY_MAX_CHARS
+        best: str | None = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = response_at_cap(mid)
+            if len(candidate) <= max_output_length:
+                best = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best is not None:
+            return best
 
-    lo, hi = 0, _COMMENT_BODY_MAX_CHARS
-    best: str | None = None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        candidate = response_at_cap(mid)
-        if len(candidate) <= max_output_length:
-            best = candidate
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    if best is not None:
-        return best
-
-    # Not even a body-length-zero single comment fits -- no comment
-    # from this raw page can be delivered at all.
+    # Not even a body-length-zero single comment fits (or raw_fields,
+    # which has no smaller-cap retry to attempt at all -- a raw
+    # comment's body is Jira's own ADF object, not the plain string
+    # _cap_text_field/_summarize_comment's body_max_chars shrinks).
+    # Fall back to a genuinely empty page (0 comments, next_start_at
+    # skipping past the one that couldn't fit) before giving up
+    # entirely -- an empty envelope is smaller than even a body-length-
+    # zero single comment (which still carries id/author/visibility/
+    # jsd_public/timestamps), so there's a real budget range where this
+    # succeeds and a hard error would otherwise have been wrong.
+    empty_response = response_for(0)
+    if len(empty_response) <= max_output_length:
+        return empty_response
     return None
 
 

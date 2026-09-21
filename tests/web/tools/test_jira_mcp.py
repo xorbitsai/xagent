@@ -473,6 +473,63 @@ def test_list_projects_raw_fields_shrinks_page_to_fit_and_advances_correctly(
     assert result["next_start_at"] == len(result["projects"])
 
 
+def test_list_projects_raw_fields_skips_a_project_too_big_to_fit_even_alone(
+    monkeypatch,
+):
+    # A single raw project too large to fit at all: the shrink loop
+    # bottoms out at count=0, which must still advance next_start_at
+    # past the unfittable project (never equal to the caller's own
+    # start_at=0), or a caller mechanically following it would refetch
+    # start_at=0 forever.
+    huge_project = {"id": "1", "key": "P1", "blob": "x" * 5000}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"values": [huge_project], "isLast": True}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 500)
+
+    result = json.loads(jira.jira_list_projects(raw_fields=True))
+
+    assert result["status"] == "success"
+    assert result["projects"] == []
+    assert result["truncated"] is True
+    assert result["next_start_at"] == 1
+    assert result["next_start_at"] != 0
+
+
+def test_list_projects_raw_fields_shrink_advances_from_the_raw_index(monkeypatch):
+    # A malformed entry precedes two real projects, and the page must
+    # shrink to fit -- next_start_at must be computed from the KEPT
+    # project's actual raw position (2, after the malformed entry at
+    # raw index 0 and the kept project at raw index 1), not from the
+    # filtered count (1), which would point at the kept project's own
+    # position and make a caller refetch (duplicate) it.
+    projects = [
+        "not-a-dict",
+        {"id": "1", "key": "P1", "name": "x" * 300},
+        {"id": "2", "key": "P2", "name": "y" * 300},
+    ]
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"values": projects, "isLast": True}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 500)
+
+    result = json.loads(jira.jira_list_projects(raw_fields=True))
+
+    assert result["status"] == "success"
+    assert len(result["projects"]) == 1
+    assert result["projects"][0]["id"] == "1"
+    assert result["next_start_at"] == 2
+    assert result["next_start_at"] != 1
+
+
 def test_list_projects_next_start_at_counts_raw_page_not_filtered(monkeypatch):
     # One malformed (non-dict) entry alongside two real projects. If
     # next_start_at were computed from the filtered `projects` list (2)
@@ -1616,11 +1673,13 @@ def test_list_comments_raw_fields_shrinks_page_to_fit_and_advances_correctly(
     assert result["next_start_at"] == len(result["comments"])
 
 
-def test_list_comments_raw_fields_errors_on_an_unfittable_single_comment(monkeypatch):
+def test_list_comments_raw_fields_skips_an_unfittable_single_comment(monkeypatch):
     # A raw comment's body is an ADF object, not a plain string
     # _cap_text_field can shrink -- unlike the summarized path, a
-    # single unfittable raw comment can't be shrunk further, so this
-    # must be the bounded-error case, not a silently-skipped page.
+    # single unfittable raw comment can't be shrunk further, so it
+    # falls back to a genuinely empty page (smaller than even a
+    # body-length-zero comment envelope) rather than erroring, with
+    # next_start_at skipping past the comment that couldn't fit.
     raw_comment = {"id": "1", "body": {"type": "doc", "content": "x" * 5000}}
     mock_request = Mock(
         side_effect=[
@@ -1630,6 +1689,26 @@ def test_list_comments_raw_fields_errors_on_an_unfittable_single_comment(monkeyp
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 300)
+
+    result = json.loads(jira.jira_list_comments("ENG-1", raw_fields=True))
+
+    assert result["status"] == "success"
+    assert result["comments"] == []
+    assert result["next_start_at"] == 1
+    assert result["next_start_at"] != 0
+
+
+def test_list_comments_raw_fields_errors_when_not_even_an_empty_page_fits(monkeypatch):
+    raw_comment = {"id": "1", "body": {"type": "doc", "content": "x" * 5000}}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"comments": [raw_comment], "total": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    empty_page_size = len(jira._build_comments_response([], 1, 1))
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: empty_page_size - 1)
 
     result = json.loads(jira.jira_list_comments("ENG-1", raw_fields=True))
 
@@ -1736,14 +1815,15 @@ def test_list_comments_shrinks_a_single_oversized_comment_instead_of_dropping_it
     assert result["next_start_at"] is None  # this WAS the whole (one-comment) page
 
 
-def test_list_comments_returns_error_when_not_even_an_empty_bodied_comment_fits(
+def test_list_comments_falls_back_to_an_empty_page_when_single_comment_unfittable(
     monkeypatch,
 ):
-    # A budget so small that not even a single comment with its body
-    # shrunk to nothing fits at all -- no comment from this raw page can
-    # be delivered, so this must be the hard error case, not a silent
-    # "success" with the comment skipped and unrecoverable via
-    # next_start_at.
+    # A budget too small for even a body-length-zero single comment, but
+    # big enough for a genuinely empty page -- a real budget range where
+    # the empty-page fallback (smaller than any single comment's
+    # id/author/visibility/jsd_public/timestamps overhead) succeeds
+    # rather than erroring, with next_start_at skipping past the
+    # comment that couldn't fit.
     raw_comment = {"id": "1", "body": "x" * 50}
     mock_request = Mock(
         side_effect=[
@@ -1754,6 +1834,26 @@ def test_list_comments_returns_error_when_not_even_an_empty_bodied_comment_fits(
     monkeypatch.setattr(jira.requests, "request", mock_request)
     empty_page_size = len(jira._build_comments_response([], 1, 1))
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: empty_page_size + 5)
+
+    result = json.loads(jira.jira_list_comments("ENG-1"))
+
+    assert result["status"] == "success"
+    assert result["comments"] == []
+    assert result["next_start_at"] == 1
+    assert result["next_start_at"] != 0
+
+
+def test_list_comments_returns_error_when_not_even_an_empty_page_fits(monkeypatch):
+    raw_comment = {"id": "1", "body": "x" * 50}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"comments": [raw_comment], "total": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    empty_page_size = len(jira._build_comments_response([], 1, 1))
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: empty_page_size - 1)
 
     result = json.loads(jira.jira_list_comments("ENG-1"))
 
@@ -1782,17 +1882,35 @@ def test_fit_comments_page_shrinks_a_single_unfittable_comment():
     assert result["next_start_at"] == offset + len(raw_comments)
 
 
-def test_fit_comments_page_errors_when_not_even_an_empty_bodied_comment_fits():
-    # Mirrors the size-too-small-for-anything case above but calls
-    # _fit_comments_page directly: returns None (the caller's cue to
-    # return a bounded error) rather than skipping the comment via
-    # next_start_at, since retrying could never succeed here either.
+def test_fit_comments_page_falls_back_to_empty_when_unfittable_even_shrunk():
+    # Mirrors the empty-page-fallback case above but calls
+    # _fit_comments_page directly: a budget too small for even a
+    # body-length-zero single comment still fits a genuinely empty
+    # page, so this returns a valid (non-None) success response with
+    # next_start_at skipping past the comment that couldn't fit --
+    # not None (the caller's cue for a bounded error).
     raw_comments = ["not-a-dict", {"id": "1", "body": "x" * 50}]
     offset = 10
     empty_page_size = len(jira._build_comments_response([], 5, offset + 2))
 
     response = jira._fit_comments_page(
         raw_comments, offset, 5, False, empty_page_size + 5
+    )
+
+    assert response is not None
+    result = json.loads(response)
+    assert result["comments"] == []
+    assert result["next_start_at"] == offset + 2
+    assert result["next_start_at"] != offset
+
+
+def test_fit_comments_page_returns_none_when_not_even_an_empty_page_fits():
+    raw_comments = ["not-a-dict", {"id": "1", "body": "x" * 50}]
+    offset = 10
+    empty_page_size = len(jira._build_comments_response([], 5, offset + 2))
+
+    response = jira._fit_comments_page(
+        raw_comments, offset, 5, False, empty_page_size - 1
     )
 
     assert response is None

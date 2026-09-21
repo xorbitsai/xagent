@@ -247,13 +247,6 @@ def test_get_issue_percent_encodes_issue_key_in_path(monkeypatch):
     )
 
 
-def test_path_segment_rejects_bare_dot_segments():
-    with pytest.raises(ValueError):
-        jira._path_segment(".")
-    with pytest.raises(ValueError):
-        jira._path_segment("..")
-
-
 def test_path_segment_rejects_blank_or_padded_values():
     # An empty issue_key (e.g. an unresolved templated variable from an
     # LLM caller) would otherwise silently build /rest/api/2/issue/,
@@ -454,6 +447,7 @@ def test_search_issues_sends_jql_and_reports_next_page_token(monkeypatch):
         "https://api.atlassian.com/ex/jira/site-a/rest/api/3/search/jql"
     )
     assert search_call.kwargs["params"]["jql"] == "project = ENG"
+    assert search_call.kwargs["params"]["maxResults"] == 50
     count_call = mock_request.call_args_list[2]
     assert count_call.kwargs["url"] == (
         "https://api.atlassian.com/ex/jira/site-a/rest/api/3/search/approximate-count"

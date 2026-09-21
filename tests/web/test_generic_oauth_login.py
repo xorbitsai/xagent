@@ -837,6 +837,32 @@ def test_bare_login_for_unrestricted_provider_still_proceeds(db_session):
     assert resp.status_code == 307
 
 
+def test_planner_catalog_login_requests_tasks_scope(db_session):
+    db, user = db_session
+    token = _token_for(user)
+    planner = get_builtin_public_mcp_app("planner")
+    assert planner is not None
+    db.add(PublicMCPApp(**planner))
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+    )
+    response = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id="planner",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    query = parse_qs(urlparse(_location(response)).query)
+    assert set(query["scope"][0].split()) == {"Tasks.ReadWrite", "User.Read"}
+
+
 def test_excel_login_requests_refresh_permission(db_session):
     db, user = db_session
     token = _token_for(user)

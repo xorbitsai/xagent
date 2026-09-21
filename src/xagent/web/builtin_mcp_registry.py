@@ -733,6 +733,27 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "planner",
+            "name": "Planner",
+            "description": "Connect a Microsoft 365 work or school account to manage basic Planner plans, buckets, and tasks, including checklists and assignments. Personal Microsoft accounts and Premium plans are not supported.",
+            "icon": "https://www.google.com/s2/favicons?domain=tasks.office.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "microsoft",
+            "category": "Productivity",
+            "oauth_scopes": ["Tasks.ReadWrite"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.planner"],
+                "env_mapping": {"AUTH_TOKEN": "access_token"},
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "planner",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "powerpoint",
             "name": "PowerPoint",
             "description": "Connect to PowerPoint to read, create, and edit presentations stored on OneDrive or SharePoint.",
@@ -1753,6 +1774,20 @@ def is_builtin_public_mcp_app(app_id: str) -> bool:
     return get_builtin_public_mcp_app(app_id) is not None
 
 
+def is_reserved_builtin_public_mcp_app_id(app_id: str) -> bool:
+    """Whether an ID collides with a built-in after identity normalization.
+
+    Persisted lookups remain exact so an existing operator-owned row cannot be
+    silently reinterpreted. New rows use this stricter check to prevent a
+    case/whitespace alias from surviving a downgrade and blocking a later seed.
+    """
+    identity = canonicalize_builtin_identity(app_id)
+    return any(
+        canonicalize_builtin_identity(row["app_id"]) == identity
+        for row in get_builtin_public_mcp_app_rows()
+    )
+
+
 def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     row = get_builtin_public_mcp_app(app_id)
     if row is None:
@@ -1987,6 +2022,10 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
         protected_server_identities = (
             ("shopify", "Shopify", "shopify"),
             ("excel", "Excel", "Excel"),
+            ("whatsapp", "WhatsApp Business", "WhatsApp Business"),
+            ("planner", "Planner", "Planner"),
+            ("sharepoint", "SharePoint", "SharePoint"),
+            ("powerpoint", "PowerPoint", "PowerPoint"),
         )
         builtin_app_ids = {row["app_id"] for row in builtin_app_rows}
         for app_id, display_name, official_server_name in protected_server_identities:

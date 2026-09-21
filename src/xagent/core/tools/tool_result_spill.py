@@ -1,11 +1,12 @@
 """Spill oversized tool results to a workspace file instead of truncating them.
 
 This module is the single owner of the tool-result-spill mechanism: the two
-path primitives shared by the writer, the engine's registration gate, and the
-read tool (``normalize_spilled_relative_path`` / ``resolve_spilled_under``),
-plus the constants that describe the on-disk and in-context contract. Later
-stages in this same module add the walk/write path and the read-side
-helpers; nothing here depends on them.
+path primitives written to be shared by the writer, an engine registration
+gate and the read tool (``normalize_spilled_relative_path`` /
+``resolve_spilled_under``), plus the constants that describe the on-disk and
+in-context contract. Later stages in this same module add the walk/write path
+and the read-side helpers; nothing here depends on them. The engine side is
+not wired up yet: outside this module and its tests, nothing calls in.
 """
 
 from __future__ import annotations
@@ -29,8 +30,17 @@ from .user_interaction import tool_result_waits_for_user
 logger = logging.getLogger(__name__)
 
 SPILL_DIR_NAME = "tool-results"
+# The workspace subdirectory the spill directory sits in. It is the same
+# name core/workspace.py gives TaskWorkspace.output_dir, and the same one
+# normalize_spilled_relative_path accepts as an optional prefix.
+SPILL_WORKSPACE_OUTPUT_DIR_NAME = "output"
 SPILL_RESERVED_RESULT_KEY = "_xagent_spilled_results"
 SPILL_PLACEHOLDER_TEXT = "[large result stored by the engine; see the notice below]"
+SPILL_UNAVAILABLE_NOTICE = (
+    "[A large value in this result was stored in a workspace file that is no "
+    "longer available. Treat it as unavailable and do not reconstruct its "
+    "contents.]"
+)
 # What the placeholder costs inside the serialized result, which is two
 # characters more than the text itself: it is a string, so encoding it adds
 # the two quotes. That is the number a value has to beat before replacing
@@ -319,6 +329,48 @@ def resolve_spilled_under(
         # instead of a generic framework error.
         return None
     return resolved
+
+
+def spill_dir_for_workspace(workspace_dir: str | Path) -> str:
+    """This workspace's spill directory, as the plain string SpillTarget holds.
+
+    The one place the layout is built. Nothing in this repository calls it
+    yet; it is written for the three callers that will need the same
+    directory from three different starting points -- the tool factory
+    holds a workspace object, the execution context holds only a workspace
+    path string, and the read tool holds a workspace object again -- each
+    of which would otherwise join the parts itself. A directory that three
+    callers spell separately is a directory that moves in two of the three
+    places.
+
+    Takes the workspace root rather than its output directory so the whole
+    relative layout lives here, and returns a str rather than a Path
+    because that is what SpillTarget and resolve_spilled_under take.
+
+    Raises ValueError for a workspace_dir that is not an absolute path. Any
+    relative spelling -- "", ".", "./", "././", "..", "output" -- resolves
+    against the process's current working directory, not the workspace, and
+    the join still produces a non-empty result such as "output/tool-results"
+    or "../output/tool-results". A caller's own "no spill directory" guard
+    checks truthiness, so it would pass a relative result on and spill files
+    would be written and resolved wherever the process happens to be
+    running. This does not narrow what a real caller can pass: the only
+    producer of a workspace path in this repository is TaskWorkspace, which
+    resolves it once at construction time
+    (``self.base_dir = Path(base_dir).expanduser().resolve()``), and the
+    execution context's workspace-path string is a copy of that value. The
+    check is here because that string also travels through a persisted
+    checkpoint and comes back unvalidated; a relative one arriving that way
+    should fail loudly rather than silently retarget the spill directory.
+    """
+    path = Path(workspace_dir)
+    if not path.is_absolute():
+        raise ValueError(
+            f"workspace_dir must be an absolute path, not {workspace_dir!r}: "
+            "a relative one would put the spill directory wherever the process "
+            "happens to be running"
+        )
+    return str(path / SPILL_WORKSPACE_OUTPUT_DIR_NAME / SPILL_DIR_NAME)
 
 
 def _spill_json_default(value: Any) -> str:
@@ -1203,8 +1255,8 @@ def spill_oversized_values(
     oversized -- or a new object built by copying only the containers on
     each spilled path (see _copy_and_set). Returns
     (possibly-new result, report records) -- the records are not yet
-    validated against a registry; that happens at the engine's four gates,
-    not here.
+    validated against a registry; that is for the engine side to do when it
+    registers them, not here.
 
     No key of `result` is ever dropped. A value is replaced by the
     placeholder or left as it was; nothing disappears from the returned
@@ -1278,12 +1330,102 @@ def spill_oversized_values(
             records.append(record)
             new_result = _copy_and_set(new_result, path, SPILL_PLACEHOLDER_TEXT)
         if records:
-            # The report travels with the result itself: add_tool_result's
-            # registration gate reads it from the result dict the wrapper
-            # returns, the same way it does for the whole-root tier.
+            # The report travels with the result itself, so the engine side
+            # can read it back off the result dict the wrapper returns
+            # rather than being handed it separately -- the same way it
+            # will for the whole-root tier.
             new_result = {**new_result, SPILL_RESERVED_RESULT_KEY: records}
         return new_result, records
     return _second_tier_result(result, target, tool_name, budget)
+
+
+def _spill_record_shape_failure(record: Any) -> str | None:
+    """Name the first shape rule ``record`` breaks, or None if it breaks none.
+
+    The answer is drawn from this function's own fixed wording and never
+    from the record itself. A record that fails here is one whose fields
+    are not the writer's, so every string it carries -- its keys as much as
+    its values -- is text a tool chose, and none of it is safe to hand to a
+    log line.
+    """
+    if not isinstance(record, dict):
+        return "record is not a dict"
+    relative_path = record.get("relative_path")
+    # The isinstance check is not redundant with the line below it:
+    # normalize_spilled_relative_path answers None for a value that is not
+    # a string, and a relative_path of None would then equal its own
+    # normalization.
+    if not isinstance(relative_path, str):
+        return "relative_path is not a string"
+    if normalize_spilled_relative_path(relative_path) != relative_path:
+        return "relative_path is not a canonical spilled-result path"
+    if record.get("kind") not in ("array", "object", "text"):
+        return "kind is not array, object or text"
+    for key in ("item_count", "original_chars"):
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"{key} is not a non-negative int"
+    if not isinstance(record.get("value_path"), str):
+        return "value_path is not a string"
+    record_fields = record.get("record_fields")
+    if record_fields is not None and not (
+        isinstance(record_fields, list)
+        and all(isinstance(item, str) for item in record_fields)
+    ):
+        return "record_fields is not a list of strings"
+    truncated_after_items = record.get("truncated_after_items")
+    if truncated_after_items is not None and (
+        not isinstance(truncated_after_items, int)
+        or isinstance(truncated_after_items, bool)
+        or truncated_after_items < 0
+    ):
+        return "truncated_after_items is not a non-negative int"
+    return None
+
+
+def spill_record_shape_is_valid(record: Any) -> bool:
+    """Is this a well-formed report record, regardless of truth.
+
+    Checks the field shape a genuine record has -- string types,
+    non-negative ints, the three-value kind enum -- and that relative_path
+    is spelled the way the writer spells it. It says nothing about whether
+    the file actually exists; that is a separate check, and it belongs to a
+    caller that has a spill directory to look in, which this function does
+    not take.
+
+    Extra keys are tolerated and the two optional fields (record_fields,
+    truncated_after_items) may be absent rather than None, because a reader
+    of a record takes the keys it needs by name: a record written by an
+    older or a newer build stays usable as long as every field it does
+    carry is the right shape.
+
+    relative_path is held to normalize_spilled_relative_path, which accepts
+    only "tool-results/<name>" with <name> drawn from [A-Za-z0-9_-] plus a
+    .json or .txt suffix. render_spill_notice writes that field into a
+    notice line verbatim, with no JSON encoding around it, so anything
+    else -- a forged clause that stays on one line and reads as trailing
+    engine text, an ANSI escape, a bidi override, or a line break that ends
+    the entry early and starts an entry of its own -- must not reach the
+    renderer. That one rule replaces the earlier line-break rule rather
+    than joining it: the normalizer's output is built from a fixed
+    directory name and a filename matching that character class, so a value
+    equal to its own normalization cannot hold a line boundary in the first
+    place. value_path and record_fields carry the same tool-supplied text,
+    but render_spill_notice always passes them through _json_data first,
+    which escapes a line break rather than emitting it, so this gate leaves
+    them to the type checks below.
+
+    No caller in this repository uses it yet. It is written for two: an
+    engine registration gate that decides which records to persist, and
+    render_spill_notice, which must not interpolate an unvalidated
+    relative_path, item_count or original_chars into text the model reads.
+
+    The rules themselves live in _spill_record_shape_failure, which answers
+    which rule was broken rather than only that one was, so a caller that
+    drops a record can say so in its log line. This is the answer for a
+    caller that only needs to decide.
+    """
+    return _spill_record_shape_failure(record) is None
 
 
 SPILL_OBSERVATION_NOTICE_MAX_CHARS = 1_536
@@ -1339,19 +1481,25 @@ def _spill_record_fields_clause(kind: str, record_fields: Any) -> str:
 def _render_spill_record_line(record: dict[str, Any]) -> str:
     """Render one report record as a notice line.
 
-    Renders from whatever the record claims -- a record reaching here has
-    already passed the engine's four registration gates (or, for the
-    observation notice's own tool result, was just built by this run's own
-    writer). relative_path is engine-generated and gate-checked before it
-    reaches here (the second gate's path-syntax regex already rejects a
-    newline in it), so only the location and field names below are tool
-    data: they are copied verbatim from the tool's own data and never
-    filtered through a character whitelist; instead they are quoted as JSON
-    string values (via _json_data), so an embedded newline, quote, or line
-    separator is escaped rather than able to break out of the line or forge
-    a second entry. The three length caps (field name, value_path, field
-    list) are re-applied here at render time rather than trusted from a
-    record that may have been replayed from an older checkpoint.
+    Renders from whatever the record claims. Its one call site is
+    render_spill_notice, which puts every record through the same rules
+    spill_record_shape_is_valid answers for -- one at a time, so it can
+    name the one that failed -- before rendering it. The relative_path that
+    reaches here is therefore already spelled the way
+    normalize_spilled_relative_path spells it -- that is what makes it safe
+    to write into the notice unescaped, and it also leaves this function's
+    own .get(key, default) fallbacks unreachable, defensive rather than
+    load-bearing. The location and field names below are tool data too,
+    copied verbatim from the tool's own data and never filtered through a
+    character whitelist; instead they are quoted as JSON string values (via
+    _json_data), so an embedded newline, quote, or line separator is
+    escaped rather than able to break out of the line or forge a second
+    entry. The three length caps (field name, value_path, field list) are
+    re-applied here at render time rather than trusted from a record that
+    may have been replayed from an older checkpoint, and the path cap is
+    applied for the same reason: a canonical path is 13 characters of
+    directory plus a name of up to 117, so it can still be longer than the
+    notice gives one entry's path.
     """
     relative_path = str(record.get("relative_path", ""))[:SPILL_NOTICE_PATH_MAX_CHARS]
     value_path = _elide_value_path(str(record.get("value_path", "")))
@@ -1392,6 +1540,12 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
     dict is a different case and is dropped with a warning instead, since
     a record list can be replayed from a checkpoint an older build wrote
     and this renderer's own callers have a result to return.
+
+    A record whose field shape is not the writer's is dropped the same way
+    and for the same reason: this renderer interpolates a record's own
+    fields into text the model reads, so both the field shape and the
+    spelling of relative_path are checked here, by this function, rather
+    than assumed to have been checked by whoever produced the list.
     """
     if style not in ("observation", "compaction"):
         raise ValueError(
@@ -1416,6 +1570,33 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
             logger.warning(
                 "Ignoring a spilled-result record that is not a dict: %r",
                 type(record),
+            )
+            continue
+        shape_failure = _spill_record_shape_failure(record)
+        if shape_failure is not None:
+            # The two checks stay apart on purpose. The one above answers
+            # "is this a record at all"; this one answers "is every field
+            # the shape the writer produces" -- including relative_path
+            # being spelled the way the writer spells it, since this
+            # renderer writes that field into the notice unescaped, so a
+            # line break, a forged clause of its own, or an escape sequence
+            # inside it would reach the model as engine text. Whether the
+            # file behind that path still exists is a question this
+            # function cannot ask: it takes no directory to look in. A
+            # record can arrive here unvalidated in two real ways: a
+            # checkpoint written by an older build, and a caller that
+            # renders before registering.
+            #
+            # The dropped record's own strings stay out of this line: they
+            # are the tool's text, and the operator needs to know which
+            # rule was broken, not what the tool wrote. The rule's name and
+            # the number of keys are both this engine's own words.
+            logger.warning(
+                "Ignoring a spilled-result record whose field shape is not "
+                "the one the spill writer produces: %s; the record carries "
+                "%d keys.",
+                shape_failure,
+                len(record),
             )
             continue
         path = record.get("relative_path")

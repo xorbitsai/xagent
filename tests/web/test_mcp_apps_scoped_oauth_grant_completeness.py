@@ -7,7 +7,8 @@ something the provider's own default_scopes don't grant, but that's missing
 from the set, fails silently -- a bare provider-level OAuth grant is treated
 as sufficient, the app reports "connected", and every scope-gated tool call
 then fails. This pins every connector currently documented by the policy,
-including Excel and Word, so a future edit cannot silently drop one.
+including whatsapp, Planner, SharePoint, PowerPoint, Excel, and Word, so a
+future edit cannot silently drop one.
 
 Deliberately narrow: a fully general "every builtin oauth app whose scopes
 exceed its provider's default_scopes must be listed here" test does not hold
@@ -15,7 +16,7 @@ across the registry today -- several existing google/microsoft/zoom-family
 apps (e.g. onedrive, outlook, teams) also request scopes beyond their
 provider's (identity-only) default_scopes without being listed, and
 asserting that gap closed is a separate, cross-connector investigation well
-beyond these connectors' scope.
+beyond these connectors' own scope.
 """
 
 from xagent.web.builtin_mcp_registry import (
@@ -25,7 +26,7 @@ from xagent.web.builtin_mcp_registry import (
 from xagent.web.mcp_apps import requires_app_scoped_oauth_grant
 
 # Apps already known (from mcp_apps.py's own comment) to need this guard,
-# pinned here so a regression in any of them -- not just whatsapp/sharepoint
+# pinned here so a regression in any of them -- not just the newest connectors
 # -- is caught the same way.
 _EXPECTED_APP_SCOPED_APPS = frozenset(
     {
@@ -34,6 +35,8 @@ _EXPECTED_APP_SCOPED_APPS = frozenset(
         "github",
         "myob",
         "meta-ads",
+        "planner",
+        "powerpoint",
         "sharepoint",
         "whatsapp",
         "word",
@@ -74,6 +77,10 @@ def test_whatsapp_scopes_actually_exceed_the_meta_providers_default_scopes():
         "this test (and the set) should be updated together, not left to "
         "silently drift."
     )
+
+
+def test_planner_scopes_exceed_the_microsoft_providers_default_scopes():
+    assert _app_scopes_beyond_provider_defaults("planner") == {"Tasks.ReadWrite"}
 
 
 def test_sharepoint_scopes_actually_exceed_the_microsoft_providers_default_scopes():

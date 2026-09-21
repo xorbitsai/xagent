@@ -9,6 +9,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils.security import redact_sensitive_text
 from .utils import clamp_limit, clamp_offset, require_clean_text, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +37,30 @@ MAX_RETRY_AFTER_SECONDS = 30
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
+
+
+def _safe_text(value: Any) -> str:
+    """Redact credential-shaped substrings (Bearer tokens, key=/secret=
+    -style assignments, URL credentials) out of arbitrary text before it
+    reaches a log line or a tool's returned error message.
+
+    str(exc) is often built from data this module doesn't control --
+    proxy/gateway error bodies, low-level connection-error reprs that
+    can embed request details -- so it isn't guaranteed free of the
+    Authorization header _headers() sets on every request. Matches
+    shopify.py's/mixpanel.py's _safe_text convention for the same risk.
+
+    Callers must apply this exactly once, at the point a message is
+    first captured from an exception -- redact_sensitive_text is NOT
+    idempotent (its masking can itself look credential-shaped enough to
+    get masked again), so _error() does not call this itself: the
+    binary search in _bounded_search_error re-invokes _error() on many
+    different slices of the same message, and a second redaction pass
+    per slice would keep shrinking the masked portion on every
+    call, breaking the "longer slice never produces shorter output"
+    assumption the search's correctness depends on.
+    """
+    return redact_sensitive_text(str(value))
 
 
 def _error(message: str) -> str:
@@ -269,8 +294,9 @@ def jira_list_accessible_sites() -> str:
         sites = _accessible_resources()
         return _success(sites=sites)
     except Exception as e:
-        logger.error(f"Error listing accessible Jira sites: {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(f"Error listing accessible Jira sites: {safe_message}")
+        return _error(safe_message)
 
 
 @mcp.tool()
@@ -293,8 +319,9 @@ def jira_get_current_user() -> str:
             }
         )
     except Exception as e:
-        logger.error(f"Error fetching authenticated Jira user: {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(f"Error fetching authenticated Jira user: {safe_message}")
+        return _error(safe_message)
 
 
 @mcp.tool()
@@ -329,8 +356,9 @@ def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -
             next_start_at=(offset + len(projects)) if truncated else None,
         )
     except Exception as e:
-        logger.error(f"Error listing Jira projects: {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(f"Error listing Jira projects: {safe_message}")
+        return _error(safe_message)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -731,9 +759,13 @@ def jira_search_issues(
     except Exception as e:
         # None of this setup touches jql, so the full exception detail
         # is safe to log here -- unlike the try block below, which does
-        # touch jql and routes through _log_metadata_only instead.
-        logger.error(f"Error searching Jira issues: {e}")
-        return _bounded_search_error(str(e), get_tool_max_output_length())
+        # touch jql and routes through _log_metadata_only instead. Still
+        # redacted for credential-shaped content (_safe_text), since a
+        # connection-level error from _resolve_cloud_id's own request
+        # can embed request/header details this module doesn't control.
+        safe_message = _safe_text(e)
+        logger.error(f"Error searching Jira issues: {safe_message}")
+        return _bounded_search_error(safe_message, get_tool_max_output_length())
 
     try:
         issues: list[dict[str, Any]] = []
@@ -841,7 +873,7 @@ def jira_search_issues(
         return response
     except Exception as e:
         _log_metadata_only(logger.error, "Error searching Jira issues", e)
-        return _bounded_search_error(str(e), max_output_length)
+        return _bounded_search_error(_safe_text(e), max_output_length)
 
 
 @mcp.tool()
@@ -855,8 +887,9 @@ def jira_get_issue(issue_key: str, cloud_id: str = "") -> str:
         result = _request("GET", cloud_id, _issue_path(issue_key))
         return _success(issue=result)
     except Exception as e:
-        logger.error(f"Error fetching Jira issue {issue_key}: {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(f"Error fetching Jira issue {issue_key}: {safe_message}")
+        return _error(safe_message)
 
 
 @mcp.tool()
@@ -900,8 +933,11 @@ def jira_create_issue(
         )
         return _success(issue=result)
     except Exception as e:
-        logger.error(f"Error creating Jira issue in project {project_key}: {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(
+            f"Error creating Jira issue in project {project_key}: {safe_message}"
+        )
+        return _error(safe_message)
 
 
 @mcp.tool()
@@ -956,8 +992,9 @@ def jira_update_issue(
         )
         return _success(issue_key=issue_key)
     except Exception as e:
-        logger.error(f"Error updating Jira issue {issue_key}: {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(f"Error updating Jira issue {issue_key}: {safe_message}")
+        return _error(safe_message)
 
 
 @mcp.tool()
@@ -983,8 +1020,11 @@ def jira_list_transitions(issue_key: str, cloud_id: str = "") -> str:
         ]
         return _success(transitions=transitions)
     except Exception as e:
-        logger.error(f"Error listing transitions for Jira issue {issue_key}: {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(
+            f"Error listing transitions for Jira issue {issue_key}: {safe_message}"
+        )
+        return _error(safe_message)
 
 
 @mcp.tool()
@@ -1039,10 +1079,12 @@ def jira_transition_issue(
         )
         return _success(issue_key=issue_key, transitioned_to=match.get("name"))
     except Exception as e:
+        safe_message = _safe_text(e)
         logger.error(
-            f"Error transitioning Jira issue {issue_key} to '{transition_name}': {e}"
+            f"Error transitioning Jira issue {issue_key} to '{transition_name}': "
+            f"{safe_message}"
         )
-        return _error(str(e))
+        return _error(safe_message)
 
 
 @mcp.tool()
@@ -1077,8 +1119,11 @@ def jira_list_comments(
             next_start_at=(offset + len(comments)) if truncated else None,
         )
     except Exception as e:
-        logger.error(f"Error listing comments for Jira issue {issue_key}: {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(
+            f"Error listing comments for Jira issue {issue_key}: {safe_message}"
+        )
+        return _error(safe_message)
 
 
 @mcp.tool()
@@ -1096,8 +1141,9 @@ def jira_add_comment(issue_key: str, body: str, cloud_id: str = "") -> str:
         )
         return _success(comment=result)
     except Exception as e:
-        logger.error(f"Error adding comment to Jira issue {issue_key}: {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(f"Error adding comment to Jira issue {issue_key}: {safe_message}")
+        return _error(safe_message)
 
 
 @mcp.tool()
@@ -1142,8 +1188,9 @@ def jira_search_users(
             next_start_at=(offset + len(result)) if truncated else None,
         )
     except Exception as e:
-        logger.error(f"Error searching Jira users for '{query}': {e}")
-        return _error(str(e))
+        safe_message = _safe_text(e)
+        logger.error(f"Error searching Jira users for '{query}': {safe_message}")
+        return _error(safe_message)
 
 
 if __name__ == "__main__":

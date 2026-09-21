@@ -1260,6 +1260,34 @@ def test_search_issues_error_log_omits_raw_jql(monkeypatch, caplog):
     assert "super-secret-customer-name" not in caplog.text
 
 
+def test_search_issues_bounded_error_redacts_credential_shaped_text_once(
+    monkeypatch,
+):
+    # _bounded_search_error's binary search calls _error() on many
+    # different slices of the same message; redaction must happen
+    # exactly once, before the search starts, not per-slice (which
+    # would keep re-masking an already-masked substring shorter on
+    # every attempt and break the search's fitting logic). A tiny
+    # max_output_length forces the search to actually slice the
+    # (already redacted) message rather than returning it whole.
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            requests.exceptions.ConnectionError(
+                "Authorization: Bearer sk-abc123XYZ while searching"
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 60)
+
+    result = json.loads(jira.jira_search_issues("project = ENG"))
+
+    assert result["status"] == "error"
+    assert "sk-abc123XYZ" not in result["message"]
+    assert len(json.dumps(result)) <= 60
+
+
 def test_search_issues_setup_error_logs_full_detail(monkeypatch, caplog):
     # A failure before the search ever touches jql (no accessible Jira
     # sites here) carries no caller-controlled JQL content, so unlike
@@ -1322,6 +1350,35 @@ def test_get_issue_returns_issue(monkeypatch):
 
     assert result["status"] == "success"
     assert result["issue"]["key"] == "ENG-1"
+
+
+def test_get_issue_redacts_credential_shaped_text_from_a_connection_error(
+    monkeypatch, caplog
+):
+    # A low-level connection error's str() isn't under this module's
+    # control and can embed request details (the Authorization header
+    # _headers() sets on every request) -- both the returned message
+    # and the log line must have that redacted, not just avoid logging
+    # it outright the way the JQL-content redaction on the search path
+    # does.
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            requests.exceptions.ConnectionError(
+                "Failed to establish a new connection: "
+                "Authorization: Bearer sk-abc123XYZ"
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with caplog.at_level(logging.ERROR, logger="jira-mcp"):
+        result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    assert result["status"] == "error"
+    assert "sk-abc123XYZ" not in result["message"]
+    assert "sk-abc123XYZ" not in caplog.text
+    assert "***3XYZ" in result["message"]
 
 
 def test_create_issue_sends_expected_fields(monkeypatch):

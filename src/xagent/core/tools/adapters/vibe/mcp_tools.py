@@ -34,6 +34,44 @@ def _stable_server_names(values: Any) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _apply_stdio_output_limit_env(
+    mcp_configs: list[dict[str, Any]], config: "BaseToolConfig"
+) -> None:
+    """Mirror this process's output-filter budget into stdio child env vars.
+
+    ``OutputFilteredToolWrapper`` (see factory.py) truncates a stdio MCP
+    tool's result in THIS process using ``config.get_max_output_length()``
+    (and the field-count/recursion-depth counterparts). Builtin connectors
+    under ``xagent.web.tools.mcp`` size their own bounded, valid-JSON output
+    against the *same-named* env vars read inside their own subprocess.
+    ``_create_stdio_session`` launches that subprocess with a minimal,
+    explicitly-built env (credentials + caller id only) rather than
+    inheriting this process's environment, so the two budgets can silently
+    disagree and the wrapper's blind slice can then cut valid JSON produced
+    by the child mid-structure. Setting these here keeps both sides looking
+    at the same effective numbers regardless of which env var / config
+    override produced them.
+    """
+    from .....config import (
+        TOOL_MAX_FIELD_COUNT,
+        TOOL_MAX_OUTPUT_LENGTH,
+        TOOL_MAX_RECURSION_DEPTH,
+    )
+
+    for cfg in mcp_configs:
+        if cfg.get("transport") != "stdio":
+            continue
+        inner_config = cfg.get("config")
+        if not isinstance(inner_config, dict) or inner_config.get("unavailable"):
+            continue
+        env = inner_config.setdefault("env", {})
+        if not isinstance(env, dict):
+            continue
+        env.setdefault(TOOL_MAX_OUTPUT_LENGTH, str(config.get_max_output_length()))
+        env.setdefault(TOOL_MAX_FIELD_COUNT, str(config.get_max_field_count()))
+        env.setdefault(TOOL_MAX_RECURSION_DEPTH, str(config.get_max_recursion_depth()))
+
+
 def _select_config_load_failures(
     error: MCPConfigLoadError,
     spec: Any,
@@ -256,6 +294,8 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
                     [], [], requested_servers=requested_servers
                 )
                 return await _finish_mcp_setup(config, summary, [])
+
+    _apply_stdio_output_limit_env(mcp_configs, config)
 
     # Everything DB-backed is loaded at this point; what follows is pure
     # network I/O against remote MCP servers (initialize + list-tools, with

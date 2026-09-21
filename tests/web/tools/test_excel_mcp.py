@@ -234,6 +234,12 @@ def test_parse_values_json_rejects_invalid_json():
         excel._parse_values_json("{not json")
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_parse_values_json_rejects_non_json_numeric_constants(constant):
+    with pytest.raises(ValueError, match="non-JSON numeric value"):
+        excel._parse_values_json(f"[[{constant}]]")
+
+
 def test_parse_values_json_success():
     assert excel._parse_values_json('[["a", 1], ["b", 2]]') == [["a", 1], ["b", 2]]
 
@@ -385,6 +391,37 @@ def test_delete_worksheet_uses_odata_key_segment(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["url"].endswith("worksheets('Sheet1')")
+
+
+@pytest.mark.parametrize(
+    "side_effect",
+    [
+        requests.ReadTimeout("response timed out"),
+        requests.ConnectionError("connection dropped"),
+    ],
+)
+def test_delete_worksheet_transport_failure_is_indeterminate(monkeypatch, side_effect):
+    monkeypatch.setattr(excel.requests, "request", Mock(side_effect=side_effect))
+
+    result = json.loads(excel.excel_delete_worksheet("book.xlsx", "Sheet1"))
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+    assert "may already have been applied" in result["message"]
+
+
+def test_delete_worksheet_server_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(return_value=MockResponse({"error": "gateway"}, status_code=503)),
+    )
+
+    result = json.loads(excel.excel_delete_worksheet("book.xlsx", "Sheet1"))
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+    assert "HTTP 503" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -800,11 +837,10 @@ def test_list_table_rows_rejects_oversized_page_without_advancing_cursor(monkeyp
 )
 def test_list_collections_reject_oversized_final_page(monkeypatch, tool_name, args):
     max_output_length = get_tool_max_output_length()
-    mock_request = Mock(
-        return_value=MockResponse(
-            {"value": [{"values": [["x" * (max_output_length + 1000)]]}]}
-        )
+    response = MockResponse(
+        {"value": [{"values": [["x" * (max_output_length + 1000)]]}]}
     )
+    mock_request = Mock(return_value=response)
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
     result = json.loads(getattr(excel, tool_name)(*args))
@@ -812,6 +848,8 @@ def test_list_collections_reject_oversized_final_page(monkeypatch, tool_name, ar
     assert result["status"] == "error"
     assert "smaller page_size" in result["message"]
     assert "next_link" not in result
+    assert response.closed is True
+    assert mock_request.call_args.kwargs["stream"] is True
 
 
 def test_add_table_rows_with_index(monkeypatch):

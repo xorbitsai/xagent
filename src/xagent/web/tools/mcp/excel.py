@@ -451,8 +451,12 @@ def _parse_values_json(values_json: str) -> list:
     """
     if not isinstance(values_json, str):
         raise TypeError("values_json must be a string")
+
+    def _reject_non_json_number(value: str) -> None:
+        raise ValueError(f"values_json contains non-JSON numeric value {value}")
+
     try:
-        parsed = json.loads(values_json)
+        parsed = json.loads(values_json, parse_constant=_reject_non_json_number)
     except json.JSONDecodeError as exc:
         raise ValueError(f"values_json is not valid JSON: {exc}") from exc
     if not isinstance(parsed, list) or not all(isinstance(row, list) for row in parsed):
@@ -490,11 +494,17 @@ def excel_list_worksheets(
             "GET",
             path,
             params={"$top": validated_page_size} if next_link is None else None,
+            max_response_bytes=get_tool_max_output_length(),
         )
         return _success_with_bounded_collection(
             "worksheets",
             result.get("value", []),
             next_link=result.get("@odata.nextLink"),
+        )
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph worksheet page exceeds the tool ingress limit; restart "
+            "the listing with a smaller page_size."
         )
     except Exception as e:
         logger.error("Error listing worksheets for %s: %s", file_path, e)
@@ -544,8 +554,16 @@ def excel_delete_worksheet(
     try:
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("worksheets", worksheet)
-        _graph_request("DELETE", f"{base}/{segment}")
+        _graph_mutation_request("DELETE", f"{base}/{segment}")
         return _success(message="Worksheet deleted successfully")
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Worksheet deletion outcome is indeterminate for %s in %s: %s",
+            worksheet,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error deleting worksheet %s from %s: %s", worksheet, file_path, e)
         return _error(str(e))
@@ -736,11 +754,17 @@ def excel_list_tables(
             "GET",
             path,
             params={"$top": validated_page_size} if next_link is None else None,
+            max_response_bytes=get_tool_max_output_length(),
         )
         return _success_with_bounded_collection(
             "tables",
             result.get("value", []),
             next_link=result.get("@odata.nextLink"),
+        )
+    except _GraphResponseTooLargeError:
+        return _error(
+            "The Graph table page exceeds the tool ingress limit; restart the "
+            "listing with a smaller page_size."
         )
     except Exception as e:
         logger.error("Error listing tables in %s: %s", file_path, e)

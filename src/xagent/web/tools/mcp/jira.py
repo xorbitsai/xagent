@@ -841,7 +841,7 @@ def jira_search_issues(
         return response
     except Exception as e:
         _log_metadata_only(logger.error, "Error searching Jira issues", e)
-        return _bounded_search_error(str(e), get_tool_max_output_length())
+        return _bounded_search_error(str(e), max_output_length)
 
 
 @mcp.tool()

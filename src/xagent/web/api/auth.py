@@ -4101,7 +4101,7 @@ def generic_oauth_callback(
                     # picks up directly (bypassing the connected-state check)
                     # and can never resolve a token for; see
                     # APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
-                    if requires_app_scoped_oauth_grant(app_info.get("id")):
+                    if requires_app_scoped_oauth_grant(app_info):
                         logger.info(
                             "Skipping app-scoped-only app %s during bare %s "
                             "OAuth batch connect",

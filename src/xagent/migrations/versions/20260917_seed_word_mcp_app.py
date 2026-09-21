@@ -46,7 +46,7 @@ BUILTIN_PROVENANCE = {
 ROW = {
     "app_id": APP_ID,
     "name": "Word",
-    "description": "Connect to Word to read, create, and edit documents stored on OneDrive or SharePoint.",
+    "description": "Connect to Word to create documents and read or edit top-level main-body paragraphs stored on OneDrive or SharePoint. Tables, headers, footers, text boxes, notes, and tracked changes are excluded.",
     "icon": "https://www.google.com/s2/favicons?domain=office.com&sz=128",
     "transport": "oauth",
     "provider_name": "microsoft",
@@ -57,6 +57,9 @@ ROW = {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.word"],
         "env_mapping": {"AUTH_TOKEN": "access_token"},
+        "static_env": {
+            "XAGENT_TOOL_MAX_OUTPUT_LENGTH": "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+        },
         "builtin_provenance": BUILTIN_PROVENANCE,
     },
 }

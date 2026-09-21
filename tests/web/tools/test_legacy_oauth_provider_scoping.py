@@ -34,8 +34,28 @@ def test_oauth_keys_for_instagram_still_includes_bare_meta_provider():
 
 
 def test_oauth_keys_for_word_excludes_bare_microsoft_provider():
-    app = {"id": "word", "provider": "microsoft"}
+    app = {
+        "id": "word",
+        "provider": "microsoft",
+        "launch_config": {
+            "builtin_provenance": {
+                "registry": "xagent",
+                "app_id": "word",
+                "version": 1,
+            }
+        },
+    }
     assert _oauth_keys_for_app(app) == ["word"]
+
+
+def test_oauth_keys_for_preserved_custom_word_keep_bare_microsoft_provider():
+    app = {
+        "id": "word",
+        "provider": "microsoft",
+        "launch_config": {"command": "custom-word-server"},
+    }
+
+    assert _oauth_keys_for_app(app) == ["word", "microsoft"]
 
 
 def test_restrict_to_app_scoped_oauth_grant_narrows_facebook():
@@ -178,6 +198,33 @@ def test_legacy_token_resolution_uses_app_scoped_word_grant(db_session):
     )
 
     assert resolution.access_token == "files-read-write-token"
+
+
+def test_preserved_custom_word_runtime_uses_existing_bare_microsoft_grant(db_session):
+    db_session.add(
+        UserOAuth(
+            user_id=1,
+            provider="microsoft",
+            access_token="custom-word-user-read-token",
+        )
+    )
+    db_session.commit()
+    cfg = WebToolConfig(db=None, request=None, db_factory=lambda: db_session, user_id=1)
+    custom_app = {
+        "id": "word",
+        "provider": "microsoft",
+        "launch_config": {"command": "custom-word-server"},
+    }
+
+    resolution = asyncio.run(
+        cfg._resolve_legacy_oauth_access_token(
+            provider_name="microsoft",
+            app_id="word",
+            app_info=custom_app,
+        )
+    )
+
+    assert resolution.access_token == "custom-word-user-read-token"
 
 
 def test_ordinary_token_resolution_ignores_actor_owned_grant(db_session):

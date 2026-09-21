@@ -101,6 +101,26 @@ def test_transport_config_omits_static_env_when_host_var_missing(monkeypatch):
     assert "GOOGLE_ADS_DEVELOPER_TOKEN" not in transport_config["env"]
 
 
+def test_word_transport_inherits_parent_output_cap(monkeypatch):
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "100")
+    app_info = get_builtin_public_mcp_app("word")
+    assert app_info is not None
+
+    transport_config = WebToolConfig(
+        db=None, request=None
+    )._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Word"),
+        app_info={
+            "launch_config": app_info["launch_config"],
+        },
+        access_token="user-access-token",
+    )
+
+    assert transport_config["env"]["XAGENT_TOOL_MAX_OUTPUT_LENGTH"] == "100"
+
+
 def test_transport_config_forwards_instance_url_when_mapped_and_provided():
     """Salesforce (and no other provider) maps a second env_mapping entry to
     "instance_url" -- the per-org API host from the OAuth grant, distinct

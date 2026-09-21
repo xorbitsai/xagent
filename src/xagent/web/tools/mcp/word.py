@@ -58,11 +58,19 @@ _MAX_DOWNLOAD_BYTES = 10_000_000
 
 # Layered expansion, XML-part, element, and paragraph ceilings keep both
 # archive inflation and python-docx's later object graph bounded.
-_MAX_DECOMPRESSED_BYTES = 100_000_000
-_MAX_ARCHIVE_PARTS = 10_000
-_MAX_XML_PART_BYTES = 20_000_000
-_MAX_XML_ELEMENTS = 250_000
-_MAX_DOCUMENT_PARAGRAPHS = 50_000
+_MAX_DECOMPRESSED_BYTES = 25_000_000
+_MAX_ARCHIVE_PARTS = 2_000
+_MAX_XML_PART_BYTES = 8_000_000
+_MAX_XML_ELEMENTS = 50_000
+_MAX_DOCUMENT_PARAGRAPHS = 2_000
+_MAX_DOCUMENT_TEXT_CHARS = 400_000
+
+# Bound work added by one mutation before python-docx materializes and
+# serializes it. The archive validator below remains the final source of truth;
+# these limits keep a highly repetitive replacement/newline payload from first
+# building a much larger in-memory XML object graph only to be rejected later.
+_MAX_MUTATION_TEXT_CHARS = _MAX_DOCUMENT_TEXT_CHARS
+_MAX_MUTATION_CONTROL_ELEMENTS = 10_000
 
 # _upload_document sends the whole edited document in a single PUT to an
 # upload-session URL (not Graph's separate small-file content PUT), for
@@ -80,7 +88,7 @@ _UPLOAD_RETRY_BASE_SECONDS = 1.0
 _UPLOAD_RETRY_MAX_SECONDS = 4.0
 _DEFAULT_TEXT_PAGE_CHARS = 20_000
 _MAX_TEXT_PAGE_CHARS = 40_000
-_DEFAULT_PARAGRAPH_PAGE_SIZE = 100
+_DEFAULT_PARAGRAPH_PAGE_SIZE = 500
 _MAX_PARAGRAPH_PAGE_SIZE = 500
 
 
@@ -98,6 +106,7 @@ class _EditSnapshot:
 
     item_path: str
     etag: str
+    generation: str = ""
 
 
 def _success(**payload: Any) -> str:
@@ -385,9 +394,15 @@ def _validate_docx_archive(content: bytes) -> None:
 
             element_count = 0
             paragraph_count = 0
+            document_text_characters = 0
             paragraph_tag = (
                 "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"
             )
+            text_tags = {
+                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t",
+                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}delText",
+                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}instrText",
+            }
             for info in xml_infos:
                 with archive.open(info) as part:
                     for _event, element in DefusedElementTree.iterparse(
@@ -410,6 +425,17 @@ def _validate_docx_archive(content: bytes) -> None:
                             if paragraph_count > _MAX_DOCUMENT_PARAGRAPHS:
                                 raise ValueError(
                                     "The document contains too many paragraphs to process safely"
+                                )
+                        if (
+                            info.filename == "word/document.xml"
+                            and element.tag in text_tags
+                            and element.text
+                        ):
+                            document_text_characters += len(element.text)
+                            if document_text_characters > _MAX_DOCUMENT_TEXT_CHARS:
+                                raise ValueError(
+                                    "The document contains too much main-body text "
+                                    "to process safely"
                                 )
                         element.clear()
     except (zipfile.BadZipFile, ParseError, DefusedXmlException) as exc:
@@ -435,7 +461,9 @@ def _download_document(
     download_path = _content_path(file_path, site_id, drive_id)
     if need_etag:
         metadata = _graph_request(
-            "GET", item_path, params={"$select": "id,eTag,parentReference"}
+            "GET",
+            item_path,
+            params={"$select": "id,eTag,parentReference,publication"},
         )
         item_id = metadata.get("id") if isinstance(metadata, dict) else None
         etag = metadata.get("eTag") if isinstance(metadata, dict) else None
@@ -447,6 +475,14 @@ def _download_document(
             if isinstance(parent_reference, dict)
             else None
         )
+        publication = (
+            metadata.get("publication") if isinstance(metadata, dict) else None
+        )
+        if isinstance(publication, dict) and publication.get("level") == "checkout":
+            raise ValueError(
+                f"{file_path!r} is already checked out; check it in or discard "
+                "that checkout before editing it with this connector"
+            )
         if (
             not isinstance(item_id, str)
             or not item_id.strip()
@@ -473,6 +509,12 @@ def _download_document(
             "restart pagination and retry with its new generation"
         )
     _validate_docx_archive(content)
+    if snapshot is not None:
+        snapshot = _EditSnapshot(
+            item_path=snapshot.item_path,
+            etag=snapshot.etag,
+            generation=generation,
+        )
     try:
         return Document(io.BytesIO(content)), snapshot, generation
     except Exception as exc:
@@ -489,18 +531,11 @@ def _upload_document(
 ) -> dict[str, Any]:
     """Save document and upload it in place of file_path's current content.
 
-    Goes through an upload session (like _create_only_upload) instead of
-    the simpler content PUT this used before, specifically to attach
-    If-Match: etag on session creation -- confirmed in Graph's
-    createUploadSession reference, unlike the plain content-PUT endpoint's
-    own reference, which documents no conditional-write header at all.
-    Without this, two callers racing a download-mutate-upload cycle on the
-    same file could have the later one silently overwrite the earlier
-    one's change; a stale etag now fails the write with 412 instead.
-    Both fields in snapshot are mandatory. The upload session is addressed
-    by the immutable driveItem id rather than by the caller's path, so a
-    concurrent rename or delete-and-recreate cannot redirect the write to a
-    different item.
+    Graph documents If-Match only for upload-session creation, not for the
+    later preauthenticated final PUT. Acquire Graph's file checkout lock and
+    revalidate the exact downloaded bytes after the lock is held, so no edit
+    can slip between the optimistic precondition and final commit. The upload
+    session remains item-id addressed and If-Match protected as a second fence.
     """
     buffer = io.BytesIO()
     document.save(buffer)
@@ -511,19 +546,140 @@ def _upload_document(
             f"{_MAX_UPLOAD_BYTES // 1_000_000} MB limit this tool currently "
             "supports"
         )
+    _validate_docx_archive(content)
     conflict_message = (
         f"{file_path!r} was changed by someone else since this edit "
         "started; re-read it and retry"
     )
+    locked_etag = _checkout_edit_snapshot(snapshot, conflict_message)
+    locked_snapshot = _EditSnapshot(
+        item_path=snapshot.item_path,
+        etag=locked_etag,
+        generation=snapshot.generation,
+    )
+    try:
+        result = _upload_checked_out_document(
+            content, locked_snapshot, conflict_message=conflict_message
+        )
+        _check_in_edit_snapshot(snapshot, content)
+        return result
+    except Exception:
+        try:
+            _discard_edit_checkout(snapshot)
+        except Exception:
+            raise RuntimeError(
+                "Word edit failed and its checkout could not be released; "
+                "verify the document in Word before retrying"
+            ) from None
+        raise
+
+
+def _check_in_edit_snapshot(snapshot: _EditSnapshot, content: bytes) -> None:
+    try:
+        _graph_request(
+            "POST",
+            f"{snapshot.item_path}/checkin",  # codespell:ignore checkin
+            body={"comment": "Updated by Xagent Word connector"},
+        )
+        return
+    except (requests.RequestException, _GraphRequestError):
+        pass
+
+    # The check-in can commit and then lose its response. Treat it as success
+    # only when both the exact intended bytes and a non-checkout publication
+    # state can be observed; otherwise the caller's cleanup path fails closed.
+    try:
+        remote = _graph_request("GET", f"{snapshot.item_path}/content", raw=True)
+        metadata = _graph_request(
+            "GET", snapshot.item_path, params={"$select": "publication"}
+        )
+    except (ValueError, requests.RequestException, _GraphRequestError):
+        raise RuntimeError(
+            "Graph did not confirm the Word check-in completed"
+        ) from None
+    publication = metadata.get("publication") if isinstance(metadata, dict) else None
+    if remote == content and not (
+        isinstance(publication, dict) and publication.get("level") == "checkout"
+    ):
+        return
+    raise RuntimeError("Graph did not confirm the Word check-in completed")
+
+
+def _discard_edit_checkout(snapshot: _EditSnapshot) -> None:
+    _graph_request("POST", f"{snapshot.item_path}/discardCheckout")
+
+
+def _checkout_edit_snapshot(snapshot: _EditSnapshot, conflict_message: str) -> str:
+    """Lock the item, then prove it still contains the downloaded snapshot."""
+    if not snapshot.generation:
+        raise RuntimeError("Word edit snapshot is missing its content generation")
+    try:
+        _graph_request("POST", f"{snapshot.item_path}/checkout")
+    except requests.RequestException:
+        # The lock may have been acquired before the transport failed. A
+        # delegated discard can release only this user's checkout; HTTP 400
+        # means no checkout existed, while any other cleanup failure remains
+        # an explicit unknown state requiring manual verification.
+        try:
+            _discard_edit_checkout(snapshot)
+        except _GraphRequestError as cleanup_error:
+            if cleanup_error.status_code == 400:
+                raise RuntimeError(
+                    "Graph could not acquire the checkout required for a "
+                    "concurrency-safe Word edit"
+                ) from None
+            raise RuntimeError(
+                "Word checkout outcome is unknown; verify the document in "
+                "Word before retrying"
+            ) from None
+        except requests.RequestException:
+            raise RuntimeError(
+                "Word checkout outcome is unknown; verify the document in "
+                "Word before retrying"
+            ) from None
+        raise RuntimeError(
+            "Graph did not confirm the Word checkout; the possible checkout "
+            "was discarded, so the edit was not applied"
+        ) from None
+    except _GraphRequestError as exc:
+        if exc.status_code in (409, 412, 423):
+            raise ValueError(conflict_message) from exc
+        raise RuntimeError(
+            "Graph could not acquire the checkout required for a "
+            "concurrency-safe Word edit"
+        ) from exc
+    try:
+        metadata = _graph_request("GET", snapshot.item_path, params={"$select": "eTag"})
+        locked_content = _graph_request(
+            "GET", f"{snapshot.item_path}/content", raw=True
+        )
+        locked_etag = metadata.get("eTag") if isinstance(metadata, dict) else None
+        if not isinstance(locked_etag, str) or not locked_etag:
+            raise RuntimeError("Graph did not return an eTag for the checked-out file")
+        if hashlib.sha256(locked_content).hexdigest() != snapshot.generation:
+            raise ValueError(conflict_message)
+        return locked_etag
+    except Exception:
+        try:
+            _discard_edit_checkout(snapshot)
+        except Exception:
+            raise RuntimeError(
+                "Word document changed while acquiring its checkout and the "
+                "checkout could not be released; verify it in Word"
+            ) from None
+        raise
+
+
+def _upload_checked_out_document(
+    content: bytes,
+    snapshot: _EditSnapshot,
+    *,
+    conflict_message: str,
+) -> dict[str, Any]:
     try:
         session = _graph_request(
             "POST",
             f"{snapshot.item_path}/createUploadSession",
-            # "replace" (rather than the "fail" default) is required here:
-            # this path always resolves to the file already being edited,
-            # so the default's job -- refusing to silently clobber an
-            # unrelated file that happens to share this name -- is instead
-            # done by the If-Match check below.
             body={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
             extra_headers={"If-Match": snapshot.etag},
         )
@@ -599,8 +755,8 @@ def _upload_document(
         _sleep_before_upload_retry(attempt)
 
     raise RuntimeError(
-        "Word document upload outcome is unknown; verify the document before "
-        "retrying to avoid applying the edit twice"
+        "Word document upload outcome is unknown; its checkout must be "
+        "discarded before retrying"
     )
 
 
@@ -663,6 +819,7 @@ def _create_only_upload(
     (a blank new document) is always small enough for a single-PUT
     session, specifically for that atomicity guarantee.
     """
+    _validate_docx_archive(content)
     item_path = _item_path(file_path, site_id, drive_id)
     try:
         session = _graph_request(
@@ -682,44 +839,94 @@ def _create_only_upload(
         raise RuntimeError("Graph did not return an upload session URL")
 
     # The upload-session URL is itself pre-authenticated (a token in its own
-    # query string) -- Graph's createUploadSession docs warn that including
-    # an Authorization header on this PUT can cause a 401 -- so this goes
-    # through a plain requests.put, not _graph_request (which always
-    # attaches one). Both requests.put's own exception (a connection failure
-    # or timeout) and the HTTPError from raise_for_status() embed the full
-    # request URL in their default str(), so neither is stringified into a
-    # message below, and each is re-raised with "from None" rather than
-    # "from exc" -- chaining the original would still attach it as
-    # __cause__, which a future traceback/log/APM capture could surface --
-    # matching onedrive.py's identical guard on the same hazard.
+    # query string) -- never include it in an exception or chained cause.
+    # A final PUT can commit server-side and then lose its response, so creation
+    # uses the same bounded status/reconciliation loop as edits instead of
+    # reporting a definite failure for an ambiguous transport outcome.
+    offset = 0
+    for attempt in range(_UPLOAD_RETRY_ATTEMPTS):
+        try:
+            response = requests.put(
+                upload_url,
+                data=content[offset:],
+                headers={
+                    "Content-Range": (
+                        f"bytes {offset}-{len(content) - 1}/{len(content)}"
+                    ),
+                    "Content-Type": _WORD_MIME_TYPE,
+                },
+                timeout=_BINARY_TIMEOUT_SECONDS,
+            )
+            if response.status_code == 409:
+                raise ValueError(
+                    f"{file_path!r} already exists; use the other word_* tools "
+                    "to edit it instead of recreating it"
+                )
+            if response.status_code in (200, 201):
+                try:
+                    result = response.json()
+                except ValueError:
+                    result = None
+                if isinstance(result, dict) and result.get("id"):
+                    safe_item = dict(result)
+                    safe_item.pop("@microsoft.graph.downloadUrl", None)
+                    return safe_item
+            elif response.status_code == 202:
+                try:
+                    progress = response.json()
+                except ValueError:
+                    progress = None
+                next_offset = _next_upload_offset(progress, len(content))
+                if next_offset is not None:
+                    offset = next_offset
+                    continue
+            elif response.status_code < 500 and response.status_code != 416:
+                raise _GraphRequestError(
+                    f"Word document upload failed with HTTP {response.status_code}",
+                    status_code=response.status_code,
+                )
+        except requests.RequestException:
+            pass
+
+        reconciled = _reconcile_created_document(item_path, content)
+        if reconciled is not None:
+            return reconciled
+        try:
+            status = requests.get(upload_url, timeout=_BINARY_TIMEOUT_SECONDS)
+            if status.status_code == 200:
+                try:
+                    progress = status.json()
+                except ValueError:
+                    progress = None
+                next_offset = _next_upload_offset(progress, len(content))
+                if next_offset is not None:
+                    offset = next_offset
+                    _sleep_before_upload_retry(attempt)
+                    continue
+        except requests.RequestException:
+            pass
+        _sleep_before_upload_retry(attempt)
+
+    raise RuntimeError(
+        "Word document creation outcome is unknown; verify whether the file "
+        "exists before retrying"
+    )
+
+
+def _reconcile_created_document(
+    item_path: str, content: bytes
+) -> dict[str, Any] | None:
+    """Prove an ambiguous create committed by comparing the exact bytes."""
     try:
-        response = requests.put(
-            upload_url,
-            data=content,
-            headers={
-                "Content-Range": f"bytes 0-{len(content) - 1}/{len(content)}",
-                "Content-Type": _WORD_MIME_TYPE,
-            },
-            timeout=_BINARY_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-    except requests.HTTPError:
-        status_code = response.status_code
-        if status_code == 409:
-            raise ValueError(
-                f"{file_path!r} already exists; use the other word_* tools to "
-                "edit it instead of recreating it"
-            ) from None
-        raise _GraphRequestError(
-            f"Word document upload failed with HTTP {status_code}",
-            status_code=status_code,
-        ) from None
-    except requests.RequestException:
-        raise RuntimeError("Word document upload failed") from None
-    result = response.json()
-    if not isinstance(result, dict) or not result.get("id"):
-        raise RuntimeError("Graph did not confirm the document upload completed")
-    safe_item = dict(result)
+        remote = _graph_request("GET", f"{item_path}/content", raw=True)
+        if remote != content:
+            return None
+        item = _graph_request("GET", item_path, params={"$select": "id,eTag"})
+    except (ValueError, requests.RequestException, _GraphRequestError):
+        return None
+    if not isinstance(item, dict) or not item.get("id"):
+        return None
+    safe_item = dict(item)
     safe_item.pop("@microsoft.graph.downloadUrl", None)
     return safe_item
 
@@ -870,6 +1077,7 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
     which the plain-text runs[0].text assignment below would silently
     delete.
     """
+    _validate_mutation_text(text, field_name="text")
     if _paragraph_has_unsupported_structure(paragraph):
         raise ValueError(
             "paragraph contains wrapped or mathematical content outside "
@@ -894,6 +1102,52 @@ def _set_paragraph_text(paragraph: Any, text: str) -> None:
     paragraph.runs[0].text = text
     for run in paragraph.runs[1:]:
         run.text = ""
+
+
+def _mutation_control_element_count(text: str) -> int:
+    return text.count("\n") + text.count("\r") + text.count("\t")
+
+
+def _validate_mutation_text(text: str, *, field_name: str) -> None:
+    if not isinstance(text, str):
+        raise ValueError(f"{field_name} must be a string")
+    if len(text) > _MAX_MUTATION_TEXT_CHARS:
+        raise ValueError(
+            f"{field_name} exceeds the {_MAX_MUTATION_TEXT_CHARS:,}-character "
+            "Word mutation limit"
+        )
+    if _mutation_control_element_count(text) > _MAX_MUTATION_CONTROL_ELEMENTS:
+        raise ValueError(
+            f"{field_name} contains too many tabs or line breaks for one Word mutation"
+        )
+
+
+def _ensure_can_add_body_paragraph(document: DocumentType) -> None:
+    paragraph_count = len(document.element.body.xpath(".//w:p"))
+    if paragraph_count >= _MAX_DOCUMENT_PARAGRAPHS:
+        raise ValueError(
+            "The document is already at the safe paragraph limit; adding "
+            "another paragraph would make it unreadable by this connector"
+        )
+
+
+def _document_main_body_text_characters(document: DocumentType) -> int:
+    return sum(
+        len(element.text or "")
+        for element in document.element.body.xpath(
+            ".//w:t | .//w:delText | .//w:instrText"
+        )
+    )
+
+
+def _ensure_projected_text_budget(document: DocumentType, character_delta: int) -> None:
+    if (
+        _document_main_body_text_characters(document) + character_delta
+        > _MAX_DOCUMENT_TEXT_CHARS
+    ):
+        raise ValueError(
+            "The requested mutation would exceed the safe main-body text limit"
+        )
 
 
 def _text_page_response(
@@ -1176,6 +1430,9 @@ def word_set_paragraph_text(
                 f"paragraph_index {paragraph_index} is out of range for a document "
                 f"with {len(paragraphs)} paragraphs"
             )
+        _ensure_projected_text_budget(
+            document, len(text) - len(paragraphs[paragraph_index].text)
+        )
         _set_paragraph_text(paragraphs[paragraph_index], text)
         item = _upload_document(document, file_path, snapshot)
         return _success(item=item)
@@ -1206,6 +1463,9 @@ def word_append_paragraph(
             file_path, site_id, drive_id
         )
         assert snapshot is not None
+        _validate_mutation_text(text, field_name="text")
+        _ensure_can_add_body_paragraph(document)
+        _ensure_projected_text_budget(document, len(text))
         document.add_paragraph(text, style=style)
         item = _upload_document(document, file_path, snapshot)
         return _success(item=item)
@@ -1231,6 +1491,9 @@ def word_add_heading(
             file_path, site_id, drive_id
         )
         assert snapshot is not None
+        _validate_mutation_text(text, field_name="text")
+        _ensure_can_add_body_paragraph(document)
+        _ensure_projected_text_budget(document, len(text))
         document.add_heading(text, level=level)
         item = _upload_document(document, file_path, snapshot)
         return _success(item=item)
@@ -1279,11 +1542,17 @@ def word_replace_text(
     try:
         if not find:
             raise ValueError("find must not be empty")
+        _validate_mutation_text(find, field_name="find")
+        _validate_mutation_text(replace, field_name="replace")
         document, snapshot, _generation = _download_document(
             file_path, site_id, drive_id
         )
         assert snapshot is not None
         replacements = 0
+        added_characters = 0
+        character_delta = 0
+        added_control_elements = 0
+        planned_replacements: list[tuple[Run, str]] = []
         field_depth_stack: list[bool] = []
         for paragraph in document.paragraphs:
             for r, field_protected in _iter_replaceable_runs(
@@ -1306,12 +1575,33 @@ def word_replace_text(
                             "instruction out of sync -- edit this paragraph "
                             "directly in Word instead"
                         )
-                    replacements += run.text.count(find)
-                    run.text = run.text.replace(find, replace)
+                    count = run.text.count(find)
+                    updated_text = run.text.replace(find, replace)
+                    replacements += count
+                    character_delta += len(updated_text) - len(run.text)
+                    added_characters += max(0, len(updated_text) - len(run.text))
+                    added_control_elements += max(
+                        0,
+                        _mutation_control_element_count(updated_text)
+                        - _mutation_control_element_count(run.text),
+                    )
+                    if added_characters > _MAX_MUTATION_TEXT_CHARS:
+                        raise ValueError(
+                            "replacement would add too much text in one Word mutation"
+                        )
+                    if added_control_elements > _MAX_MUTATION_CONTROL_ELEMENTS:
+                        raise ValueError(
+                            "replacement would add too many tabs or line breaks "
+                            "in one Word mutation"
+                        )
+                    planned_replacements.append((run, updated_text))
         if replacements == 0:
             # Nothing changed -- uploading the unmodified document would
             # still create a new version/last-modified entry for no reason.
             return _success(replacements=0)
+        _ensure_projected_text_budget(document, character_delta)
+        for run, updated_text in planned_replacements:
+            run.text = updated_text
         item = _upload_document(document, file_path, snapshot)
         return _success(item=item, replacements=replacements)
     except Exception as e:

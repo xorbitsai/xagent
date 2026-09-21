@@ -85,6 +85,11 @@ def test_word_scopes_actually_exceed_the_microsoft_providers_default_scopes():
         row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "word"
     )
     assert word_app["oauth_scopes"] == ["Files.ReadWrite.All"]
+    assert word_app["launch_config"]["static_env"] == {
+        "XAGENT_TOOL_MAX_OUTPUT_LENGTH": "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+    }
+    assert "top-level main-body paragraphs" in word_app["description"]
+    assert "Tables, headers, footers" in word_app["description"]
     assert _app_scopes_beyond_provider_defaults("word"), (
         "word's oauth_scopes are now fully covered by the microsoft "
         "provider's default_scopes -- if that's genuinely true, it no "

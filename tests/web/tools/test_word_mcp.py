@@ -34,6 +34,27 @@ def _edit_download_mock(content: bytes, *, etag='"abc"') -> Mock:
     return Mock(side_effect=lambda *a, **k: next(responses))
 
 
+def _bypass_edit_checkout(monkeypatch) -> None:
+    """Keep upload-mechanics tests focused; checkout has dedicated coverage."""
+    monkeypatch.setattr(
+        word, "_checkout_edit_snapshot", lambda snapshot, _message: snapshot.etag
+    )
+    monkeypatch.setattr(
+        word, "_check_in_edit_snapshot", lambda _snapshot, _content: None
+    )
+    monkeypatch.setattr(word, "_discard_edit_checkout", lambda _snapshot: None)
+
+
+def _snapshot_for(document: Document, etag='"abc"') -> word._EditSnapshot:
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return word._EditSnapshot(
+        "/drives/drive-1/items/item-1",
+        etag,
+        hashlib.sha256(buffer.getvalue()).hexdigest(),
+    )
+
+
 class MockResponse:
     def __init__(
         self,
@@ -451,9 +472,14 @@ def test_create_only_upload_does_not_chain_secret_bearing_exception(monkeypatch)
     monkeypatch.setattr(word.requests, "request", mock_request)
     mock_put = Mock(return_value=MockResponse({}, status_code=500, url=secret_url))
     monkeypatch.setattr(word.requests, "put", mock_put)
+    monkeypatch.setattr(word, "_reconcile_created_document", Mock(return_value=None))
+    monkeypatch.setattr(
+        word.requests, "get", Mock(side_effect=requests.ConnectionError("dropped"))
+    )
+    monkeypatch.setattr(word.time, "sleep", Mock())
 
-    with pytest.raises(word._GraphRequestError) as exc_info:
-        word._create_only_upload(b"content", "Report.docx", None, None)
+    with pytest.raises(RuntimeError) as exc_info:
+        word._create_only_upload(_docx_bytes(), "Report.docx", None, None)
 
     assert exc_info.value.__cause__ is None
 
@@ -466,9 +492,14 @@ def test_create_only_upload_connection_error_does_not_chain_exception(monkeypatc
         side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
     )
     monkeypatch.setattr(word.requests, "put", mock_put)
+    monkeypatch.setattr(word, "_reconcile_created_document", Mock(return_value=None))
+    monkeypatch.setattr(
+        word.requests, "get", Mock(side_effect=requests.ConnectionError("dropped"))
+    )
+    monkeypatch.setattr(word.time, "sleep", Mock())
 
     with pytest.raises(RuntimeError) as exc_info:
-        word._create_only_upload(b"content", "Report.docx", None, None)
+        word._create_only_upload(_docx_bytes(), "Report.docx", None, None)
 
     assert exc_info.value.__cause__ is None
 
@@ -496,6 +527,29 @@ def test_create_document_uploads_blank_document(monkeypatch):
     assert "Authorization" not in put_call.kwargs.get("headers", {})
     # Re-parses as a real, valid (if blank) docx.
     Document(io.BytesIO(put_call.kwargs["data"]))
+
+
+def test_create_document_reconciles_commit_when_final_response_is_lost(monkeypatch):
+    content = _docx_bytes()
+    responses = iter(
+        [
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+            MockResponse(content=content),
+            MockResponse({"id": "new-item", "eTag": '"new"'}),
+        ]
+    )
+    monkeypatch.setattr(
+        word.requests, "request", Mock(side_effect=lambda *a, **k: next(responses))
+    )
+    monkeypatch.setattr(
+        word.requests,
+        "put",
+        Mock(side_effect=requests.ConnectionError("committed response was lost")),
+    )
+
+    result = word._create_only_upload(content, "Report.docx", None, None)
+
+    assert result == {"id": "new-item", "eTag": '"new"'}
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +860,7 @@ def test_set_paragraph_text_requires_read_generation():
 
 
 def test_set_paragraph_text_uploads_updated_document(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
     content = _docx_bytes(lambda d: d.add_paragraph("Old text"))
     responses = iter(
         [
@@ -834,6 +889,7 @@ def test_set_paragraph_text_uploads_updated_document(monkeypatch):
 
 
 def test_append_paragraph(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
     content = _docx_bytes()
     responses = iter(
         [
@@ -861,6 +917,7 @@ def test_add_heading_validates_level():
 
 
 def test_add_heading_uploads_updated_document(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
     content = _docx_bytes()
     responses = iter(
         [
@@ -883,6 +940,8 @@ def test_add_heading_uploads_updated_document(monkeypatch):
 
 
 def test_replace_text_counts_matches_within_runs(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
+
     def build(d):
         p = d.add_paragraph()
         p.add_run("foo bar foo")
@@ -1145,6 +1204,7 @@ def test_replace_text_edits_ordinary_text_after_a_field_ends(monkeypatch):
     """State must not leak past a field's own "end" marker -- a paragraph
     with nothing but ordinary text, appearing after a completed field,
     must remain freely editable."""
+    _bypass_edit_checkout(monkeypatch)
     from docx.oxml.ns import qn
     from docx.oxml.shared import OxmlElement
 
@@ -1242,6 +1302,7 @@ def test_replace_text_ignores_field_state_from_tracked_insertion(monkeypatch):
     correctly skipped (it's not visible through this module's read tools
     either) -- but its fldChar markers must not leak field-protected state
     onto ordinary text later in the same paragraph."""
+    _bypass_edit_checkout(monkeypatch)
     from docx.oxml.ns import qn
     from docx.oxml.shared import OxmlElement
 
@@ -1290,6 +1351,7 @@ def test_replace_text_finds_match_inside_hyperlink_run(monkeypatch):
     """paragraph.runs excludes runs nested inside <w:hyperlink>. Iterating
     only paragraph.runs would silently skip a match inside hyperlink text
     even though word_get_document_text surfaces that same text."""
+    _bypass_edit_checkout(monkeypatch)
     from docx.oxml.shared import OxmlElement
 
     def build(d):
@@ -1489,6 +1551,14 @@ def test_validate_docx_archive_bounds_paragraph_count(monkeypatch):
         word._validate_docx_archive(buffer.getvalue())
 
 
+def test_validate_docx_archive_bounds_main_body_text(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("sixteen chars!!!"))
+    monkeypatch.setattr(word, "_MAX_DOCUMENT_TEXT_CHARS", 5)
+
+    with pytest.raises(ValueError, match="too much main-body text"):
+        word._validate_docx_archive(content)
+
+
 def test_validate_docx_archive_rejects_dtd_entities():
     import zipfile
 
@@ -1527,6 +1597,7 @@ def test_get_document_text_rejects_zip_bomb(monkeypatch):
 
 
 def test_upload_document_sends_if_match_when_etag_given(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
     mock_request = Mock(
         return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
     )
@@ -1537,7 +1608,7 @@ def test_upload_document_sends_if_match_when_etag_given(monkeypatch):
     word._upload_document(
         Document(),
         "Report.docx",
-        word._EditSnapshot("/drives/drive-1/items/item-1", '"abc123"'),
+        _snapshot_for(Document(), '"abc123"'),
     )
 
     session_call = mock_request.call_args
@@ -1547,10 +1618,98 @@ def test_upload_document_sends_if_match_when_etag_given(monkeypatch):
     )
 
 
+def test_upload_document_holds_checkout_through_final_commit(monkeypatch):
+    original = _docx_bytes(lambda d: d.add_paragraph("before"))
+    document = Document(io.BytesIO(original))
+    document.paragraphs[0].text = "after"
+    snapshot = word._EditSnapshot(
+        "/drives/drive-1/items/item-1",
+        '"before-etag"',
+        hashlib.sha256(original).hexdigest(),
+    )
+    responses = iter(
+        [
+            MockResponse({}, status_code=204),  # checkout
+            MockResponse({"eTag": '"checked-out-etag"'}),
+            MockResponse(content=original),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+            MockResponse({}, status_code=204),  # check in
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(
+        word.requests,
+        "put",
+        Mock(return_value=MockResponse({"id": "item-1"}, status_code=200)),
+    )
+
+    result = word._upload_document(document, "Report.docx", snapshot)
+
+    assert result["id"] == "item-1"
+    urls = [call.kwargs["url"] for call in mock_request.call_args_list]
+    assert urls[0].endswith("/checkout")
+    assert urls[3].endswith("/createUploadSession")
+    assert urls[4].endswith("/checkin")  # codespell:ignore checkin
+    assert mock_request.call_args_list[3].kwargs["headers"]["If-Match"] == (
+        '"checked-out-etag"'
+    )
+
+
+def test_checkout_revalidation_discards_lock_when_content_changed(monkeypatch):
+    original = _docx_bytes(lambda d: d.add_paragraph("before"))
+    changed = _docx_bytes(lambda d: d.add_paragraph("someone else changed it"))
+    snapshot = word._EditSnapshot(
+        "/drives/drive-1/items/item-1",
+        '"before"',
+        hashlib.sha256(original).hexdigest(),
+    )
+    responses = iter(
+        [
+            MockResponse({}, status_code=204),
+            MockResponse({"eTag": '"changed"'}),
+            MockResponse(content=changed),
+            MockResponse({}, status_code=204),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    with pytest.raises(ValueError, match="changed by someone else"):
+        word._checkout_edit_snapshot(snapshot, "changed by someone else")
+
+    assert mock_request.call_args_list[-1].kwargs["url"].endswith("/discardCheckout")
+
+
+def test_check_in_reconciles_when_success_response_is_lost(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("committed"))
+    responses = iter(
+        [
+            requests.ConnectionError("check-in response lost"),
+            MockResponse(content=content),
+            MockResponse({"publication": {"level": "published"}}),
+        ]
+    )
+
+    def request(*args, **kwargs):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(word.requests, "request", Mock(side_effect=request))
+    snapshot = word._EditSnapshot(
+        "/drives/drive-1/items/item-1", '"before"', "generation"
+    )
+
+    word._check_in_edit_snapshot(snapshot, content)
+
+
 def test_upload_document_rejects_stale_etag_at_session_creation(monkeypatch):
     """A 412 at createUploadSession means someone else changed the file
     since it was downloaded for this edit -- surfaced as a clear conflict,
     not the generic upload-failure message."""
+    _bypass_edit_checkout(monkeypatch)
     mock_request = Mock(
         return_value=MockResponse({"error": {"code": "..."}}, status_code=412)
     )
@@ -1560,7 +1719,7 @@ def test_upload_document_rejects_stale_etag_at_session_creation(monkeypatch):
         word._upload_document(
             Document(),
             "Report.docx",
-            word._EditSnapshot("/drives/drive-1/items/item-1", '"stale"'),
+            _snapshot_for(Document(), '"stale"'),
         )
 
 
@@ -1568,6 +1727,7 @@ def test_upload_document_rejects_stale_etag_at_content_put(monkeypatch):
     """Graph can also reject the conditional write at the content PUT step
     rather than session creation, depending on timing -- both paths must
     surface the same clear conflict message."""
+    _bypass_edit_checkout(monkeypatch)
     mock_request = Mock(
         return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
     )
@@ -1579,11 +1739,12 @@ def test_upload_document_rejects_stale_etag_at_content_put(monkeypatch):
         word._upload_document(
             Document(),
             "Report.docx",
-            word._EditSnapshot("/drives/drive-1/items/item-1", '"stale"'),
+            _snapshot_for(Document(), '"stale"'),
         )
 
 
 def test_upload_document_reconciles_committed_timeout(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
     document = Document()
     buffer = io.BytesIO()
     document.save(buffer)
@@ -1607,7 +1768,7 @@ def test_upload_document_reconciles_committed_timeout(monkeypatch):
     result = word._upload_document(
         document,
         "Report.docx",
-        word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
+        _snapshot_for(document),
     )
 
     assert result["id"] == "item-1"
@@ -1615,6 +1776,7 @@ def test_upload_document_reconciles_committed_timeout(monkeypatch):
 
 
 def test_upload_document_resumes_from_server_offset(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
     monkeypatch.setattr(
         word.requests,
         "request",
@@ -1633,7 +1795,7 @@ def test_upload_document_resumes_from_server_offset(monkeypatch):
     word._upload_document(
         Document(),
         "Report.docx",
-        word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
+        _snapshot_for(Document()),
     )
 
     assert (
@@ -1646,6 +1808,7 @@ def test_upload_document_resumes_from_server_offset(monkeypatch):
 
 
 def test_upload_document_reports_unresolved_ambiguous_outcome(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
     monkeypatch.setattr(
         word.requests,
         "request",
@@ -1667,12 +1830,13 @@ def test_upload_document_reports_unresolved_ambiguous_outcome(monkeypatch):
         word._upload_document(
             Document(),
             "Report.docx",
-            word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
+            _snapshot_for(Document()),
         )
     assert [call.args[0] for call in sleep.call_args_list] == [1.0, 2.0]
 
 
 def test_upload_document_backs_off_before_resuming_5xx(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
     monkeypatch.setattr(
         word.requests,
         "request",
@@ -1699,7 +1863,7 @@ def test_upload_document_backs_off_before_resuming_5xx(monkeypatch):
     result = word._upload_document(
         Document(),
         "Report.docx",
-        word._EditSnapshot("/drives/drive-1/items/item-1", '"abc"'),
+        _snapshot_for(Document()),
     )
 
     assert result["id"] == "item-1"
@@ -1716,12 +1880,75 @@ def test_download_document_returns_etag_from_metadata(monkeypatch):
 
     _document, snapshot, generation = word._download_document("Report.docx", None, None)
 
-    assert snapshot == word._EditSnapshot("/drives/drive-1/items/item-1", '"xyz"')
+    assert snapshot == word._EditSnapshot(
+        "/drives/drive-1/items/item-1", '"xyz"', generation
+    )
     assert generation == hashlib.sha256(content).hexdigest()
     metadata_call = mock_request.call_args_list[0]
-    assert metadata_call.kwargs["params"] == {"$select": "id,eTag,parentReference"}
+    assert metadata_call.kwargs["params"] == {
+        "$select": "id,eTag,parentReference,publication"
+    }
     content_call = mock_request.call_args_list[1]
     assert content_call.kwargs["url"].endswith("/drives/drive-1/items/item-1/content")
+
+
+def test_download_document_refuses_to_adopt_existing_checkout(monkeypatch):
+    metadata = _edit_metadata()
+    metadata["publication"] = {"level": "checkout"}
+    mock_request = Mock(return_value=MockResponse(metadata))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    with pytest.raises(ValueError, match="already checked out"):
+        word._download_document("Report.docx", None, None)
+
+    assert mock_request.call_count == 1
+
+
+def test_parser_work_budget_is_materially_bounded():
+    assert word._MAX_DECOMPRESSED_BYTES <= 25_000_000
+    assert word._MAX_XML_ELEMENTS <= 50_000
+    assert word._MAX_DOCUMENT_PARAGRAPHS <= 2_000
+    assert word._MAX_DOCUMENT_TEXT_CHARS <= 400_000
+    assert word._DEFAULT_PARAGRAPH_PAGE_SIZE == word._MAX_PARAGRAPH_PAGE_SIZE
+
+
+def test_append_rejects_document_already_at_paragraph_limit(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("at limit"))
+    mock_request = _edit_download_mock(content)
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(word, "_MAX_DOCUMENT_PARAGRAPHS", 1)
+
+    result = json.loads(word.word_append_paragraph("Report.docx", "one too many"))
+
+    assert result["status"] == "error"
+    assert "paragraph limit" in result["message"]
+    assert mock_request.call_count == 2
+
+
+def test_append_rejects_projected_text_growth_before_serializing(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("1234"))
+    mock_request = _edit_download_mock(content)
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(word, "_MAX_DOCUMENT_TEXT_CHARS", 5)
+
+    result = json.loads(word.word_append_paragraph("Report.docx", "67"))
+
+    assert result["status"] == "error"
+    assert "safe main-body text limit" in result["message"]
+    assert mock_request.call_count == 2
+
+
+def test_replace_rejects_excessive_generated_line_breaks_before_upload(monkeypatch):
+    content = _docx_bytes(lambda d: d.add_paragraph("needle"))
+    mock_request = _edit_download_mock(content)
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(word, "_MAX_MUTATION_CONTROL_ELEMENTS", 2)
+
+    result = json.loads(word.word_replace_text("Report.docx", "needle", "a\nb\nc\nd"))
+
+    assert result["status"] == "error"
+    assert "too many tabs or line breaks" in result["message"]
+    assert mock_request.call_count == 0
 
 
 @pytest.mark.parametrize(

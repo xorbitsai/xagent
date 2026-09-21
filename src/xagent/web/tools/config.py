@@ -533,7 +533,7 @@ def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
     from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
 
     return restrict_to_app_scoped_oauth_grant(
-        app_info.get("id"), (app_info.get("provider"), app_info.get("id"))
+        app_info, (app_info.get("provider"), app_info.get("id"))
     )
 
 
@@ -4005,6 +4005,7 @@ class WebToolConfig(BaseToolConfig):
         *,
         provider_name: object,
         app_id: object,
+        app_info: Mapping[str, Any] | None = None,
         resource_owner_key: str | None = None,
     ) -> _LegacyOAuthTokenResolution:
         """Resolve and persist one exact OAuth owner in an isolated transaction."""
@@ -4032,7 +4033,8 @@ class WebToolConfig(BaseToolConfig):
                 # can't be trusted to carry a permission added after that flow
                 # already existed. See APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
                 providers_to_check = restrict_to_app_scoped_oauth_grant(
-                    app_id, [provider_name, app_id]
+                    app_info if app_info is not None else app_id,
+                    [provider_name, app_id],
                 )
                 oauth_account = (
                     scoped_user_oauth_query(
@@ -4261,6 +4263,7 @@ class WebToolConfig(BaseToolConfig):
                 legacy_token = await self._resolve_legacy_oauth_access_token(
                     provider_name=provider_name,
                     app_id=app_id,
+                    app_info=app_info,
                     resource_owner_key=(
                         self._mcp_runtime_authorization_policy.resource_owner_key
                         if actor_builtin

@@ -2169,7 +2169,7 @@ def _enrich_oauth_server_info(
     provider = app_info.get("provider")
     app_id = app_info.get("id")
     connected_account = None
-    for key in restrict_to_app_scoped_oauth_grant(app_id, [app_id, provider]):
+    for key in restrict_to_app_scoped_oauth_grant(app_info, [app_id, provider]):
         connected_account = oauth_emails.get(key)
         if connected_account:
             break
@@ -2265,7 +2265,7 @@ def _oauth_account_can_connect(oauth_account: object) -> bool:
 
 def _oauth_keys_for_app(app: dict) -> list[str]:
     return restrict_to_app_scoped_oauth_grant(
-        app.get("id"), _app_lookup_keys(app.get("id"), app.get("provider"))
+        app, _app_lookup_keys(app.get("id"), app.get("provider"))
     )
 
 
@@ -4742,7 +4742,7 @@ def _teardown_mcp_app_server_locally(
         if str(server.transport or "").lower() == "oauth":
             provider = expected_app.provider_name
             providers_to_delete = restrict_to_app_scoped_oauth_grant(
-                app_id, [provider, app_id]
+                expected_app, [provider, app_id]
             )
             if providers_to_delete:
                 builtin_oauth_revocations.extend(
@@ -5057,7 +5057,7 @@ async def delete_mcp_server(
                 # disconnect any other app — Instagram — still relying on
                 # that shared grant.
                 providers_to_delete = restrict_to_app_scoped_oauth_grant(
-                    app_id, [provider, app_id]
+                    app_info, [provider, app_id]
                 )
                 if providers_to_delete:
                     builtin_oauth_revocations.extend(

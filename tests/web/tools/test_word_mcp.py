@@ -867,6 +867,41 @@ def test_paginated_reads_reject_tiny_output_cap_before_download(monkeypatch, too
     mock_request.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: word.word_create_document("Report.docx"),
+        lambda: word.word_set_paragraph_text(
+            "Report.docx", 0, "New text", expected_generation="deadbeef"
+        ),
+        lambda: word.word_append_paragraph("Report.docx", "New text"),
+        lambda: word.word_add_heading("Report.docx", "New heading"),
+        lambda: word.word_replace_text("Report.docx", "find", "replace"),
+    ],
+)
+def test_mutating_tools_reject_tiny_output_cap_before_graph_work(monkeypatch, call):
+    """A cap too small for _success() to fit lets the outer output filter
+    raw-truncate a real response into invalid JSON, since only _error() (not
+    _success()) degrades gracefully. Rejecting the cap upfront, before any
+    Graph work, avoids ever generating that unparsable output."""
+    mock_request = Mock()
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock()
+    monkeypatch.setattr(word.requests, "put", mock_put)
+    monkeypatch.setattr(
+        word,
+        "get_tool_max_output_length",
+        lambda: word._MIN_TOOL_OUTPUT_LENGTH - 1,
+    )
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert "XAGENT_TOOL_MAX_OUTPUT_LENGTH" in result["message"]
+    mock_request.assert_not_called()
+    mock_put.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # write
 # ---------------------------------------------------------------------------
@@ -1825,6 +1860,41 @@ def test_upload_document_reconciles_committed_timeout(monkeypatch):
         word.requests,
         "put",
         Mock(side_effect=requests.ConnectionError("connection dropped")),
+    )
+
+    result = word._upload_document(
+        document,
+        "Report.docx",
+        _snapshot_for(document),
+    )
+
+    assert result["id"] == "item-1"
+    assert result["eTag"] == '"new"'
+
+
+def test_upload_document_reconciles_after_stale_content_range(monkeypatch):
+    """A 416 (Content-Range desync, e.g. after a prior ambiguous PUT actually
+    landed more bytes than this session's local offset tracked) is retryable
+    ambiguity, like a dropped connection -- not a definite failure that
+    should discard the in-progress edit before checking whether it already
+    committed."""
+    _bypass_edit_checkout(monkeypatch)
+    document = Document()
+    buffer = io.BytesIO()
+    document.save(buffer)
+    uploaded = buffer.getvalue()
+    responses = iter(
+        [
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+            MockResponse(content=uploaded),
+            MockResponse({"id": "item-1", "eTag": '"new"'}),
+        ]
+    )
+    monkeypatch.setattr(
+        word.requests, "request", Mock(side_effect=lambda *a, **k: next(responses))
+    )
+    monkeypatch.setattr(
+        word.requests, "put", Mock(return_value=MockResponse({}, status_code=416))
     )
 
     result = word._upload_document(

@@ -93,6 +93,7 @@ _DEFAULT_PARAGRAPH_PAGE_SIZE = 500
 _MIN_PARAGRAPH_PAGE_SIZE = 100
 _MAX_PARAGRAPH_PAGE_SIZE = 500
 _MIN_PAGINATION_OUTPUT_LENGTH = 16_384
+_MIN_TOOL_OUTPUT_LENGTH = 2_048
 
 
 class _GraphRequestError(RuntimeError):
@@ -731,7 +732,7 @@ def _upload_checked_out_document(
                 if next_offset is not None:
                     offset = next_offset
                     continue
-            elif response.status_code < 500:
+            elif response.status_code < 500 and response.status_code != 416:
                 raise _GraphRequestError(
                     f"Word document upload failed with HTTP {response.status_code}",
                     status_code=response.status_code,
@@ -1316,6 +1317,23 @@ def _require_pagination_output_budget() -> None:
         )
 
 
+def _require_tool_output_budget() -> None:
+    """Reject caps too small for _success() to guarantee a valid envelope.
+
+    Unlike _error(), _success() always serializes its full payload -- an
+    accepted cap below this floor lets a real success response (even a
+    no-op) exceed it, so the outer raw-truncating output filter mangles the
+    result into invalid JSON instead of the filter ever seeing a complete
+    envelope. The check runs before any Graph work in every non-paginated
+    Word tool.
+    """
+    if get_tool_max_output_length() < _MIN_TOOL_OUTPUT_LENGTH:
+        raise ValueError(
+            "Word tools require XAGENT_TOOL_MAX_OUTPUT_LENGTH to be at least "
+            f"{_MIN_TOOL_OUTPUT_LENGTH} characters"
+        )
+
+
 @mcp.tool()
 def word_create_document(
     file_path: str, site_id: str | None = None, drive_id: str | None = None
@@ -1324,6 +1342,7 @@ def word_create_document(
     already exists there -- edit it with the other word_* tools instead of
     recreating it."""
     try:
+        _require_tool_output_budget()
         buffer = io.BytesIO()
         Document().save(buffer)
         item = _create_only_upload(buffer.getvalue(), file_path, site_id, drive_id)
@@ -1434,6 +1453,7 @@ def word_set_paragraph_text(
     the word_list_paragraphs response that supplied paragraph_index, preventing
     an intervening edit from redirecting the index to different content."""
     try:
+        _require_tool_output_budget()
         if not expected_generation:
             raise ValueError(
                 "expected_generation from word_list_paragraphs is required"
@@ -1480,6 +1500,7 @@ def word_append_paragraph(
     invalid names raise an error rather than silently falling back to
     Normal."""
     try:
+        _require_tool_output_budget()
         document, snapshot, _generation = _download_document(
             file_path, site_id, drive_id
         )
@@ -1506,6 +1527,7 @@ def word_add_heading(
     """Append a heading to the end of a Word document. level is 0 (the
     document title style) through 9."""
     try:
+        _require_tool_output_budget()
         if not 0 <= level <= 9:
             raise ValueError("level must be between 0 and 9")
         document, snapshot, _generation = _download_document(
@@ -1561,6 +1583,7 @@ def word_replace_text(
     binding or the field's own instruction, with no way for this tool to
     update either to match."""
     try:
+        _require_tool_output_budget()
         if not find:
             raise ValueError("find must not be empty")
         _validate_mutation_text(find, field_name="find")

@@ -2033,6 +2033,32 @@ class TestToolConcurrencyConfig:
         assert get_tool_max_concurrency() == 3
 
 
+class TestGetToolMaxStructuredTruncateInputChars:
+    """Test get_tool_max_structured_truncate_input_chars() function."""
+
+    def test_default(self, monkeypatch):
+        from xagent.config import get_tool_max_structured_truncate_input_chars
+
+        monkeypatch.delenv(
+            "XAGENT_TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS", raising=False
+        )
+        assert get_tool_max_structured_truncate_input_chars() == 10_000_000
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import get_tool_max_structured_truncate_input_chars
+
+        monkeypatch.setenv("XAGENT_TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS", "500000")
+        assert get_tool_max_structured_truncate_input_chars() == 500000
+
+    def test_invalid_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_tool_max_structured_truncate_input_chars
+
+        monkeypatch.setenv(
+            "XAGENT_TOOL_MAX_STRUCTURED_TRUNCATE_INPUT_CHARS", "not-a-number"
+        )
+        assert get_tool_max_structured_truncate_input_chars() == 10_000_000
+
+
 class TestTaskRuntimeHookConfig:
     def test_defaults(self, monkeypatch):
         monkeypatch.delenv(TASK_RUNTIME_HOOK_MAX_WORKERS, raising=False)

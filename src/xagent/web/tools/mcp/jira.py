@@ -453,14 +453,14 @@ _RETRY_PAGE_SIZE = 10
 #: (bounding a self-inflicted retry instead of skipping optional data).
 _FALLBACK_ATTEMPT_TIMEOUT_SECONDS = 10
 
-#: Rough upper bound on how many extra characters replacing a page's
-#: "total_count": null with an actual number can add (the field's key,
-#: comma, and quoting are already present in the null-count page, so the
-#: only real delta is null (4 chars) -> up to a many-digit integer).
-#: Checked before calling _approximate_count so a page already close to
-#: max_output_length skips the network round trip for a count that's
-#: about to be discarded anyway, rather than fetching it and finding out
-#: after the fact.
+#: Rough upper bound on how many extra characters replacing
+#: "approximate_total_count": null with an actual number can add (the
+#: field's key, comma, and quoting are already present in the two-null
+#: page, so the only real delta is null (4 chars) -> up to a many-digit
+#: integer). Checked before calling _approximate_count so a page already
+#: close to max_output_length skips the network round trip for a count
+#: that's about to be discarded anyway, rather than fetching it and
+#: finding out after the fact.
 _TOTAL_COUNT_RESERVE_CHARS = 20
 
 #: Fields requested for jira_search_issues. Kept in one place so every
@@ -622,20 +622,44 @@ def _fetch_and_summarize_page(
 
 
 def _build_search_response(
-    issues: list[dict[str, Any]], total_count: int | None, next_token: str | None
+    issues: list[dict[str, Any]],
+    *,
+    total_count: int | None = None,
+    approximate_total_count: int | None = None,
+    next_token: str | None,
 ) -> str:
-    # Field order matters here: total_count/returned_count/truncated/
+    # Field order matters here: the count fields/returned_count/truncated/
     # next_page_token come before the (much larger) issues list so that
     # if this string is ever truncated downstream anyway, the caller
     # still sees the pagination signal, not just a partial issues array
     # with no idea more pages exist.
-    return _success(
-        total_count=total_count,
+    #
+    # total_count and approximate_total_count are deliberately separate,
+    # mutually-exclusive fields rather than one field whose precision
+    # varies by call: total_count is only ever set from len(issues) (a
+    # final page's exact count), approximate_total_count only ever from
+    # Jira's own approximate-count endpoint, which Atlassian's API docs
+    # explicitly document as an estimate. A single shared field would
+    # let a consumer read a wire value as exact on one call and as an
+    # estimate on another with no way to tell which case it's looking
+    # at. total_count keeps its original always-present-as-null
+    # behavior (existing callers already treat a null there as "not
+    # computed"); approximate_total_count is omitted entirely rather
+    # than sent as null on every call that never computes it -- this is
+    # the common case (most pages don't have both a continuation token
+    # AND output-budget headroom for the advisory count call), and this
+    # tool's whole purpose is staying under an output-size budget, so
+    # a boilerplate null field on every response works against that.
+    payload: dict[str, Any] = {"total_count": total_count}
+    if approximate_total_count is not None:
+        payload["approximate_total_count"] = approximate_total_count
+    payload.update(
         returned_count=len(issues),
         truncated=bool(next_token),
         next_page_token=next_token or None,
         issues=issues,
     )
+    return _success(**payload)
 
 
 def _bounded_search_error(message: str, max_output_length: int) -> str:
@@ -741,16 +765,27 @@ def jira_search_issues(
     except under an extremely small configured output cap where even
     that can't fit -- there, the response is the bare
     {"status": "error"} envelope with no message key at all.
-    Returns total_count: an approximate count of ALL issues matching the
-    JQL (independent of pagination; null if unavailable, e.g. the count
-    endpoint failed, OR because including it would have pushed an
-    otherwise-fitting page over the output limit -- both cases look the
-    same to the caller). Only computed for the first page of a search
-    (when next_page_token is empty) -- it's a per-JQL constant, not tied
-    to any one page, so carry it forward yourself for later pages of the
-    same search instead of expecting it again. Compare it against
-    returned_count to know whether more issues exist beyond what
-    truncated/next_page_token alone would tell you.
+    Returns two mutually-exclusive count fields for the total matching
+    the JQL (independent of pagination; neither is populated when this
+    isn't the first page, the count endpoint failed, or including a
+    count would have pushed an otherwise-fitting page over the output
+    limit -- these cases all look the same to the caller). Only ever
+    computed for the first page of a search (when next_page_token is
+    empty) -- it's a per-JQL constant, not tied to any one page, so
+    carry it forward yourself for later pages of the same search
+    instead of expecting it again.
+    - total_count: the EXACT total, always present (null when not
+      computed) -- only set when this first page is also the last (no
+      more results beyond it), since len(issues) is already exact in
+      that case with no extra call needed.
+    - approximate_total_count: an ESTIMATE from Jira's own
+      approximate-count endpoint, present ONLY when there ARE more
+      results beyond this first page and it was actually computed
+      (Atlassian's API explicitly documents this endpoint's result as
+      an estimate, not an exact count) -- absent, not null, otherwise.
+    Compare either one against returned_count to know whether more
+    issues exist beyond what truncated/next_page_token alone would
+    tell you.
     """
     try:
         resolved_cloud_id = _resolve_cloud_id(cloud_id)
@@ -797,7 +832,7 @@ def jira_search_issues(
                 allow_retry=is_first_attempt,
                 raw_fields=raw_fields,
             )
-            response = _build_search_response(issues, None, next_token)
+            response = _build_search_response(issues, next_token=next_token)
             if len(response) <= max_output_length:
                 fit = True
                 break
@@ -829,7 +864,7 @@ def jira_search_issues(
                 max_output_length,
             )
 
-        # total_count is a per-JQL constant, independent of pagination --
+        # The count is a per-JQL constant, independent of pagination --
         # only fetch it once, for the caller's first page, and only when
         # there's actually more beyond this page: an exact count is
         # already known for free (len(issues)) when this page is both
@@ -837,38 +872,53 @@ def jira_search_issues(
         # would just be a redundant network round trip for a number
         # that's already exact. Never fetched on either early return
         # above (size-overflow or stuck-cursor) either, for the same
-        # "don't do wasted work" reason.
+        # "don't do wasted work" reason. exact_total_count and
+        # approximate_total_count are mutually exclusive: at most one
+        # of them is ever set below (see _build_search_response for why
+        # they're kept as two separate fields instead of one whose
+        # precision silently varies by call).
+        exact_total_count: int | None = None
+        approximate_total_count: int | None = None
         if next_page_token:
-            total_count = None
+            pass
         elif not next_token:
-            total_count = len(issues)
+            exact_total_count = len(issues)
         elif len(response) + _TOTAL_COUNT_RESERVE_CHARS > max_output_length:
             # `response` is the already-fitting page the loop above just
             # built -- if there's not even enough headroom left for a
-            # plausible total_count value, skip the network round trip
-            # (and the count endpoint's own rate-limit budget) for a
-            # result that's about to be discarded as soon as it comes
-            # back anyway.
-            total_count = None
+            # plausible count value, skip the network round trip (and
+            # the count endpoint's own rate-limit budget) for a result
+            # that's about to be discarded as soon as it comes back
+            # anyway.
+            pass
         else:
-            total_count = _approximate_count(resolved_cloud_id, jql)
+            approximate_total_count = _approximate_count(resolved_cloud_id, jql)
 
-        if total_count is not None:
-            with_count = _build_search_response(issues, total_count, next_token)
+        if exact_total_count is not None or approximate_total_count is not None:
+            with_count = _build_search_response(
+                issues,
+                total_count=exact_total_count,
+                approximate_total_count=approximate_total_count,
+                next_token=next_token,
+            )
             if len(with_count) <= max_output_length:
                 response = with_count
             else:
-                # total_count is advisory; if adding it is ever what
-                # tips an already-fitting page over budget, drop it
-                # rather than fail a search that otherwise fit -- reuse
-                # `response` (the loop's already-fitting, already-built
-                # page) instead of paying for another full serialization
-                # of `issues` just to reproduce the same page again.
-                total_count = None
+                # Both counts are additive/advisory; if adding either is
+                # ever what tips an already-fitting page over budget,
+                # drop it rather than fail a search that otherwise fit
+                # -- reuse `response` (the loop's already-fitting,
+                # already-built page) instead of paying for another
+                # full serialization of `issues` just to reproduce the
+                # same page again.
+                exact_total_count = None
+                approximate_total_count = None
 
         logger.info(
             f"jira_search_issues: returned={len(issues)} "
-            f"approx_total={total_count} has_next_page={bool(next_token)}"
+            f"exact_total={exact_total_count} "
+            f"approximate_total={approximate_total_count} "
+            f"has_next_page={bool(next_token)}"
         )
         return response
     except Exception as e:

@@ -464,7 +464,8 @@ def test_search_issues_sends_jql_and_reports_next_page_token(monkeypatch):
     assert result["issues"][0]["key"] == "ENG-1"
     assert result["issues"][0]["summary"] == "Bug"
     assert result["returned_count"] == 1
-    assert result["total_count"] == 42
+    assert result["total_count"] is None
+    assert result["approximate_total_count"] == 42
     assert result["truncated"] is True
     assert result["next_page_token"] == "token-2"
     search_call = mock_request.call_args_list[1]
@@ -647,6 +648,7 @@ def test_search_issues_total_count_is_none_when_count_endpoint_fails(monkeypatch
 
     assert result["status"] == "success"
     assert result["total_count"] is None
+    assert "approximate_total_count" not in result
     assert result["returned_count"] == 1
 
 
@@ -685,7 +687,8 @@ def test_search_issues_retries_with_smaller_page_when_over_output_budget(monkeyp
 
     assert result["status"] == "success"
     assert result["returned_count"] == 3
-    assert result["total_count"] == 500
+    assert result["total_count"] is None
+    assert result["approximate_total_count"] == 500
     assert result["next_page_token"] == "retry-next-token"
     first_search_call = mock_request.call_args_list[1]
     retry_search_call = mock_request.call_args_list[2]
@@ -905,6 +908,7 @@ def test_search_issues_skips_approximate_count_on_later_pages(monkeypatch):
 
     assert result["status"] == "success"
     assert result["total_count"] is None
+    assert "approximate_total_count" not in result
     # Only 2 calls total (sites + search) -- no approximate-count call.
     assert mock_request.call_count == 2
 
@@ -934,9 +938,42 @@ def test_search_issues_final_first_page_uses_exact_count_without_a_network_call(
 
     assert result["status"] == "success"
     assert result["total_count"] == 2
+    assert "approximate_total_count" not in result
     assert result["returned_count"] == 2
     # Only 2 calls total (sites + search) -- no approximate-count call.
     assert mock_request.call_count == 2
+
+
+def test_search_issues_exact_and_approximate_total_count_are_mutually_exclusive():
+    # total_count and approximate_total_count must never both carry a
+    # value on the same response -- an exact count and an estimate are
+    # different precision guarantees, and collapsing them into one
+    # field (or emitting both) would let a consumer read one value as
+    # if it had the other's precision. Exercised directly against
+    # _build_search_response rather than the full tool, since the tool
+    # itself never has both a final-page exact count AND an
+    # approximate-count result to pass in at the same time -- this
+    # pins the contract at the one function that assembles the wire
+    # payload, independent of which caller path reaches it.
+    issues = [jira._summarize_issue({"key": "ENG-1", "fields": {"summary": "a"}})]
+
+    exact_only = json.loads(
+        jira._build_search_response(issues, total_count=1, next_token=None)
+    )
+    assert exact_only["total_count"] == 1
+    assert "approximate_total_count" not in exact_only
+
+    approximate_only = json.loads(
+        jira._build_search_response(
+            issues, approximate_total_count=50, next_token="next-token"
+        )
+    )
+    assert approximate_only["total_count"] is None
+    assert approximate_only["approximate_total_count"] == 50
+
+    neither = json.loads(jira._build_search_response(issues, next_token="next-token"))
+    assert neither["total_count"] is None
+    assert "approximate_total_count" not in neither
 
 
 def test_search_issues_first_page_with_more_results_still_calls_approximate_count(
@@ -958,7 +995,8 @@ def test_search_issues_first_page_with_more_results_still_calls_approximate_coun
 
     result = json.loads(jira.jira_search_issues("project = ENG"))
 
-    assert result["total_count"] == 42
+    assert result["total_count"] is None
+    assert result["approximate_total_count"] == 42
     assert mock_request.call_count == 3
 
 
@@ -980,7 +1018,7 @@ def test_search_issues_skips_approximate_count_when_no_headroom_left(monkeypatch
     monkeypatch.setattr(jira.requests, "request", mock_request)
     fitting_length = len(
         jira._build_search_response(
-            [jira._summarize_issue(page["issues"][0])], None, "next-token"
+            [jira._summarize_issue(page["issues"][0])], next_token="next-token"
         )
     )
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: fitting_length + 5)
@@ -988,6 +1026,7 @@ def test_search_issues_skips_approximate_count_when_no_headroom_left(monkeypatch
     result = json.loads(jira.jira_search_issues("project = ENG"))
 
     assert result["total_count"] is None
+    assert "approximate_total_count" not in result
     # Only 2 calls total (sites + search) -- no approximate-count call.
     assert mock_request.call_count == 2
 
@@ -1014,7 +1053,7 @@ def test_search_issues_drops_total_count_and_reuses_fitting_response_on_overflow
     monkeypatch.setattr(jira.requests, "request", mock_request)
     fitting_length = len(
         jira._build_search_response(
-            [jira._summarize_issue(page["issues"][0])], None, "next-token"
+            [jira._summarize_issue(page["issues"][0])], next_token="next-token"
         )
     )
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: fitting_length + 25)
@@ -1023,8 +1062,10 @@ def test_search_issues_drops_total_count_and_reuses_fitting_response_on_overflow
         result = json.loads(jira.jira_search_issues("project = ENG"))
 
     assert result["total_count"] is None
+    assert "approximate_total_count" not in result
     assert mock_request.call_count == 3
-    assert "approx_total=None" in caplog.text
+    assert "exact_total=None" in caplog.text
+    assert "approximate_total=None" in caplog.text
 
 
 def test_search_issues_raw_fields_returns_the_unslimmed_jira_shape(monkeypatch):

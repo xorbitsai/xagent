@@ -1225,6 +1225,32 @@ def test_success_with_capped_dict_degrades_a_two_key_nested_dict_to_a_marker(
     assert result["record"]["metrics"] == {"truncated": True}
 
 
+def test_success_with_capped_dict_skips_the_marker_when_it_would_grow_the_field(
+    monkeypatch,
+):
+    """Regression test: the {"truncated": true} marker (19 bytes) can be
+    bigger than the tiny dict it would replace (e.g. {"a": 1}, 8 bytes).
+    Installing it anyway would grow the payload instead of shrinking it,
+    eating into the byte budget phase 2 needs to keep other fields (like
+    "id") alive -- silently dropping exactly the kind of field the
+    last-resort fallback exists to preserve. The marker must only be used
+    when it's actually smaller than what it replaces; otherwise this falls
+    back to {}, same as before the marker existed."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "85")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"tiny": {"a": 1}, "id": "r1", "name": "Bob", "note": "n" * 30},
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 85
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["record"]["id"] == "r1"
+    assert result["record"]["tiny"] == {}
+
+
 def test_success_with_capped_dict_top_level_single_key_survives_phase_two(
     monkeypatch,
 ):

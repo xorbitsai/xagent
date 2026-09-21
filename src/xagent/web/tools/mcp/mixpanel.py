@@ -64,13 +64,13 @@ def _error(message: str) -> str:
 
 def _success_with_capped_list(key: str, items: Any) -> str:
     """Wrap a bare list under ``key`` for success_with_capped_dict, then
-    restore the nested key if its phase-2 fallback dropped it -- but only
-    when the restored size still fits XAGENT_TOOL_MAX_OUTPUT_LENGTH.
+    restore the nested key if its last-resort fallback dropped it -- but
+    only when the restored size still fits XAGENT_TOOL_MAX_OUTPUT_LENGTH.
 
-    success_with_capped_dict can drop the wrapper's sole key entirely once
-    list-halving alone can't fit an aggressively low limit, leaving
-    capped[key] == {} instead of {key: []} -- a caller doing
-    result[key][key] then raises KeyError. Restoring the key
+    success_with_capped_dict's last-resort fallback can drop the wrapper's
+    sole key entirely once list-halving alone can't fit an aggressively
+    low limit, leaving capped[key] == {} instead of {key: []} -- a caller
+    doing result[key][key] then raises KeyError. Restoring the key
     unconditionally isn't safe: this string ends up at
     result["content"][0]["text"] in the MCP adapter's response, which the
     separate OutputFilteredToolWrapper re-checks against this same limit
@@ -79,10 +79,10 @@ def _success_with_capped_list(key: str, items: Any) -> str:
     garbage, worse than the KeyError. The required {key: [...]} shape has
     a fixed minimum byte size; below it, no representation is both
     correctly shaped and within budget, so the limit wins and
-    result[key][key] can still KeyError in that narrow window -- a
-    pre-existing gap in success_with_capped_dict itself (shared by every
-    other caller), not one this local wrapper can close without touching
-    that shared function.
+    result[key][key] can still KeyError in that narrow window -- an
+    inherent floor of success_with_capped_dict's last-resort fallback
+    (shared by every other caller), not one this local wrapper can close
+    without touching that shared function.
     """
     max_output_length = get_tool_max_output_length()
     capped_response = success_with_capped_dict(key, {key: items})

@@ -825,12 +825,33 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
         else:
             high = middle - 1
     payload["warnings"] = [warning[:low] + marker]
+    field_marker = {"truncated": True}
     while len(json.dumps(payload, ensure_ascii=False)) > max_output_length:
         value = payload.get(field_name)
         if not isinstance(value, dict) or not value:
             break
         keys = list(value)
-        payload[field_name] = {key: value[key] for key in keys[: len(keys) // 2]}
+        if len(keys) > 1:
+            payload[field_name] = {key: value[key] for key in keys[: len(keys) // 2]}
+            continue
+        # A 1-key dict can't shrink further by dropping keys without
+        # emptying it outright -- the same key-count-halving rule
+        # success_with_capped_dict's phase 1 uses floors to zero once only
+        # one key is left, collapsing straight to {} in a single step
+        # instead of degrading gradually (see that function's docstring
+        # for the general problem this mirrors; this loop reimplements
+        # its own halving locally to make room for `warnings`, so it
+        # inherited the same sharp edge). Try the small marker first, but
+        # only when it's smaller than what it replaces and hasn't already
+        # been tried -- this loop has no further fallback tier below {},
+        # so it must still empty the field outright if even the marker
+        # doesn't make it fit.
+        if value != field_marker and len(
+            json.dumps(field_marker, ensure_ascii=False)
+        ) < len(json.dumps(value, ensure_ascii=False)):
+            payload[field_name] = dict(field_marker)
+        else:
+            payload[field_name] = {}
     return json.dumps(payload, ensure_ascii=False)
 
 

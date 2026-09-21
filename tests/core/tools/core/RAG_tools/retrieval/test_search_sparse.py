@@ -34,7 +34,9 @@ def _searched_terms(mock_table) -> List[str]:
 class TestSearchSparse:
     """Test search_sparse main function."""
 
-    def test_search_sparse_success_no_filters(self, make_handle, routed_facade) -> None:
+    def test_search_sparse_success_no_filters(
+        self, make_handle, routed_coordinator
+    ) -> None:
         """Test successful sparse search with collection filter only (KB isolation).
 
         Re-pointed (#511): the public ``search_sparse`` runs the real handle FTS
@@ -84,7 +86,7 @@ class TestSearchSparse:
         mock_limit.where.return_value = mock_where
         mock_where.to_pandas.return_value = mock_results_df
 
-        with routed_facade(search_sparse_module, handle):
+        with routed_coordinator(search_sparse_module, handle):
             response = search_sparse_module.search_sparse(
                 collection="test_col",
                 model_tag="test_model",
@@ -114,7 +116,7 @@ class TestSearchSparse:
         where_arg = mock_limit.where.call_args[0][0]
         assert "collection" in where_arg.lower() or "test_col" in where_arg
 
-    def test_search_sparse_with_filters(self, make_handle, routed_facade) -> None:
+    def test_search_sparse_with_filters(self, make_handle, routed_coordinator) -> None:
         """Test sparse search with filters."""
         from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
         from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
@@ -154,7 +156,7 @@ class TestSearchSparse:
         with patch.object(
             LanceDBCollectionHandle, "_substring_fallback", return_value=[]
         ) as mock_fallback:
-            with routed_facade(search_sparse_module, handle):
+            with routed_coordinator(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -179,7 +181,7 @@ class TestSearchSparse:
         mock_where.to_pandas.assert_called_once()
 
     def test_search_sparse_applies_collection_filter(
-        self, make_handle, routed_facade
+        self, make_handle, routed_coordinator
     ) -> None:
         """Test that search_sparse always applies collection filter for KB isolation (Issue #72)."""
         from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
@@ -214,7 +216,7 @@ class TestSearchSparse:
         with patch.object(
             LanceDBCollectionHandle, "_substring_fallback", return_value=[]
         ):
-            with routed_facade(search_sparse_module, handle):
+            with routed_coordinator(search_sparse_module, handle):
                 search_sparse_module.search_sparse(
                     collection="my_kb",
                     model_tag="test_model",
@@ -227,7 +229,9 @@ class TestSearchSparse:
         mock_vector_store.build_filter_expression.assert_called_once()
         mock_limit.where.assert_called_once()
 
-    def test_search_sparse_fts_index_missing(self, make_handle, routed_facade) -> None:
+    def test_search_sparse_fts_index_missing(
+        self, make_handle, routed_coordinator
+    ) -> None:
         """Test sparse search when FTS index is missing."""
         from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
         from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
@@ -263,7 +267,7 @@ class TestSearchSparse:
         with patch.object(
             LanceDBCollectionHandle, "_substring_fallback", return_value=[]
         ):
-            with routed_facade(search_sparse_module, handle):
+            with routed_coordinator(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -281,7 +285,7 @@ class TestSearchSparse:
         assert _searched_terms(mock_table) == ["query"]
         mock_search.limit.assert_called_once_with(1)
 
-    def test_search_sparse_readonly_mode(self, make_handle, routed_facade) -> None:
+    def test_search_sparse_readonly_mode(self, make_handle, routed_coordinator) -> None:
         """Test sparse search in readonly mode."""
         from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
         from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
@@ -317,7 +321,7 @@ class TestSearchSparse:
         with patch.object(
             LanceDBCollectionHandle, "_substring_fallback", return_value=[]
         ):
-            with routed_facade(search_sparse_module, handle):
+            with routed_coordinator(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -341,7 +345,7 @@ class TestSearchSparse:
         "xagent.core.tools.core.RAG_tools.utils.model_resolver.resolve_embedding_adapter"
     )
     def test_search_sparse_database_error(
-        self, mock_resolve: Mock, make_handle, routed_facade
+        self, mock_resolve: Mock, make_handle, routed_coordinator
     ) -> None:
         """Test error handling during database operation."""
         handle, mock_vector_store, _ = make_handle(collection="test_col")
@@ -354,7 +358,7 @@ class TestSearchSparse:
         mock_cfg.model_name = "legacy_model"
         mock_resolve.return_value = (mock_cfg, object())
 
-        with routed_facade(search_sparse_module, handle):
+        with routed_coordinator(search_sparse_module, handle):
             response = search_sparse_module.search_sparse(
                 collection="test_col",
                 model_tag="test_model",
@@ -377,7 +381,7 @@ class TestSearchSparse:
         assert mock_vector_store.open_embeddings_table.call_count == 1
         mock_vector_store.open_embeddings_table.assert_called_once_with("test_model")
 
-    def test_search_sparse_empty_results(self, make_handle, routed_facade) -> None:
+    def test_search_sparse_empty_results(self, make_handle, routed_coordinator) -> None:
         """Test sparse search returning no results."""
         from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
         from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
@@ -413,7 +417,7 @@ class TestSearchSparse:
         with patch.object(
             LanceDBCollectionHandle, "_substring_fallback", return_value=[]
         ):
-            with routed_facade(search_sparse_module, handle):
+            with routed_coordinator(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -433,7 +437,7 @@ class TestSearchSparse:
         mock_search.limit.assert_called_once_with(5)
 
     def test_search_sparse_triggers_fallback_with_results(
-        self, make_handle, routed_facade
+        self, make_handle, routed_coordinator
     ) -> None:
         """Ensure fallback populates results and emits an FTS warning."""
         from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
@@ -495,7 +499,7 @@ class TestSearchSparse:
             autospec=True,
             side_effect=_fake_fallback,
         ):
-            with routed_facade(search_sparse_module, handle):
+            with routed_coordinator(search_sparse_module, handle):
                 response = search_sparse_module.search_sparse(
                     collection="test_col",
                     model_tag="test_model",
@@ -510,7 +514,9 @@ class TestSearchSparse:
         assert response.results[0].doc_id == "doc-fallback"
         assert any(w.code == "FTS_FALLBACK" for w in response.warnings)
 
-    def test_search_sparse_score_clamping(self, make_handle, routed_facade) -> None:
+    def test_search_sparse_score_clamping(
+        self, make_handle, routed_coordinator
+    ) -> None:
         """Test that sparse search scores are properly clamped to [0, 1] range."""
         from xagent.core.tools.core.RAG_tools.core.schemas import IndexResult
 
@@ -553,7 +559,7 @@ class TestSearchSparse:
         )
         mock_where.to_pandas.return_value = test_data
 
-        with routed_facade(search_sparse_module, handle):
+        with routed_coordinator(search_sparse_module, handle):
             response = search_sparse_module.search_sparse(
                 collection="test_col",
                 model_tag="test_model",

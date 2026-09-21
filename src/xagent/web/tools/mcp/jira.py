@@ -9,7 +9,13 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import setup_proxy_env, success_with_capped_dict
+from .utils import (
+    clamp_limit,
+    clamp_offset,
+    require_clean_text,
+    setup_proxy_env,
+    success_with_capped_dict,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-mcp")
@@ -53,8 +59,21 @@ def _headers() -> dict[str, str]:
     }
 
 
-def _clamp_limit(limit: int) -> int:
-    return max(1, min(int(limit), MAX_LIMIT))
+def _clean_text_error(value: str, field_name: str, *, hint: str = "") -> str | None:
+    """Return an _error(...) payload if `value` fails require_clean_text,
+    else None -- callers do `if (err := _clean_text_error(...)): return err`.
+
+    A caller-input validation failure here is a routine, expected rejection
+    (an agent will retry with a fixed value), not a connector/API error, so
+    it's handled the same way for every field: caught locally and returned
+    directly, never left to propagate into the surrounding try/except's
+    `logger.error` -- which is reserved for genuine request failures.
+    """
+    try:
+        require_clean_text(value, field_name)
+    except ValueError as exc:
+        return _error(f"{exc}{hint}")
+    return None
 
 
 def _truncate(text: str, max_chars: int = MAX_ERROR_RESPONSE_TEXT_CHARS) -> str:
@@ -303,8 +322,8 @@ def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -
     response's next_start_at to fetch the next page (0 to start over).
     """
     try:
-        max_results = _clamp_limit(limit)
-        offset = max(0, int(start_at))
+        max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
+        offset = clamp_offset(start_at)
         result = _request(
             "GET",
             cloud_id,
@@ -348,7 +367,7 @@ def jira_search_issues(
     the next page.
     """
     try:
-        max_results = _clamp_limit(limit)
+        max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
         # /rest/api/2/search and /rest/api/3/search are deprecated (removed
         # by Atlassian on Jira Cloud); /rest/api/3/search/jql is the
         # replacement and pages via nextPageToken instead of startAt/total.
@@ -823,8 +842,8 @@ def jira_create_issue(
     be one of the site's configured priorities.
     """
     try:
-        if not summary:
-            return _error("summary cannot be empty")
+        if err := _clean_text_error(summary, "summary"):
+            return err
         fields: dict[str, Any] = {
             "project": {"key": project_key},
             "summary": summary,
@@ -867,8 +886,8 @@ def jira_update_issue(
     try:
         fields: dict[str, Any] = {}
         if summary is not None:
-            if not summary:
-                return _error("summary cannot be empty")
+            if err := _clean_text_error(summary, "summary"):
+                return err
             fields["summary"] = summary
         if description is not None:
             fields["description"] = description
@@ -877,11 +896,15 @@ def jira_update_issue(
                 {"accountId": assignee_account_id} if assignee_account_id else None
             )
         if priority is not None:
-            if not priority:
-                return _error(
-                    "priority cannot be empty -- Jira has no way to clear "
-                    "priority through this field; omit the parameter instead"
-                )
+            if err := _clean_text_error(
+                priority,
+                "priority",
+                hint=(
+                    " -- Jira also has no way to clear priority through this "
+                    "field; omit the parameter instead"
+                ),
+            ):
+                return err
             fields["priority"] = {"name": priority}
         if not fields:
             return _error("No fields provided to update")
@@ -1151,8 +1174,8 @@ def jira_list_comments(
     error returned instead.
     """
     try:
-        max_results = _clamp_limit(limit)
-        offset = max(0, int(start_at))
+        max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
+        offset = clamp_offset(start_at)
         result = _request(
             "GET",
             cloud_id,
@@ -1221,8 +1244,8 @@ def jira_search_users(
     response's next_start_at to fetch the next page (0 to start over).
     """
     try:
-        max_results = _clamp_limit(limit)
-        offset = max(0, int(start_at))
+        max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
+        offset = clamp_offset(start_at)
         result = _request(
             "GET",
             cloud_id,

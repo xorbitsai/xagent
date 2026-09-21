@@ -16,6 +16,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from tests.shared.postgres_disposable import disposable_database_factory
+from tests.web.services.coordinator_command_shared import claim_task_command
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -102,7 +103,7 @@ async def host(tmp_path, monkeypatch, database_url):
     get_engine().dispose()
 
 
-def claim(task_id):
+async def claim(task_id):
     with get_session_local()() as db:
         row = (
             db.query(TaskExecutionCommand)
@@ -113,7 +114,7 @@ def claim(task_id):
         return (
             None
             if row is None
-            else task_command_transport.claim_task_command(
+            else await claim_task_command(
                 db, runner_id="worker-1", command_db_id=row.id
             )
         )
@@ -205,7 +206,9 @@ async def test_remote_append_preserves_owner_until_real_finalizer_and_cleanup_ex
     monkeypatch.setattr(task_execution, "execute_task_background", execute)
     first = await create(host)
     assert first.status == TaskStatus.PENDING
-    await task_command_execution.execute_durable_task_command(claim(first.task_id))
+    await task_command_execution.execute_durable_task_command(
+        await claim(first.task_id)
+    )
     await asyncio.wait_for(terminal.wait(), 10)
     script = """
 import asyncio, json, sys
@@ -256,7 +259,9 @@ asyncio.run(main())
         finally:
             await other.close()
         followup = asyncio.create_task(
-            task_command_execution.execute_durable_task_command(claim(first.task_id))
+            task_command_execution.execute_durable_task_command(
+                await claim(first.task_id)
+            )
         )
         await asyncio.sleep(0.1)
         assert not followup.done()
@@ -330,7 +335,7 @@ async def test_unknown_reply_returns_original_identity_without_reinjection(
     request = asyncio.create_task(task_resume.resume_task_reply(ctx))
     try:
         await eventually(lambda: _has_pending(ctx.task_id))
-        command = claim(ctx.task_id)
+        command = await claim(ctx.task_id)
         await task_command_execution.execute_durable_task_command(command)
         with pytest.raises(task_resume.TaskResumeOutcomeUnknownError) as unknown:
             await asyncio.wait_for(request, 10)
@@ -408,7 +413,7 @@ async def test_reply_carries_authenticated_actor_after_agent_owner_transfer(
     command_id = task_resume_command._admit_reply(ctx, "sdk", "", "reply")
     prepare = AsyncMock()
     monkeypatch.setattr(task_resume, "resume_task_reply", prepare)
-    await task_command_execution.execute_durable_task_command(claim(ctx.task_id))
+    await task_command_execution.execute_durable_task_command(await claim(ctx.task_id))
     delivered = prepare.call_args.args[0]
     assert delivered.actor_user_id == actor_id
     assert delivered.task_owner_user_id == host.owner
@@ -442,7 +447,9 @@ async def test_controls_apply_while_execution_is_running(host, monkeypatch):
     from xagent.web.services import task_start_consumer
 
     monkeypatch.setattr(task_start_consumer, "_schedule_committed_turn", schedule)
-    await task_command_execution.execute_durable_task_command(claim(first.task_id))
+    await task_command_execution.execute_durable_task_command(
+        await claim(first.task_id)
+    )
     await asyncio.wait_for(started.wait(), 5)
     with get_session_local()() as db:
         task_command_transport.stage_task_command(
@@ -460,7 +467,10 @@ async def test_controls_apply_while_execution_is_running(host, monkeypatch):
     )
     try:
         await asyncio.wait_for(
-            task_command_execution.execute_durable_task_command(claim(first.task_id)), 2
+            task_command_execution.execute_durable_task_command(
+                await claim(first.task_id)
+            ),
+            2,
         )
         control.assert_awaited_once()
         assert not finish.is_set()
@@ -488,7 +498,7 @@ async def test_shutdown_drains_command_waiting_for_execution_cleanup(host):
     previous = asyncio.create_task(previous_execution())
     coordinator.track_execution(previous)
     await cleanup_entered.wait()
-    command = claim(first.task_id)
+    command = await claim(first.task_id)
     apply = AsyncMock()
     pending = asyncio.create_task(coordinator.execute_command(command, apply))
     await eventually(coordinator._command_lock.locked)
@@ -508,19 +518,14 @@ async def test_shutdown_drains_command_waiting_for_execution_cleanup(host):
 async def test_real_claim_during_committed_handoff_keeps_lease_and_waits(
     host, monkeypatch, kind
 ):
-    from xagent.web.services import (
-        task_command_execution,
-    )
+    from xagent.web.services import task_command_execution
     from xagent.web.services import task_command_transport as transport
     from xagent.web.services import task_coordinator_runtime as runtime
-    from xagent.web.services import (
-        task_resume_command,
-        task_start_consumer,
-    )
+    from xagent.web.services import task_resume_command, task_start_consumer
 
     first = await create(host)
     coordinator = await runtime.get_task_coordinator_registry().ensure(first.task_id)
-    initial = claim(first.task_id)
+    initial = await claim(first.task_id)
     committed, register, child_end, applied = (asyncio.Event() for _ in range(4))
 
     async def handoff():
@@ -547,7 +552,7 @@ async def test_real_claim_during_committed_handoff_keeps_lease_and_waits(
             target_run_id=row.run_id,
         )
         db.commit()
-    competitor = claim(first.task_id)
+    competitor = await claim(first.task_id)
     assert competitor is not None
     with get_session_local()() as db:
         row = db.get(Task, first.task_id)

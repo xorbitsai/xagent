@@ -8,16 +8,16 @@ from ..core.schemas import (
 )
 
 if TYPE_CHECKING:
-    from ..kb import KBLegacyStepCompatibilityFacade
+    from ..kb import KBCoordinator
 
 logger = logging.getLogger(__name__)
 
 
-def _get_legacy_step_compatibility_facade() -> "KBLegacyStepCompatibilityFacade":
-    """Return the coordinator-owned legacy step compatibility facade."""
+def _get_coordinator() -> "KBCoordinator":
+    """Return the process-wide KB coordinator that owns search routing."""
     from ..kb import get_kb_coordinator
 
-    return get_kb_coordinator().legacy_step_compatibility
+    return get_kb_coordinator()
 
 
 def search_sparse(
@@ -34,7 +34,7 @@ def search_sparse(
     is_admin: bool = False,
 ) -> SparseSearchResponse:
     """Performs sparse (Full-Text Search) retrieval on the specified collection."""
-    return _get_legacy_step_compatibility_facade().search_sparse(
+    return _get_coordinator().search_sparse_sync(
         collection=collection,
         model_tag=model_tag,
         query_text=query_text,
@@ -65,7 +65,7 @@ async def search_sparse_async(
     is_admin: bool = False,
 ) -> SparseSearchResponse:
     """Perform sparse retrieval using async vector store abstraction."""
-    return await _get_legacy_step_compatibility_facade().search_sparse_async(
+    return await _get_coordinator().search_sparse(
         collection=collection,
         model_tag=model_tag,
         query_text=query_text,

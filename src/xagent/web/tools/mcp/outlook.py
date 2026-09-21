@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime
 from datetime import timezone as dt_timezone
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, unquote, urlsplit
 
 import requests
@@ -782,6 +782,8 @@ def outlook_create_event(
     both the organizer and every attendee in the series.
     """
     try:
+        if recurrence is not None and not isinstance(recurrence, str):
+            raise TypeError("recurrence must be a string")
         # Timezone validity is part of the write contract, independent of
         # whether the caller explicitly bypasses availability checks.
         _resolve_zoneinfo(timezone, allow_windows_names=True)
@@ -896,6 +898,8 @@ def outlook_update_event(
     attendees: list[str] | str | None = None,
     is_all_day: bool | None = None,
     ignore_conflicts: bool = False,
+    recurrence: str | None = None,
+    acknowledge_recurring_exception_risk: bool = False,
 ) -> str:
     """Update an existing Outlook calendar event.
     If the update moves the event, changes its all-day span, or adds
@@ -931,6 +935,17 @@ def outlook_update_event(
     Schedule changes to recurring series masters cannot be checked safely as
     one scalar window and are rejected unless ignore_conflicts=True. Update a
     specific occurrence when possible.
+    recurrence replaces or adds the event's recurrence rule using one RFC 5545
+    RRULE string; clearing an existing series is not supported. An all-day
+    event must use a bare-date UNTIL such as UNTIL=20260911; a timed event must
+    use a UTC UNTIL ending in Z. Recurrence updates must resubmit both
+    start_datetime and end_datetime with an explicit timezone so the recurrence
+    range and default weekday use the same current start frame written to
+    Outlook. Because this changes multiple future occurrences, it also requires
+    ignore_conflicts=True after the user confirms the full series is safe.
+    Replacing a series master's recurrence additionally requires
+    acknowledge_recurring_exception_risk=True after the user accepts that
+    edited or cancelled occurrences may need separate adjustment.
     Because a plain Graph GET does not expose a reliable timezone for an
     existing all-day window, adding attendees to one requires resubmitting both
     boundaries with an explicit timezone. Any all-day window submission that
@@ -938,15 +953,19 @@ def outlook_update_event(
     date labels in an unknown old timezone do not prove equal absolute windows.
     """
     try:
+        if recurrence is not None and not isinstance(recurrence, str):
+            raise TypeError("recurrence must be a string")
         # Outlook's existing replacement contract treats every non-None value,
         # including an empty string, as an explicit attendee list. Normalizing
         # the empty string yields [], which means clear all attendees.
         attendees_given = attendees is not None
+        recurrence_given = recurrence is not None
         touches_schedule = (
             start_datetime is not None
             or end_datetime is not None
             or attendees_given
             or is_all_day is not None
+            or recurrence_given
         )
         single_boundary_update = (start_datetime is not None) != (
             end_datetime is not None
@@ -954,6 +973,27 @@ def outlook_update_event(
         both_boundaries_supplied = (
             start_datetime is not None and end_datetime is not None
         )
+
+        if recurrence is not None:
+            recurrence_body = recurrence.strip()
+            if recurrence_body.upper().startswith("RRULE:"):
+                recurrence_body = recurrence_body[len("RRULE:") :].strip()
+            if not recurrence_body:
+                raise ValueError("recurrence rule must not be empty")
+            if not both_boundaries_supplied or timezone is None:
+                raise ValueError(
+                    "Updating recurrence requires both start_datetime and "
+                    "end_datetime with an explicit timezone so the recurrence "
+                    "range is derived from the same current start frame written "
+                    "to Outlook."
+                )
+            if not ignore_conflicts:
+                raise ValueError(
+                    "Cannot safely conflict-check every occurrence changed by a "
+                    "recurrence update. Pass ignore_conflicts=True only after the "
+                    "user confirms the complete series schedule is safe."
+                )
+
         if timezone is not None and touches_schedule:
             _resolve_zoneinfo(timezone, allow_windows_names=True)
             if start_datetime is None and end_datetime is None:
@@ -1054,6 +1094,24 @@ def outlook_update_event(
                 "and end_datetime with one shared timezone because Graph does "
                 "not expose the boundaries' reliable current timezone."
             )
+        if recurrence_given and existing.get("type") in {"occurrence", "exception"}:
+            raise ValueError(
+                "Recurrence can only be changed on a single event or series "
+                "master; update the recurring series master instead of one "
+                "occurrence or exception."
+            )
+        if (
+            recurrence_given
+            and existing.get("type") == "seriesMaster"
+            and not acknowledge_recurring_exception_risk
+        ):
+            raise ValueError(
+                "Outlook cannot atomically preserve instance exceptions while "
+                "replacing a recurring series master's rule; pass "
+                "acknowledge_recurring_exception_risk=True only after the user "
+                "accepts that edited or cancelled occurrences may need separate "
+                "adjustment."
+            )
 
         schedule_semantics_supplied = (
             start_datetime is not None
@@ -1136,6 +1194,17 @@ def outlook_update_event(
                     end_datetime, write_timezone
                 )
 
+        graph_recurrence = None
+        if recurrence is not None:
+            # The recurrence input guard requires start_datetime, and the
+            # normalization above therefore always produces a string here.
+            graph_recurrence = build_graph_recurrence(
+                recurrence,
+                cast(str, effective_start),
+                write_timezone,
+                is_all_day=effective_is_all_day,
+            )
+
         payload: dict[str, Any] = {}
         if subject is not None:
             payload["subject"] = subject
@@ -1172,6 +1241,8 @@ def outlook_update_event(
             retained_attendees = existing_attendees_raw
         if is_all_day is not None:
             payload["isAllDay"] = is_all_day
+        if graph_recurrence is not None:
+            payload["recurrence"] = graph_recurrence
 
         if not payload and attendees_given:
             current_event = _graph_request(

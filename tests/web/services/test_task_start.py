@@ -95,7 +95,7 @@ def test_task_starts_execute_without_api_routes() -> None:
                         assert not hasattr(appended, "background_task")
                         a2a = await task_start.start_a2a_turn(
                             agent_id=agent_id, task_owner_user_id=owner, agent_execution_mode="balanced",
-                            text="a2a first", message_id="message-1", context_id=None, task_id=None,
+                            key_prefix="key-one", text="a2a first", message_id="message-1", context_id=None, task_id=None,
                         )
                         legacy_handle_index = len(background)
                         await task_start.execute_existing_task(

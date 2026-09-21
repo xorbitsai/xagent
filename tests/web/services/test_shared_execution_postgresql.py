@@ -5,9 +5,8 @@ from unittest.mock import Mock
 import pytest
 from sqlalchemy.orm import sessionmaker
 
-from tests.shared.postgres_disposable import (
-    disposable_database_factory,
-)
+from tests.shared.postgres_disposable import disposable_database_factory
+from tests.web.services.coordinator_command_shared import claim_for_owner
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
@@ -15,10 +14,7 @@ from xagent.web.models.user import User
 from xagent.web.services import task_coordinator_service as ownership
 from xagent.web.services import task_event_bridge
 from xagent.web.services import task_start_consumer as consumer
-from xagent.web.services.task_command_transport import (
-    TaskCommandRejected,
-    claim_task_command,
-)
+from xagent.web.services.task_command_transport import TaskCommandRejected
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload
 
 pytestmark = pytest.mark.postgresql
@@ -52,14 +48,12 @@ def test_postgres_handoff_completion_and_lease_are_atomic(monkeypatch, fail_comp
                 payload=TaskTurnPayload("hello"),
             )
             db.commit()
-            command = claim_task_command(
-                db, runner_id="worker", command_db_id=accepted.command_db_id
-            )
             task_id = task.id
             owner_lease = ownership.acquire_task_lease_no_commit(
                 db, task_id, runner_id="worker"
             )
             db.commit()
+            command = claim_for_owner(db, owner_lease, accepted.command_db_id)
         assert owner_lease is not None
         if fail_completion:
             monkeypatch.setattr(

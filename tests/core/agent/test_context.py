@@ -28,6 +28,9 @@ from xagent.core.agent.context.enrichment import (
 from xagent.core.agent.context.execution import (
     CLOCK_TIMEZONE_METADATA_KEY,
     COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES,
+    COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    COMPACT_THRESHOLD_SOURCE_UNKNOWN,
 )
 from xagent.core.agent.grounding import VALUE_KINDS, step_intent_not_fact_rule
 from xagent.core.agent.language import (
@@ -2558,6 +2561,52 @@ def test_compact_request_blocks_when_context_window_is_unknown() -> None:
     assert request["blocked"] is True
     assert request["metadata"]["llm_compact_context_window_unknown"] is True
     assert request["max_tokens"] == 0
+
+
+def test_compact_config_threshold_source_defaults_and_round_trips() -> None:
+    context = ExecutionContext(execution_id="threshold-source")
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+    context.compact_config.threshold = 96_000
+    context.compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+    payload = context.to_dict()
+    assert payload["compact_config"]["threshold_source"] == (
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+    )
+
+    rebuilt = ExecutionContext.from_dict(payload)
+    assert rebuilt.compact_config.threshold == 96_000
+    assert rebuilt.compact_config.threshold_source == (
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+    )
+
+
+def test_compact_config_threshold_source_unknown_for_legacy_checkpoints() -> None:
+    context = ExecutionContext(execution_id="legacy-threshold-source")
+    payload = context.to_dict()
+    # A checkpoint written before the field existed says nothing about where
+    # its threshold came from; restoring it must not claim a provenance.
+    del payload["compact_config"]["threshold_source"]
+
+    rebuilt = ExecutionContext.from_dict(payload)
+    assert rebuilt.compact_config.threshold == 32000
+    assert rebuilt.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_UNKNOWN
+
+
+def test_compact_request_metadata_carries_threshold_source() -> None:
+    context = ExecutionContext(execution_id="threshold-provenance")
+    context.compact_config.threshold = 1
+    context.compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+    context.add_user_message("requirement that must survive")
+    context.add_assistant_message("work in progress")
+
+    request = context.build_llm_compact_request_if_needed(context_window=32_000)
+
+    assert request is not None
+    assert request["metadata"]["threshold"] == 1
+    assert request["metadata"]["threshold_source"] == (
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+    )
 
 
 def test_compact_request_blocks_when_tokenizer_cannot_load(

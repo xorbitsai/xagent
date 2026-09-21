@@ -8,19 +8,17 @@ transaction, including command receipts and execution-state transitions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from uuid import uuid4
 
-from sqlalchemy import and_, func, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+from ...config import get_task_lease_ttl_seconds
 from ..models.task import Task, TaskStatus, task_status_predicate
 from .task_execution_controller import TaskControlSnapshot, TaskControlState
-from .task_lease_service import (
-    lease_state_version_case,
-    task_lease_expires_at,
-    utc_now,
-)
+from .task_lease_service import lease_state_version_case, task_lease_expires_at, utc_now
 
 
 @dataclass(frozen=True)
@@ -106,6 +104,91 @@ def renew_task_lease_no_commit(db: Session, lease: TaskLease) -> bool:
         .execution_options(synchronize_session=False)
     ).scalar_one_or_none()
     return renewed is not None
+
+
+class TaskLeaseRenewalState(str, Enum):
+    RENEWED = "renewed"
+    DEFERRED = "deferred"
+    LOST = "lost"
+
+
+def renew_task_leases_no_commit(
+    db: Session, leases: tuple[TaskLease, ...]
+) -> dict[TaskLease, TaskLeaseRenewalState]:
+    """Renew task owners without waiting behind another task's row lock.
+
+    Unlike execution heartbeats, task ownership spans runs and settlement.
+    Neither run_id nor business status restricts these renewals. Results become
+    authoritative only after the caller commits this transaction.
+    """
+    if not leases:
+        return {}
+    if db.get_bind().dialect.name != "postgresql":
+        return {
+            lease: (
+                TaskLeaseRenewalState.RENEWED
+                if renew_task_lease_no_commit(db, lease)
+                else TaskLeaseRenewalState.LOST
+            )
+            for lease in leases
+        }
+
+    statement_ms = max(1, int(min(5, get_task_lease_ttl_seconds() / 4) * 1000))
+    db.execute(
+        text(
+            "SELECT set_config('statement_timeout', :statement, true), "
+            "set_config('lock_timeout', :lock, true)"
+        ),
+        {"statement": f"{statement_ms}ms", "lock": f"{min(1000, statement_ms)}ms"},
+    )
+    owned = or_(*(task_lease_predicate(lease) for lease in leases))
+    available = list(
+        db.scalars(
+            select(Task.id)
+            .where(owned)
+            .with_for_update(of=Task, key_share=True, skip_locked=True)
+        )
+    )
+    renewed: set[TaskLease] = set()
+    if available:
+        now = utc_now()
+        rows = db.execute(
+            update(Task)
+            .where(Task.id.in_(available), owned)
+            .values(
+                lease_expires_at=task_lease_expires_at(now),
+                last_heartbeat_at=now,
+                updated_at=Task.updated_at,
+            )
+            .returning(Task.id, Task.runner_id, Task.lease_attempt_id)
+            .execution_options(synchronize_session=False)
+        )
+        renewed = {TaskLease(row[0], row[1], row[2]) for row in rows}
+    remaining = [lease for lease in leases if lease not in renewed]
+    # A skipped row is not proof of loss. Read the committed owner without
+    # taking another row lock; an uncommitted takeover remains deferred.
+    visible = (
+        {
+            TaskLease(row[0], row[1], row[2])
+            for row in db.execute(
+                select(Task.id, Task.runner_id, Task.lease_attempt_id).where(
+                    Task.id.in_([lease.task_id for lease in remaining])
+                )
+            )
+        }
+        if remaining
+        else set()
+    )
+    return {
+        lease: (
+            TaskLeaseRenewalState.RENEWED
+            if lease in renewed
+            else TaskLeaseRenewalState.DEFERRED
+            if lease in visible
+            else TaskLeaseRenewalState.LOST
+        )
+        for lease in leases
+    }
 
 
 def lock_task_lease_no_commit(db: Session, lease: TaskLease) -> bool:

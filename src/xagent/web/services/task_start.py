@@ -8,17 +8,22 @@ connector runtime values and background task handles stay inside the runner.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_shared_task_execution_enabled
 from ..models.agent import Agent
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..models.task_command import TaskExecutionCommand
+from ..models.task_input_receipt import TaskInputReceipt
 from ..models.workforce import WorkforceRun
 from .a2a_protocol import A2ATaskSnapshot, new_context_id, task_context_id
 from .a2a_task_read import load_a2a_task_snapshot
@@ -42,6 +47,11 @@ from .managed_file_ref import (
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
+from .task_command_transport import (
+    _resolve_actor_subject,
+    command_identity_matches_task,
+    notify_task_command_dispatcher,
+)
 from .task_execution_controller import task_execution_controller
 from .task_orchestrator import (
     TaskTurnError,
@@ -51,6 +61,7 @@ from .task_orchestrator import (
     TaskTurnPayload,
     TurnKind,
     TurnStarted,
+    _EnqueuedTurn,
     _PreparedTurn,
     _retire_turn_session_best_effort,
     commit_claimed_turn_or_reconcile,
@@ -637,20 +648,105 @@ class _A2ATurnPreparation:
     claimed_turn: _PreparedTurn | None
 
 
+def _input_hash(values: list[Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(values, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _replay_a2a_input(
+    db: Session,
+    receipt: TaskInputReceipt,
+    *,
+    payload_hash: str,
+    text: str,
+    context_id: str | None,
+    agent_id: int,
+    owner_id: int,
+) -> A2ATaskSnapshot:
+    task = db.get(Task, receipt.task_id) if receipt.task_id is not None else None
+    command = (
+        db.get(TaskExecutionCommand, receipt.command_db_id)
+        if receipt.command_db_id is not None
+        else None
+    )
+    if (
+        task is None
+        or command is None
+        or task.user_id != owner_id
+        or task.agent_id != agent_id
+        or task.source != "a2a"
+        or command.task_id != task.id
+        or not command_identity_matches_task(db, task, command)
+    ):
+        raise TaskStartRejected("a2a_input_unavailable")
+    if receipt.payload_hash != payload_hash and not (
+        context_id is not None
+        and context_id == task_context_id(task)
+        and receipt.payload_hash == _input_hash([text, None])
+    ):
+        raise TaskStartRejected("a2a_input_conflict")
+    return A2ATaskSnapshot.from_task(task)
+
+
 def _prepare_a2a_turn_sync(
     *,
     agent_id: int,
     task_owner_user_id: int,
     agent_execution_mode: str,
     text: str,
+    message_id: str,
+    key_prefix: str,
     context_id: str | None,
     task_id: int | None,
-) -> _A2ATurnPreparation:
+) -> _A2ATurnPreparation | A2ATaskSnapshot:
     """Create/claim or validate an A2A turn in one worker-owned transaction."""
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         payload = TaskTurnPayload(transcript_message=text)
+        receipt = None
+        if task_id is None and get_shared_task_execution_enabled():
+            subject = _resolve_actor_subject(db, task_owner_user_id)
+            if subject is None:
+                raise TaskStartRejected("a2a_input_unavailable")
+            identity_hash = _input_hash(
+                ["a2a/start/v1", subject, agent_id, key_prefix, message_id]
+            )
+            payload_hash = _input_hash([text, context_id])
+            existing = db.get(TaskInputReceipt, identity_hash)
+            if existing is not None:
+                return _replay_a2a_input(
+                    db,
+                    existing,
+                    payload_hash=payload_hash,
+                    text=text,
+                    context_id=context_id,
+                    agent_id=agent_id,
+                    owner_id=task_owner_user_id,
+                )
+            receipt = TaskInputReceipt(
+                identity_hash=identity_hash, payload_hash=payload_hash
+            )
+            db.add(receipt)
+            try:
+                # Serialize first acceptance before creating a Task. The row
+                # remains invisible until the complete acceptance graph commits.
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                existing = db.get(TaskInputReceipt, identity_hash)
+                if existing is None:
+                    raise
+                return _replay_a2a_input(
+                    db,
+                    existing,
+                    payload_hash=payload_hash,
+                    text=text,
+                    context_id=context_id,
+                    agent_id=agent_id,
+                    owner_id=task_owner_user_id,
+                )
         created_task = task_id is None
         if task_id is None:
             context_id = context_id or new_context_id()
@@ -678,7 +774,30 @@ def _prepare_a2a_turn_sync(
             db.flush()
             db.refresh(task)
             task_snapshot = A2ATaskSnapshot.from_task(task)
-            db.commit()
+            if receipt is not None:
+                assert isinstance(claimed_turn, _EnqueuedTurn)
+                receipt.task_id = int(task.id)
+                receipt.command_db_id = claimed_turn.command_db_id
+            try:
+                db.commit()
+            except Exception:
+                if receipt is None:
+                    raise
+                # A lost COMMIT acknowledgement must not create another input.
+                db.close()
+                with SessionLocal() as check:
+                    saved = check.get(TaskInputReceipt, identity_hash)
+                    if saved is None:
+                        raise
+                    return _replay_a2a_input(
+                        check,
+                        saved,
+                        payload_hash=payload_hash,
+                        text=text,
+                        context_id=context_id,
+                        agent_id=agent_id,
+                        owner_id=task_owner_user_id,
+                    )
             kind = TurnKind.CREATE
         else:
             existing_task = (
@@ -728,6 +847,7 @@ async def start_a2a_turn(
     agent_execution_mode: str,
     text: str,
     message_id: str,
+    key_prefix: str,
     context_id: str | None,
     task_id: int | None,
 ) -> A2ATaskSnapshot:
@@ -738,11 +858,16 @@ async def start_a2a_turn(
                 task_owner_user_id=task_owner_user_id,
                 agent_execution_mode=agent_execution_mode,
                 text=text,
+                message_id=message_id,
+                key_prefix=key_prefix,
                 context_id=context_id,
                 task_id=task_id,
             )
         )
 
+        if isinstance(preparation, A2ATaskSnapshot):
+            notify_task_command_dispatcher()
+            return preparation
         prepared_task = preparation.task
         if prepared_task.status in {
             TaskStatus.PAUSED,

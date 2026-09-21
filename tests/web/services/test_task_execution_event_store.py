@@ -11,49 +11,18 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from tests.shared.postgres_disposable import disposable_database_factory
-from xagent.web.models.database import Base
+from tests.web.services.task_database_shared import engine as engine_fixture
+from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.task import Task
 from xagent.web.models.task_execution_event import TaskExecutionEvent
-from xagent.web.models.user import User
 from xagent.web.services.task_execution_event_store import (
     ExecutionEventConflict,
     append_task_execution_event_no_commit,
     load_task_execution_events,
 )
 
-
-@pytest.fixture(
-    params=["sqlite", pytest.param("postgresql", marks=pytest.mark.postgresql)]
-)
-def engine(request, tmp_path):
-    if request.param == "postgresql":
-        with disposable_database_factory("execution_events") as make:
-            yield make("store")
-    else:
-        result = sa.create_engine(f"sqlite:///{tmp_path / 'events.db'}")
-
-        @sa.event.listens_for(result, "connect")
-        def enable_foreign_keys(connection, _record):
-            connection.execute("PRAGMA foreign_keys=ON")
-
-        try:
-            yield result
-        finally:
-            result.dispose()
-
-
-@pytest.fixture
-def task_id(engine):
-    Base.metadata.create_all(engine)
-    with Session(engine) as db:
-        user = User(username="event-owner", password_hash="unused")
-        db.add(user)
-        db.flush()
-        task = Task(user_id=user.id, title="Existing task", description="unchanged")
-        db.add(task)
-        db.commit()
-        return task.id
+engine = engine_fixture
+task_id = task_id_fixture
 
 
 def append(db, task_id, key="turn-1", **overrides):

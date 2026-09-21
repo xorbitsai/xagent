@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
 from xagent.core.agent import runtime as runtime_module
+from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.execution import (
     COMPACT_SUMMARY_METADATA_KEY,
+    COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    COMPACT_THRESHOLD_SOURCE_UNKNOWN,
     COMPACT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
 )
@@ -41,6 +46,12 @@ class SlowLLM:
         return "never"
 
 
+@pytest.fixture(autouse=True)
+def reset_compact_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The once-per-model warning set is process-global; isolate it per test.
+    monkeypatch.setattr(runtime_module, "_COMPACT_WINDOW_WARNED_MODELS", set())
+
+
 @pytest.mark.asyncio
 async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -> None:
     monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_RATIO", raising=False)
@@ -69,6 +80,9 @@ async def test_prepare_llm_for_context_uses_resolved_model_window(monkeypatch) -
 
     assert isinstance(prepared, PreparedLLM)
     assert context.compact_config.threshold == 786_432
+    assert context.compact_config.threshold_source == (
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+    )
     assert resolved_llm_metadata(prepared) == {
         "selected_model": "deepseek/deepseek-v4-flash",
         "context_window": 1_048_576,
@@ -1963,7 +1977,9 @@ class _SummarizingLLM:
 
 
 @pytest.mark.asyncio
-async def test_compaction_does_not_truncate_an_unsendable_safe_request() -> None:
+async def test_compaction_does_not_truncate_an_unsendable_safe_request(
+    caplog,
+) -> None:
     context = ExecutionContext(execution_id="unsafe-to-truncate")
     context.compact_config.threshold = 24000
     context.compact_config.max_messages = 2
@@ -1990,15 +2006,388 @@ async def test_compaction_does_not_truncate_an_unsendable_safe_request() -> None
         async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
             raise AssertionError("an oversized compact request must not be sent")
 
-    result = await PatternRuntime().compact_context_if_needed(
-        context=context,
-        llm=UnusedLLM(),
-    )
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await PatternRuntime().compact_context_if_needed(
+            context=context,
+            llm=UnusedLLM(),
+        )
 
     assert not result.compacted
     assert result.metadata["llm_compact_request_too_large"] is True
     assert result.metadata["fallback_suppressed"] is True
     assert context.messages == original_messages
+    # Too large is a fit problem; the unknown-window warning must not claim it.
+    assert not any("has no context_window" in r.getMessage() for r in caplog.records)
+    assert any(
+        "cannot fit the compact model window" in r.getMessage() for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_compaction_names_the_compact_model_when_its_window_is_unknown(
+    caplog,
+) -> None:
+    context = ExecutionContext(execution_id="compact-window-unknown")
+    context.compact_config.threshold = 1
+    context.add_user_message("requirement that must survive")
+    context.add_assistant_message("work in progress")
+    original_messages = list(context.messages)
+
+    class WindowlessLLM:
+        model_name = "qwen3.6-plus"
+        context_window = None
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+            raise AssertionError("compaction must not call a model with no window")
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await PatternRuntime().compact_context_if_needed(
+            context=context, llm=WindowlessLLM()
+        )
+        # Blocked compaction leaves the context over threshold, so the next
+        # iteration blocks again; the warning must not repeat with it.
+        repeat = await PatternRuntime().compact_context_if_needed(
+            context=context, llm=WindowlessLLM()
+        )
+
+    assert not result.compacted
+    assert result.metadata["llm_compact_context_window_unknown"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert repeat.metadata["llm_compact_context_window_unknown"] is True
+    assert context.messages == original_messages
+    messages = [record.getMessage() for record in caplog.records]
+    unknown_window = [m for m in messages if "qwen3.6-plus" in m]
+    assert len(unknown_window) == 1
+    assert "context_window" in unknown_window[0]
+    assert "compact-window-unknown" in unknown_window[0]
+    # The generic "cannot fit" message describes a different failure and must
+    # not be logged for this one.
+    assert not any("cannot fit the compact model window" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_compaction_reports_tokenizer_unavailable_distinctly(
+    monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """A known compact-model window but a tokenizer that fails to load is
+    neither the "window unknown" case nor the generic "cannot fit" case --
+    each describes a different reason compaction had to be skipped, and
+    conflating them would point an operator at the wrong fix."""
+    context = ExecutionContext(execution_id="compact-tokenizer-unavailable")
+    context.compact_config.threshold = 1
+    context.add_user_message("requirement that must survive")
+    context.add_assistant_message("work in progress")
+    original_messages = list(context.messages)
+
+    class SizedLLM:
+        model_name = "compact-test"
+        context_window = 32_000
+
+        async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+            raise AssertionError("compaction must not call a model with no tokenizer")
+
+    execution_module._compact_token_encoding.cache_clear()
+
+    def fail_to_load(_: str) -> None:
+        raise OSError("offline")
+
+    monkeypatch.setattr(execution_module.tiktoken, "get_encoding", fail_to_load)
+    try:
+        with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+            result = await PatternRuntime().compact_context_if_needed(
+                context=context, llm=SizedLLM()
+            )
+    finally:
+        execution_module._compact_token_encoding.cache_clear()
+
+    assert not result.compacted
+    assert result.metadata["llm_compact_tokenizer_unavailable"] is True
+    assert result.metadata["fallback_suppressed"] is True
+    assert context.messages == original_messages
+    messages = [record.getMessage() for record in caplog.records]
+    tokenizer_unavailable = [m for m in messages if "could not count" in m]
+    assert len(tokenizer_unavailable) == 1
+    assert "cannot fit the compact model window" not in tokenizer_unavailable[0]
+    assert "has no context_window" not in tokenizer_unavailable[0]
+    assert not any("cannot fit the compact model window" in m for m in messages)
+    assert not any("has no context_window" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_drop_backstop_metadata_carries_threshold_source() -> None:
+    context = ExecutionContext(execution_id="backstop-provenance")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    for index in range(5):
+        context.add_user_message(f"message-{index}")
+
+    # No compact model: the runtime drops messages instead of summarizing.
+    result = await PatternRuntime().compact_context_if_needed(context=context)
+
+    assert result.compacted
+    assert result.metadata["threshold"] == 1
+    assert result.metadata["threshold_source"] == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_warns_when_selected_model_has_no_window(
+    caplog,
+) -> None:
+    class PreparedLLM:
+        model_name = "moonshotai.kimi-k2.5"
+        context_window = None
+
+    class VirtualLLM:
+        async def prepare_for_call(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            preferred_input_modalities: tuple[str, ...] = (),
+        ) -> Any:
+            return PreparedLLM()
+
+    context = ExecutionContext()
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        for _ in range(2):
+            await prepare_llm_for_context(
+                llm=VirtualLLM(),
+                messages=[{"role": "user", "content": "hello"}],
+                context=context,
+            )
+
+    # Nothing to derive from, so the threshold stands as-is, but its source no
+    # longer claims to be the plain default since a selection was made.
+    assert context.compact_config.threshold == 32000
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_UNKNOWN
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if "moonshotai.kimi-k2.5" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "compaction threshold" in warnings[0]
+    assert "32000" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_prepare_llm_for_context_warns_when_a_later_selection_has_no_window(
+    caplog,
+) -> None:
+    class SizedLLM:
+        model_name = "sized"
+        context_window = 128_000
+
+    class WindowlessLLM:
+        model_name = "windowless"
+        context_window = None
+
+    class VirtualLLM:
+        def __init__(self) -> None:
+            self.selections = [SizedLLM(), WindowlessLLM(), WindowlessLLM()]
+
+        async def prepare_for_call(self, messages: Any, **_: Any) -> Any:
+            return self.selections.pop(0)
+
+    context = ExecutionContext()
+    llm = VirtualLLM()
+    messages = [{"role": "user", "content": "hello"}]
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        for _ in range(3):
+            await prepare_llm_for_context(llm=llm, messages=messages, context=context)
+
+    # The earlier selection's derived threshold value stands, but its source
+    # no longer claims to describe the active (windowless) model.
+    assert context.compact_config.threshold == 96_000
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_UNKNOWN
+    warnings = [
+        r.getMessage() for r in caplog.records if "windowless" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "96000" in warnings[0]
+    assert "threshold_source=unknown" in warnings[0]
+    assert "XAGENT_COMPACT_THRESHOLD_DEFAULT" not in warnings[0]
+
+
+def test_warn_restored_compact_threshold_only_for_the_default_source(caplog) -> None:
+    class FixedLLM:
+        model_id = "row-35"
+        model_name = "moonshotai.kimi-k2.5"
+
+    restored = ExecutionContext.from_dict(ExecutionContext().to_dict())
+    assert restored.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_DEFAULT
+    derived = ExecutionContext()
+    derived.compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(restored, FixedLLM())
+        runtime_module.warn_restored_compact_threshold(restored, FixedLLM())
+        runtime_module.warn_restored_compact_threshold(derived, FixedLLM())
+        runtime_module.warn_restored_compact_threshold(restored, None)
+
+    warnings = [
+        r.getMessage() for r in caplog.records if "resumed task" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    # Keyed on the stable model id, not the display name.
+    assert "row-35" in warnings[0]
+    assert "32000" in warnings[0]
+
+
+def test_warn_restored_compact_threshold_default_source_windowless_model_warns(
+    caplog,
+) -> None:
+    class WindowlessLLM:
+        model_id = "row-40"
+        model_name = "moonshotai.kimi-k2.5"
+
+    context = ExecutionContext.from_dict(ExecutionContext().to_dict())
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, WindowlessLLM())
+        runtime_module.warn_restored_compact_threshold(context, WindowlessLLM())
+
+    warnings = [
+        r.getMessage() for r in caplog.records if "resumed task" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "row-40" in warnings[0]
+
+
+def test_warn_restored_compact_threshold_silent_when_live_model_has_a_window(
+    caplog,
+) -> None:
+    class SizedLLM:
+        model_id = "row-41"
+        context_window = 256_000
+
+    context = ExecutionContext.from_dict(ExecutionContext().to_dict())
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, SizedLLM())
+
+    assert not any("resumed task" in r.getMessage() for r in caplog.records)
+
+
+def test_warn_restored_compact_threshold_silent_for_virtual_model(caplog) -> None:
+    class VirtualLLM:
+        model_id = "row-42"
+        context_window = None
+
+        async def prepare_for_call(self, messages: Any, **_: Any) -> Any:
+            return self
+
+    context = ExecutionContext.from_dict(ExecutionContext().to_dict())
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_DEFAULT
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, VirtualLLM())
+
+    assert not any("resumed task" in r.getMessage() for r in caplog.records)
+
+
+def test_warn_restored_compact_threshold_unknown_source_windowless_model_warns(
+    caplog,
+) -> None:
+    class WindowlessLLM:
+        model_id = "row-43"
+        model_name = "moonshotai.kimi-k2.5"
+
+    payload = ExecutionContext().to_dict()
+    del payload["compact_config"]["threshold_source"]
+    context = ExecutionContext.from_dict(payload)
+    assert context.compact_config.threshold_source == COMPACT_THRESHOLD_SOURCE_UNKNOWN
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, WindowlessLLM())
+
+    warnings = [
+        r.getMessage() for r in caplog.records if "resumed task" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "row-43" in warnings[0]
+
+
+def test_warn_restored_compact_threshold_silent_for_context_window_source(
+    caplog,
+) -> None:
+    class WindowlessLLM:
+        model_id = "row-44"
+        model_name = "moonshotai.kimi-k2.5"
+
+    context = ExecutionContext()
+    context.compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, WindowlessLLM())
+
+    assert not any("resumed task" in r.getMessage() for r in caplog.records)
+
+
+def test_warn_restored_compact_threshold_silent_for_none_llm(caplog) -> None:
+    context = ExecutionContext.from_dict(ExecutionContext().to_dict())
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runtime_module.warn_restored_compact_threshold(context, None)
+
+    assert not any("resumed task" in r.getMessage() for r in caplog.records)
+
+
+def test_compact_model_key_prefers_the_stable_model_id() -> None:
+    class Both:
+        model_id = "row-36"
+        model_name = "moonshotai.kimi-k2.5"
+
+    class NameOnly:
+        model_id = ""
+        model_name = "moonshotai.kimi-k2.5"
+
+    class Neither:
+        pass
+
+    assert runtime_module.compact_model_key(Both()) == "row-36"
+    assert runtime_module.compact_model_key(NameOnly()) == "moonshotai.kimi-k2.5"
+    assert runtime_module.compact_model_key(Neither()) == "Neither"
+
+
+@pytest.mark.asyncio
+async def test_compact_trace_event_carries_threshold_source() -> None:
+    class CompactEventTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(
+            self,
+            event_type: Any,
+            *,
+            task_id: str | None = None,
+            step_id: str | None = None,
+            data: dict[str, Any] | None = None,
+        ) -> None:
+            self.events.append(
+                {
+                    "event_type": getattr(event_type, "value", str(event_type)),
+                    "data": data or {},
+                }
+            )
+
+    tracer = CompactEventTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="compact-trace")
+    context = ExecutionContext(execution_id="compact-trace")
+    context.compact_config.threshold = 1
+    context.compact_config.max_messages = 2
+    for index in range(5):
+        context.add_user_message(f"message-{index}")
+
+    result = await runtime.compact_context_if_needed(context=context)
+
+    assert result.compacted
+    compact_events = [e for e in tracer.events if "compact" in str(e["event_type"])]
+    assert compact_events, tracer.events
+    for event in compact_events:
+        assert event["data"]["threshold"] == 1
+        assert event["data"]["threshold_source"] == COMPACT_THRESHOLD_SOURCE_DEFAULT
 
 
 @pytest.mark.asyncio

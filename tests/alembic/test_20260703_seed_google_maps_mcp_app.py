@@ -105,3 +105,30 @@ def test_downgrade_removes_google_maps(tmp_path):
             migration.upgrade()
             migration.downgrade()
         assert "google-maps" not in _app_ids(connection)
+
+
+def test_downgrade_preserves_colliding_custom_app(tmp_path):
+    """An operator's custom app that reuses app_id="google-maps" (e.g. a
+    hand-created connector with a different config) must survive downgrade,
+    since upgrade() itself no-ops on that collision."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport)"
+                " VALUES ('google-maps', 'Custom Maps Connector', 'oauth')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert "google-maps" in _app_ids(connection)
+        row = connection.execute(
+            text(
+                "SELECT name, transport FROM public_mcp_apps WHERE app_id='google-maps'"
+            )
+        ).first()
+        assert row[0] == "Custom Maps Connector"
+        assert row[1] == "oauth"

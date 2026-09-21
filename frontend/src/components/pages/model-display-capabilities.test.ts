@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 
-import { getProviderDisplayCapabilities } from "./model-display-capabilities"
+import {
+  getProviderDisplayCapabilities,
+  isContextWindowUnset,
+} from "./model-display-capabilities"
 
 describe("getProviderDisplayCapabilities", () => {
   it("keeps sound effect and music distinct on the audio tab", () => {
@@ -48,5 +51,19 @@ describe("getProviderDisplayCapabilities", () => {
         "audio",
       ),
     ).toEqual(["tts"])
+  })
+})
+
+describe("isContextWindowUnset", () => {
+  it("flags LLM rows whose context window is missing or non-positive", () => {
+    expect(isContextWindowUnset({ category: "llm" })).toBe(true)
+    expect(isContextWindowUnset({ category: "llm", context_window: 0 })).toBe(true)
+    expect(isContextWindowUnset({ category: "llm", context_window: -1 })).toBe(true)
+  })
+
+  it("does not flag LLM rows with a window or non-LLM rows", () => {
+    expect(isContextWindowUnset({ category: "llm", context_window: 256000 })).toBe(false)
+    expect(isContextWindowUnset({ category: "embedding" })).toBe(false)
+    expect(isContextWindowUnset({ category: "image", context_window: 0 })).toBe(false)
   })
 })

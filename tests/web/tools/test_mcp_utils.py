@@ -1243,9 +1243,7 @@ def test_success_with_capped_dict_top_level_single_key_survives_phase_two(
     # first half of keys" step drops "id" before "notes" -- if phase 2 were
     # then allowed to empty the single remaining "notes" key down to {},
     # "id" would never be recovered even though it's small enough to fit.
-    raw = utils.success_with_capped_dict(
-        "record", {"notes": "x" * 5000, "id": "rec1"}
-    )
+    raw = utils.success_with_capped_dict("record", {"notes": "x" * 5000, "id": "rec1"})
     result = json.loads(raw)
 
     assert len(raw) <= 70

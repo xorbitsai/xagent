@@ -180,6 +180,71 @@ async def test_non_numeric_stdio_env_override_is_replaced_and_warned(
 
 
 @pytest.mark.asyncio
+async def test_existing_int_env_value_is_coerced_to_str(monkeypatch):
+    """A pre-existing value that is numerically valid but not itself a
+    string (e.g. a real int, as opposed to its string form) must still come
+    out as a string: a subprocess env must be all-str, and returning early
+    without coercing would leave a non-str value in it."""
+    captured: dict = {}
+    _capture_create(monkeypatch, captured)
+
+    config = _FakeConfig(
+        [
+            {
+                "name": "jira",
+                "transport": "stdio",
+                "config": {
+                    "command": "python",
+                    "args": [],
+                    "env": {TOOL_MAX_OUTPUT_LENGTH: 4096},
+                },
+            }
+        ]
+    )
+    await create_mcp_tools(config)
+
+    (cfg,) = captured["mcp_configs"]
+    env = cfg["config"]["env"]
+    assert env[TOOL_MAX_OUTPUT_LENGTH] == "4096"
+    assert isinstance(env[TOOL_MAX_OUTPUT_LENGTH], str)
+
+
+@pytest.mark.asyncio
+async def test_identity_resolution_failure_falls_back_to_no_exemptions(
+    monkeypatch, caplog
+):
+    """If resolving actor session identities itself raises, create_mcp_tools
+    must not crash: it falls back to treating no server as
+    actor/execution-scoped, the same degrade a config that never defined
+    the getter at all already gets, and logs the failure."""
+    captured: dict = {}
+    _capture_create(monkeypatch, captured)
+
+    class _RaisingIdentityConfig(_FakeConfig):
+        def get_actor_mcp_stdio_session_identities(self):
+            raise RuntimeError("boom")
+
+    config = _RaisingIdentityConfig(
+        [
+            {
+                "name": "jira",
+                "transport": "stdio",
+                "config": {"command": "python", "args": []},
+            }
+        ]
+    )
+    with caplog.at_level(logging.WARNING):
+        await create_mcp_tools(config)
+
+    (cfg,) = captured["mcp_configs"]
+    assert cfg["config"]["env"][TOOL_MAX_OUTPUT_LENGTH] == "12345"
+    assert any(
+        "Failed to resolve actor MCP stdio session identities" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_non_stdio_configs_are_left_untouched(monkeypatch):
     captured: dict = {}
     _capture_create(monkeypatch, captured)

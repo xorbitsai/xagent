@@ -59,6 +59,10 @@ def _setdefault_numeric_env(
                 existing,
             )
         else:
+            # A subprocess env must be all-str; an existing int/bool value
+            # is numerically valid but still needs coercing, not just
+            # leaving as-is.
+            env[key] = str(existing)
             return
     env[key] = str(value)
 
@@ -379,7 +383,18 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     # be resolved (and exempted) before mirroring output limits below, not
     # after.
     identity_getter = getattr(config, "get_actor_mcp_stdio_session_identities", None)
-    session_identities = identity_getter() if callable(identity_getter) else {}
+    try:
+        session_identities = identity_getter() if callable(identity_getter) else {}
+    except Exception as exc:
+        # Same fallback as a config that never defined the getter at all:
+        # treat no server as actor/execution-scoped rather than let this
+        # call crash outright.
+        logger.warning(
+            "Failed to resolve actor MCP stdio session identities (%s); "
+            "treating no stdio server as actor/execution-scoped for this call",
+            type(exc).__name__,
+        )
+        session_identities = {}
     mcp_configs = _apply_stdio_output_limits_env(
         mcp_configs, config, exempt_server_names=frozenset(session_identities)
     )

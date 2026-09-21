@@ -261,6 +261,15 @@ def test_path_segment_rejects_blank_or_padded_values():
     assert jira._path_segment("ENG-1") == "ENG-1"
 
 
+def test_path_segment_rejects_none_instead_of_stringifying_it():
+    # str(None) is "None" -- non-blank, non-padded, and not "." or ".."
+    # -- so without an explicit None check it would sail through every
+    # other guard and become a literal "None" path segment instead of
+    # raising.
+    with pytest.raises(ValueError, match="None"):
+        jira._path_segment(None)
+
+
 def test_get_issue_rejects_a_blank_issue_key(monkeypatch):
     # _path_segment raises before _request ever makes a network call --
     # no site-resolution call happens either.
@@ -771,6 +780,26 @@ def test_bounded_search_error_shrinks_further_when_escaping_inflates_the_slice()
     assert result["message"] == "bad query near "
 
 
+def test_bounded_search_error_finds_the_largest_fitting_slice_under_heavy_escaping():
+    # A message that's ALL JSON-escapable characters (each " costs 2
+    # output chars) breaks a linear "shrink by exactly the overshoot"
+    # correction: a single over-budget attempt's overshoot, subtracted
+    # straight from the budget, overshoots past a smaller slice that
+    # would actually have fit -- landing on budget<=0 and discarding
+    # the message entirely even though e.g. a 5-quote slice fits
+    # exactly. The response must still carry as much message content
+    # as structurally fits, not degrade to the bare no-message envelope
+    # just because the escape ratio isn't 1:1.
+    message = '"' * 10
+
+    response = jira._bounded_search_error(message, 44)
+
+    assert len(response) <= 44
+    result = json.loads(response)
+    assert result["status"] == "error"
+    assert result["message"] == '"' * 5
+
+
 def test_search_issues_cursor_stuck_error_is_also_bounded(monkeypatch):
     # The pagination-cursor-stuck error is a second, independent _error
     # call site with the same unmeasured-against-the-cap gap the
@@ -1229,6 +1258,22 @@ def test_search_issues_error_log_omits_raw_jql(monkeypatch, caplog):
         jira.jira_search_issues(_SENTINEL_JQL)
 
     assert "super-secret-customer-name" not in caplog.text
+
+
+def test_search_issues_setup_error_logs_full_detail(monkeypatch, caplog):
+    # A failure before the search ever touches jql (no accessible Jira
+    # sites here) carries no caller-controlled JQL content, so unlike
+    # the search-phase error path above, it must log the full exception
+    # detail -- the same way every other tool in this file does -- not
+    # be reduced to just the exception type name.
+    monkeypatch.setattr(
+        jira.requests, "request", Mock(return_value=MockResponse(json_data=[]))
+    )
+
+    with caplog.at_level(logging.ERROR, logger="jira-mcp"):
+        jira.jira_search_issues("project = ENG")
+
+    assert "No accessible Jira sites" in caplog.text
 
 
 def test_approximate_count_uses_a_short_no_retry_timeout(monkeypatch):

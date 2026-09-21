@@ -98,8 +98,14 @@ def _path_segment(value: str) -> str:
     missing) -- an empty issue_key (e.g. an unresolved templated
     variable from an LLM caller) would otherwise silently build
     /rest/api/2/issue/, hitting the issue-collection endpoint instead
-    of a clear local error naming the actual mistake.
+    of a clear local error naming the actual mistake. Rejects None
+    explicitly, ahead of the str() coercion below: str(None) is the
+    non-blank, non-padded string "None", which would otherwise sail
+    through both checks and silently become a literal path segment
+    instead of raising.
     """
+    if value is None:
+        raise ValueError("path segment must not be None")
     value = str(value)
     if value in (".", ".."):
         raise ValueError(f"path segment must not be '.' or '..': {value!r}")
@@ -641,20 +647,31 @@ def _bounded_search_error(message: str, max_output_length: int) -> str:
     # error text, which can quote the offending clause -- so it isn't
     # guaranteed plain ASCII with no JSON-escapable characters. A `"`,
     # `\`, or control character costs MORE than one output character
-    # per source character, so a single budget-sized slice can still
-    # overflow; shrink by exactly the overshoot and retry rather than
-    # giving up on any message content the moment one slice attempt
-    # doesn't fit. Bounded to a handful of iterations since each retry
-    # strictly reduces the remaining budget.
+    # per source character (up to 6x, for a \u00XX-escaped control
+    # char), so a budget-sized slice can still overflow. Shrinking by
+    # exactly the *output* overshoot assumes a 1:1 source-to-output
+    # ratio that only holds for plain characters -- against an
+    # escape-heavy prefix it overshoots the true fitting size and can
+    # land on budget<=0 (discarding the message entirely) even when a
+    # smaller, still-fitting slice exists. `len(_error(message[:n]))`
+    # is monotonically non-decreasing in n (a longer prefix never
+    # produces fewer output characters, since JSON escaping only ever
+    # adds characters), so binary search over n finds the exact
+    # largest fitting slice in O(log budget) steps regardless of how
+    # escape-heavy the message is.
     budget = max_output_length - len(_error(""))
-    for _ in range(50):
-        if budget <= 0:
-            break
-        short = _error(message[:budget])
-        overflow = len(short) - max_output_length
-        if overflow <= 0:
-            return short
-        budget -= overflow
+    best: str | None = None
+    lo, hi = 0, budget
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = _error(message[:mid])
+        if len(candidate) <= max_output_length:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is not None:
+        return best
     return json.dumps({"status": "error"}, ensure_ascii=False)
 
 
@@ -711,7 +728,14 @@ def jira_search_issues(
         resolved_cloud_id = _resolve_cloud_id(cloud_id)
         max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
         max_output_length = get_tool_max_output_length()
+    except Exception as e:
+        # None of this setup touches jql, so the full exception detail
+        # is safe to log here -- unlike the try block below, which does
+        # touch jql and routes through _log_metadata_only instead.
+        logger.error(f"Error searching Jira issues: {e}")
+        return _bounded_search_error(str(e), get_tool_max_output_length())
 
+    try:
         issues: list[dict[str, Any]] = []
         next_token: str | None = None
         response = ""

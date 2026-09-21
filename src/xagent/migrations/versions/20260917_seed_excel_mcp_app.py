@@ -1,7 +1,7 @@
 """seed built-in Excel (OAuth) MCP connector
 
 Revision ID: 20260917_seed_excel_mcp_app
-Revises: 91899e1d97d3
+Revises: 6f40e43d9e28
 Create Date: 2026-09-17 00:00:00.000000
 
 """
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260917_seed_excel_mcp_app"
-down_revision: Union[str, None] = "91899e1d97d3"
+down_revision: Union[str, None] = "6f40e43d9e28"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

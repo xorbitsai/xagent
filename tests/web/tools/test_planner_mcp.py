@@ -115,6 +115,10 @@ def test_build_assignments_empty_returns_none():
 
 
 def test_build_assignments_shape():
+    """Each assignee in the same call must get a DISTINCT orderHint --
+    reusing the same literal for 2+ assignees ties their order, the exact
+    bug this file already fixed once for buckets (see _sequential_order_
+    hints)."""
     result = planner._build_assignments(["user-1", "user-2"])
     assert result == {
         "user-1": {
@@ -123,9 +127,15 @@ def test_build_assignments_shape():
         },
         "user-2": {
             "@odata.type": "#microsoft.graph.plannerAssignment",
-            "orderHint": " !",
+            "orderHint": " ! !",
         },
     }
+
+
+def test_sequential_order_hints_are_distinct_and_increasing():
+    hints = planner._sequential_order_hints(4)
+    assert hints == [" !", " ! !", " ! ! !", " ! ! ! !"]
+    assert len(set(hints)) == len(hints)
 
 
 def test_build_assignments_rejects_malformed_user_id():
@@ -212,6 +222,32 @@ def test_bounded_envelopes_remain_valid_below_minimum(monkeypatch, configured_li
     response = planner._error("x" * 10_000)
     assert len(response) <= planner._MIN_OUTPUT_LENGTH
     assert json.loads(response)["status"] == "error"
+
+
+@pytest.mark.parametrize("configured_limit", [18, 0, -1])
+def test_success_with_capped_dict_remains_valid_below_minimum(
+    monkeypatch, configured_limit
+):
+    """success_with_capped_dict (in .utils, used by planner_get_plan and
+    every other single-object read/create tool) has no floor of its own on
+    get_tool_max_output_length -- unlike planner.py's own _bounded_json --
+    so an aggressively low configured cap could make even its final
+    fallback exceed the limit and get corrupted by the platform's output
+    filter."""
+    from xagent.web.tools.mcp import utils as mcp_utils
+
+    monkeypatch.setattr(
+        mcp_utils, "get_tool_max_output_length", lambda: configured_limit
+    )
+    mock_request = Mock(
+        return_value=MockResponse({"id": "plan-1", "title": "x" * 10_000})
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    response = planner.planner_get_plan("plan-1")
+
+    assert len(response) <= mcp_utils._MIN_OUTPUT_LENGTH
+    assert json.loads(response)["status"] == "success"
 
 
 def test_resolve_list_path_defaults_when_no_next_link():

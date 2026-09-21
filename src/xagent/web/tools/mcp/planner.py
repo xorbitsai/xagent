@@ -51,6 +51,29 @@ _INDETERMINATE_MIN_OUTPUT_LENGTH = 320
 # Microsoft's create/update examples use " !" as the insertion hint; Graph
 # resolves that relative hint to a concrete value. Bucket creation can still
 # omit orderHint because Graph generates bucket ordering when it is absent.
+#
+# " !" is only documented for inserting a single item into an otherwise-
+# empty list ("Using order hints in Planner"). Reusing that exact literal
+# for every assignee in the SAME call -- e.g. two names in one
+# planner_assign_task call -- gives them identical hints, which is exactly
+# the "2nd+ sibling gets an unordered, tied hint" bug this file already
+# fixed once for buckets. Each assignee instead gets a distinct hint by
+# following the doc's own append-at-the-end algorithm ("<previous> !"),
+# applied within this one call: assignee i's hint is " !" repeated i times.
+
+
+def _sequential_order_hints(count: int) -> list[str]:
+    """Distinct, increasing order hints for `count` items appended in one
+    call, per "Using order hints in Planner"'s documented pattern for
+    inserting a new last item after an item with no next item: hint =
+    "<previous_hint> !". Starting from item 1's own documented value (" !"),
+    each subsequent item's hint is the previous one with " !" appended."""
+    hints = []
+    hint = ""
+    for _ in range(count):
+        hint = f"{hint} !"
+        hints.append(hint)
+    return hints
 
 
 class _GraphRequestError(RuntimeError):
@@ -510,12 +533,13 @@ def _validated_user_ids(user_ids: list[str]) -> list[str]:
 def _build_assignments(user_ids: list[str] | None) -> dict[str, Any] | None:
     if not user_ids:
         return None
+    validated = _validated_user_ids(user_ids)
     return {
         user_id: {
             "@odata.type": "#microsoft.graph.plannerAssignment",
-            "orderHint": " !",
+            "orderHint": hint,
         }
-        for user_id in _validated_user_ids(user_ids)
+        for user_id, hint in zip(validated, _sequential_order_hints(len(validated)))
     }
 
 

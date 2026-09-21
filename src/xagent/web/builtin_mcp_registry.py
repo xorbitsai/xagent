@@ -1998,6 +1998,9 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
         protected_server_identities = (
             ("shopify", "Shopify", "shopify"),
             ("excel", "Excel", "Excel"),
+            ("planner", "Planner", "Planner"),
+            ("sharepoint", "SharePoint", "SharePoint"),
+            ("powerpoint", "PowerPoint", "PowerPoint"),
         )
         builtin_app_ids = {row["app_id"] for row in builtin_app_rows}
         for app_id, display_name, official_server_name in protected_server_identities:

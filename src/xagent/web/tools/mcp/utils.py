@@ -143,6 +143,23 @@ def require_clean_identifier(value: str, field_name: str) -> str:
     return value
 
 
+def require_clean_text(value: str, field_name: str) -> str:
+    """Reject an empty or whitespace-padded free-text value (e.g. a title,
+    display name, or other human-authored field) rather than silently
+    fixing it.
+
+    Same underlying check as require_clean_identifier, but that function's
+    message ("must be a non-empty id...") reads as confusing/wrong for a
+    field that was never an id - a human-facing field like an issue's
+    summary or a priority name should be rejected in its own terms instead.
+    """
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError(
+            f"{field_name} cannot be empty or have leading/trailing whitespace"
+        )
+    return value
+
+
 def url_path_id(value: str, field_name: str) -> str:
     """Validate then percent-encode an id for safe interpolation into a URL
     path segment.

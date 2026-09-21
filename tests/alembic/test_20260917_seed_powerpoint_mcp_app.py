@@ -1,9 +1,10 @@
-"""Tests for the Google Ads MCP connector seed migration."""
+"""Tests for the PowerPoint MCP connector seed migration."""
 
 import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -12,10 +13,10 @@ from sqlalchemy import create_engine, text
 def _load_migration_module():
     migration_file = (
         Path(__file__).parent.parent.parent
-        / "src/xagent/migrations/versions/20260724_seed_google_ads_mcp_app.py"
+        / "src/xagent/migrations/versions/20260917_seed_powerpoint_mcp_app.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "seed_google_ads_migration", migration_file
+        "seed_powerpoint_migration", migration_file
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -53,23 +54,24 @@ def _app_ids(connection):
     return set(connection.execute(text("SELECT app_id FROM public_mcp_apps")).scalars())
 
 
-def test_upgrade_inserts_google_ads(tmp_path):
+def test_upgrade_inserts_powerpoint(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
         _create_table(connection)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        assert "google-ads" in _app_ids(connection)
+        assert "powerpoint" in _app_ids(connection)
         row = connection.execute(
             text(
-                "SELECT transport, provider_name, launch_config FROM public_mcp_apps WHERE app_id='google-ads'"
+                "SELECT transport, provider_name, launch_config FROM public_mcp_apps"
+                " WHERE app_id='powerpoint'"
             )
         ).first()
         assert row[0] == "oauth"
-        assert row[1] == "google"
-        assert "xagent.web.tools.mcp.google_ads" in str(row[2])
-        assert "GOOGLE_ADS_DEVELOPER_TOKEN" in str(row[2])
+        assert row[1] == "microsoft"
+        assert "xagent.web.tools.mcp.powerpoint" in str(row[2])
+        assert "builtin_provenance" in str(row[2])
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -81,56 +83,79 @@ def test_upgrade_is_idempotent(tmp_path):
             migration.upgrade()
             migration.upgrade()  # second run must not raise or duplicate
         rows = connection.execute(
-            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='google-ads'")
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='powerpoint'")
         ).scalar()
         assert rows == 1
 
 
-def test_seed_row_matches_registry(tmp_path):
-    """The migration snapshot and the runtime registry must define the same
-    google-ads row (the migration is a frozen copy; this catches drift)."""
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-
-    migration = _load_migration_module()
-    registry_row = next(
-        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "google-ads"
-    )
-    assert migration.ROW == registry_row
-
-
-def test_downgrade_removes_google_ads(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    migration = _load_migration_module()
-    with engine.begin() as connection:
-        _create_table(connection)
-        with patch.object(migration, "op", _operations(connection)):
-            migration.upgrade()
-            migration.downgrade()
-        assert "google-ads" not in _app_ids(connection)
-
-
-def test_downgrade_preserves_colliding_custom_app(tmp_path):
-    """An operator's custom app that reuses app_id="google-ads" (e.g. a
-    hand-created connector with a different config) must survive downgrade,
-    since upgrade() itself no-ops on that collision."""
+def test_upgrade_rejects_unprovenanced_app_id_collision(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
         _create_table(connection)
         connection.execute(
             text(
-                "INSERT INTO public_mcp_apps (app_id, name, transport, provider_name)"
-                " VALUES ('google-ads', 'Custom Ads Connector', 'stdio', NULL)"
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) "
+                "VALUES ('powerpoint', 'Operator app', 'stdio', '{}')"
             )
         )
         with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="no matching builtin_provenance"):
+                migration.upgrade()
+
+
+def test_downgrade_preserves_unprovenanced_app_id_collision(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) "
+                "VALUES ('powerpoint', 'Operator app', 'stdio', '{}')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+
+        assert "powerpoint" in _app_ids(connection)
+
+
+def test_seed_row_matches_registry(tmp_path):
+    """The migration snapshot and the runtime registry must define the same
+    powerpoint row (the migration is a frozen copy; this catches drift)."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    migration = _load_migration_module()
+    registry_row = next(
+        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "powerpoint"
+    )
+    assert migration.ROW == registry_row
+
+
+def test_downgrade_removes_powerpoint(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
-        assert "google-ads" in _app_ids(connection)
-        row = connection.execute(
-            text(
-                "SELECT name, transport FROM public_mcp_apps WHERE app_id='google-ads'"
-            )
-        ).first()
-        assert row[0] == "Custom Ads Connector"
-        assert row[1] == "stdio"
+        assert "powerpoint" not in _app_ids(connection)
+
+
+def test_upgrade_and_downgrade_no_op_without_table(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        table_names = set(
+            connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).scalars()
+        )
+        assert "public_mcp_apps" not in table_names

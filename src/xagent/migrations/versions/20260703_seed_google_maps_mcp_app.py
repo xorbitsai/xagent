@@ -11,6 +11,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.migrations.seed_helpers import delete_unmodified_seeded_rows
+
 # revision identifiers, used by Alembic.
 revision: str = "20260703_seed_google_maps_mcp_app"
 down_revision: Union[str, None] = "20260704_merge_alembic_heads"
@@ -68,13 +70,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    if "public_mcp_apps" not in set(inspector.get_table_names()):
-        return
-    # Only the catalog entry is removed. Any MCPServer/UserMCPServer rows created
-    # by users who already connected (possibly holding an admin platform key) are
-    # intentionally left in place — connect-driven rows are not owned by this
-    # migration and are cleaned up through the normal disconnect path.
-    bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-    )
+    # Only the catalog entry is removed, and only if it still matches this
+    # migration's seed snapshot — an operator's pre-existing custom
+    # app_id="google-maps" row is left in place. Any MCPServer/UserMCPServer
+    # rows created by users who already connected (possibly holding an admin
+    # platform key) are intentionally left in place — connect-driven rows are
+    # not owned by this migration and are cleaned up through the normal
+    # disconnect path.
+    delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, [ROW])

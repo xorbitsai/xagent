@@ -733,33 +733,35 @@ def jira_search_issues(
     cloud_id: str = "",
     limit: int = 50,
     next_page_token: str = "",
-    raw_fields: bool = False,
+    raw_fields: bool = True,
 ) -> str:
     """
     Search issues with JQL (Jira Query Language) -- the recommended way to
-    find issues by project, assignee, status, text, etc. Each result is a
-    compact projection (key, summary, status, status_category, assignee,
-    priority, issue_type, project_key, labels, parent_key, resolution,
-    created, updated) -- not the full issue. Use jira_get_issue for a
-    description, dependencies (issue_links/subtasks), or any other field
-    not in that list.
+    find issues by project, assignee, status, text, etc. By default each
+    result is Jira's own nested object (under "fields", e.g.
+    issue["fields"]["status"]["id"]), restricted to a fixed field subset
+    (summary, status, assignee, priority, issuetype, project, updated,
+    created, resolution, labels, parent) -- not the full issue. Use
+    jira_get_issue for a description, dependencies (issue_links/subtasks),
+    or any other field not in that list.
     jql: a JQL query, e.g. 'project = ENG AND status = "In Progress"
     ORDER BY updated DESC' or 'text ~ "login bug"'.
     limit: max issues to return per page (default 50, capped at 100).
     next_page_token: pass the previous response's next_page_token to fetch
     the next page -- always check `truncated` and re-call with it instead
     of assuming one page is everything.
-    raw_fields: return each issue as Jira's own nested object (under
-    "fields", e.g. issue["fields"]["status"]["id"]) instead of the
-    compact projection -- for an existing integration written against
-    the raw shape this tool returned before compact projection was
-    added. Still only the same field subset the compact projection
-    covers (see above); it changes how those fields are shaped, not
-    which ones are fetched -- use jira_get_issue for a field not in
-    that list either way. Bigger per-issue payload, so a raw page can
-    need more/smaller fallback pages to fit the output budget than the
-    same query would at the default setting; prefer the default
-    projection for new integrations.
+    raw_fields: defaults to True (Jira's own nested shape, matching what
+    this tool has always returned -- callers that don't pass this
+    parameter keep getting the same field layout they always have,
+    whichever version they were written against). Pass False to opt into
+    a smaller, flattened per-issue projection (key, summary, status,
+    status_category, assignee, priority, issue_type, project_key, labels,
+    parent_key, resolution, created, updated) recommended for new
+    integrations -- roughly 10x smaller per issue, so a page is far less
+    likely to need a fallback retry at a smaller size to fit the output
+    budget. Either way, only the same fixed field subset above is
+    fetched; this changes how those fields are shaped, not which ones --
+    use jira_get_issue for a field not in that list either way.
     A search error (invalid JQL, a page too big even at minimal size, a
     stuck pagination cursor) always has a "message" key describing it,
     except under an extremely small configured output cap where even

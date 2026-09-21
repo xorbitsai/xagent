@@ -458,7 +458,10 @@ def test_search_issues_sends_jql_and_reports_next_page_token(monkeypatch):
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
 
-    result = json.loads(jira.jira_search_issues("project = ENG"))
+    # raw_fields=False here since this test is about JQL/pagination
+    # mechanics, not response shape -- decoupled from whichever shape
+    # is the tool's current default.
+    result = json.loads(jira.jira_search_issues("project = ENG", raw_fields=False))
 
     assert result["status"] == "success"
     assert result["issues"][0]["key"] == "ENG-1"
@@ -569,7 +572,7 @@ def test_search_issues_summarizes_issue_fields(monkeypatch):
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
 
-    result = json.loads(jira.jira_search_issues("project = DW"))
+    result = json.loads(jira.jira_search_issues("project = DW", raw_fields=False))
 
     assert result["issues"] == [
         {
@@ -620,7 +623,7 @@ def test_search_issues_summarizes_resolved_issue(monkeypatch):
     )
     monkeypatch.setattr(jira.requests, "request", mock_request)
 
-    result = json.loads(jira.jira_search_issues("project = DW"))
+    result = json.loads(jira.jira_search_issues("project = DW", raw_fields=False))
 
     assert result["issues"][0]["resolution"] == "Fixed"
 
@@ -864,7 +867,12 @@ def test_search_issues_tries_a_size_of_one_when_small_limit_overflows(monkeypatc
     monkeypatch.setattr(jira.requests, "request", mock_request)
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 400)
 
-    result = json.loads(jira.jira_search_issues("project = ENG", limit=3))
+    # raw_fields=False here: this test is about the size-1 fallback
+    # path, not response shape, and the fixture below was sized to
+    # overflow specifically under the compact projection's byte count.
+    result = json.loads(
+        jira.jira_search_issues("project = ENG", limit=3, raw_fields=False)
+    )
 
     assert result["status"] == "success"
     assert result["returned_count"] == 1
@@ -1023,7 +1031,7 @@ def test_search_issues_skips_approximate_count_when_no_headroom_left(monkeypatch
     )
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: fitting_length + 5)
 
-    result = json.loads(jira.jira_search_issues("project = ENG"))
+    result = json.loads(jira.jira_search_issues("project = ENG", raw_fields=False))
 
     assert result["total_count"] is None
     assert "approximate_total_count" not in result
@@ -1059,7 +1067,7 @@ def test_search_issues_drops_total_count_and_reuses_fitting_response_on_overflow
     monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: fitting_length + 25)
 
     with caplog.at_level(logging.INFO, logger="jira-mcp"):
-        result = json.loads(jira.jira_search_issues("project = ENG"))
+        result = json.loads(jira.jira_search_issues("project = ENG", raw_fields=False))
 
     assert result["total_count"] is None
     assert "approximate_total_count" not in result
@@ -1096,7 +1104,12 @@ def test_search_issues_raw_fields_returns_the_unslimmed_jira_shape(monkeypatch):
     assert result["issues"][0]["fields"]["assignee"]["emailAddress"] == "a@example.com"
 
 
-def test_search_issues_default_still_returns_the_compact_projection(monkeypatch):
+def test_search_issues_default_now_returns_the_raw_jira_shape(monkeypatch):
+    # raw_fields defaults to True: an existing caller that never passes
+    # this parameter must keep getting the same nested shape this tool
+    # has always returned (Finding B -- flipping the default to the
+    # compact projection would have silently broken every unchanged
+    # caller reading issue["fields"][...]).
     raw_issue = {
         "key": "ENG-1",
         "fields": {
@@ -1113,6 +1126,30 @@ def test_search_issues_default_still_returns_the_compact_projection(monkeypatch)
     monkeypatch.setattr(jira.requests, "request", mock_request)
 
     result = json.loads(jira.jira_search_issues("project = ENG"))
+
+    assert result["issues"] == [raw_issue]
+
+
+def test_search_issues_raw_fields_false_returns_the_compact_projection(monkeypatch):
+    # Explicitly opting into the smaller projection recommended for new
+    # integrations still works the same way it did when it was the
+    # default.
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "status": {"id": "3", "name": "In Progress"},
+        },
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"issues": [raw_issue]}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_issues("project = ENG", raw_fields=False))
 
     assert result["issues"] == [
         {

@@ -145,6 +145,31 @@ snapshot images, and adding a prefix does not transfer resource ownership.
 
 ## Channel replies and failure recovery
 
+Shared Slack, Feishu and Telegram inputs use durable receipts scoped to the
+owner, configured channel, conversation and sender. Slack identifies a physical
+message by its workspace and timestamp; Feishu uses its message ID; Telegram
+uses the chat, topic and message ID. Repeated deliveries reuse the original
+accepted task and START, including after ingress restarts. Changed text, stable
+file IDs or reply context for the same identity is rejected; send a new message
+to request new work. Deleted targets remain unavailable. Control commands and
+local execution retain their existing behavior.
+
+Feishu and Telegram retain short-window message batching. Every unseen physical message
+accepted together gets a receipt pointing to the same START. A retry may split, reorder
+or overlap an earlier batch: accepted messages are replayed, and only unseen
+messages enter a new turn. An earlier message whose accepted target is no longer
+available, or whose content conflicts with its receipt, receives an error without
+blocking unseen messages in the same batch.
+Telegram voice identity uses the original message and
+stable file ID, so replay does not download or transcribe the voice again.
+
+Attachments are downloaded and durably staged before task selection. Their
+metadata, task, transcript, START and reply destination commit atomically.
+Progress uses the same delivery claim as the final reply: the loading message
+is created after acceptance and its ID is persisted for reuse. Telegram retains
+voice input, agent selection and stop/conversation-switch controls. Lost platform
+acknowledgements can still repeat a send, as described below.
+
 Accepted channel commands and final-reply destinations are committed together.
 The designated ingress checks pending final replies every 30 seconds, including
 after restart. A separate delivery claim prevents ordinary concurrent sends;

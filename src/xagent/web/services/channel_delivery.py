@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import case, or_, select, update
+from sqlalchemy import case, false, or_, select, update
 from sqlalchemy.orm import Session
 
 from ...core.runtime_performance import increment_counter
@@ -50,7 +50,9 @@ class ChannelDelivery:
 ChannelSender = Callable[[ChannelDelivery, dict[str, Any]], Awaitable[None]]
 
 
-def _claim(command_id: int) -> tuple[ChannelDelivery, dict[str, Any] | None] | None:
+def _claim(
+    command_id: int, *, progress: bool = False
+) -> tuple[ChannelDelivery, dict[str, Any] | None] | None:
     from .shared_channel_execution import _read_channel_result
 
     now = datetime.now(timezone.utc)
@@ -64,6 +66,12 @@ def _claim(command_id: int) -> tuple[ChannelDelivery, dict[str, Any] | None] | N
                 or_(
                     TaskChannelDelivery.available_at.is_(None),
                     TaskChannelDelivery.available_at <= now,
+                    (
+                        TaskChannelDelivery.claim_token.is_(None)
+                        & (TaskChannelDelivery.failure_count == 0)
+                    )
+                    if progress
+                    else false(),
                 ),
             )
             .values(
@@ -135,6 +143,7 @@ def _settle_no_commit(
     now = datetime.now(timezone.utc)
     retry_at = now + timedelta(seconds=_DELIVERY_RETRY_SECONDS)
     values: dict[str, Any] = {
+        "destination": delivery.destination,
         "status": status,
         "claim_token": None,
         "available_at": retry_at if status == "pending" else None,
@@ -208,14 +217,20 @@ def _renew(delivery: ChannelDelivery) -> bool:
 
 
 async def deliver_channel_result(
-    command_id: int, sender: ChannelSender, *, pending_notice: bool = False
+    command_id: int,
+    sender: ChannelSender,
+    *,
+    pending_notice: bool = False,
+    progress: bool = False,
 ) -> bool:
     """Return whether a final send completed; never change Agent/task status."""
     delivery = None
     heartbeat = None
     sending: asyncio.Future[None] | None = None
     try:
-        claimed = await run_db_io_cancellation_safe(lambda: _claim(command_id))
+        claimed = await run_db_io_cancellation_safe(
+            lambda: _claim(command_id, progress=progress)
+        )
         if claimed is None:
             return False
         delivery, result = claimed

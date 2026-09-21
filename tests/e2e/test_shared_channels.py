@@ -23,9 +23,8 @@ pytestmark = pytest.mark.e2e
     [
         (platform, scenario)
         for platform in ("slack", "feishu", "telegram")
-        for scenario in ("text", "file", "reply")
-    ]
-    + [("telegram", "pending")],
+        for scenario in ("text", "file", "reply", "pending")
+    ],
 )
 async def test_channel_callback_runs_remotely_and_returns_answer(
     shared_app, monkeypatch, platform, scenario, tmp_path
@@ -134,7 +133,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
             await asyncio.wait_for(
                 bot._process_event(
                     "conversation",
-                    {},
+                    {"team_id": "workspace"},
                     {
                         "type": "message",
                         "channel_type": "im",
@@ -202,23 +201,32 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
             bot = TelegramBotInstance(
                 "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi", "e2e", channel_id, "E2E"
             )
-            await bot.bot.session.close()
+            from datetime import datetime, timezone
+
+            from aiogram import types
+            from aiogram.methods import SendDocument
+
+            async def platform_request(_bot, method, timeout=None):
+                if isinstance(method, SendDocument):
+                    delivered.append(Path(method.document.path).read_bytes())
+                return types.Message(
+                    message_id=77,
+                    date=datetime.now(timezone.utc),
+                    chat=types.Chat(id=456, type="private"),
+                ).as_(_bot)
+
+            telegram_requests = AsyncMock(side_effect=platform_request)
+            monkeypatch.setattr(bot.bot.session, "make_request", telegram_requests)
 
             async def download_file(_path, *, destination):
                 Path(destination).write_bytes(b"unique shared input\n")
 
-            bot.bot = SimpleNamespace(
-                edit_message_text=AsyncMock(),
-                send_message=AsyncMock(),
-                get_file=AsyncMock(
-                    return_value=SimpleNamespace(file_path="source.txt")
-                ),
-                download_file=download_file,
+            monkeypatch.setattr(
+                bot.bot,
+                "get_file",
+                AsyncMock(return_value=SimpleNamespace(file_path="source.txt")),
             )
-
-            async def answer_document(document, **kwargs):
-                delivered.append(Path(document.path).read_bytes())
-                return SimpleNamespace(delete=AsyncMock())
+            monkeypatch.setattr(bot.bot, "download_file", download_file)
 
             loading = SimpleNamespace(
                 message_id=77, edit_text=AsyncMock(), delete=AsyncMock()
@@ -229,7 +237,6 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 from_user=SimpleNamespace(id=123),
                 chat=SimpleNamespace(id=456),
                 answer=AsyncMock(return_value=loading),
-                answer_document=answer_document,
                 text=input_text,
                 caption=None,
                 document=SimpleNamespace(
@@ -246,7 +253,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 video=None,
             )
             await asyncio.wait_for(bot._process_user_messages_batch(123, [message]), 30)
-            assert expected_text in str(loading.edit_text.call_args_list)
+            assert expected_text in str(telegram_requests.call_args_list)
             if pending:
                 from xagent.web.services.channel_delivery import recover_channel_results
 
@@ -268,6 +275,14 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 return
             if with_file:
                 assert delivered == [b"UNIQUE SHARED INPUT\n"]
+        if pending:
+            from xagent.web.models.task_channel_delivery import TaskChannelDelivery
+            from xagent.web.models.task_command import TaskExecutionCommand
+
+            with get_session_local()() as db:
+                assert db.query(TaskExecutionCommand).count() == 1
+                assert db.query(TaskChannelDelivery).one().status == "pending"
+            return
         with get_session_local()() as db:
             tasks = db.query(Task).all()
             assert len(tasks) == 1
@@ -276,6 +291,13 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
             task_id, status="waiting_for_user" if with_question else "completed"
         )
         if with_file:
+            from xagent.web.models.uploaded_file import UploadedFile
+
+            with get_session_local()() as db:
+                uploaded = db.query(UploadedFile).filter_by(filename="source.txt").one()
+                cached = Path(uploaded.storage_path)
+                cached.relative_to(tmp_path / "uploads" / f"user_{app.user_id}")
+                assert cached.read_bytes() == b"unique shared input\n"
             if platform != "feishu":
                 assert delivered == [b"UNIQUE SHARED INPUT\n"]
             else:
@@ -301,7 +323,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 await asyncio.wait_for(
                     bot._process_event(
                         "conversation",
-                        {},
+                        {"team_id": "workspace"},
                         {
                             "type": "message",
                             "channel_type": "im",
@@ -320,6 +342,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                     bot._process_messages_batch("sender", [message]), 30
                 )
             else:
+                message.message_id += 1
                 message.text = followup_text
                 await asyncio.wait_for(
                     bot._process_user_messages_batch(123, [message]), 30
@@ -342,7 +365,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 if platform == "slack"
                 else bot._update_text.call_args_list
                 if platform == "feishu"
-                else loading.edit_text.call_args_list
+                else telegram_requests.call_args_list
             )
             assert "Shared E2E answer" in str(replies[-1])
         assert forwarded
@@ -351,6 +374,8 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
             for event in forwarded
         )
     finally:
+        if platform == "telegram" and bot is not None:
+            await bot.bot.session.close()
         await stop_task_event_bridge()
         from xagent.web.services.task_events import (
             set_task_command_delivery,

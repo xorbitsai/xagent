@@ -84,3 +84,24 @@ def test_oauth_lifecycle_changes_run_real_postgresql_fence_tests(
     assert (
         "pytest tests/web/api/test_mcp_oauth_lifecycle_postgresql.py -m postgresql -q"
     ) in regression["run"]
+
+
+@pytest.mark.parametrize(
+    "source_path",
+    [
+        "src/xagent/web/services/uploaded_file_store.py",
+        "tests/web/test_feishu_message_queue.py",
+        "tests/web/test_telegram_message_queue.py",
+    ],
+)
+def test_channel_input_dependencies_trigger_postgresql_regressions(source_path):
+    text = _workflow_text()
+    assert source_path in _push_paths(text)
+    assert source_path in _detector_paths(text)
+    workflow = yaml.safe_load(text)
+    steps = workflow["jobs"]["test-postgresql-migrations"]["steps"]
+    assert any(
+        "pytest tests/web/services/test_channel_input_acceptance.py "
+        in step.get("run", "")
+        for step in steps
+    )

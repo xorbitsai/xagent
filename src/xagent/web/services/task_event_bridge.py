@@ -40,6 +40,10 @@ class _Origin:
     delivered: OrderedDict[str, bool] = field(default_factory=OrderedDict)
 
 
+class TaskReplyRouteUnavailable(ConnectionError):
+    """The accepted command has not acquired a live reply route yet."""
+
+
 class TaskEventBridge:
     """One process boot identity; combined hosts use the same Redis path."""
 
@@ -316,7 +320,9 @@ class TaskEventBridge:
                     "xagent.task.reply.delivery", attributes={"outcome": "no_route"}
                 )
                 if require_ack:
-                    raise ConnectionError("Original task command route is unavailable")
+                    raise TaskReplyRouteUnavailable(
+                        "Original task command route is unavailable"
+                    )
                 return
             host_id, origin = route
             delivery_id = uuid4().hex

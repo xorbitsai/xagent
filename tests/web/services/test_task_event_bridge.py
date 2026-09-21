@@ -406,3 +406,64 @@ async def test_unexpected_platform_failure_returns_negative_ack(bridge, monkeypa
     )
     assert json.loads(publish.await_args.args[1])["delivered"] is False
     await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_progress_route_backs_off_and_recovers(monkeypatch):
+    from xagent.web.services import shared_channel_execution as shared
+
+    now = 0.0
+    monkeypatch.setattr(shared, "monotonic", lambda: now)
+    reply = AsyncMock(
+        side_effect=[
+            module.TaskReplyRouteUnavailable("missing"),
+            module.TaskReplyRouteUnavailable("missing"),
+            None,
+            module.TaskReplyRouteUnavailable("missing again"),
+            None,
+        ]
+    )
+    bridge = Mock()
+    bridge.reply_for.return_value = reply
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+    event = Mock()
+    for _ in range(100):
+        await forwarder.handle_event(event)
+    assert reply.await_count == 1
+    now = 1.0
+    await forwarder.handle_event(event)
+    now = 2.0
+    await forwarder.handle_event(event)
+    assert reply.await_count == 2
+    now = 3.0
+    await forwarder.handle_event(event)
+    await forwarder.handle_event(event)
+    assert reply.await_count == 4
+    now = 3.5
+    await forwarder.handle_event(event)
+    assert reply.await_count == 4
+    now = 4.0
+    await forwarder.handle_event(event)
+    assert reply.await_count == 5
+
+
+@pytest.mark.asyncio
+async def test_missing_progress_route_retry_delay_is_capped(monkeypatch):
+    from xagent.web.services import shared_channel_execution as shared
+
+    now = 0.0
+    monkeypatch.setattr(shared, "monotonic", lambda: now)
+    reply = AsyncMock(side_effect=module.TaskReplyRouteUnavailable("missing"))
+    bridge = Mock()
+    bridge.reply_for.return_value = reply
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    forwarder = shared.ChannelProgressForwarder(
+        Mock(command_id="command", task_id=42), "run"
+    )
+    for now in [0.0, 1.0, 3.0, 7.0, 15.0, 31.0, 61.0, 91.0]:
+        for _ in range(100):
+            await forwarder.handle_event(Mock())
+    assert reply.await_count == 8

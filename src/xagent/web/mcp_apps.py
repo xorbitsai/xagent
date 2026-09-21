@@ -77,6 +77,11 @@ from .models.public_mcp import PublicMCPApp
 # (User.Read), while workbook reads and writes require Files.ReadWrite from
 # the Excel app row. A bare microsoft grant may continue serving other
 # Microsoft connectors, but it must neither provision nor satisfy Excel.
+#
+# powerpoint: same reasoning as excel -- reading/writing presentations
+# requires Files.ReadWrite, which isn't part of the microsoft provider's
+# default_scopes (["User.Read"]). A bare microsoft grant, or one scoped to
+# a different Microsoft app, must never be treated as satisfying it.
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
     {
         "excel",
@@ -85,6 +90,7 @@ APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
         "myob",
         "meta-ads",
         "planner",
+        "powerpoint",
         "sharepoint",
         "whatsapp",
     }

@@ -6,8 +6,9 @@ link to the builtin registry it protects: an app whose oauth_scopes need
 something the provider's own default_scopes don't grant, but that's missing
 from the set, fails silently -- a bare provider-level OAuth grant is treated
 as sufficient, the app reports "connected", and every scope-gated tool call
-then fails. This pins the recently added whatsapp, Planner, SharePoint, and
-Excel connectors, so a future edit can't silently drop any of them.
+then fails. This pins the recently added whatsapp, Planner, SharePoint,
+PowerPoint, and Excel connectors, so a future edit can't silently drop any
+of them.
 
 Deliberately narrow: a fully general "every builtin oauth app whose scopes
 exceed its provider's default_scopes must be listed here" test does not hold
@@ -35,6 +36,7 @@ _EXPECTED_APP_SCOPED_APPS = frozenset(
         "myob",
         "meta-ads",
         "planner",
+        "powerpoint",
         "sharepoint",
         "whatsapp",
     }

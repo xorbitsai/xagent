@@ -1998,6 +1998,7 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
         protected_server_identities = (
             ("shopify", "Shopify", "shopify"),
             ("excel", "Excel", "Excel"),
+            ("whatsapp", "WhatsApp Business", "WhatsApp Business"),
             ("planner", "Planner", "Planner"),
             ("sharepoint", "SharePoint", "SharePoint"),
             ("powerpoint", "PowerPoint", "PowerPoint"),

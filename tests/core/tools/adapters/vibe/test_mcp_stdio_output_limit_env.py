@@ -62,7 +62,9 @@ async def test_stdio_configs_receive_the_parents_effective_output_limits(monkeyp
         captured["mcp_configs"] = mcp_configs
         return []
 
-    monkeypatch.setattr(ToolFactory, "_create_mcp_tools_from_configs", staticmethod(fake_create))
+    monkeypatch.setattr(
+        ToolFactory, "_create_mcp_tools_from_configs", staticmethod(fake_create)
+    )
 
     config = _FakeConfig(
         [
@@ -94,7 +96,9 @@ async def test_existing_stdio_env_entries_are_preserved(monkeypatch):
         captured["mcp_configs"] = mcp_configs
         return []
 
-    monkeypatch.setattr(ToolFactory, "_create_mcp_tools_from_configs", staticmethod(fake_create))
+    monkeypatch.setattr(
+        ToolFactory, "_create_mcp_tools_from_configs", staticmethod(fake_create)
+    )
 
     config = _FakeConfig(
         [
@@ -129,7 +133,9 @@ async def test_non_stdio_configs_are_left_untouched(monkeypatch):
         captured["mcp_configs"] = mcp_configs
         return []
 
-    monkeypatch.setattr(ToolFactory, "_create_mcp_tools_from_configs", staticmethod(fake_create))
+    monkeypatch.setattr(
+        ToolFactory, "_create_mcp_tools_from_configs", staticmethod(fake_create)
+    )
 
     config = _FakeConfig(
         [
@@ -154,7 +160,9 @@ async def test_unavailable_stdio_placeholder_is_left_untouched(monkeypatch):
         captured["mcp_configs"] = mcp_configs
         return []
 
-    monkeypatch.setattr(ToolFactory, "_create_mcp_tools_from_configs", staticmethod(fake_create))
+    monkeypatch.setattr(
+        ToolFactory, "_create_mcp_tools_from_configs", staticmethod(fake_create)
+    )
 
     config = _FakeConfig(
         [

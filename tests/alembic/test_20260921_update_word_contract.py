@@ -24,6 +24,20 @@ def _load_migration_module():
     return module
 
 
+def _load_seed_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260917_seed_word_mcp_app.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "seed_word_migration_for_contract_test", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -135,3 +149,45 @@ def test_downgrade_restores_owned_word_contract(tmp_path):
         ).first()
         assert row[0] == migration.OLD_DESCRIPTION
         assert migration.OUTPUT_LIMIT_ENV not in str(row[1])
+
+
+def test_fresh_upgrade_then_downgrade_restores_down_revision_exactly(tmp_path):
+    """The follow-up revision must downgrade to the frozen seed contract.
+
+    This catches the subtle case where both migrations seed the newest values:
+    upgrading a fresh database looks correct, but downgrading one revision then
+    invents state that never existed at its down_revision.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    seed = _load_seed_migration_module()
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(seed, "op", _operations(connection)):
+            seed.upgrade()
+        seeded = connection.execute(
+            text(
+                "SELECT description, launch_config FROM public_mcp_apps "
+                "WHERE app_id='word'"
+            )
+        ).first()
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            upgraded = connection.execute(
+                text(
+                    "SELECT description, launch_config FROM public_mcp_apps "
+                    "WHERE app_id='word'"
+                )
+            ).first()
+            assert upgraded[0] == migration.NEW_DESCRIPTION
+            assert migration.OUTPUT_LIMIT_ENV in str(upgraded[1])
+            migration.downgrade()
+
+        downgraded = connection.execute(
+            text(
+                "SELECT description, launch_config FROM public_mcp_apps "
+                "WHERE app_id='word'"
+            )
+        ).first()
+        assert downgraded == seeded

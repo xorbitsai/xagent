@@ -586,8 +586,8 @@ def _check_in_edit_snapshot(snapshot: _EditSnapshot, content: bytes) -> None:
         pass
 
     # The check-in can commit and then lose its response. Treat it as success
-    # only when both the exact intended bytes and a non-checkout publication
-    # state can be observed; otherwise the caller's cleanup path fails closed.
+    # only when both the exact intended bytes and an explicit published state
+    # can be observed; otherwise the caller's cleanup path fails closed.
     try:
         remote = _graph_request("GET", f"{snapshot.item_path}/content", raw=True)
         metadata = _graph_request(
@@ -598,8 +598,10 @@ def _check_in_edit_snapshot(snapshot: _EditSnapshot, content: bytes) -> None:
             "Graph did not confirm the Word check-in completed"
         ) from None
     publication = metadata.get("publication") if isinstance(metadata, dict) else None
-    if remote == content and not (
-        isinstance(publication, dict) and publication.get("level") == "checkout"
+    if (
+        remote == content
+        and isinstance(publication, dict)
+        and publication.get("level") == "published"
     ):
         return
     raise RuntimeError("Graph did not confirm the Word check-in completed")

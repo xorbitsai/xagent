@@ -1705,6 +1705,32 @@ def test_check_in_reconciles_when_success_response_is_lost(monkeypatch):
     word._check_in_edit_snapshot(snapshot, content)
 
 
+def test_check_in_reconciliation_requires_explicit_published_state(monkeypatch):
+    """Matching bytes alone cannot prove a lost-response check-in completed."""
+    content = _docx_bytes(lambda d: d.add_paragraph("committed"))
+    responses = iter(
+        [
+            requests.ConnectionError("check-in response lost"),
+            MockResponse(content=content),
+            MockResponse({}),
+        ]
+    )
+
+    def request(*args, **kwargs):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(word.requests, "request", Mock(side_effect=request))
+    snapshot = word._EditSnapshot(
+        "/drives/drive-1/items/item-1", '"before"', "generation"
+    )
+
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        word._check_in_edit_snapshot(snapshot, content)
+
+
 def test_upload_document_rejects_stale_etag_at_session_creation(monkeypatch):
     """A 412 at createUploadSession means someone else changed the file
     since it was downloaded for this edit -- surfaced as a clear conflict,

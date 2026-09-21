@@ -129,16 +129,48 @@ def test_upgrade_preserves_unowned_custom_word_row(tmp_path):
         assert row == "Operator Word"
 
 
-def test_seed_row_matches_registry(tmp_path):
-    """The migration snapshot and the runtime registry must define the same
-    word row (the migration is a frozen copy; this catches drift)."""
+def test_seed_row_keeps_stable_registry_identity(tmp_path):
+    """The frozen seed keeps identity fields aligned with the registry.
+
+    Description and launch configuration intentionally evolve in the next
+    migration, so comparing the entire row would make a correct migration
+    chain impossible to downgrade faithfully.
+    """
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration_module()
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "word"
     )
-    assert migration.ROW == registry_row
+    assert {
+        key: migration.ROW[key]
+        for key in (
+            "app_id",
+            "name",
+            "icon",
+            "transport",
+            "provider_name",
+            "category",
+            "oauth_scopes",
+            "is_visible_in_connector",
+        )
+    } == {
+        key: registry_row[key]
+        for key in (
+            "app_id",
+            "name",
+            "icon",
+            "transport",
+            "provider_name",
+            "category",
+            "oauth_scopes",
+            "is_visible_in_connector",
+        )
+    }
+    assert (
+        migration.ROW["launch_config"]["builtin_provenance"]
+        == registry_row["launch_config"]["builtin_provenance"]
+    )
 
 
 def test_downgrade_removes_word(tmp_path):

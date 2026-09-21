@@ -88,7 +88,7 @@ def _apply_stdio_output_limits_env(
     var / config override produced it.
 
     ``config.get_max_field_count()``/``get_max_recursion_depth()`` are
-    mirrored the same way pre-emptively, even though no builtin connector
+    mirrored the same way preemptively, even though no builtin connector
     reads those two env vars yet, so a connector that starts reading them
     later doesn't need a second pass through this function.
 

@@ -416,6 +416,63 @@ def test_list_projects_drops_avatar_urls(monkeypatch):
     assert "avatarUrls" not in json.dumps(result)
 
 
+def test_list_projects_raw_fields_returns_the_unsummarized_jira_shape(monkeypatch):
+    raw_project = {
+        "id": "10033",
+        "key": "DW",
+        "name": "Datapel WMS",
+        "projectTypeKey": "software",
+        "avatarUrls": {"48x48": "https://api.atlassian.com/.../avatar"},
+        "lead": {"accountId": "abc123", "displayName": "Alice"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"values": [raw_project], "isLast": True}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_projects(raw_fields=True))
+
+    assert result["projects"] == [raw_project]
+    assert result["truncated"] is False
+    assert result["next_start_at"] is None
+
+
+def test_list_projects_raw_fields_shrinks_page_to_fit_and_advances_correctly(
+    monkeypatch,
+):
+    # Unlike the summarized path (small enough per-project that this has
+    # never been a practical concern), raw project objects can be large
+    # enough that even a page smaller than `limit` needs to shrink to
+    # fit -- next_start_at must then point at the first DROPPED project
+    # (offset + kept count), not wherever Jira's own isLast/page-size
+    # signal said, so a caller resuming from it neither skips nor
+    # repeats a project.
+    big_projects = [
+        {"id": str(i), "key": f"P{i}", "name": "x" * 300, "extra": "y" * 300}
+        for i in range(20)
+    ]
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"values": big_projects, "isLast": True}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 3000)
+
+    raw_response = jira.jira_list_projects(raw_fields=True)
+    result = json.loads(raw_response)
+
+    assert len(raw_response) <= 3000
+    assert result["status"] == "success"
+    assert 0 < len(result["projects"]) < 20
+    assert result["truncated"] is True
+    assert result["next_start_at"] == len(result["projects"])
+
+
 def test_list_projects_next_start_at_counts_raw_page_not_filtered(monkeypatch):
     # One malformed (non-dict) entry alongside two real projects. If
     # next_start_at were computed from the filtered `projects` list (2)
@@ -531,6 +588,100 @@ def test_get_issue_returns_issue(monkeypatch):
 
     assert result["status"] == "success"
     assert result["issue"]["key"] == "ENG-1"
+
+
+def test_get_issue_raw_fields_returns_the_unflattened_jira_shape(monkeypatch):
+    # raw_fields restores access to the pre-summarization "issue.fields"
+    # nesting (e.g. status.id, not just the summary's flattened
+    # status_category name) for an existing integration written against
+    # the old raw shape, or a nested sub-field the summary never exposed.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {
+            "summary": "Bug",
+            "status": {"id": "10004", "name": "In Progress"},
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1", raw_fields=True))
+
+    assert result["status"] == "success"
+    assert result["issue"]["fields"]["status"]["id"] == "10004"
+    assert result["issue"]["fields"]["summary"] == "Bug"
+    # The summarized-mode-only extras don't apply in raw mode.
+    assert "extra_field_values" not in result
+    assert "description_truncated" not in result
+
+
+def test_get_issue_raw_fields_still_fetches_requested_extra_fields(monkeypatch):
+    # extra_fields still controls which fields Jira is asked for in raw
+    # mode -- it just skips the summarized path's separate
+    # extra_field_values envelope, since the raw "fields" object already
+    # contains everything requested.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {"summary": "Bug", "customfield_10099": "custom value"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_get_issue("ENG-1", extra_fields="customfield_10099", raw_fields=True)
+    )
+
+    assert result["issue"]["fields"]["customfield_10099"] == "custom value"
+    issue_call = mock_request.call_args_list[1]
+    assert "customfield_10099" in issue_call.kwargs["params"]["fields"]
+
+
+def test_get_issue_raw_fields_bounds_an_oversized_response(monkeypatch):
+    # Same output-cap guarantee as the summarized path, just via
+    # success_with_capped_dict directly on the raw payload instead of
+    # the summary's own bounding machinery.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {
+            "summary": "Bug",
+            "issuelinks": [{"outwardIssue": {"key": f"ENG-{i}"}} for i in range(500)],
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 2000)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 2000)
+
+    raw_response = jira.jira_get_issue("ENG-1", raw_fields=True)
+    result = json.loads(raw_response)
+
+    assert len(raw_response) <= 2000
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_get_issue_flattens_description_and_surfaces_dependencies(monkeypatch):
@@ -803,6 +954,20 @@ def test_get_issue_bounds_the_aggregate_extra_field_values_size(monkeypatch):
     # would push the whole response past budget and get dropped
     # entirely by the extreme fallback -- reporting success with no
     # sign the requested fields were ever there.
+    #
+    # Pinned to a specific max_output_length (both bindings -- jira.py's
+    # own and the one success_with_capped_dict reads from utils.py --
+    # since they're separate imports) rather than relying on whatever
+    # get_tool_max_output_length() resolves to from the ambient
+    # environment: this test's assertion bound is calibrated against
+    # remaining_budget's exact value (max_output_length // 2), so an
+    # unpinned/differently-configured cap could silently make it
+    # exercise a different code path (or fail outright) without
+    # actually catching a regression. 60_000 keeps remaining_budget at
+    # exactly _ISSUE_DESCRIPTION_MAX_CHARS (30_000), matching this
+    # test's existing assertion bound.
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 60_000)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 60_000)
     near_cap_value = "x" * (jira._ISSUE_DESCRIPTION_MAX_CHARS - 100)
     raw_issue = {
         "key": "ENG-1",
@@ -833,6 +998,46 @@ def test_get_issue_bounds_the_aggregate_extra_field_values_size(monkeypatch):
     assert result["extra_field_values_truncated"] is True
     total_extra_size = len(json.dumps(result["extra_field_values"]))
     assert total_extra_size <= jira._ISSUE_DESCRIPTION_MAX_CHARS + 1000
+
+
+def test_get_issue_extra_field_values_stays_within_a_small_configured_cap(
+    monkeypatch,
+):
+    # A configured max_output_length well under 60_000 (the point below
+    # which an earlier version's aggregate-budget floor exceeded the
+    # ENTIRE cap) must not make extra_field_values -- or
+    # description_truncated alongside it -- vanish. Since
+    # extra_field_values is a protected top-level extra that
+    # success_with_capped_dict can't gradually shrink, an oversized
+    # aggregate budget here forces that helper's last-resort
+    # with_extras=False fallback, which drops every extra at once and
+    # reports a plain "success" with no sign any of them were ever
+    # requested -- the regression this test guards against.
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 2000)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 2000)
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_big": "x" * 25000},
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_big"))
+
+    assert result["status"] == "success"
+    assert len(json.dumps(result)) <= 2000
+    assert "extra_field_values" in result
+    assert "description_truncated" in result
+    assert result["extra_field_values_truncated"] is True
 
 
 def test_get_issue_rejects_jira_field_selector_syntax_in_extra_fields(monkeypatch):
@@ -1358,6 +1563,79 @@ def test_list_comments_flattens_adf_body_and_drops_avatar_urls(monkeypatch):
     assert "avatarUrls" not in json.dumps(result)
 
 
+def test_list_comments_raw_fields_returns_the_unflattened_jira_shape(monkeypatch):
+    raw_comment = {
+        "id": "10001",
+        "author": {"accountId": "u1", "displayName": "Bruce"},
+        "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": "Looks good"}],
+                }
+            ],
+        },
+        "renderedBody": "<p>Looks good</p>",
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"comments": [raw_comment], "total": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_comments("ENG-1", raw_fields=True))
+
+    assert result["comments"] == [raw_comment]
+    assert result["next_start_at"] is None
+
+
+def test_list_comments_raw_fields_shrinks_page_to_fit_and_advances_correctly(
+    monkeypatch,
+):
+    raw_comments = [{"id": str(i), "body": "x" * 300} for i in range(20)]
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"comments": raw_comments, "total": 20}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 3000)
+
+    raw_response = jira.jira_list_comments("ENG-1", raw_fields=True)
+    result = json.loads(raw_response)
+
+    assert len(raw_response) <= 3000
+    assert result["status"] == "success"
+    assert 0 < len(result["comments"]) < 20
+    assert result["truncated"] is True
+    assert result["next_start_at"] == len(result["comments"])
+
+
+def test_list_comments_raw_fields_errors_on_an_unfittable_single_comment(monkeypatch):
+    # A raw comment's body is an ADF object, not a plain string
+    # _cap_text_field can shrink -- unlike the summarized path, a
+    # single unfittable raw comment can't be shrunk further, so this
+    # must be the bounded-error case, not a silently-skipped page.
+    raw_comment = {"id": "1", "body": {"type": "doc", "content": "x" * 5000}}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"comments": [raw_comment], "total": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 300)
+
+    result = json.loads(jira.jira_list_comments("ENG-1", raw_fields=True))
+
+    assert result["status"] == "error"
+
+
 def _raw_comment_with_body(comment_id: str, body_length: int):
     return {"id": comment_id, "body": "x" * body_length}
 
@@ -1428,13 +1706,44 @@ def test_list_comments_returns_bounded_error_when_single_comment_too_big(monkeyp
     assert "output limit" in result["message"]
 
 
-def test_list_comments_returns_empty_page_when_only_one_comment_overflows(monkeypatch):
-    # When there's room for an empty page but not for the single
-    # comment on it, that's a valid bounded page (0 comments,
-    # next_start_at pointing PAST the comment left out, not at it --
-    # equal to start_at would make a caller following it re-fetch this
-    # exact position forever) -- not the hard error the too-small-for-
-    # even-that case above hits.
+def test_list_comments_shrinks_a_single_oversized_comment_instead_of_dropping_it(
+    monkeypatch,
+):
+    # When a single comment doesn't fit at its default per-comment body
+    # cap, it must be shrunk further (a smaller body cap, same
+    # body_truncated signal) rather than dropped from the page --
+    # next_start_at advances past it normally (it WAS delivered), not
+    # skipped as if it never existed.
+    raw_comment = {"id": "1", "body": "x" * 500}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"comments": [raw_comment], "total": 1}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 400)
+
+    result = json.loads(jira.jira_list_comments("ENG-1"))
+
+    assert result["status"] == "success"
+    assert len(result["comments"]) == 1
+    comment = result["comments"][0]
+    assert comment["id"] == "1"
+    assert comment["body_truncated"] is True
+    assert 0 < len(comment["body"]) < 500
+    assert len(json.dumps(result)) <= 400
+    assert result["next_start_at"] is None  # this WAS the whole (one-comment) page
+
+
+def test_list_comments_returns_error_when_not_even_an_empty_bodied_comment_fits(
+    monkeypatch,
+):
+    # A budget so small that not even a single comment with its body
+    # shrunk to nothing fits at all -- no comment from this raw page can
+    # be delivered, so this must be the hard error case, not a silent
+    # "success" with the comment skipped and unrecoverable via
+    # next_start_at.
     raw_comment = {"id": "1", "body": "x" * 50}
     mock_request = Mock(
         side_effect=[
@@ -1448,19 +1757,36 @@ def test_list_comments_returns_empty_page_when_only_one_comment_overflows(monkey
 
     result = json.loads(jira.jira_list_comments("ENG-1"))
 
-    assert result["status"] == "success"
-    assert result["comments"] == []
-    assert result["next_start_at"] == 1
-    assert result["next_start_at"] != 0  # must not equal start_at (the default 0)
+    assert result["status"] == "error"
 
 
-def test_fit_comments_page_advances_past_a_single_unfittable_comment():
-    # A single comment that doesn't fit even alone, preceded by a
-    # malformed (non-dict) raw entry -- next_start_at must skip past the
-    # unfittable comment's own raw position (offset + 2), not just the
-    # malformed entry's, and must never equal offset (a caller
-    # mechanically resuming from it would otherwise re-fetch this exact
-    # position forever).
+def test_fit_comments_page_shrinks_a_single_unfittable_comment():
+    # A single comment that doesn't fit at the default cap, preceded by
+    # a malformed (non-dict) raw entry -- next_start_at_for(1)'s "every
+    # raw comment accounted for" branch must still be reached (the
+    # malformed entry is filtered, not counted against kept), and the
+    # comment's body must be shrunk (not the comment dropped).
+    raw_comments = ["not-a-dict", {"id": "1", "body": "x" * 500}]
+    offset = 10
+
+    response = jira._fit_comments_page(raw_comments, offset, 12, True, 400)
+
+    assert response is not None
+    result = json.loads(response)
+    assert len(result["comments"]) == 1
+    assert result["comments"][0]["body_truncated"] is True
+    assert 0 < len(result["comments"][0]["body"]) < 500
+    # has_more_raw=True and every kept (filtered) comment is included --
+    # the raw-page-relative "more beyond this page" signal, not a
+    # skip-past-the-unfittable-entry one.
+    assert result["next_start_at"] == offset + len(raw_comments)
+
+
+def test_fit_comments_page_errors_when_not_even_an_empty_bodied_comment_fits():
+    # Mirrors the size-too-small-for-anything case above but calls
+    # _fit_comments_page directly: returns None (the caller's cue to
+    # return a bounded error) rather than skipping the comment via
+    # next_start_at, since retrying could never succeed here either.
     raw_comments = ["not-a-dict", {"id": "1", "body": "x" * 50}]
     offset = 10
     empty_page_size = len(jira._build_comments_response([], 5, offset + 2))
@@ -1469,11 +1795,7 @@ def test_fit_comments_page_advances_past_a_single_unfittable_comment():
         raw_comments, offset, 5, False, empty_page_size + 5
     )
 
-    assert response is not None
-    result = json.loads(response)
-    assert result["comments"] == []
-    assert result["next_start_at"] == offset + 2
-    assert result["next_start_at"] != offset
+    assert response is None
 
 
 def test_list_comments_next_start_at_counts_raw_page_not_filtered(monkeypatch):
@@ -1829,13 +2151,13 @@ def test_get_issue_extra_field_values_survives_capped_dict_fallback(monkeypatch)
             ]
         ),
     )
-    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 40000)
-    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 40000)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 25000)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 25000)
 
     raw_response = jira.jira_get_issue("ENG-1", extra_fields="customfield_10099")
     result = json.loads(raw_response)
 
-    assert len(raw_response) <= 40000
+    assert len(raw_response) <= 25000
     assert result["status"] == "success"
     assert "extra_field_values" not in result["issue"]
     assert result["extra_field_values"]["customfield_10099"].endswith("[truncated]")

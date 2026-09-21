@@ -309,17 +309,70 @@ def _summarize_project(project: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _fit_raw_list_page(
+    key: str,
+    items: list[dict[str, Any]],
+    offset: int,
+    base_truncated: bool,
+    base_next_start_at: int | None,
+    max_output_length: int,
+) -> str | None:
+    """Build {key: items[:count], truncated, next_start_at} at the
+    largest count (halving from len(items)) that fits max_output_length,
+    for a raw (unsummarized) list page -- the summarized path's items
+    are small enough per-entry that this has never been a practical
+    concern, but a raw one (avatarUrls, permissions, and other metadata
+    the summary drops) can be large enough to need the same
+    halve-until-it-fits treatment _fit_comments_page uses.
+
+    If the count has to shrink below len(items), truncated/next_start_at
+    are recomputed from the actual included count (offset + count) --
+    not base_next_start_at, which assumed the whole raw page fit -- so a
+    caller following it resumes exactly where this page's cut left off,
+    neither skipping nor repeating an item. Returns None if not even a
+    count of 0 fits.
+    """
+
+    def response_for(count: int) -> str:
+        if count == len(items):
+            truncated, next_start_at = base_truncated, base_next_start_at
+        else:
+            truncated, next_start_at = True, offset + count
+        return _success(
+            **{key: items[:count]}, truncated=truncated, next_start_at=next_start_at
+        )
+
+    count = len(items)
+    response = response_for(count)
+    while len(response) > max_output_length and count > 0:
+        count //= 2
+        response = response_for(count)
+    return response if len(response) <= max_output_length else None
+
+
 @mcp.tool()
-def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -> str:
+def jira_list_projects(
+    cloud_id: str = "", limit: int = 50, start_at: int = 0, raw_fields: bool = False
+) -> str:
     """
     List projects on a Jira site -- id, key (e.g. "ENG"), name, and
     project_type_key. Use the returned key with jira_create_issue and
     jira_search_issues. Other project metadata (lead, category, archived/
-    private flags) is not returned.
+    private flags) is not returned unless raw_fields is set.
     cloud_id: optional site id from jira_list_accessible_sites; omit when
     the account has only one accessible site.
     start_at: offset into the full project list -- pass the previous
     response's next_start_at to fetch the next page (0 to start over).
+    raw_fields: return each project as Jira's own object (avatarUrls,
+    lead, category, archived/private flags, and everything else this
+    tool normally drops) instead of the summary above -- for an
+    existing integration written against the raw shape this tool
+    returned before summarization was added. Bigger per-project payload,
+    so fewer projects may fit a page than the same request would at the
+    default setting, and a page can shrink below what `limit` asked for
+    to stay within the output budget -- always check `truncated` and
+    resume from next_start_at rather than assuming one page is
+    everything.
     """
     try:
         max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
@@ -333,20 +386,35 @@ def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira projects API")
         raw_projects = result.get("values") or []
-        projects = [_summarize_project(p) for p in raw_projects if isinstance(p, dict)]
         # bool(raw_projects) guards against a server that signals more
         # pages while returning an empty page: without it next_start_at
         # would equal start_at and a caller following it would loop
-        # forever. Counting the RAW page (not the filtered `projects`) --
+        # forever. Counting the RAW page (not the filtered list below) --
         # same pattern as jira_search_users below -- matters because
         # Jira's startAt is positional over the raw page: undercounting
         # by however many entries got filtered out would make the next
         # request re-fetch (duplicate) entries already consumed here.
         truncated = bool(raw_projects) and not result.get("isLast", True)
+        next_start_at = (offset + len(raw_projects)) if truncated else None
+        if raw_fields:
+            projects = [p for p in raw_projects if isinstance(p, dict)]
+            response = _fit_raw_list_page(
+                "projects",
+                projects,
+                offset,
+                truncated,
+                next_start_at,
+                get_tool_max_output_length(),
+            )
+            if response is None:
+                return _error(
+                    "A Jira projects page exceeds the tool output limit even "
+                    "when empty; fetch it individually or narrow the request"
+                )
+            return response
+        projects = [_summarize_project(p) for p in raw_projects if isinstance(p, dict)]
         return _success(
-            projects=projects,
-            truncated=truncated,
-            next_start_at=(offset + len(raw_projects)) if truncated else None,
+            projects=projects, truncated=truncated, next_start_at=next_start_at
         )
     except Exception as e:
         logger.error(f"Error listing Jira projects: {e}")
@@ -700,7 +768,12 @@ def _cap_extra_field_value(value: Any, max_chars: int) -> tuple[Any, bool]:
 
 
 @mcp.tool()
-def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -> str:
+def jira_get_issue(
+    issue_key: str,
+    cloud_id: str = "",
+    extra_fields: str = "",
+    raw_fields: bool = False,
+) -> str:
     """
     Get one issue's details -- description, status, assignee,
     reporter/creator, priority, components, fix versions, due date, and
@@ -732,6 +805,19 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
     _ISSUE_DESCRIPTION_MAX_CHARS is truncated with description_truncated
     set to true, so the result is always parseable JSON regardless of
     how large the real description is.
+    raw_fields: return each fetched field (the default set, plus any
+    extra_fields) as Jira's own nested object under "fields" (e.g.
+    issue["fields"]["status"]["id"]) instead of the flattened summary
+    above -- for an existing integration written against the raw shape
+    this tool returned before summarization was added, or to reach a
+    nested sub-field (e.g. status.id, not just status.name) the summary
+    doesn't expose. extra_fields still controls which fields beyond the
+    default set are fetched; extra_field_values/description_truncated
+    are not produced in this mode since the raw "fields" object already
+    contains everything requested. Bigger per-issue payload than the
+    default projection, so a raw response can shrink further under a
+    small output budget (see success_with_capped_dict) than the same
+    request would at the default setting.
     """
     try:
         # Jira's `fields` query param treats a leading "-" as "exclude
@@ -761,6 +847,15 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
         )
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira issue API")
+        if raw_fields:
+            # The raw "fields" object already contains every field this
+            # request fetched (default set plus any requested_extra), so
+            # extra_field_values/description_truncated -- which only
+            # exist to work around the summary's flattening -- don't
+            # apply here. success_with_capped_dict still bounds the
+            # whole thing the same way the summarized path is bounded,
+            # just without a protected top-level extra to carve out.
+            return success_with_capped_dict("issue", result)
         issue = _summarize_full_issue(result)
         description_truncated = _cap_text_field(
             issue, "description", _ISSUE_DESCRIPTION_MAX_CHARS
@@ -781,25 +876,39 @@ def jira_get_issue(issue_key: str, cloud_id: str = "", extra_fields: str = "") -
             "description_truncated": description_truncated
         }
         if requested_extra:
-            raw_fields = _as_dict(result.get("fields"))
+            response_fields = _as_dict(result.get("fields"))
             extra_field_values: dict[str, Any] = {}
             extra_field_values_truncated = False
-            # Half the configured budget (but never less than a single
-            # field's own cap, so requesting just one field still gets
-            # the full _ISSUE_DESCRIPTION_MAX_CHARS it always has),
-            # reserved for the combined extra_field_values dict -- this
-            # leaves the other half for `issue` and the rest of the
-            # envelope under the default budget, and bounds the
-            # aggregate proportionately for a differently-configured one.
-            remaining_budget = max(
-                get_tool_max_output_length() // 2, _ISSUE_DESCRIPTION_MAX_CHARS
-            )
+            # Half the configured budget, reserved for the combined
+            # extra_field_values dict -- this leaves the other half for
+            # `issue` and the rest of the envelope. This must scale
+            # DOWN with a small configured max_output_length, not just
+            # up with a large one: an earlier version floored this at
+            # _ISSUE_DESCRIPTION_MAX_CHARS (30_000) "so a single
+            # requested field still gets a reasonable amount of room",
+            # but that floor made the aggregate budget bigger than the
+            # ENTIRE configured output cap whenever max_output_length
+            # was under 60_000 (the current default, 50 KiB, included) --
+            # success_with_capped_dict's `issue` shrinking can't touch
+            # extra_field_values at all (it's a protected top-level
+            # extra), so an oversized aggregate here forced the
+            # function's last-resort with_extras=False fallback, which
+            # drops extra_field_values -- and description_truncated
+            # alongside it -- entirely, reporting a plain "success" with
+            # no sign any of it was ever there. Each individual field is
+            # still separately capped at _ISSUE_DESCRIPTION_MAX_CHARS by
+            # the min(...) below, and remaining_budget<=0 below already
+            # degrades gracefully to an empty, explicitly-flagged
+            # extra_field_values instead of silently vanishing -- that
+            # graceful path only works if this budget is never inflated
+            # past what success_with_capped_dict can actually deliver.
+            remaining_budget = get_tool_max_output_length() // 2
             for name in requested_extra:
                 if remaining_budget <= 0:
                     extra_field_values_truncated = True
                     break
                 value, was_truncated = _cap_extra_field_value(
-                    raw_fields.get(name),
+                    response_fields.get(name),
                     min(_ISSUE_DESCRIPTION_MAX_CHARS, remaining_budget),
                 )
                 extra_field_values[name] = value
@@ -1006,11 +1115,18 @@ def jira_transition_issue(
         return _error(str(e))
 
 
-def _summarize_comment(comment: dict[str, Any]) -> dict[str, Any]:
+def _summarize_comment(
+    comment: dict[str, Any], *, body_max_chars: int = _COMMENT_BODY_MAX_CHARS
+) -> dict[str, Any]:
     """Flatten a comment's ADF body to plain text and drop the author's
     avatarUrls -- a long comment thread otherwise repeats that avatar
     ladder once per comment and is a routine way jira_list_comments'
     output ran past the per-tool-output-string cap.
+
+    body_max_chars is only ever overridden by _fit_comments_page's
+    single-comment shrink search (a smaller cap than the fixed default
+    for the one comment that doesn't fit any other way); every other
+    caller gets the fixed default.
     """
     raw_visibility = comment.get("visibility")
     visibility = _as_dict(raw_visibility)
@@ -1047,9 +1163,7 @@ def _summarize_comment(comment: dict[str, Any]) -> dict[str, Any]:
     # fit (see _fit_comments_page for that), but it does guarantee a
     # single pathologically large comment is never why a page can't be
     # built at all.
-    summarized["body_truncated"] = _cap_text_field(
-        summarized, "body", _COMMENT_BODY_MAX_CHARS
-    )
+    summarized["body_truncated"] = _cap_text_field(summarized, "body", body_max_chars)
     return summarized
 
 
@@ -1071,21 +1185,34 @@ def _fit_comments_page(
     total: int,
     has_more_raw: bool,
     max_output_length: int,
+    *,
+    raw_fields: bool = False,
 ) -> str | None:
     """Build a whole-comment prefix (each comment already body-capped by
-    _summarize_comment) that fits max_output_length, trying every raw
-    entry first and halving the count until it fits if that overflows.
-    Halving can under-deliver relative to the true largest fitting
-    prefix (e.g. 8 kept comments where the full page and half (4) both
-    overflow but 6 would fit tries 8/4/2/1/0, never 6) -- accepted for
-    consistency with the same halving strategy every sibling connector
-    uses for this "shrink a list until the response fits" problem,
-    rather than this being the one bespoke exact-fit search in the file.
+    _summarize_comment, unless raw_fields is set) that fits
+    max_output_length, trying every raw entry first and halving the
+    count until it fits if that overflows. Halving can under-deliver
+    relative to the true largest fitting prefix (e.g. 8 kept comments
+    where the full page and half (4) both overflow but 6 would fit
+    tries 8/4/2/1/0, never 6) -- accepted for consistency with the same
+    halving strategy every sibling connector uses for this "shrink a
+    list until the response fits" problem, rather than this being the
+    one bespoke exact-fit search in the file.
 
-    Returns None if not even an empty page (0 comments, pointing
-    next_start_at just past the one comment that couldn't fit) fits --
-    the caller should treat that as a bounded error, the same way
-    jira_search_issues does when its minimal page still doesn't fit.
+    When even a single SUMMARIZED comment doesn't fit at its default
+    per-comment body cap, this retries that SAME comment with a
+    progressively smaller body cap (binary search) rather than skipping
+    it outright -- shrinking is far more likely to make one comment fit
+    than the fixed default assumed, and preserves its content instead
+    of losing it. raw_fields skips this refinement (a raw comment's
+    body is Jira's own ADF object, not the plain string _cap_text_field
+    shrinks) and falls straight to the bounded-error case below when a
+    single raw comment doesn't fit.
+
+    Returns None if not even a single comment (with an empty body, in
+    the non-raw case) fits -- the caller should treat that as a bounded
+    error, the same way jira_search_issues does when its minimal page
+    still doesn't fit.
 
     next_start_at is computed from the RAW position of (or immediately
     after) the last comment actually kept -- not from the filtered/kept
@@ -1095,11 +1222,11 @@ def _fit_comments_page(
     next_start_at, extended to also cover a size-triggered cut, not
     just a filtered-out malformed entry).
     """
-    # (raw index, summarized comment) pairs -- kept together instead of
-    # two parallel lists so the two can't drift out of alignment under a
-    # future edit to the filter below.
+    # (raw index, summarized-or-raw comment) pairs -- kept together
+    # instead of two parallel lists so the two can't drift out of
+    # alignment under a future edit to the filter below.
     kept: list[tuple[int, dict[str, Any]]] = [
-        (index, _summarize_comment(raw))
+        (index, raw if raw_fields else _summarize_comment(raw))
         for index, raw in enumerate(raw_comments)
         if isinstance(raw, dict)
     ]
@@ -1140,18 +1267,65 @@ def _fit_comments_page(
     # problem, rather than a bespoke bisection: MAX_LIMIT bounds a page
     # to 100 comments, so the extra precision an exact-largest-fit search
     # would buy isn't worth this being the one mechanism in the file that
-    # doesn't match its siblings.
+    # doesn't match its siblings. Stops at count=1 (not 0): a lone
+    # comment that still doesn't fit at its default body cap gets a
+    # dedicated shrink search below instead of being dropped straight
+    # to an empty page.
     count = len(kept)
     response = response_for(count)
-    while len(response) > max_output_length and count > 0:
+    while len(response) > max_output_length and count > 1:
         count //= 2
         response = response_for(count)
-    return response if len(response) <= max_output_length else None
+    if len(response) <= max_output_length:
+        return response
+
+    if not kept or raw_fields:
+        # raw_fields: a raw comment's body is Jira's own ADF object, not
+        # the plain string _cap_text_field/_summarize_comment's
+        # body_max_chars shrinks -- there's no smaller-cap retry to
+        # attempt here, so a single unfittable raw comment goes straight
+        # to the bounded-error case below.
+        return None
+
+    # A single comment doesn't fit even at _COMMENT_BODY_MAX_CHARS.
+    # Retry the SAME comment (not a different one -- next_start_at_for
+    # must stay anchored to this raw index either way) with a smaller
+    # body cap. Binary search is valid here for the same reason it is
+    # in _bounded_search_error: _truncate's slice is a prefix of the
+    # original body, and a longer prefix can only produce an equal or
+    # longer JSON-escaped output, never a shorter one -- so response
+    # length is monotonically non-decreasing in the cap.
+    raw_comment = raw_comments[kept[0][0]]
+
+    def response_at_cap(body_max_chars: int) -> str:
+        comment = _summarize_comment(raw_comment, body_max_chars=body_max_chars)
+        return _build_comments_response([comment], total, next_start_at_for(1))
+
+    lo, hi = 0, _COMMENT_BODY_MAX_CHARS
+    best: str | None = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = response_at_cap(mid)
+        if len(candidate) <= max_output_length:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is not None:
+        return best
+
+    # Not even a body-length-zero single comment fits -- no comment
+    # from this raw page can be delivered at all.
+    return None
 
 
 @mcp.tool()
 def jira_list_comments(
-    issue_key: str, cloud_id: str = "", limit: int = 50, start_at: int = 0
+    issue_key: str,
+    cloud_id: str = "",
+    limit: int = 50,
+    start_at: int = 0,
+    raw_fields: bool = False,
 ) -> str:
     """
     List comments on an issue (id, body, author, visibility, jsd_public,
@@ -1166,12 +1340,23 @@ def jira_list_comments(
     A comment body longer than _COMMENT_BODY_MAX_CHARS is truncated
     with body_truncated set to true on that comment; if the whole page
     still doesn't fit the tool output limit even after that, fewer
-    comments than requested are returned (down to zero) with
+    comments than requested are returned (down to one) with
     next_start_at pointing at the first one left out, so pagination
-    stays valid -- except when a single comment doesn't fit even alone,
-    where next_start_at skips past it instead, since retrying would
-    never succeed. Only if even a single empty page doesn't fit is an
-    error returned instead.
+    stays valid. A single comment that still doesn't fit at that point
+    is shrunk further (a smaller body cap, same body_truncated signal)
+    rather than dropped -- next_start_at only ever skips past a comment
+    when not even an empty-bodied version of it fits in the configured
+    output limit at all.
+    raw_fields: return each comment as Jira's own object (body as its
+    original ADF rich-text structure, not flattened plain text; every
+    other field Jira returns, e.g. renderedBody) instead of the summary
+    above -- for an existing integration written against the raw shape
+    this tool returned before summarization was added. Pages still
+    shrink (down to one comment) to fit the output budget the same way
+    the summarized path does; a single raw comment that doesn't fit
+    even alone is not shrunk further (unlike the summarized path, its
+    body isn't a plain string _cap_text_field can trim), so that case
+    returns a bounded error instead of a page that silently skips it.
     """
     try:
         max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
@@ -1201,6 +1386,7 @@ def jira_list_comments(
             total,
             has_more_raw,
             get_tool_max_output_length(),
+            raw_fields=raw_fields,
         )
         if response is None:
             return _error(

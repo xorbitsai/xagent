@@ -14,6 +14,7 @@ from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import create_access_token, generic_oauth_callback
 from xagent.web.models.database import Base
+from xagent.web.models.gmail_watch import GmailWatchState
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -162,6 +163,116 @@ def test_gmail_callback_best_effort_registers_watch_after_oauth_commit(
     )
     assert oauth_account.email == "alice@gmail.com"
     assert calls == [int(user.id)]
+
+
+def test_gmail_reconnect_revives_same_identity_tombstone_in_place(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    tombstone = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        provider_user_id="google-user-1",
+        email="alice@gmail.com",
+        access_token="",
+    )
+    db.add(tombstone)
+    db.flush()
+    watch = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(tombstone.id),
+        email="alice@gmail.com",
+        history_id="history-1",
+        topic_name="projects/demo/topics/xagent-gmail-alice",
+        status="failed",
+        last_error=gmail_provisioning.GMAIL_RECONNECT_REQUIRED_ERROR,
+    )
+    db.add(watch)
+    db.commit()
+    tombstone_id = int(tombstone.id)
+    watch_id = int(watch.id)
+
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "reconnected-token",
+                    "refresh_token": "reconnected-refresh",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+    provisioned_account_ids: list[int] = []
+
+    def capture_best_effort(_db, *, user_id: int, context: str):
+        account = (
+            _db.query(UserOAuth)
+            .filter(UserOAuth.user_id == user_id, UserOAuth.provider == "gmail")
+            .one()
+        )
+        provisioned_account_ids.append(int(account.id))
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "best_effort_provision_gmail_watches_for_user",
+        capture_best_effort,
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    reconnected = db.query(UserOAuth).filter(UserOAuth.provider == "gmail").one()
+    assert int(reconnected.id) == tombstone_id
+    assert reconnected.access_token == "reconnected-token"
+    assert reconnected.refresh_token == "reconnected-refresh"
+    assert db.get(GmailWatchState, watch_id) is not None
+    assert provisioned_account_ids == [tombstone_id]
+
+
+def test_gmail_reconnect_does_not_reuse_a_different_identity_tombstone(db_session):
+    db, user = db_session
+    tombstone = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        provider_user_id="google-user-1",
+        email="shared-address@gmail.com",
+        access_token="",
+    )
+    db.add(tombstone)
+    db.commit()
+
+    matched = auth_api._matching_gmail_reconnect_tombstone(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        connector_key="gmail",
+        provider_user_id="google-user-2",
+        email="shared-address@gmail.com",
+    )
+
+    assert matched is None
 
 
 def test_gmail_callback_succeeds_when_best_effort_watch_provisioning_raises(

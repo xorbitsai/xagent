@@ -78,6 +78,7 @@ from ..services.db_runtime import await_task_settlement, propagate_deferred_canc
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     normalize_user_oauth_resource_owner_key,
+    scoped_user_oauth_query,
 )
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
@@ -172,6 +173,59 @@ def _run_post_commit_oauth_side_effects(
             connector_key,
             exc_info=True,
         )
+
+
+def _matching_gmail_reconnect_tombstone(
+    db: Session,
+    *,
+    user_id: int,
+    resource_owner_key: str | None,
+    connector_key: str,
+    provider_user_id: object,
+    email: object,
+) -> UserOAuth | None:
+    """Return the same-identity Gmail tombstone that a reconnect can revive.
+
+    Gmail triggers and watch state bind to ``UserOAuth.id``. Replacing a
+    retained tombstone with a fresh row would cascade-delete its watch and
+    leave the trigger bound to the removed id. Only ordinary Gmail needs this
+    identity preservation; actor credentials have no Gmail lifecycle rows.
+
+    A stable upstream id wins. Email is a fallback only when the stored row
+    did not have an upstream id, so authorizing a different Google identity
+    cannot silently move an existing mailbox trigger to that account.
+    """
+    if resource_owner_key is not None or connector_key != "gmail":
+        return None
+
+    candidates = (
+        scoped_user_oauth_query(
+            db,
+            user_id=int(user_id),
+            resource_owner_key=None,
+        )
+        .filter(
+            UserOAuth.provider == connector_key,
+            UserOAuth.access_token == "",
+        )
+        .order_by(UserOAuth.id.desc())
+        .all()
+    )
+    normalized_provider_user_id = str(provider_user_id) if provider_user_id else None
+    if normalized_provider_user_id is not None:
+        for candidate in candidates:
+            if candidate.provider_user_id == normalized_provider_user_id:
+                return candidate
+
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email:
+        return None
+    for candidate in candidates:
+        if normalized_provider_user_id and candidate.provider_user_id:
+            continue
+        if str(candidate.email or "").strip().lower() == normalized_email:
+            return candidate
+    return None
 
 
 def _oauth_env_name(provider: str, suffix: str) -> str:
@@ -3979,20 +4033,50 @@ def generic_oauth_callback(
                 # Serialize replacement in the stable user namespace.
                 db.query(User.id).filter(User.id == user_id).with_for_update().one()
 
-            delete_scoped_user_oauth_accounts(
+            connector_key = app_id or provider
+            oauth_account = _matching_gmail_reconnect_tombstone(
                 db,
                 user_id=user_id,
                 resource_owner_key=resource_owner_key,
-                providers=[app_id or provider],
+                connector_key=connector_key,
+                provider_user_id=provider_user_id,
+                email=email,
             )
+            if oauth_account is None:
+                delete_scoped_user_oauth_accounts(
+                    db,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                    providers=[connector_key],
+                )
+                oauth_account = UserOAuth(
+                    user_id=user_id,
+                    provider=connector_key,
+                    resource_owner_key=resource_owner_key,
+                )
+                db.add(oauth_account)
+            else:
+                # Preserve the matching tombstone's primary key, but retain
+                # the callback's replace-all semantics for any other Gmail
+                # rows in the ordinary namespace.
+                (
+                    scoped_user_oauth_query(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=None,
+                    )
+                    .filter(
+                        UserOAuth.provider == connector_key,
+                        UserOAuth.id != int(oauth_account.id),
+                    )
+                    .delete(synchronize_session=False)
+                )
 
-            oauth_account = UserOAuth(
-                user_id=user_id,
-                provider=(app_id or provider),
-                resource_owner_key=resource_owner_key,
-                provider_user_id=str(provider_user_id) if provider_user_id else None,
+            setattr(
+                oauth_account,
+                "provider_user_id",
+                str(provider_user_id) if provider_user_id else None,
             )
-            db.add(oauth_account)
 
             setattr(oauth_account, "access_token", access_token)
             setattr(oauth_account, "token_type", token_data.get("token_type", "Bearer"))
@@ -4012,15 +4096,15 @@ def generic_oauth_callback(
                 token_scope = " ".join(str(scope) for scope in token_scope)
             setattr(oauth_account, "scope", token_scope)
             setattr(oauth_account, "email", email)
+            setattr(oauth_account, "refresh_token", None)
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
             # Salesforce returns the per-org API host here instead of using a
             # fixed domain -- no other provider (besides Deputy, handled
-            # explicitly below) sends this key, and oauth_account is freshly
-            # created above (never an update to an existing row), so
-            # token_data.get() returning None for every other provider is
-            # already the correct, final value: no `if "instance_url" in
-            # token_data` guard needed to avoid clobbering anything.
+            # explicitly below) sends this key. A callback fully replaces
+            # credential metadata even when it revives a Gmail tombstone, so
+            # token_data.get() returning None for every other provider is the
+            # correct final value rather than stale state to preserve.
             resolved_instance_url = token_data.get("instance_url")
             if is_deputy:
                 # Deputy's equivalent is `endpoint`, not `instance_url`, and
@@ -4035,6 +4119,7 @@ def generic_oauth_callback(
                 # (MYOB can't reach this branch without it).
                 resolved_instance_url = myob_business_id
             setattr(oauth_account, "instance_url", resolved_instance_url)
+            setattr(oauth_account, "expires_at", None)
             if "expires_in" in token_data:
                 setattr(
                     oauth_account,

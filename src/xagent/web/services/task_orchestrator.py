@@ -1229,7 +1229,6 @@ def _accept_turn_no_commit(
     is_workforce_task = isinstance(agent_config, dict) and isinstance(
         agent_config.get("workforce_run_id"), int
     )
-    claimed_task: Task | None = None
     if is_workforce_task:
         # Workforce tasks: reject turns whose owning workforce was archived or
         # whose live config drifted from the run's pinned fingerprint. CREATE
@@ -1248,26 +1247,25 @@ def _accept_turn_no_commit(
             )
         except WorkforceTurnRejectedError as exc:
             raise TaskTurnError(exc.reason) from exc
-        # Keep the WorkforceRun projection in the same transaction as the Task
-        # RUNNING acceptance. A later best-effort worker can otherwise arrive
-        # after completion and resurrect the projection.
-        from .workforce_runtime import sync_workforce_run_status
-
-        if not queued:
-            claimed_task = (
-                db.query(Task).filter(Task.id == task_id, Task.run_id == run_id).one()
-            )
-            sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
     if not queued:
-        # The trigger projection is deliberately not workforce-specific: any
-        # acceptance that takes a task out of PAUSED / WAITING_FOR_USER has to
-        # take its trigger run out of the parked state too, in this same
-        # transaction -- otherwise a resumed run keeps reading as parked until the
+        # One read of the claimed row serves both projections below. The
+        # workforce guard stays ahead of it on purpose: a rejected turn has to
+        # raise TaskTurnError on its own terms, without depending on this row
+        # still being readable (``.one()`` would raise NoResultFound instead).
+        claimed_task = (
+            db.query(Task).filter(Task.id == task_id, Task.run_id == run_id).one()
+        )
+        # Keep both run projections in the same transaction as the Task RUNNING
+        # acceptance. A later best-effort worker can otherwise arrive after
+        # completion and resurrect the projection. The trigger projection is
+        # deliberately not workforce-specific: any acceptance that takes a task
+        # out of PAUSED / WAITING_FOR_USER has to take its trigger run out of the
+        # parked state too, or a resumed run keeps reading as parked until the
         # task terminates (#2177).
-        if claimed_task is None:
-            claimed_task = (
-                db.query(Task).filter(Task.id == task_id, Task.run_id == run_id).one()
-            )
+        if is_workforce_task:
+            from .workforce_runtime import sync_workforce_run_status
+
+            sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
         sync_trigger_run_status(db, claimed_task, TaskStatus.RUNNING)
     if queued:
         return replace(result, run_id=run_id, status=TaskStatus.PENDING)

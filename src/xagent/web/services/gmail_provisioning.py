@@ -101,64 +101,87 @@ def gmail_watch_disabled_error() -> str:
 def mark_gmail_oauth_reconnect_required(
     db: Session, *, oauth_account: UserOAuth
 ) -> int:
-    """Quiesce local Gmail watch state after credentials become unusable.
+    """Clear a permanently-invalid Gmail grant and quiesce its watch state.
 
-    The caller owns the transaction. Keeping the ``UserOAuth`` identity row
-    preserves reconnect status, so the old FK cascade no longer retires the
-    dependent watch. Mark both the watch and its enabled triggers failed in
-    the same transaction that clears the tokens.
+    Callers must not clear ``oauth_account``'s token fields themselves for an
+    ordinary Gmail grant -- this function owns that. Clearing the tokens and
+    quiescing the watch and its enabled triggers land in one commit under
+    this account's mailbox transition lock, the same lock every other
+    watch-state mutator in this module takes. Doing the token clear here,
+    inside the lock, matters as much as the lock itself: entering it commits
+    the caller's session first (on PostgreSQL, before a separate connection
+    takes the advisory lock), so a token clear already staged by the caller
+    would land in its own earlier commit, split from the watch/trigger
+    update below -- a crash in between (or a provisioning/renewal run
+    already holding the lock) would leave the grant tombstoned with its
+    watch still reporting ACTIVE, the exact state this function exists to
+    prevent.
     """
     if not is_ordinary_gmail(oauth_account):
         return 0
 
     account_id = int(oauth_account.id)
     user_id = int(oauth_account.user_id)
-    updated = (
-        db.query(GmailWatchState)
-        .filter(
-            GmailWatchState.oauth_account_id == account_id,
-            GmailWatchState.user_id == user_id,
-        )
-        .update(
+    email = str(oauth_account.email or "").strip().lower()
+
+    with _gmail_watch_transition_lock(db, account_id) as transition_db:
+        transition_db.query(UserOAuth).filter(UserOAuth.id == account_id).update(
             {
-                GmailWatchState.status: TriggerProvisioningStatus.FAILED.value,
-                GmailWatchState.last_error: GMAIL_RECONNECT_REQUIRED_ERROR,
-                GmailWatchState.watch_expiration: None,
+                UserOAuth.access_token: "",
+                UserOAuth.refresh_token: None,
+                UserOAuth.expires_at: None,
             },
             synchronize_session=False,
         )
-    )
 
-    email = str(oauth_account.email or "").strip().lower()
-    triggers = (
-        db.query(AgentTrigger)
-        .filter(
-            AgentTrigger.user_id == user_id,
-            AgentTrigger.type == TriggerType.GMAIL.value,
-            AgentTrigger.enabled.is_(True),
-        )
-        .all()
-    )
-    for trigger in triggers:
-        bound_account_id = gmail_binding_id(trigger.config)
-        if bound_account_id is not None:
-            matches = bound_account_id == account_id
-        else:
-            matches = bool(
-                is_legacy_gmail_binding(trigger.config)
-                and email
-                and str(trigger.resource_id or "").strip().lower() == email
+        updated = (
+            transition_db.query(GmailWatchState)
+            .filter(
+                GmailWatchState.oauth_account_id == account_id,
+                GmailWatchState.user_id == user_id,
             )
-        if not matches:
-            continue
-        setattr(
-            trigger,
-            "provisioning_status",
-            TriggerProvisioningStatus.FAILED.value,
+            .update(
+                {
+                    GmailWatchState.status: TriggerProvisioningStatus.FAILED.value,
+                    GmailWatchState.last_error: GMAIL_RECONNECT_REQUIRED_ERROR,
+                    GmailWatchState.watch_expiration: None,
+                },
+                synchronize_session=False,
+            )
         )
-        setattr(trigger, "provisioning_error", GMAIL_RECONNECT_REQUIRED_ERROR)
-        db.add(trigger)
-        updated += 1
+
+        triggers = (
+            transition_db.query(AgentTrigger)
+            .filter(
+                AgentTrigger.user_id == user_id,
+                AgentTrigger.type == TriggerType.GMAIL.value,
+                AgentTrigger.enabled.is_(True),
+            )
+            .all()
+        )
+        for trigger in triggers:
+            bound_account_id = gmail_binding_id(trigger.config)
+            if bound_account_id is not None:
+                matches = bound_account_id == account_id
+            else:
+                matches = bool(
+                    is_legacy_gmail_binding(trigger.config)
+                    and email
+                    and str(trigger.resource_id or "").strip().lower() == email
+                )
+            if not matches:
+                continue
+            setattr(
+                trigger,
+                "provisioning_status",
+                TriggerProvisioningStatus.FAILED.value,
+            )
+            setattr(trigger, "provisioning_error", GMAIL_RECONNECT_REQUIRED_ERROR)
+            transition_db.add(trigger)
+            updated += 1
+        transition_db.commit()
+
+    db.expire(oauth_account)
     return int(updated)
 
 
@@ -1374,6 +1397,7 @@ def _provisioning_account(
         )
         .filter(
             UserOAuth.provider == GMAIL_OAUTH_PROVIDER,
+            UserOAuth.access_token != "",
             func.lower(UserOAuth.email) == mailbox,
         )
         .order_by(UserOAuth.id)

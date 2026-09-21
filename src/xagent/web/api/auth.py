@@ -221,7 +221,12 @@ def _matching_gmail_reconnect_tombstone(
     if not normalized_email:
         return None
     for candidate in candidates:
-        if normalized_provider_user_id and candidate.provider_user_id:
+        if candidate.provider_user_id:
+            # The stored row has its own verified upstream id -- matching it
+            # by email alone would let an unverified reconnect (this
+            # callback's provider_user_id came back empty) silently move a
+            # different identity's mailbox trigger onto whatever account is
+            # authorizing right now.
             continue
         if str(candidate.email or "").strip().lower() == normalized_email:
             return candidate

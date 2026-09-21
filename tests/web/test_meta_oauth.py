@@ -275,6 +275,39 @@ def test_gmail_reconnect_does_not_reuse_a_different_identity_tombstone(db_sessio
     assert matched is None
 
 
+def test_gmail_reconnect_does_not_reuse_a_verified_tombstone_when_the_new_callback_has_no_id(
+    db_session,
+):
+    """A reconnect whose callback didn't yield a provider_user_id (e.g. a
+    userinfo response missing the configured id field) must not fall back to
+    matching a tombstone by email alone when that tombstone already has its
+    own verified upstream id recorded -- that id proves it belongs to a
+    specific Google identity, and this callback hasn't proven it's the same
+    one.
+    """
+    db, user = db_session
+    tombstone = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        provider_user_id="google-user-1",
+        email="shared-address@gmail.com",
+        access_token="",
+    )
+    db.add(tombstone)
+    db.commit()
+
+    matched = auth_api._matching_gmail_reconnect_tombstone(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        connector_key="gmail",
+        provider_user_id=None,
+        email="shared-address@gmail.com",
+    )
+
+    assert matched is None
+
+
 def test_gmail_callback_succeeds_when_best_effort_watch_provisioning_raises(
     db_session, monkeypatch, caplog
 ):

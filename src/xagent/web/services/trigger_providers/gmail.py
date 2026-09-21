@@ -181,6 +181,49 @@ def _normalized_email(value: object) -> str:
     return str(value or "").strip().lower()
 
 
+def _legacy_mailbox_account_id(
+    db: Session, trigger: AgentTrigger, mailbox: str
+) -> int | None:
+    """Resolve a legacy (no ``oauth_account_id``) Gmail binding's account id.
+
+    Prefers a live grant so a retained reconnect tombstone sharing the
+    mailbox's email cannot make an otherwise-unambiguous match look
+    ambiguous. Falls back to a lone tombstone when it is the only row for
+    this mailbox: teardown (``release_gmail_mailbox_if_unused``) must still
+    find the watch tied to a now-dead grant, or its Pub/Sub topic and
+    subscription leak forever.
+    """
+    live_matches = (
+        db.query(UserOAuth.id)
+        .filter(
+            UserOAuth.user_id == int(trigger.user_id),
+            ordinary_gmail_clause(),
+            UserOAuth.access_token != "",
+            func.lower(UserOAuth.email) == mailbox,
+        )
+        .order_by(UserOAuth.id)
+        .limit(2)
+        .all()
+    )
+    if len(live_matches) == 1:
+        return int(live_matches[0][0])
+    if live_matches:
+        return None
+
+    all_matches = (
+        db.query(UserOAuth.id)
+        .filter(
+            UserOAuth.user_id == int(trigger.user_id),
+            ordinary_gmail_clause(),
+            func.lower(UserOAuth.email) == mailbox,
+        )
+        .order_by(UserOAuth.id)
+        .limit(2)
+        .all()
+    )
+    return int(all_matches[0][0]) if len(all_matches) == 1 else None
+
+
 def _bearer_token(context: CallbackRequestContext) -> str | None:
     authorization = context.header("authorization") or ""
     scheme, _, token = authorization.partition(" ")
@@ -487,20 +530,10 @@ class GmailProvider:
             mailbox = _normalized_email(resource_id)
             if not mailbox:
                 return
-            matches = (
-                db.query(UserOAuth)
-                .filter(
-                    UserOAuth.user_id == int(trigger.user_id),
-                    ordinary_gmail_clause(),
-                    func.lower(UserOAuth.email) == mailbox,
-                )
-                .order_by(UserOAuth.id)
-                .limit(2)
-                .all()
-            )
-            if len(matches) != 1:
+            resolved_id = _legacy_mailbox_account_id(db, trigger, mailbox)
+            if resolved_id is None:
                 return
-            oauth_account_id = int(matches[0].id)
+            oauth_account_id = resolved_id
         else:
             oauth_account = get_scoped_user_oauth_account(
                 db,

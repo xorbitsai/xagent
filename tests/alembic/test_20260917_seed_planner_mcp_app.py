@@ -88,10 +88,9 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
-def test_downgrade_reupgrade_preserves_owned_row_when_legacy_alias_exists(tmp_path):
-    """A legacy alias created while older admin validation was active must not
-    turn a supported rollback/re-upgrade into a startup failure. Keeping the
-    provenance-owned exact row is safer than deleting operator-owned alias data.
+def test_downgrade_requires_legacy_alias_remediation_before_reupgrade(tmp_path):
+    """Fail before creating a half-downgraded state, then prove the documented
+    alias remediation permits a complete downgrade/re-upgrade round trip.
     """
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
@@ -106,11 +105,19 @@ def test_downgrade_reupgrade_preserves_owned_row_when_legacy_alias_exists(tmp_pa
                     "(' planner ', 'Legacy alias', 'stdio', '{}')"
                 )
             )
-            migration.downgrade()
+            with pytest.raises(RuntimeError, match="Remove or recreate"):
+                migration.upgrade()
+            with pytest.raises(RuntimeError, match="Remove or recreate"):
+                migration.downgrade()
             assert _app_ids(connection) == {"planner", " planner "}
+            connection.execute(
+                text("DELETE FROM public_mcp_apps WHERE app_id=' planner '")
+            )
+            migration.downgrade()
+            assert "planner" not in _app_ids(connection)
             migration.upgrade()
 
-        assert _app_ids(connection) == {"planner", " planner "}
+        assert _app_ids(connection) == {"planner"}
         rows = connection.execute(
             text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='planner'")
         ).scalar_one()

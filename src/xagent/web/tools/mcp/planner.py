@@ -306,7 +306,9 @@ def _graph_request(
                 "do not retry automatically. Read the resource first to determine "
                 "whether the change was applied."
             ) from exc
-        raise
+        raise RuntimeError(
+            "Planner request failed before a response was received"
+        ) from exc
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -316,7 +318,7 @@ def _graph_request(
         message = truncate_error_text(redact_sensitive_text(str(exc)))
         if response_text:
             message = f"{message} - {response_text}"
-        if mutation and response.status_code >= 500:
+        if mutation and (response.status_code == 408 or response.status_code >= 500):
             raise _MutationOutcomeIndeterminate(
                 "Planner mutation outcome is unknown after a server failure; "
                 "do not retry automatically. Read the resource first to determine "

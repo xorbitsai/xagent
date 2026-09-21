@@ -383,6 +383,19 @@ def test_create_plan_server_failure_is_indeterminate(monkeypatch):
     assert result["status"] == "indeterminate"
 
 
+def test_create_plan_http_timeout_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(return_value=MockResponse({"error": "timeout"}, status_code=408)),
+    )
+
+    result = json.loads(planner.planner_create_plan("group-1", "New plan"))
+
+    assert result["status"] == "indeterminate"
+    assert result["retryable"] is False
+
+
 def test_create_plan_requires_title():
     result = json.loads(planner.planner_create_plan("group-1", "   "))
     assert result["status"] == "error"
@@ -455,6 +468,21 @@ def test_get_plan_rejects_and_bounds_non_object_response(monkeypatch):
     assert len(serialized) <= 300
     assert result["status"] == "error"
     assert "invalid plan object" in result["message"]
+
+
+def test_get_plan_transport_failure_does_not_expose_exception_text(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(side_effect=requests.Timeout("token=secret-transport-value")),
+    )
+
+    serialized = planner.planner_get_plan("plan-1")
+    result = json.loads(serialized)
+
+    assert result["status"] == "error"
+    assert "secret-transport-value" not in serialized
+    assert "before a response was received" in result["message"]
 
 
 # ---------------------------------------------------------------------------

@@ -113,11 +113,10 @@ def upgrade() -> None:
                 str(row["app_id"]) for row in collisions if row["app_id"] != APP_ID
             )
             if aliases:
-                logger.warning(
-                    "Preserving the provenance-owned Planner row despite "
-                    "legacy normalized app_id aliases %r; new aliases are "
-                    "rejected by the admin API",
-                    aliases,
+                raise RuntimeError(
+                    "Cannot use builtin Planner connector while legacy normalized "
+                    f"public_mcp_apps aliases exist: {aliases!r}. Remove or recreate "
+                    "those custom apps under non-reserved app_ids, then retry."
                 )
             return
         if len(collisions) == 1 and collisions[0]["app_id"] == APP_ID:
@@ -170,13 +169,11 @@ def downgrade() -> None:
         if row["app_id"] != APP_ID
     )
     if aliases:
-        logger.warning(
-            "Preserving the provenance-owned Planner row during downgrade "
-            "because legacy normalized app_id aliases %r would otherwise "
-            "block a later re-upgrade",
-            aliases,
+        raise RuntimeError(
+            "Cannot safely downgrade builtin Planner while legacy normalized "
+            f"public_mcp_apps aliases exist: {aliases!r}. Remove or recreate those "
+            "custom apps under non-reserved app_ids, then retry the downgrade."
         )
-        return
     bind.execute(
         sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
     )

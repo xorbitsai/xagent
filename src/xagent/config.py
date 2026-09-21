@@ -3107,7 +3107,8 @@ def get_tool_max_output_length() -> int:
     by the combination of per-string limit, max field count, and max recursion depth.
 
     Returns:
-        Maximum per-string length from TOOL_MAX_OUTPUT_LENGTH env var, or 50k by default
+        Maximum per-string length from TOOL_MAX_OUTPUT_LENGTH env var, clamped
+        to MIN_TOOL_MAX_OUTPUT_LENGTH, or 50k by default.
     """
     env_str = os.getenv(TOOL_MAX_OUTPUT_LENGTH)
     if env_str:

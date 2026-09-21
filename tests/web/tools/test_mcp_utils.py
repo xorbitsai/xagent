@@ -1324,3 +1324,52 @@ def test_success_with_capped_dict_last_resort_falls_back_to_dropping_extras(
     assert result["truncated"] is True
     assert "note_one" not in result
     assert "note_two" not in result
+
+
+def test_truncation_marker_or_empty_prefers_the_marker_when_smaller():
+    """The shared helper both success_with_capped_dict's phase 1 and
+    shopify.py's local last-key loop delegate to: uses the marker when
+    it's smaller than the value it replaces."""
+    assert utils.truncation_marker_or_empty({"total": "x" * 5000}) == {
+        "truncated": True
+    }
+
+
+def test_truncation_marker_or_empty_falls_back_to_empty_when_the_marker_would_grow_it():
+    """Regression test for the review finding that motivated gating the
+    marker on size at all: a tiny value (here, {"a": 1}, 8 bytes) is
+    smaller than the marker itself (19 bytes) -- installing the marker
+    would grow the payload instead of shrinking it, so this must fall
+    back to {} instead."""
+    assert utils.truncation_marker_or_empty({"a": 1}) == {}
+
+
+def test_success_with_capped_dict_extras_degradation_never_grows_a_field(
+    monkeypatch,
+):
+    """Regression test: the extras-degradation loop used to unconditionally
+    set a field to `True` without checking whether that's actually smaller
+    than the value it replaces -- the same class of bug the field marker's
+    own size gate exists to prevent, just missing here. Degrading an
+    already-tiny extra field (here, 1 byte) to `True` (4 bytes) would grow
+    the payload; confirmed this can never surface as a worse final result
+    (candidates are tried smallest-effort-first, so a candidate that grew
+    is always dominated by one tried earlier), but the loop should still
+    stop rather than waste effort building a candidate that can't help."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "70")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"id": "rec1", "Notes": "x" * 5000},
+        extra_fields={"tiny": 1},
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    # The undegraded extras candidate doesn't fit at this limit, and
+    # degrading "tiny" to `True` wouldn't help (it would grow), so this
+    # must land on the next viable fallback -- dropping extras entirely
+    # while still keeping the record's id -- not a bloated "tiny": true.
+    assert result["record"] == {"id": "rec1"}
+    assert "tiny" not in result

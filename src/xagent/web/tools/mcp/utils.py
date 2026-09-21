@@ -190,11 +190,28 @@ def url_path_id(value: str, field_name: str) -> str:
 # marker instead keeps that field non-empty and self-explanatory, the same
 # way the envelope's own top-level "truncated" flag is, rather than leaving
 # a bare {} a caller can't distinguish from "always empty" -- but only when
-# the marker is itself smaller than the value it replaces (checked at each
-# call site): a marker bigger than a tiny value would grow the payload
-# instead of shrinking it, eating into the budget phase 2 and the
-# id-preserving last-resort fallback need to keep other fields alive.
+# the marker is itself smaller than the value it replaces (see
+# truncation_marker_or_empty): a marker bigger than a tiny value would grow
+# the payload instead of shrinking it, eating into the budget phase 2 and
+# the id-preserving last-resort fallback need to keep other fields alive.
 _FIELD_TRUNCATION_MARKER: dict[str, Any] = {"truncated": True}
+
+
+def truncation_marker_or_empty(value: Any) -> dict[str, Any]:
+    """Return a copy of ``_FIELD_TRUNCATION_MARKER`` if it's smaller
+    (serialized) than ``value``, otherwise ``{}``.
+
+    Shared by ``success_with_capped_dict``'s own phase 1 and any local
+    caller that reimplements the identical "this dict is down to its last
+    key, shrink it one more step" decision (e.g. a connector's own
+    capping helper that needs to make room for extra fields after
+    delegating the bulk of the shrinking to ``success_with_capped_dict``)
+    -- factored out so the decision has exactly one implementation to fix
+    when a case like this is found, instead of drifting between copies.
+    """
+    marker_size = len(json.dumps(_FIELD_TRUNCATION_MARKER, ensure_ascii=False))
+    current_size = len(json.dumps(value, ensure_ascii=False))
+    return dict(_FIELD_TRUNCATION_MARKER) if marker_size < current_size else {}
 
 
 def success_with_capped_dict(
@@ -217,33 +234,40 @@ def success_with_capped_dict(
     scalar fields behind -- and there's no cursor to retry with, so that
     data is gone for this call. Phase 1 instead repeatedly finds the
     largest list/dict-valued key and halves *its* contents (recursing one
-    level, not further): a list halves smoothly regardless of length, but
-    halving a *dict's key count* the same way floors to zero once only one
-    key is left, collapsing it straight to {} in a single step instead of
-    degrading gradually -- and a 2-key dict reaches that same floor one
-    step later, once halving has already dropped it to one key. Whenever a
-    dict-valued field is down to its last key, phase 1 replaces it with
-    ``_FIELD_TRUNCATION_MARKER`` (when that marker is actually smaller than
-    the value it replaces -- otherwise {}, same as before), so that field
-    stays a small, non-empty signal that something here was dropped rather
-    than growing the payload. Phase 2 is a fallback for the residual case
-    -- a dict with no list/dict-valued keys at all (e.g. a handful of
-    scalar keys with huge string values) -- and drops whole top-level keys
-    the same way, but always leaves at least one key standing rather than
-    run the same single-key floor all the way down to {}. This still
-    doesn't guarantee the final response never contains ``{}`` for this
-    field: if even one surviving key doesn't fit, the last-resort fallback
-    below can still fall back that far, by design -- these two phases only
-    guarantee they won't be the ones to empty it needlessly.
+    level, not further): a list approaches empty gradually as it halves
+    (1000, 500, ..., 2, 1) -- though, like a dict, its very last element
+    still disappears in one step once it's down to a single item; that
+    residual case isn't addressed here (a pre-existing, accepted gap, not
+    one this fix closes). Halving a *dict's key count* the same way floors
+    to zero once only one key is left, collapsing it straight to {} in a
+    single step instead of degrading gradually -- and a 2-key dict reaches
+    that same floor one step later, once halving has already dropped it to
+    one key. Whenever a dict-valued field is down to its last key, phase 1
+    replaces it with ``truncation_marker_or_empty``'s result -- the small
+    ``_FIELD_TRUNCATION_MARKER`` when that's actually smaller than the
+    value it replaces, otherwise {} same as before -- so that field stays
+    a small, non-empty signal that something here was dropped rather than
+    growing the payload. Phase 2 is a fallback for the residual case -- a
+    dict with no *remaining* list/dict-valued keys (either because it never
+    had any, e.g. a handful of scalar keys with huge string values, or
+    because phase 1 already exhausted the ones it had) -- and drops whole
+    top-level keys the same way, but always leaves at least one key
+    standing rather than run the same single-key floor all the way down to
+    {}. This still doesn't guarantee the final response never contains
+    ``{}`` for this field: if even one surviving key doesn't fit, the
+    last-resort fallback below can still fall back that far, by design --
+    these two phases only guarantee they won't be the ones to empty it
+    needlessly.
 
     ``extra_fields`` adds fixed top-level response fields that must be counted
     while trimming the dict, such as a calendar event's derived Meet link.
     Reserved envelope keys cannot be overridden. If the payload is still too
-    large once ``data`` itself is fully truncated, each extra field is
-    degraded to ``True`` (largest first) before any of them are dropped
-    outright, so a caller-registered field (e.g. a per-field truncation
-    flag) keeps its key -- signaling it exists but is unreliable -- for as
-    long as there's room for it at all.
+    large once ``data`` itself is fully truncated, each extra field whose
+    value is bigger than the ``True`` placeholder is degraded to ``True``
+    (largest first, same size-gate as the field marker above) before any of
+    them are dropped outright, so a caller-registered field (e.g. a
+    per-field truncation flag) keeps its key -- signaling it exists but is
+    unreliable -- for as long as there's room for it at all.
     """
     extras = extra_fields or {}
     reserved_fields = {"status", field_name, "truncated"}
@@ -303,18 +327,12 @@ def success_with_capped_dict(
                 }
             else:
                 # A 1-key dict can't shrink further by dropping keys
-                # without emptying it outright. Prefer the small marker
-                # over a bare {} -- but only when the marker actually is
-                # smaller than the value it would replace; otherwise fall
-                # back to {}, same as before this marker existed, rather
-                # than growing the payload. Either way this field is done:
-                # mark it exhausted now instead of waiting to detect the
-                # marker again on a later pass by equality, which would
-                # also misfire if real data happened to equal the marker.
-                marker = dict(_FIELD_TRUNCATION_MARKER)
-                current_size = len(json.dumps(target_value, ensure_ascii=False))
-                marker_size = len(json.dumps(marker, ensure_ascii=False))
-                working[target_key] = marker if marker_size < current_size else {}
+                # without emptying it outright. Either way this field is
+                # done: mark it exhausted now instead of waiting to detect
+                # the marker again on a later pass by equality, which
+                # would also misfire if real data happened to equal the
+                # marker.
+                working[target_key] = truncation_marker_or_empty(target_value)
                 exhausted_keys.add(target_key)
         truncated = True
         response = _build(working, truncated)
@@ -353,6 +371,7 @@ def success_with_capped_dict(
 
         candidates = [_build_compact(extras)]
         degraded_extras = dict(extras)
+        degraded_marker_size = len(json.dumps(True, ensure_ascii=False))
         while degraded_extras:
             largest_key = max(
                 degraded_extras,
@@ -360,9 +379,16 @@ def success_with_capped_dict(
                     json.dumps(degraded_extras[key], ensure_ascii=False)
                 ),
             )
-            if degraded_extras[largest_key] is True:
+            largest_value = degraded_extras[largest_key]
+            if largest_value is True or degraded_marker_size >= len(
+                json.dumps(largest_value, ensure_ascii=False)
+            ):
                 # The largest remaining extra is already the placeholder,
-                # so degrading it again would change nothing -- whatever
+                # or degrading it wouldn't actually shrink it (e.g. an
+                # already-short scalar) -- the same size-gate
+                # success_with_capped_dict's own field marker uses (see
+                # truncation_marker_or_empty), applied here so this loop
+                # can't grow the payload it exists to shrink. Whatever
                 # smaller (or already-`True`) fields remain aren't worth
                 # visiting individually, and the candidates below take it
                 # from here.

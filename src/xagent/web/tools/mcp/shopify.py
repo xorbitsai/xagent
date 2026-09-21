@@ -18,7 +18,12 @@ from ....core.utils.security import (
     reject_private_network_host,
 )
 from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
-from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict
+from .utils import (
+    clamp_limit,
+    setup_proxy_env,
+    success_with_capped_dict,
+    truncation_marker_or_empty,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shopify-mcp")
@@ -792,10 +797,17 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
     returned via a bare `_success()` call with no cap at all, so an
     oversized single object hit the same hard-truncated-into-broken-JSON
     failure mode the pagination helper exists to prevent. Reuses
-    `success_with_capped_dict` (utils.py) for the actual shrinking rather
+    `success_with_capped_dict` (utils.py) for the initial shrinking rather
     than reimplementing its halving logic locally -- unlike the pagination
     case, there's no cursor to invalidate here, so the generic dict-capping
-    helper's usual contract applies unmodified.
+    helper's usual contract applies unmodified. Once `warnings` needs its
+    own room afterward, the tail loop below still halves `value`'s keys
+    locally (no cursor concern there either, but also no clean way to ask
+    `success_with_capped_dict` to shrink further around an already-built
+    envelope) -- it shares `truncation_marker_or_empty`'s 1-key-floor fix
+    with that function's own phase 1, but not its id-preserving last-resort
+    tier, so a record already down to one key can still empty out here in
+    a way `success_with_capped_dict` alone would have recovered.
     """
     response = _success(**{field_name: value}, _errors=errors)
     max_output_length = get_tool_max_output_length()
@@ -825,7 +837,6 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
         else:
             high = middle - 1
     payload["warnings"] = [warning[:low] + marker]
-    field_marker = {"truncated": True}
     while len(json.dumps(payload, ensure_ascii=False)) > max_output_length:
         value = payload.get(field_name)
         if not isinstance(value, dict) or not value:
@@ -841,17 +852,16 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
         # instead of degrading gradually (see that function's docstring
         # for the general problem this mirrors; this loop reimplements
         # its own halving locally to make room for `warnings`, so it
-        # inherited the same sharp edge). Try the small marker first, but
-        # only when it's smaller than what it replaces and hasn't already
-        # been tried -- this loop has no further fallback tier below {},
-        # so it must still empty the field outright if even the marker
-        # doesn't make it fit.
-        if value != field_marker and len(
-            json.dumps(field_marker, ensure_ascii=False)
-        ) < len(json.dumps(value, ensure_ascii=False)):
-            payload[field_name] = dict(field_marker)
-        else:
-            payload[field_name] = {}
+        # inherited the same sharp edge). truncation_marker_or_empty
+        # applies the identical fix: a small marker when that's actually
+        # smaller than what it replaces, otherwise {} -- this loop has no
+        # further fallback tier below {}, so it must still empty the field
+        # outright if even the marker doesn't make it fit. Once `value`
+        # already *is* the marker, the helper's own size comparison
+        # naturally falls to {} (a value equal to the marker is never
+        # strictly smaller than itself), so this terminates without
+        # needing to detect that case separately.
+        payload[field_name] = truncation_marker_or_empty(value)
     return json.dumps(payload, ensure_ascii=False)
 
 

@@ -1041,7 +1041,13 @@ def test_success_with_capped_dict_last_resort_fallback_keeps_capitalized_id(
     once a record got truncated all the way down -- exercised directly
     against the shared utility (not through a deputy_* tool) because
     reaching this exact branch also requires extra_fields to push the
-    unstripped candidate over the limit, which no deputy_* call site uses."""
+    unstripped candidate over the limit, which no deputy_* call site uses.
+
+    This also happens to be the branch where oversized `extra_fields`
+    (here, "note") get degraded to `True` rather than dropped outright --
+    asserted explicitly so a regression in that degradation (wrong order,
+    or leaking the full value past the limit) would be caught here rather
+    than only by this module's own dedicated marker/degradation tests."""
     monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
 
     raw = mcp_utils.success_with_capped_dict(
@@ -1054,3 +1060,4 @@ def test_success_with_capped_dict_last_resort_fallback_keeps_capitalized_id(
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert result["record"] == {"Id": 123}
+    assert result["note"] is True

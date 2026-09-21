@@ -647,6 +647,33 @@ def test_get_issue_returns_issue(monkeypatch):
     assert result["issue"]["key"] == "ENG-1"
 
 
+def test_get_issue_redacts_credential_shaped_text_from_a_connection_error(
+    monkeypatch, caplog
+):
+    # A low-level connection error's str() isn't under this module's
+    # control and can embed request details (the Authorization header
+    # _headers() sets on every request) -- both the returned message
+    # and the log line must have that redacted.
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            requests.exceptions.ConnectionError(
+                "Failed to establish a new connection: "
+                "Authorization: Bearer sk-abc123XYZ"
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with caplog.at_level("ERROR", logger="jira-mcp"):
+        result = json.loads(jira.jira_get_issue("ENG-1"))
+
+    assert result["status"] == "error"
+    assert "sk-abc123XYZ" not in result["message"]
+    assert "sk-abc123XYZ" not in caplog.text
+    assert "***3XYZ" in result["message"]
+
+
 def test_get_issue_raw_fields_returns_the_unflattened_jira_shape(monkeypatch):
     # raw_fields restores access to the pre-summarization "issue.fields"
     # nesting (e.g. status.id, not just the summary's flattened

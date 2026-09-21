@@ -84,3 +84,30 @@ def test_oauth_lifecycle_changes_run_real_postgresql_fence_tests(
     assert (
         "pytest tests/web/api/test_mcp_oauth_lifecycle_postgresql.py -m postgresql -q"
     ) in regression["run"]
+
+
+@pytest.mark.parametrize(
+    "source_path",
+    [
+        "src/xagent/web/services/uploaded_file_store.py",
+        "src/xagent/core/workspace.py",
+        "src/xagent/web/models/task_channel_delivery.py",
+        "src/xagent/web/services/channel_input_acceptance.py",
+        "src/xagent/web/services/channel_runtime.py",
+        "src/xagent/web/services/shared_channel_execution.py",
+        "tests/web/services/test_channel_input_acceptance.py",
+    ],
+)
+def test_channel_acceptance_changes_run_postgresql_regressions(source_path):
+    text = _workflow_text()
+    assert source_path in _push_paths(text)
+    assert source_path in _detector_paths(text)
+    job = yaml.safe_load(text)["jobs"]["test-postgresql-migrations"]
+    step = next(
+        step
+        for step in job["steps"]
+        if "tests/web/services/test_channel_input_acceptance.py" in step.get("run", "")
+    )
+    assert step["if"] == "needs.detect-migration-changes.outputs.should-test == 'true'"
+    assert "-m postgresql" in step["run"]
+    assert "XAGENT_TEST_POSTGRES_URL" in step["env"]

@@ -216,3 +216,35 @@ authentication and task ownership checks still apply to replayed requests.
 Dropping this table, including migration downgrade, discards the retry history
 and removes the corresponding deduplication guarantee. This is acceptance
 idempotency, not an exactly-once guarantee for external tools or message sends.
+
+
+### Channel input acceptance foundation
+
+The internal `channel_input_acceptance` service supports committing physical-input
+receipts, task selection, attachment bindings, the user transcript, START, and the
+reply destination in one transaction. Input identity includes the owner subject,
+channel, sender, provider scope, and physical message ID. An identical retry uses
+the original command; changed content conflicts, and a deleted target is not recreated.
+
+Batch lookup separates new inputs, original commands to replay, and rejected old
+receipts. Newly accepted inputs in one batch share one START and use the last new
+input's reply destination. Concurrent overlapping batches must look up and partition
+again when acceptance reports `ChannelInputBatchChanged`. Lookup batches must be
+nonempty and belong to one owner, channel, sender, source, and provider scope.
+Lookup and acceptance reject mixed channel/sender/source/scope batches with
+`TaskTurnError("input_batch_invalid")` before accessing the database. Lookup also
+rejects an owner change while resolving a batch. Attachments
+must already be durably staged; acceptance binds their metadata atomically, while
+callers remain responsible for compensating unreferenced staged objects after failure.
+
+When a commit acknowledgement is lost, the service first checks whether this
+attempt's receipt and command were committed. Confirming that outcome does not
+re-authorize the already accepted request against later channel configuration.
+Replaying a competing request still requires current authorization. Only receipt
+primary-key conflicts trigger repartition; unrelated integrity failures propagate.
+`ChannelInputBatchChanged` is a retry signal for the caller's partition loop, not a
+user-facing `TaskTurnError`.
+
+This foundation does not yet switch Slack, Feishu, or Telegram to receipt-based
+input acceptance. Existing channel paths remain active; provider integration and
+progress observation are separate follow-up changes.

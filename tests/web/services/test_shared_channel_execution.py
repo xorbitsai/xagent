@@ -105,6 +105,44 @@ def test_acceptance_persists_start_and_single_transcript_without_lease(selected)
         assert db.get(Task, selected.selection.task_id) is not None
 
 
+@pytest.mark.parametrize("changed_payload", [False, True])
+def test_uncertain_commit_requires_matching_payload(
+    selected, monkeypatch, changed_payload
+):
+    from sqlalchemy.orm import Session
+
+    commit = Session.commit
+    failure = ConnectionError("commit acknowledgement lost")
+
+    def uncertain_commit(db):
+        commit(db)
+        if changed_payload:
+            with get_session_local()() as other:
+                command = other.query(TaskExecutionCommand).one()
+                command.payload = {**command.payload, "message": "different message"}
+                commit(other)
+        raise failure
+
+    monkeypatch.setattr(Session, "commit", uncertain_commit)
+    if changed_payload:
+        with pytest.raises(ConnectionError) as error:
+            shared._accept_channel_turn(selected, TaskTurnPayload("hello"), "ingress")
+        assert error.value is failure
+    else:
+        command_id = shared._accept_channel_turn(
+            selected, TaskTurnPayload("hello"), "ingress"
+        )
+    with get_session_local()() as db:
+        command = db.query(TaskExecutionCommand).one()
+        assert command.command_id == selected.command_id
+        assert command.payload["message"] == (
+            "different message" if changed_payload else "hello"
+        )
+        if not changed_payload:
+            assert command.id == command_id
+        assert db.query(TaskChatMessage).count() == 1
+
+
 def test_start_failure_rolls_back_message_and_run(selected, monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("START failed")

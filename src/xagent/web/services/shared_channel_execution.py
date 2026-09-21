@@ -11,6 +11,7 @@ from uuid import uuid4
 from sqlalchemy import exists, select
 from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
+from sqlalchemy.orm import Session
 
 from ...config import get_task_reply_wait_timeout_seconds
 from ...core.agent.trace import (
@@ -112,7 +113,7 @@ class SharedChannelTurn:
     """An ingress-owned selection and stop signal, never an Agent or lease."""
 
     selection: SelectedChannelTask
-    workspace: TaskWorkspace
+    workspace: TaskWorkspace | None
     run_id: str = field(default_factory=lambda: str(uuid4()))
     command_id: str = field(default_factory=lambda: uuid4().hex)
     accepted: bool = False
@@ -331,107 +332,119 @@ async def prepare_shared_channel_turn(
         raise
 
 
+def accept_channel_turn_no_commit(
+    db: Session, turn: SharedChannelTurn, payload: TaskTurnPayload, host_id: str
+) -> int:
+    """Stage START, transcript and delivery inside the caller transaction."""
+    selection = turn.selection
+    owner = _load_channel_owner_sync(
+        db,
+        channel_id=selection.channel_id,
+        external_user_id=selection.external_user_id,
+    )
+    if owner.user_id != selection.user_id:
+        raise TaskTurnError("owner_changed")
+    task = db.execute(
+        select(Task).where(Task.id == selection.task_id).with_for_update()
+    ).scalar_one_or_none()
+    if (
+        task is None
+        or task.channel_id != selection.channel_id
+        or task.user_id != owner.user_id
+    ):
+        raise TaskTurnError("task_not_found")
+    if (
+        task.state_version != selection.state_version
+        or task.run_id != selection.previous_run_id
+        or not reserve_task_start_no_commit(
+            db,
+            task_id=int(task.id),
+            task_owner_user_id=selection.user_id,
+            statuses=(
+                TaskStatus.PENDING,
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.PAUSED,
+                TaskStatus.WAITING_FOR_USER,
+            ),
+        )
+    ):
+        raise TaskTurnError("busy")
+    db.refresh(task)
+    files = (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.file_id.in_(payload.file_ids),
+            UploadedFile.user_id == owner.user_id,
+            UploadedFile.task_id == task.id,
+        )
+        .all()
+    )
+    if len(files) != len(set(payload.file_ids)):
+        raise TaskTurnError("file_unavailable")
+    message = persist_user_message_no_commit(
+        db,
+        task_id=int(task.id),
+        user_id=owner.user_id,
+        content=payload.transcript_message,
+        attachments=payload.attachments,
+        turn_id=turn.command_id,
+    )
+    db.flush()
+    start = TaskStartPayload(
+        version=1,
+        run_id=turn.run_id,
+        expected_run_id=selection.previous_run_id,
+        state_version=int(task.state_version),
+        turn_id=turn.command_id,
+        kind="channel",
+        message=payload.transcript_message,
+        execution_message=payload.execution_message,
+        file_ids=list(payload.file_ids),
+        before_message_id=int(message.id) if message is not None else None,
+        channel=ChannelExecutionContext(
+            channel_id=selection.channel_id,
+            external_user_id=selection.external_user_id,
+        ),
+    )
+    staged = stage_task_start_command(
+        db,
+        task_id=int(task.id),
+        actor_user_id=owner.user_id,
+        start=start,
+        reply_host_id=host_id,
+        reply_origin=turn.origin,
+    )
+    if turn.delivery_destination is not None:
+        db.add(
+            TaskChannelDelivery(
+                command_id=staged.staged_db_id,
+                channel_id=selection.channel_id,
+                destination=turn.delivery_destination,
+            )
+        )
+    return staged.staged_db_id
+
+
 def _accept_channel_turn(
     turn: SharedChannelTurn, payload: TaskTurnPayload, host_id: str
 ) -> int:
     selection = turn.selection
     with get_session_local()() as db:
-        owner = _load_channel_owner_sync(
-            db,
-            channel_id=selection.channel_id,
-            external_user_id=selection.external_user_id,
-        )
-        if owner.user_id != selection.user_id:
-            raise TaskTurnError("owner_changed")
-        task = db.execute(
-            select(Task).where(Task.id == selection.task_id).with_for_update()
-        ).scalar_one_or_none()
-        if (
-            task is None
-            or task.channel_id != selection.channel_id
-            or task.user_id != owner.user_id
-        ):
-            raise TaskTurnError("task_not_found")
-        if (
-            task.state_version != selection.state_version
-            or task.run_id != selection.previous_run_id
-            or not reserve_task_start_no_commit(
-                db,
-                task_id=int(task.id),
-                task_owner_user_id=selection.user_id,
-                statuses=(
-                    TaskStatus.PENDING,
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.PAUSED,
-                    TaskStatus.WAITING_FOR_USER,
-                ),
-            )
-        ):
-            raise TaskTurnError("busy")
-        db.refresh(task)
-        files = (
-            db.query(UploadedFile)
-            .filter(
-                UploadedFile.file_id.in_(payload.file_ids),
-                UploadedFile.user_id == owner.user_id,
-                UploadedFile.task_id == task.id,
-            )
-            .all()
-        )
-        if len(files) != len(set(payload.file_ids)):
-            raise TaskTurnError("file_unavailable")
-        message = persist_user_message_no_commit(
-            db,
-            task_id=int(task.id),
-            user_id=owner.user_id,
-            content=payload.transcript_message,
-            attachments=payload.attachments,
-            turn_id=turn.command_id,
-        )
-        db.flush()
-        start = TaskStartPayload(
-            version=1,
-            run_id=turn.run_id,
-            expected_run_id=selection.previous_run_id,
-            state_version=int(task.state_version),
-            turn_id=turn.command_id,
-            kind="channel",
-            message=payload.transcript_message,
-            execution_message=payload.execution_message,
-            file_ids=list(payload.file_ids),
-            before_message_id=int(message.id) if message is not None else None,
-            channel=ChannelExecutionContext(
-                channel_id=selection.channel_id,
-                external_user_id=selection.external_user_id,
-            ),
-        )
-        staged = stage_task_start_command(
-            db,
-            task_id=int(task.id),
-            actor_user_id=owner.user_id,
-            start=start,
-            reply_host_id=host_id,
-            reply_origin=turn.origin,
-        )
-        if turn.delivery_destination is not None:
-            db.add(
-                TaskChannelDelivery(
-                    command_id=staged.staged_db_id,
-                    channel_id=selection.channel_id,
-                    destination=turn.delivery_destination,
-                )
-            )
+        command_db_id = accept_channel_turn_no_commit(db, turn, payload, host_id)
+        expected_payload = cast(
+            TaskExecutionCommand, db.get(TaskExecutionCommand, command_db_id)
+        ).payload
         try:
             db.commit()
         except Exception:
             db.close()
             with get_session_local()() as check:
-                saved = check.get(TaskExecutionCommand, staged.staged_db_id)
+                saved = check.get(TaskExecutionCommand, command_db_id)
                 if (
                     saved is None
                     or saved.command_id != turn.command_id
-                    or saved.payload != start.model_dump(mode="json")
+                    or saved.payload != expected_payload
                 ):
                     raise
             logger.warning(
@@ -440,7 +453,7 @@ def _accept_channel_turn(
                 turn.command_id,
             )
             increment_counter("xagent.channel.acceptance.commit_recovered")
-        return staged.staged_db_id
+        return command_db_id
 
 
 def _read_channel_result(command_id: int, run_id: str) -> dict[str, Any] | None:

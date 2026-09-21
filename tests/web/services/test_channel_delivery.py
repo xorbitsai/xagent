@@ -234,7 +234,10 @@ async def test_channel_pending_wait_is_bounded_and_keeps_command(selected, monke
     bridge.register_origin.return_value = "origin"
     monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
     monkeypatch.setattr(shared, "get_task_reply_wait_timeout_seconds", lambda: 0.03)
-    result = await asyncio.wait_for(selected.execute(TaskTurnPayload("hello"), None), 1)
+    # Acceptance includes real database I/O before the short reply-wait deadline.
+    result = await asyncio.wait_for(
+        selected.execute(TaskTurnPayload("hello"), None), 10
+    )
     assert result["status"] == "accepted"
     with get_session_local()() as db:
         assert db.query(TaskExecutionCommand).one().status == "pending"

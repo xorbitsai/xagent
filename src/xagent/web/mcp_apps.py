@@ -62,14 +62,36 @@ from .models.public_mcp import PublicMCPApp
 # "meta" grant could ever have carried them), so a bare connect must never
 # be treated as satisfying it.
 #
-# sharepoint/word: same reasoning as facebook -- their functional scopes
-# ("Sites.ReadWrite.All"/"Files.ReadWrite.All") aren't part of the microsoft
-# provider's default_scopes (["User.Read"]), and both connectors are brand
-# new. A pre-existing bare "microsoft" grant (e.g. one created by connecting
-# Outlook/Teams/OneDrive) therefore cannot satisfy either connector.
+# sharepoint: same reasoning as facebook -- its "Sites.ReadWrite.All" scope
+# isn't part of the microsoft provider's default_scopes (["User.Read"]),
+# and the connector is brand new (no pre-existing bare "microsoft" grant,
+# e.g. one created by connecting Outlook/Teams/OneDrive, could ever have
+# carried it), so a bare connect -- or a grant scoped to one of those other
+# Microsoft apps -- must never be treated as satisfying it.
+# excel: the shared microsoft provider's default scope is identity-only
+# (User.Read), while workbook reads and writes require Files.ReadWrite from
+# the Excel app row. A bare microsoft grant may continue serving other
+# Microsoft connectors, but it must neither provision nor satisfy Excel.
+# word: likewise, its Files.ReadWrite.All scope isn't part of the microsoft
+# provider's defaults, so only the Word app-scoped grant is sufficient.
 APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
-    {"facebook", "github", "myob", "meta-ads", "whatsapp", "sharepoint", "word"}
+    {
+        "excel",
+        "facebook",
+        "github",
+        "myob",
+        "meta-ads",
+        "sharepoint",
+        "whatsapp",
+        "word",
+    }
 )
+
+# Word's seed migration deliberately preserves a pre-existing custom row with
+# the same app_id. Such a row must keep the OAuth behavior it had before Word
+# became a builtin. Other entries in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT do
+# not share that migration contract and continue to be identified by app_id.
+_APPS_REQUIRING_PROVENANCE_FOR_OAUTH_POLICY = frozenset({"word"})
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:
@@ -102,14 +124,15 @@ def requires_app_scoped_oauth_grant(app_or_id: object) -> bool:
     "Facebook") is covered consistently everywhere this policy is checked.
     """
     app_id = _oauth_policy_app_id(app_or_id)
-    if _normalize_oauth_grant_key(app_id) not in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
+    normalized_app_id = _normalize_oauth_grant_key(app_id)
+    if normalized_app_id not in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
         return False
 
-    # A catalog row can predate a newly reserved builtin id. Seed migrations
-    # deliberately preserve such operator-owned collisions instead of adopting
-    # them, so runtime OAuth policy must make the same ownership distinction.
-    # Otherwise a preserved custom ``word`` row backed by a valid bare
-    # ``microsoft`` grant is silently reinterpreted as the official builtin.
+    # Word's catalog row can predate its newly reserved builtin id. Its seed
+    # migration preserves that operator-owned collision instead of adopting
+    # it, so runtime OAuth policy must make the same ownership distinction.
+    if normalized_app_id not in _APPS_REQUIRING_PROVENANCE_FOR_OAUTH_POLICY:
+        return True
     if isinstance(app_or_id, Mapping):
         return _persisted_builtin_provenance_matches(
             str(app_id), app_or_id.get("launch_config")

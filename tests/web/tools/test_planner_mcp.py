@@ -210,7 +210,7 @@ def test_bounded_envelopes_remain_valid_below_minimum(monkeypatch, configured_li
     monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: configured_limit)
 
     response = planner._error("x" * 10_000)
-    assert len(response) <= planner.MIN_TOOL_MAX_OUTPUT_LENGTH
+    assert len(response) <= planner._MIN_OUTPUT_LENGTH
     assert json.loads(response)["status"] == "error"
 
 
@@ -345,6 +345,26 @@ def test_create_plan_transport_failure_is_indeterminate(monkeypatch):
         "group_id": "group-1",
         "match": {"title": "New plan"},
     }
+
+
+def test_indeterminate_reconciliation_survives_low_output_cap(monkeypatch):
+    """A reconciliation-bearing indeterminate envelope (read_tool + a
+    Planner id, no free-text message) runs 190-240+ chars -- comfortably
+    over _MIN_OUTPUT_LENGTH (64) but under _INDETERMINATE_MIN_OUTPUT_LENGTH
+    (320). An operator-configured cap in that range must not silently drop
+    the reconciliation identity, or the whole point of this response --
+    telling the caller what to check before retrying -- is lost exactly
+    when it matters."""
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: 100)
+    monkeypatch.setattr(
+        planner.requests, "request", Mock(side_effect=requests.Timeout("timed out"))
+    )
+
+    result = json.loads(planner.planner_create_plan("group-1", "New plan"))
+
+    assert result["status"] == "indeterminate"
+    assert result["reconciliation"]["read_tool"] == "planner_list_plans"
+    assert result["reconciliation"]["group_id"] == "group-1"
 
 
 def test_create_plan_unreadable_success_is_indeterminate(monkeypatch):

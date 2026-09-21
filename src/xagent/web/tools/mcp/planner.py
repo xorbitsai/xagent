@@ -9,11 +9,7 @@ from urllib.parse import unquote
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from ....config import (
-    MIN_TOOL_MAX_OUTPUT_LENGTH,
-    TOOL_MAX_OUTPUT_LENGTH,
-    get_tool_max_output_length,
-)
+from ....config import TOOL_MAX_OUTPUT_LENGTH, get_tool_max_output_length
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
 from .utils import (
@@ -32,6 +28,24 @@ mcp = FastMCP("planner-mcp")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_TIMEOUT_SECONDS = 30
+
+# Kept local to this connector rather than in the shared config module: a
+# floor on the *shared* get_tool_max_output_length() would silently widen
+# every other tool's configured cap too, not just this one's. Values below
+# this make even a bare {"status": "error"} fallback vulnerable to the
+# output filter cutting the JSON in the middle.
+_MIN_OUTPUT_LENGTH = 64
+
+# _indeterminate()'s reconciliation payloads (read_tool + a Planner id or
+# two) run 190-240+ chars even with no free-text message -- comfortably
+# under this floor, but well over _MIN_OUTPUT_LENGTH. Without a higher
+# floor for this one response type, any operator-configured cap between
+# _MIN_OUTPUT_LENGTH and ~250 would silently drop every reconciliation
+# identity, defeating the whole point of this response: telling the
+# caller what to check before retrying a mutation whose outcome is
+# unknown. A single very long user-supplied title/name can still exceed
+# this and fall through to the bare status tiers below, same as before.
+_INDETERMINATE_MIN_OUTPUT_LENGTH = 320
 
 # Planner assignment writes require an orderHint for every assigned user.
 # Microsoft's create/update examples use " !" as the insertion hint; Graph
@@ -56,8 +70,10 @@ class _MutationOutcomeIndeterminate(RuntimeError):
     """A mutation may have reached Graph but its outcome cannot be observed."""
 
 
-def _bounded_json(payloads: tuple[dict[str, Any], ...]) -> str:
-    max_output_length = max(MIN_TOOL_MAX_OUTPUT_LENGTH, get_tool_max_output_length())
+def _bounded_json(
+    payloads: tuple[dict[str, Any], ...], *, min_length: int = _MIN_OUTPUT_LENGTH
+) -> str:
+    max_output_length = max(min_length, get_tool_max_output_length())
     for payload in payloads:
         response = json.dumps(payload, ensure_ascii=False)
         if len(response) <= max_output_length:
@@ -115,7 +131,8 @@ def _indeterminate(
             },
             {"status": "indeterminate", "retryable": False},
             {"status": "indeterminate"},
-        )
+        ),
+        min_length=_INDETERMINATE_MIN_OUTPUT_LENGTH,
     )
 
 
@@ -192,7 +209,7 @@ def _bounded_list_response(
     if list_field not in _LIST_PROJECTION_FIELDS:
         raise ValueError(f"unsupported Planner list field: {list_field}")
 
-    max_output_length = max(MIN_TOOL_MAX_OUTPUT_LENGTH, get_tool_max_output_length())
+    max_output_length = max(_MIN_OUTPUT_LENGTH, get_tool_max_output_length())
 
     def _serialize(values: list[Any], *, truncated: bool, mode: str | None) -> str:
         payload: dict[str, Any] = {

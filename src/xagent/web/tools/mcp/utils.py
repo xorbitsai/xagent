@@ -183,6 +183,16 @@ def url_path_id(value: str, field_name: str) -> str:
     return quote(value, safe="")
 
 
+# Phase 1's per-field marker (see success_with_capped_dict): a 1-key dict
+# can't shrink by dropping trailing keys the way a list halves its elements
+# or a larger dict drops its trailing half -- floor(1 / 2) is 0, so the same
+# rule would erase the whole dict to {} in a single step. Substituting this
+# marker instead keeps that field non-empty and self-explanatory, the same
+# way the envelope's own top-level "truncated" flag is, rather than leaving
+# a bare {} a caller can't distinguish from "always empty".
+_FIELD_TRUNCATION_MARKER: dict[str, Any] = {"truncated": True}
+
+
 def success_with_capped_dict(
     field_name: str,
     data: Any,
@@ -203,15 +213,28 @@ def success_with_capped_dict(
     scalar fields behind -- and there's no cursor to retry with, so that
     data is gone for this call. Phase 1 instead repeatedly finds the
     largest list/dict-valued key and halves *its* contents (recursing one
-    level, not further), so small scalar keys survive untouched as long as
-    there is a bigger key left to shrink first. Phase 2 is a fallback for
-    the residual case -- a dict with no list/dict-valued keys at all (e.g.
-    a handful of scalar keys with huge string values) -- and drops whole
-    keys, exactly as phase 1 replaces; it's guaranteed to terminate at {}.
+    level, not further): a list halves smoothly regardless of length, but
+    halving a *dict's key count* the same way floors to zero once only one
+    key is left, collapsing it straight to {} in a single step instead of
+    degrading gradually -- and a 2-key dict reaches that same floor one
+    step later, once halving has already dropped it to one key. Whenever a
+    dict-valued field is down to its last key, phase 1 replaces it with
+    ``_FIELD_TRUNCATION_MARKER`` instead of continuing to halve, so that
+    field stays a small, non-empty signal that something here was dropped.
+    Phase 2 is a fallback for the residual case -- a dict with no
+    list/dict-valued keys at all (e.g. a handful of scalar keys with huge
+    string values) -- and drops whole top-level keys the same way, but
+    always leaves at least one key standing rather than run the same
+    single-key floor all the way down to {}.
 
     ``extra_fields`` adds fixed top-level response fields that must be counted
     while trimming the dict, such as a calendar event's derived Meet link.
-    Reserved envelope keys cannot be overridden.
+    Reserved envelope keys cannot be overridden. If the payload is still too
+    large once ``data`` itself is fully truncated, each extra field is
+    degraded to ``True`` (largest first) before any of them are dropped
+    outright, so a caller-registered field (e.g. a per-field truncation
+    flag) keeps its key -- signaling it exists but is unreliable -- for as
+    long as there's room for it at all.
     """
     extras = extra_fields or {}
     reserved_fields = {"status", field_name, "truncated"}
@@ -244,11 +267,14 @@ def success_with_capped_dict(
 
     working = dict(data)
     truncated = False
+    exhausted_keys: set[Any] = set()
     while len(response) > max_output_length:
         collection_keys = [
             key
             for key, value in working.items()
-            if isinstance(value, (list, dict)) and len(value) > 0
+            if key not in exhausted_keys
+            and isinstance(value, (list, dict))
+            and len(value) > 0
         ]
         if not collection_keys:
             break
@@ -261,15 +287,25 @@ def success_with_capped_dict(
             working[target_key] = target_value[: len(target_value) // 2]
         else:
             sub_keys = list(target_value.keys())
-            working[target_key] = {
-                sub_key: target_value[sub_key]
-                for sub_key in sub_keys[: len(sub_keys) // 2]
-            }
+            if len(sub_keys) > 1:
+                working[target_key] = {
+                    sub_key: target_value[sub_key]
+                    for sub_key in sub_keys[: len(sub_keys) // 2]
+                }
+            elif target_value == _FIELD_TRUNCATION_MARKER:
+                # Already replaced by the marker below on an earlier pass
+                # and picked again (it's still a non-empty dict) -- nothing
+                # left to shrink here, so stop re-selecting it and let a
+                # still-shrinkable field (if any) take the next turn.
+                exhausted_keys.add(target_key)
+                continue
+            else:
+                working[target_key] = dict(_FIELD_TRUNCATION_MARKER)
         truncated = True
         response = _build(working, truncated)
 
     keys = list(working.keys())
-    while len(response) > max_output_length and keys:
+    while len(response) > max_output_length and len(keys) > 1:
         keys = keys[: len(keys) // 2]
         working = {key: working[key] for key in keys}
         truncated = True
@@ -288,10 +324,42 @@ def success_with_capped_dict(
             if isinstance(data.get(id_key), (str, int, float, bool)):
                 compact_data[id_key] = data[id_key]
                 break
-        candidates = (
-            _build(compact_data, True, with_extras=False),
-            _build({}, True, with_extras=False),
-            json.dumps({"status": "success", "truncated": True}, ensure_ascii=False),
+
+        def _build_compact(current_extras: dict[str, Any]) -> str:
+            return json.dumps(
+                {
+                    "status": "success",
+                    field_name: compact_data,
+                    **current_extras,
+                    "truncated": True,
+                },
+                ensure_ascii=False,
+            )
+
+        candidates = [_build_compact(extras)]
+        degraded_extras = dict(extras)
+        while degraded_extras:
+            largest_key = max(
+                degraded_extras,
+                key=lambda key: len(
+                    json.dumps(degraded_extras[key], ensure_ascii=False)
+                ),
+            )
+            if degraded_extras[largest_key] is True:
+                # Every extra field is already degraded to the same
+                # placeholder -- no more room to make between "all extras
+                # present" and "no extras at all" below.
+                break
+            degraded_extras[largest_key] = True
+            candidates.append(_build_compact(degraded_extras))
+        candidates.extend(
+            (
+                _build(compact_data, True, with_extras=False),
+                _build({}, True, with_extras=False),
+                json.dumps(
+                    {"status": "success", "truncated": True}, ensure_ascii=False
+                ),
+            )
         )
         for candidate in candidates:
             if len(candidate) <= max_output_length:

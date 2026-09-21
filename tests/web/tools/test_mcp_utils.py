@@ -1170,3 +1170,133 @@ def test_conflict_response_uses_valid_compact_json_below_fixed_envelope(
     assert response["status"] == "conflict"
     assert response["truncated"] is True
     assert len(response_text) <= 300
+
+
+# ---------------------------------------------------------------------------
+# success_with_capped_dict - dict-collapse sharp edge and last-resort extras
+# ---------------------------------------------------------------------------
+
+
+def test_success_with_capped_dict_degrades_a_single_key_nested_dict_to_a_marker(
+    monkeypatch,
+):
+    """Regression test: phase 1 shrinks a dict-valued field by halving its
+    KEY COUNT, mirroring how a list halves its elements. That works for a
+    list at any length, but floors to zero for a dict with only one key,
+    collapsing the whole field to {} in a single step instead of degrading
+    gradually. The field should become a small, non-empty truncation
+    marker instead, so a caller can tell something was dropped rather than
+    reading {} and being unable to distinguish "truncated" from "always
+    empty"."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "200")
+
+    raw = utils.success_with_capped_dict(
+        "record", {"id": "rec1", "metrics": {"total": "x" * 5000}}
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 200
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["record"]["id"] == "rec1"
+    assert result["record"]["metrics"] == {"truncated": True}
+
+
+def test_success_with_capped_dict_degrades_a_two_key_nested_dict_to_a_marker(
+    monkeypatch,
+):
+    """Regression test: a 2-key dict reaches the same floor as the 1-key
+    case one step later -- halving its key count first drops to 1 key, and
+    a *subsequent* halving of that 1-key remainder is what collapses it to
+    {}. The field must still end up as a non-empty marker, not {}, once
+    fully exhausted."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "150")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"id": "rec1", "metrics": {"total": "x" * 3000, "avg": "y" * 3000}},
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 150
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["record"]["id"] == "rec1"
+    assert result["record"]["metrics"] == {"truncated": True}
+
+
+def test_success_with_capped_dict_top_level_single_key_survives_phase_two(
+    monkeypatch,
+):
+    """Regression test: phase 2's top-level key-drop halves the key COUNT
+    the same way phase 1 does for a nested dict, which floors to zero once
+    only one top-level key is left -- the exact gap `mixpanel.py`'s
+    `_success_with_capped_list` had to work around locally, since it
+    wraps a bare list as `{key: items}` before calling this function.
+    Once down to a single top-level key that still doesn't fit on its
+    own, phase 2 must stop rather than empty `data` to {} and lose a
+    field (here, "id") that the final compact-data fallback could
+    otherwise have recovered."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "70")
+
+    # "notes" sorts first (dict insertion order) so phase 2's "keep the
+    # first half of keys" step drops "id" before "notes" -- if phase 2 were
+    # then allowed to empty the single remaining "notes" key down to {},
+    # "id" would never be recovered even though it's small enough to fit.
+    raw = utils.success_with_capped_dict(
+        "record", {"notes": "x" * 5000, "id": "rec1"}
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 70
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["record"] == {"id": "rec1"}
+
+
+def test_success_with_capped_dict_last_resort_degrades_extras_before_dropping_them(
+    monkeypatch,
+):
+    """Regression test: once `data` itself is fully truncated, the last
+    resort used to drop every `extra_fields` entry outright the moment the
+    full-extras candidate didn't fit. A caller-registered extra field
+    (e.g. a per-field truncation flag) should keep its key -- even
+    degraded to a generic placeholder -- for as long as there's room,
+    instead of the whole `extra_fields` dict vanishing in one step."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "100")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 123, "Notes": "x" * 5000},
+        extra_fields={"note": "y" * 60},
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 100
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["record"] == {"Id": 123}
+    assert "note" in result
+    assert result["note"] is True
+
+
+def test_success_with_capped_dict_last_resort_falls_back_to_dropping_extras(
+    monkeypatch,
+):
+    """When even a fully-degraded extras dict (every value replaced by
+    `True`) still doesn't fit, the last resort must still fall back to
+    dropping extras entirely rather than getting stuck or erroring."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "80")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 123, "Notes": "x" * 5000},
+        extra_fields={"note_one": "y" * 60, "note_two": "z" * 60},
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 80
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert "note_one" not in result
+    assert "note_two" not in result

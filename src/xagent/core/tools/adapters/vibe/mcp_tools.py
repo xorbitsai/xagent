@@ -34,23 +34,70 @@ def _stable_server_names(values: Any) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _apply_stdio_output_limit_env(
-    mcp_configs: list[dict[str, Any]], config: "BaseToolConfig"
+def _setdefault_numeric_env(
+    env: dict[str, Any], key: str, value: int, *, server_name: Any
 ) -> None:
-    """Mirror this process's output-filter budget into stdio child env vars.
+    """Set ``env[key]`` to ``value`` unless it already holds a valid number.
+
+    A pre-existing non-numeric value would silently make the child-side
+    getter (``xagent.config.get_tool_max_output_length`` and friends) fall
+    back to its own default instead of the caller's intended override, which
+    defeats the point of mirroring an effective value at all. Nothing in
+    the codebase sets such a value today, but if one shows up, replace it
+    (and say so) rather than preserve garbage.
+    """
+    existing = env.get(key)
+    if existing is not None:
+        try:
+            int(existing)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Stdio MCP server %r had a non-numeric %s override (%r); "
+                "replacing it with the effective value",
+                server_name,
+                key,
+                existing,
+            )
+        else:
+            return
+    env[key] = str(value)
+
+
+def _apply_stdio_output_limits_env(
+    mcp_configs: list[dict[str, Any]],
+    config: "BaseToolConfig",
+    *,
+    exempt_server_names: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
+    """Mirror this process's output-filter budgets into stdio child env vars.
 
     ``OutputFilteredToolWrapper`` (see factory.py) truncates a stdio MCP
-    tool's result in THIS process using ``config.get_max_output_length()``
-    (and the field-count/recursion-depth counterparts). Builtin connectors
-    under ``xagent.web.tools.mcp`` size their own bounded, valid-JSON output
-    against the *same-named* env vars read inside their own subprocess.
-    ``_create_stdio_session`` launches that subprocess with a minimal,
-    explicitly-built env (credentials + caller id only) rather than
-    inheriting this process's environment, so the two budgets can silently
-    disagree and the wrapper's blind slice can then cut valid JSON produced
-    by the child mid-structure. Setting these here keeps both sides looking
-    at the same effective numbers regardless of which env var / config
-    override produced them.
+    tool's result in THIS process using ``config.get_max_output_length()``.
+    Builtin connectors under ``xagent.web.tools.mcp`` size their own
+    bounded, valid-JSON output against the *same-named* env var read inside
+    their own subprocess. ``_create_stdio_session`` launches that subprocess
+    with a minimal, explicitly-built env (credentials + caller id only)
+    rather than inheriting this process's environment, so the two budgets
+    can silently disagree and the wrapper's blind slice can then cut valid
+    JSON produced by the child mid-structure. Mirroring the value here keeps
+    both sides looking at the same effective number regardless of which env
+    var / config override produced it.
+
+    ``config.get_max_field_count()``/``get_max_recursion_depth()`` are
+    mirrored the same way pre-emptively, even though no builtin connector
+    reads those two env vars yet, so a connector that starts reading them
+    later doesn't need a second pass through this function.
+
+    ``exempt_server_names`` must list every server that bypasses the
+    generic MCP loader for its own actor/execution-scoped session consumer
+    (e.g. chrome-devtools via ``bind_chrome_execution_scope``): that path
+    fail-closes on any unexpected env key, so injecting into it would take
+    down the connector instead of just fixing its output budget.
+
+    Returns a new list (stdio entries needing an env change are shallow
+    copies); ``mcp_configs`` and its dicts are never mutated in place, since
+    they may be the same objects a config's own request-scoped cache holds
+    onto and returns again on a later call within this request.
     """
     from .....config import (
         TOOL_MAX_FIELD_COUNT,
@@ -58,18 +105,49 @@ def _apply_stdio_output_limit_env(
         TOOL_MAX_RECURSION_DEPTH,
     )
 
+    result: list[dict[str, Any]] = []
     for cfg in mcp_configs:
-        if cfg.get("transport") != "stdio":
-            continue
+        server_name = cfg.get("name")
         inner_config = cfg.get("config")
-        if not isinstance(inner_config, dict) or inner_config.get("unavailable"):
+        if (
+            cfg.get("transport") != "stdio"
+            or (isinstance(server_name, str) and server_name in exempt_server_names)
+            or not isinstance(inner_config, dict)
+            or inner_config.get("unavailable")
+        ):
+            result.append(cfg)
             continue
-        env = inner_config.setdefault("env", {})
-        if not isinstance(env, dict):
+        existing_env = inner_config.get("env")
+        if existing_env is not None and not isinstance(existing_env, dict):
+            logger.warning(
+                "Stdio MCP server %r has a non-dict env (%s); skipping "
+                "output-limit mirroring for it",
+                server_name,
+                type(existing_env).__name__,
+            )
+            result.append(cfg)
             continue
-        env.setdefault(TOOL_MAX_OUTPUT_LENGTH, str(config.get_max_output_length()))
-        env.setdefault(TOOL_MAX_FIELD_COUNT, str(config.get_max_field_count()))
-        env.setdefault(TOOL_MAX_RECURSION_DEPTH, str(config.get_max_recursion_depth()))
+        env = dict(existing_env or {})
+        _setdefault_numeric_env(
+            env,
+            TOOL_MAX_OUTPUT_LENGTH,
+            config.get_max_output_length(),
+            server_name=server_name,
+        )
+        _setdefault_numeric_env(
+            env,
+            TOOL_MAX_FIELD_COUNT,
+            config.get_max_field_count(),
+            server_name=server_name,
+        )
+        _setdefault_numeric_env(
+            env,
+            TOOL_MAX_RECURSION_DEPTH,
+            config.get_max_recursion_depth(),
+            server_name=server_name,
+        )
+        result.append({**cfg, "config": {**inner_config, "env": env}})
+    return result
 
 
 def _select_config_load_failures(
@@ -295,7 +373,16 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
                 )
                 return await _finish_mcp_setup(config, summary, [])
 
-    _apply_stdio_output_limit_env(mcp_configs, config)
+    # Actor/execution-scoped stdio sessions (e.g. chrome-devtools) bypass
+    # the generic MCP loader for their own session consumer, which
+    # fail-closes on any env key it didn't itself put there — so they must
+    # be resolved (and exempted) before mirroring output limits below, not
+    # after.
+    identity_getter = getattr(config, "get_actor_mcp_stdio_session_identities", None)
+    session_identities = identity_getter() if callable(identity_getter) else {}
+    mcp_configs = _apply_stdio_output_limits_env(
+        mcp_configs, config, exempt_server_names=frozenset(session_identities)
+    )
 
     # Everything DB-backed is loaded at this point; what follows is pure
     # network I/O against remote MCP servers (initialize + list-tools, with
@@ -309,10 +396,6 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     try:
         from .factory import ToolFactory
 
-        identity_getter = getattr(
-            config, "get_actor_mcp_stdio_session_identities", None
-        )
-        session_identities = identity_getter() if callable(identity_getter) else {}
         consumer_getter = getattr(config, "get_actor_mcp_stdio_session_consumer", None)
         session_consumer = consumer_getter() if callable(consumer_getter) else None
         create_kwargs: dict[str, Any] = {"sandbox": config.get_sandbox()}

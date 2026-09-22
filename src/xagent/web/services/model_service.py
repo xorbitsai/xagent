@@ -16,11 +16,13 @@ from sqlalchemy.orm import Session
 from xagent.core.model.image.base import BaseImageModel, default_image_abilities
 
 from ...core.model.chat.basic.base import BaseLLM
+from ...core.model.image.adapter import retry_image_call
 from ...core.model.image.dashscope import DashScopeImageModel
 from ...core.model.image.gemini import GeminiImageModel
 from ...core.model.image.openai import OpenAIImageModel
 from ...core.model.image.xinference import XinferenceImageModel
 from ...core.model.video.base import BaseVideoModel
+from ...core.retry import create_retry_wrapper
 from ..models.model import Model as DBModel
 from .llm_utils import AutoModelUnavailableError
 
@@ -650,8 +652,35 @@ def get_vision_model(db: Session, user_id: Optional[int] = None) -> Optional[Bas
 def _add_image_model_with_id(
     models_dict: dict[str, Any], instance: Any, db_model: DBModel
 ) -> None:
+    """Stamp the configured id on the provider, then publish it wrapped.
+
+    Both steps target the right object on purpose.
+
+    The id is set on the *inner* provider because that is what calls
+    ``record_image_usage``; stamping a wrapper instead leaves the recording
+    provider without one, and the aggregator then groups on the non-unique
+    provider-facing name.
+
+    The retry policy is applied here rather than left off, so the
+    no-double-billing invariant holds by construction on this path too. It
+    previously held only because this path happened not to retry at all — which
+    is not a property anyone declared, and the next person to add a retry here
+    would have silently re-billed every invalid-but-charged 200.
+    """
+    # Kept despite the constructor argument at the call sites: this function is
+    # reachable with a provider built any other way, and the stamp is what
+    # guarantees the recording layer has an id. A caller that forgets the
+    # constructor argument would otherwise bill under the provider-facing name.
     setattr(instance, "model_id", str(db_model.model_id))
-    models_dict[str(db_model.model_id)] = instance
+    models_dict[str(db_model.model_id)] = create_retry_wrapper(
+        instance,
+        BaseImageModel,
+        retry_methods={"generate_image", "edit_image"},
+        # Same rule as get_image_model_instance reads from the row, so the two
+        # construction paths cannot disagree about how often a call is retried.
+        max_retries=getattr(db_model, "max_retries", 3) or 3,
+        retry_on=retry_image_call,
+    )
     logger.info(
         f"Added image model: model_id={db_model.model_id}, model_name={db_model.model_name}"
     )
@@ -707,12 +736,19 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                     db_model.abilities
                     or default_image_abilities(model_provider, model_name)
                 )
+                # Passed at construction, not only stamped afterwards by
+                # _add_image_model_with_id: the provider is what records image
+                # usage, and the aggregator groups on `model_id or model`, so a
+                # provider left without one bills under the non-unique
+                # provider-facing name.
+                configured_id = str(db_model.model_id)
                 if model_provider == "dashscope":
                     image_model = DashScopeImageModel(
                         model_name=model_name,
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=configured_id,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "gemini":
@@ -721,6 +757,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=configured_id,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "openai":
@@ -729,6 +766,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=configured_id,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "xinference":
@@ -737,6 +775,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=configured_id,
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
             except Exception as e:

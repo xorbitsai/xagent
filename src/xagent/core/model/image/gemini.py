@@ -18,9 +18,42 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from ...utils.security import redact_sensitive_text, redact_url_credentials_for_logging
-from .base import BaseImageModel, default_image_abilities
+from ..chat.token_context import MediaCallType
+from .base import (
+    BaseImageModel,
+    InvalidImageResponseError,
+    decode_billed_body,
+    default_image_abilities,
+    invalid_response_from,
+    resolve_requested_size,
+)
+from .usage import record_image_usage, record_unusable_response
 
 logger = logging.getLogger(__name__)
+
+
+def _gemini_token_usage(response_data: Any) -> Dict[str, Any]:
+    """Token counts from a Gemini 200, never raising.
+
+    Reads defensively because it runs *before* the metering call, in the same
+    try as the structural checks below. A 200 whose ``usageMetadata`` is a list
+    or a string -- or whose whole body is a JSON array -- would otherwise raise
+    ``AttributeError`` here, be reclassified as an already-billed invalid
+    response, and lose the billing row for a call Google did charge for: the
+    reclassified error asserts the row was already written, and the retry policy
+    refuses to retry on that basis. Absent or malformed metadata yields zeros,
+    so the row still records the call as billed-but-unmeasured.
+    """
+    metadata = (
+        response_data.get("usageMetadata") if isinstance(response_data, dict) else None
+    )
+    if not isinstance(metadata, dict):
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {
+        "prompt_tokens": metadata.get("promptTokenCount", 0),
+        "completion_tokens": metadata.get("candidatesTokenCount", 0),
+        "total_tokens": metadata.get("totalTokenCount", 0),
+    }
 
 
 def _parse_size_to_gemini_config(size: str, model_name: str) -> Dict[str, str]:
@@ -147,6 +180,7 @@ class GeminiImageModel(BaseImageModel):
         base_url: Optional[str] = None,
         timeout: float = 300.0,
         abilities: Optional[List[str]] = None,
+        model_id: str = "",
     ):
         """
         Initialize Gemini image generation model.
@@ -158,8 +192,12 @@ class GeminiImageModel(BaseImageModel):
             timeout: Request timeout in seconds
             abilities: List of supported abilities (defaults to auto-detected based on model)
                       Some models like "gemini-3-pro-image-preview-2k" also support ["generate", "edit"]
+            model_id: Configured model id used for usage attribution
         """
         self.model_name = model_name
+        # See OpenAIImageModel: this provider records its own usage, so the
+        # configured id must live here rather than on the retry wrapper.
+        self.model_id = model_id
         self.api_key = (
             api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         )
@@ -345,33 +383,77 @@ class GeminiImageModel(BaseImageModel):
                     )
                     response.raise_for_status()
 
-                response_data = response.json()
+                # Inside the billing boundary: the 200 is already charged, so a
+                # body that will not decode is an invalid response, not a
+                # retryable failure. Left outside, a JSONDecodeError reached the
+                # retry predicate and the call was re-billed with no metering
+                # row ever written.
+                try:
+                    response_data = decode_billed_body(
+                        response.json, "Gemini returned an undecodable body"
+                    )
+                except InvalidImageResponseError:
+                    # Metered before re-raising. Classifying an undecodable
+                    # billed body as non-retryable stops the repeat charges,
+                    # but the one real charge still has to leave a row -- the
+                    # same half openai/xinference already do on their own
+                    # decode failures.
+                    record_unusable_response(
+                        model_name=self.model_name,
+                        model_id=self.model_id,
+                        call_type=MediaCallType.GENERATE_IMAGE,
+                        resolution=(image_config or {}).get("imageSize", ""),
+                    )
+                    raise
 
-            # Parse the response
-            # Gemini API returns:
-            # {
-            #   "candidates": [
-            #     {
-            #       "content": {
-            #         "parts": [
-            #           {
-            #             "inlineData": {
-            #               "mimeType": "image/png",
-            #               "data": "base64_encoded_image_data"
-            #             }
-            #           }
-            #         ]
-            #       },
-            #       "finishReason": "STOP",
-            #       ...
-            #     }
-            #   ],
-            #   "usageMetadata": {...}
-            # }
+                # Parse the response
+                # Gemini API returns:
+                # {
+                #   "candidates": [
+                #     {
+                #       "content": {
+                #         "parts": [
+                #           {
+                #             "inlineData": {
+                #               "mimeType": "image/png",
+                #               "data": "base64_encoded_image_data"
+                #             }
+                #           }
+                #         ]
+                #       },
+                #       "finishReason": "STOP",
+                #       ...
+                #     }
+                #   ],
+                #   "usageMetadata": {...}
+                # }
+
+                # Meter before validating the response body. Google has already
+                # billed this 200, and usageMetadata is present even when the
+                # candidate carries no usable image (safety-blocked finish reason,
+                # empty parts). Recording after the structural checks below would
+                # drop usage for exactly those billed-but-unusable responses.
+                # Those checks raise InvalidImageResponseError, which the production
+                # retry policy refuses to retry, so this row is written exactly once
+                # per billed call.
+                token_usage = _gemini_token_usage(response_data)
+                record_image_usage(
+                    {"usage": token_usage},
+                    model_name=self.model_name,
+                    model_id=self.model_id,
+                    call_type=MediaCallType.GENERATE_IMAGE,
+                    # image_count stays 1 deliberately. The Gemini API has no
+                    # multi-image parameter and this client forwards only
+                    # `temperature` out of **kwargs, so a caller-supplied `n` never
+                    # reaches the provider; the response parser also takes just the
+                    # first inlineData part. Billing `n` here would charge for
+                    # images that were never generated.
+                    resolution=(image_config or {}).get("imageSize", ""),
+                )
 
             candidates = response_data.get("candidates", [])
             if not candidates:
-                raise RuntimeError("No candidates in response")
+                raise InvalidImageResponseError("No candidates in response")
 
             first_candidate = candidates[0]
             finish_reason = first_candidate.get("finishReason")
@@ -379,7 +461,7 @@ class GeminiImageModel(BaseImageModel):
             parts = content.get("parts", [])
 
             if not parts:
-                raise RuntimeError("No parts in response content")
+                raise InvalidImageResponseError("No parts in response content")
 
             # Look for inlineData with image (base64 encoded)
             image_url = None
@@ -407,21 +489,12 @@ class GeminiImageModel(BaseImageModel):
 
             if not image_url:
                 if finish_reason and finish_reason != "STOP":
-                    raise RuntimeError(
+                    raise InvalidImageResponseError(
                         f"Image generation failed with finish reason: {finish_reason}"
                     )
-                raise RuntimeError("No image data in response")
+                raise InvalidImageResponseError("No image data in response")
 
-            # Extract usage metadata
-            usage_metadata = response_data.get("usageMetadata", {})
-
-            # Build token usage info
-            token_usage = {
-                "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
-                "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
-                "total_tokens": usage_metadata.get("totalTokenCount", 0),
-            }
-
+            # Usage was already recorded above, before validation.
             return {
                 "image_url": image_url,
                 "usage": token_usage,
@@ -430,6 +503,20 @@ class GeminiImageModel(BaseImageModel):
                 "raw_response": response_data,
             }
 
+        except InvalidImageResponseError:
+            # Re-raised unchanged: wrapping it in a plain RuntimeError below
+            # would erase the non-retryable classification, and the response was
+            # already billed and metered, so a retry only buys another charge.
+            raise
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            # Same classification, reached implicitly. `candidates` and `parts`
+            # are checked for truthiness but not for element type, so a 200
+            # whose candidates are strings fails on `.get` with an
+            # AttributeError rather than a raise. Classified positionally
+            # instead of by enumerating shapes: anything that fails walking an
+            # already-metered body is an invalid response. The request half of
+            # this try raises httpx errors, matched by the clauses below.
+            raise invalid_response_from(e, "Invalid response format") from e
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
                 "Gemini image generation API error "
@@ -584,8 +671,16 @@ class GeminiImageModel(BaseImageModel):
         # Add generation config
         gen_config: dict[str, Any] = {"responseModalities": ["Image"]}
 
-        # Optionally add size config if provided
-        size = kwargs.get("size", "1024*1024")
+        # Optionally add size config if provided.
+        # Same precedence generate_image applies -- reported by review against
+        # the other three providers, and true here too: reading `size` alone
+        # renders and bills an edit at the stale default.
+        size = resolve_requested_size(
+            kwargs.get("size"),
+            resolution=kwargs.get("resolution"),
+            width=kwargs.get("width"),
+            height=kwargs.get("height"),
+        )
         image_config = _parse_size_to_gemini_config(size, self.model_name)
         aspect_ratio = kwargs.get("aspect_ratio")
         if aspect_ratio:
@@ -624,12 +719,44 @@ class GeminiImageModel(BaseImageModel):
                     )
                     response.raise_for_status()
 
-                response_data = response.json()
+                # Inside the billing boundary: the 200 is already charged, so a
+                # body that will not decode is an invalid response, not a
+                # retryable failure. Left outside, a JSONDecodeError reached the
+                # retry predicate and the call was re-billed with no metering
+                # row ever written.
+                try:
+                    response_data = decode_billed_body(
+                        response.json, "Gemini returned an undecodable body"
+                    )
+                except InvalidImageResponseError:
+                    # See generate_image: a billed body that will not decode
+                    # still leaves a row.
+                    record_unusable_response(
+                        model_name=self.model_name,
+                        model_id=self.model_id,
+                        call_type=MediaCallType.EDIT_IMAGE,
+                        resolution=(image_config or {}).get("imageSize", ""),
+                    )
+                    raise
+
+                # Meter before validating the response body — see generate_image
+                # for why a billed 200 must be recorded ahead of the structural
+                # checks below.
+                token_usage = _gemini_token_usage(response_data)
+                record_image_usage(
+                    {"usage": token_usage},
+                    model_name=self.model_name,
+                    model_id=self.model_id,
+                    call_type=MediaCallType.EDIT_IMAGE,
+                    # image_count stays 1 — see generate_image: `n` never reaches
+                    # the Gemini API and only one image is ever parsed back.
+                    resolution=(image_config or {}).get("imageSize", ""),
+                )
 
             # Parse response - similar to generate but for edited image
             candidates = response_data.get("candidates", [])
             if not candidates:
-                raise RuntimeError("No candidates in response")
+                raise InvalidImageResponseError("No candidates in response")
 
             first_candidate = candidates[0]
             finish_reason = first_candidate.get("finishReason")
@@ -637,7 +764,7 @@ class GeminiImageModel(BaseImageModel):
             response_parts = content.get("parts", [])
 
             if not response_parts:
-                raise RuntimeError("No parts in response content")
+                raise InvalidImageResponseError("No parts in response content")
 
             # Look for image URL in Markdown text response (most common format)
             edited_image_url = None
@@ -663,20 +790,12 @@ class GeminiImageModel(BaseImageModel):
 
             if not edited_image_url:
                 if finish_reason and finish_reason != "STOP":
-                    raise RuntimeError(
+                    raise InvalidImageResponseError(
                         f"Image editing failed with finish reason: {finish_reason}"
                     )
-                raise RuntimeError("No image data in edit response")
+                raise InvalidImageResponseError("No image data in edit response")
 
-            # Extract usage metadata
-            usage_metadata = response_data.get("usageMetadata", {})
-
-            token_usage = {
-                "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
-                "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
-                "total_tokens": usage_metadata.get("totalTokenCount", 0),
-            }
-
+            # Usage was already recorded above, before validation.
             return {
                 "image_url": edited_image_url,
                 "usage": token_usage,
@@ -685,6 +804,20 @@ class GeminiImageModel(BaseImageModel):
                 "raw_response": response_data,
             }
 
+        except InvalidImageResponseError:
+            # Re-raised unchanged: wrapping it in a plain RuntimeError below
+            # would erase the non-retryable classification, and the response was
+            # already billed and metered, so a retry only buys another charge.
+            raise
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            # Same classification, reached implicitly. `candidates` and `parts`
+            # are checked for truthiness but not for element type, so a 200
+            # whose candidates are strings fails on `.get` with an
+            # AttributeError rather than a raise. Classified positionally
+            # instead of by enumerating shapes: anything that fails walking an
+            # already-metered body is an invalid response. The request half of
+            # this try raises httpx errors, matched by the clauses below.
+            raise invalid_response_from(e, "Invalid response format") from e
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
                 "Gemini image editing API error "

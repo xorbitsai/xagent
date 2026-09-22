@@ -58,6 +58,7 @@ _VALID_FILTER_FIELDS = frozenset(
         "json_path",
         "chunk_hash",
         "config_hash",
+        "generation_id",
         "metadata",
         # embeddings table
         "model",
@@ -73,6 +74,8 @@ _VALID_FILTER_FIELDS = frozenset(
         "semantic_id",
         "technical_id",
         "operator",
+        # active_generations table
+        "published_at",
         # prompt_templates table
         "id",
         "name",
@@ -2046,3 +2049,93 @@ class MainPointerStore(ABC):
         user_id: Optional[int] = None,
     ) -> bool:
         """Async version of delete_main_pointer."""
+
+
+class _UnsetUserIdFilter:
+    """Sentinel type for omitted active-generation user_id filters."""
+
+
+USER_ID_FILTER_UNSET = _UnsetUserIdFilter()
+UserIdFilter = Union[Optional[int], _UnsetUserIdFilter]
+
+
+class ActiveGenerationStore(ABC):
+    """Published active-generation pointer contract for ingestion and retrieval.
+
+    Each pointer identifies the single searchable generation for a document scope:
+    (collection, doc_id, parse_hash, user_id, model_tag).
+    """
+
+    @abstractmethod
+    def publish_active_generation(
+        self,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        user_id: Optional[int],
+        model_tag: Optional[str],
+        generation_id: str,
+        config_hash: str,
+        operator: Optional[str] = None,
+    ) -> None:
+        """Publish or replace the active generation pointer for a scope."""
+
+    @abstractmethod
+    def get_active_generation(
+        self,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        user_id: Optional[int],
+        model_tag: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the active generation pointer for a scope, if any."""
+
+    @abstractmethod
+    def list_active_generations(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: UserIdFilter = USER_ID_FILTER_UNSET,
+        model_tag: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """List active generation pointers for a collection."""
+
+    @abstractmethod
+    async def publish_active_generation_async(
+        self,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        user_id: Optional[int],
+        model_tag: Optional[str],
+        generation_id: str,
+        config_hash: str,
+        operator: Optional[str] = None,
+    ) -> None:
+        """Async version of publish_active_generation."""
+
+    @abstractmethod
+    async def get_active_generation_async(
+        self,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        user_id: Optional[int],
+        model_tag: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Async version of get_active_generation."""
+
+    @abstractmethod
+    async def list_active_generations_async(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: UserIdFilter = USER_ID_FILTER_UNSET,
+        model_tag: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Async version of list_active_generations."""

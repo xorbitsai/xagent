@@ -1406,9 +1406,7 @@ def test_kb_web_job_zero_pages_without_failures_fails(tmp_path, monkeypatch):
         db.close()
 
 
-def test_background_web_file_new_branch_returns_rollback_callback(
-    tmp_path, monkeypatch
-):
+def test_background_web_file_new_branch_compensates_on_failure(tmp_path, monkeypatch):
     from xagent.core.file_storage.factory import get_unscoped_file_storage
     from xagent.web.jobs.kb_tasks import _handle_web_file
 
@@ -1456,9 +1454,22 @@ def test_background_web_file_new_branch_returns_rollback_callback(
                 is_admin=False,
                 processed_urls={},
             )
-            assert callable(result["rollback_on_failure"])
+            from xagent.core.tools.core.RAG_tools.kb import get_kb_coordinator
+            from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
+                _run_file_handler_compensation,
+            )
 
-            result["rollback_on_failure"](None)
+            assert (
+                _run_file_handler_compensation(
+                    pipeline_facade=get_kb_coordinator().pipeline,
+                    page_operation=None,
+                    file_info=result,
+                    collection="web-kb",
+                    url="https://example.com/page",
+                    warnings=[],
+                )
+                is None
+            )
 
         verify_db = SessionLocal()
         try:

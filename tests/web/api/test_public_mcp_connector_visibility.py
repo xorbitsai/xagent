@@ -920,8 +920,8 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
 
 
 def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
-    """Granola and Notion have no local launch command at all — they host
-    their own MCP server and are reached over streamable_http. This is
+    """Granola, Notion, Atlassian and Miro have no local launch command at all —
+    they host their own MCP server and are reached over streamable_http. This is
     intentionally split out of
     test_builtin_registry_uses_runtime_available_launch_commands, whose name
     is about local launch *commands* and would misdescribe these
@@ -942,8 +942,30 @@ def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
         "auth": {"type": "mcp_oauth"},
     }
 
+    # Atlassian's current endpoint is /v2/mcp; the legacy /v1/sse endpoint is
+    # unsupported after 2026-06-30 and must not be what the catalog points at.
+    assert rows_by_app_id["atlassian"]["transport"] == "streamable_http"
+    assert rows_by_app_id["atlassian"]["launch_config"] == {
+        "url": "https://mcp.atlassian.com/v2/mcp",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "atlassian",
+            "version": 1,
+        },
+    }
 
-@pytest.mark.parametrize("app_id", ["granola", "notion"])
+    # Miro serves MCP at the host root (its protected-resource metadata
+    # names "https://mcp.miro.com/" as the resource), not under /mcp.
+    assert rows_by_app_id["miro"]["transport"] == "streamable_http"
+    assert rows_by_app_id["miro"]["launch_config"] == {
+        "url": "https://mcp.miro.com/",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {"registry": "xagent", "app_id": "miro", "version": 1},
+    }
+
+
+@pytest.mark.parametrize("app_id", ["granola", "notion", "atlassian", "miro"])
 def test_builtin_registry_classifies_remote_mcp_apps_as_mcp_oauth(app_id) -> None:
     """The registry shape must classify as mcp_oauth — anything else means the
     catalog entry is uninstallable (connect_mcp_app rejects non-api_key apps

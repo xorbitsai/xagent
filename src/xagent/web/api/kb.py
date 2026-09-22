@@ -2464,42 +2464,9 @@ def _existing_web_file_result_with_rollback(
         ingestion_runs_snapshot=ingestion_runs_snapshot,
     )
 
-    def _rollback_existing(
-        ingestion_result: Optional[IngestionResult] = None,
-    ) -> None:
-        rollback_error: Optional[Exception] = None
-        try:
-            doc_cb = document_compensation(ingestion_result)
-            doc_cb()
-        except Exception as exc:  # noqa: BLE001
-            rollback_error = exc
-            logger.warning(
-                "Failed to restore RAG rows during existing web file rollback: "
-                "file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            status_cb = status_compensation(ingestion_result)
-            status_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore ingestion runs during existing web file rollback: "
-                "file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        if rollback_error is not None:
-            raise rollback_error
-
     return FileHandlerResult(
         file_path=str(file_path),
         file_id=file_record_id,
-        rollback_on_failure=_rollback_existing,
         document_compensation=document_compensation,
         status_compensation=status_compensation,
         rollback_context={
@@ -2566,53 +2533,9 @@ def _create_new_web_file_handler_result(
             is_admin=is_admin,
         )
 
-        def _rollback_new_web_file(
-            ingestion_result: Optional[IngestionResult] = None,
-        ) -> None:
-            rollback_error: Optional[Exception] = None
-            try:
-                doc_cb = document_compensation(ingestion_result)
-                doc_cb()
-            except Exception as exc:  # noqa: BLE001
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to clean RAG rows during new web file rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-            try:
-                file_compensation()
-            except Exception as exc:  # noqa: BLE001
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to clean file during new web file rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-            try:
-                status_cb = status_compensation(ingestion_result)
-                status_cb()
-            except Exception as exc:  # noqa: BLE001
-                if rollback_error is None:
-                    rollback_error = exc
-                logger.warning(
-                    "Failed to clear ingestion status during new web file "
-                    "rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-            if rollback_error is not None:
-                raise rollback_error
-
         return FileHandlerResult(
             file_path=str(persistent_file),
             file_id=file_record_id,
-            rollback_on_failure=_rollback_new_web_file,
             file_compensation=file_compensation,
             document_compensation=document_compensation,
             status_compensation=status_compensation,
@@ -2837,69 +2760,12 @@ def _refresh_existing_file_if_changed(
         backup_path=backup_path,
     )
 
-    def _rollback_refresh(
-        ingestion_result: Optional[IngestionResult] = None,
-    ) -> None:
-        rollback_error: Optional[Exception] = None
-        file_succeeded = False
-        try:
-            doc_cb = document_compensation(ingestion_result)
-            doc_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore RAG rows during web file refresh rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            file_compensation()
-            file_succeeded = True
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore file during web file refresh rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            status_cb = status_compensation(ingestion_result)
-            status_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore ingestion runs during web file refresh "
-                "rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        if rollback_error is None and file_succeeded:
-            try:
-                snapshot_compensation()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to cleanup backup file during web file refresh "
-                    "rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-        if rollback_error is not None:
-            raise rollback_error
-
     def _commit_refresh() -> None:
         backup_path.unlink(missing_ok=True)
 
     return FileHandlerResult(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
-        rollback_on_failure=_rollback_refresh,
         commit_on_success=_commit_refresh,
         file_compensation=file_compensation,
         document_compensation=document_compensation,
@@ -3066,63 +2932,6 @@ def _recreate_missing_existing_file(
         backup_path=backup_for_failure,
     )
 
-    def _rollback_recreate(
-        ingestion_result: Optional[IngestionResult] = None,
-    ) -> None:
-        rollback_error: Optional[Exception] = None
-        file_succeeded = False
-        try:
-            doc_cb = document_compensation(ingestion_result)
-            doc_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore RAG rows during recreated web file rollback: "
-                "file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            file_compensation()
-            file_succeeded = True
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore file during recreated web file rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        try:
-            status_cb = status_compensation(ingestion_result)
-            status_cb()
-        except Exception as exc:  # noqa: BLE001
-            if rollback_error is None:
-                rollback_error = exc
-            logger.warning(
-                "Failed to restore ingestion runs during recreated web file "
-                "rollback: file_id=%s, error=%s",
-                file_record_id,
-                exc,
-                exc_info=True,
-            )
-        if rollback_error is None and file_succeeded:
-            try:
-                snapshot_compensation()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to cleanup backup file during recreated web file "
-                    "rollback: file_id=%s, error=%s",
-                    file_record_id,
-                    exc,
-                    exc_info=True,
-                )
-        if rollback_error is not None:
-            raise rollback_error
-
     def _commit_recreate() -> None:
         if backup_for_failure is not None:
             backup_for_failure.unlink(missing_ok=True)
@@ -3130,7 +2939,6 @@ def _recreate_missing_existing_file(
     return FileHandlerResult(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
-        rollback_on_failure=_rollback_recreate,
         commit_on_success=_commit_recreate,
         file_compensation=file_compensation,
         document_compensation=document_compensation,

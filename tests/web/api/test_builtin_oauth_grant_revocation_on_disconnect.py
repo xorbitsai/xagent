@@ -433,6 +433,34 @@ async def test_delete_connected_account_skips_revocation_with_a_live_sibling(
     delete.assert_not_called()
 
 
+async def test_delete_connected_account_ignores_token_cleared_sibling_reference(
+    db, monkeypatch
+):
+    """A reconnect tombstone is identity history, not a live grant reference."""
+    from xagent.web.api.cloud_storage import delete_connected_account
+
+    user, account = _seed_bare_github_account(db)
+    other_user = User(username="tombstone-owner", password_hash="h", is_admin=False)
+    db.add(other_user)
+    db.flush()
+    tombstone = UserOAuth(
+        user_id=int(other_user.id),
+        provider="github",
+        provider_user_id="42",
+        access_token="",
+    )
+    db.add(tombstone)
+    db.commit()
+
+    delete = Mock(return_value=MockResponse())
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    await delete_connected_account(int(account.id), db=db, user=user)
+
+    assert db.get(UserOAuth, int(tombstone.id)) is not None
+    _assert_github_grant_was_revoked(delete)
+
+
 async def test_delete_connected_account_survives_a_revoke_failure(db, monkeypatch):
     from xagent.web.api.cloud_storage import delete_connected_account
 

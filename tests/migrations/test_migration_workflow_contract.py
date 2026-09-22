@@ -93,6 +93,13 @@ def test_oauth_lifecycle_changes_run_real_postgresql_fence_tests(
         "src/xagent/core/workspace.py",
         "src/xagent/web/models/task_channel_delivery.py",
         "src/xagent/web/services/channel_input_acceptance.py",
+        "src/xagent/web/services/channel_delivery.py",
+        "src/xagent/web/services/channel_progress.py",
+        "src/xagent/web/services/task_event_bridge.py",
+        "tests/web/services/test_channel_progress.py",
+        "tests/web/services/channel_delivery_shared.py",
+        "tests/web/services/test_channel_delivery.py",
+        "tests/web/services/test_task_event_bridge.py",
         "src/xagent/web/services/channel_runtime.py",
         "src/xagent/web/services/shared_channel_execution.py",
         "tests/web/services/test_channel_input_acceptance.py",
@@ -111,3 +118,13 @@ def test_channel_acceptance_changes_run_postgresql_regressions(source_path):
     assert step["if"] == "needs.detect-migration-changes.outputs.should-test == 'true'"
     assert "-m postgresql" in step["run"]
     assert "XAGENT_TEST_POSTGRES_URL" in step["env"]
+
+
+def test_channel_progress_is_in_postgresql_test_command():
+    workflow = yaml.safe_load(_workflow_text())
+    runs = "\n".join(
+        step.get("run", "")
+        for step in workflow["jobs"]["test-postgresql-migrations"]["steps"]
+    )
+    assert "tests/web/services/test_channel_progress.py" in runs
+    assert "tests/web/services/test_channel_delivery.py" in runs

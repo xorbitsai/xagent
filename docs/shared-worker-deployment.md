@@ -238,13 +238,62 @@ must already be durably staged; acceptance binds their metadata atomically, whil
 callers remain responsible for compensating unreferenced staged objects after failure.
 
 When a commit acknowledgement is lost, the service first checks whether this
-attempt's receipt and command were committed. Confirming that outcome does not
-re-authorize the already accepted request against later channel configuration.
+attempt's receipt and command were committed. For a batch, recovery checks only
+the primary input receipt and its command identity, relying on atomic acceptance;
+it does not scan all secondary receipts for competing acceptances. Confirming
+that outcome does not re-authorize the already accepted request against later channel configuration.
 Replaying a competing request still requires current authorization. Only receipt
 primary-key conflicts trigger repartition; unrelated integrity failures propagate.
 `ChannelInputBatchChanged` is a retry signal for the caller's partition loop, not a
 user-facing `TaskTurnError`.
 
 This foundation does not yet switch Slack, Feishu, or Telegram to receipt-based
-input acceptance. Existing channel paths remain active; provider integration and
-progress observation are separate follow-up changes.
+input acceptance. Existing channel paths remain active; provider integration
+remains a separate follow-up change.
+
+
+### Accepted channel command observation and progress
+
+An accepted input can construct a `SharedChannelTurn` using `as_turn()` and call
+`observe()` to attach a reply route and wait for the existing command. Observation
+does not create another START, transcript message, or receipt. The existing
+`execute()` entry point continues to accept new work and uses the same result wait.
+The caller closes the observer to release its local event route. Reply timeout
+returns the accepted/pending result; final delivery can recover independently.
+
+`DurableChannelProgress` is an explicit sender, not a trace handler. Channel
+handlers filter, aggregate and rate-limit trace events before calling `send()`,
+so ignored events do not acquire a delivery claim. This does not reduce worker
+trace routing or Redis traffic. Final delivery remains independent of filtering.
+
+It sends progress and final replies through the existing
+delivery claim. Progress callbacks update `delivery.destination` with platform
+loading-message identifiers; settlement persists them under the claim token so
+later observers and final recovery reuse that destination. An active claim blocks
+both kinds of send. Successful progress releases the claim without a poll delay,
+allowing an ordinary final send or recovery to run immediately. Pending notices
+and result polling retain their existing delay. Progress can bypass a pending
+poll delay when no send has failed, but respects failed-send backoff. Progress-send failures defer further
+sends without consuming the final reply retry budget; final-send failures retain
+the bounded retry budget. Platform sends remain at least once
+when acknowledgement or destination persistence is uncertain.
+
+Worker progress forwarding runs outside the agent's trace dispatch wait. Each
+execution allows one in-flight send and up to 128 queued events. Events are sent
+in order; a full queue applies backpressure instead of dropping healthy progress.
+Connection failures discard the queued backlog and retain the retry policy below.
+Normal execution drains progress for up to five seconds before committing its
+final result, then cancels any remaining send. Cancellation or execution errors
+abort forwarding immediately. Cleanup drains the owned send in all cases.
+Final results keep their independent durable delivery path.
+
+Worker progress retries connection failures on subsequent trace events with an
+exponential delay from one to thirty seconds, reset after successful delivery.
+This includes missing or closed routes, dead ingress hosts and lost acknowledgements,
+so replacement observers can resume progress. Already emitted progress is not
+replayed. Non-connection errors still disable the progress forwarder.
+
+Commit recovery counts an observed competing receipt before checking current
+authorization. A competing batch requests repartition immediately, consistently
+with receipt conflicts during flush; the next lookup must still authorize the
+caller. Single-message replay also retains its authorization checks.

@@ -85,6 +85,16 @@ class AcceptedChannelInput:
     replayed: bool
     selection: SelectedChannelTask
 
+    def as_turn(self) -> SharedChannelTurn:
+        return SharedChannelTurn(
+            self.selection,
+            workspace=None,
+            run_id=self.run_id,
+            command_id=self.command_id,
+            accepted=True,
+            command_db_id=self.command_db_id,
+        )
+
 
 def _replay(
     db: Session, receipt: TaskInputReceipt, incoming: ChannelInput, owner_id: int
@@ -359,8 +369,6 @@ def accept_channel_input(
                     and command.command_id == turn.command_id
                 )
                 if not own_commit:
-                    # Another attempt won; confirming our commit grants no replay authority.
-                    current_owner_id, _ = _identity(check, incoming)
                     logger.warning(
                         "Channel input recovery found competing acceptance command_db_id=%s",
                         saved.command_db_id,
@@ -368,6 +376,8 @@ def accept_channel_input(
                     increment_counter("xagent.channel.acceptance.competing_commit")
                     if additional_inputs:
                         raise ChannelInputBatchChanged() from error
+                    # A competing receipt grants no replay authority.
+                    current_owner_id, _ = _identity(check, incoming)
                     return _replay(check, saved, incoming, current_owner_id)
                 # Confirm our durable acceptance without converting later channel
                 # changes into a rejection. Keep the original selection/result.

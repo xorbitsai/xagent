@@ -2672,6 +2672,17 @@ async def execute_resume_background(
             assert lease_stop_event is not None
             assert lease_heartbeat_task is not None
 
+        # The resumed agent may have been rebuilt from history with no
+        # outbound message handler, in which case the runtime drops the
+        # next question with only a warning (#1328). Install the
+        # task-scoped handler before anything below can build or run the
+        # agent's runner; re-setting an equivalent handler on a caller
+        # that already installed one is harmless.
+        if hasattr(agent_service, "set_outbound_message_handler"):
+            agent_service.set_outbound_message_handler(
+                make_agent_outbound_handler(task_id)
+            )
+
         # The task row can become RUNNING before the original AgentRunner has
         # created a context/checkpoint. Retry an early failed injection only
         # after that original execution has settled and persisted its state.

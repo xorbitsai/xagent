@@ -77,6 +77,17 @@ async def test_cloud_account_listing_contains_only_ordinary_rows(oauth_rows) -> 
 
 
 @pytest.mark.asyncio
+async def test_cloud_account_listing_hides_reconnect_tombstones(oauth_rows) -> None:
+    db, user, ordinary, _actor, _actor_gmail = oauth_rows
+    ordinary.access_token = ""
+    db.commit()
+
+    accounts = await list_connected_accounts(provider=None, db=db, user=user)
+
+    assert accounts == []
+
+
+@pytest.mark.asyncio
 async def test_cloud_account_delete_cannot_address_an_actor_row(oauth_rows) -> None:
     db, user, _ordinary, actor, _actor_gmail = oauth_rows
 
@@ -96,6 +107,20 @@ def test_cloud_credentials_cannot_select_an_actor_row_by_id(oauth_rows) -> None:
     assert exc_info.value.status_code == 404
 
 
+def test_cloud_credentials_require_reconnect_for_a_token_cleared_row(
+    oauth_rows,
+) -> None:
+    db, user, ordinary, _actor, _actor_gmail = oauth_rows
+    ordinary.access_token = ""
+    db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        get_google_credentials(int(user.id), db, int(ordinary.id))
+
+    assert exc_info.value.status_code == 401
+    assert "reconnect" in str(exc_info.value.detail).lower()
+
+
 def test_gmail_watch_provisioning_rejects_an_actor_row(oauth_rows) -> None:
     db, _user, _ordinary, _actor, actor_gmail = oauth_rows
 
@@ -108,6 +133,31 @@ def test_gmail_watch_provisioning_rejects_a_non_gmail_row(oauth_rows) -> None:
 
     with pytest.raises(GmailProvisioningError, match="ordinary Gmail account"):
         ensure_gmail_mailbox_provisioned(db, ordinary)
+
+
+def test_gmail_consumers_require_reconnect_for_a_token_cleared_row(
+    oauth_rows,
+) -> None:
+    db, user, _ordinary, _actor, _actor_gmail = oauth_rows
+    tombstone = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        email="stale@gmail.example",
+        access_token="",
+    )
+    db.add(tombstone)
+    db.commit()
+    db.refresh(tombstone)
+
+    with pytest.raises(GmailProvisioningError, match="reconnect required"):
+        ensure_gmail_mailbox_provisioned(db, tombstone)
+
+    with pytest.raises(TriggerServiceError, match="reconnect required"):
+        _resolve_gmail_resource(
+            db,
+            user_id=int(user.id),
+            oauth_account_id=int(tombstone.id),
+        )
 
 
 def test_gmail_trigger_binding_rejects_an_actor_row(oauth_rows) -> None:

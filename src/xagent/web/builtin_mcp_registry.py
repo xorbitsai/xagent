@@ -1064,6 +1064,81 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "atlassian",
+            "name": "Atlassian (Jira, Confluence, Bitbucket)",
+            "description": "Connect to Atlassian to search and work with Jira issues, Confluence pages and Bitbucket repositories through Atlassian's hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=atlassian.com&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth), same shape as Granola/Notion: Atlassian
+            # hosts the server (github.com/atlassian/atlassian-mcp-server) and
+            # exposes Jira, Confluence and Bitbucket Cloud tools; there is no
+            # local module to launch. Users connect via POST
+            # /api/mcp/apps/{id}/oauth/connect (per-user OAuth 2.1
+            # Authorization Code + PKCE); the authorization server advertises
+            # a registration_endpoint, so Dynamic Client Registration is used
+            # and no static client credentials are required. /v2/mcp is the
+            # vendor's current endpoint — the legacy /v1/sse endpoint is
+            # unsupported after 2026-06-30. This row sits alongside the
+            # separate "jira" row (our own local Jira tool launched behind
+            # Atlassian 3LO, transport "oauth"); both are visible in the
+            # connector picker because they expose different tool sets.
+            "launch_config": {
+                "url": "https://mcp.atlassian.com/v2/mcp",
+                "auth": {"type": "mcp_oauth"},
+                # Stable ownership marker used by the seed migration
+                # (whatsapp/shopify pattern): a pre-existing operator row
+                # under this app_id is neither adopted on upgrade nor
+                # deleted on downgrade. The connect path copies only
+                # url/auth onto the shared server row, so this key never
+                # reaches the runtime connection.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "atlassian",
+                    "version": 1,
+                },
+            },
+        },
+        {
+            "app_id": "miro",
+            "name": "Miro",
+            "description": "Connect to Miro to find boards and read, create and update board content through Miro's hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=miro.com&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth), same shape as Granola/Notion: Miro hosts
+            # the server itself and exposes its own board tools; there is no
+            # local module to launch. The MCP endpoint is the host root — the
+            # protected-resource metadata names "https://mcp.miro.com/" as
+            # the resource and as its own authorization server. Users connect
+            # via POST /api/mcp/apps/{id}/oauth/connect (per-user OAuth 2.1
+            # Authorization Code + PKCE); Miro advertises a
+            # registration_endpoint, so Dynamic Client Registration is used
+            # and no static client credentials are required. Miro's
+            # oauth-authorization-server document advertises only
+            # client_secret_* token auth methods (its openid-configuration
+            # lists "none"), but a DCR request with
+            # token_endpoint_auth_method="none" was verified on 2026-09-20 to
+            # return 201 with a public client, which is the shape our
+            # register_mcp_oauth_public_client requires.
+            "launch_config": {
+                "url": "https://mcp.miro.com/",
+                "auth": {"type": "mcp_oauth"},
+                # Same ownership marker as the atlassian row above.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "miro",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "aws",
             "name": "AWS",
             "description": "Connect to AWS to check CloudWatch alarms/metrics/logs, DynamoDB health, and SQS queue depth.",

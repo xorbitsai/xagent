@@ -722,7 +722,7 @@ def test_failed_commit_recovery_distinguishes_other_writer(
         recovered = accept(incoming)
         assert recovered.replayed
         assert recovered.command_id == results[0].command_id
-    if winner and not revoke:
+    if winner:
         counter.assert_called_once_with("xagent.channel.acceptance.competing_commit")
         assert "Channel input recovery found competing acceptance" in caplog.text
     else:
@@ -1057,3 +1057,112 @@ def test_receipts_are_inserted_in_identity_order(ingress):
     finally:
         event.remove(engine, "before_cursor_execute", observe)
     assert inserted == sorted(key for key, _ in keyed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_observe_existing_command_without_new_acceptance(
+    ingress, monkeypatch, terminal
+):
+    from unittest.mock import AsyncMock
+
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.services import shared_channel_execution as shared
+
+    incoming, sessions = ingress
+    saved = accept(incoming)
+    monkeypatch.setattr(shared, "get_session_local", lambda: sessions)
+    notify = Mock()
+    monkeypatch.setattr(shared, "notify_task_command_dispatcher", notify)
+    monkeypatch.setattr(shared, "get_task_reply_wait_timeout_seconds", lambda: 0)
+    bridge = Mock(host_id="observer-host")
+    bridge.register_origin.return_value = "observer-origin"
+    monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
+    monkeypatch.setattr(
+        shared,
+        "_accept_channel_turn",
+        Mock(side_effect=AssertionError("must not accept")),
+    )
+    if terminal:
+        with sessions() as db:
+            command = db.get(TaskExecutionCommand, saved.command_db_id)
+            command.status = "completed"
+            command.result = {
+                "channel_result": {"status": "completed", "output": "answer"}
+            }
+            db.get(Task, saved.task_id).run_id = saved.run_id
+            db.commit()
+    observer = saved.as_turn()
+    handler = AsyncMock()
+    try:
+        result = await observer.observe(handler)
+        assert result["status"] == ("completed" if terminal else "accepted")
+        receive = bridge.register_origin.call_args.args[2]
+        trace = {
+            "id": "trace-id",
+            "scope": "task",
+            "action": "update",
+            "category": "general",
+            "task_id": str(saved.task_id),
+            "timestamp": "2026-09-21T00:00:00Z",
+            "data": {"message": "working"},
+        }
+        await receive({"type": "channel_trace", "run_id": "other-run", "trace": trace})
+        handler.handle_event.assert_not_awaited()
+        await receive({"type": "channel_trace", "run_id": saved.run_id, "trace": trace})
+        handler.handle_event.assert_awaited_once()
+        assert handler.handle_event.await_args.args[0].id == "trace-id"
+        notify.assert_called_once()
+        with sessions() as db:
+            command = db.query(TaskExecutionCommand).one()
+            assert command.command_id == saved.command_id
+            assert command.reply_host_id == "observer-host"
+            assert command.reply_origin == "observer-origin"
+            assert db.query(TaskChatMessage).count() == 1
+            assert db.query(TaskInputReceipt).count() == 1
+    finally:
+        await observer.close()
+    bridge.discard_origin.assert_called_once_with("observer-origin")
+
+
+def test_competing_batch_repartitions_before_revocation_is_checked(
+    ingress, monkeypatch, caplog
+):
+    from sqlalchemy.orm import Session
+
+    from xagent.web.services.channel_runtime import ChannelAuthorizationError
+
+    incoming, sessions = ingress
+    commit = Session.commit
+    counter = Mock()
+    monkeypatch.setattr(inputs, "increment_counter", counter)
+    failure = ConnectionError("commit did not land")
+
+    def fail_commit(db):
+        if not any(isinstance(row, TaskInputReceipt) for row in db.dirty):
+            return commit(db)
+        db.rollback()
+        monkeypatch.setattr(Session, "commit", commit)
+        accept(incoming)
+        with sessions() as other:
+            other.get(UserChannel, incoming.channel_id).config = {
+                "allowed_users": ["someone-else"]
+            }
+            commit(other)
+        raise failure
+
+    monkeypatch.setattr(Session, "commit", fail_commit)
+    batch = (incoming, replace(incoming, message_id="new"))
+    with pytest.raises(inputs.ChannelInputBatchChanged) as error:
+        accept(batch[0], additional_inputs=batch[1:])
+    assert error.value.__cause__ is failure
+    counter.assert_called_once_with("xagent.channel.acceptance.competing_commit")
+    assert "competing acceptance" in caplog.text
+    with pytest.raises(ChannelAuthorizationError):
+        inputs.lookup_channel_inputs(batch)
+    with sessions() as db:
+        assert (
+            db.query(TaskInputReceipt).count()
+            == db.query(TaskExecutionCommand).count()
+            == 1
+        )

@@ -3,7 +3,7 @@
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1497,3 +1497,62 @@ class TestCrawlStopReasonDrivesStatus:
         )
 
         assert result.status == "success"
+
+
+class TestLegacyPersistentFileCompensationGuard:
+    """The legacy persistent-file cleanup must not touch a file whose fate the
+    file_handler already owns through boundary compensation."""
+
+    @staticmethod
+    def _run(tmp_path: Path, file_info: Optional[dict]) -> tuple[MagicMock, Path]:
+        from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
+            _run_legacy_persistent_file_compensation,
+        )
+
+        persistent = tmp_path / "page.md"
+        persistent.write_text("keep me", encoding="utf-8")
+        facade = MagicMock()
+        # Explicit: an unconfigured MagicMock is truthy and would read as
+        # "compensation failed", steering the callee down the error branch.
+        facade.compensate_web_page_file_side_effect.return_value = []
+        _run_legacy_persistent_file_compensation(
+            pipeline_facade=facade,
+            page_operation=None,
+            collection="col",
+            url="https://example.com/page",
+            copied_persistent_file=persistent,
+            file_info=file_info,  # type: ignore[arg-type]
+            warnings=[],
+        )
+        return facade, persistent
+
+    def test_per_boundary_compensation_spares_the_persistent_file(self, tmp_path):
+        """A reused existing web file would otherwise be unlinked on rollback."""
+        facade, _ = self._run(
+            tmp_path,
+            {
+                "file_path": "page.md",
+                "file_id": "file-1",
+                "document_compensation": lambda result=None: (lambda: None),
+                "status_compensation": lambda result=None: (lambda: None),
+            },
+        )
+
+        facade.record_web_page_file_side_effect.assert_not_called()
+
+    def test_unmanaged_persistent_file_is_still_registered_for_cleanup(self, tmp_path):
+        """Counter-case: with no declared compensation the cleanup is registered."""
+        facade, persistent = self._run(
+            tmp_path, {"file_path": "page.md", "file_id": "file-1"}
+        )
+
+        facade.record_web_page_file_side_effect.assert_called_once_with(
+            None,
+            collection="col",
+            url="https://example.com/page",
+            file_path=str(persistent),
+            file_id="file-1",
+            reason="legacy_persistent_file",
+            extra_payload={"rollback_kind": "legacy_persistent_file"},
+            compensation=ANY,
+        )

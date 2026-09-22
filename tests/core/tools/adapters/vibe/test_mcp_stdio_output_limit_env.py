@@ -10,13 +10,20 @@ disagree -- and when the parent's budget is smaller, its blind slice can cut
 the child's already-valid JSON mid-structure.
 
 ``create_mcp_tools`` closes this by mirroring the parent's own effective
-budget into every stdio config's env before tools are built from it, so
-both sides always agree regardless of which env var / config override
-produced the parent's number -- except for a server that bypasses the
-generic MCP loader for its own actor/execution-scoped session consumer
-(e.g. chrome-devtools), which fail-closes on any env key it didn't itself
-put there: injecting into that config would take the connector down
-instead of fixing its output budget, so those servers are exempted.
+budget into every stdio config's env before tools are built from it. The
+parent's own filter (``ToolFactory._apply_output_filters``) computes its
+budget once from ``config.get_max_output_length()`` and applies it
+uniformly to every tool -- there is no per-server override on the parent
+side -- so a pre-existing per-server env value is always OVERWRITTEN, never
+preserved: keeping a larger existing value would still let the parent's
+blind slice cut a child response sized to a budget the parent itself has
+no way to honor, exactly reproducing the bug this mechanism exists to fix.
+
+The one exception is a server that bypasses the generic MCP loader for its
+own actor/execution-scoped session consumer (e.g. chrome-devtools), which
+fail-closes on any env key it didn't itself put there: injecting into that
+config would take the connector down instead of fixing its output budget,
+so those servers are exempted.
 
 Only ``XAGENT_TOOL_MAX_OUTPUT_LENGTH`` is mirrored: no builtin connector
 reads a field-count/recursion-depth env var, so mirroring those would only
@@ -107,11 +114,10 @@ async def test_stdio_configs_receive_the_parents_effective_output_limit(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_existing_numeric_stdio_env_entries_are_preserved(monkeypatch):
+async def test_other_env_entries_survive_untouched(monkeypatch):
     """Credentials and caller-id env already placed on the config (e.g. by
-    the actor-owned/team-owned loaders) must survive untouched, and an
-    already-present NUMERIC output-limit value on the config -- from some
-    future per-server override -- is never clobbered."""
+    the actor-owned/team-owned loaders) must survive untouched -- only the
+    output-limit key itself is ever touched."""
     captured: dict = {}
     _capture_create(monkeypatch, captured)
 
@@ -123,10 +129,7 @@ async def test_existing_numeric_stdio_env_entries_are_preserved(monkeypatch):
                 "config": {
                     "command": "python",
                     "args": [],
-                    "env": {
-                        "XAGENT_MCP_CALLER_ID": "user-1",
-                        TOOL_MAX_OUTPUT_LENGTH: "4096",
-                    },
+                    "env": {"XAGENT_MCP_CALLER_ID": "user-1"},
                 },
             }
         ]
@@ -136,70 +139,56 @@ async def test_existing_numeric_stdio_env_entries_are_preserved(monkeypatch):
     (cfg,) = captured["mcp_configs"]
     env = cfg["config"]["env"]
     assert env["XAGENT_MCP_CALLER_ID"] == "user-1"
-    assert env[TOOL_MAX_OUTPUT_LENGTH] == "4096"
-
-
-@pytest.mark.asyncio
-async def test_existing_int_env_value_is_coerced_to_str(monkeypatch):
-    """A pre-existing value that is numerically valid but not itself a
-    string (e.g. a real int, as opposed to its string form) must still come
-    out as a string: a subprocess env must be all-str."""
-    captured: dict = {}
-    _capture_create(monkeypatch, captured)
-
-    config = _FakeConfig(
-        [
-            {
-                "name": "jira",
-                "transport": "stdio",
-                "config": {
-                    "command": "python",
-                    "args": [],
-                    "env": {TOOL_MAX_OUTPUT_LENGTH: 4096},
-                },
-            }
-        ]
-    )
-    await create_mcp_tools(config)
-
-    (cfg,) = captured["mcp_configs"]
-    env = cfg["config"]["env"]
-    assert env[TOOL_MAX_OUTPUT_LENGTH] == "4096"
-    assert isinstance(env[TOOL_MAX_OUTPUT_LENGTH], str)
+    assert env[TOOL_MAX_OUTPUT_LENGTH] == "12345"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "existing",
     [
-        "not-a-number",  # non-numeric string
-        3.7,  # float: int(existing) truncating it would be a different bug
-        "3.7",  # string form of a float
-        True,  # bool is an int subclass but not an intended override
+        "4096",  # a SMALLER numeric string -- harmless on its own, but the
+        4096,  # parent has no way to honor a per-server value either way
+        400,  # LARGER than the parent's effective budget: the actual bug
+        "400",  # this round fixes -- a valid, larger child budget must not
+        # survive, or the parent's blind slice (which knows only its own,
+        # smaller budget) still corrupts a response sized to this one.
+        True,
         False,
-        0,  # zero: parses fine but would cap every response at ~empty
+        3.7,
+        "3.7",
+        0,
         "0",
-        -5,  # negative: same failure mode as zero
+        -5,
         "-5",
+        "not-a-number",
     ],
     ids=[
-        "non-numeric-str",
-        "float",
-        "str-float",
+        "smaller-str",
+        "smaller-int",
+        "larger-int",
+        "larger-str",
         "bool-true",
         "bool-false",
+        "float",
+        "str-float",
         "zero-int",
         "zero-str",
         "negative-int",
         "negative-str",
+        "non-numeric-str",
     ],
 )
-async def test_invalid_stdio_env_override_is_replaced_and_warned(
+async def test_any_existing_output_limit_override_is_overwritten_and_warned(
     monkeypatch, caplog, existing
 ):
-    """Every value the real child-side getter (``int(env_str)``, with no
-    positivity check) would either reject outright or accept but misuse
-    must be replaced here instead of preserved, and the replacement logged."""
+    """The parent's own filter (``ToolFactory._apply_output_filters``) has
+    no per-server override of its own -- it always uses
+    ``config.get_max_output_length()`` -- so ANY pre-existing per-server
+    value, valid or not, smaller or larger, must be overwritten with that
+    same effective value rather than preserved. Preserving a larger one
+    would leave the child able to produce a response the parent's blind
+    slice still cuts mid-structure, exactly reproducing the bug this
+    mechanism exists to fix."""
     captured: dict = {}
     _capture_create(monkeypatch, captured)
 
@@ -222,7 +211,37 @@ async def test_invalid_stdio_env_override_is_replaced_and_warned(
     (cfg,) = captured["mcp_configs"]
     env = cfg["config"]["env"]
     assert env[TOOL_MAX_OUTPUT_LENGTH] == "12345"
-    assert any("invalid" in r.message for r in caplog.records)
+    assert any("has no way to honor" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_existing_override_already_matching_is_not_re_warned(monkeypatch, caplog):
+    """An existing value that already equals the parent's effective budget
+    (e.g. this function ran once already, or the value was set to match on
+    purpose) is still normalized in place, but doesn't spam a warning on
+    every call -- only an actual mismatch is worth flagging."""
+    captured: dict = {}
+    _capture_create(monkeypatch, captured)
+
+    config = _FakeConfig(
+        [
+            {
+                "name": "jira",
+                "transport": "stdio",
+                "config": {
+                    "command": "python",
+                    "args": [],
+                    "env": {TOOL_MAX_OUTPUT_LENGTH: "12345"},
+                },
+            }
+        ]
+    )
+    with caplog.at_level(logging.WARNING):
+        await create_mcp_tools(config)
+
+    (cfg,) = captured["mcp_configs"]
+    assert cfg["config"]["env"][TOOL_MAX_OUTPUT_LENGTH] == "12345"
+    assert not any("has no way to honor" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -421,34 +440,52 @@ def test_input_configs_are_never_mutated_in_place():
     assert result_a[0]["config"] is not original_inner
 
 
+def _child_bounded_json(budget: int) -> str:
+    """Build a valid JSON string no longer than ``budget``, the way a real
+    connector's own capping logic (e.g. ``success_with_capped_dict``)
+    would: add items until the next one would exceed the budget, never by
+    slicing a larger string mid-structure. A naive ``payload[:budget]``
+    slice is exactly the failure mode this whole mechanism exists to
+    prevent, so it must not also be how these tests build a "child"
+    output -- that would prove nothing about JSON validity either way."""
+    items: list[str] = []
+    while True:
+        candidate = json.dumps({"issues": [*items, f"issue-{len(items)}"]})
+        if len(candidate) > budget:
+            break
+        items.append(f"issue-{len(items)}")
+    return json.dumps({"issues": items})
+
+
 def test_mismatched_budget_corrupts_json_but_mirrored_budget_does_not():
     """Differential regression for the bug this PR fixes.
 
-    Before the fix, the child sizes its own output against whatever budget
-    IT reads from its own environment (simulated here as a distinct value
-    the parent never told it about), and the parent's own
-    ``OutputValueFilter`` -- which knows only ITS budget -- blindly slices
-    that already-valid JSON at a different boundary, corrupting it.
+    Before the fix, the child sizes its own bounded, valid-JSON output
+    against whatever budget IT reads from its own environment (simulated
+    here as a distinct value the parent never told it about), and the
+    parent's own ``OutputValueFilter`` -- which knows only ITS budget --
+    blindly slices that already-valid JSON at a different boundary,
+    corrupting it.
 
     After the fix, ``_apply_stdio_output_limit_env`` (the real production
     function, not a stand-in) is what determines what the child would
     read: a child sized to that mirrored value and a parent filtering with
-    the same budget never disagree, so the filter never touches it.
+    the same budget never disagree, so the filter never touches it and the
+    result stays valid JSON.
     """
     parent_budget = 120
     unmirrored_child_budget = 400  # what the child would use without this PR
 
-    payload = json.dumps({"issues": [f"issue-{i}" for i in range(50)]})
-    assert len(payload) > unmirrored_child_budget > parent_budget
-
     # Before: the child's own budget has nothing to do with the parent's.
-    child_output_before = payload[:unmirrored_child_budget]
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(child_output_before[:parent_budget])
+    # It builds a valid, larger response the parent was never told about.
+    child_output_before = _child_bounded_json(unmirrored_child_budget)
+    assert len(child_output_before) > parent_budget
     filtered_before = OutputValueFilter(
         max_chars=parent_budget, max_fields=1000, max_recursion=10
     ).filter(child_output_before, tool_name="jira")
     assert filtered_before != child_output_before  # the filter cut it
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(filtered_before.split("\n\n[OUTPUT TRUNCATED")[0])
 
     # After: the mirrored value IS the parent's own budget.
     config = _FakeConfig([], max_output_length=parent_budget)
@@ -465,8 +502,57 @@ def test_mismatched_budget_corrupts_json_but_mirrored_budget_does_not():
     mirrored_budget = int(cfg["config"]["env"][TOOL_MAX_OUTPUT_LENGTH])
     assert mirrored_budget == parent_budget
 
-    child_output_after = payload[:mirrored_budget]
+    child_output_after = _child_bounded_json(mirrored_budget)
     filtered_after = OutputValueFilter(
         max_chars=parent_budget, max_fields=1000, max_recursion=10
     ).filter(child_output_after, tool_name="jira")
     assert filtered_after == child_output_after
+    json.loads(filtered_after)  # still valid JSON, not just unchanged
+
+
+def test_preexisting_larger_override_would_have_corrupted_json_before_the_overwrite():
+    """The exact scenario a reviewer flagged: a config's own env already
+    carries a larger, individually-valid output-limit override (e.g. an
+    operator- or API-set per-server value) than the parent's effective
+    budget. Before this fix preserved such a value; now it's overwritten,
+    closing the same JSON-corruption path the rest of this mechanism
+    guards against."""
+    parent_budget = 120
+    preexisting_child_override = 400  # valid on its own, but larger
+
+    config = _FakeConfig([], max_output_length=parent_budget)
+    (cfg,) = _apply_stdio_output_limit_env(
+        [
+            {
+                "name": "jira",
+                "transport": "stdio",
+                "config": {
+                    "command": "x",
+                    "args": [],
+                    "env": {TOOL_MAX_OUTPUT_LENGTH: preexisting_child_override},
+                },
+            }
+        ],
+        config,
+    )
+    mirrored_budget = int(cfg["config"]["env"][TOOL_MAX_OUTPUT_LENGTH])
+    assert mirrored_budget == parent_budget  # not the preexisting 400
+
+    # A child that had instead honored its own preexisting override would
+    # have produced a valid, larger response the parent's filter still
+    # corrupts.
+    would_be_child_output = _child_bounded_json(preexisting_child_override)
+    assert len(would_be_child_output) > parent_budget
+    filtered = OutputValueFilter(
+        max_chars=parent_budget, max_fields=1000, max_recursion=10
+    ).filter(would_be_child_output, tool_name="jira")
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(filtered.split("\n\n[OUTPUT TRUNCATED")[0])
+
+    # With the overwritten (mirrored) budget instead, no corruption.
+    actual_child_output = _child_bounded_json(mirrored_budget)
+    filtered = OutputValueFilter(
+        max_chars=parent_budget, max_fields=1000, max_recursion=10
+    ).filter(actual_child_output, tool_name="jira")
+    assert filtered == actual_child_output
+    json.loads(filtered)  # doesn't raise

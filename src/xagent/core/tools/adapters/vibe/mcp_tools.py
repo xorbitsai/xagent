@@ -34,51 +34,6 @@ def _stable_server_names(values: Any) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _setdefault_numeric_env(
-    env: dict[str, Any], key: str, value: int, *, server_name: Any
-) -> None:
-    """Set ``env[key]`` to ``value`` unless it already holds a valid,
-    positive integer.
-
-    The real child-side getter (``xagent.config.get_tool_max_output_length``)
-    does a plain ``int(env_str)`` and only special-cases an empty/falsy
-    string, so a value it would mishandle must be rejected here too rather
-    than passed through:
-
-    - non-numeric (a string that doesn't parse, or anything that isn't
-      ``str``/``int`` to begin with, e.g. a ``float``) would make the child
-      raise and silently fall back to its own default -- reintroducing the
-      exact budget divergence this mirroring exists to prevent.
-    - zero or negative parses fine on the child's side but caps every
-      response at (or below) an empty budget, since a real payload's length
-      is never <= 0.
-
-    ``bool`` is deliberately excluded even though it is an ``int``
-    subclass: ``True``/``False`` are not intended numeric overrides.
-    """
-    existing = env.get(key)
-    if existing is not None:
-        parsed: int | None = None
-        if isinstance(existing, str) or (
-            isinstance(existing, int) and not isinstance(existing, bool)
-        ):
-            try:
-                parsed = int(existing)
-            except (TypeError, ValueError):
-                parsed = None
-        if parsed is not None and parsed > 0:
-            env[key] = str(parsed)
-            return
-        logger.warning(
-            "Stdio MCP server %r had an invalid %s override (%r); "
-            "replacing it with the effective value",
-            server_name,
-            key,
-            existing,
-        )
-    env[key] = str(value)
-
-
 def _apply_stdio_output_limit_env(
     mcp_configs: list[dict[str, Any]],
     config: "BaseToolConfig",
@@ -95,9 +50,16 @@ def _apply_stdio_output_limit_env(
     with a minimal, explicitly-built env (credentials + caller id only)
     rather than inheriting this process's environment, so the two budgets
     can silently disagree and the wrapper's blind slice can then cut valid
-    JSON produced by the child mid-structure. Mirroring the value here keeps
-    both sides looking at the same effective number regardless of which env
-    var / config override produced it.
+    JSON produced by the child mid-structure.
+
+    ``_apply_output_filters`` (factory.py) computes ``max_chars`` once from
+    ``config.get_max_output_length()`` and applies it uniformly to every
+    tool -- there is no per-server override on the parent side. So a
+    pre-existing per-server value in a config's own env is *always*
+    overwritten here rather than preserved: keeping a value the parent
+    itself has no way to honor would defeat the whole point of mirroring
+    one, and would still let the parent's blind slice cut a child response
+    sized to a larger, unaligned budget.
 
     ``exempt_server_names`` must list every server that bypasses the
     generic MCP loader for its own actor/execution-scoped session consumer
@@ -111,6 +73,13 @@ def _apply_stdio_output_limit_env(
     onto and returns again on a later call within this request.
     """
     from .....config import TOOL_MAX_OUTPUT_LENGTH
+
+    # Lazy and computed at most once: some BaseToolConfig implementations
+    # used in practice (e.g. a fixture built for a non-stdio-only test)
+    # don't define get_max_output_length() at all, and the old, per-entry
+    # call site never reached it when there were no stdio entries to act
+    # on -- calling it unconditionally up front would call it even then.
+    effective_value: str | None = None
 
     result: list[dict[str, Any]] = []
     for cfg in mcp_configs:
@@ -134,13 +103,21 @@ def _apply_stdio_output_limit_env(
             )
             result.append(cfg)
             continue
+        if effective_value is None:
+            effective_value = str(config.get_max_output_length())
         env = dict(existing_env or {})
-        _setdefault_numeric_env(
-            env,
-            TOOL_MAX_OUTPUT_LENGTH,
-            config.get_max_output_length(),
-            server_name=server_name,
-        )
+        existing = env.get(TOOL_MAX_OUTPUT_LENGTH)
+        if existing is not None and str(existing) != effective_value:
+            logger.warning(
+                "Stdio MCP server %r had its own %s override (%r), which the "
+                "parent's own output filter has no way to honor; overwriting "
+                "it with the effective value (%s) to keep both sides aligned",
+                server_name,
+                TOOL_MAX_OUTPUT_LENGTH,
+                existing,
+                effective_value,
+            )
+        env[TOOL_MAX_OUTPUT_LENGTH] = effective_value
         result.append({**cfg, "config": {**inner_config, "env": env}})
     return result
 

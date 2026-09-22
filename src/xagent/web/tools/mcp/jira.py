@@ -10,6 +10,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
 from ....core.utils.security import redact_sensitive_text
+from ...utils.graphql_errors import truncate_error_text
 from .utils import (
     clamp_limit,
     clamp_offset,
@@ -31,10 +32,6 @@ ME_URL = "https://api.atlassian.com/me"
 JIRA_API_BASE = "https://api.atlassian.com/ex/jira"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
-# Matches zoom.py's convention: an error body that isn't the expected
-# {"errorMessages": [...]} shape (e.g. an HTML gateway error page) must not
-# be forwarded to the LLM/logs verbatim and unbounded.
-MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 # Jira endpoints are rate-limited; on a 429 with a small Retry-After we wait
 # once and retry rather than failing outright, mirroring the same bounded-
 # retry policy as the Slack/Intercom sibling modules.
@@ -89,15 +86,6 @@ def _clean_text_error(value: str, field_name: str, *, hint: str = "") -> str | N
     except ValueError as exc:
         return _error(f"{exc}{hint}")
     return None
-
-
-def _truncate(text: str, max_chars: int = MAX_ERROR_RESPONSE_TEXT_CHARS) -> str:
-    """Bound text to max_chars (MAX_ERROR_RESPONSE_TEXT_CHARS by default,
-    for error text), marking the cut.
-    """
-    if len(text) > max_chars:
-        return text[:max_chars] + "... [truncated]"
-    return text
 
 
 def _path_segment(value: str) -> str:
@@ -170,7 +158,7 @@ def _extract_error_detail(response: requests.Response) -> str | None:
         messages.extend(f"{field}: {msg}" for field, msg in field_errors.items())
     if not messages:
         return None
-    return _truncate("; ".join(messages))
+    return truncate_error_text("; ".join(messages))
 
 
 def _request_absolute(
@@ -205,7 +193,7 @@ def _request_absolute(
         message = str(exc)
         detail = _extract_error_detail(response)
         if detail is None:
-            detail = _truncate(response.text.strip())
+            detail = truncate_error_text(response.text.strip())
         if detail:
             message = f"{message} - {detail}"
         raise RuntimeError(message) from exc
@@ -236,7 +224,9 @@ def _resolve_cloud_id(cloud_id: str) -> str:
         raise ValueError("No accessible Jira sites found for this account")
     if len(sites) == 1:
         site_id = sites[0].get("id") if isinstance(sites[0], dict) else None
-        if not site_id:
+        # Presence, not truthiness: an id is opaque and never contractually
+        # excludes a falsy-but-valid value like 0 or "0".
+        if site_id is None:
             raise ValueError("The single accessible Jira site is missing a valid 'id'")
         return str(site_id)
     site_list = (
@@ -530,7 +520,7 @@ def _cap_text_field(payload: dict[str, Any], field: str, max_chars: int) -> bool
     """
     value = payload.get(field)
     if isinstance(value, str) and len(value) > max_chars:
-        payload[field] = _truncate(value, max_chars)
+        payload[field] = truncate_error_text(value, max_chars)
         return True
     return False
 
@@ -788,13 +778,13 @@ def _cap_extra_field_value(value: Any, max_chars: int) -> tuple[Any, bool]:
         value = _flatten_adf(value)
     if isinstance(value, str):
         if len(value) > max_chars:
-            return _truncate(value, max_chars), True
+            return truncate_error_text(value, max_chars), True
         return value, False
     if value is None:
         return None, False
     serialized = json.dumps(value, ensure_ascii=False)
     if len(serialized) > max_chars:
-        return _truncate(serialized, max_chars), True
+        return truncate_error_text(serialized, max_chars), True
     return value, False
 
 
@@ -1135,7 +1125,9 @@ def jira_transition_issue(
                 f"Available transitions: {available}"
             )
         transition_id = match.get("id")
-        if not transition_id:
+        # Presence, not truthiness: an id is opaque and never contractually
+        # excludes a falsy-but-valid value like 0 or "0".
+        if transition_id is None:
             return _error(
                 f"Matched transition '{transition_name}' is missing a valid 'id'"
             )
@@ -1329,11 +1321,18 @@ def _fit_comments_page(
         # A single comment doesn't fit even at _COMMENT_BODY_MAX_CHARS.
         # Retry the SAME comment (not a different one -- next_start_at_for
         # must stay anchored to this raw index either way) with a smaller
-        # body cap. Binary search is valid here because _truncate's slice
-        # is a prefix of the original body, and a longer prefix can only
-        # produce an equal or longer JSON-escaped output, never a shorter
-        # one -- so response length is monotonically non-decreasing in the
-        # cap.
+        # body cap. Binary search is safe here even though response length
+        # isn't STRICTLY monotonic in the cap: truncate_error_text's slice
+        # is a prefix of the original body, so length increases with the
+        # cap right up to cap == len(body) -- where the "... [truncated]"
+        # marker disappears entirely, briefly making the response SHORTER
+        # than at cap == len(body) - 1. That one dip can't make the search
+        # return an over-budget "best": every candidate is fit-checked
+        # directly before being recorded, and response length is constant
+        # (not decreasing) for every cap >= len(body), so the search's
+        # right-biased walk (lo = mid + 1 on a fit) still reaches the
+        # untruncated body whenever it fits, rather than getting stuck on
+        # a smaller, needlessly-truncated candidate.
         #
         # Flattening the ADF body is the expensive part of
         # _summarize_comment (a full tree walk), and is identical across
@@ -1405,22 +1404,25 @@ def jira_list_comments(
     still doesn't fit the tool output limit even after that, fewer
     comments than requested are returned (down to one) with
     next_start_at pointing at the first one left out, so pagination
-    stays valid. A single comment that still doesn't fit at that point
-    is shrunk further (a smaller body cap, same body_truncated signal)
-    rather than dropped -- next_start_at only ever skips past a comment
-    when not even an empty-bodied version of it fits in the configured
-    output limit at all.
+    stays valid. In this default (non-raw_fields) mode, a single
+    comment that still doesn't fit at that point is shrunk further (a
+    smaller body cap, same body_truncated signal) rather than dropped
+    -- next_start_at only ever skips past a comment when not even an
+    empty-bodied version of it fits in the configured output limit at
+    all. raw_fields mode has a lower bar for that skip -- see below.
     raw_fields: return each comment as Jira's own object (body as its
     original ADF rich-text structure, not flattened plain text; every
-    other field Jira returns, e.g. renderedBody) instead of the summary
-    above -- for an existing integration written against the raw shape
-    this tool returned before summarization was added. Pages still
-    shrink (down to one comment) to fit the output budget the same way
-    the summarized path does; a single raw comment that doesn't fit
-    even alone is not shrunk further (unlike the summarized path, its
-    body isn't a plain string _cap_text_field can trim), so that case
-    skips straight to the same empty-page fallback described above,
-    with no smaller-cap retry in between.
+    other field this endpoint returns by default) instead of the
+    summary above -- for an existing integration written against the
+    raw shape this tool returned before summarization was added. Pages
+    still shrink (down to one comment) to fit the output budget the
+    same way the summarized path does; a single raw comment that
+    doesn't fit even alone is not shrunk further (unlike the summarized
+    path, its body isn't a plain string _cap_text_field can trim), so
+    that case skips straight to the same empty-page fallback described
+    above as soon as the raw comment alone doesn't fit -- a lower bar
+    than the summarized path's "not even empty-bodied" threshold, since
+    there's no smaller-cap retry in between.
     """
     try:
         max_results = clamp_limit(limit, max_limit=MAX_LIMIT)

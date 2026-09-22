@@ -117,6 +117,46 @@ def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
 
+def _project_upload_item(result: Any) -> dict[str, Any]:
+    """Keep only the small, stable fields a caller needs to reference the
+    document a write just committed to.
+
+    The full Graph driveItem is unprojected and effectively unbounded --
+    its name, webUrl, parentReference, and identity facets can push a
+    committed write's response past the configured output cap, where the
+    outer raw-truncating output filter would mangle it into invalid JSON
+    after the write has already happened, leaving the caller unable to
+    tell success from failure.
+    """
+    if not isinstance(result, dict):
+        return {}
+    return {key: result[key] for key in ("id", "eTag", "name") if key in result}
+
+
+def _success_with_item(item: dict[str, Any], **payload: Any) -> str:
+    """Build a success envelope carrying an upload result, guaranteed to fit
+    the configured output cap.
+
+    item is already projected by _project_upload_item, but even that isn't
+    provably bounded (an unusually long id/name/eTag), so this degrades the
+    same way _error() does rather than ever relying on the outer filter to
+    shrink an already-committed write's response.
+    """
+    max_length = get_tool_max_output_length()
+    for projected in (
+        item,
+        {key: item[key] for key in ("id", "eTag") if key in item},
+        {key: item[key] for key in ("id",) if key in item},
+    ):
+        encoded = _success(item=projected, **payload)
+        if len(encoded) <= max_length:
+            return encoded
+    encoded = _success(**payload)
+    if len(encoded) <= max_length:
+        return encoded
+    return _success()
+
+
 def _error(message: str, *, details: Any = None) -> str:
     payload: dict[str, Any] = {"status": "error", "message": message}
     if details is not None:
@@ -720,9 +760,7 @@ def _upload_checked_out_document(
                 except ValueError:
                     result = None
                 if isinstance(result, dict) and result.get("id"):
-                    safe_item = dict(result)
-                    safe_item.pop("@microsoft.graph.downloadUrl", None)
-                    return safe_item
+                    return _project_upload_item(result)
             elif response.status_code == 202:
                 try:
                     progress = response.json()
@@ -803,9 +841,7 @@ def _reconcile_uploaded_document(
         return None
     if not isinstance(item, dict) or not item.get("id"):
         return None
-    safe_item = dict(item)
-    safe_item.pop("@microsoft.graph.downloadUrl", None)
-    return safe_item
+    return _project_upload_item(item)
 
 
 def _create_only_upload(
@@ -875,9 +911,7 @@ def _create_only_upload(
                 except ValueError:
                     result = None
                 if isinstance(result, dict) and result.get("id"):
-                    safe_item = dict(result)
-                    safe_item.pop("@microsoft.graph.downloadUrl", None)
-                    return safe_item
+                    return _project_upload_item(result)
                 outcome_ambiguous = True
             elif response.status_code == 202:
                 try:
@@ -1346,7 +1380,7 @@ def word_create_document(
         buffer = io.BytesIO()
         Document().save(buffer)
         item = _create_only_upload(buffer.getvalue(), file_path, site_id, drive_id)
-        return _success(item=item)
+        return _success_with_item(item)
     except Exception as e:
         logger.error("Error creating Word document %s: %s", file_path, e)
         return _error(str(e))
@@ -1476,7 +1510,7 @@ def word_set_paragraph_text(
         )
         _set_paragraph_text(paragraphs[paragraph_index], text)
         item = _upload_document(document, file_path, snapshot)
-        return _success(item=item)
+        return _success_with_item(item)
     except Exception as e:
         logger.error(
             "Error setting paragraph %s text in Word document %s: %s",
@@ -1510,7 +1544,7 @@ def word_append_paragraph(
         _ensure_projected_text_budget(document, len(text))
         document.add_paragraph(text, style=style)
         item = _upload_document(document, file_path, snapshot)
-        return _success(item=item)
+        return _success_with_item(item)
     except Exception as e:
         logger.error("Error appending paragraph to Word document %s: %s", file_path, e)
         return _error(str(e))
@@ -1539,7 +1573,7 @@ def word_add_heading(
         _ensure_projected_text_budget(document, len(text))
         document.add_heading(text, level=level)
         item = _upload_document(document, file_path, snapshot)
-        return _success(item=item)
+        return _success_with_item(item)
     except Exception as e:
         logger.error("Error adding heading to Word document %s: %s", file_path, e)
         return _error(str(e))
@@ -1592,11 +1626,24 @@ def word_replace_text(
             file_path, site_id, drive_id
         )
         assert snapshot is not None
+        # Each run's projected growth is computed from `count` alone (a match
+        # count times a per-match length/control-element delta) rather than
+        # by building the replaced string -- run.text.replace(find, replace)
+        # is deferred to the materialization loop below, after every budget
+        # check has passed. find/replace are each already bounded to
+        # _MAX_MUTATION_TEXT_CHARS, but a single run's text is not: without
+        # this, a run holding many repeats of a short match could request an
+        # intermediate string far larger than any of this function's budgets
+        # before those budgets ever see it.
+        replace_length_delta = len(replace) - len(find)
+        replace_control_delta = _mutation_control_element_count(
+            replace
+        ) - _mutation_control_element_count(find)
         replacements = 0
         added_characters = 0
         character_delta = 0
         added_control_elements = 0
-        planned_replacements: list[tuple[Run, str]] = []
+        planned_replacements: list[Run] = []
         field_depth_stack: list[bool] = []
         for paragraph in document.paragraphs:
             for r, field_protected in _iter_replaceable_runs(
@@ -1620,15 +1667,10 @@ def word_replace_text(
                             "directly in Word instead"
                         )
                     count = run.text.count(find)
-                    updated_text = run.text.replace(find, replace)
                     replacements += count
-                    character_delta += len(updated_text) - len(run.text)
-                    added_characters += max(0, len(updated_text) - len(run.text))
-                    added_control_elements += max(
-                        0,
-                        _mutation_control_element_count(updated_text)
-                        - _mutation_control_element_count(run.text),
-                    )
+                    character_delta += count * replace_length_delta
+                    added_characters += max(0, count * replace_length_delta)
+                    added_control_elements += max(0, count * replace_control_delta)
                     if added_characters > _MAX_MUTATION_TEXT_CHARS:
                         raise ValueError(
                             "replacement would add too much text in one Word mutation"
@@ -1638,16 +1680,16 @@ def word_replace_text(
                             "replacement would add too many tabs or line breaks "
                             "in one Word mutation"
                         )
-                    planned_replacements.append((run, updated_text))
+                    planned_replacements.append(run)
         if replacements == 0:
             # Nothing changed -- uploading the unmodified document would
             # still create a new version/last-modified entry for no reason.
             return _success(replacements=0)
         _ensure_projected_text_budget(document, character_delta)
-        for run, updated_text in planned_replacements:
-            run.text = updated_text
+        for run in planned_replacements:
+            run.text = run.text.replace(find, replace)
         item = _upload_document(document, file_path, snapshot)
-        return _success(item=item, replacements=replacements)
+        return _success_with_item(item, replacements=replacements)
     except Exception as e:
         logger.error("Error replacing text in Word document %s: %s", file_path, e)
         return _error(str(e))

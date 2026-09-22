@@ -536,6 +536,49 @@ def test_create_document_uploads_blank_document(monkeypatch):
     Document(io.BytesIO(put_call.kwargs["data"]))
 
 
+def test_create_document_projects_driveitem_to_small_stable_fields(monkeypatch):
+    """A committed write must never return the full Graph driveItem -- only
+    the small stable fields a caller needs (id, eTag, name). The full item
+    carries unbounded fields (webUrl, parentReference, identity metadata)
+    that could push the response past the output cap, where the outer
+    raw-truncating output filter would mangle it into invalid JSON after
+    the write has already committed."""
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
+    )
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    big_item = {
+        "id": "new-item",
+        "eTag": '"abc"',
+        "name": "Report.docx",
+        "@microsoft.graph.downloadUrl": "https://download.example/secret-token",
+        "webUrl": "https://contoso.sharepoint.com/" + "a" * 500,
+        "parentReference": {"driveId": "drive-1", "path": "/drive/root:/Folder"},
+        "createdBy": {"user": {"displayName": "Someone", "id": "user-1"}},
+    }
+    mock_put = Mock(return_value=MockResponse(big_item, status_code=201))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(word.word_create_document("Report.docx"))
+
+    assert result["status"] == "success"
+    assert result["item"] == {"id": "new-item", "eTag": '"abc"', "name": "Report.docx"}
+
+
+def test_success_with_item_degrades_to_fit_a_low_cap(monkeypatch):
+    """Even the projected {id, eTag, name} envelope isn't provably bounded --
+    an unusually long name must not prevent _success_with_item from
+    returning valid JSON that fits the configured cap."""
+    monkeypatch.setattr(word, "get_tool_max_output_length", lambda: 60)
+    item = {"id": "item-1", "eTag": '"abc"', "name": "a" * 200}
+
+    encoded = word._success_with_item(item)
+
+    assert len(encoded) <= 60
+    parsed = json.loads(encoded)
+    assert parsed["status"] == "success"
+
+
 def test_create_document_does_not_claim_identical_destination_after_lost_response(
     monkeypatch,
 ):
@@ -1036,6 +1079,39 @@ def test_replace_text_counts_matches_within_runs(monkeypatch):
     assert result["replacements"] == 2
     uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
     assert uploaded.paragraphs[0].text == "baz bar baz"
+
+
+def test_replace_text_rejects_large_expansion_via_arithmetic_not_allocation(
+    monkeypatch,
+):
+    """The per-run growth budget must be checked using count * per-match
+    length delta -- integer arithmetic -- before run.text.replace() is ever
+    called. A run holding many repeats of a short match, replaced with a
+    long string, would otherwise materialize a replaced string far larger
+    than any budget could reject in time: 100,000 repeats of a 1-character
+    match times a 100,000-character replacement asks for ~10 billion
+    characters (several GB), long before either mutation budget below (400k)
+    is checked against the *already built* string."""
+    import tracemalloc
+
+    content = _docx_bytes(lambda d: d.add_paragraph("a" * 100_000))
+    mock_request = _edit_download_mock(content)
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    tracemalloc.start()
+    try:
+        result = json.loads(word.word_replace_text("Report.docx", "a", "b" * 100_000))
+    finally:
+        _current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+    assert result["status"] == "error"
+    assert "too much text" in result["message"]
+    # Proves the budget was enforced via arithmetic on `count`, not by first
+    # building the ~10 billion character replaced string (several GB) --
+    # peak traced memory stays orders of magnitude smaller.
+    assert peak < 5_000_000
+    assert mock_request.call_count == 2
 
 
 def test_replace_text_rejects_empty_find():

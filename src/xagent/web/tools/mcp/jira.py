@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -238,8 +239,12 @@ def _resolve_cloud_id(cloud_id: str) -> str:
     if len(sites) == 1:
         site_id = sites[0].get("id") if isinstance(sites[0], dict) else None
         # Presence, not truthiness: an id is opaque and never contractually
-        # excludes a falsy-but-valid value like 0 or "0".
-        if site_id is None:
+        # excludes a falsy-but-valid value like 0 or "0". A blank/padded
+        # string is still rejected explicitly here (with this function's
+        # own specific message) rather than left to fall through to
+        # _path_segment's much more generic "path segment must not be
+        # blank or padded" error a few calls downstream.
+        if site_id is None or (isinstance(site_id, str) and not site_id.strip()):
             raise ValueError("The single accessible Jira site is missing a valid 'id'")
         return str(site_id)
     site_list = (
@@ -500,7 +505,6 @@ def _summarize_issue(issue: dict[str, Any]) -> dict[str, Any]:
     # failing the ENTIRE page over a single bad issue instead of just
     # that issue degrading gracefully.
     fields = _as_dict(issue.get("fields"))
-    assignee = _as_dict(fields.get("assignee"))
     status = _as_dict(fields.get("status"))
     priority = _as_dict(fields.get("priority"))
     issuetype = _as_dict(fields.get("issuetype"))
@@ -512,14 +516,13 @@ def _summarize_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "summary": fields.get("summary"),
         "status": status.get("name"),
         "status_category": _as_dict(status.get("statusCategory")).get("name"),
-        "assignee": (
-            {
-                "account_id": assignee.get("accountId"),
-                "display_name": assignee.get("displayName"),
-            }
-            if assignee
-            else None
-        ),
+        # _summarize_person (not a plain truthiness check here) so a
+        # permission-redacted "{}" assignee is reported as "someone,
+        # details unavailable" rather than collapsed into the same None
+        # used for a genuinely unassigned issue -- matching
+        # _summarize_full_issue's identical field, which already goes
+        # through _summarize_person for the same reason.
+        "assignee": _summarize_person(fields.get("assignee")),
         "priority": priority.get("name"),
         "issue_type": issuetype.get("name"),
         "project_key": project.get("key"),
@@ -788,13 +791,18 @@ def _bounded_search_error(message: str, max_output_length: int) -> str:
     "error"}, no message key at all) is the smallest valid envelope this
     module can produce; below that there's no budget left to signal
     failure in valid JSON at all, which is a systemic gap in the cap
-    itself, not something a single tool's error path can close.
+    itself, not something a single tool's error path can close. Note
+    this already degrades gracefully at 0/negative max_output_length
+    without a lower floor: the arithmetic below simply produces an
+    empty search range, which the loop treats the same as "no fitting
+    slice found."
     """
     full = _error(message)
     if len(full) <= max_output_length:
         return full
-    # Trim the message text itself (not _truncate's fixed 1000-char
-    # cap, which does nothing for a configured budget smaller than
+    # Trim the message text itself (not truncate_error_text's fixed
+    # 1000-char default cap, which does nothing for a configured budget
+    # smaller than
     # that) down to whatever's left after the envelope's own overhead.
     # budget=0 degrades this to _error("") -- a "message" key that's
     # present but empty -- which is as close to preserving that key as
@@ -887,7 +895,9 @@ def jira_search_issues(
     - total_count: the EXACT total, always present (null when not
       computed) -- only set when this first page is also the last (no
       more results beyond it), since len(issues) is already exact in
-      that case with no extra call needed.
+      that case with no extra call needed; still omitted, even then, if
+      including it would have pushed an otherwise-fitting page over the
+      output limit (see the note above).
     - approximate_total_count: an ESTIMATE from Jira's own
       approximate-count endpoint, present ONLY when there ARE more
       results beyond this first page and it was actually computed
@@ -1146,6 +1156,31 @@ def _flatten_adf(value: Any) -> str | None:
                 url = data.get("url") or data.get("name") or data.get("title")
             out.append(str(url or ""))
             return
+        if node_type == "status":
+            # An inline status lozenge (e.g. inserted via Jira's "/status"
+            # editor command) -- another leaf node with no "text" and no
+            # "content" to recurse into, the same shape problem mention/
+            # emoji/inlineCard above exist to fix.
+            out.append(str(attrs.get("text") or ""))
+            return
+        if node_type == "date":
+            # An inline date reference -- attrs carries only a
+            # "timestamp" (ms since the Unix epoch, as a string), no
+            # "text"/"content" to fall back to, so without this branch
+            # it would vanish the same way status/mention/emoji/
+            # inlineCard would without theirs.
+            timestamp = attrs.get("timestamp")
+            if timestamp is None:
+                return
+            try:
+                out.append(
+                    datetime.fromtimestamp(int(timestamp) / 1000, tz=timezone.utc)
+                    .date()
+                    .isoformat()
+                )
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+            return
         for child in node.get("content") or []:
             _walk(child, depth + 1)
         # listItem/blockquote wrap block children (typically a paragraph)
@@ -1219,11 +1254,15 @@ def _summarize_person(person: Any) -> dict[str, Any] | None:
     "{}" for a permission-restricted assignee/reporter/creator/author,
     which must still be reported as "someone, details unavailable"
     rather than silently collapsed into the same None used for a
-    genuinely unassigned field.
+    genuinely unassigned field. A non-dict, non-None value (e.g. a
+    misconfigured custom field reshaping this to a string) is neither
+    of those two real signals -- degrades to None the same way every
+    other malformed nested field in this module does, rather than
+    fabricating a {account_id: None, display_name: None} shape for
+    data that was never actually a person object at all.
     """
-    if person is None:
+    if not isinstance(person, dict):
         return None
-    person = _as_dict(person)
     return {
         "account_id": person.get("accountId"),
         "display_name": person.get("displayName"),
@@ -1256,7 +1295,9 @@ def _summarize_full_issue(issue: dict[str, Any]) -> dict[str, Any]:
         "priority": priority.get("name"),
         "issue_type": issuetype.get("name"),
         "project_key": project.get("key"),
-        "labels": fields.get("labels") or [],
+        "labels": (
+            fields.get("labels") if isinstance(fields.get("labels"), list) else []
+        ),
         "parent_key": parent.get("key"),
         "resolution": resolution.get("name"),
         "components": [
@@ -1302,8 +1343,14 @@ _GET_ISSUE_FIELDS = (
 #: Parsed once for jira_get_issue's extra_fields dedup: a caller-named
 #: field already in the default set would otherwise be fetched, ADF-
 #: flattened, and capped a second time under extra_field_values, wasting
-#: both work and output budget on data already visible in `issue`.
-_GET_ISSUE_FIELD_NAMES = frozenset(_GET_ISSUE_FIELDS.split(","))
+#: both work and output budget on data already visible in `issue`. Lower-
+#: cased here (not just at the comparison site below) since the default
+#: set includes a mixed-case Jira field id ("fixVersions") -- comparing
+#: an already-lowercased caller name against un-lowercased entries would
+#: silently never match that one field regardless of the caller's casing.
+_GET_ISSUE_FIELD_NAMES = frozenset(
+    name.lower() for name in _GET_ISSUE_FIELDS.split(",")
+)
 
 
 def _cap_extra_field_value(value: Any, max_chars: int) -> tuple[Any, bool]:
@@ -1515,21 +1562,39 @@ def jira_get_issue(
         response = success_with_capped_dict(
             "issue", issue, extra_fields=top_level_extra
         )
-        if not description_truncated:
-            # description_truncated's value above only reflects the
-            # fixed _ISSUE_DESCRIPTION_MAX_CHARS cap -- it says nothing
-            # about success_with_capped_dict's OWN shrink phases, which
-            # can still drop "description" (phase 1, if it's ever the
-            # largest field) or the whole `issue` object down to just an
-            # id (phase 2) when the overall response still doesn't fit
-            # after that. Re-check the actual serialized result so the
-            # flag can't report "not truncated" while the field is
-            # silently gone -- reparsing only happens on this otherwise-
-            # rare path (the flag was already true, or the response fit
-            # without shrinking, in the common case).
+        # description_truncated (computed above) and extra_field_values_
+        # truncated (computed in the loop above, when requested_extra is
+        # non-empty) each only reflect what happened BEFORE this call --
+        # neither says anything about success_with_capped_dict's OWN
+        # shrink phases, which can still drop "description" from `issue`
+        # (its whole-key-dropping phase, or the final id-only/empty
+        # fallback -- never its largest-collection-first phase, since
+        # description is always a plain string by this point, not a list
+        # or dict) when the overall response still doesn't fit after
+        # that. Separately, when `issue` plus extra_field_values still
+        # doesn't fit even with `issue` shrunk to nothing,
+        # success_with_capped_dict's last-resort with_extras=False
+        # fallback drops the WHOLE extras dict -- extra_field_values and
+        # its own _truncated flag included -- reporting a plain
+        # "success" with no sign either was ever requested. Re-check the
+        # actual serialized result so neither flag can report "not
+        # truncated" -- or simply vanish along with its own data -- while
+        # the underlying field is silently gone. Reparsing only happens
+        # on this otherwise-rare path (both flags were already true and
+        # no extra fields were requested, or the response fit without
+        # shrinking at all, in the common case).
+        if not description_truncated or requested_extra:
             parsed = json.loads(response)
-            if "description" not in parsed.get("issue", {}):
+            patched = False
+            if not description_truncated and "description" not in parsed.get(
+                "issue", {}
+            ):
                 parsed["description_truncated"] = True
+                patched = True
+            if requested_extra and "extra_field_values" not in parsed:
+                parsed["extra_field_values_truncated"] = True
+                patched = True
+            if patched:
                 response = json.dumps(parsed, ensure_ascii=False)
         return response
     except Exception as e:
@@ -1713,8 +1778,15 @@ def jira_transition_issue(
             )
         transition_id = match.get("id")
         # Presence, not truthiness: an id is opaque and never contractually
-        # excludes a falsy-but-valid value like 0 or "0".
-        if transition_id is None:
+        # excludes a falsy-but-valid value like 0 or "0". A blank/padded
+        # string is still rejected explicitly (unlike a numeric id, it
+        # has no other contractual meaning) -- this id is embedded
+        # directly into a POST body below, not routed through
+        # _path_segment's own blank-value guard the way a URL-bound id
+        # (e.g. cloud_id) is, so nothing else would catch it here.
+        if transition_id is None or (
+            isinstance(transition_id, str) and not transition_id.strip()
+        ):
             return _error(
                 f"Matched transition '{transition_name}' is missing a valid 'id'"
             )
@@ -1772,9 +1844,12 @@ def _summarize_comment(
         # a JSM agent can mark a comment internal-only (jsdPublic=false)
         # with no role/group visibility restriction set at all, so
         # visibility alone can silently report a JSM-internal comment as
-        # public. None (not False) when the issue isn't a JSM request,
-        # since this key is simply absent there -- not itself a public/
-        # internal signal.
+        # public. None both when the issue isn't a JSM request (this key
+        # is simply absent there) and, more rarely, if the key is present
+        # but not actually a bool (a malformed/proxied response) -- this
+        # module has no third state to represent "present but unusable"
+        # separately from "absent", so both collapse to the same None a
+        # caller must not treat as a public/internal signal either way.
         "jsd_public": jsd_public if isinstance(jsd_public, bool) else None,
         "created": comment.get("created"),
         "updated": comment.get("updated"),
@@ -2024,7 +2099,15 @@ def jira_list_comments(
             return _error("Unexpected response format from Jira comments API")
         raw_comments = result.get("comments") or []
         raw_total = result.get("total")
-        total = raw_total if isinstance(raw_total, int) else offset + len(raw_comments)
+        # bool is a subclass of int in Python -- exclude it explicitly (as
+        # _approximate_count already does for its own count field), or a
+        # {"total": true}-shaped response anomaly would silently be used
+        # as if it were a real count instead of falling back below.
+        total = (
+            raw_total
+            if isinstance(raw_total, int) and not isinstance(raw_total, bool)
+            else offset + len(raw_comments)
+        )
         # bool(raw_comments) guards the no-progress case (empty page
         # while total still exceeds offset): next_start_at must never
         # equal start_at. Counted from the RAW page (not any filtered/

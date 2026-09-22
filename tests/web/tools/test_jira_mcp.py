@@ -92,8 +92,18 @@ def test_request_absolute_truncates_unstructured_error_body(monkeypatch):
     with pytest.raises(RuntimeError) as excinfo:
         jira._request_absolute("GET", "https://api.atlassian.com/me")
 
-    assert "[truncated]" in str(excinfo.value)
-    assert len(str(excinfo.value)) < len(long_body)
+    message = str(excinfo.value)
+    assert "[truncated]" in message
+    assert len(message) < len(long_body)
+    # Pins the exact bound this file now depends on implicitly:
+    # jira.py's own local MAX_ERROR_RESPONSE_TEXT_CHARS/_truncate were
+    # removed in favor of the shared truncate_error_text's `limit=1000`
+    # default -- without asserting the exact length here, a future
+    # change to that shared default would silently change this file's
+    # truncation length with no test catching the coupling.
+    expected_detail = jira.truncate_error_text(long_body)
+    assert len(expected_detail) == 1000 + len("... [truncated]")
+    assert message.endswith(expected_detail)
 
 
 def test_request_absolute_truncates_large_structured_error_body(monkeypatch):
@@ -111,8 +121,15 @@ def test_request_absolute_truncates_large_structured_error_body(monkeypatch):
     with pytest.raises(RuntimeError) as excinfo:
         jira._request_absolute("GET", "https://api.atlassian.com/me")
 
-    assert "[truncated]" in str(excinfo.value)
-    assert len(str(excinfo.value)) < len("; ".join(long_messages))
+    message = str(excinfo.value)
+    assert "[truncated]" in message
+    assert len(message) < len("; ".join(long_messages))
+    # See test_request_absolute_truncates_unstructured_error_body: pins
+    # the same implicit shared-default coupling for the structured
+    # (errorMessages-joined) error body path.
+    expected_detail = jira.truncate_error_text("; ".join(long_messages))
+    assert len(expected_detail) == 1000 + len("... [truncated]")
+    assert message.endswith(expected_detail)
 
 
 def test_request_absolute_retries_once_on_429_with_retry_after(monkeypatch):
@@ -215,6 +232,34 @@ def test_resolve_cloud_id_multiple_sites_message_reports_a_falsy_zero_id(monkeyp
     )
 
     with pytest.raises(ValueError, match=r"Zero \(0\)"):
+        jira._resolve_cloud_id("")
+
+
+def test_resolve_cloud_id_single_site_accepts_a_falsy_zero_id(monkeypatch):
+    site_zero = {"id": 0, "name": "Zero", "url": "https://zero.atlassian.net"}
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[site_zero])),
+    )
+
+    assert jira._resolve_cloud_id("") == "0"
+
+
+def test_resolve_cloud_id_single_site_rejects_a_blank_id(monkeypatch):
+    # The id==0 fix (is None, not truthiness) has a side effect: a blank
+    # string id would otherwise silently pass through to a much more
+    # generic error several calls downstream (_path_segment's "must not
+    # be blank or padded"). Rejected here explicitly, with this
+    # function's own specific, actionable message.
+    blank_site = {"id": "  ", "name": "Blank", "url": "https://blank.atlassian.net"}
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[blank_site])),
+    )
+
+    with pytest.raises(ValueError, match="missing a valid 'id'"):
         jira._resolve_cloud_id("")
 
 
@@ -1444,6 +1489,44 @@ def test_summarize_issue_tolerates_a_non_list_labels_field():
     assert result["labels"] == []
 
 
+def test_summarize_issue_reports_present_for_a_redacted_assignee():
+    # A permission-redacted assignee comes back from Jira as a present-
+    # but-empty {}, not absent -- _summarize_issue (jira_search_issues)
+    # must report that the same way _summarize_full_issue
+    # (jira_get_issue) already does via _summarize_person, not collapse
+    # it into the same None used for a genuinely unassigned issue.
+    raw_issue = {"key": "ENG-1", "fields": {"summary": "ok", "assignee": {}}}
+    result = jira._summarize_issue(raw_issue)
+    assert result["assignee"] == {"account_id": None, "display_name": None}
+
+
+def test_summarize_full_issue_tolerates_a_non_list_labels_field():
+    # _summarize_full_issue's labels used to be `fields.get("labels") or
+    # []`, which only substitutes [] for a FALSY value -- a truthy
+    # non-list value (e.g. a malformed/proxied "labels": "urgent")
+    # would pass straight through unfiltered instead of degrading the
+    # same way the pre-existing _summarize_issue already does.
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "labels": "not-a-list"},
+    }
+    result = jira._summarize_full_issue(raw_issue)
+    assert result["labels"] == []
+
+
+def test_summarize_person_degrades_to_none_for_a_non_dict_value():
+    # A non-dict, non-None value (e.g. a misconfigured custom field
+    # reshaping this to a string) is neither "genuinely absent" nor a
+    # real (if redacted) person object -- must degrade to None like
+    # every other malformed nested field in this module, not fabricate
+    # a {account_id: None, display_name: None} shape for data that was
+    # never a person object at all.
+    assert jira._summarize_person("not-a-dict") is None
+    assert jira._summarize_person(None) is None
+    assert jira._summarize_person({}) == {"account_id": None, "display_name": None}
+
+
 def test_approximate_count_warns_on_non_dict_response(monkeypatch, caplog):
     # A proxy/gateway reshaping the WHOLE response body (not just the
     # count field) to a non-dict must not degrade to total_count=None
@@ -2049,6 +2132,33 @@ def test_get_issue_extra_fields_ignores_a_default_name_regardless_of_case(
     assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
 
 
+def test_get_issue_extra_fields_ignores_fixversions_default_field(monkeypatch):
+    # _GET_ISSUE_FIELDS' one mixed-case default field id ("fixVersions")
+    # is a regression-prone special case for the case-insensitive dedup:
+    # comparing an always-lowercased caller name against a NOT-
+    # lowercased default set would never match this field regardless of
+    # the caller's own casing, silently re-fetching and duplicating it
+    # under extra_field_values.
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "fixVersions": [{"name": "v1.0"}]},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="fixVersions"))
+
+    assert result["issue"]["fix_versions"] == ["v1.0"]
+    assert "extra_field_values" not in result
+    issue_call = mock_request.call_args_list[1]
+    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+
+
 def test_get_issue_extra_fields_deduplicates_repeated_names(monkeypatch):
     # "a,a,b" must not charge the aggregate budget for "a" twice --
     # doing so could starve a later distinct field's share for no
@@ -2212,6 +2322,51 @@ def test_get_issue_description_truncated_reflects_the_field_being_dropped(
     assert result["description_truncated"] is True
 
 
+def test_get_issue_extra_field_values_truncated_survives_the_last_resort_fallback(
+    monkeypatch,
+):
+    # At a configured cap small enough that extra_field_values ALONE
+    # (already sized to roughly half the budget) still doesn't leave
+    # room for even a fully-collapsed `issue`, success_with_capped_dict
+    # falls into its last-resort with_extras=False path, which drops
+    # the WHOLE extras dict -- extra_field_values and its own
+    # _truncated flag included, not just `issue` -- reporting a plain
+    # "success" with no sign the field was ever requested. Unlike
+    # description_truncated (already re-checked below), nothing
+    # previously restored this flag when that happened.
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 150)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 150)
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "description": "short",
+            "customfield_a": "x" * 500,
+            "customfield_b": "y" * 500,
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(
+        jira.jira_get_issue("ENG-1", extra_fields="customfield_a,customfield_b")
+    )
+
+    assert result["status"] == "success"
+    assert len(json.dumps(result)) <= 150
+    assert "extra_field_values" not in result
+    assert result["extra_field_values_truncated"] is True
+
+
 def test_get_issue_rejects_jira_field_selector_syntax_in_extra_fields(monkeypatch):
     # Jira's `fields` query param treats a leading "-" as "exclude this
     # field" and "*" as a wildcard, not a literal field id -- passed
@@ -2303,6 +2458,54 @@ def test_flatten_adf_emoji_falls_back_to_short_name_without_text():
         ],
     }
     assert jira._flatten_adf(adf) == ":+1:"
+
+
+def test_flatten_adf_renders_status_and_date_nodes():
+    # status/date are inline leaf nodes with no "text" and no "content"
+    # to recurse into, the same shape problem mention/emoji/inlineCard
+    # exist to fix -- without explicit handling they silently vanish.
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "Blocked: "},
+                    {
+                        "type": "status",
+                        "attrs": {"text": "TO DO", "color": "neutral"},
+                    },
+                    {"type": "text", "text": " due "},
+                    {
+                        "type": "date",
+                        "attrs": {"timestamp": "1700000000000"},
+                    },
+                ],
+            }
+        ],
+    }
+    assert jira._flatten_adf(adf) == "Blocked: TO DO due 2023-11-14"
+
+
+def test_flatten_adf_date_node_tolerates_a_missing_or_malformed_timestamp():
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "date", "attrs": {}},
+                    {"type": "text", "text": "b"},
+                    {"type": "date", "attrs": {"timestamp": "not-a-number"}},
+                    {"type": "text", "text": "c"},
+                ],
+            }
+        ],
+    }
+    assert jira._flatten_adf(adf) == "abc"
 
 
 def test_flatten_adf_list_items_have_no_blank_line_between_them():
@@ -2562,6 +2765,64 @@ def test_transition_issue_matches_name_case_insensitively(monkeypatch):
     assert transition_call.kwargs["json"] == {"transition": {"id": "21"}}
 
 
+def test_transition_issue_rejects_a_matched_transition_missing_an_id(monkeypatch):
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data={"transitions": [{"id": None, "name": "Done"}]}),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_transition_issue("ENG-1", "done"))
+
+    assert result["status"] == "error"
+    assert "missing a valid 'id'" in result["message"]
+
+
+def test_transition_issue_rejects_a_matched_transition_with_a_blank_id(monkeypatch):
+    # Presence, not truthiness, means a falsy-but-valid id like 0 is
+    # accepted -- but a blank/padded string has no other contractual
+    # meaning and is embedded directly into the POST body below with no
+    # other guard (unlike a URL-bound id, which _path_segment would
+    # catch), so it must still be rejected explicitly here.
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data={"transitions": [{"id": "  ", "name": "Done"}]}),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_transition_issue("ENG-1", "done"))
+
+    assert result["status"] == "error"
+    assert "missing a valid 'id'" in result["message"]
+
+
+def test_transition_issue_accepts_a_falsy_zero_id(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"transitions": [{"id": 0, "name": "Done"}]}),
+            MockResponse(json_data={}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_transition_issue("ENG-1", "done"))
+
+    assert result["status"] == "success"
+    transition_call = mock_request.call_args_list[2]
+    assert transition_call.kwargs["json"] == {"transition": {"id": 0}}
+
+
 def test_transition_issue_reports_available_transitions_when_not_found(monkeypatch):
     monkeypatch.setattr(
         jira.requests,
@@ -2673,6 +2934,39 @@ def test_list_comments_ignores_non_int_total(monkeypatch):
     result = json.loads(jira.jira_list_comments("ENG-1"))
 
     assert result["status"] == "success"
+    assert result["truncated"] is False
+    assert result["next_start_at"] is None
+
+
+def test_list_comments_ignores_a_bool_total(monkeypatch):
+    # bool is a subclass of int in Python -- a malformed/proxied
+    # {"total": true} response must not be silently used as a real
+    # count (total==True behaves as 1 in arithmetic, corrupting both
+    # the returned `total` field and the has_more/next_start_at
+    # pagination math), the same class of bug _approximate_count
+    # already guards against for its own count field. Two comments (not
+    # one) makes the bug observable: True==1 would report total=1
+    # despite 2 comments actually being on the page.
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={
+                    "comments": [
+                        {"id": "1", "body": "First"},
+                        {"id": "2", "body": "Second"},
+                    ],
+                    "total": True,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_comments("ENG-1"))
+
+    assert result["status"] == "success"
+    assert result["total"] == 2
     assert result["truncated"] is False
     assert result["next_start_at"] is None
 

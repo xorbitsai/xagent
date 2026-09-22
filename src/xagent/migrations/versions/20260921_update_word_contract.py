@@ -46,46 +46,58 @@ def _is_owned(launch_config: object) -> bool:
     ) == builtin_provenance_identity(BUILTIN_PROVENANCE)
 
 
-def _owned_row(bind: sa.engine.Connection) -> tuple[dict, str] | None:
+def _owned_launch_config(bind: sa.engine.Connection) -> dict | None:
     row = (
         bind.execute(
-            sa.select(
-                PUBLIC_MCP_APPS_TABLE.c.launch_config,
-                PUBLIC_MCP_APPS_TABLE.c.description,
-            ).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+            sa.select(PUBLIC_MCP_APPS_TABLE.c.launch_config).where(
+                PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
+            )
         )
         .mappings()
         .first()
     )
     if row is None or not _is_owned(row["launch_config"]):
         return None
-    return dict(row["launch_config"]), row["description"]
+    return dict(row["launch_config"])
+
+
+def _description_if_unchanged(expected_current: str, new_value: str) -> sa.Case:
+    """A CASE expression re-checking ``description`` at UPDATE time.
+
+    description is not a protected builtin field (admin_mcp.py's
+    _BUILTIN_PROTECTED_FIELDS), so an operator may have legitimately
+    customized it via the admin PATCH endpoint at any time. Evaluating the
+    "is it still canonical" condition inside the UPDATE itself (rather than
+    branching in Python on a value this function already SELECTed earlier)
+    means the database re-reads the current value atomically at write time,
+    so a customization landing between this migration's read and its write
+    can't be silently clobbered by a decision made against stale state.
+    Mirrors 20260911_update_onedrive_description.py's identical rationale,
+    expressed atomically instead of read-then-write.
+    """
+    return sa.case(
+        (PUBLIC_MCP_APPS_TABLE.c.description == expected_current, new_value),
+        else_=PUBLIC_MCP_APPS_TABLE.c.description,
+    )
 
 
 def upgrade() -> None:
     bind = op.get_bind()
     if "public_mcp_apps" not in set(sa.inspect(bind).get_table_names()):
         return
-    owned = _owned_row(bind)
-    if owned is None:
+    launch_config = _owned_launch_config(bind)
+    if launch_config is None:
         return
-    launch_config, description = owned
     static_env = dict(launch_config.get("static_env") or {})
     static_env[OUTPUT_LIMIT_ENV] = OUTPUT_LIMIT_ENV
     launch_config["static_env"] = static_env
-    values: dict[str, object] = {"launch_config": launch_config}
-    # description is not a protected builtin field (admin_mcp.py's
-    # _BUILTIN_PROTECTED_FIELDS), so an operator may have legitimately
-    # customized it via the admin PATCH endpoint. Only refresh it when it
-    # still holds the prior canonical text -- otherwise a customization
-    # would be silently overwritten (mirrors
-    # 20260911_update_onedrive_description.py's identical rationale).
-    if description == OLD_DESCRIPTION:
-        values["description"] = NEW_DESCRIPTION
     bind.execute(
         sa.update(PUBLIC_MCP_APPS_TABLE)
         .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        .values(**values)
+        .values(
+            description=_description_if_unchanged(OLD_DESCRIPTION, NEW_DESCRIPTION),
+            launch_config=launch_config,
+        )
     )
 
 
@@ -93,10 +105,9 @@ def downgrade() -> None:
     bind = op.get_bind()
     if "public_mcp_apps" not in set(sa.inspect(bind).get_table_names()):
         return
-    owned = _owned_row(bind)
-    if owned is None:
+    launch_config = _owned_launch_config(bind)
+    if launch_config is None:
         return
-    launch_config, description = owned
     static_env = dict(launch_config.get("static_env") or {})
     if static_env.get(OUTPUT_LIMIT_ENV) == OUTPUT_LIMIT_ENV:
         static_env.pop(OUTPUT_LIMIT_ENV)
@@ -104,11 +115,11 @@ def downgrade() -> None:
         launch_config["static_env"] = static_env
     else:
         launch_config.pop("static_env", None)
-    values: dict[str, object] = {"launch_config": launch_config}
-    if description == NEW_DESCRIPTION:
-        values["description"] = OLD_DESCRIPTION
     bind.execute(
         sa.update(PUBLIC_MCP_APPS_TABLE)
         .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        .values(**values)
+        .values(
+            description=_description_if_unchanged(NEW_DESCRIPTION, OLD_DESCRIPTION),
+            launch_config=launch_config,
+        )
     )

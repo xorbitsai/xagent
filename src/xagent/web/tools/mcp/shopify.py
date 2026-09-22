@@ -804,11 +804,16 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
     own room afterward, the tail loop below still halves `value`'s keys
     locally (no cursor concern there either, but also no clean way to ask
     `success_with_capped_dict` to shrink further around an already-built
-    envelope) -- it shares `halve_dict_or_mark`'s per-step decision (and
-    its 1-key-floor fix) with that function's own phase 1, but not its
-    id-preserving last-resort tier, so a record already down to one key can
-    still empty out here in a way `success_with_capped_dict` alone would
-    have recovered.
+    envelope) -- it uses `halve_dict_or_mark` for that per-field decision
+    (immediate marker installation is safe here specifically because there
+    is only ever one dict field in play, `value`, unlike
+    `success_with_capped_dict`'s own phase 1, which no longer calls
+    `halve_dict_or_mark` at all now that it shrinks several dict-valued
+    fields against a shared budget -- see that helper's docstring for why
+    the two cases need different handling). This tail loop also lacks
+    `success_with_capped_dict`'s id-preserving last-resort tier, so a
+    record already down to one key can still empty out here in a way
+    `success_with_capped_dict` alone would have recovered.
     """
     response = _success(**{field_name: value}, _errors=errors)
     max_output_length = get_tool_max_output_length()

@@ -49,8 +49,13 @@ logger = logging.getLogger(__name__)
 _PLACEHOLDER_MODEL_NAMES = {"", "none", "null", "default"}
 
 
-def _usable_model_name(value: Any) -> TypeGuard[str]:
-    """A real model identity, not a placeholder. TypeGuard so callers narrow."""
+def is_usable_model_name(value: Any) -> TypeGuard[str]:
+    """A real model identity, not a placeholder. TypeGuard so callers narrow.
+
+    Public because every producer needs the same answer: the placeholder set is
+    a property of billing, not of this module, and a second copy of it would be
+    free to drift from this one.
+    """
     return (
         isinstance(value, str) and value.strip().lower() not in _PLACEHOLDER_MODEL_NAMES
     )
@@ -78,7 +83,7 @@ def resolve_billing_model(
 
     # The placeholder filter applies to the configured id too: a config that
     # literally names the model "default" or "none" must not be billed as one.
-    if _usable_model_name(configured_id):
+    if is_usable_model_name(configured_id):
         return configured_id
     for attr in ("model_name", "model"):
         # Guarded individually: this runs *before* record_media_usage's own
@@ -89,7 +94,7 @@ def resolve_billing_model(
         except Exception as e:  # noqa: BLE001
             logger.warning("Reading %s for billing identity failed: %s", attr, e)
             continue
-        if _usable_model_name(value):
+        if is_usable_model_name(value):
             return value
     return fallback
 

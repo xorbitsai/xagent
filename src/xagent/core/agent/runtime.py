@@ -35,6 +35,7 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
+from .checkpoint import CheckpointPersistenceError
 from .context.execution import (
     COMPACT_SUMMARY_FALLBACK_BUDGETS,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -1822,6 +1823,28 @@ class PatternRuntime:
         if self.tracer is None:
             return
 
+        # Normalize here rather than only in ``TraceCheckpointStore``: that
+        # wrapper is applied in exactly one place (``xagent/service.py``), so
+        # the fallback ``PatternRuntime`` constructions in ``auto.py``,
+        # ``react.py`` and ``dag.py`` talk to a bare tracer and would otherwise
+        # surface a raw writer exception. DAG only treats
+        # ``CheckpointPersistenceError`` as a durability failure; anything else
+        # is swallowed by its generic handler into a permanent step failure.
+        #
+        # ``CheckpointPersistenceError`` is re-raised untouched so an error the
+        # store already normalized is not wrapped twice, and ``BaseException``
+        # is not caught at all so cancellation / ``SystemExit`` /
+        # ``KeyboardInterrupt`` keep their control-flow semantics.
+        try:
+            await self._write_checkpoint_to_tracer(payload)
+        except CheckpointPersistenceError:
+            raise
+        except Exception as exc:
+            raise CheckpointPersistenceError(
+                "Checkpoint writer failed before persistence was confirmed."
+            ) from exc
+
+    async def _write_checkpoint_to_tracer(self, payload: dict[str, Any]) -> None:
         checkpoint = getattr(self.tracer, "checkpoint", None)
         if callable(checkpoint):
             await self._maybe_await(checkpoint(**payload))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from collections import Counter
@@ -65,6 +66,47 @@ from .skill_tool import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def snapshot_container(value: Any) -> Any:
+    """Return a point-in-time copy of a container held in live state.
+
+    Used by the checkpoint snapshot producers (``ExecutionContext.to_dict``
+    and ``ReActPattern.get_state``) for the containers that some code path
+    mutates in place. Holding a copy is what lets the DAG checkpoint
+    rollback reinstate a previous snapshot, rather than handing back an
+    object that has since been written through.
+
+    Serializing a checkpoint must never fail because of what a value *is*:
+    a tool result can hold anything a custom or MCP tool chose to return
+    (a lock, a file handle, a generator), and the JSON layer downstream
+    already degrades those to a placeholder rather than erroring. So a
+    ``deepcopy`` failure falls back to a shallow copy of the top-level
+    container, which still defends against the mutations that matter here
+    (``pop``, ``__setitem__``, ``append`` on the container itself), and a
+    failure of even that returns the value unchanged.
+    """
+    if not isinstance(value, (dict, list, set)):
+        return value
+    try:
+        return copy.deepcopy(value)
+    except Exception:  # noqa: BLE001 - never fail a snapshot over a value
+        logger.debug(
+            "snapshot_container: deep copy failed, falling back to a shallow "
+            "copy of %s",
+            type(value).__name__,
+            exc_info=True,
+        )
+    try:
+        return copy.copy(value)
+    except Exception:  # noqa: BLE001 - last resort: hand back the original
+        logger.debug(
+            "snapshot_container: shallow copy failed for %s; returning it as-is",
+            type(value).__name__,
+            exc_info=True,
+        )
+        return value
+
 
 READ_FILE_CONTEXT_LIMIT = 12_000
 # Set by the web layer into ``ExecutionContext.metadata`` at turn start: the
@@ -1245,6 +1287,27 @@ class ExecutionContext:
         return child
 
     def to_dict(self) -> dict[str, Any]:
+        # Containers that some code path mutates in place are snapshotted
+        # here, so a caller holding the result is not looking at live state.
+        # The DAG checkpoint rollback (``_DAGStepRuntime.checkpoint``)
+        # depends on that: it reinstates a previously returned dict to undo
+        # a failed checkpoint.
+        #
+        # Only ``metadata`` needs it. Its in-place writers include
+        # ``runner.py`` (``metadata[key] = value``, ``update``, ``pop``),
+        # ``dag.py`` (``OUTPUT_LANGUAGE_METADATA_KEY``,
+        # ``PREFERRED_INPUT_MODALITIES_METADATA_KEY``) and ``react.py``
+        # (``IMAGE_EDIT_UNAVAILABLE_METADATA_KEY``).
+        #
+        # Deliberately NOT copied, because nothing writes into them after the
+        # owning object is created -- copying them would cost time on every
+        # checkpoint and buy nothing:
+        #   * ``message.metadata`` / ``message.tool_calls`` -- ``Message`` is
+        #     a frozen dataclass and no writer mutates either dict of an
+        #     already-appended message.
+        #   * component payloads (workspace state, memory snapshot) -- these
+        #     are replaced wholesale, and a deep copy of a large workspace
+        #     state would be the most expensive thing on this path.
         return {
             "execution_id": self.execution_id,
             "user_id": self.user_id,
@@ -1269,7 +1332,7 @@ class ExecutionContext:
                 for message in self.messages
             ],
             "system_prompt": self.system_prompt,
-            "metadata": self.metadata,
+            "metadata": snapshot_container(self.metadata),
             # A sibling of ``metadata``, deliberately not a member of it:
             # ``request_context`` keys land inside ``metadata`` verbatim
             # (``runner.py:1001`` writes ``context.metadata[key] = value``), so

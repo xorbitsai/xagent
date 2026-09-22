@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
+from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.tools.user_interaction import (
+    ToolInteractionSettlement,
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
@@ -26,3 +30,104 @@ def test_resume_capability_detection() -> None:
 
     assert callable(user_interaction_resume_callable(Resumable()))
     assert user_interaction_resume_callable(object()) is None
+
+
+def test_successful_settlement_preserves_the_tool_result() -> None:
+    result = {"success": True, "post_urn": "urn:li:share:123"}
+
+    settlement = ToolInteractionSettlement.succeeded(result)
+
+    assert settlement.projected_result() is result
+
+
+def test_successful_settlement_rejects_a_failed_tool_result() -> None:
+    with pytest.raises(ValueError, match="cannot carry a failed tool result"):
+        ToolInteractionSettlement.succeeded({"success": False, "error": "failed"})
+
+
+@pytest.mark.parametrize(
+    "result, message",
+    [
+        (None, "needs a result"),
+        ({"status": "waiting_for_user"}, "cannot wait for user input"),
+    ],
+)
+def test_successful_settlement_rejects_non_terminal_results(
+    result: object, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ToolInteractionSettlement.succeeded(result)
+
+
+@pytest.mark.parametrize("status", ["rejected", "failed", "dispatch_unknown"])
+def test_terminal_settlement_rejects_a_waiting_result(status: str) -> None:
+    with pytest.raises(ValueError, match="cannot wait for user input"):
+        ToolInteractionSettlement(  # type: ignore[arg-type]
+            status=status,
+            result={"status": "waiting_for_user"},
+        )
+
+
+def test_successful_settlement_uses_the_canonical_failure_classifier() -> None:
+    """A padded status must classify exactly as ``tool_result_succeeded`` does.
+
+    A hand-rolled classifier here added a ``.strip()`` the canonical helper
+    does not have, so ``{"status": " error "}`` was a failure in one place and
+    a success in the other. Both directions are asserted so a future
+    divergence fails whichever way it drifts.
+    """
+
+    padded = {"status": " error "}
+    exact = {"status": "ERROR"}
+    assert tool_result_succeeded(padded) is True
+    assert tool_result_succeeded(exact) is False
+
+    assert ToolInteractionSettlement.succeeded(padded).result is padded
+    with pytest.raises(ValueError, match="cannot carry a failed tool result"):
+        ToolInteractionSettlement.succeeded(exact)
+
+
+@pytest.mark.parametrize("status", ["rejected", "failed", "dispatch_unknown"])
+def test_non_successful_settlement_has_an_unambiguous_failure_shape(
+    status: str,
+) -> None:
+    settlement = ToolInteractionSettlement(status=status, result={"detail": "safe"})  # type: ignore[arg-type]
+
+    assert settlement.projected_result() == {
+        "success": False,
+        "settlement_status": status,
+        "error": {
+            "rejected": "The user rejected the tool call.",
+            "failed": "The resumed tool call failed.",
+            "dispatch_unknown": (
+                "The tool call may have reached the external system. Automatic retry "
+                "is disabled; verify the external system before trying again."
+            ),
+        }[status],
+        "detail": "safe",
+    }
+
+
+def test_non_dict_failure_result_is_nested_under_result() -> None:
+    settlement = ToolInteractionSettlement.failed(result="upstream said no")
+
+    assert settlement.projected_result() == {
+        "success": False,
+        "settlement_status": "failed",
+        "error": "The resumed tool call failed.",
+        "result": "upstream said no",
+    }
+
+
+def test_failed_settlement_preserves_a_tool_specific_status() -> None:
+    settlement = ToolInteractionSettlement.failed(
+        result={"status": "cancelled_by_policy"}
+    )
+
+    assert settlement.projected_result()["status"] == "cancelled_by_policy"
+    assert settlement.projected_result()["settlement_status"] == "failed"
+
+
+def test_settlement_rejects_an_unknown_status() -> None:
+    with pytest.raises(ValueError, match="Invalid tool interaction settlement"):
+        ToolInteractionSettlement(status="unknown")  # type: ignore[arg-type]

@@ -2790,7 +2790,12 @@ def test_the_marker_survives_a_checkpoint_round_trip() -> None:
     context.metadata[_MARKER] = True
 
     payload = context.to_dict()
-    assert payload["metadata"] is context.metadata
+    # Metadata travels whole, but as a copy: ``to_dict`` is a point-in-time
+    # snapshot that shares no mutable container with the live context, so
+    # that a stored payload can be reinstated by the DAG checkpoint
+    # rollback. Equality, not identity, is what "travels whole" means here.
+    assert payload["metadata"] == context.metadata
+    assert payload["metadata"] is not context.metadata
     restored = ExecutionContext.from_dict(json.loads(json.dumps(payload)))
 
     assert restored.metadata[_MARKER] is True
@@ -3095,3 +3100,118 @@ def test_dropping_an_unattested_marker_is_logged_with_ids_only(
         assert "True" not in message
     else:
         assert len(records) == 0
+
+
+def _mutable_container_ids(obj: object, seen: set[int] | None = None) -> set[int]:
+    """Collect ``id()`` of every dict/list/set reachable from ``obj``."""
+    if seen is None:
+        seen = set()
+    if id(obj) in seen or not isinstance(obj, (dict, list, set)):
+        return seen
+    seen.add(id(obj))
+    values = obj.values() if isinstance(obj, dict) else obj
+    for value in values:
+        _mutable_container_ids(value, seen)
+    return seen
+
+
+def _live_container_ids(
+    obj: object,
+    seen: set[int] | None = None,
+    visited: set[int] | None = None,
+    depth: int = 0,
+) -> set[int]:
+    """Collect ``id()`` of every mutable container in a live object graph."""
+    if seen is None:
+        seen = set()
+    if visited is None:
+        visited = set()
+    if depth > 8 or id(obj) in visited:
+        return seen
+    visited.add(id(obj))
+    if isinstance(obj, (dict, list, set)):
+        seen.add(id(obj))
+        values = obj.values() if isinstance(obj, dict) else obj
+        for value in values:
+            _live_container_ids(value, seen, visited, depth + 1)
+    elif hasattr(obj, "__dict__"):
+        for value in vars(obj).values():
+            _live_container_ids(value, seen, visited, depth + 1)
+    return seen
+
+
+def test_execution_context_to_dict_snapshots_in_place_mutated_containers() -> None:
+    """``to_dict()`` must not hand back a container someone writes into.
+
+    The DAG checkpoint rollback restores a previously returned ``to_dict()``
+    to undo a failed checkpoint, so any container a later code path mutates
+    in place has to be copied here.
+
+    The invariant is deliberately *not* "nothing is shared". Values that are
+    only ever reassigned cannot leak a later write into a snapshot, and
+    copying them would cost time on every checkpoint, so they are exempt:
+
+    * ``components[*]`` (workspace state, memory snapshot) -- replaced
+      wholesale, never written through, and potentially large.
+    * each message's ``metadata`` / ``tool_calls`` -- ``Message`` is a frozen
+      dataclass and no writer mutates either dict once the message is
+      appended.
+    """
+
+    context = ExecutionContext(execution_id="alias-check")
+    context.metadata["dag_step_id"] = "a"
+    context.metadata["nested"] = {"inner": ["deep"]}
+    context.add_user_message("hi", metadata={"kind": "dag_step_instruction"})
+    context.add_message(
+        "assistant",
+        "a",
+        tool_calls=[
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}"},
+            }
+        ],
+    )
+    context.workspace_state["ws"] = {"k": ["v"]}
+    context.components["memory"].snapshot = {"m": {"deep": [1]}}
+
+    snapshot = context.to_dict()
+
+    # The one container with in-place writers must be copied, deeply.
+    assert snapshot["metadata"] is not context.metadata
+    assert snapshot["metadata"]["nested"] is not context.metadata["nested"]
+
+    # Whatever else is shared must be one of the documented write-once
+    # exemptions -- a new shared container fails this test.
+    exempt = _mutable_container_ids(
+        [
+            snapshot["components"],
+            [message["metadata"] for message in snapshot["messages"]],
+            [message["tool_calls"] for message in snapshot["messages"]],
+            snapshot["workspace_state"],
+            snapshot["memory_snapshot"],
+        ]
+    )
+    shared = _mutable_container_ids(snapshot) & _live_container_ids(context)
+
+    assert not (shared - exempt)
+
+
+def test_execution_context_to_dict_is_unaffected_by_later_mutation() -> None:
+    """A later in-place write to ``metadata`` must not reach the snapshot."""
+
+    context = ExecutionContext(execution_id="alias-check")
+    context.metadata["dag_step_id"] = "a"
+    context.metadata["nested"] = {"inner": "before"}
+    context.add_user_message("hi", metadata={"kind": "dag_step_instruction"})
+
+    snapshot = context.to_dict()
+    before = copy.deepcopy(snapshot["metadata"])
+
+    # Both shapes the real writers use: a new top-level key (runner.py,
+    # dag.py, react.py) and a write into a nested value.
+    context.metadata["output_language"] = "English"
+    context.metadata["nested"]["inner"] = "after"
+
+    assert snapshot["metadata"] == before

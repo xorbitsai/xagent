@@ -158,7 +158,21 @@ class TraceCheckpointStore:
         execution_id = self._execution_id(payload)
         event_payload = self._event_payload(payload, execution_id=execution_id)
 
-        event_id = await self._call_checkpoint_writer(payload, event_payload)
+        # Normalize ordinary writer failures at the persistence boundary so
+        # callers can tell "the checkpoint is not durable" apart from "the
+        # step itself failed". ``CheckpointPersistenceError`` passes through
+        # unchanged, and ``BaseException`` (cancellation, ``SystemExit``,
+        # ``KeyboardInterrupt``) is deliberately not caught: those carry
+        # control-flow meaning that must not be downgraded to a persistence
+        # failure.
+        try:
+            event_id = await self._call_checkpoint_writer(payload, event_payload)
+        except CheckpointPersistenceError:
+            raise
+        except Exception as exc:
+            raise CheckpointPersistenceError(
+                "Checkpoint writer failed before persistence was confirmed."
+            ) from exc
         if event_id is None:
             raise CheckpointPersistenceError(
                 "Tracer does not expose a durable checkpoint write API."

@@ -1326,36 +1326,125 @@ def test_success_with_capped_dict_last_resort_falls_back_to_dropping_extras(
     assert "note_two" not in result
 
 
-def test_truncation_marker_or_empty_prefers_the_marker_when_smaller():
-    """The shared helper both success_with_capped_dict's phase 1 and
-    shopify.py's local last-key loop delegate to: uses the marker when
-    it's smaller than the value it replaces."""
-    assert utils.truncation_marker_or_empty({"total": "x" * 5000}) == {
-        "truncated": True
-    }
+def test_halve_dict_or_mark_halves_while_more_than_one_key_remains():
+    """The shared per-step helper both success_with_capped_dict's phase 1
+    and shopify.py's local tail loop delegate to: drops the trailing half of
+    the keys and reports the field is not yet at its floor."""
+    shrunk, floored = utils.halve_dict_or_mark({"a": 1, "b": 2, "c": 3, "d": 4})
+
+    assert shrunk == {"a": 1, "b": 2}
+    assert floored is False
 
 
-def test_truncation_marker_or_empty_falls_back_to_empty_when_the_marker_would_grow_it():
+def test_halve_dict_or_mark_uses_the_marker_at_the_floor_when_smaller():
+    shrunk, floored = utils.halve_dict_or_mark({"total": "x" * 5000})
+
+    assert shrunk == {"truncated": True}
+    assert floored is True
+
+
+def test_halve_dict_or_mark_falls_back_to_empty_when_the_marker_would_grow_it():
     """Regression test for the review finding that motivated gating the
     marker on size at all: a tiny value (here, {"a": 1}, 8 bytes) is
     smaller than the marker itself (19 bytes) -- installing the marker
     would grow the payload instead of shrinking it, so this must fall
-    back to {} instead."""
-    assert utils.truncation_marker_or_empty({"a": 1}) == {}
+    back to {} instead, and still report the floor was reached."""
+    shrunk, floored = utils.halve_dict_or_mark({"a": 1})
+
+    assert shrunk == {}
+    assert floored is True
 
 
-def test_success_with_capped_dict_extras_degradation_never_grows_a_field(
+def test_success_with_capped_dict_downgrades_markers_before_dropping_sibling_fields(
     monkeypatch,
 ):
-    """Regression test: the extras-degradation loop used to unconditionally
-    set a field to `True` without checking whether that's actually smaller
-    than the value it replaces -- the same class of bug the field marker's
-    own size gate exists to prevent, just missing here. Degrading an
-    already-tiny extra field (here, 1 byte) to `True` (4 bytes) would grow
-    the payload; confirmed this can never surface as a worse final result
-    (candidates are tried smallest-effort-first, so a candidate that grew
-    is always dominated by one tried earlier), but the loop should still
-    stop rather than waste effort building a candidate that can't help."""
+    """Regression test: several dict fields hitting the one-key floor in
+    the same call each cost a marker's worth of bytes over {}. That
+    overhead alone used to keep the response over the limit after phase 1
+    had nothing left to shrink, so phase 2 then dropped whole sibling
+    fields (including small scalars like "name") that the pre-marker code
+    kept as {} -- a worse result than before the marker existed. Markers
+    must be downgraded back to {} first, so every field stays present
+    before any of them gets labelled."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "140")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {
+            "id": "r1",
+            "a": {"k": "x" * 500},
+            "b": {"k": "y" * 500},
+            "c": {"k": "z" * 500},
+            "name": "Bob",
+        },
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 140
+    assert result["truncated"] is True
+    assert set(result["record"]) == {"id", "a", "b", "c", "name"}
+    assert result["record"]["id"] == "r1"
+    assert result["record"]["name"] == "Bob"
+    # Only as many markers survive as the budget allows: the latest
+    # installed one ("c", the smallest original field) is downgraded to {}
+    # while the earlier ones keep their marker.
+    assert result["record"]["a"] == {"truncated": True}
+    assert result["record"]["b"] == {"truncated": True}
+    assert result["record"]["c"] == {}
+
+
+def test_success_with_capped_dict_marks_a_one_key_dict_without_recursing_into_it(
+    monkeypatch,
+):
+    """Phase 1 recurses one level, not further: a one-key dict whose sole
+    value is a huge list is replaced by the marker wholesale rather than
+    having that inner list halved. Pinned here so the behavior reads as
+    deliberate now that the marker exists, not as an oversight."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "150")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"id": "r1", "wrap": {"items": [{"k": "x" * 100} for _ in range(50)]}},
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 150
+    assert result["record"]["id"] == "r1"
+    assert result["record"]["wrap"] == {"truncated": True}
+
+
+def test_success_with_capped_dict_last_resort_keeps_extras_that_fit_beside_an_empty_record(
+    monkeypatch,
+):
+    """Regression test: the last-resort ladder went from "id + extras"
+    straight to "id, no extras", never trying "empty record + extras". A
+    long id that doesn't fit beside the extras therefore cost the extras
+    entirely, even when they'd have fit beside {} -- which is how a
+    calendar event's Meet link could vanish under truncation although it
+    had room. The pre-PR code kept it (its phase 2 collapsed the record to
+    {} with extras still attached), so this was a regression."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "66")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"id": "LONGISHIDVALUE1234", "Notes": "x" * 5000},
+        extra_fields={"f": True},
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 66
+    assert result["truncated"] is True
+    assert result["record"] == {}
+    assert result["f"] is True
+
+
+def test_success_with_capped_dict_last_resort_never_degrades_an_extra_that_would_grow(
+    monkeypatch,
+):
+    """Regression test: degrading an already-tiny extra field (here, `1`,
+    1 byte) to `True` (4 bytes) would grow the payload, so the ladder must
+    skip that step -- and, since the extras fit beside an empty record,
+    keep the field with its real value rather than a bloated `true`."""
     monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "70")
 
     raw = utils.success_with_capped_dict(
@@ -1365,11 +1454,7 @@ def test_success_with_capped_dict_extras_degradation_never_grows_a_field(
     )
     result = json.loads(raw)
 
-    assert result["status"] == "success"
+    assert len(raw) <= 70
     assert result["truncated"] is True
-    # The undegraded extras candidate doesn't fit at this limit, and
-    # degrading "tiny" to `True` wouldn't help (it would grow), so this
-    # must land on the next viable fallback -- dropping extras entirely
-    # while still keeping the record's id -- not a bloated "tiny": true.
-    assert result["record"] == {"id": "rec1"}
-    assert "tiny" not in result
+    assert result["record"] == {}
+    assert result["tiny"] == 1

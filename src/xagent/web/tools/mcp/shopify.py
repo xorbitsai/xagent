@@ -20,9 +20,9 @@ from ....core.utils.security import (
 from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
 from .utils import (
     clamp_limit,
+    halve_dict_or_mark,
     setup_proxy_env,
     success_with_capped_dict,
-    truncation_marker_or_empty,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -804,10 +804,11 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
     own room afterward, the tail loop below still halves `value`'s keys
     locally (no cursor concern there either, but also no clean way to ask
     `success_with_capped_dict` to shrink further around an already-built
-    envelope) -- it shares `truncation_marker_or_empty`'s 1-key-floor fix
-    with that function's own phase 1, but not its id-preserving last-resort
-    tier, so a record already down to one key can still empty out here in
-    a way `success_with_capped_dict` alone would have recovered.
+    envelope) -- it shares `halve_dict_or_mark`'s per-step decision (and
+    its 1-key-floor fix) with that function's own phase 1, but not its
+    id-preserving last-resort tier, so a record already down to one key can
+    still empty out here in a way `success_with_capped_dict` alone would
+    have recovered.
     """
     response = _success(**{field_name: value}, _errors=errors)
     max_output_length = get_tool_max_output_length()
@@ -837,31 +838,22 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
         else:
             high = middle - 1
     payload["warnings"] = [warning[:low] + marker]
+    # Same per-step rule as success_with_capped_dict's phase 1 (halve the
+    # keys, then a size-gated marker at the one-key floor), via the shared
+    # helper. `floored` tracks the floor explicitly, like that function's
+    # exhausted_keys, instead of relying on the marker never comparing
+    # strictly smaller than itself: this loop has no tier below {}, so once
+    # the floor is reached and the payload is still oversized, the field is
+    # emptied outright rather than re-selected.
+    floored = False
     while len(json.dumps(payload, ensure_ascii=False)) > max_output_length:
         value = payload.get(field_name)
         if not isinstance(value, dict) or not value:
             break
-        keys = list(value)
-        if len(keys) > 1:
-            payload[field_name] = {key: value[key] for key in keys[: len(keys) // 2]}
-            continue
-        # A 1-key dict can't shrink further by dropping keys without
-        # emptying it outright -- the same key-count-halving rule
-        # success_with_capped_dict's phase 1 uses floors to zero once only
-        # one key is left, collapsing straight to {} in a single step
-        # instead of degrading gradually (see that function's docstring
-        # for the general problem this mirrors; this loop reimplements
-        # its own halving locally to make room for `warnings`, so it
-        # inherited the same sharp edge). truncation_marker_or_empty
-        # applies the identical fix: a small marker when that's actually
-        # smaller than what it replaces, otherwise {} -- this loop has no
-        # further fallback tier below {}, so it must still empty the field
-        # outright if even the marker doesn't make it fit. Once `value`
-        # already *is* the marker, the helper's own size comparison
-        # naturally falls to {} (a value equal to the marker is never
-        # strictly smaller than itself), so this terminates without
-        # needing to detect that case separately.
-        payload[field_name] = truncation_marker_or_empty(value)
+        if floored:
+            payload[field_name] = {}
+            break
+        payload[field_name], floored = halve_dict_or_mark(value)
     return json.dumps(payload, ensure_ascii=False)
 
 

@@ -191,27 +191,44 @@ def url_path_id(value: str, field_name: str) -> str:
 # way the envelope's own top-level "truncated" flag is, rather than leaving
 # a bare {} a caller can't distinguish from "always empty" -- but only when
 # the marker is itself smaller than the value it replaces (see
-# truncation_marker_or_empty): a marker bigger than a tiny value would grow
+# _truncation_marker_or_empty): a marker bigger than a tiny value would grow
 # the payload instead of shrinking it, eating into the budget phase 2 and
 # the id-preserving last-resort fallback need to keep other fields alive.
 _FIELD_TRUNCATION_MARKER: dict[str, Any] = {"truncated": True}
 
 
-def truncation_marker_or_empty(value: Any) -> dict[str, Any]:
+def _truncation_marker_or_empty(value: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``_FIELD_TRUNCATION_MARKER`` if it's smaller
-    (serialized) than ``value``, otherwise ``{}``.
-
-    Shared by ``success_with_capped_dict``'s own phase 1 and any local
-    caller that reimplements the identical "this dict is down to its last
-    key, shrink it one more step" decision (e.g. a connector's own
-    capping helper that needs to make room for extra fields after
-    delegating the bulk of the shrinking to ``success_with_capped_dict``)
-    -- factored out so the decision has exactly one implementation to fix
-    when a case like this is found, instead of drifting between copies.
-    """
+    (serialized) than ``value``, otherwise ``{}``."""
     marker_size = len(json.dumps(_FIELD_TRUNCATION_MARKER, ensure_ascii=False))
     current_size = len(json.dumps(value, ensure_ascii=False))
     return dict(_FIELD_TRUNCATION_MARKER) if marker_size < current_size else {}
+
+
+def halve_dict_or_mark(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """One shrink step for a non-empty dict-valued field: drop the trailing
+    half of its keys while it still has more than one, otherwise replace it
+    with ``_truncation_marker_or_empty``'s result.
+
+    Returns ``(shrunk, floored)``. ``floored`` is True once the field hit
+    its one-key floor -- whatever came back (marker or ``{}``) is that
+    field's final state and nothing further can be squeezed out of it, so a
+    caller must stop selecting it rather than re-detect the marker later by
+    equality (which would misfire if real data happened to equal it, and
+    would spin forever if the size comparison ever admitted ties).
+
+    Shared by ``success_with_capped_dict``'s own phase 1 and any local
+    caller that reimplements the identical per-step decision (e.g. a
+    connector's own capping helper that needs to make room for extra fields
+    after delegating the bulk of the shrinking to
+    ``success_with_capped_dict``) -- factored out so the decision has
+    exactly one implementation to fix when a case like this is found,
+    instead of drifting between copies.
+    """
+    keys = list(value)
+    if len(keys) > 1:
+        return {key: value[key] for key in keys[: len(keys) // 2]}, False
+    return _truncation_marker_or_empty(value), True
 
 
 def success_with_capped_dict(
@@ -243,31 +260,42 @@ def success_with_capped_dict(
     single step instead of degrading gradually -- and a 2-key dict reaches
     that same floor one step later, once halving has already dropped it to
     one key. Whenever a dict-valued field is down to its last key, phase 1
-    replaces it with ``truncation_marker_or_empty``'s result -- the small
+    replaces it via ``halve_dict_or_mark`` with the small
     ``_FIELD_TRUNCATION_MARKER`` when that's actually smaller than the
-    value it replaces, otherwise {} same as before -- so that field stays
-    a small, non-empty signal that something here was dropped rather than
-    growing the payload. Phase 2 is a fallback for the residual case -- a
-    dict with no *remaining* list/dict-valued keys (either because it never
-    had any, e.g. a handful of scalar keys with huge string values, or
-    because phase 1 already exhausted the ones it had) -- and drops whole
-    top-level keys the same way, but always leaves at least one key
-    standing rather than run the same single-key floor all the way down to
-    {}. This still doesn't guarantee the final response never contains
-    ``{}`` for this field: if even one surviving key doesn't fit, the
-    last-resort fallback below can still fall back that far, by design --
-    these two phases only guarantee they won't be the ones to empty it
-    needlessly.
+    value it replaces (otherwise {} same as before), so that field stays a
+    small, non-empty signal that something here was dropped rather than
+    growing the payload. Those markers are a luxury, though: each costs a
+    few bytes more than {}, and with several exhausted fields that overhead
+    can push a response that would have fit with {} back over the limit.
+    So before phase 2 starts dropping whole fields, installed markers are
+    downgraded back to {} one at a time (smallest original field first)
+    until the response fits -- budget goes to keeping every field present
+    before it goes to labelling any of them. Phase 2 is a fallback for the
+    residual case -- a dict with no *remaining* list/dict-valued keys
+    (either because it never had any, e.g. a handful of scalar keys with
+    huge string values, or because phase 1 already exhausted the ones it
+    had) -- and drops whole top-level keys the same way, but always leaves
+    at least one key standing rather than run the same single-key floor all
+    the way down to {}. This still doesn't guarantee the final response
+    never contains ``{}`` for this field: if even one surviving key doesn't
+    fit, the last-resort fallback below can still fall back that far, by
+    design -- these phases only guarantee they won't be the ones to empty
+    it needlessly.
 
     ``extra_fields`` adds fixed top-level response fields that must be counted
     while trimming the dict, such as a calendar event's derived Meet link.
     Reserved envelope keys cannot be overridden. If the payload is still too
-    large once ``data`` itself is fully truncated, each extra field whose
-    value is bigger than the ``True`` placeholder is degraded to ``True``
-    (largest first, same size-gate as the field marker above) before any of
-    them are dropped outright, so a caller-registered field (e.g. a
-    per-field truncation flag) keeps its key -- signaling it exists but is
-    unreliable -- for as long as there's room for it at all.
+    large once ``data`` itself is fully truncated, the last resort walks a
+    ladder from most to least informative: the record's id (if it has one)
+    with the extras intact, then with each extra field whose value is
+    bigger than the ``True`` placeholder degraded to ``True`` (largest
+    first, same size-gate as the field marker above); then an empty record
+    with the extras intact; then the id alone; then an empty record with
+    the degraded extras; and only then an empty record with no extras at
+    all. Real values outrank placeholders at every rung: a Meet link that
+    fits beside an empty record beats keeping only the id (that rung is
+    what stops a long id from crowding the link out entirely), but a
+    ``True`` placeholder for it does not beat the id.
     """
     extras = extra_fields or {}
     reserved_fields = {"status", field_name, "truncated"}
@@ -282,13 +310,13 @@ def success_with_capped_dict(
         payload: Any,
         truncated: bool,
         *,
-        with_extras: bool = True,
+        extras_override: dict[str, Any] | None = None,
     ) -> str:
         return json.dumps(
             {
                 "status": "success",
                 field_name: payload,
-                **(extras if with_extras else {}),
+                **(extras if extras_override is None else extras_override),
                 "truncated": truncated,
             },
             ensure_ascii=False,
@@ -301,6 +329,7 @@ def success_with_capped_dict(
     working = dict(data)
     truncated = False
     exhausted_keys: set[str] = set()
+    marker_keys: list[str] = []
     while len(response) > max_output_length:
         collection_keys = [
             key
@@ -319,22 +348,22 @@ def success_with_capped_dict(
         if isinstance(target_value, list):
             working[target_key] = target_value[: len(target_value) // 2]
         else:
-            sub_keys = list(target_value.keys())
-            if len(sub_keys) > 1:
-                working[target_key] = {
-                    sub_key: target_value[sub_key]
-                    for sub_key in sub_keys[: len(sub_keys) // 2]
-                }
-            else:
-                # A 1-key dict can't shrink further by dropping keys
-                # without emptying it outright. Either way this field is
-                # done: mark it exhausted now instead of waiting to detect
-                # the marker again on a later pass by equality, which
-                # would also misfire if real data happened to equal the
-                # marker.
-                working[target_key] = truncation_marker_or_empty(target_value)
+            shrunk, floored = halve_dict_or_mark(target_value)
+            working[target_key] = shrunk
+            if floored:
                 exhausted_keys.add(target_key)
+                if shrunk:
+                    marker_keys.append(target_key)
         truncated = True
+        response = _build(working, truncated)
+
+    # Markers cost more bytes than {}; with several exhausted fields that
+    # overhead alone can keep the response over the limit and hand phase 2
+    # a reason to drop whole sibling fields that would have fit as {}.
+    # Downgrade markers first, latest-installed (smallest original field)
+    # first, so every field stays present before any of them gets labelled.
+    while len(response) > max_output_length and marker_keys:
+        working[marker_keys.pop()] = {}
         response = _build(working, truncated)
 
     keys = list(working.keys())
@@ -358,18 +387,9 @@ def success_with_capped_dict(
                 compact_data[id_key] = data[id_key]
                 break
 
-        def _build_compact(current_extras: dict[str, Any]) -> str:
-            return json.dumps(
-                {
-                    "status": "success",
-                    field_name: compact_data,
-                    **current_extras,
-                    "truncated": True,
-                },
-                ensure_ascii=False,
-            )
-
-        candidates = [_build_compact(extras)]
+        # Extras snapshots from most to least informative: intact first,
+        # then one more field degraded to `True` per step, largest first.
+        extras_steps = [dict(extras)]
         degraded_extras = dict(extras)
         degraded_marker_size = len(json.dumps(True, ensure_ascii=False))
         while degraded_extras:
@@ -385,20 +405,36 @@ def success_with_capped_dict(
             ):
                 # The largest remaining extra is already the placeholder,
                 # or degrading it wouldn't actually shrink it (e.g. an
-                # already-short scalar) -- the same size-gate
-                # success_with_capped_dict's own field marker uses (see
-                # truncation_marker_or_empty), applied here so this loop
-                # can't grow the payload it exists to shrink. Whatever
-                # smaller (or already-`True`) fields remain aren't worth
-                # visiting individually, and the candidates below take it
-                # from here.
+                # already-short scalar) -- the same size-gate the field
+                # marker uses (see _truncation_marker_or_empty), applied
+                # here so this ladder can't grow the payload it exists to
+                # shrink. Whatever smaller (or already-`True`) fields
+                # remain aren't worth visiting individually.
                 break
             degraded_extras[largest_key] = True
-            candidates.append(_build_compact(degraded_extras))
+            extras_steps.append(dict(degraded_extras))
+
+        # Rungs, top to bottom: id + extras (intact, then degraded); empty
+        # record + intact extras; id alone; empty record + degraded extras;
+        # empty record alone. Real information outranks placeholders at
+        # every step: a Meet link that fits beside {} beats keeping only the
+        # id (without that rung it vanished just because it didn't fit
+        # beside the id), but a `True` placeholder for it does not -- the
+        # id is worth more than a flag that only says "there was a link".
+        full_extras, degraded_steps = extras_steps[0], extras_steps[1:]
+        candidates = [
+            _build(compact_data, True, extras_override=step) for step in extras_steps
+        ]
+        if compact_data:
+            candidates.append(_build({}, True, extras_override=full_extras))
+        candidates.append(_build(compact_data, True, extras_override={}))
+        if compact_data:
+            candidates.extend(
+                _build({}, True, extras_override=step) for step in degraded_steps
+            )
         candidates.extend(
             (
-                _build(compact_data, True, with_extras=False),
-                _build({}, True, with_extras=False),
+                _build({}, True, extras_override={}),
                 json.dumps(
                     {"status": "success", "truncated": True}, ensure_ascii=False
                 ),

@@ -67,6 +67,7 @@ def shared_redis_url(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def local_execution_unless_selected(monkeypatch, tmp_path, shared_redis_url):
     """Override the legacy-suite fixture: E2E never defaults to local execution."""
+    from xagent.core.file_storage import get_unscoped_file_storage
     from xagent.core.utils.encryption import get_cipher
 
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
@@ -77,5 +78,8 @@ def local_execution_unless_selected(monkeypatch, tmp_path, shared_redis_url):
     monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path / "storage"))
     get_cipher.cache_clear()
+    # Each fixture has its own root, shared with fresh worker processes.
+    get_unscoped_file_storage.cache_clear()
     yield
+    get_unscoped_file_storage.cache_clear()
     get_cipher.cache_clear()

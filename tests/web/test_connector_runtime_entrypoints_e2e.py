@@ -887,6 +887,8 @@ async def test_feishu_new_task_fallback_snapshots_empty(
         )
 
         bot = object.__new__(FeishuBotInstance)
+        bot._initialize_batch_control()
+        bot.user_active_trace_handlers = {}
         bot.channel_id = int(channel.id)
         bot.channel_name = "Feishu test"
         bot.active_tasks = {}
@@ -983,6 +985,8 @@ async def test_feishu_existing_task_commits_registered_attachment_before_executi
     )
 
     bot = object.__new__(FeishuBotInstance)
+    bot._initialize_batch_control()
+    bot.user_active_trace_handlers = {}
     bot.channel_id = channel_id
     bot.channel_name = "Feishu attachment test"
     bot.active_tasks = {"open-id-existing": str(task_id)}

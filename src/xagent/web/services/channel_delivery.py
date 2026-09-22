@@ -45,6 +45,11 @@ class ChannelDelivery:
     user_id: int
     destination: dict[str, Any]
     claim_token: str
+    external_user_id: str
+
+
+class ChannelDeliveryDiscarded(Exception):
+    """The sender intentionally suppressed an abandoned conversation reply."""
 
 
 ChannelSender = Callable[[ChannelDelivery, dict[str, Any]], Awaitable[None]]
@@ -97,6 +102,7 @@ def _claim(
             cast(int, command.actor_user_id),
             dict(row.destination),
             token,
+            channel["external_user_id"],
         )
         try:
             owner = _load_channel_owner_sync(
@@ -270,7 +276,13 @@ async def deliver_channel_result(
         )
         if heartbeat in done:
             await heartbeat
-        await sending
+        try:
+            await sending
+        except ChannelDeliveryDiscarded:
+            await run_db_io_cancellation_safe(
+                lambda: _settle(delivery, status="discarded")
+            )
+            return False
         status = "delivered" if result is not None else "pending"
         await run_db_io_cancellation_safe(
             lambda: (
@@ -306,6 +318,39 @@ async def deliver_channel_result(
             *(child for child in (sending, heartbeat) if child is not None),
             return_exceptions=True,
         )
+
+
+async def discard_channel_task_results(
+    *, channel_id: int, external_user_id: str, task_id: int
+) -> None:
+    """Discard pending replies for an authorized abandoned conversation."""
+
+    def discard() -> None:
+        with get_session_local()() as db:
+            owner = _load_channel_owner_sync(
+                db, channel_id=channel_id, external_user_id=external_user_id
+            )
+            commands = (
+                select(TaskExecutionCommand.id)
+                .join(Task, Task.id == TaskExecutionCommand.task_id)
+                .where(
+                    Task.id == task_id,
+                    Task.user_id == owner.user_id,
+                    Task.channel_id == channel_id,
+                )
+            )
+            db.execute(
+                update(TaskChannelDelivery)
+                .where(
+                    TaskChannelDelivery.command_id.in_(commands),
+                    TaskChannelDelivery.channel_id == channel_id,
+                    TaskChannelDelivery.status == "pending",
+                )
+                .values(status="discarded", claim_token=None)
+            )
+            db.commit()
+
+    await run_db_io_cancellation_safe(discard)
 
 
 def _pending(channel_id: int) -> list[int]:

@@ -52,6 +52,7 @@ dependencies = [
   "redis>=5.0.0",
   "pillow >= 10.0.0",
   "defusedxml>=0.7.1",
+  "python-docx>=1.1.0",  # Built-in Word MCP connector runtime
   "pypinyin>=0.53.0",
   "cairosvg >= 2.7.1",
   "lancedb>=0.32.0",
@@ -318,6 +319,7 @@ module = [
   "asyncssh",
   "bashlex",
   "docx",
+  "docx.*",
   "defusedxml",
   "defusedxml.*",
   "pptx",
@@ -383,6 +385,9 @@ module = [
   # asyncssh ships no type stubs; the runner annotates connection types that
   # would otherwise trip disallow_any_unimported.
   "xagent.core.ssh.runner",
+  # python-docx ships no type stubs; this module annotates its Document type
+  # (docx.document.Document) which would otherwise trip disallow_any_unimported.
+  "xagent.web.tools.mcp.word",
 ]
 disallow_any_unimported = false
 warn_unused_ignores = false

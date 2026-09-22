@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
 from lark_oapi.api.im.v1 import (
@@ -20,6 +21,8 @@ class FeishuTraceHandler(TraceHandler):
         api_client: Any,
         chat_id: str,
         message_id: Optional[str] = None,
+        *,
+        send_update: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.task_id = task_id
         self.api_client = api_client
@@ -28,6 +31,13 @@ class FeishuTraceHandler(TraceHandler):
             message_id  # The ID of the loading message we can potentially update
         )
         self.current_text = ""
+        self.cancelled = False
+        self._send_update = send_update
+
+    def cancel(self, *, discard_output: bool = True) -> None:
+        self.cancelled = True
+        # The shared cancel signature is retained; Feishu final replies use
+        # the bot's conversation generation instead of trace-handler state.
 
     async def handle_event(self, event: TraceEvent) -> None:
         try:
@@ -58,12 +68,17 @@ class FeishuTraceHandler(TraceHandler):
             logger.warning(f"FeishuTraceHandler error for task {self.task_id}: {e}")
 
     async def _update_message(self, text: str, final: bool = False) -> None:
-        if not text:
+        if self.cancelled or not text:
             return
 
         display_text = text if final else text + " ✍️"
 
         if self.current_text == display_text:
+            return
+
+        if self._send_update is not None:
+            await self._send_update(display_text[:4000])
+            self.current_text = display_text
             return
 
         self.current_text = display_text
@@ -87,6 +102,8 @@ class FeishuTraceHandler(TraceHandler):
                 resp = await asyncio.get_event_loop().run_in_executor(
                     None, self.api_client.im.v1.message.patch, req
                 )
+                if self.cancelled:
+                    return
                 if not resp.success():
                     logger.error(
                         f"Failed to patch Feishu message: {resp.code}, {resp.msg}"

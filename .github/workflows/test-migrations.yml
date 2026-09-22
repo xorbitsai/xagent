@@ -51,6 +51,9 @@ on:
       - 'src/xagent/core/workspace.py'
       - 'src/xagent/web/models/task_channel_delivery.py'
       - 'src/xagent/web/services/channel_input_acceptance.py'
+      - 'src/xagent/web/channels/batch_control.py'
+      - 'src/xagent/web/channels/feishu/bot.py'
+      - 'src/xagent/web/channels/feishu/trace_handler.py'
       - 'src/xagent/web/services/channel_delivery.py'
       - 'src/xagent/web/services/channel_progress.py'
       - 'src/xagent/web/services/task_event_bridge.py'
@@ -59,6 +62,10 @@ on:
       - 'tests/web/services/test_channel_delivery.py'
       - 'tests/web/services/test_task_event_bridge.py'
       - 'tests/web/services/test_channel_input_acceptance.py'
+      - 'tests/web/test_slack_durable_input.py'
+      - 'tests/web/test_feishu_durable_input.py'
+      - 'src/xagent/web/channels/slack/bot.py'
+      - 'src/xagent/web/channels/slack/trace_handler.py'
       - 'src/xagent/web/services/channel_runtime.py'
       - 'src/xagent/web/services/task_command_transport.py'
       - 'tests/web/services/test_task_command_transport.py'
@@ -198,6 +205,9 @@ jobs:
             src/xagent/core/workspace.py
             src/xagent/web/models/task_channel_delivery.py
             src/xagent/web/services/channel_input_acceptance.py
+            src/xagent/web/channels/batch_control.py
+            src/xagent/web/channels/feishu/bot.py
+            src/xagent/web/channels/feishu/trace_handler.py
             src/xagent/web/services/channel_delivery.py
             src/xagent/web/services/channel_progress.py
             src/xagent/web/services/task_event_bridge.py
@@ -206,6 +216,10 @@ jobs:
             tests/web/services/test_channel_delivery.py
             tests/web/services/test_task_event_bridge.py
             tests/web/services/test_channel_input_acceptance.py
+            tests/web/test_slack_durable_input.py
+            tests/web/test_feishu_durable_input.py
+            src/xagent/web/channels/slack/bot.py
+            src/xagent/web/channels/slack/trace_handler.py
             src/xagent/web/services/channel_runtime.py
             src/xagent/web/services/task_command_transport.py
             tests/web/services/test_task_command_transport.py
@@ -516,7 +530,7 @@ jobs:
       - name: Test task command staging concurrency (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          pytest tests/web/services/test_channel_input_acceptance.py tests/web/services/test_channel_progress.py tests/web/services/test_channel_delivery.py tests/web/services/test_a2a_input_idempotency.py tests/alembic/test_20260919_task_input_receipts.py tests/web/services/test_task_command_transport.py tests/web/services/test_task_start_protocol.py tests/web/services/test_shared_execution_postgresql.py tests/web/services/test_task_coordinator_commands.py tests/web/services/test_command_owner_dispatch.py tests/alembic/test_20260918_command_retry_available_at.py tests/web/services/test_task_coordinator_runtime.py tests/web/services/test_task_coordinator_service.py tests/web/services/test_task_coordinator_heartbeat.py tests/web/services/test_shared_channel_execution.py -m postgresql -q
+          pytest tests/web/test_slack_durable_input.py tests/web/test_feishu_durable_input.py tests/web/services/test_channel_input_acceptance.py tests/web/services/test_channel_progress.py tests/web/services/test_channel_delivery.py tests/web/services/test_a2a_input_idempotency.py tests/alembic/test_20260919_task_input_receipts.py tests/web/services/test_task_command_transport.py tests/web/services/test_task_start_protocol.py tests/web/services/test_shared_execution_postgresql.py tests/web/services/test_task_coordinator_commands.py tests/web/services/test_command_owner_dispatch.py tests/alembic/test_20260918_command_retry_available_at.py tests/web/services/test_task_coordinator_runtime.py tests/web/services/test_task_coordinator_service.py tests/web/services/test_task_coordinator_heartbeat.py tests/web/services/test_shared_channel_execution.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

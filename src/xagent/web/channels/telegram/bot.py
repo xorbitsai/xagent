@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import (
     Any,
     Callable,
-    Coroutine,
     Dict,
     Optional,
     Sequence,
@@ -82,6 +81,7 @@ from ...services.task_execution_context_service import (
 from ...services.task_lease_service import TaskLeaseLostError
 from ...services.task_orchestrator import TaskTurnPayload
 from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
+from ..batch_control import BatchChannelControl
 from .handler import TelegramTraceHandler
 from .utils import (
     CancelledDelivery,
@@ -118,7 +118,8 @@ class TelegramVoiceTranscriptionError(RuntimeError):
     """Raised when a Telegram voice prompt cannot be transcribed."""
 
 
-class TelegramBotInstance:
+class TelegramBotInstance(BatchChannelControl[int]):
+    control_label = "Telegram"
     queue_flush_delay_seconds = 1.0
     voice_transcription_timeout_seconds = 180.0
     task_list_message_limit = 3800
@@ -535,16 +536,6 @@ class TelegramBotInstance:
             self.user_switch_locks[user_id] = lock
         return lock
 
-    def _enqueue_user_message(self, user_id: int, message: Any) -> bool:
-        if not self._accepting:
-            return False
-
-        self.user_message_queues.setdefault(user_id, []).append(message)
-        task = self.user_message_tasks.get(user_id)
-        if task is None or task.done():
-            self._schedule_user_queue(user_id)
-        return True
-
     @staticmethod
     def _help_text() -> str:
         return (
@@ -827,17 +818,6 @@ class TelegramBotInstance:
             )
         return None
 
-    def _schedule_user_queue(self, user_id: int) -> bool:
-        if not self._accepting:
-            return False
-        self.user_message_tasks[user_id] = asyncio.create_task(
-            self._process_user_queue(user_id)
-        )
-        return True
-
-    def _conversation_generation(self, user_id: int) -> int:
-        return self.user_conversation_generations.get(user_id, 0)
-
     def _start_new_conversation(self, user_id: int) -> tuple[bool, bool]:
         """Reset the conversation. Returns (stopped_something, persisted)."""
 
@@ -864,119 +844,8 @@ class TelegramBotInstance:
         )
         return stopped, True
 
-    def _stop_current_conversation(self, user_id: int) -> bool:
-        # discard_output=False: /stop pauses the run but keeps the user in this
-        # conversation, so the partial answer must still be delivered.
-        return self._request_current_conversation_stop(
-            user_id,
-            reason="Telegram stop requested",
-            discard_output=False,
-        )
-
-    def _request_current_conversation_stop(
-        self, user_id: int, *, reason: str, discard_output: bool = True
-    ) -> bool:
-        queued_messages = self.user_message_queues.pop(user_id, None)
-        active_trace_handler = self._active_trace_handlers().get(user_id)
-        if active_trace_handler is not None:
-            active_trace_handler.cancel(discard_output=discard_output)
-        active_execution = self.user_active_executions.get(user_id)
-        if active_execution is not None and isinstance(
-            active_execution[1], SharedChannelTurn
-        ):
-            active_execution[1].discard_output = discard_output
-        stopped = self._stop_user_active_execution(user_id, reason=reason)
-        preparing = user_id in self.user_preparing_executions
-        if preparing and not stopped:
-            self._request_user_stop(user_id)
-        return bool(queued_messages) or stopped or preparing
-
     def _active_trace_handlers(self) -> Dict[int, TelegramTraceHandler]:
         return self.user_active_trace_handlers
-
-    def _stop_user_active_execution(self, user_id: int, *, reason: str) -> bool:
-        active_execution = self.user_active_executions.get(user_id)
-        if active_execution is None:
-            return False
-
-        task_id, agent_service = active_execution
-        if isinstance(agent_service, SharedChannelTurn):
-            return agent_service.request_stop()
-        pause_execution_by_id = getattr(agent_service, "pause_execution_by_id", None)
-        if not callable(pause_execution_by_id):
-            logger.warning(
-                "Telegram active task %s for user %s does not support pause",
-                task_id,
-                user_id,
-            )
-            return False
-
-        try:
-            return bool(pause_execution_by_id(str(task_id), reason=reason))
-        except Exception as e:
-            logger.warning(
-                "Failed to pause Telegram active task %s for user %s: %s",
-                task_id,
-                user_id,
-                e,
-            )
-            return False
-
-    def _get_user_stop_event(self, user_id: int) -> asyncio.Event:
-        event = self.user_stop_events.get(user_id)
-        if event is None:
-            event = asyncio.Event()
-            self.user_stop_events[user_id] = event
-        return event
-
-    def _request_user_stop(self, user_id: int) -> None:
-        self._get_user_stop_event(user_id).set()
-
-    def _consume_user_stop_request(self, user_id: int) -> bool:
-        event = self.user_stop_events.get(user_id)
-        if event is None or not event.is_set():
-            return False
-        event.clear()
-        return True
-
-    def _clear_user_stop_request(self, user_id: int) -> None:
-        event = self.user_stop_events.get(user_id)
-        if event is not None:
-            event.clear()
-
-    async def _await_execution_with_stop_monitor(
-        self,
-        user_id: int,
-        execution: Coroutine[Any, Any, dict[str, Any]],
-        *,
-        reason: str,
-    ) -> dict[str, Any]:
-        execution_task: asyncio.Task[dict[str, Any]] = asyncio.create_task(execution)
-        stop_event = self._get_user_stop_event(user_id)
-
-        try:
-            while True:
-                if execution_task.done():
-                    return await execution_task
-
-                if stop_event.is_set():
-                    while not execution_task.done():
-                        if self._stop_user_active_execution(user_id, reason=reason):
-                            stop_event.clear()
-                            break
-                        await asyncio.sleep(0.05)
-                    continue
-
-                done, _ = await asyncio.wait(
-                    {execution_task},
-                    timeout=0.05,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if execution_task in done:
-                    return await execution_task
-        finally:
-            if not execution_task.done():
-                await cancel_and_drain_async_task(execution_task)
 
     @staticmethod
     async def _finalize_requested_stop(
@@ -1283,25 +1152,8 @@ class TelegramBotInstance:
         if stop_event is not None and not stop_event.is_set():
             self.user_stop_events.pop(user_id, None)
 
-    async def _process_user_queue(self, user_id: int) -> None:
-        while True:
-            await asyncio.sleep(self.queue_flush_delay_seconds)
-            messages = self.user_message_queues.pop(user_id, [])
-            if messages:
-                await self._process_user_messages_batch(user_id, messages)
-
-            if self.user_message_queues.get(user_id):
-                continue
-
-            current_task = cast(asyncio.Task, asyncio.current_task())
-            if self.user_message_tasks.get(user_id) is current_task:
-                self.user_message_tasks.pop(user_id, None)
-
-            if not self.user_message_queues.get(user_id):
-                self._prune_idle_user_state(user_id)
-                return
-
-            self.user_message_tasks[user_id] = current_task
+    async def _process_queued_batch(self, user_id: int, messages: list[Any]) -> None:
+        await self._process_user_messages_batch(user_id, messages)
 
     async def _extract_message_content(
         self, message: types.Message

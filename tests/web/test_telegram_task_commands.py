@@ -1227,3 +1227,24 @@ def test_directory_fsync_is_skipped_where_it_is_unsupported(
     assert TelegramBotInstance._save_active_tasks(bot) is False
     assert bot._active_tasks_unsaved is True
     assert opened == [str(tmp_path)]
+
+
+def test_stop_signals_new_preparation_despite_retained_shared_turn() -> None:
+    from unittest.mock import Mock
+
+    from xagent.web.services.channel_runtime import SelectedChannelTask
+    from xagent.web.services.shared_channel_execution import SharedChannelTurn
+
+    bot = _bot(1)
+    previous = SharedChannelTurn(
+        SelectedChannelTask(1, 7, False, 1, "101", None, 0), None
+    )
+    previous.request_stop = Mock(return_value=True)
+    bot.user_active_executions[101] = (7, previous)
+    bot.user_preparing_executions.add(101)
+    bot.user_message_queues[101] = ["before stop"]
+
+    assert bot._stop_current_conversation(101)
+    previous.request_stop.assert_called_once()
+    assert bot._consume_user_stop_request(101)
+    assert not bot.user_message_queues

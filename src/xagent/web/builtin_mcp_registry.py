@@ -806,6 +806,30 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "word",
+            "name": "Word",
+            "description": "Connect to Word to create documents and read or edit top-level main-body paragraphs stored on OneDrive or SharePoint. Tables, headers, footers, text boxes, notes, and tracked changes are excluded.",
+            "icon": "https://www.google.com/s2/favicons?domain=office.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "microsoft",
+            "category": "Productivity",
+            "oauth_scopes": ["Files.ReadWrite.All"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.word"],
+                "env_mapping": {"AUTH_TOKEN": "access_token"},
+                "static_env": {
+                    "XAGENT_TOOL_MAX_OUTPUT_LENGTH": "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+                },
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "word",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "excel",
             "name": "Excel",
             "description": "Connect to Excel to read and write worksheets, cell ranges, and tables in workbooks stored on OneDrive or SharePoint.",
@@ -1110,6 +1134,84 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "builtin_provenance": {
                     "registry": "xagent",
                     "app_id": "miro",
+                    "version": 1,
+                },
+            },
+        },
+        {
+            "app_id": "fireflies",
+            "name": "Fireflies",
+            "description": "Connect to Fireflies to search your meetings and read transcripts, summaries and action items through Fireflies' hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=fireflies.ai&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth), same shape as Granola/Notion/Atlassian/
+            # Miro: Fireflies hosts the server itself
+            # (docs.fireflies.ai/getting-started/mcp-configuration) and
+            # exposes its own meeting tools; there is no local module to
+            # launch. The protected-resource metadata names
+            # "https://api.fireflies.ai/mcp" as the resource and
+            # "https://api.fireflies.ai/" as the authorization server, whose
+            # metadata advertises a registration_endpoint, PKCE S256 and token
+            # auth method "none", so users connect via POST
+            # /api/mcp/apps/{id}/oauth/connect (per-user OAuth 2.1
+            # Authorization Code + PKCE with Dynamic Client Registration) and
+            # no static client credentials are required. The vendor docs also
+            # describe a static "Authorization: Bearer <api key>" header as a
+            # Claude Desktop alternative; the catalog deliberately models only
+            # the OAuth shape, so no secret ever lives in launch_config.
+            "launch_config": {
+                "url": "https://api.fireflies.ai/mcp",
+                "auth": {"type": "mcp_oauth"},
+                # Same ownership marker as the atlassian/miro rows above.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "fireflies",
+                    "version": 1,
+                },
+            },
+        },
+        {
+            "app_id": "rocketlane",
+            "name": "Rocketlane",
+            "description": "Connect to Rocketlane to search projects, create and update delivery tasks and log time entries through Rocketlane's hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=rocketlane.com&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth), same shape as Granola/Notion: Rocketlane
+            # hosts the server itself and exposes its own project, task and
+            # time-entry tools; there is no local module to launch. Users
+            # connect via POST /api/mcp/apps/{id}/oauth/connect (per-user
+            # OAuth 2.1 Authorization Code + PKCE); the authorization server
+            # advertises a registration_endpoint and lists "none" among its
+            # token_endpoint_auth_methods_supported, so Dynamic Client
+            # Registration is used and no static client credentials are
+            # required.
+            #
+            # Discovery takes the path-suffixed candidate at both hops and
+            # needs no mcp_oauth.py change: the protected-resource document
+            # lives at /.well-known/oauth-protected-resource/mcp (the host
+            # root returns 404), which protected_resource_metadata_urls tries
+            # first for a path-bearing endpoint, and it names the
+            # path-bearing issuer
+            # https://rocketlane.scalekit.com/resources/res_121247790507492638,
+            # whose metadata authorization_server_metadata_urls likewise
+            # looks for under /.well-known/oauth-authorization-server<path>
+            # (the same shape as the atlassian row's
+            # auth.atlassian.com/<tenant> issuer).
+            "launch_config": {
+                "url": "https://rocket-mcp.rl-platforms.rocketlane.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+                # Same ownership marker as the atlassian/miro rows above.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "rocketlane",
                     "version": 1,
                 },
             },

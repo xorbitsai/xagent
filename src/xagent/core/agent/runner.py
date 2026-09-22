@@ -923,6 +923,19 @@ class AgentRunner:
                     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
                     None,
                 )
+            # A resumed checkpoint may carry stale or legacy caller-influenced
+            # values. The resume boundary supplies these two server-owned
+            # identities from the current task row and exact execution lease.
+            #
+            # ``is not None`` rather than ``in metadata``: several resume
+            # entry points pass the key unconditionally with a None value
+            # (they have no trusted source of their own to supply). Treating
+            # that as authoritative would erase the checkpointed real source
+            # and permanently deny a pending approval that was gated under it.
+            # An absent value means "I do not know", never "there is none".
+            for key in ("task_source", "run_id"):
+                if metadata.get(key) is not None:
+                    context.metadata[key] = metadata[key]
             return
 
         current_metadata = dict(metadata)

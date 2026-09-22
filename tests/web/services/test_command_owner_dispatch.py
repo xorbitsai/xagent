@@ -128,9 +128,12 @@ async def test_old_processing_claim_does_not_block_new_owner(host):
         assert db.get(TaskExecutionCommand, cid).result == {"reconciled": True}
 
 
-async def test_replaced_owner_cannot_complete_command(host):
+async def test_replaced_owner_cannot_complete_command(host, monkeypatch):
     factory, tid, registry = host
     cid = enqueue(host)
+    # Exercise the settlement fence before heartbeat-driven cancellation can
+    # race it. Owner-loss cancellation is covered by the runtime tests.
+    monkeypatch.setattr(registry, "_run_heartbeats", AsyncMock())
 
     async def execute(command):
         with factory() as db:

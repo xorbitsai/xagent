@@ -920,9 +920,9 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
 
 
 def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
-    """Granola, Notion, Atlassian and Miro have no local launch command at all —
-    they host their own MCP server and are reached over streamable_http. This is
-    intentionally split out of
+    """Granola, Notion, Atlassian, Miro, Fireflies and Rocketlane have no local
+    launch command at all — they host their own MCP server and are reached over
+    streamable_http. This is intentionally split out of
     test_builtin_registry_uses_runtime_available_launch_commands, whose name
     is about local launch *commands* and would misdescribe these
     remote-only entries."""
@@ -964,8 +964,42 @@ def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
         "builtin_provenance": {"registry": "xagent", "app_id": "miro", "version": 1},
     }
 
+    # Fireflies serves MCP under /mcp; its protected-resource metadata names
+    # "https://api.fireflies.ai/mcp" as the resource and "https://api.fireflies.ai/"
+    # as the authorization server. Per-user OAuth 2.1 + PKCE with DCR; the
+    # docs' static API-key header is a Claude Desktop alternative the catalog
+    # deliberately does not model.
+    assert rows_by_app_id["fireflies"]["transport"] == "streamable_http"
+    assert rows_by_app_id["fireflies"]["launch_config"] == {
+        "url": "https://api.fireflies.ai/mcp",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "fireflies",
+            "version": 1,
+        },
+    }
 
-@pytest.mark.parametrize("app_id", ["granola", "notion", "atlassian", "miro"])
+    # Rocketlane serves MCP under /mcp on a dedicated host; its
+    # protected-resource metadata is published at the path-suffixed
+    # /.well-known/oauth-protected-resource/mcp, so the endpoint path is
+    # load-bearing for discovery and must stay exactly as verified.
+    assert rows_by_app_id["rocketlane"]["transport"] == "streamable_http"
+    assert rows_by_app_id["rocketlane"]["launch_config"] == {
+        "url": "https://rocket-mcp.rl-platforms.rocketlane.com/mcp",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "rocketlane",
+            "version": 1,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "app_id",
+    ["granola", "notion", "atlassian", "miro", "fireflies", "rocketlane"],
+)
 def test_builtin_registry_classifies_remote_mcp_apps_as_mcp_oauth(app_id) -> None:
     """The registry shape must classify as mcp_oauth — anything else means the
     catalog entry is uninstallable (connect_mcp_app rejects non-api_key apps

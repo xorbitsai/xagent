@@ -12,6 +12,7 @@ from ....task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
+from ...checkpoint import CheckpointPersistenceError
 from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
@@ -178,26 +179,126 @@ class _DAGStepRuntime:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self.dag_pattern._set_active_step_context(self.step_id, context.to_dict())
-        get_state = getattr(pattern, "get_state", None)
-        if callable(get_state):
-            self.dag_pattern._set_active_step_pattern_state(
-                self.step_id,
-                get_state(),
-            )
+        # Snapshot only this step's own entries. Steps run concurrently
+        # (``max_concurrency`` defaults to 4) and the ``await`` below is a
+        # suspension point, so restoring the whole mapping would discard a
+        # sibling step's in-flight progress on failure.
+        #
+        # No deep copy is needed here, which keeps the hot path (~23
+        # checkpoint call sites per step) free of copying cost. That rests on
+        # two properties, both of which are pinned by tests:
+        #
+        # 1. ``_set_active_step_context`` / ``_set_active_step_pattern_state``
+        #    *replace* the dict entry rather than mutating it in place, so the
+        #    previous object survives the write untouched.
+        # 2. ``context.to_dict()`` and ``pattern.get_state()`` snapshot every
+        #    container that some code path mutates in place, so nothing that
+        #    happens after the entry was stored can reach into it. What they
+        #    still hand out by reference is write-once (replaced wholesale,
+        #    never written through) -- both methods document each exemption,
+        #    and the tests in ``test_context.py`` / ``test_react.py`` fail if
+        #    a new shared container appears.
+        #
+        # Together they make holding the previous reference and reassigning it
+        # a complete rollback. If a future change starts mutating one of those
+        # values in place, snapshot it there -- deep-copying the whole entry
+        # here would hide the problem and put the cost on every checkpoint.
+        was_active = self.step_id in self.dag_pattern.active_step_ids
+        had_context = self.step_id in self.dag_pattern.active_step_contexts
+        context_before = self.dag_pattern.active_step_contexts.get(self.step_id)
+        had_state = self.step_id in self.dag_pattern.active_step_pattern_states
+        state_before = self.dag_pattern.active_step_pattern_states.get(self.step_id)
         step_metadata = {
             "active_step_id": self.step_id,
             "child_label": label,
         }
         if metadata:
             step_metadata.update(metadata)
-        return await self.parent.checkpoint(
-            label=f"dag_{label}",
-            context=self.root_context,
-            pattern=self.dag_pattern,
-            status=status,
-            metadata=step_metadata,
-        )
+        try:
+            self.dag_pattern._set_active_step_context(self.step_id, context.to_dict())
+            get_state = getattr(pattern, "get_state", None)
+            if callable(get_state):
+                self.dag_pattern._set_active_step_pattern_state(
+                    self.step_id,
+                    get_state(),
+                )
+            return await self.parent.checkpoint(
+                label=f"dag_{label}",
+                context=self.root_context,
+                pattern=self.dag_pattern,
+                status=status,
+                metadata=step_metadata,
+            )
+        except BaseException as exc:
+            unrestorable = self._restore_step_snapshot(
+                was_active=was_active,
+                had_context=had_context,
+                context_before=context_before,
+                had_state=had_state,
+                state_before=state_before,
+            )
+            if unrestorable and isinstance(exc, Exception):
+                # The rollback could not fully reinstate the previous entry,
+                # so report a durability failure rather than let the caller
+                # believe the pre-checkpoint state survived. Only ordinary
+                # exceptions are replaced: cancellation, ``SystemExit`` and
+                # ``KeyboardInterrupt`` carry control-flow meaning and must
+                # reach the caller unchanged.
+                raise CheckpointPersistenceError(
+                    "Cannot roll back the DAG step checkpoint for step "
+                    f"{self.step_id!r}: {unrestorable}."
+                ) from exc
+            raise
+
+    def _restore_step_snapshot(
+        self,
+        *,
+        was_active: bool,
+        had_context: bool,
+        context_before: dict[str, Any] | None,
+        had_state: bool,
+        state_before: dict[str, Any] | None,
+    ) -> str | None:
+        """Undo this step's own active-step writes after a failed checkpoint.
+
+        Only entries keyed by ``self.step_id`` are touched, so a concurrently
+        running step keeps whatever it wrote while this coroutine was
+        suspended on the checkpoint ``await``.
+
+        This never raises, so a problem with one entry cannot leave the others
+        half-restored. It returns ``None`` when the rollback was complete, and
+        otherwise a description of what could not be reinstated, which the
+        caller turns into a durability failure.
+        """
+        unrestorable: list[str] = []
+        if not was_active:
+            # Nothing in the ``try`` removes a step id, so the id can only
+            # have been *added* by the setters. Drop it again.
+            self.dag_pattern.active_step_ids = [
+                step_id
+                for step_id in self.dag_pattern.active_step_ids
+                if step_id != self.step_id
+            ]
+        # A recorded-but-``None`` entry can only come from restored or legacy
+        # persisted state. It must not surface as an ``AssertionError``:
+        # DAGPattern's generic ``except Exception`` would swallow that into a
+        # permanent ``step.status="failed"`` instead of a retryable durability
+        # failure. Drop the key rather than write ``None`` back, so the
+        # mapping keeps its declared ``dict[str, dict[str, Any]]`` shape.
+        if had_context and context_before is not None:
+            self.dag_pattern.active_step_contexts[self.step_id] = context_before
+        else:
+            self.dag_pattern.active_step_contexts.pop(self.step_id, None)
+            if had_context:
+                unrestorable.append("the previous context is missing")
+        if had_state and state_before is not None:
+            self.dag_pattern.active_step_pattern_states[self.step_id] = state_before
+        else:
+            self.dag_pattern.active_step_pattern_states.pop(self.step_id, None)
+            if had_state:
+                unrestorable.append("the previous pattern state is missing")
+        self.dag_pattern._sync_legacy_active_step()
+        return " and ".join(unrestorable) if unrestorable else None
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         await self.parent.on_tool_start(tool_call=self._with_step(tool_call))
@@ -1049,7 +1150,11 @@ class DAGPattern(AgentPattern):
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
             )
-        except ExecutionInterrupted:
+        except (ExecutionInterrupted, CheckpointPersistenceError):
+            # A checkpoint that did not persist is a durability failure, not a
+            # step failure: converting it here would clear the active step and
+            # let a later ``_fail()`` checkpoint durably overwrite the last
+            # good checkpoint with the post-failure state.
             raise
         except Exception as exc:
             step.status = "failed"

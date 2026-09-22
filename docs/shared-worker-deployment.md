@@ -247,10 +247,23 @@ primary-key conflicts trigger repartition; unrelated integrity failures propagat
 `ChannelInputBatchChanged` is a retry signal for the caller's partition loop, not a
 user-facing `TaskTurnError`.
 
-This foundation does not yet switch Slack, Feishu, or Telegram to receipt-based
-input acceptance. Existing channel paths remain active; provider integration
-remains a separate follow-up change.
+Slack and Feishu use this foundation in shared execution mode. Telegram
+continues to use its existing input acceptance path.
 
+
+### Slack input acceptance
+
+In shared execution mode, Slack messages use durable receipts keyed by the
+workspace, channel, sender and physical message timestamp. Message and mention
+redeliveries reuse the original task and command, including after ingress restart.
+Authorization is checked again before replay. Attachments are staged before task
+selection and committed with the receipt, transcript, START and reply destination;
+an unavailable attachment prevents acceptance of that input.
+
+Slack keeps its existing progress filtering and three-second tool-status cadence.
+Selected display updates share the durable delivery claim with final replies, and
+the loading-message timestamp is persisted for observers and recovery. Local
+execution and control commands retain their existing behavior.
 
 ### Accepted channel command observation and progress
 
@@ -297,3 +310,64 @@ Commit recovery counts an observed competing receipt before checking current
 authorization. A competing batch requests repartition immediately, consistently
 with receipt conflicts during flush; the next lookup must still authorize the
 caller. Single-message replay also retains its authorization checks.
+
+
+### Feishu and Telegram batch controls
+
+Feishu and Telegram collect ordinary messages into short batches and continue
+processing messages received while the preceding batch runs. Control commands
+are handled outside that queue. Feishu supports `/start`, `/help`, `/new`,
+`/stop` and `/pause`; state-changing commands authorize the sender before acting.
+`/stop` clears pending input and requests a pause while retaining the current
+task. `/new` saves a new-conversation selection before clearing queued input and
+stopping the old turn; late preparation cannot restore the previous selection.
+Messages arriving while a Feishu control command is being authorized wait until
+that command finishes; they are then queued in arrival order. A command clears
+only earlier pending input. If a new-conversation selection is saved but cleanup
+of previous replies fails, Feishu reports that the new conversation is selected.
+
+Telegram retains its task-switching, agent selection and voice behavior. Both
+channels also signal a preparing request when a retained previous shared turn
+accepts a stop; previously Telegram could miss that newer preparation.
+
+These controls retain the existing per-user conversation scope and active-task
+file formats. They do not add cross-chat isolation or durable pending-input
+storage. Platform sends already in flight may complete after a control command.
+
+
+### Feishu input acceptance
+
+In shared execution mode, Feishu identifies each physical input by its configured
+channel, authorized sender, chat and message ID. Retries after ingress restart
+reuse the original task and START. Overlapping batches replay existing commands
+and accept only new inputs; changed or deleted original inputs are reported
+without preventing unrelated new inputs from being accepted. Messages from
+different chats are accepted in separate batches while retaining the existing
+per-user task selection.
+
+Attachments are staged before acceptance and their metadata commits together
+with receipts, transcript, START and reply destination. Attachment failure
+(including a missing provider file key) prevents acceptance of all new messages
+in that contiguous chat group; the user must resend the group together. Later
+chat groups continue independently. Progress and final output share the durable
+delivery claim and retain the saved loading-message ID across observers.
+
+Database acceptance is authoritative. If saving the local current-task file
+fails afterwards, the accepted task remains valid and the user is told so;
+retrying the same physical message reuses that task. The task selection remains
+in memory, but a restart can lose that unsaved selection. The file format and
+per-user conversation scope are unchanged. `/new` still saves its selection
+before stopping old work; failure at that earlier boundary leaves old work intact.
+
+Shared ordinary messages predating ingress startup are checked against receipts;
+old control commands remain filtered to prevent replaying `/new` or `/stop`.
+Controls interrupt unaccepted preparation or request a pause if acceptance has
+already committed, and `/new` suppresses the old result. Ingress shutdown detaches
+observers without pausing accepted worker tasks, including acceptance that commits
+while shutdown is draining. Explicit user controls still take effect during that
+drain. Observation failures after acceptance are logged without reporting a failed
+request; durable result recovery continues when an active channel bot is running.
+Deactivating the channel suspends that delivery recovery until it is active again.
+Local execution keeps
+its previous behavior. Inputs still waiting in the in-memory queue are not made
+durable by this change; external sends remain at least once.

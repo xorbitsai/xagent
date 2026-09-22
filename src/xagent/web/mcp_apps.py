@@ -77,6 +77,8 @@ from .models.public_mcp import PublicMCPApp
 # (User.Read), while workbook reads and writes require Files.ReadWrite from
 # the Excel app row. A bare microsoft grant may continue serving other
 # Microsoft connectors, but it must neither provision nor satisfy Excel.
+# word: likewise, its Files.ReadWrite.All scope isn't part of the microsoft
+# provider's defaults, so only the Word app-scoped grant is sufficient.
 #
 # powerpoint: same reasoning as excel -- reading/writing presentations
 # requires Files.ReadWrite, which isn't part of the microsoft provider's
@@ -93,8 +95,15 @@ APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset(
         "powerpoint",
         "sharepoint",
         "whatsapp",
+        "word",
     }
 )
+
+# Word's seed migration deliberately preserves a pre-existing custom row with
+# the same app_id. Such a row must keep the OAuth behavior it had before Word
+# became a builtin. Other entries in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT do
+# not share that migration contract and continue to be identified by app_id.
+_APPS_REQUIRING_PROVENANCE_FOR_OAUTH_POLICY = frozenset({"word"})
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:
@@ -113,18 +122,42 @@ def _normalize_oauth_grant_key(value: object) -> str | None:
     return normalized or None
 
 
-def requires_app_scoped_oauth_grant(app_id: object) -> bool:
+def _oauth_policy_app_id(app_or_id: object) -> object:
+    if isinstance(app_or_id, Mapping):
+        return app_or_id.get("id")
+    return getattr(app_or_id, "app_id", app_or_id)
+
+
+def requires_app_scoped_oauth_grant(app_or_id: object) -> bool:
     """Whether app_id must not be satisfied by a bare provider-level grant.
 
     Normalized the same way _app_lookup_keys resolves an app's own id, so a
     differently-cased or whitespace-padded admin-created app_id (e.g.
     "Facebook") is covered consistently everywhere this policy is checked.
     """
-    return _normalize_oauth_grant_key(app_id) in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT
+    app_id = _oauth_policy_app_id(app_or_id)
+    normalized_app_id = _normalize_oauth_grant_key(app_id)
+    if normalized_app_id not in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT:
+        return False
+
+    # Word's catalog row can predate its newly reserved builtin id. Its seed
+    # migration preserves that operator-owned collision instead of adopting
+    # it, so runtime OAuth policy must make the same ownership distinction.
+    if normalized_app_id not in _APPS_REQUIRING_PROVENANCE_FOR_OAUTH_POLICY:
+        return True
+    if isinstance(app_or_id, Mapping):
+        return _persisted_builtin_provenance_matches(
+            str(app_id), app_or_id.get("launch_config")
+        )
+    if hasattr(app_or_id, "launch_config"):
+        return _persisted_builtin_provenance_matches(
+            str(app_id), getattr(app_or_id, "launch_config")
+        )
+    return True
 
 
 def restrict_to_app_scoped_oauth_grant(
-    app_id: object, candidates: Iterable[object]
+    app_or_id: object, candidates: Iterable[object]
 ) -> list[str]:
     """Narrow OAuth provider/grant candidates to app-scoped ones where required.
 
@@ -140,8 +173,9 @@ def restrict_to_app_scoped_oauth_grant(
     """
     deduped = list(dict.fromkeys(c for c in candidates if isinstance(c, str) and c))
 
-    if not requires_app_scoped_oauth_grant(app_id):
+    if not requires_app_scoped_oauth_grant(app_or_id):
         return deduped
+    app_id = _oauth_policy_app_id(app_or_id)
     normalized_app_id = _normalize_oauth_grant_key(app_id)
     return [
         candidate

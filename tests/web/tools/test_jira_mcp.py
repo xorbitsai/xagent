@@ -263,6 +263,27 @@ def test_resolve_cloud_id_single_site_rejects_a_blank_id(monkeypatch):
         jira._resolve_cloud_id("")
 
 
+def test_resolve_cloud_id_single_site_rejects_a_padded_id(monkeypatch):
+    # A blank check alone (`not value.strip()`) only catches an
+    # all-whitespace string -- a value padded AROUND real content (e.g.
+    # " abc-123 ") has a non-empty strip() result and would silently
+    # pass through unmodified unless the stricter `strip() != value`
+    # form (matching _path_segment's own check) is used instead.
+    padded_site = {
+        "id": " abc-123 ",
+        "name": "Padded",
+        "url": "https://padded.atlassian.net",
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[padded_site])),
+    )
+
+    with pytest.raises(ValueError, match="missing a valid 'id'"):
+        jira._resolve_cloud_id("")
+
+
 def test_request_builds_url_with_resolved_cloud_id(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"id": "10001", "key": "ENG-1"})
@@ -2367,6 +2388,48 @@ def test_get_issue_extra_field_values_truncated_survives_the_last_resort_fallbac
     assert result["extra_field_values_truncated"] is True
 
 
+def test_get_issue_truncated_flag_patch_never_exceeds_the_output_cap(monkeypatch):
+    # The patch that restores description_truncated/extra_field_values_
+    # truncated after success_with_capped_dict's fallback drops them
+    # must never itself push the response back over max_output_length:
+    # success_with_capped_dict already measured `response` to fit, and
+    # adding keys during the patch step without re-checking could
+    # silently produce invalid, over-budget output. A cap this close to
+    # the internal _MIN_OUTPUT_LENGTH floor (64) leaves success_with_
+    # capped_dict's own fallback candidate with no slack for the patch
+    # to add anything to.
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 64)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 64)
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "description": "short",
+            "customfield_a": "x" * 500,
+            "customfield_b": "y" * 500,
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    raw_response = jira.jira_get_issue(
+        "ENG-1", extra_fields="customfield_a,customfield_b"
+    )
+
+    assert len(raw_response) <= 64
+    result = json.loads(raw_response)
+    assert result["status"] == "success"
+
+
 def test_get_issue_rejects_jira_field_selector_syntax_in_extra_fields(monkeypatch):
     # Jira's `fields` query param treats a leading "-" as "exclude this
     # field" and "*" as a wildcard, not a literal field id -- passed
@@ -2796,6 +2859,31 @@ def test_transition_issue_rejects_a_matched_transition_with_a_blank_id(monkeypat
             side_effect=[
                 MockResponse(json_data=[_SITE_A]),
                 MockResponse(json_data={"transitions": [{"id": "  ", "name": "Done"}]}),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_transition_issue("ENG-1", "done"))
+
+    assert result["status"] == "error"
+    assert "missing a valid 'id'" in result["message"]
+
+
+def test_transition_issue_rejects_a_matched_transition_with_a_padded_id(monkeypatch):
+    # A blank check alone (`not value.strip()`) only catches an
+    # all-whitespace string -- a value padded AROUND real content
+    # (e.g. " 31") has a non-empty strip() result and would silently
+    # pass through into the POST body unless the stricter
+    # `strip() != value` form is used instead.
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(
+                    json_data={"transitions": [{"id": " 31", "name": "Done"}]}
+                ),
             ]
         ),
     )

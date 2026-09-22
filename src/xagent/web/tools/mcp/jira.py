@@ -244,7 +244,9 @@ def _resolve_cloud_id(cloud_id: str) -> str:
         # own specific message) rather than left to fall through to
         # _path_segment's much more generic "path segment must not be
         # blank or padded" error a few calls downstream.
-        if site_id is None or (isinstance(site_id, str) and not site_id.strip()):
+        if site_id is None or (
+            isinstance(site_id, str) and (not site_id or site_id.strip() != site_id)
+        ):
             raise ValueError("The single accessible Jira site is missing a valid 'id'")
         return str(site_id)
     site_list = (
@@ -1595,7 +1597,18 @@ def jira_get_issue(
                 parsed["extra_field_values_truncated"] = True
                 patched = True
             if patched:
-                response = json.dumps(parsed, ensure_ascii=False)
+                patched_response = json.dumps(parsed, ensure_ascii=False)
+                # `response` was already measured to fit max_output_length
+                # by success_with_capped_dict; adding a key here can push
+                # it back over that budget under an extremely small
+                # configured cap (near _MIN_OUTPUT_LENGTH), with nothing
+                # else re-checking it afterward. Keep the already-fitting,
+                # unpatched response in that case -- a truncation flag
+                # that's occasionally stale is a smaller problem than
+                # invalid, over-budget JSON the docstring promises never
+                # happens.
+                if len(patched_response) <= get_tool_max_output_length():
+                    response = patched_response
         return response
     except Exception as e:
         safe_message = _safe_text(e)
@@ -1785,7 +1798,8 @@ def jira_transition_issue(
         # _path_segment's own blank-value guard the way a URL-bound id
         # (e.g. cloud_id) is, so nothing else would catch it here.
         if transition_id is None or (
-            isinstance(transition_id, str) and not transition_id.strip()
+            isinstance(transition_id, str)
+            and (not transition_id or transition_id.strip() != transition_id)
         ):
             return _error(
                 f"Matched transition '{transition_name}' is missing a valid 'id'"

@@ -189,11 +189,13 @@ def url_path_id(value: str, field_name: str) -> str:
 # rule would erase the whole dict to {} in a single step. Substituting this
 # marker instead keeps that field non-empty and self-explanatory, the same
 # way the envelope's own top-level "truncated" flag is, rather than leaving
-# a bare {} a caller can't distinguish from "always empty" -- but only when
-# the marker is itself smaller than the value it replaces (see
-# _truncation_marker_or_empty): a marker bigger than a tiny value would grow
-# the payload instead of shrinking it, eating into the budget phase 2 and
-# the id-preserving last-resort fallback need to keep other fields alive.
+# a bare {} a caller can't distinguish from "always empty" -- but only once
+# there's budget to spare for it (see success_with_capped_dict's marker-
+# upgrade pass): installing it any earlier, before the full response is
+# known to fit, can cost a sibling field real data it would otherwise have
+# kept -- a marker bigger than {} that gets installed while other fields
+# are still being shrunk eats into the budget they need, rather than only
+# spending what's left over once nothing more can be squeezed out.
 _FIELD_TRUNCATION_MARKER: dict[str, Any] = {"truncated": True}
 
 
@@ -217,13 +219,18 @@ def halve_dict_or_mark(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     equality (which would misfire if real data happened to equal it, and
     would spin forever if the size comparison ever admitted ties).
 
-    Shared by ``success_with_capped_dict``'s own phase 1 and any local
-    caller that reimplements the identical per-step decision (e.g. a
-    connector's own capping helper that needs to make room for extra fields
-    after delegating the bulk of the shrinking to
-    ``success_with_capped_dict``) -- factored out so the decision has
-    exactly one implementation to fix when a case like this is found,
-    instead of drifting between copies.
+    Installing the marker as soon as this one field hits its floor is only
+    safe when there is no sibling field whose own shrinking could still be
+    starved by the bytes it costs -- true for a local caller shrinking a
+    single dict field on its own (e.g. a connector's own capping helper
+    making room for extra fields after delegating the bulk of the
+    shrinking to ``success_with_capped_dict``), which is what this is for.
+    ``success_with_capped_dict``'s own phase 1 shrinks several dict-valued
+    fields against a shared budget and does *not* use this: it floors to
+    {} immediately and only considers the marker afterward, once every
+    field's final size is known (see that function's docstring) -- calling
+    this here instead would reintroduce exactly the problem it was
+    written to fix.
     """
     keys = list(value)
     if len(keys) > 1:
@@ -256,31 +263,30 @@ def success_with_capped_dict(
     still disappears in one step once it's down to a single item; that
     residual case isn't addressed here (a pre-existing, accepted gap, not
     one this fix closes). Halving a *dict's key count* the same way floors
-    to zero once only one key is left, collapsing it straight to {} in a
-    single step instead of degrading gradually -- and a 2-key dict reaches
-    that same floor one step later, once halving has already dropped it to
-    one key. Whenever a dict-valued field is down to its last key, phase 1
-    replaces it via ``halve_dict_or_mark`` with the small
-    ``_FIELD_TRUNCATION_MARKER`` when that's actually smaller than the
-    value it replaces (otherwise {} same as before), so that field stays a
-    small, non-empty signal that something here was dropped rather than
-    growing the payload. Those markers are a luxury, though: each costs a
-    few bytes more than {}, and with several exhausted fields that overhead
-    can push a response that would have fit with {} back over the limit.
-    So before phase 2 starts dropping whole fields, installed markers are
-    downgraded back to {} one at a time (smallest original field first)
-    until the response fits -- budget goes to keeping every field present
-    before it goes to labelling any of them. Phase 2 is a fallback for the
-    residual case -- a dict with no *remaining* list/dict-valued keys
-    (either because it never had any, e.g. a handful of scalar keys with
-    huge string values, or because phase 1 already exhausted the ones it
-    had) -- and drops whole top-level keys the same way, but always leaves
-    at least one key standing rather than run the same single-key floor all
-    the way down to {}. This still doesn't guarantee the final response
-    never contains ``{}`` for this field: if even one surviving key doesn't
-    fit, the last-resort fallback below can still fall back that far, by
-    design -- these phases only guarantee they won't be the ones to empty
-    it needlessly.
+    to zero once only one key is left; phase 1 floors a dict-valued field to
+    {} at that point (same as a list's last element, and the same as this
+    function did before the marker existed), rather than installing
+    ``_FIELD_TRUNCATION_MARKER`` there directly -- a call with several
+    large dict-valued fields shrinks them one at a time, and a marker
+    installed on the first while its siblings are still oversized would
+    cost bytes those siblings need, potentially losing a sibling's real
+    value that would otherwise have fit as {}. Only once phase 1 has fully
+    converged (using {} throughout, so this step alone can never do worse
+    than the pre-marker behavior) does a second pass spend whatever budget
+    is left over upgrading floored fields back to the marker, largest
+    original field first, checked against the actual rebuilt response each
+    time and stopping at the first upgrade that doesn't fit -- so a marker
+    is only ever paid for out of genuine surplus, never at another field's
+    expense. Phase 2 is a fallback for the residual case -- a dict with no
+    *remaining* list/dict-valued keys (either because it never had any,
+    e.g. a handful of scalar keys with huge string values, or because
+    phase 1 already exhausted the ones it had) -- and drops whole top-level
+    keys the same way, but always leaves at least one key standing rather
+    than run the same single-key floor all the way down to {}. This still
+    doesn't guarantee the final response never contains ``{}`` for this
+    field: if even one surviving key doesn't fit, the last-resort fallback
+    below can still fall back that far, by design -- these phases only
+    guarantee they won't be the ones to empty it needlessly.
 
     ``extra_fields`` adds fixed top-level response fields that must be counted
     while trimming the dict, such as a calendar event's derived Meet link.
@@ -328,17 +334,20 @@ def success_with_capped_dict(
 
     working = dict(data)
     truncated = False
-    # Fields that hit the one-key floor and got the marker. They're the only
-    # floored fields that need tracking: one that became {} is already
-    # excluded by the len > 0 filter below, while a marker is a non-empty
-    # dict that would otherwise be re-selected forever. Kept in install
-    # order so the downgrade pass below can peel them off latest-first.
-    marker_keys: list[str] = []
+    # Dict-valued fields floored to {} (their one remaining key dropped),
+    # in the order it happened -- i.e. largest-original-field first, since
+    # phase 1 always picks the largest remaining collection field. Tracked
+    # so the marker-upgrade pass below knows which fields are eligible and
+    # in what priority, and so a floored field (still a dict, just empty)
+    # isn't re-selected: len(value) > 0 already excludes it below, but
+    # tracking it explicitly here means that filter doesn't have to be the
+    # only thing standing between this loop and re-processing it.
+    floored_keys: list[str] = []
     while len(response) > max_output_length:
         collection_keys = [
             key
             for key, value in working.items()
-            if key not in marker_keys
+            if key not in floored_keys
             and isinstance(value, (list, dict))
             and len(value) > 0
         ]
@@ -352,21 +361,36 @@ def success_with_capped_dict(
         if isinstance(target_value, list):
             working[target_key] = target_value[: len(target_value) // 2]
         else:
-            shrunk, floored = halve_dict_or_mark(target_value)
-            working[target_key] = shrunk
-            if floored and shrunk:
-                marker_keys.append(target_key)
+            sub_keys = list(target_value.keys())
+            if len(sub_keys) > 1:
+                working[target_key] = {
+                    sub_key: target_value[sub_key]
+                    for sub_key in sub_keys[: len(sub_keys) // 2]
+                }
+            else:
+                working[target_key] = {}
+                floored_keys.append(target_key)
         truncated = True
         response = _build(working, truncated)
 
-    # Markers cost more bytes than {}; with several exhausted fields that
-    # overhead alone can keep the response over the limit and hand phase 2
-    # a reason to drop whole sibling fields that would have fit as {}.
-    # Downgrade markers first, latest-installed (smallest original field)
-    # first, so every field stays present before any of them gets labelled.
-    while len(response) > max_output_length and marker_keys:
-        working[marker_keys.pop()] = {}
-        response = _build(working, truncated)
+    # Phase 1 above never installs the marker itself, so this point is
+    # reached with every floored field at {} -- the same state the
+    # pre-marker version of this function would have produced, and
+    # therefore never worse than it. Only now, with the rest of the
+    # shrinking already accounted for, is any leftover budget spent
+    # upgrading floored fields back to the informative marker, largest
+    # original field first, one at a time, checked against the real
+    # rebuilt response rather than a per-field size guess -- so a marker
+    # can never come at the expense of a sibling's data the way installing
+    # it up front could. All floored fields cost the same fixed amount to
+    # upgrade, so once one doesn't fit, none of the rest would either.
+    for key in floored_keys:
+        working[key] = dict(_FIELD_TRUNCATION_MARKER)
+        upgraded_response = _build(working, truncated)
+        if len(upgraded_response) > max_output_length:
+            working[key] = {}
+            break
+        response = upgraded_response
 
     keys = list(working.keys())
     while len(response) > max_output_length and len(keys) > 1:

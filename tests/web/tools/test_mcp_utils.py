@@ -1228,14 +1228,18 @@ def test_success_with_capped_dict_degrades_a_two_key_nested_dict_to_a_marker(
 def test_success_with_capped_dict_skips_the_marker_when_it_would_grow_the_field(
     monkeypatch,
 ):
-    """Regression test: the {"truncated": true} marker (19 bytes) can be
-    bigger than the tiny dict it would replace (e.g. {"a": 1}, 8 bytes).
-    Installing it anyway would grow the payload instead of shrinking it,
-    eating into the byte budget phase 2 needs to keep other fields (like
-    "id") alive -- silently dropping exactly the kind of field the
-    last-resort fallback exists to preserve. The marker must only be used
-    when it's actually smaller than what it replaces; otherwise this falls
-    back to {}, same as before the marker existed."""
+    """Regression test: phase 1 floors an exhausted dict field to {} first
+    (never installing the marker directly), then only upgrades it to the
+    {"truncated": true} marker (19 bytes) if the *actual rebuilt response*
+    with that marker installed still fits. Here upgrading "tiny" would cost
+    17 bytes over its floored {}, and "name"/"note" are still oversized
+    enough at that point that there's no surplus to spend -- so the
+    upgrade must be skipped, matching the pre-marker (base) result exactly:
+    "name" and "note" still get dropped by phase 2 afterward, same as
+    always. Checked end-to-end (not just via the size-comparison unit test
+    below) so a regression that reintroduced eager marker installation --
+    which could still land on the same final shape by chance if a later
+    pass coincidentally downgraded it back -- would be caught here too."""
     monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "85")
 
     raw = utils.success_with_capped_dict(
@@ -1247,8 +1251,7 @@ def test_success_with_capped_dict_skips_the_marker_when_it_would_grow_the_field(
     assert len(raw) <= 85
     assert result["status"] == "success"
     assert result["truncated"] is True
-    assert result["record"]["id"] == "r1"
-    assert result["record"]["tiny"] == {}
+    assert result["record"] == {"tiny": {}, "id": "r1"}
 
 
 def test_success_with_capped_dict_top_level_single_key_survives_phase_two(
@@ -1309,7 +1312,11 @@ def test_success_with_capped_dict_last_resort_falls_back_to_dropping_extras(
 ):
     """When even a fully-degraded extras dict (every value replaced by
     `True`) still doesn't fit, the last resort must still fall back to
-    dropping extras entirely rather than getting stuck or erroring."""
+    dropping extras entirely rather than getting stuck or erroring -- while
+    still preserving the compact `Id` the drop-extras rungs exist to keep
+    (asserted explicitly so a regression that lost the id along with the
+    extras, e.g. by falling all the way to the id-less rung instead of the
+    id-with-no-extras one, would be caught here)."""
     monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "80")
 
     raw = utils.success_with_capped_dict(
@@ -1322,6 +1329,7 @@ def test_success_with_capped_dict_last_resort_falls_back_to_dropping_extras(
     assert len(raw) <= 80
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["record"] == {"Id": 123}
     assert "note_one" not in result
     assert "note_two" not in result
 
@@ -1355,42 +1363,71 @@ def test_halve_dict_or_mark_falls_back_to_empty_when_the_marker_would_grow_it():
     assert floored is True
 
 
-def test_success_with_capped_dict_downgrades_markers_before_dropping_sibling_fields(
+def test_success_with_capped_dict_never_loses_a_base_fitting_value_to_marker_overhead(
     monkeypatch,
 ):
-    """Regression test: several dict fields hitting the one-key floor in
-    the same call each cost a marker's worth of bytes over {}. That
-    overhead alone used to keep the response over the limit after phase 1
-    had nothing left to shrink, so phase 2 then dropped whole sibling
-    fields (including small scalars like "name") that the pre-marker code
-    kept as {} -- a worse result than before the marker existed. Markers
-    must be downgraded back to {} first, so every field stays present
-    before any of them gets labelled."""
+    """Regression test (two related failure modes, same root cause):
+    several dict fields hitting the one-key floor in the same call each
+    cost a marker's worth of bytes over {}. If markers were installed
+    eagerly during phase 1 (before every field's final size is known),
+    that overhead could push the response over budget while OTHER fields
+    are still being shrunk -- not just cause phase 2 to drop a whole
+    sibling top-level field afterward (the original report), but actually
+    evict a nested value that phase 1 itself would otherwise have kept
+    intact, exactly like the pre-marker (base) code would have. Both are
+    checked here directly against base's own output at the same cap:
+    phase 1 must float exactly as far as base does before any marker is
+    even considered, and installing a marker afterward must only ever add
+    information relative to base, never remove it.
+
+    - At limit=140: three same-size fields (a, b, c) reach the floor, and
+      base still has to halve the fourth ("meta") once (to {"left": "L"})
+      before everything fits -- matched here byte-for-byte, since phase 1
+      floors to {} exactly like base until every field's final size is
+      known, before any marker is even considered.
+    - At limit=160: base's own halving of "meta" is no longer needed --
+      it fits fully intact ({"left": "L", "right": "R"}) once a/b/c are
+      {}. A regression that installs a/b/c's markers immediately (spending
+      budget before "meta" is ever considered) would force "meta" through
+      phase 1's own halving anyway, permanently losing real data that
+      base, and this fixed version, both keep intact -- markers should
+      only ever be paid for out of budget left over *after* matching
+      base, never budget base itself needed."""
+    data = {
+        "id": "r1",
+        "a": {"k": "x" * 500},
+        "b": {"k": "y" * 500},
+        "c": {"k": "z" * 500},
+        "meta": {"left": "L", "right": "R"},
+        "name": "Bob",
+    }
+
     monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "140")
+    raw_140 = utils.success_with_capped_dict("record", data)
+    result_140 = json.loads(raw_140)
 
-    raw = utils.success_with_capped_dict(
-        "record",
-        {
-            "id": "r1",
-            "a": {"k": "x" * 500},
-            "b": {"k": "y" * 500},
-            "c": {"k": "z" * 500},
-            "name": "Bob",
-        },
-    )
-    result = json.loads(raw)
+    assert len(raw_140) <= 140
+    assert result_140["truncated"] is True
+    assert set(result_140["record"]) == {"id", "a", "b", "c", "meta", "name"}
+    assert result_140["record"]["id"] == "r1"
+    assert result_140["record"]["name"] == "Bob"
+    # Matches base exactly at this cap: "meta" still needs one halving
+    # pass even without any marker in the picture.
+    assert result_140["record"]["meta"] == {"left": "L"}
 
-    assert len(raw) <= 140
-    assert result["truncated"] is True
-    assert set(result["record"]) == {"id", "a", "b", "c", "name"}
-    assert result["record"]["id"] == "r1"
-    assert result["record"]["name"] == "Bob"
-    # Only as many markers survive as the budget allows: the latest
-    # installed one ("c", the smallest original field) is downgraded to {}
-    # while the earlier ones keep their marker.
-    assert result["record"]["a"] == {"truncated": True}
-    assert result["record"]["b"] == {"truncated": True}
-    assert result["record"]["c"] == {}
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "160")
+    raw_160 = utils.success_with_capped_dict("record", data)
+    result_160 = json.loads(raw_160)
+
+    assert len(raw_160) <= 160
+    assert result_160["truncated"] is True
+    assert result_160["record"]["meta"] == {"left": "L", "right": "R"}
+    # The 20 extra bytes of budget over the base-equivalent 140-byte state
+    # are exactly enough for one marker upgrade (17 bytes) -- spent on "a",
+    # the first field floored, rather than wasted or spent unsafely early.
+    assert result_160["record"]["a"] == {"truncated": True}
+    assert result_160["record"]["b"] == {}
+    assert result_160["record"]["c"] == {}
 
 
 def test_success_with_capped_dict_marks_a_one_key_dict_without_recursing_into_it(

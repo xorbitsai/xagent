@@ -838,13 +838,18 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
         else:
             high = middle - 1
     payload["warnings"] = [warning[:low] + marker]
-    # Same per-step rule as success_with_capped_dict's phase 1 (halve the
-    # keys, then a size-gated marker at the one-key floor), via the shared
-    # helper. `floored` tracks the floor explicitly, like that function's
-    # marker_keys, instead of relying on the marker never comparing
-    # strictly smaller than itself: this loop has no tier below {}, so once
-    # the floor is reached and the payload is still oversized, the field is
-    # emptied outright rather than re-selected.
+    # Halve the keys, then a size-gated marker at the one-key floor, via
+    # the shared per-field helper -- installed immediately here rather than
+    # deferred to a separate leftover-budget pass the way
+    # success_with_capped_dict's own phase 1 does it, because there is only
+    # ever one dict field in play in this loop (`value`), so there is no
+    # sibling field a marker's extra bytes could come at the expense of
+    # (see halve_dict_or_mark's docstring for why that distinction
+    # matters). `floored` tracks the floor explicitly instead of relying
+    # on the marker never comparing strictly smaller than itself: this
+    # loop has no tier below {}, so once the floor is reached and the
+    # payload is still oversized, the field is emptied outright rather
+    # than re-selected.
     floored = False
     while len(json.dumps(payload, ensure_ascii=False)) > max_output_length:
         value = payload.get(field_name)

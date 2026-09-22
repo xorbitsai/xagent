@@ -1458,3 +1458,27 @@ def test_success_with_capped_dict_last_resort_never_degrades_an_extra_that_would
     assert result["truncated"] is True
     assert result["record"] == {}
     assert result["tiny"] == 1
+
+
+def test_success_with_capped_dict_last_resort_ranks_a_degraded_extra_below_the_id(
+    monkeypatch,
+):
+    """Pins the fifth ladder rung and its position: an empty record beside a
+    *degraded* extra ranks below the id alone -- only intact extras are
+    worth giving the id up for. Here nothing containing the id fits and the
+    extra doesn't fit intact beside {} either, so the degraded-extra rung is
+    the first that fits and the id is (correctly) already gone; swapping
+    rungs 4 and 5, or dropping rung 5, would change this result."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "75")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"id": "LONGISHIDVALUE1234", "Notes": "x" * 5000},
+        extra_fields={"note": "y" * 60},
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 75
+    assert result["truncated"] is True
+    assert result["record"] == {}
+    assert result["note"] is True

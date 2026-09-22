@@ -841,7 +841,7 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
     # Same per-step rule as success_with_capped_dict's phase 1 (halve the
     # keys, then a size-gated marker at the one-key floor), via the shared
     # helper. `floored` tracks the floor explicitly, like that function's
-    # exhausted_keys, instead of relying on the marker never comparing
+    # marker_keys, instead of relying on the marker never comparing
     # strictly smaller than itself: this loop has no tier below {}, so once
     # the floor is reached and the payload is still oversized, the field is
     # emptied outright rather than re-selected.

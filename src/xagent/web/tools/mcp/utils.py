@@ -292,10 +292,10 @@ def success_with_capped_dict(
     first, same size-gate as the field marker above); then an empty record
     with the extras intact; then the id alone; then an empty record with
     the degraded extras; and only then an empty record with no extras at
-    all. Real values outrank placeholders at every rung: a Meet link that
-    fits beside an empty record beats keeping only the id (that rung is
-    what stops a long id from crowding the link out entirely), but a
-    ``True`` placeholder for it does not beat the id.
+    all. The id is given up for extras only while those extras are intact:
+    a real Meet link that fits beside an empty record beats keeping only
+    the id (that rung is what stops a long id from crowding the link out
+    entirely), but a ``True`` placeholder for it does not beat the id.
     """
     extras = extra_fields or {}
     reserved_fields = {"status", field_name, "truncated"}
@@ -328,13 +328,17 @@ def success_with_capped_dict(
 
     working = dict(data)
     truncated = False
-    exhausted_keys: set[str] = set()
+    # Fields that hit the one-key floor and got the marker. They're the only
+    # floored fields that need tracking: one that became {} is already
+    # excluded by the len > 0 filter below, while a marker is a non-empty
+    # dict that would otherwise be re-selected forever. Kept in install
+    # order so the downgrade pass below can peel them off latest-first.
     marker_keys: list[str] = []
     while len(response) > max_output_length:
         collection_keys = [
             key
             for key, value in working.items()
-            if key not in exhausted_keys
+            if key not in marker_keys
             and isinstance(value, (list, dict))
             and len(value) > 0
         ]
@@ -350,10 +354,8 @@ def success_with_capped_dict(
         else:
             shrunk, floored = halve_dict_or_mark(target_value)
             working[target_key] = shrunk
-            if floored:
-                exhausted_keys.add(target_key)
-                if shrunk:
-                    marker_keys.append(target_key)
+            if floored and shrunk:
+                marker_keys.append(target_key)
         truncated = True
         response = _build(working, truncated)
 
@@ -416,8 +418,8 @@ def success_with_capped_dict(
 
         # Rungs, top to bottom: id + extras (intact, then degraded); empty
         # record + intact extras; id alone; empty record + degraded extras;
-        # empty record alone. Real information outranks placeholders at
-        # every step: a Meet link that fits beside {} beats keeping only the
+        # empty record alone. The id is given up for extras only while they
+        # are intact: a Meet link that fits beside {} beats keeping only the
         # id (without that rung it vanished just because it didn't fit
         # beside the id), but a `True` placeholder for it does not -- the
         # id is worth more than a flag that only says "there was a link".

@@ -199,6 +199,15 @@ def test_env_variable_default():
         os.environ[TOOL_MAX_OUTPUT_LENGTH] = "100000"
         assert get_tool_max_output_length() == 100000
 
+        # A value below what any connector's own local floor needs is this
+        # getter's caller's problem, not this shared getter's: it must
+        # return the exact configured value for every tool, not silently
+        # widen it -- otherwise an operator's deliberately low cap on one
+        # tool gets overridden for every other tool that shares this getter.
+        for small_value in (18, 0, -1):
+            os.environ[TOOL_MAX_OUTPUT_LENGTH] = str(small_value)
+            assert get_tool_max_output_length() == small_value
+
         # Test with invalid env var (should fallback to default)
         os.environ[TOOL_MAX_OUTPUT_LENGTH] = "invalid"
         result = get_tool_max_output_length()

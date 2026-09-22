@@ -6,7 +6,7 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
-from tests.web.services.test_shared_channel_execution import database_url  # noqa: F401
+from tests.web.services.channel_delivery_shared import database_url  # noqa: F401
 
 
 def test_retry_budget_upgrade_preserves_pending_rows(database_url):  # noqa: F811

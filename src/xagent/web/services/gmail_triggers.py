@@ -210,6 +210,10 @@ def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
         raise GmailWatchConfigurationError(
             "Gmail watch access requires an ordinary Gmail account"
         )
+    if not oauth_account.access_token:
+        raise GmailWatchConfigurationError(
+            "Gmail OAuth credentials are unavailable; reconnect required"
+        )
 
     client_id, client_secret = _get_google_oauth_config(db)
     if not client_id or not client_secret:
@@ -369,6 +373,7 @@ def scan_due_gmail_watch_renewals(
             GmailWatchState.oauth_account_id == UserOAuth.id,
         )
         .filter(ordinary_gmail_clause())
+        .filter(UserOAuth.access_token != "")
         .filter(
             or_(
                 GmailWatchState.id.is_(None),

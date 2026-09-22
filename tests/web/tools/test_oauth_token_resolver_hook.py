@@ -19,11 +19,14 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
 )
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.models.database import Base
+from xagent.web.models.gmail_watch import GmailWatchState
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
+from xagent.web.models.trigger import TriggerProvisioningStatus
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services.gmail_provisioning import GMAIL_RECONNECT_REQUIRED_ERROR
 from xagent.web.services.mcp_oauth import MCPAuthorizationChallenge
 from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import (
@@ -1018,12 +1021,12 @@ async def test_user_oauth_refresh_transient_failure_retains_unavailable_without_
 
 
 @pytest.mark.asyncio
-async def test_user_oauth_refresh_permanently_invalid_deletes_record(
+async def test_user_oauth_refresh_permanently_invalid_keeps_reconnect_tombstone(
     db_session,
     monkeypatch,
 ):
-    """Only a confirmed-dead refresh token (_OAuthRefreshPermanentlyInvalid)
-    should cost the user their stored connection.
+    """A confirmed-dead refresh token clears secrets but keeps the account
+    identity so callers can distinguish reconnect-required from never connected.
     """
     db, user = db_session
     oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
@@ -1052,7 +1055,77 @@ async def test_user_oauth_refresh_permanently_invalid_deletes_record(
         oauth_token_required=True,
     )
     with isolated_session_factory() as verification_db:
-        assert verification_db.get(UserOAuth, account_id) is None
+        tombstone = verification_db.get(UserOAuth, account_id)
+        assert tombstone is not None
+        assert tombstone.access_token == ""
+        assert tombstone.refresh_token is None
+        assert tombstone.expires_at is None
+        assert tombstone.provider == "google"
+
+
+@pytest.mark.asyncio
+async def test_permanently_invalid_gmail_refresh_quiesces_watch_state(
+    db_session,
+    monkeypatch,
+):
+    db, user = db_session
+    oauth_server = _add_oauth_server(
+        db,
+        user,
+        name="Gmail",
+        app_id="resolver-gmail",
+        provider="gmail",
+        launch_config=_launch_config("GMAIL_ACCESS_TOKEN"),
+    )
+    oauth_account = _add_user_oauth(
+        db,
+        user,
+        provider="gmail",
+        access_token="expired-gmail-token",
+    )
+    oauth_account.email = "alice@example.com"
+    watch = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(oauth_account.id),
+        email="alice@example.com",
+        history_id="history-1",
+        topic_name="projects/demo/topics/xagent-gmail-alice",
+        watch_expiration=datetime.now(timezone.utc) + timedelta(days=1),
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db.add(watch)
+    db.commit()
+    account_id = int(oauth_account.id)
+    watch_id = int(watch.id)
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    async def fail_refresh(*args, **kwargs):
+        raise web_tools_config._OAuthRefreshPermanentlyInvalid()
+
+    monkeypatch.setattr(web_tools_config, "refresh_oauth_token_if_needed", fail_refresh)
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Gmail"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        tombstone = verification_db.get(UserOAuth, account_id)
+        quiesced_watch = verification_db.get(GmailWatchState, watch_id)
+        assert tombstone is not None
+        assert tombstone.access_token == ""
+        assert quiesced_watch is not None
+        assert quiesced_watch.status == TriggerProvisioningStatus.FAILED.value
+        assert quiesced_watch.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
+        assert quiesced_watch.watch_expiration is None
 
 
 @pytest.mark.asyncio
@@ -2203,6 +2276,38 @@ async def test_hook_ignores_bare_meta_token_for_app_scoped_facebook(db_session):
     configs = await cfg.get_mcp_server_configs()
 
     assert seen_providers == ["facebook"]
+    _assert_unavailable_mcp_config(
+        configs[0], server, reason="oauth_token_required", oauth_token_required=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_ignores_bare_microsoft_token_for_planner(db_session):
+    db, user = db_session
+    server = _add_oauth_server(
+        db,
+        user,
+        name="Planner",
+        app_id="planner",
+        provider="microsoft",
+        launch_config=_launch_config(env_key="AUTH_TOKEN"),
+    )
+    seen_providers: list[str] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        seen_providers.append(request.provider)
+        if request.provider == "microsoft":
+            return ResolvedToken(
+                access_token="bare-microsoft-hook-token", expires_at=None
+            )
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert seen_providers == ["planner"]
     _assert_unavailable_mcp_config(
         configs[0], server, reason="oauth_token_required", oauth_token_required=True
     )

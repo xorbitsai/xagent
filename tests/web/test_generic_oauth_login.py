@@ -12,6 +12,7 @@ import base64
 import hashlib
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -23,6 +24,7 @@ from xagent.web.api.auth import (
     _is_salesforce_provider,
     _resolve_oauth_secret,
     create_access_token,
+    generic_oauth_callback,
     generic_oauth_login,
     verify_token,
 )
@@ -31,9 +33,11 @@ from xagent.web.builtin_mcp_registry import (
     get_builtin_public_mcp_app,
 )
 from xagent.web.models.database import Base
+from xagent.web.models.mcp import MCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.oauth_provider_quirks import requires_pkce
 
 XERO_APP_SCOPES = [
@@ -98,6 +102,16 @@ def _provider(
 def _location(response) -> str:
     # RedirectResponse stores the target in the Location header.
     return response.headers["location"]
+
+
+class _MockOAuthResponse:
+    def __init__(self, payload: dict):
+        self._payload = payload
+        self.status_code = 200
+        self.text = ""
+
+    def json(self):
+        return self._payload
 
 
 # ---------- the actual regression checks ------------------------------------
@@ -821,6 +835,144 @@ def test_bare_login_for_unrestricted_provider_still_proceeds(db_session):
     )
 
     assert resp.status_code == 307
+
+
+def test_planner_catalog_login_requests_tasks_scope(db_session):
+    db, user = db_session
+    token = _token_for(user)
+    planner = get_builtin_public_mcp_app("planner")
+    assert planner is not None
+    db.add(PublicMCPApp(**planner))
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+    )
+    response = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id="planner",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    query = parse_qs(urlparse(_location(response)).query)
+    assert set(query["scope"][0].split()) == {"Tasks.ReadWrite", "User.Read"}
+
+
+def test_excel_login_requests_refresh_permission(db_session):
+    db, user = db_session
+    token = _token_for(user)
+    excel_row = get_builtin_public_mcp_app("excel")
+    assert excel_row is not None
+    db.add(PublicMCPApp(**excel_row))
+    db.commit()
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/api/auth/microsoft/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id="excel",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 307
+    scopes = parse_qs(urlparse(_location(resp)).query)["scope"][0].split()
+    assert set(scopes) == {"User.Read", "Files.ReadWrite", "offline_access"}
+
+
+def test_bare_microsoft_callback_skips_excel_but_connects_eligible_sibling(
+    db_session, monkeypatch
+):
+    """A User.Read-only provider grant must not provision the Excel app."""
+    from xagent.web.api import auth as auth_api
+
+    db, user = db_session
+    db.add_all(
+        [
+            PublicMCPApp(
+                app_id="excel",
+                name="Excel",
+                transport="oauth",
+                provider_name="microsoft",
+                oauth_scopes=["Files.ReadWrite"],
+                is_visible_in_connector=True,
+                launch_config={"command": "python", "args": ["-m", "excel"]},
+            ),
+            PublicMCPApp(
+                app_id="microsoft-profile",
+                name="Microsoft Profile",
+                transport="oauth",
+                provider_name="microsoft",
+                oauth_scopes=["User.Read"],
+                is_visible_in_connector=True,
+                launch_config={"command": "python", "args": ["-m", "profile"]},
+            ),
+        ]
+    )
+    db.commit()
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "microsoft"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=_MockOAuthResponse(
+                {
+                    "access_token": "user-read-token",
+                    "token_type": "Bearer",
+                    "scope": "User.Read",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=_MockOAuthResponse(
+                {"id": "microsoft-user-1", "mail": "alice@example.com"}
+            )
+        ),
+    )
+    provider = SimpleNamespace(
+        provider_name="microsoft",
+        client_id=encrypt_value("microsoft-client-id"),
+        client_secret=encrypt_value("microsoft-client-secret"),
+        token_url="https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        redirect_uri="https://app.example.com/api/auth/microsoft/callback",
+        userinfo_url="https://graph.microsoft.com/v1.0/me",
+        user_id_path="id",
+        email_path="mail",
+        default_scopes=["User.Read"],
+    )
+
+    response = generic_oauth_callback("microsoft", request, db, provider)
+
+    assert response.status_code == 200
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "microsoft")
+        .one()
+        .access_token
+        == "user-read-token"
+    )
+    server_names = {server.name for server in db.query(MCPServer).all()}
+    assert "Microsoft Profile" in server_names
+    assert "Excel" not in server_names
 
 
 def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):

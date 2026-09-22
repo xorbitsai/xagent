@@ -1784,6 +1784,111 @@ async def test_execution_adapter_posts_user_message_after_restart() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execution_adapter_resume_uses_handler_installed_after_post_user_message() -> (
+    None
+):
+    """A resumed run must use the outbound handler installed on the host's
+    config, even when the runner handle already existed before that
+    installation happened.
+
+    post_user_message builds and registers a runner via _build_runner()
+    when no handle exists yet, copying config.outbound_message_handler at
+    construction time. Every non-WebSocket resume caller (task_resume.py,
+    the SaaS dispatcher) calls post_user_message before it installs its
+    outbound handler, so the runner would otherwise be frozen with a None
+    handler and resume() would silently drop the resumed agent's next
+    message (#1328).
+    """
+    tracer = TracerCheckpointStore()
+    first_llm = BlockingLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-noop",
+                    "name": "noop",
+                    "args": {},
+                }
+            ],
+        }
+    )
+    first_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="resume-handler-ordering",
+            pattern="react",
+            llm=first_llm,
+            tools=[FakeTool()],
+            tracer=tracer,
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    first_adapter.start(task="Wait for message", task_id="resume-handler-ordering-exec")
+    first_handle = first_adapter.registry.get("resume-handler-ordering-exec")
+    assert first_handle is not None
+    assert first_handle.task is not None
+    await first_llm.started.wait()
+    assert first_adapter.pause(
+        "resume-handler-ordering-exec", reason="pause before restart"
+    )
+    first_llm.release.set()
+    interrupted = await first_handle.task
+    assert interrupted["status"] == "interrupted"
+
+    sent_messages: list[dict[str, Any]] = []
+    restarted_llm = FakeLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-message",
+                        "name": "send_message",
+                        "args": {
+                            "message": "Still working",
+                            "message_type": "progress",
+                            "expect_response": False,
+                        },
+                    }
+                ],
+            },
+            "resumed done",
+        ]
+    )
+    restarted_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="resume-handler-ordering",
+            pattern="react",
+            llm=restarted_llm,
+            tools=[FakeTool()],
+            tracer=tracer,
+            outbound_message_handler=None,
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    # post_user_message runs first, while config.outbound_message_handler
+    # is still None, so it would build and register the runner handler-less.
+    assert await restarted_adapter.post_user_message(
+        "resume-handler-ordering-exec",
+        "New message after process restart.",
+        request_interrupt=False,
+    )
+
+    # The host installs its outbound handler only now, after the runner
+    # handle already exists (mirrors execute_resume_background's ordering).
+    restarted_adapter.config.outbound_message_handler = sent_messages.append
+
+    resumed = await restarted_adapter.resume("resume-handler-ordering-exec")
+
+    assert resumed is not None
+    assert resumed["success"] is True
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["type"] == "agent_message"
+    assert sent_messages[0]["message"] == "Still working"
+
+
+@pytest.mark.asyncio
 async def test_set_interrupt_checker_propagates_to_prebuilt_adapter() -> None:
     # The mid-run quota checker is normally installed before a run, but
     # set_interrupt_checker must also push onto an already-built adapter — the

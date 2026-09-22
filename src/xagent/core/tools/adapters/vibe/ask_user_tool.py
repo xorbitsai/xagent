@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .factory import register_tool
-from .interaction_types import INTERACTION_TYPES
+from .interaction_types import INTERACTION_TYPES, OPTIONS_REQUIRED_GUIDANCE
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ class InteractionArg(BaseModel):
     field: str = Field(description="Field name for the data")
     label: str = Field(description="Display label for the field")
     options: Optional[list[InteractionOption]] = Field(
-        default=None, description="Options for select types"
+        default=None, description=OPTIONS_REQUIRED_GUIDANCE
     )
     placeholder: Optional[str] = Field(default=None, description="Placeholder text")
     multiline: Optional[bool] = Field(

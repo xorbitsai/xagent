@@ -262,10 +262,18 @@ async def test_shutdown_drains_command_while_registry_retains_lease(host):
     try:
         with factory() as db:
             before = db.get(Task, tid).last_heartbeat_at
-        await asyncio.sleep(0.09)
-        with factory() as db:
-            task = db.get(Task, tid)
-            assert task.runner_id == "worker" and task.last_heartbeat_at > before
+
+        async def wait_for_renewal():
+            while True:
+                with factory() as db:
+                    task = db.get(Task, tid)
+                    assert task.runner_id == "worker"
+                    if task.last_heartbeat_at > before:
+                        return
+                await asyncio.sleep(0.01)
+
+        # Wait for a committed renewal, not a fixed database/scheduler latency.
+        await asyncio.wait_for(wait_for_renewal(), 5)
         assert not closing.done()
     finally:
         release.set()

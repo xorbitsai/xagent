@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import case, or_, select, update
+from sqlalchemy import case, false, or_, select, update
 from sqlalchemy.orm import Session
 
 from ...core.runtime_performance import increment_counter
@@ -50,7 +50,9 @@ class ChannelDelivery:
 ChannelSender = Callable[[ChannelDelivery, dict[str, Any]], Awaitable[None]]
 
 
-def _claim(command_id: int) -> tuple[ChannelDelivery, dict[str, Any] | None] | None:
+def _claim(
+    command_id: int, *, progress: bool = False
+) -> tuple[ChannelDelivery, dict[str, Any] | None] | None:
     from .shared_channel_execution import _read_channel_result
 
     now = datetime.now(timezone.utc)
@@ -64,6 +66,12 @@ def _claim(command_id: int) -> tuple[ChannelDelivery, dict[str, Any] | None] | N
                 or_(
                     TaskChannelDelivery.available_at.is_(None),
                     TaskChannelDelivery.available_at <= now,
+                    (
+                        TaskChannelDelivery.claim_token.is_(None)
+                        & (TaskChannelDelivery.failure_count == 0)
+                    )
+                    if progress
+                    else false(),
                 ),
             )
             .values(
@@ -131,13 +139,17 @@ def _settle_no_commit(
     *,
     status: str = "pending",
     failed: bool = False,
+    retry_only: bool = False,
+    progress_sent: bool = False,
 ) -> str | None:
     now = datetime.now(timezone.utc)
     retry_at = now + timedelta(seconds=_DELIVERY_RETRY_SECONDS)
     values: dict[str, Any] = {
+        "destination": delivery.destination,
         "status": status,
-        "claim_token": None,
-        "available_at": retry_at if status == "pending" else None,
+        # Keep the token as a retry fence: progress bypasses only unclaimed delays.
+        "claim_token": delivery.claim_token if retry_only else None,
+        "available_at": retry_at if status == "pending" and not progress_sent else None,
         "delivered_at": now if status == "delivered" else None,
     }
     if failed:
@@ -179,10 +191,22 @@ def _record_delivery_outcome(
 
 
 def _settle(
-    delivery: ChannelDelivery, *, status: str = "pending", failed: bool = False
+    delivery: ChannelDelivery,
+    *,
+    status: str = "pending",
+    failed: bool = False,
+    retry_only: bool = False,
+    progress_sent: bool = False,
 ) -> None:
     with get_session_local()() as db:
-        settled = _settle_no_commit(db, delivery, status=status, failed=failed)
+        settled = _settle_no_commit(
+            db,
+            delivery,
+            status=status,
+            failed=failed,
+            retry_only=retry_only,
+            progress_sent=progress_sent,
+        )
         db.commit()
     if failed:
         _record_delivery_outcome(delivery, settled, reason="delivery_error")
@@ -208,17 +232,25 @@ def _renew(delivery: ChannelDelivery) -> bool:
 
 
 async def deliver_channel_result(
-    command_id: int, sender: ChannelSender, *, pending_notice: bool = False
+    command_id: int,
+    sender: ChannelSender,
+    *,
+    pending_notice: bool = False,
+    progress: bool = False,
 ) -> bool:
     """Return whether a final send completed; never change Agent/task status."""
     delivery = None
     heartbeat = None
     sending: asyncio.Future[None] | None = None
+    progress_pending = False
     try:
-        claimed = await run_db_io_cancellation_safe(lambda: _claim(command_id))
+        claimed = await run_db_io_cancellation_safe(
+            lambda: _claim(command_id, progress=progress)
+        )
         if claimed is None:
             return False
         delivery, result = claimed
+        progress_pending = progress and result is None
         if result is None and not pending_notice:
             await run_db_io_cancellation_safe(lambda: _settle(delivery))
             return False
@@ -240,7 +272,13 @@ async def deliver_channel_result(
             await heartbeat
         await sending
         status = "delivered" if result is not None else "pending"
-        await run_db_io_cancellation_safe(lambda: _settle(delivery, status=status))
+        await run_db_io_cancellation_safe(
+            lambda: (
+                _settle(delivery, progress_sent=True)
+                if progress_pending
+                else _settle(delivery, status=status)
+            )
+        )
         return result is not None
     except Exception:
         logger.exception("Channel result delivery deferred command_id=%s", command_id)
@@ -249,7 +287,11 @@ async def deliver_channel_result(
         if delivery is not None:
             try:
                 await run_db_io_cancellation_safe(
-                    lambda: _settle(delivery, failed=True)
+                    lambda: (
+                        _settle(delivery, retry_only=True)
+                        if progress_pending
+                        else _settle(delivery, failed=True)
+                    )
                 )
             except Exception:
                 logger.exception(

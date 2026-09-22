@@ -1106,6 +1106,93 @@ def test_normalize_args_by_schema_keeps_scalar_for_union_scalar_or_array_field()
     assert normalized["value"] == "abc"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "field_name", "field_schema", "value"),
+    [
+        (
+            "excel_add_table_rows",
+            "index",
+            {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+            True,
+        ),
+        (
+            "excel_delete_table_row",
+            "row_index",
+            {"type": "integer", "minimum": 0},
+            "3",
+        ),
+        (
+            "excel_list_table_rows",
+            "skip",
+            {"type": "integer", "minimum": 0, "default": 0},
+            1.0,
+        ),
+        (
+            "excel_list_table_rows",
+            "page_size",
+            {"type": "integer", "minimum": 1, "maximum": 100},
+            0,
+        ),
+    ],
+)
+async def test_adapter_rejects_coerced_or_out_of_range_excel_integer_args(
+    monkeypatch, tool_name, field_name, field_schema, value
+):
+    mcp_tool = SimpleNamespace(
+        name=tool_name,
+        description="Excel tool",
+        inputSchema={
+            "type": "object",
+            "properties": {field_name: field_schema},
+            "required": [field_name],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+    execute = AsyncMock()
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+
+    result = await adapter.run_json_async({field_name: value})
+
+    assert result["is_error"] is True
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_adapter_forwards_valid_excel_integer_args_without_coercion(monkeypatch):
+    mcp_tool = SimpleNamespace(
+        name="excel_list_table_rows",
+        description="List Excel table rows",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "skip": {"type": "integer", "minimum": 0, "default": 0},
+                "page_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20,
+                },
+            },
+            "required": [],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+    execute = AsyncMock(return_value={"content": [], "is_error": False})
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+
+    result = await adapter.run_json_async({"skip": 3, "page_size": 10})
+
+    assert result["is_error"] is False
+    assert execute.await_args.args[1] == {"skip": 3, "page_size": 10}
+
+
 def test_build_args_model_handles_anyof_multi_type_schema():
     mcp_tool = SimpleNamespace(
         name="multi_type_tool",

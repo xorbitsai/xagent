@@ -147,6 +147,10 @@ def _configure_postgres_app(
     postgres_url: str,
 ) -> None:
     monkeypatch.setenv("DATABASE_URL", postgres_url)
+    # These tests measure request/service checkouts, not worker polling.
+    # A combined host dispatcher can borrow the only slot after a response
+    # and make the zero-checkout assertions fail despite correct cleanup.
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "web")
     monkeypatch.setenv("XAGENT_DB_POOL_SIZE", "1")
     monkeypatch.setenv("XAGENT_DB_MAX_OVERFLOW", "0")
     monkeypatch.setenv("XAGENT_DB_POOL_TIMEOUT_SECONDS", "1")

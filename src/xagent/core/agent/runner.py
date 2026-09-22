@@ -145,6 +145,7 @@ class AgentRunner:
         checkpoint: dict[str, Any] | None = None,
         runtime: PatternRuntime | None = None,
         interrupt_checker: Any | None = None,
+        outbound_message_handler: Any | None = None,
         streaming_handler: Any | None = None,
         extra_tools: list[Any] | None = None,
         metadata: dict[str, Any] | None = None,
@@ -258,11 +259,21 @@ class AgentRunner:
                     context_refs=task_context_refs,
                 )
 
+        # A runner registered by post_user_message before the host installed
+        # its handler would otherwise resume handler-less (#1328); an
+        # explicit handler passed to the resumed run wins over the
+        # constructor-time one. Passing None here means "inherit the
+        # constructor-time handler," not "clear it"; no caller clears a
+        # handler today, so there is deliberately no sentinel for that.
         runtime = runtime or PatternRuntime(
             tracer=self.tracer,
             execution_id=execution_id,
             interrupt_checker=interrupt_checker,
-            outbound_message_handler=self.outbound_message_handler,
+            outbound_message_handler=(
+                outbound_message_handler
+                if outbound_message_handler is not None
+                else self.outbound_message_handler
+            ),
         )
         if self.workspace_enabled and runtime.context_ref_resolver is None:
             if workspace is None:
@@ -514,6 +525,7 @@ class AgentRunner:
         extra_tools: list[Any] | None = None,
         metadata: dict[str, Any] | None = None,
         interrupt_checker: Any | None = None,
+        outbound_message_handler: Any | None = None,
     ) -> dict[str, Any]:
         checkpoint = await self._load_latest_checkpoint(execution_id)
         resolved_task = self._resolve_task(
@@ -535,6 +547,7 @@ class AgentRunner:
             extra_tools=extra_tools,
             metadata=metadata,
             interrupt_checker=interrupt_checker,
+            outbound_message_handler=outbound_message_handler,
         )
 
     async def inject_user_message(

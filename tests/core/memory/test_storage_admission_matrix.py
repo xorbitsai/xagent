@@ -494,8 +494,31 @@ def test_contended_lock_returns_a_typed_retryable_outcome(tmp_path, scope):
     assert _snapshot(connection) == before
 
 
-@pytest.mark.parametrize("metadata", ['{"user_id":1e309}', '{"user_id":Infinity}'])
-def test_nonfinite_legacy_user_id_requires_repair(tmp_path, metadata):
+# One contract: a persisted user_id that does not denote exactly one in-range
+# owner blocks the rewrite, whether coercing it overflows ("1e309", "Infinity"),
+# raises ValueError ("NaN", the strings naming them) or silently succeeds on a
+# value that is not an owner (a fractional float, a bool, a list).
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        '{"user_id":1e309}',
+        '{"user_id":Infinity}',
+        '{"user_id":-Infinity}',
+        '{"user_id":NaN}',
+        '{"user_id":"nan"}',
+        '{"user_id":"Infinity"}',
+        '{"user_id":1.5}',
+        '{"user_id":true}',
+        '{"user_id":[1]}',
+        # json.loads rounds this text to 9007199254740992.0 before any
+        # validation sees it, so int() would stage a different owner than the
+        # metadata names. 2**53 is what both spellings collapse to, so a float
+        # that large names no single owner either and is rejected too.
+        '{"user_id":9007199254740993.0}',
+        '{"user_id":9007199254740992.0}',
+    ],
+)
+def test_unusable_legacy_user_id_requires_repair(tmp_path, metadata):
     connection = lancedb.connect(tmp_path)
     table = connection.create_table(
         "memories",
@@ -507,6 +530,35 @@ def test_nonfinite_legacy_user_id_requires_repair(tmp_path, metadata):
     assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
     assert outcome.detail == REPAIR_REQUIRED_DETAIL
     assert _snapshot(connection) == before
+
+
+# The other half of that contract: every spelling admission resolved before
+# still admits, and still lands on the same owner.
+@pytest.mark.parametrize(
+    ("metadata", "user_id"),
+    [
+        ('{"user_id":5}', 5),
+        ('{"user_id":5.0}', 5),
+        ('{"user_id":"5"}', 5),
+        # The largest float that still names exactly one owner.
+        ('{"user_id":9007199254740991.0}', 2**53 - 1),
+        # Past that range only the lossy float spelling is refused: a JSON
+        # integer token decodes exactly however large it is, and so does a
+        # numeric string, so the owner itself is never unreachable.
+        ('{"user_id":9007199254740993}', 2**53 + 1),
+        ('{"user_id":"9007199254740993"}', 2**53 + 1),
+    ],
+)
+def test_resolvable_legacy_user_id_still_admits(tmp_path, metadata, user_id):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table({"id": ["note"], "text": ["text"], "metadata": [metadata]}),
+    )
+    _safe_close_table(table)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert _snapshot(connection)[2][0][USER_ID_COLUMN] == user_id
 
 
 def test_distant_duplicate_is_rejected_without_mutation(tmp_path):
@@ -630,6 +682,119 @@ def test_scope_only_marker_never_certifies_admission(tmp_path, case):
         assert math.isnan(after[2][0]["vector"][0])
     else:
         assert after[2] == before[2]
+
+
+# The generation the base branch's validator stamped tables with, before the
+# strict ``user_id`` scan existed. A fixture carrying it stands in for every
+# table already certified when the bumped generation ships.
+BASE_FULL_ADMISSION_VERSION = b"1"
+
+
+def _previously_certified_connection(tmp_path, metadata):
+    """Seed a table a previous validator generation certified at its version.
+
+    Everything ``_is_fully_admitted`` inspects is present and current: the
+    required columns and their types, a fixed-size float32 vector column, and a
+    full-admission marker bound to this table's own version. Only the marker's
+    generation is stale, and the staged ``user_id`` is the projection that
+    generation would have written for ``metadata`` -- ``int(1.5)`` for a value
+    the strict scan now rejects, the real owner for one it accepts.
+    """
+    assert BASE_FULL_ADMISSION_VERSION != FULL_ADMISSION_VERSION
+    connection = lancedb.connect(tmp_path)
+    identity = json.dumps(IDENTITY.as_dict(), sort_keys=True, separators=(",", ":"))
+    marker = {
+        MAINTENANCE_METADATA_KEY: MAINTENANCE_VERSION,
+        MAINTENANCE_TABLE_VERSION_KEY: b"1",
+        FULL_ADMISSION_METADATA_KEY: BASE_FULL_ADMISSION_VERSION,
+        FULL_ADMISSION_TABLE_VERSION_KEY: b"1",
+    }
+    schema = pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field("text", pa.string()),
+            pa.field("metadata", pa.string()),
+            pa.field("vector", pa.list_(pa.float32(), 4)),
+            pa.field(USER_ID_COLUMN, pa.int64(), metadata=marker),
+            pa.field(SCOPE_DIMS_COLUMN, pa.list_(pa.string())),
+        ],
+        metadata={VECTOR_IDENTITY_METADATA_KEY: identity.encode()},
+    )
+    row = {
+        "id": "note-0",
+        "text": "text-0",
+        "metadata": metadata,
+        "vector": [1.0, 2.0, 3.0, 4.0],
+        USER_ID_COLUMN: int(float(json.loads(metadata)["user_id"])),
+        SCOPE_DIMS_COLUMN: [],
+    }
+    table = connection.create_table(
+        "memories", pa.Table.from_pylist([row], schema=schema)
+    )
+    version = table.version
+    _safe_close_table(table)
+    # The marker is otherwise live: it names this table's own version, so its
+    # generation is the only thing that can keep it off the fast path.
+    assert version == 1
+    return connection
+
+
+def test_previously_certified_table_is_rescanned_and_blocked_when_invalid(tmp_path):
+    """A stale certificate never short-circuits a stricter validator.
+
+    The old validator read ``1.5`` as owner ``1``, staged it and stamped the
+    table complete. Honouring that marker would leave the vector path pushing
+    down an owner the authoritative metadata never named, so the generation
+    bump has to force the rescan that rejects the row instead.
+    """
+    connection = _previously_certified_connection(tmp_path, '{"user_id": 1.5}')
+    before = _snapshot(connection)
+
+    outcome = _admit(connection)
+
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert outcome.detail == REPAIR_REQUIRED_DETAIL
+    assert outcome.maintenance.status is MaintenanceStatus.INVALID_LEGACY_DATA
+    after = _snapshot(connection)
+    # Same version, same schema, same rows -- including the wrong owner the old
+    # path persisted, which admission refuses to certify and never rewrites.
+    assert after == before
+    marker = after[1].field(USER_ID_COLUMN).metadata
+    assert marker[FULL_ADMISSION_METADATA_KEY] == BASE_FULL_ADMISSION_VERSION
+    assert marker[FULL_ADMISSION_METADATA_KEY] != FULL_ADMISSION_VERSION
+    assert marker[FULL_ADMISSION_TABLE_VERSION_KEY] == str(before[0]).encode()
+
+
+def test_previously_certified_table_is_recertified_when_valid(tmp_path, monkeypatch):
+    """The other half of the bump: a sound table is rescanned, then re-stamped."""
+    connection = _previously_certified_connection(tmp_path, '{"user_id": 7}')
+    before_version = _snapshot(connection)[0]
+    scanned = []
+    original = vector_compatibility._checkpoint
+
+    def observe(stage, batch=None):
+        if stage == "scan_batch":
+            scanned.append(batch)
+        original(stage, batch)
+
+    monkeypatch.setattr(vector_compatibility, "_checkpoint", observe)
+    outcome = _admit(connection)
+
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    # The stale marker bought no shortcut: the row really went through the scan.
+    assert scanned == [1]
+    version, schema, rows = _snapshot(connection)
+    assert version == before_version + 1
+    assert rows[0][USER_ID_COLUMN] == 7
+    marker = schema.field(USER_ID_COLUMN).metadata
+    assert marker[FULL_ADMISSION_METADATA_KEY] == FULL_ADMISSION_VERSION
+    assert marker[FULL_ADMISSION_TABLE_VERSION_KEY] == str(version).encode()
+    # Certified under the current generation, so the one-time rescan really is
+    # one-time: the next admission takes the fast path and rewrites nothing.
+    scanned.clear()
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    assert scanned == []
+    assert _snapshot(connection)[0] == version
 
 
 def _admit_foreign_identity_after_snapshot(path, snapshotted, committed, results):

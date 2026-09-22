@@ -105,12 +105,17 @@ class FileHandlerResult(TypedDict):
         file_id: Optional file_id for stable doc_id generation
         rollback_on_failure: Optional callback to compensate file persistence
             when the subsequent document ingestion does not succeed.
+            Only consulted when no per-boundary callback is set; the
+            boundary callbacks below take priority.
         commit_on_success: Optional callback to finalize temporary rollback
             resources once the subsequent document ingestion succeeds.
         rollback_context: Optional operation-outcome metadata describing the
             web file side effect. This is internal and does not affect public
             web ingestion result schemas.
         file_compensation: Optional FILE-boundary compensation callback.
+            Declaring any boundary callback (or rollback_on_failure) also
+            disables the pipeline's own persistent-file cleanup: the
+            handler owns whatever it wrote.
         document_compensation: Optional DOCUMENT-boundary compensation callback.
         status_compensation: Optional STATUS-boundary compensation callback.
         snapshot_compensation: Optional SNAPSHOT-boundary compensation callback.
@@ -389,8 +394,13 @@ def _run_legacy_persistent_file_compensation(
 ) -> Optional[str]:
     if not copied_persistent_file or not copied_persistent_file.exists():
         return None
+    # A handler that declared boundary compensation owns this file's fate --
+    # the new-file handler deletes it, the reuse handler leaves it alone. That
+    # second case is why this matters: its file_path is a pre-existing file,
+    # and unlinking it here would destroy user data.
     if file_info and (
-        "rollback_on_failure" in file_info or "file_compensation" in file_info
+        _has_per_boundary_compensation(file_info)
+        or file_info.get("rollback_on_failure") is not None
     ):
         return None
 

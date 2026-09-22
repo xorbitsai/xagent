@@ -34,10 +34,12 @@ from xagent.web.services.gmail_provisioning import (
     GMAIL_ACCOUNT_UNAVAILABLE_ERROR,
     GMAIL_INVALID_OAUTH_ACCOUNT_BINDING_ERROR,
     GMAIL_PUSH_PUBLISHER,
+    GMAIL_RECONNECT_REQUIRED_ERROR,
     GMAIL_WATCH_DISABLED_ERROR,
     ensure_gmail_mailbox_provisioned,
     gmail_subscription_path,
     gmail_topic_path,
+    mark_gmail_oauth_reconnect_required,
     reconcile_gmail_push_endpoints,
     reconcile_gmail_trigger_provisioning,
     release_gmail_mailbox_if_unused,
@@ -583,6 +585,30 @@ def test_trigger_provisioning_rejects_ambiguous_legacy_mailbox(
     assert status == TriggerProvisioningStatus.FAILED.value
     assert trigger.provisioning_error == GMAIL_ACCOUNT_UNAVAILABLE_ERROR
     assert db_session.query(GmailWatchState).count() == 0
+
+
+def test_provisioning_account_ignores_tombstone_sharing_the_live_accounts_email(
+    db_session: Session,
+) -> None:
+    """A retained reconnect tombstone must not make an otherwise-unambiguous
+    legacy mailbox lookup report false ambiguity: it shares the live
+    account's email (the identity a reconnect would revive), but it is not
+    itself a usable grant.
+    """
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    live = _create_oauth(db_session, user, email="legacy@gmail.example")
+    tombstone = _create_oauth(db_session, user, email="Legacy@Gmail.Example")
+    tombstone.access_token = ""
+    db_session.add(tombstone)
+    trigger = _create_gmail_trigger(db_session, user, agent, live)
+    trigger.config = {"watch_label": "INBOX"}
+    db_session.commit()
+
+    account = gmail_provisioning._provisioning_account(db_session, trigger)
+
+    assert account is not None
+    assert int(account.id) == int(live.id)
 
 
 def test_release_rejects_actor_owned_account(db_session: Session) -> None:
@@ -1624,6 +1650,102 @@ async def test_gmail_provider_register_unregister_offload_sync_sdk_work(
     ]
 
 
+async def test_gmail_provider_unregister_ignores_tombstone_sharing_the_live_accounts_email(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy (no ``oauth_account_id``) unregister must resolve the live
+    account even though a token-cleared tombstone shares its email -- see
+    the matching ``_provisioning_account`` fix for the register-side path.
+    """
+    from xagent.web.services.trigger_providers.gmail import GmailProvider
+
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    live = _create_oauth(db_session, user, email="legacy@gmail.example")
+    tombstone = _create_oauth(db_session, user, email="Legacy@Gmail.Example")
+    tombstone.access_token = ""
+    db_session.add(tombstone)
+    trigger = _create_gmail_trigger(db_session, user, agent, live)
+    trigger.config = {"watch_label": "INBOX"}
+    db_session.commit()
+
+    released: list[int] = []
+
+    def fake_release(_db: Session, oauth_account_id: int) -> bool:
+        released.append(oauth_account_id)
+        return True
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
+        fake_release,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.asyncio.to_thread",
+        fake_to_thread,
+    )
+
+    provider = GmailProvider()
+    await provider.unregister(
+        db_session,
+        trigger,
+        {"watch_label": "INBOX"},
+        resource_id=str(live.email),
+    )
+
+    assert released == [int(live.id)]
+
+
+async def test_gmail_provider_unregister_releases_a_sole_tombstone_mailbox(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy trigger whose only matching account is a reconnect tombstone
+    must still tear down that mailbox's watch/Pub/Sub resources: excluding
+    tombstones outright (rather than only de-ranking them against a live
+    sibling) would leak them forever once the grant is dead.
+    """
+    from xagent.web.services.trigger_providers.gmail import GmailProvider
+
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    tombstone = _create_oauth(db_session, user, email="dead@gmail.example")
+    tombstone.access_token = ""
+    db_session.add(tombstone)
+    trigger = _create_gmail_trigger(db_session, user, agent, tombstone)
+    trigger.config = {"watch_label": "INBOX"}
+    db_session.commit()
+
+    released: list[int] = []
+
+    def fake_release(_db: Session, oauth_account_id: int) -> bool:
+        released.append(oauth_account_id)
+        return True
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
+        fake_release,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.asyncio.to_thread",
+        fake_to_thread,
+    )
+
+    provider = GmailProvider()
+    await provider.unregister(
+        db_session,
+        trigger,
+        {"watch_label": "INBOX"},
+        resource_id=str(tombstone.email),
+    )
+
+    assert released == [int(tombstone.id)]
+
+
 def test_slow_registration_returns_pending_then_reconciles_to_active(
     db_session: Session,
 ) -> None:
@@ -1747,6 +1869,114 @@ def test_reconcile_copies_watch_state_status_onto_triggers(
 
     # Idempotent: nothing to update on a second pass.
     assert reconcile_gmail_trigger_provisioning(db_session) == 0
+
+
+def test_token_cleared_gmail_account_quiesces_watch_and_trigger(
+    db_session: Session,
+) -> None:
+    """The function owns clearing the grant's tokens; callers must not clear
+    them beforehand (see its docstring) -- this account still has a live
+    access/refresh token and a future expiry when the call is made.
+    """
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    account.refresh_token = "refresh-token"
+    account.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    trigger.provisioning_status = TriggerProvisioningStatus.ACTIVE.value
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="hist-1",
+        topic_name="projects/demo-project/topics/xagent-gmail-abc",
+        watch_expiration=datetime.now(timezone.utc) + timedelta(days=1),
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add_all([trigger, state])
+    db_session.commit()
+
+    updated = mark_gmail_oauth_reconnect_required(
+        db_session,
+        oauth_account=account,
+    )
+    db_session.commit()
+
+    assert updated == 2
+    db_session.refresh(account)
+    db_session.refresh(state)
+    db_session.refresh(trigger)
+    assert account.access_token == ""
+    assert account.refresh_token is None
+    assert account.expires_at is None
+    assert state.status == TriggerProvisioningStatus.FAILED.value
+    assert state.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
+    assert state.watch_expiration is None
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == GMAIL_RECONNECT_REQUIRED_ERROR
+    assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 0
+
+
+def test_mark_gmail_oauth_reconnect_required_serializes_with_the_transition_lock(
+    db_session: Session,
+) -> None:
+    """A concurrent provisioning/renewal run holding this account's mailbox
+    transition lock must block a reconnect-required update, not race it --
+    without the lock, a run that already read the since-cleared token could
+    commit ``status=ACTIVE`` after this function's own update, silently
+    resurrecting an active-looking watch on a now-dead grant.
+    """
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="hist-1",
+        topic_name="projects/demo-project/topics/xagent-gmail-abc",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add(state)
+    db_session.commit()
+    account_id = int(account.id)
+
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_lock() -> None:
+        with gmail_provisioning._gmail_watch_transition_lock(db_session, account_id):
+            lock_acquired.set()
+            release_lock.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock, name="lock-holder")
+    holder.start()
+    try:
+        assert lock_acquired.wait(timeout=5)
+
+        finished = threading.Event()
+
+        def call_mark_reconnect() -> None:
+            mark_gmail_oauth_reconnect_required(db_session, oauth_account=account)
+            finished.set()
+
+        caller = threading.Thread(target=call_mark_reconnect, name="reconnect-flagger")
+        caller.start()
+        try:
+            # The transition lock is held by another thread, so the call
+            # above must block on it rather than updating the watch state
+            # immediately.
+            assert not finished.wait(timeout=0.3)
+        finally:
+            release_lock.set()
+            caller.join(timeout=5)
+        assert finished.is_set()
+    finally:
+        holder.join(timeout=5)
+
+    db_session.commit()
+    db_session.refresh(state)
+    assert state.status == TriggerProvisioningStatus.FAILED.value
 
 
 @pytest.mark.parametrize(

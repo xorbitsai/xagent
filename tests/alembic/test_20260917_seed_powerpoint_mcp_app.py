@@ -8,6 +8,7 @@ import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 
 def _load_migration_module():
@@ -159,3 +160,37 @@ def test_upgrade_and_downgrade_no_op_without_table(tmp_path):
             ).scalars()
         )
         assert "public_mcp_apps" not in table_names
+
+
+def test_fresh_registry_seed_rejects_normalized_custom_server_collision(tmp_path):
+    """seed_builtin_oauth_and_public_mcp_apps's protected_server_identities
+    guard now covers powerpoint -- pin it the same way excel's is already
+    pinned, so a future edit can't silently reopen the fresh-install
+    collision hole for this connector specifically."""
+    from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+    from xagent.web.models.database import Base
+    from xagent.web.models.mcp import MCPServer
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh-seed.sqlite'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    db.add(
+        MCPServer(
+            name=" PowerPoint ",
+            managed="external",
+            transport="stdio",
+            command="custom",
+        )
+    )
+    db.commit()
+    db.close()
+
+    with engine.begin() as connection:
+        with pytest.raises(RuntimeError, match="custom mcp_servers identity"):
+            seed_builtin_oauth_and_public_mcp_apps(connection)
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='powerpoint'")
+        ).scalar_one()
+
+    assert count == 0

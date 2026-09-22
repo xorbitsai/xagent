@@ -1279,6 +1279,13 @@ async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -
         await asyncio.wait_for(resume_task, timeout=30)
 
     agent_service.resume_execution_by_id.assert_awaited_once()
+    # The handover hands the same agent object to the shared resume
+    # entrypoint, which must install the outbound handler before it
+    # resumes the run (#1328).
+    call_names = [name for name, _args, _kwargs in agent_service.mock_calls]
+    assert call_names.index("set_outbound_message_handler") < call_names.index(
+        "resume_execution_by_id"
+    )
     db = _direct_db_session()
     try:
         restored = db.query(Task).filter(Task.id == task_id).one()

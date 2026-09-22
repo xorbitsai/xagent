@@ -74,9 +74,12 @@ from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ....tools.adapters.vibe.interaction_types import (
     DEFAULT_WAITING_INTERACTION,
+    DEGRADED_FIELDS_NOTE,
     INTERACTION_TYPE_ALIASES,
     INTERACTION_TYPES,
-    TYPES_REQUIRING_OPTIONS,
+    OPTIONS_REQUIRED_GUIDANCE,
+    degrade_options_less_pickers,
+    lacks_required_options,
 )
 from ....tools.user_interaction import (
     tool_result_waits_for_user,
@@ -445,12 +448,15 @@ def _is_answerable(interaction: Any) -> bool:
     cannot answer, because a form whose fields are all widgets renders no
     Submit button (``isConnectAppsOnly``, clarification-form.tsx). A picker
     with no options survives ``_normalize_ask_user_interactions`` (which drops
-    the blank options, not the interaction) as a control with nothing to pick.
-    Aliases are not a third case: normalization has already mapped them onto
-    these seven. Two gaps stay open, both under the embedded widget's default
-    ``filesDisabled``: a ``file_upload`` renders nothing, and an
-    ``action_cards`` whose options are all file actions renders no cards
-    (``visibleOptions``, clarification-form.tsx).
+    the blank options, not the interaction) as a control with nothing to pick;
+    both publishing call sites degrade such a picker to a ``text_input``
+    (``degrade_options_less_pickers``) before the list reaches
+    ``_send_waiting_message``, so that branch fires here only for a caller
+    that skips that step. Aliases are not a third case: normalization has
+    already mapped them onto these seven. Two gaps stay open, both under the
+    embedded widget's default ``filesDisabled``: a ``file_upload`` renders
+    nothing, and an ``action_cards`` whose options are all file actions
+    renders no cards (``visibleOptions``, clarification-form.tsx).
     """
 
     if not isinstance(interaction, dict):
@@ -464,10 +470,7 @@ def _is_answerable(interaction: Any) -> bool:
         return False
     if interaction_type not in INTERACTION_TYPES:
         return False
-    if interaction_type in TYPES_REQUIRING_OPTIONS:
-        options = interaction.get("options")
-        return isinstance(options, list) and bool(options)
-    return True
+    return not lacks_required_options(interaction)
 
 
 class ReActPattern(AgentPattern):
@@ -2358,7 +2361,7 @@ class ReActPattern(AgentPattern):
                         "a sufficiently specified task; decide those yourself. A task "
                         "is not sufficiently specified if carrying it out would "
                         "require inventing a fact-carrying argument value the user "
-                        "has not provided."
+                        "has not provided. " + OPTIONS_REQUIRED_GUIDANCE
                     ),
                     "parameters": {
                         "type": "object",
@@ -2633,6 +2636,17 @@ class ReActPattern(AgentPattern):
                     str(item.get("field") or "response"), used_fields
                 )
                 deduplicated_interactions.append(item)
+            deduplicated_interactions, degraded_fields = degrade_options_less_pickers(
+                deduplicated_interactions
+            )
+            # Absent, not empty, when nothing was degraded: the key is a
+            # signal, and a model that sees it on every call learns to
+            # ignore it.
+            degradation: dict[str, Any] = (
+                {"degraded_fields": degraded_fields, "note": DEGRADED_FIELDS_NOTE}
+                if degraded_fields
+                else {}
+            )
             outbound_message, interactions = await self._send_waiting_message(
                 runtime=runtime,
                 message=message,
@@ -2647,6 +2661,7 @@ class ReActPattern(AgentPattern):
                     "message": message,
                     "expect_response": True,
                     "interactions": interactions,
+                    **degradation,
                 },
             )
             self.status = "waiting_for_user"
@@ -2658,8 +2673,11 @@ class ReActPattern(AgentPattern):
                     "message_type": "question",
                     # Pre-append copy: what the model supplied is its own output
                     # and echoes back; an engine-appended field would read as
-                    # one it authored too.
+                    # one it authored too. A degraded field is the model's own
+                    # (same name), so it does echo -- under the type the user
+                    # was actually shown.
                     "interactions": deduplicated_interactions,
+                    **degradation,
                 },
                 tool_call_id=tool_call.get("id"),
             )
@@ -2707,8 +2725,13 @@ class ReActPattern(AgentPattern):
         that must stay field-free, and whose callers need the published list
         back to store on the waiting request.
 
-        Appended, never substituted for the list: an options-less picker's
-        ``label`` is the only copy of the question text the run has.
+        Appended, never substituted for the list: an entry this check cannot
+        answer can still be a real control -- ``connect_apps`` is one the
+        frontend renders, reachable tool-authored or off-schema. An
+        options-less picker no longer reaches here from either call site
+        (``degrade_options_less_pickers``); if one did, its ``label`` would
+        be the only copy of the question text the run has, which is why this
+        appends rather than replaces.
         """
 
         published = list(interactions)
@@ -2967,8 +2990,16 @@ class ReActPattern(AgentPattern):
                 item["field"] = _unique_field(
                     str(item.get("field") or "response"), used_fields
                 )
-                interactions.append(item)
                 deduplicated_request_interactions.append(item)
+            # Tool-authored, so there is no model to hand the degraded names
+            # back to; the warning inside is the only signal. Degraded before
+            # the per-request list is recorded on ``requests`` below, so the
+            # structured row (built from those lists) and the published list
+            # agree on what was shown.
+            deduplicated_request_interactions, _ = degrade_options_less_pickers(
+                deduplicated_request_interactions
+            )
+            interactions.extend(deduplicated_request_interactions)
 
             requests.append(
                 {

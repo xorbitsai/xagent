@@ -65,6 +65,11 @@ def get_google_credentials(
         raise HTTPException(
             status_code=401, detail="Google Drive account not connected"
         )
+    if not oauth_account.access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Google Drive session expired. Please reconnect.",
+        )
 
     client_id, client_secret = get_google_oauth_config(db)
     if not client_id or not client_secret:
@@ -119,6 +124,8 @@ async def list_connected_accounts(
 
     if provider:
         query = query.filter(UserOAuth.provider == provider)
+
+    query = query.filter(UserOAuth.access_token != "")
 
     accounts = query.all()
 

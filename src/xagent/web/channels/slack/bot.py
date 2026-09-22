@@ -9,6 +9,7 @@ import re
 from collections import deque
 from contextlib import suppress
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Callable, cast
 from uuid import uuid4
 
@@ -25,16 +26,26 @@ from ....config import (
     get_slack_app_token,
     get_storage_root,
 )
+from ....core.agent.trace import TraceEvent
 from ....core.file_ref import build_file_id_ref
+from ....core.file_storage.keys import build_upload_storage_key
 from ...models.task import TaskStatus
 from ...services.agent_service_manager import get_agent_manager
-from ...services.channel_delivery import ChannelDelivery, recover_channel_results
+from ...services.channel_delivery import (
+    ChannelDelivery,
+    deliver_channel_result,
+    recover_channel_results,
+)
+from ...services.channel_input_acceptance import (
+    ChannelInput,
+    accept_channel_input,
+    lookup_channel_input,
+)
+from ...services.channel_progress import DurableChannelProgress
 from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
-    ClaimedChannelTask,
     DownloadedChannelFile,
-    SelectedChannelTask,
     authorize_channel_sender,
     deactivate_channel_sync,
     load_active_channel_configs,
@@ -46,6 +57,7 @@ from ...services.channel_runtime import (
 )
 from ...services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ...services.db_runtime import (
+    await_task_settlement,
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
@@ -60,14 +72,19 @@ from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
 from ...services.shared_channel_execution import (
     SharedChannelTurn,
-    prepare_shared_channel_turn,
 )
+from ...services.task_event_bridge import get_task_event_bridge
 from ...services.task_execution_context_service import (
     materialize_task_execution_recovery_state,
 )
 from ...services.task_lease_service import TaskLeaseLostError
-from ...services.task_orchestrator import TaskTurnPayload
+from ...services.task_orchestrator import TaskTurnError, TaskTurnPayload
 from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
+from ...services.uploaded_file_store import (
+    StagedUploadedFile,
+    compensate_staged_uploaded_files,
+    stage_uploaded_file_from_local_path,
+)
 from .trace_handler import SlackTraceHandler
 from .utils import (
     SlackFileRef,
@@ -435,7 +452,6 @@ class SlackBotInstance:
         payload: dict[str, Any],
         event: dict[str, Any],
     ) -> None:
-        del payload
         slack_user_id = str(event.get("user") or "")
         slack_channel_id = str(event.get("channel") or "")
         thread_ts = self._reply_thread_ts(event)
@@ -460,21 +476,21 @@ class SlackBotInstance:
             )
             return
 
+        if get_shared_task_execution_enabled():
+            await self._process_shared_event(
+                conversation_key, payload, event, text, files
+            )
+            return
+
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
-        shared_turn: SharedChannelTurn | None = None
         agent_service = None
         loading_ts: str | None = None
         try:
             prompt_text = text or "Please process the attached Slack file(s)."
             active_task_id = self.active_tasks.get(conversation_key)
             try:
-                prepare = (
-                    prepare_shared_channel_turn
-                    if get_shared_task_execution_enabled()
-                    else prepare_channel_task
-                )
-                prepared_task = await prepare(
+                prepared_task = await prepare_channel_task(
                     channel_id=self.channel_id,
                     external_user_id=slack_user_id,
                     active_task_id=active_task_id,
@@ -505,13 +521,8 @@ class SlackBotInstance:
                 )
                 return
 
-            selected_task: SelectedChannelTask | ClaimedChannelTask
-            if isinstance(prepared_task, SharedChannelTurn):
-                shared_turn = prepared_task
-                selected_task = shared_turn.selection
-            else:
-                selected_task = prepared_task
-                managed_lease = prepared_task.managed_lease
+            selected_task = prepared_task
+            managed_lease = prepared_task.managed_lease
             task_id = selected_task.task_id
             claimed_task_id = task_id
             owner_user_id = selected_task.user_id
@@ -520,33 +531,32 @@ class SlackBotInstance:
                 self.active_tasks[conversation_key] = task_id
                 self._save_active_tasks()
 
-            if shared_turn is None:
-                setup_snapshot = await run_db_io_cancellation_safe(
-                    lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
-                )
-                if setup_snapshot is None:
-                    raise RuntimeError(f"Task {task_id} disappeared before execution")
+            setup_snapshot = await run_db_io_cancellation_safe(
+                lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
+            )
+            if setup_snapshot is None:
+                raise RuntimeError(f"Task {task_id} disappeared before execution")
 
-                agent_manager = get_agent_manager()
-                agent_service = await agent_manager.get_agent_for_task(
-                    task_id,
-                    user=setup_snapshot.runtime_user,
-                    task_setup_snapshot=setup_snapshot,
-                    task_owner_user_id=owner_user_id,
-                )
-                agent_service.set_conversation_history(
-                    [dict(message) for message in setup_snapshot.conversation_history],
-                    watermark=setup_snapshot.conversation_watermark,
-                )
-                recovery_state = await materialize_task_execution_recovery_state(
-                    setup_snapshot.execution_recovery
-                )
-                agent_service.set_execution_context_messages(
-                    recovery_state.get("messages", [])
-                )
-                agent_service.set_recovered_skill_context(
-                    recovery_state.get("skill_context")
-                )
+            agent_manager = get_agent_manager()
+            agent_service = await agent_manager.get_agent_for_task(
+                task_id,
+                user=setup_snapshot.runtime_user,
+                task_setup_snapshot=setup_snapshot,
+                task_owner_user_id=owner_user_id,
+            )
+            agent_service.set_conversation_history(
+                [dict(message) for message in setup_snapshot.conversation_history],
+                watermark=setup_snapshot.conversation_watermark,
+            )
+            recovery_state = await materialize_task_execution_recovery_state(
+                setup_snapshot.execution_recovery
+            )
+            agent_service.set_execution_context_messages(
+                recovery_state.get("messages", [])
+            )
+            agent_service.set_recovered_skill_context(
+                recovery_state.get("skill_context")
+            )
 
             turn_id = str(uuid4())
             context: dict[str, Any] = {"turn_id": turn_id}
@@ -560,7 +570,6 @@ class SlackBotInstance:
                     agent_service=agent_service,
                     task_id=task_id,
                     user_id=owner_user_id,
-                    **({"workspace": shared_turn.workspace} if shared_turn else {}),
                 )
                 if not uploaded_info:
                     raise SlackFileDownloadError(
@@ -590,14 +599,13 @@ class SlackBotInstance:
                 context["files"] = persisted_attachments
                 context["display_message"] = display_message
 
-            if shared_turn is None:
-                await persist_channel_user_message(
-                    task_id=task_id,
-                    user_id=owner_user_id,
-                    content=display_message or prompt_text,
-                    attachments=persisted_attachments or None,
-                    turn_id=turn_id,
-                )
+            await persist_channel_user_message(
+                task_id=task_id,
+                user_id=owner_user_id,
+                content=display_message or prompt_text,
+                attachments=persisted_attachments or None,
+                turn_id=turn_id,
+            )
 
             loading_ts = await self._send_text(
                 slack_channel_id,
@@ -616,53 +624,30 @@ class SlackBotInstance:
                 if agent_service is not None:
                     agent_service.tracer.add_handler(trace_handler)
 
-            if shared_turn is not None:
-                shared_turn.delivery_destination = {
-                    "chat_id": slack_channel_id,
-                    "thread_ts": thread_ts,
-                    "loading_ts": loading_ts,
-                }
-                result = await shared_turn.execute(
-                    TaskTurnPayload(
-                        transcript_message=display_message or prompt_text,
-                        execution_message=execution_text,
-                        attachments=persisted_attachments or None,
-                        file_ids=tuple(
-                            item["file_id"] for item in persisted_attachments
-                        ),
-                    ),
-                    trace_handler,
-                )
-                await shared_turn.deliver(
-                    self._deliver_shared_result,
-                    pending_notice=result.get("status") == "accepted",
-                )
-                return
-            else:
-                local_service: Any = agent_service
-                local_lease = cast(ManagedTaskLease, managed_lease)
-                from ...user_isolated_memory import UserContext
+            local_service: Any = agent_service
+            local_lease = cast(ManagedTaskLease, managed_lease)
+            from ...user_isolated_memory import UserContext
 
-                actual_task_id = str(task_id)
-                try:
-                    with UserContext(owner_user_id):
-                        result = await agent_manager.execute_task(
-                            agent_service=local_service,
-                            task=execution_text,
-                            context=context,
-                            task_id=actual_task_id,
-                            tracking_task_id=actual_task_id,
-                            db_session=None,
-                            manage_task_lease=False,
-                            task_lease=local_lease.lease,
-                            task_lease_heartbeat_task=local_lease.heartbeat_task,
-                        )
-                finally:
-                    if (
-                        trace_handler is not None
-                        and trace_handler in local_service.tracer.handlers
-                    ):
-                        local_service.tracer.handlers.remove(trace_handler)
+            actual_task_id = str(task_id)
+            try:
+                with UserContext(owner_user_id):
+                    result = await agent_manager.execute_task(
+                        agent_service=local_service,
+                        task=execution_text,
+                        context=context,
+                        task_id=actual_task_id,
+                        tracking_task_id=actual_task_id,
+                        db_session=None,
+                        manage_task_lease=False,
+                        task_lease=local_lease.lease,
+                        task_lease_heartbeat_task=local_lease.heartbeat_task,
+                    )
+            finally:
+                if (
+                    trace_handler is not None
+                    and trace_handler in local_service.tracer.handlers
+                ):
+                    local_service.tracer.handlers.remove(trace_handler)
 
             projection = project_execution_result_for_channel(result)
             if managed_lease is not None and not await managed_lease.finalize_result(
@@ -747,11 +732,213 @@ class SlackBotInstance:
                     thread_ts=thread_ts,
                 )
         finally:
-            if shared_turn is not None:
-                await shared_turn.close()
             if managed_lease is not None:
                 close_task = asyncio.create_task(managed_lease.close())
                 await drain_async_task_cancellation_safe(close_task)
+
+    async def _process_shared_event(
+        self,
+        conversation_key: str,
+        envelope: dict[str, Any],
+        event: dict[str, Any],
+        text: str,
+        files: list[dict[str, Any]],
+    ) -> None:
+        chat_id = str(event["channel"])
+        thread_ts = self._reply_thread_ts(event)
+        turn: SharedChannelTurn | None = None
+        staged: list[StagedUploadedFile] = []
+        try:
+            # ts identifies the physical message in both message/app_mention
+            # envelopes; client_msg_id/event_id do not appear in both shapes.
+            message_id = str(event.get("ts") or "")
+            file_ids = tuple(str(item.get("id") or "") for item in files)
+            team_id = _payload_team_id(envelope) or str(event.get("team") or "")
+            if (
+                not message_id
+                or not team_id
+                or any(not identity for identity in file_ids)
+            ):
+                raise TaskTurnError("input_identity_missing")
+            if self.channel_id is None:
+                raise ChannelConfigurationError("Channel is not configured")
+            incoming = ChannelInput(
+                self.channel_id,
+                str(event["user"]),
+                "slack",
+                (team_id, chat_id),
+                message_id,
+                text,
+                file_ids,
+                {"chat_id": chat_id, "thread_ts": thread_ts, "loading_ts": None},
+            )
+            owner_id, accepted = await run_db_io_cancellation_safe(
+                lambda: lookup_channel_input(incoming)
+            )
+            if accepted is None:
+                get_task_event_bridge().require_ready()
+                with TemporaryDirectory(prefix="xagent-slack-input-") as staging_dir:
+                    for file_info in files:
+                        try:
+                            downloaded = await self._download_slack_file(
+                                file_info, Path(staging_dir)
+                            )
+                        except Exception as error:
+                            raise SlackFileDownloadError(
+                                "Slack attachment download failed"
+                            ) from error
+                        if downloaded is None:
+                            raise SlackFileDownloadError("Slack attachment unavailable")
+                        file_id = str(uuid4())
+                        worker = asyncio.create_task(
+                            asyncio.to_thread(
+                                stage_uploaded_file_from_local_path,
+                                local_path=downloaded.path,
+                                user_id=owner_id,
+                                filename=downloaded.name,
+                                file_id=file_id,
+                                mime_type=downloaded.mime_type,
+                                storage_key=build_upload_storage_key(
+                                    owner_id, file_id, downloaded.name
+                                ),
+                                upload_source="slack",
+                                execution_scope=None,
+                            )
+                        )
+                        uploaded, cancellation = await await_task_settlement(worker)
+                        staged.append(uploaded)
+                        if cancellation is not None:
+                            raise cancellation
+                    attachments = normalize_attachments_for_persistence(
+                        [
+                            {
+                                "file_id": item.file_id,
+                                "name": item.filename,
+                                "type": item.mime_type,
+                                "size": item.file_size,
+                            }
+                            for item in staged
+                        ]
+                    )
+                    display = text or "Attached file(s): " + ", ".join(
+                        item.filename for item in staged
+                    )
+                    acceptance = asyncio.create_task(
+                        asyncio.to_thread(
+                            accept_channel_input,
+                            incoming,
+                            owner_id=owner_id,
+                            active_task_id=self.active_tasks.get(conversation_key),
+                            channel_name=self.channel_name,
+                            payload=TaskTurnPayload(
+                                display,
+                                execution_message=append_uploaded_files_context(
+                                    text
+                                    or "Please process the attached Slack file(s).",
+                                    build_uploaded_files_context(attachments),
+                                ),
+                                attachments=attachments or None,
+                                file_ids=tuple(item.file_id for item in staged),
+                            ),
+                            staged_files=tuple(staged),
+                            host_id=get_task_event_bridge().host_id,
+                        )
+                    )
+                    settled, cancellation = await await_task_settlement(acceptance)
+                    accepted = settled
+                    if not accepted.replayed and accepted.selection.is_new_task:
+                        self.active_tasks[conversation_key] = accepted.task_id
+                        self._save_active_tasks()
+                    if cancellation is not None:
+                        raise cancellation
+            turn = accepted.as_turn()
+
+            async def send_progress(update: str | None) -> None:
+                async def send(delivery: ChannelDelivery, _: TraceEvent | None) -> None:
+                    destination = delivery.destination
+                    if not destination["loading_ts"]:
+                        destination["loading_ts"] = await self._send_text(
+                            destination["chat_id"],
+                            "Got it, I'm working on this now.\n"
+                            "_I'll update this message as I make progress._",
+                            thread_ts=destination["thread_ts"],
+                        )
+                        if not destination["loading_ts"]:
+                            raise RuntimeError("Slack loading message has no timestamp")
+                    if update is not None:
+                        await self._update_mrkdwn(
+                            destination["chat_id"], destination["loading_ts"], update
+                        )
+
+                await DurableChannelProgress(
+                    accepted.command_db_id, send, self._deliver_shared_result
+                ).send()
+
+            handler = SlackTraceHandler(
+                accepted.task_id,
+                self.web_client,
+                chat_id,
+                "",
+                send_update=send_progress,
+            )
+            await send_progress(None)
+            result = await turn.observe(handler)
+            await deliver_channel_result(
+                accepted.command_db_id,
+                self._deliver_shared_result,
+                pending_notice=result.get("status") == "accepted",
+            )
+        except ChannelAuthorizationError:
+            await self._send_text(
+                chat_id,
+                "🚫 You are not authorized to use this bot.",
+                thread_ts=thread_ts,
+            )
+        except ChannelConfigurationError:
+            await self._send_text(
+                chat_id,
+                "Configuration error: Cannot find the owner of this bot.",
+                thread_ts=thread_ts,
+            )
+        except TaskTurnError as error:
+            messages = {
+                "busy": "I'm still working on the previous message. Please wait for it to finish.",
+                "input_conflict": "This Slack message was already accepted with different content. Please send a new message.",
+                "input_unavailable": "The original task is no longer available. Please send a new message.",
+            }
+            await self._send_text(
+                chat_id,
+                messages.get(
+                    str(error), "This message could not be accepted. Please try again."
+                ),
+                thread_ts=thread_ts,
+            )
+        except SlackFileDownloadError:
+            await self._send_text(
+                chat_id,
+                "I couldn't download the attached Slack file(s). "
+                "Please try uploading them again.",
+                thread_ts=thread_ts,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error accepting or observing Slack input")
+            if turn is None:
+                await self._send_text(
+                    chat_id,
+                    "Sorry, an error occurred while processing your request.",
+                    thread_ts=thread_ts,
+                )
+        finally:
+            try:
+                if turn is not None:
+                    await turn.close()
+            finally:
+                if staged:
+                    await run_db_io_cancellation_safe(
+                        lambda: compensate_staged_uploaded_files(tuple(staged))
+                    )
 
     async def _handle_control_command(
         self,

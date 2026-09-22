@@ -14,6 +14,14 @@ from dateutil.rrule import rrulestr as _rrulestr
 
 from ....config import get_tool_max_output_length
 
+# Keep room for a small structured status envelope. Kept local to this
+# module rather than baked into the shared get_tool_max_output_length()
+# getter itself -- that getter is read directly by many unrelated code
+# paths (including the core OutputFilteredToolWrapper), and clamping it
+# there would silently widen every caller's configured cap, not just this
+# helper's own smallest fallback shape.
+_MIN_OUTPUT_LENGTH = 64
+
 _DIGITS_ONLY_RE = re.compile(r"[0-9]+")
 _BARE_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _NUMERIC_BYDAY_RE = re.compile(r"[+-]?[0-9]{1,2}(MO|TU|WE|TH|FR|SA|SU)")
@@ -220,7 +228,7 @@ def success_with_capped_dict(
             "extra_fields must not override status, the capped field, or truncated"
         )
 
-    max_output_length = get_tool_max_output_length()
+    max_output_length = max(_MIN_OUTPUT_LENGTH, get_tool_max_output_length())
 
     def _build(
         payload: Any,

@@ -134,7 +134,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
             await asyncio.wait_for(
                 bot._process_event(
                     "conversation",
-                    {},
+                    {"team_id": "T1"},
                     {
                         "type": "message",
                         "channel_type": "im",
@@ -301,7 +301,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 await asyncio.wait_for(
                     bot._process_event(
                         "conversation",
-                        {},
+                        {"team_id": "T1"},
                         {
                             "type": "message",
                             "channel_type": "im",

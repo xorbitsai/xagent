@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -671,6 +672,34 @@ def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
             pass
 
 
+def test_builtin_oauth_server_records_catalog_provenance() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    provenance = {"registry": "xagent", "app_id": "excel", "version": 1}
+    with Session(engine) as db:
+        _ensure_user_mcp_server(
+            db,
+            1,
+            {
+                "id": "excel",
+                "name": "Excel",
+                "description": "Connect to Excel.",
+                "provider": "microsoft",
+                "auth_type": "builtin_oauth",
+                "launch_config": {"builtin_provenance": provenance},
+            },
+        )
+        db.commit()
+
+        server = db.query(MCPServer).filter(MCPServer.name == "Excel").one()
+        assert server.auth == {
+            "app_id": "excel",
+            "provider": "microsoft",
+            "builtin_provenance": provenance,
+        }
+    engine.dispose()
+
+
 def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
     temp_dir = _setup_test_db()
     db = next(get_db())
@@ -891,9 +920,9 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
 
 
 def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
-    """Granola and Notion have no local launch command at all — they host
-    their own MCP server and are reached over streamable_http. This is
-    intentionally split out of
+    """Granola, Notion, Atlassian, Miro and Fireflies have no local launch
+    command at all — they host their own MCP server and are reached over
+    streamable_http. This is intentionally split out of
     test_builtin_registry_uses_runtime_available_launch_commands, whose name
     is about local launch *commands* and would misdescribe these
     remote-only entries."""
@@ -913,8 +942,48 @@ def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
         "auth": {"type": "mcp_oauth"},
     }
 
+    # Atlassian's current endpoint is /v2/mcp; the legacy /v1/sse endpoint is
+    # unsupported after 2026-06-30 and must not be what the catalog points at.
+    assert rows_by_app_id["atlassian"]["transport"] == "streamable_http"
+    assert rows_by_app_id["atlassian"]["launch_config"] == {
+        "url": "https://mcp.atlassian.com/v2/mcp",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "atlassian",
+            "version": 1,
+        },
+    }
 
-@pytest.mark.parametrize("app_id", ["granola", "notion"])
+    # Miro serves MCP at the host root (its protected-resource metadata
+    # names "https://mcp.miro.com/" as the resource), not under /mcp.
+    assert rows_by_app_id["miro"]["transport"] == "streamable_http"
+    assert rows_by_app_id["miro"]["launch_config"] == {
+        "url": "https://mcp.miro.com/",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {"registry": "xagent", "app_id": "miro", "version": 1},
+    }
+
+    # Fireflies serves MCP under /mcp; its protected-resource metadata names
+    # "https://api.fireflies.ai/mcp" as the resource and "https://api.fireflies.ai/"
+    # as the authorization server. Per-user OAuth 2.1 + PKCE with DCR; the
+    # docs' static API-key header is a Claude Desktop alternative the catalog
+    # deliberately does not model.
+    assert rows_by_app_id["fireflies"]["transport"] == "streamable_http"
+    assert rows_by_app_id["fireflies"]["launch_config"] == {
+        "url": "https://api.fireflies.ai/mcp",
+        "auth": {"type": "mcp_oauth"},
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "fireflies",
+            "version": 1,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "app_id", ["granola", "notion", "atlassian", "miro", "fireflies"]
+)
 def test_builtin_registry_classifies_remote_mcp_apps_as_mcp_oauth(app_id) -> None:
     """The registry shape must classify as mcp_oauth — anything else means the
     catalog entry is uninstallable (connect_mcp_app rejects non-api_key apps
@@ -1199,6 +1268,38 @@ def test_shopify_foreign_provenance_is_not_owned_but_is_reported() -> None:
             shutil.rmtree(temp_dir)
         except OSError:
             pass
+
+
+def test_unmarked_planner_catalog_collision_keeps_custom_execution_fields() -> None:
+    """An operator-owned app_id collision must not receive builtin execution."""
+    from xagent.web.builtin_mcp_registry import (
+        _persisted_builtin_provenance_matches,
+    )
+    from xagent.web.mcp_apps import _app_to_dict
+
+    custom_launch = {
+        "command": "custom-planner",
+        "args": ["--serve"],
+        "required_env": ["CUSTOM_TOKEN"],
+    }
+    custom = PublicMCPApp(
+        app_id="planner",
+        name="Internal Planning",
+        description="Operator-owned planning connector",
+        transport="stdio",
+        provider_name=None,
+        category="Custom",
+        oauth_scopes=None,
+        is_visible_in_connector=True,
+        launch_config=custom_launch,
+    )
+
+    assert _persisted_builtin_provenance_matches("planner", custom_launch) is False
+    projected = _app_to_dict(custom)
+    assert projected["name"] == "Internal Planning"
+    assert projected["transport"] == "stdio"
+    assert projected["provider"] is None
+    assert projected["launch_config"] == custom_launch
 
 
 def test_init_db_logs_safe_builtin_registry_drift_without_repairing(
@@ -2168,7 +2269,13 @@ def test_admin_custom_patch_validates_merged_state_and_keeps_app_id_immutable() 
             pass
 
 
-def test_admin_create_rejects_reserved_builtin_id_after_deletion() -> None:
+@pytest.mark.parametrize(
+    ("builtin_id", "attempted_id"),
+    [("gmail", "gmail"), ("planner", "PLANNER"), ("planner", " planner ")],
+)
+def test_admin_create_rejects_reserved_builtin_id_after_deletion(
+    builtin_id: str, attempted_id: str
+) -> None:
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 
     temp_dir = _setup_test_db()
@@ -2177,13 +2284,14 @@ def test_admin_create_rejects_reserved_builtin_id_after_deletion() -> None:
         admin_headers = _login("admin", "admin123")
         db = next(get_db())
         try:
-            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == builtin_id).one()
             db.delete(app)
             db.commit()
         finally:
             db.close()
-        canonical = get_builtin_public_mcp_app("gmail")
+        canonical = get_builtin_public_mcp_app(builtin_id)
         assert canonical is not None
+        canonical["app_id"] = attempted_id
 
         response = client.post(
             "/api/admin/mcp/apps",
@@ -2195,7 +2303,9 @@ def test_admin_create_rejects_reserved_builtin_id_after_deletion() -> None:
         db = next(get_db())
         try:
             assert (
-                db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").first()
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id.in_([builtin_id, attempted_id]))
+                .first()
                 is None
             )
         finally:

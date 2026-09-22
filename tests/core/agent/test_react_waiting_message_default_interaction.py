@@ -14,11 +14,15 @@ interaction row, which is built from this same list.
 ``ReActPattern._send_waiting_message`` is the one place every suspending
 path publishes through, and it appends a ``text_input`` field whenever
 nothing already in the list is answerable -- an empty list, but equally a
-list whose every entry the render surface would drop or render with nothing
-to pick. Appended, not substituted for the list: an options-less picker's
-``label`` is the question text, and the run has no other copy of it. These
-cells pin that on all three paths and pin the reverse: a model that did
-supply an answerable field gets exactly its own, untouched.
+list whose every entry the render surface would drop or cannot answer.
+Appended, not substituted for the list: a widget such as ``connect_apps`` is
+a real control the model may want shown. An options-less picker used to be
+the other unanswerable-but-kept shape; since xagent#2529 both publishing
+call sites degrade it to a ``text_input`` per field before it reaches this
+append (``test_react_options_less_picker_degradation.py``), so by the time
+the list-level check runs it is answerable. These cells pin the append on
+all three paths and pin the reverse: a model that did supply an answerable
+field gets exactly its own, untouched.
 """
 
 from __future__ import annotations
@@ -213,10 +217,9 @@ async def test_ask_user_question_echoes_only_what_the_model_itself_supplied() ->
                     "message": "Which one?",
                     "interactions": [
                         {
-                            "type": "select_one",
-                            "field": "choice",
-                            "label": "Which region?",
-                            "options": [],
+                            "type": "connect_apps",
+                            "field": "apps",
+                            "label": "Connect your calendar",
                         }
                     ],
                 },
@@ -230,12 +233,7 @@ async def test_ask_user_question_echoes_only_what_the_model_itself_supplied() ->
     await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
 
     assert _published_interactions(runtime) == [
-        {
-            "type": "select_one",
-            "field": "choice",
-            "label": "Which region?",
-            "options": [],
-        },
+        {"type": "connect_apps", "field": "apps", "label": "Connect your calendar"},
         DEFAULT_FIELD,
     ]
     echoed = "".join(
@@ -243,7 +241,7 @@ async def test_ask_user_question_echoes_only_what_the_model_itself_supplied() ->
         for message in context.messages
         if getattr(message, "role", "") == "tool"
     )
-    assert "Which region?" in echoed
+    assert "Connect your calendar" in echoed
     assert "Your response" not in echoed
 
 
@@ -357,17 +355,12 @@ async def test_the_per_request_copies_exclude_the_appended_field() -> None:
     context = ExecutionContext()
     context.add_user_message("Ask")
 
-    picker = {
-        "type": "select_one",
-        "field": "choice",
-        "label": "Which region?",
-        "options": [],
-    }
+    widget = {"type": "connect_apps", "field": "apps", "label": "Connect an app"}
     await pattern._pause_for_tool_results(
         waiting_pairs=[
             (
                 {"id": "call_a", "name": "tool_a"},
-                {"message": "Need a region", "interactions": [picker]},
+                {"message": "Need a region", "interactions": [widget]},
             ),
             ({"id": "call_b", "name": "tool_b"}, {"message": "Need a value"}),
         ],
@@ -375,10 +368,10 @@ async def test_the_per_request_copies_exclude_the_appended_field() -> None:
         runtime=runtime,
     )
 
-    assert _published_interactions(runtime) == [picker, DEFAULT_FIELD]
+    assert _published_interactions(runtime) == [widget, DEFAULT_FIELD]
     assert pattern.waiting_for_user_request is not None
     requests = pattern.waiting_for_user_request["requests"]
-    assert [request["interactions"] for request in requests] == [[picker], []]
+    assert [request["interactions"] for request in requests] == [[widget], []]
 
 
 @pytest.mark.asyncio
@@ -438,81 +431,6 @@ async def test_model_supplied_interactions_are_not_augmented() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "picker_type", ["select_one", "select_multiple", "action_cards"]
-)
-async def test_a_picker_whose_options_were_all_blank_keeps_its_label(
-    picker_type: str,
-) -> None:
-    """The list is non-empty and still unanswerable.
-
-    ``_normalize_ask_user_interactions`` drops blank options but keeps the
-    interaction itself, so a picker whose every option was blank arrives here
-    as an entry with ``options == []`` -- a control with nothing to select,
-    which is the same dead end an empty list is. An emptiness test lets it
-    through; the answerability test appends a field to it. The picker itself
-    stays: its ``label`` is the question, and dropping it leaves a bare input
-    box asking nothing.
-    """
-
-    _, runtime = await _run(
-        "ask_user_question",
-        {
-            "message": "Which one?",
-            "interactions": [
-                {
-                    "type": picker_type,
-                    "field": "choice",
-                    "label": "Which region?",
-                    "options": [{"label": "  ", "value": ""}],
-                }
-            ],
-        },
-    )
-    assert _published_interactions(runtime) == [
-        {
-            "type": picker_type,
-            "field": "choice",
-            "label": "Which region?",
-            "options": [],
-        },
-        DEFAULT_FIELD,
-    ]
-
-
-@pytest.mark.asyncio
-async def test_a_picker_whose_options_are_not_a_list_gets_a_field() -> None:
-    """``_normalize_ask_user_interactions`` warns about a non-list ``options``
-    and then leaves it exactly as the model wrote it. A truthy non-list is
-    still nothing the render surface can iterate, so answerability has to test
-    the type, not just truthiness."""
-
-    _, runtime = await _run(
-        "ask_user_question",
-        {
-            "message": "Which one?",
-            "interactions": [
-                {
-                    "type": "select_one",
-                    "field": "choice",
-                    "label": "Choice",
-                    "options": "auto",
-                }
-            ],
-        },
-    )
-    assert _published_interactions(runtime) == [
-        {
-            "type": "select_one",
-            "field": "choice",
-            "label": "Choice",
-            "options": "auto",
-        },
-        DEFAULT_FIELD,
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
     ("interaction", "expected_type"),
     [
         ({"type": "confirm", "field": "ok", "label": "Proceed?"}, "confirm"),
@@ -554,10 +472,17 @@ async def test_a_type_that_needs_no_options_is_left_alone(
 
 
 @pytest.mark.asyncio
-async def test_one_answerable_field_keeps_the_whole_list() -> None:
-    """The append is all-or-nothing: one usable control is enough, and the
-    unusable one beside it is published as the model wrote it rather than
-    being pruned. Pruning is the write side's decision, not this one's."""
+async def test_a_dead_picker_beside_a_live_field_is_degraded_not_pruned() -> None:
+    """Records a reversed decision. xagent#2322 pinned here that an
+    unanswerable entry beside a usable one is published as the model wrote
+    it, pruning being the write side's decision. For an options-less picker
+    that no longer holds: the write side does refuse such an entry
+    (``validate_v1_write_payload``, ``options_required``), but the engine's
+    own publish path never runs that validator, so the dead control reached
+    the user anyway. It is now neither pruned nor left verbatim but degraded
+    to a ``text_input`` under its own name (xagent#2529), which keeps the
+    ``label`` pruning would lose. Nothing is appended: both entries are
+    answerable by the time the list-level check runs."""
 
     _, runtime = await _run(
         "ask_user_question",
@@ -574,9 +499,10 @@ async def test_one_answerable_field_keeps_the_whole_list() -> None:
             ],
         },
     )
-    assert [item["field"] for item in _published_interactions(runtime)] == [
-        "empty",
-        "city",
+    published = _published_interactions(runtime)
+    assert [(item["field"], item["type"]) for item in published] == [
+        ("empty", "text_input"),
+        ("city", "select_one"),
     ]
 
 
@@ -700,10 +626,9 @@ async def test_the_appended_field_is_deduplicated_against_the_kept_ones() -> Non
             "message": "Which one?",
             "interactions": [
                 {
-                    "type": "select_one",
+                    "type": "connect_apps",
                     "field": "response",
                     "label": "Which region?",
-                    "options": [],
                 }
             ],
         },
@@ -744,16 +669,14 @@ async def test_the_appended_field_walks_past_two_taken_names() -> None:
             "message": "Which one?",
             "interactions": [
                 {
-                    "type": "select_one",
+                    "type": "connect_apps",
                     "field": "response",
                     "label": "Which region?",
-                    "options": [],
                 },
                 {
-                    "type": "select_one",
+                    "type": "connect_apps",
                     "field": "response",
                     "label": "Which city?",
-                    "options": [],
                 },
             ],
         },

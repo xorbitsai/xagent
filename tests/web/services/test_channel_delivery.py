@@ -9,10 +9,15 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from tests.web.services.test_shared_channel_execution import (
-    database_url as database_url,
+from tests.web.services.channel_delivery_shared import accepted as accepted
+from tests.web.services.channel_delivery_shared import (
+    complete,
 )
-from tests.web.services.test_shared_channel_execution import selected as selected
+from tests.web.services.channel_delivery_shared import database_url as database_url
+from tests.web.services.channel_delivery_shared import (
+    expire_claim,
+)
+from tests.web.services.channel_delivery_shared import selected as selected
 from xagent.web.models.database import get_session_local
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_channel_delivery import TaskChannelDelivery
@@ -21,43 +26,6 @@ from xagent.web.models.user_channel import UserChannel
 from xagent.web.services import channel_delivery as delivery
 from xagent.web.services import shared_channel_execution as shared
 from xagent.web.services.task_orchestrator import TaskTurnPayload
-
-
-@pytest.fixture
-def accepted(selected):
-    selected.delivery_destination = {
-        "chat_id": "conversation",
-        "loading_message_id": "loading",
-    }
-    command_id = shared._accept_channel_turn(
-        selected, TaskTurnPayload("hello"), "old-ingress"
-    )
-    return command_id
-
-
-def complete(command_id):
-    with get_session_local()() as db:
-        command = db.get(TaskExecutionCommand, command_id)
-        command.status = "completed"
-        command.result = {
-            "channel_result": {
-                "success": True,
-                "status": "completed",
-                "output": "saved answer",
-            }
-        }
-        task = db.get(Task, command.task_id)
-        task.run_id = command.target_run_id
-        task.status = TaskStatus.COMPLETED
-        db.commit()
-
-
-def expire_claim(command_id):
-    with get_session_local()() as db:
-        db.get(TaskChannelDelivery, command_id).available_at = datetime.now(
-            timezone.utc
-        ) - timedelta(seconds=1)
-        db.commit()
 
 
 @pytest.mark.asyncio
@@ -234,7 +202,10 @@ async def test_channel_pending_wait_is_bounded_and_keeps_command(selected, monke
     bridge.register_origin.return_value = "origin"
     monkeypatch.setattr(shared, "get_task_event_bridge", lambda: bridge)
     monkeypatch.setattr(shared, "get_task_reply_wait_timeout_seconds", lambda: 0.03)
-    result = await asyncio.wait_for(selected.execute(TaskTurnPayload("hello"), None), 1)
+    # Acceptance includes real database I/O before the short reply-wait deadline.
+    result = await asyncio.wait_for(
+        selected.execute(TaskTurnPayload("hello"), None), 10
+    )
     assert result["status"] == "accepted"
     with get_session_local()() as db:
         assert db.query(TaskExecutionCommand).one().status == "pending"

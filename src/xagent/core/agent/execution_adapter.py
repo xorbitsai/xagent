@@ -162,6 +162,12 @@ class AgentExecutionAdapter:
         # Carry the mid-run quota checker into the resumed run too, so a
         # paused-and-resumed continuation is gated like a fresh run.
         kwargs.setdefault("interrupt_checker", self.config.interrupt_checker)
+        # The handle may have been built by post_user_message before the
+        # host installed the outbound handler, so re-read it from config
+        # for the resumed run (#1328).
+        kwargs.setdefault(
+            "outbound_message_handler", self.config.outbound_message_handler
+        )
         resume_metadata = dict(kwargs.get("metadata") or {})
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities

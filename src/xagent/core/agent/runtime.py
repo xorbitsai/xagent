@@ -938,6 +938,24 @@ class PatternRuntime:
 
         if self.outbound_message_handler is not None:
             await self._maybe_await(self.outbound_message_handler(payload))
+        elif expect_response or message_type == "question":
+            # A dropped question parks the run waiting for a reply that can
+            # never arrive, so this is worth a warning.
+            logger.warning(
+                "Dropping agent outbound message for execution %s: no outbound "
+                "message handler is installed (type=%r, expect_response=%s)",
+                self.execution_id,
+                message_type,
+                expect_response,
+            )
+        else:
+            logger.debug(
+                "Dropping agent outbound message for execution %s: no outbound "
+                "message handler is installed (type=%r, expect_response=%s)",
+                self.execution_id,
+                message_type,
+                expect_response,
+            )
 
         return payload
 

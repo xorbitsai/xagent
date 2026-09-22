@@ -320,8 +320,8 @@ def test_concurrent_ensure_collection_metadata_table_is_safe(
     unexpected = [
         exc
         for exc in errors
-        if "Commit conflict" not in str(exc)
-        and "incompatible with concurrent" not in str(exc)
+        if "commit conflict" not in str(exc).lower()
+        and "incompatible with concurrent" not in str(exc).lower()
     ]
     assert unexpected == []
     conn = get_vector_store_raw_connection()

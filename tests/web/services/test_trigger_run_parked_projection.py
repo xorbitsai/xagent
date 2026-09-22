@@ -581,13 +581,22 @@ def test_every_task_status_has_an_explicit_projection_answer(task_status):
 def test_frontend_status_vocabulary_matches_the_backend_enum():
     """The UI list is a contract: every value the backend writes needs a label."""
 
-    source = (
+    source_path = (
         Path(__file__).resolve().parents[3]
         / "frontend"
         / "src"
         / "lib"
         / "agent-triggers-api.ts"
-    ).read_text(encoding="utf-8")
+    )
+    # A checkout without the frontend tree cannot check a cross-layer contract, so
+    # skip instead of failing -- the same guard
+    # tests/core/tools/adapters/vibe/test_interaction_type_aliases.py uses. The
+    # assertions below stay strict: a present-but-drifted list is exactly what
+    # this test exists to catch.
+    if not source_path.exists():
+        pytest.skip(f"frontend source not present: {source_path}")
+
+    source = source_path.read_text(encoding="utf-8")
     match = re.search(
         r"AGENT_TRIGGER_RUN_STATUSES\s*=\s*\[(.*?)\]\s*as const",
         source,

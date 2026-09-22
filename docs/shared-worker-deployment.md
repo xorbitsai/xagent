@@ -252,6 +252,20 @@ input acceptance. Existing channel paths remain active; provider integration
 remains a separate follow-up change.
 
 
+### Slack input acceptance
+
+In shared execution mode, Slack messages use durable receipts keyed by the
+workspace, channel, sender and physical message timestamp. Message and mention
+redeliveries reuse the original task and command, including after ingress restart.
+Authorization is checked again before replay. Attachments are staged before task
+selection and committed with the receipt, transcript, START and reply destination;
+an unavailable attachment prevents acceptance of that input.
+
+Slack keeps its existing progress filtering and three-second tool-status cadence.
+Selected display updates share the durable delivery claim with final replies, and
+the loading-message timestamp is persisted for observers and recovery. Local
+execution and control commands retain their existing behavior.
+
 ### Accepted channel command observation and progress
 
 An accepted input can construct a `SharedChannelTurn` using `as_turn()` and call

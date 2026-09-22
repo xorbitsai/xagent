@@ -1139,6 +1139,42 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "fireflies",
+            "name": "Fireflies",
+            "description": "Connect to Fireflies to search your meetings and read transcripts, summaries and action items through Fireflies' hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=fireflies.ai&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth), same shape as Granola/Notion/Atlassian/
+            # Miro: Fireflies hosts the server itself
+            # (docs.fireflies.ai/getting-started/mcp-configuration) and
+            # exposes its own meeting tools; there is no local module to
+            # launch. The protected-resource metadata names
+            # "https://api.fireflies.ai/mcp" as the resource and
+            # "https://api.fireflies.ai/" as the authorization server, whose
+            # metadata advertises a registration_endpoint, PKCE S256 and token
+            # auth method "none", so users connect via POST
+            # /api/mcp/apps/{id}/oauth/connect (per-user OAuth 2.1
+            # Authorization Code + PKCE with Dynamic Client Registration) and
+            # no static client credentials are required. The vendor docs also
+            # describe a static "Authorization: Bearer <api key>" header as a
+            # Claude Desktop alternative; the catalog deliberately models only
+            # the OAuth shape, so no secret ever lives in launch_config.
+            "launch_config": {
+                "url": "https://api.fireflies.ai/mcp",
+                "auth": {"type": "mcp_oauth"},
+                # Same ownership marker as the atlassian/miro rows above.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "fireflies",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "aws",
             "name": "AWS",
             "description": "Connect to AWS to check CloudWatch alarms/metrics/logs, DynamoDB health, and SQS queue depth.",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Awaitable, Callable
 
 from slack_sdk.web.async_client import AsyncWebClient
 
@@ -29,11 +30,14 @@ class SlackTraceHandler(TraceHandler):
         client: AsyncWebClient,
         channel_id: str,
         message_ts: str,
+        *,
+        send_update: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.task_id = task_id
         self.client = client
         self.channel_id = channel_id
         self.message_ts = message_ts
+        self._send_update = send_update
         self.current_text = ""
         self._last_status_update_at = 0.0
         self._last_status_text = ""
@@ -106,6 +110,10 @@ class SlackTraceHandler(TraceHandler):
             :_MAX_STATUS_MRKDWN_CHARS
         ]
         if not display_text or display_text == self.current_text:
+            return
+        if self._send_update is not None:
+            await self._send_update(display_text)
+            self.current_text = display_text
             return
         self.current_text = display_text
         await self.client.chat_update(

@@ -206,6 +206,18 @@ def test_resolve_cloud_id_multiple_sites_message_handles_non_dict_entries(monkey
         jira._resolve_cloud_id("")
 
 
+def test_resolve_cloud_id_multiple_sites_message_reports_a_falsy_zero_id(monkeypatch):
+    site_zero = {"id": 0, "name": "Zero", "url": "https://zero.atlassian.net"}
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[site_zero, _SITE_B])),
+    )
+
+    with pytest.raises(ValueError, match=r"Zero \(0\)"):
+        jira._resolve_cloud_id("")
+
+
 def test_request_builds_url_with_resolved_cloud_id(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"id": "10001", "key": "ENG-1"})
@@ -281,6 +293,21 @@ def test_get_issue_rejects_a_blank_issue_key(monkeypatch):
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
+
+
+def test_get_issue_blank_issue_key_does_not_log_an_error(monkeypatch, caplog):
+    # A blank issue_key is routine caller-input validation (the same
+    # class _clean_text_error handles for other fields), not a
+    # connector/API failure -- it must not reach the tool's broad
+    # except block and get logged at ERROR, which is reserved for
+    # genuine backend/request failures.
+    monkeypatch.setattr(jira.requests, "request", Mock())
+
+    with caplog.at_level("ERROR", logger="jira-mcp"):
+        result = json.loads(jira.jira_get_issue(""))
+
+    assert result["status"] == "error"
+    assert caplog.records == []
 
 
 def test_path_segment_rejects_bare_dot_and_dot_dot():
@@ -1997,6 +2024,59 @@ def test_get_issue_extra_fields_ignores_a_name_already_in_the_default_set(monkey
     assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
 
 
+def test_get_issue_extra_fields_ignores_a_default_name_regardless_of_case(
+    monkeypatch,
+):
+    # "Summary" (capitalized) names the same field as the default
+    # "summary" -- case-insensitively recognizing it as already-visible
+    # matters twice over: it must not be re-fetched from Jira (wasting
+    # part of the extra-fields budget), and it must not show up in
+    # extra_field_values as a spurious null just because Jira's own
+    # response doesn't echo back that exact casing.
+    raw_issue = {"key": "ENG-1", "fields": {"summary": "ok"}}
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="Summary"))
+
+    assert "extra_field_values" not in result
+    issue_call = mock_request.call_args_list[1]
+    assert issue_call.kwargs["params"]["fields"] == jira._GET_ISSUE_FIELDS
+
+
+def test_get_issue_extra_fields_deduplicates_repeated_names(monkeypatch):
+    # "a,a,b" must not charge the aggregate budget for "a" twice --
+    # doing so could starve a later distinct field's share for no
+    # reason, since the caller only ever gets one "a" entry back
+    # regardless of how many times it was named.
+    raw_issue = {
+        "key": "ENG-1",
+        "fields": {"summary": "ok", "customfield_a": "value-a"},
+    }
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data=raw_issue),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_get_issue("ENG-1", extra_fields="customfield_a,customfield_a")
+    )
+
+    assert result["extra_field_values"] == {"customfield_a": "value-a"}
+    issue_call = mock_request.call_args_list[1]
+    assert issue_call.kwargs["params"]["fields"] == (
+        f"{jira._GET_ISSUE_FIELDS},customfield_a"
+    )
+
+
 def test_get_issue_bounds_the_aggregate_extra_field_values_size(monkeypatch):
     # Two custom fields each individually under _ISSUE_DESCRIPTION_MAX_
     # CHARS can still combine to exceed the output budget -- an entirely
@@ -2090,6 +2170,46 @@ def test_get_issue_extra_field_values_stays_within_a_small_configured_cap(
     assert "extra_field_values" in result
     assert "description_truncated" in result
     assert result["extra_field_values_truncated"] is True
+
+
+def test_get_issue_description_truncated_reflects_the_field_being_dropped(
+    monkeypatch,
+):
+    # description_truncated is set from the fixed _ISSUE_DESCRIPTION_MAX_
+    # CHARS cap BEFORE success_with_capped_dict runs its own shrink
+    # phases on `issue` -- phase-2 key-dropping (or the last-resort
+    # fallback) can remove "description" from `issue` entirely to make
+    # room for a large protected extra_field_values, while that earlier
+    # flag still says false. A caller trusting description_truncated
+    # would wrongly conclude the (actually missing) description was
+    # short enough to return in full.
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 500)
+    monkeypatch.setattr(jira_mcp_utils, "get_tool_max_output_length", lambda: 500)
+    raw_issue = {
+        "id": "1",
+        "key": "ENG-1",
+        "fields": {
+            "summary": "ok",
+            "description": "short desc, well under the cap on its own",
+            "customfield_big": "x" * 2000,
+        },
+    }
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(json_data=[_SITE_A]),
+                MockResponse(json_data=raw_issue),
+            ]
+        ),
+    )
+
+    result = json.loads(jira.jira_get_issue("ENG-1", extra_fields="customfield_big"))
+
+    assert result["status"] == "success"
+    assert "description" not in result["issue"]
+    assert result["description_truncated"] is True
 
 
 def test_get_issue_rejects_jira_field_selector_syntax_in_extra_fields(monkeypatch):
@@ -3036,6 +3156,35 @@ def test_summarize_issue_link_reports_outward_for_empty_but_present_outward_issu
     }
     assert jira._summarize_issue_link(link) == {
         "relationship": "blocks",
+        "issue_key": None,
+        "summary": None,
+        "status": None,
+    }
+
+
+def test_summarize_issue_link_reports_inward_for_present_inward_issue():
+    # The inward branch had zero coverage -- every other fixture in
+    # this file only exercises outwardIssue.
+    link = {
+        "type": {"inward": "is blocked by", "outward": "blocks"},
+        "inwardIssue": {"key": "ENG-2", "fields": {"summary": "Blocker"}},
+    }
+    assert jira._summarize_issue_link(link) == {
+        "relationship": "is blocked by",
+        "issue_key": "ENG-2",
+        "summary": "Blocker",
+        "status": None,
+    }
+
+
+def test_summarize_issue_link_reports_neither_when_no_side_is_present():
+    # A malformed link entry with neither outwardIssue nor inwardIssue
+    # must not silently fall into the inward branch by default and
+    # fabricate a concrete relationship/direction for a link this
+    # module can't actually identify.
+    link = {"type": {"inward": "is blocked by", "outward": "blocks"}}
+    assert jira._summarize_issue_link(link) == {
+        "relationship": None,
         "issue_key": None,
         "summary": None,
         "status": None,

@@ -244,7 +244,14 @@ def _resolve_cloud_id(cloud_id: str) -> str:
         return str(site_id)
     site_list = (
         ", ".join(
-            f"{s.get('name') or 'Unknown'} ({s.get('id') or 'No ID'})"
+            # Presence, not truthiness, for id: the same falsy-but-valid
+            # (e.g. 0) risk as _resolve_cloud_id's single-site case
+            # above -- this message is exactly what tells the caller
+            # which cloud_id to pass back, so misreporting a real id as
+            # "No ID" here would send them looking for one that already
+            # exists.
+            f"{s.get('name') or 'Unknown'} "
+            f"({s.get('id') if s.get('id') is not None else 'No ID'})"
             for s in sites
             if isinstance(s, dict)
         )
@@ -1183,12 +1190,26 @@ def _summarize_issue_link(link: dict[str, Any]) -> dict[str, Any]:
     # Presence, not truthiness: Jira can send a present-but-redacted
     # "outwardIssue": {} for a permission-restricted linked issue, which
     # must still be reported as an outward link rather than silently
-    # falling through to inwardIssue.
-    is_outward = "outwardIssue" in link
-    linked = link.get("outwardIssue") if is_outward else link.get("inwardIssue")
+    # falling through to inwardIssue. Checking inward presence too (not
+    # just "else") matters because a malformed entry with NEITHER key
+    # would otherwise fall into the inward branch by default and
+    # fabricate a concrete relationship/direction for a link this
+    # module can't actually identify -- indistinguishable from a real
+    # (if redacted) inward link.
+    has_outward = "outwardIssue" in link
+    has_inward = "inwardIssue" in link
     link_type = _as_dict(link.get("type"))
+    if has_outward:
+        linked = link.get("outwardIssue")
+        relationship = link_type.get("outward")
+    elif has_inward:
+        linked = link.get("inwardIssue")
+        relationship = link_type.get("inward")
+    else:
+        linked = None
+        relationship = None
     return {
-        "relationship": link_type.get("outward" if is_outward else "inward"),
+        "relationship": relationship,
         **_summarize_mini_issue(_as_dict(linked)),
     }
 
@@ -1365,6 +1386,17 @@ def jira_get_issue(
     request would at the default setting.
     """
     try:
+        issue_path = _issue_path(issue_key)
+    except ValueError as exc:
+        # A blank/padded/dot-segment issue_key is routine caller-input
+        # validation (the same class _clean_text_error handles for
+        # other fields), not a connector/API error -- resolved directly
+        # here so it never reaches the broad except below, which logs
+        # at ERROR and would otherwise misclassify a caller mistake as
+        # a backend failure.
+        return _error(str(exc))
+
+    try:
         # Jira's `fields` query param treats a leading "-" as "exclude
         # this field" and "*" as a wildcard selector (e.g. "*all"), not
         # just a literal field id -- passed through unfiltered, either
@@ -1374,20 +1406,32 @@ def jira_get_issue(
         # Rejected the same way an already-default name is: silently
         # dropped rather than erroring, since a caller only ever loses
         # an invalid/malicious token, never a legitimate field id.
-        requested_extra = [
-            stripped
-            for name in extra_fields.split(",")
-            if (stripped := name.strip())
-            and stripped not in _GET_ISSUE_FIELD_NAMES
-            and not stripped.startswith(("-", "*"))
-        ]
+        # The default-set check is case-insensitive (Jira field ids are
+        # conventionally lowercase, e.g. "summary") so a caller writing
+        # extra_fields="Summary" is still recognized as the same field
+        # already visible under "issue.summary" -- otherwise it would
+        # both waste part of the extra-fields budget on a request Jira
+        # already answered and, if Jira's own response doesn't echo
+        # back that exact casing, end up in extra_field_values as a
+        # spurious null entry for a field the caller does have. Deduped
+        # via dict.fromkeys (order-preserving) so "a,a,b" doesn't charge
+        # the budget for "a" twice.
+        requested_extra = list(
+            dict.fromkeys(
+                stripped
+                for name in extra_fields.split(",")
+                if (stripped := name.strip())
+                and stripped.lower() not in _GET_ISSUE_FIELD_NAMES
+                and not stripped.startswith(("-", "*"))
+            )
+        )
         fields_param = _GET_ISSUE_FIELDS
         if requested_extra:
             fields_param = f"{fields_param},{','.join(requested_extra)}"
         result = _request(
             "GET",
             cloud_id,
-            _issue_path(issue_key),
+            issue_path,
             params={"fields": fields_param},
         )
         if not isinstance(result, dict):
@@ -1468,7 +1512,26 @@ def jira_get_issue(
         # success_with_capped_dict already tries the full response first
         # and only shrinks `issue` if that doesn't fit -- no need to
         # separately build and measure a plain response here first.
-        return success_with_capped_dict("issue", issue, extra_fields=top_level_extra)
+        response = success_with_capped_dict(
+            "issue", issue, extra_fields=top_level_extra
+        )
+        if not description_truncated:
+            # description_truncated's value above only reflects the
+            # fixed _ISSUE_DESCRIPTION_MAX_CHARS cap -- it says nothing
+            # about success_with_capped_dict's OWN shrink phases, which
+            # can still drop "description" (phase 1, if it's ever the
+            # largest field) or the whole `issue` object down to just an
+            # id (phase 2) when the overall response still doesn't fit
+            # after that. Re-check the actual serialized result so the
+            # flag can't report "not truncated" while the field is
+            # silently gone -- reparsing only happens on this otherwise-
+            # rare path (the flag was already true, or the response fit
+            # without shrinking, in the common case).
+            parsed = json.loads(response)
+            if "description" not in parsed.get("issue", {}):
+                parsed["description_truncated"] = True
+                response = json.dumps(parsed, ensure_ascii=False)
+        return response
     except Exception as e:
         safe_message = _safe_text(e)
         logger.error(f"Error fetching Jira issue {issue_key}: {safe_message}")

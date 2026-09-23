@@ -2896,6 +2896,118 @@ def test_event_response_fits_a_small_cap_with_a_large_conference_field(
     assert result["truncated"] is True
 
 
+def _large_event_with_hangout_link(
+    id_length: int, link_length: int = 100
+) -> dict[str, Any]:
+    """A big enough event (long description, many attendees) that phase 1
+    (list/dict shrinking) and phase 2 (dropping whole top-level keys) in
+    success_with_capped_dict both run and still don't fit -- unlike
+    test_event_response_fits_a_small_cap_with_a_large_conference_field's
+    trivial id-only body, which skips both phases and goes straight to the
+    last-resort ladder. Combined with hangoutLink, this reaches the ladder
+    the way a real large event with a Meet link actually would."""
+    return {
+        "id": "e" * id_length,
+        "description": "d" * 5000,
+        "attendees": [{"email": f"person{i}@example.com"} for i in range(300)],
+        "hangoutLink": "https://meet.google.com/" + "y" * link_length,
+    }
+
+
+def test_event_response_last_resort_drops_a_long_id_for_intact_extras(
+    fake_service, monkeypatch
+):
+    """Rung 2 of the last-resort ladder: once the id itself is long enough
+    that "id + intact extras" doesn't fit but "{} + intact extras" does,
+    the ladder must give up the id rather than degrade or drop the Meet
+    link -- a real link beside an empty record beats keeping only the id."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 200)
+    fake_service._events._insert_result = _large_event_with_hangout_link(id_length=60)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 200
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["event"] == {}
+    assert result["hangout_link"] == "https://meet.google.com/" + "y" * 100
+
+
+def test_event_response_last_resort_falls_back_to_id_alone(fake_service, monkeypatch):
+    """Rung 4 of the last-resort ladder: once even "id + degraded extras"
+    doesn't fit, the id is worth keeping again over a degraded placeholder
+    -- id alone outranks id-plus-True."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 160)
+    fake_service._events._insert_result = _large_event_with_hangout_link(id_length=90)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 160
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["event"] == {"id": "e" * 90}
+    assert "hangout_link" not in result
+    assert "conference_status" not in result
+
+
+def test_event_response_last_resort_degrades_extras_beside_an_empty_record(
+    fake_service, monkeypatch
+):
+    """Rung 5 of the last-resort ladder: once even the bare id no longer
+    fits, a degraded (True) extra beside an empty record is still more
+    informative than dropping it, so it must be kept over an empty
+    record alone."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
+    fake_service._events._insert_result = _large_event_with_hangout_link(id_length=90)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 100
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["event"] == {}
+    assert result["hangout_link"] is True
+
+
+def test_event_response_last_resort_falls_back_to_an_empty_record(
+    fake_service, monkeypatch
+):
+    """Rung 6 (the bottom of the ladder before the bare envelope): once
+    even a degraded extra beside an empty record doesn't fit, the response
+    still preserves the event's status/truncated envelope with an empty
+    record rather than dropping the field entirely."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 60)
+    fake_service._events._insert_result = _large_event_with_hangout_link(id_length=90)
+
+    raw = calendar.google_calendar_create_events(
+        summary="1:1",
+        start_time="2026-09-07T15:00:00+08:00",
+        end_time="2026-09-07T16:00:00+08:00",
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 60
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["event"] == {}
+    assert "hangout_link" not in result
+
+
 def test_incomplete_check_response_fits_a_small_cap_for_one_attendee(
     fake_service, monkeypatch
 ):

@@ -959,9 +959,9 @@ def test_list_products_caps_output_when_the_page_is_oversized(monkeypatch):
 
 def test_list_products_survives_an_aggressively_low_output_limit(monkeypatch):
     # Confirmed bug: under an extremely low XAGENT_TOOL_MAX_OUTPUT_LENGTH,
-    # success_with_capped_dict's phase-2 fallback can drop the wrapper's
-    # sole key entirely once list-halving alone isn't enough, leaving
-    # capped["products"] == {} instead of {"products": []} --
+    # success_with_capped_dict's last-resort fallback can drop the
+    # wrapper's sole key entirely once list-halving alone isn't enough,
+    # leaving capped["products"] == {} instead of {"products": []} --
     # result["products"]["products"] then raised KeyError instead of
     # returning an empty list.
     monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 30)

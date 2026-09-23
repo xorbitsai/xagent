@@ -82,6 +82,9 @@ from ..services.task_runtime import (
     task_extension_bindings_from_agent_config,
     validate_task_extension_requests,
 )
+from ..services.task_workspace_cleanup import (
+    capture_workspace_cleanup_target_best_effort,
+)
 from ..services.workforce_runtime import resolve_workforce_task_runtime
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
 
@@ -1648,16 +1651,34 @@ async def delete_task(
                 ", ".join(unreleased),
             )
 
+        # Captured while the row still exists: the workspace's base directory
+        # comes from this task's execution scope, and that scope is no longer
+        # resolvable once the row is gone. A capture that fails degrades to
+        # resolving at cleanup time -- no worse than not capturing at all --
+        # rather than blocking a deletion the caller already asked for.
+        workspace_target = await asyncio.to_thread(
+            capture_workspace_cleanup_target_best_effort, task_id, task_user_id
+        )
+
         deleted = await asyncio.to_thread(_delete_task_sync, task_id=task_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Task no longer exists")
         invalidate_task_cache(task_id)
 
-        # Remove agent from manager if it exists
-        agent_runtime_service.get_agent_manager(request).remove_agent(
-            task_id, requester_user_id
-        )
-
+        # Before the next await, not after it. The rows are committed as
+        # deleted at this point, and everything below suspends: a cancelled
+        # request would otherwise leave this task's WebSocket connections
+        # attached and its background execution running, with no row left to
+        # reconcile them against. ``CancelledError`` is a ``BaseException``, so
+        # neither handler below would catch it either.
+        #
+        # ``asyncio.create_task`` hands the cleanup to the loop, so it survives
+        # the cancellation of this handler. It only schedules, though: the
+        # cancellation of the background turn races the workspace removal below
+        # rather than preceding it, and the two unwind on separate worker
+        # threads onto the same tree. ``TaskWorkspace.cleanup`` tolerates
+        # losing that race, so neither reports a directory as leaked that the
+        # other has already removed.
         from ..services.task_execution import background_task_manager
         from .websocket import manager
 
@@ -1673,12 +1694,50 @@ async def delete_task(
 
         asyncio.create_task(_cleanup_runtime_state())
 
+        # The task's own owner, not the requester: an admin deleting someone
+        # else's task would otherwise send cleanup at the admin's user-scoped
+        # workspace root and leave the owner's directory behind.
+        #
+        # Past the commit above there is nothing left to roll back, so a
+        # cleanup failure cannot fail the request: reporting 500 here would
+        # tell the client the deletion did not happen, and its retry would get
+        # a 404. Report the deletion as done with cleanup outstanding instead.
+        #
+        # A capture that failed is already a pending cleanup: what follows can
+        # only look under the unscoped candidates, so a workspace written under
+        # a scope segment will not be found. Reporting it as cleaned would make
+        # this field silent in precisely the case it exists to surface.
+        #
+        # Off the event loop, like the account-level path and like the
+        # orchestrator's own call: removal is a recursive rmtree, and a
+        # workspace holding a large tree would otherwise stall every request on
+        # this worker.
+        workspace_cleanup_pending = workspace_target is None
+        try:
+            await asyncio.to_thread(
+                agent_runtime_service.get_agent_manager(request).remove_agent,
+                task_id,
+                task_user_id,
+                workspace_target=workspace_target,
+            )
+        except Exception:
+            workspace_cleanup_pending = True
+            logger.error(
+                "Task %s rows were deleted but its workspace cleanup failed; "
+                "the directory is leaked and needs manual reconciliation",
+                task_id,
+                exc_info=True,
+            )
+
         logger.info(f"Task {task_id} deleted successfully")
 
         return {
             "success": True,
             "message": f"Task '{task_title}' deleted successfully",
             "task_id": task_id,
+            # Always present, so a client can tell "cleaned up" from "rows
+            # gone, resources outstanding" without inferring it from absence.
+            "workspace_cleanup_pending": workspace_cleanup_pending,
         }
 
     except HTTPException:

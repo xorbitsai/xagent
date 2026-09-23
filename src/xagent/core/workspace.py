@@ -2082,11 +2082,27 @@ class TaskWorkspace:
                     )
 
     def cleanup(self) -> None:
-        """Clean up the entire workspace"""
+        """Clean up the entire workspace.
+
+        Tolerates a concurrent remover. Task deletion can race a cancelled
+        turn's own runtime cleanup -- both unwind through ``remove_agent``, on
+        separate worker threads, onto the same tree -- and the loser would
+        otherwise surface a ``FileNotFoundError`` from the middle of the walk.
+        The tree being gone is the outcome this method promises, so the caller
+        learns nothing useful from which thread removed it, and reporting it as
+        a failure would tell deletion the directory leaked when it did not.
+        """
         self._forget_internal_files()
         if self.workspace_dir.exists():
             logger.info(f"Removing workspace directory: {self.workspace_dir}")
-            shutil.rmtree(self.workspace_dir)
+            try:
+                shutil.rmtree(self.workspace_dir)
+            except FileNotFoundError:
+                logger.info(
+                    f"Workspace directory already removed concurrently: "
+                    f"{self.workspace_dir}"
+                )
+                return
             logger.info(f"Workspace directory removed: {self.workspace_dir}")
 
     def copy_to_workspace(self, source_path: str, target_subdir: str = "input") -> Path:

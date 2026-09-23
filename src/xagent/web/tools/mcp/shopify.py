@@ -18,7 +18,12 @@ from ....core.utils.security import (
     reject_private_network_host,
 )
 from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
-from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict
+from .utils import (
+    clamp_limit,
+    halve_dict_or_mark,
+    setup_proxy_env,
+    success_with_capped_dict,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shopify-mcp")
@@ -792,10 +797,23 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
     returned via a bare `_success()` call with no cap at all, so an
     oversized single object hit the same hard-truncated-into-broken-JSON
     failure mode the pagination helper exists to prevent. Reuses
-    `success_with_capped_dict` (utils.py) for the actual shrinking rather
+    `success_with_capped_dict` (utils.py) for the initial shrinking rather
     than reimplementing its halving logic locally -- unlike the pagination
     case, there's no cursor to invalidate here, so the generic dict-capping
-    helper's usual contract applies unmodified.
+    helper's usual contract applies unmodified. Once `warnings` needs its
+    own room afterward, the tail loop below still halves `value`'s keys
+    locally (no cursor concern there either, but also no clean way to ask
+    `success_with_capped_dict` to shrink further around an already-built
+    envelope) -- it uses `halve_dict_or_mark` for that per-field decision
+    (immediate marker installation is safe here specifically because there
+    is only ever one dict field in play, `value`, unlike
+    `success_with_capped_dict`'s own phase 1, which no longer calls
+    `halve_dict_or_mark` at all now that it shrinks several dict-valued
+    fields against a shared budget -- see that helper's docstring for why
+    the two cases need different handling). This tail loop also lacks
+    `success_with_capped_dict`'s id-preserving last-resort tier, so a
+    record already down to one key can still empty out here in a way
+    `success_with_capped_dict` alone would have recovered.
     """
     response = _success(**{field_name: value}, _errors=errors)
     max_output_length = get_tool_max_output_length()
@@ -825,12 +843,27 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
         else:
             high = middle - 1
     payload["warnings"] = [warning[:low] + marker]
+    # Halve the keys, then a size-gated marker at the one-key floor, via
+    # the shared per-field helper -- installed immediately here rather than
+    # deferred to a separate leftover-budget pass the way
+    # success_with_capped_dict's own phase 1 does it, because there is only
+    # ever one dict field in play in this loop (`value`), so there is no
+    # sibling field a marker's extra bytes could come at the expense of
+    # (see halve_dict_or_mark's docstring for why that distinction
+    # matters). `floored` tracks the floor explicitly instead of relying
+    # on the marker never comparing strictly smaller than itself: this
+    # loop has no tier below {}, so once the floor is reached and the
+    # payload is still oversized, the field is emptied outright rather
+    # than re-selected.
+    floored = False
     while len(json.dumps(payload, ensure_ascii=False)) > max_output_length:
         value = payload.get(field_name)
         if not isinstance(value, dict) or not value:
             break
-        keys = list(value)
-        payload[field_name] = {key: value[key] for key in keys[: len(keys) // 2]}
+        if floored:
+            payload[field_name] = {}
+            break
+        payload[field_name], floored = halve_dict_or_mark(value)
     return json.dumps(payload, ensure_ascii=False)
 
 

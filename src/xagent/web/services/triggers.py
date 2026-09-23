@@ -1457,6 +1457,18 @@ def _get_or_create_trigger_run(
     return run, True
 
 
+def _advanced_run_statuses() -> list[str]:
+    """Run statuses that start and failure writers must leave alone.
+
+    Parked and terminal. A parked run belongs to the settle projection until its
+    task moves again, and a terminal run is settled history; a writer acting on a
+    stale read has to exclude both, or it can strand a parked run the way #2177
+    describes.
+    """
+
+    return sorted(TriggerRunStatus.terminal_values() | {TriggerRunStatus.PAUSED.value})
+
+
 def _mark_run_failed(
     db: Session,
     *,
@@ -1464,11 +1476,29 @@ def _mark_run_failed(
     run: TriggerRun,
     error_message: str,
 ) -> None:
-    setattr(run, "status", TriggerRunStatus.FAILED.value)
-    setattr(run, "error_message", error_message)
-    setattr(run, "finished_at", _now())
+    """Record a failed preparation or start attempt on the run and its trigger.
+
+    A run that already advanced keeps its state: ``paused`` means the task is
+    waiting and can still be resumed, and terminal rows are never re-selected by
+    the projection, so failing either one would be a terminal lie that no later
+    transition could correct (#2177). The ``UPDATE`` carries that condition
+    itself rather than being preceded by a read, because the park can commit
+    between any read and this write.
+    """
+    advanced = _advanced_run_statuses()
+    db.execute(
+        update(TriggerRun)
+        .where(TriggerRun.id == int(run.id), TriggerRun.status.notin_(advanced))
+        .values(
+            status=TriggerRunStatus.FAILED.value,
+            error_message=error_message,
+            finished_at=_now(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    # The trigger's badge describes this attempt, not the run's state, so it is
+    # recorded whether or not the run itself was still failable.
     setattr(trigger, "last_error", error_message)
-    db.add(run)
     db.add(trigger)
     db.commit()
 
@@ -1816,13 +1846,12 @@ def _mark_trigger_run_started(start: _PreparedTriggerStart) -> None:
         if run is None or trigger is None:
             return
         started_at = run.started_at or _now()
-        # Parked and terminal states: the run left the start behind and keeps it.
-        advanced = sorted(
-            TriggerRunStatus.terminal_values() | {TriggerRunStatus.PAUSED.value}
-        )
         db.execute(
             update(TriggerRun)
-            .where(TriggerRun.id == start.run_id, TriggerRun.status.notin_(advanced))
+            .where(
+                TriggerRun.id == start.run_id,
+                TriggerRun.status.notin_(_advanced_run_statuses()),
+            )
             .values(
                 status=TriggerRunStatus.RUNNING.value,
                 started_at=started_at,
@@ -1857,15 +1886,32 @@ def _mark_trigger_run_failed_by_id(run_id: int, error_message: str) -> None:
 
 
 def _mark_trigger_run_running_if_task_running(run_id: int, task_id: int) -> bool:
+    """Report whether a rejected start still has a running task behind it.
+
+    Returns True when the task is running: that is the caller's signal not to
+    fail the run, and it stays true whether or not the run itself was still
+    writable. The run write is conditional because the task check above is a
+    read -- the park can land between it and the write, and dragging a parked run
+    back to ``running`` leaves nothing that could repair it (#2177).
+    """
     db = _with_session()
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
         run = db.query(TriggerRun).filter(TriggerRun.id == run_id).first()
         if task is None or run is None or task.status != TaskStatus.RUNNING:
             return False
-        setattr(run, "status", TriggerRunStatus.RUNNING.value)
-        setattr(run, "started_at", run.started_at or _now())
-        db.add(run)
+        db.execute(
+            update(TriggerRun)
+            .where(
+                TriggerRun.id == run_id,
+                TriggerRun.status.notin_(_advanced_run_statuses()),
+            )
+            .values(
+                status=TriggerRunStatus.RUNNING.value,
+                started_at=run.started_at or _now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
         db.commit()
         return True
     finally:

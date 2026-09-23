@@ -31,7 +31,10 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.services import triggers as triggers_module
-from xagent.web.services.task_orchestrator import sync_trigger_run_status
+from xagent.web.services.task_orchestrator import (
+    TaskTurnError,
+    sync_trigger_run_status,
+)
 
 
 @pytest.fixture()
@@ -129,3 +132,71 @@ async def test_start_bookkeeping_does_not_overwrite_a_parked_run(
     # The bookkeeping the call exists for still happened.
     db_session.refresh(trigger)
     assert trigger.last_run_at is not None
+
+
+def test_start_again_verdict_does_not_drag_an_advanced_run_back(db_session):
+    """REPRO (#2177): the other start writer is a read-then-check.
+
+    ``_mark_trigger_run_running_if_task_running`` reads the task, then writes the
+    run unconditionally. The task check says "a turn owns this task", but the park
+    can land between that read and the write, so the run write needs its own
+    condition -- otherwise it resurrects a parked run.
+    """
+
+    trigger, run = _prepare_run(db_session)
+    run_id = int(run.id)
+    task_id = int(run.task_id)
+
+    task = db_session.query(Task).filter(Task.id == task_id).one()
+    task.status = TaskStatus.RUNNING
+    db_session.add(task)
+    parked = db_session.get(TriggerRun, run_id)
+    parked.status = TriggerRunStatus.PAUSED.value
+    db_session.add(parked)
+    db_session.commit()
+
+    marked = triggers_module._mark_trigger_run_running_if_task_running(run_id, task_id)
+
+    assert marked is True, (
+        "the caller uses this verdict to decide not to fail the run, so a running "
+        "task must keep reporting True"
+    )
+    db_session.expire_all()
+    stored = db_session.get(TriggerRun, run_id)
+    assert stored.status == TriggerRunStatus.PAUSED.value, (
+        "the start-again write dragged a parked run back to 'running' (#2177)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejected_start_does_not_fail_a_parked_run(db_session, monkeypatch):
+    """REPRO (#2177): a rejected start must not terminalize a parked run.
+
+    When ``begin_turn`` rejects the turn and the task is not running, the caller
+    marks the run failed. If the task parked in the meantime, that failure is a
+    terminal lie: the projection never re-selects terminal rows, so a later
+    resume could not correct it.
+    """
+
+    trigger, run = _prepare_run(db_session)
+    run_id = int(run.id)
+    task_id = int(run.task_id)
+
+    async def park_then_reject(**_kwargs):
+        _park_the_task(db_session, task_id)
+        raise TaskTurnError("task is owned by another turn")
+
+    monkeypatch.setattr(
+        triggers_module.TaskTurnOrchestrator, "begin_turn", park_then_reject
+    )
+
+    started = await triggers_module.start_prepared_trigger_run(db_session, run=run)
+    assert started is False
+
+    db_session.expire_all()
+    stored = db_session.get(TriggerRun, run_id)
+    assert stored.status == TriggerRunStatus.PAUSED.value, (
+        "a rejected start marked the parked run failed; terminal rows are never "
+        "re-selected, so a later resume could not correct it (#2177)"
+    )
+    assert stored.finished_at is None

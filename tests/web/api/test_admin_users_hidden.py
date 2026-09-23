@@ -211,7 +211,10 @@ async def test_admin_user_delete_runs_runtime_cleanup_before_task_delete():
 
         response = await delete_user(target_id, admin, db)
 
-        assert response == {"message": "User deleted successfully"}
+        assert response == {
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
+        }
         assert provider.task_existed_on_delete == [True]
         assert db.query(Task).filter(Task.id == task_id).count() == 0
         assert (
@@ -263,7 +266,7 @@ async def test_admin_user_delete_preserves_user_when_runtime_cleanup_fails():
 
 
 @pytest.mark.asyncio
-async def test_admin_user_delete_skips_task_runtime_scan_without_providers(
+async def test_admin_user_delete_skips_runtime_cleanup_without_providers(
     monkeypatch,
 ):
     import xagent.web.api.admin_users as admin_users_module
@@ -301,7 +304,10 @@ async def test_admin_user_delete_skips_task_runtime_scan_without_providers(
 
         response = await delete_user(target_id, admin, db)
 
-        assert response == {"message": "User deleted successfully"}
+        assert response == {
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
+        }
         assert db.query(User).filter(User.id == target_id).count() == 0
     finally:
         db.close()
@@ -355,7 +361,10 @@ async def test_admin_user_delete_cleans_task_created_during_runtime_cleanup():
 
         response = await delete_user(target_id, admin, db)
 
-        assert response == {"message": "User deleted successfully"}
+        assert response == {
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
+        }
         assert initial_task_id in provider.cleaned_task_ids
         assert len(provider.cleaned_task_ids) == 2
         assert db.query(Task).filter(Task.user_id == target_id).count() == 0
@@ -402,7 +411,10 @@ async def test_admin_user_delete_pages_runtime_cleanup(monkeypatch):
 
         response = await delete_user(target_id, admin, db)
 
-        assert response == {"message": "User deleted successfully"}
+        assert response == {
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
+        }
         assert set(provider.cleaned_task_ids) == task_ids
         assert db.query(Task).filter(Task.user_id == target_id).count() == 0
     finally:

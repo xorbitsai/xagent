@@ -480,8 +480,10 @@ def _presentation_metadata(
         )
     _require_etag(item.get("eTag"), "Graph presentation eTag")
     download_url = item.get("@microsoft.graph.downloadUrl")
-    if not isinstance(download_url, str) or not download_url:
-        raise RuntimeError("Graph did not return a presentation download URL")
+    if download_url is not None and (
+        not isinstance(download_url, str) or not download_url
+    ):
+        raise RuntimeError("Graph returned an invalid presentation download URL")
     return item
 
 
@@ -492,6 +494,61 @@ def _download_preauthenticated_content(download_url: str, expected_size: int) ->
             download_url,
             stream=True,
             timeout=_BINARY_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        raise RuntimeError("PowerPoint presentation download failed") from None
+
+    try:
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            raise _GraphRequestError(
+                "PowerPoint presentation download failed with HTTP "
+                f"{response.status_code}",
+                status_code=response.status_code,
+            ) from None
+
+        content = bytearray()
+        try:
+            for chunk in response.iter_content(chunk_size=_DOWNLOAD_CHUNK_BYTES):
+                if not chunk:
+                    continue
+                if len(content) + len(chunk) > _MAX_PRESENTATION_BYTES:
+                    raise ValueError(
+                        "The presentation download exceeded the "
+                        f"{_MAX_PRESENTATION_BYTES // 1_000_000} MB limit"
+                    )
+                content.extend(chunk)
+        except requests.RequestException:
+            raise RuntimeError("PowerPoint presentation download failed") from None
+    finally:
+        response.close()
+
+    if len(content) != expected_size:
+        raise RuntimeError(
+            "PowerPoint presentation size changed while it was being downloaded"
+        )
+    return bytes(content)
+
+
+def _download_authenticated_content(
+    content_path: str, expected_size: int
+) -> bytes:
+    """Download Graph ``/content`` when metadata has no signed URL.
+
+    Personal OneDrive and some Graph-compatible drives omit
+    ``@microsoft.graph.downloadUrl`` even though the authenticated content
+    endpoint is available. Keep the same bounded streaming and safe-error
+    behavior as the signed-URL path. ``requests`` follows the normal Graph
+    redirect and strips the bearer header when the redirect crosses hosts.
+    """
+    try:
+        response = requests.request(
+            method="GET",
+            url=f"{GRAPH_BASE_URL}{content_path}",
+            headers=_graph_headers(),
+            timeout=_BINARY_TIMEOUT_SECONDS,
+            stream=True,
         )
     except requests.RequestException:
         raise RuntimeError("PowerPoint presentation download failed") from None
@@ -561,9 +618,13 @@ def _download_presentation(
         raise _ConflictError(
             "The presentation changed after it was read; fetch it again before editing"
         )
-    content = _download_preauthenticated_content(
-        item["@microsoft.graph.downloadUrl"], item["size"]
-    )
+    download_url = item.get("@microsoft.graph.downloadUrl")
+    if isinstance(download_url, str) and download_url:
+        content = _download_preauthenticated_content(download_url, item["size"])
+    else:
+        content = _download_authenticated_content(
+            _content_path(file_path, site_id, drive_id), item["size"]
+        )
     _validate_presentation_archive(content)
     try:
         presentation = Presentation(io.BytesIO(content))

@@ -624,6 +624,29 @@ def test_get_presentation_text(monkeypatch):
     assert "headers" not in mock_get.call_args.kwargs
 
 
+def test_get_presentation_text_falls_back_to_authenticated_content_endpoint(
+    monkeypatch,
+):
+    content = _pptx_bytes()
+    metadata = _metadata_response(content)
+    metadata._json_data.pop("@microsoft.graph.downloadUrl")
+    content_response = MockResponse(content=content)
+    mock_request = Mock(side_effect=[metadata, content_response])
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    mock_get = Mock()
+    monkeypatch.setattr(powerpoint.requests, "get", mock_get)
+
+    result = json.loads(powerpoint.powerpoint_get_presentation_text("Deck.pptx"))
+
+    assert result["status"] == "success"
+    assert mock_get.call_count == 0
+    content_call = mock_request.call_args_list[1]
+    assert content_call.kwargs["method"] == "GET"
+    assert content_call.kwargs["url"].endswith("/me/drive/root:/Deck.pptx:/content")
+    assert content_call.kwargs["headers"]["Authorization"] == "Bearer test-graph-token"
+    assert content_call.kwargs["stream"] is True
+
+
 def test_get_presentation_text_returns_resumable_bounded_pages(monkeypatch):
     def build(prs):
         for index in range(5):

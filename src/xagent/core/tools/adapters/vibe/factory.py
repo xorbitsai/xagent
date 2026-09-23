@@ -260,9 +260,7 @@ class ToolRegistry:
         cls._import_tool_modules()
 
         spec: ToolSelectionSpec | None = (
-            config.get_tool_selection_spec()
-            if hasattr(config, "get_tool_selection_spec")
-            else None
+            config.get_tool_selection_spec() if hasattr(config, "get_tool_selection_spec") else None
         )
         tools: list[Tool] = []
         for creator, declared_cats, selection_gate in cls._tool_creators:
@@ -288,9 +286,7 @@ class ToolRegistry:
                 # the blanket handler below.
                 raise
             except Exception as e:
-                logger.warning(
-                    f"Tool creator {creator.__name__} failed: {e}", exc_info=True
-                )
+                logger.warning(f"Tool creator {creator.__name__} failed: {e}", exc_info=True)
 
         # Sort tools by category priority
         tools = cls._sort_tools_by_category(tools)
@@ -373,9 +369,7 @@ class ToolFactory:
         """
         prepare_factory_runtime = getattr(type(config), "prepare_factory_runtime", None)
         handoff_factory_runtime = getattr(type(config), "handoff_factory_runtime", None)
-        release_factory_runtime = getattr(
-            type(config), "release_prepared_factory_runtime", None
-        )
+        release_factory_runtime = getattr(type(config), "release_prepared_factory_runtime", None)
         abort_factory_runtime = getattr(type(config), "abort_factory_runtime", None)
         body_failed = False
 
@@ -403,18 +397,14 @@ class ToolFactory:
                         else dict(additional_tool_origins)
                     )
                 else:
-                    resolved_additional_tool_origins = dict(
-                        additional_tool_origins or {}
-                    )
+                    resolved_additional_tool_origins = dict(additional_tool_origins or {})
                 resolved_additional_tools = tuple(resolved_additional_tools or ())
                 prepared_kwargs: dict[str, Any] = {
                     "apply_user_override_filter": apply_user_override_filter
                 }
                 if resolved_additional_tools:
                     prepared_kwargs["additional_tools"] = resolved_additional_tools
-                    prepared_kwargs["additional_tool_origins"] = (
-                        resolved_additional_tool_origins
-                    )
+                    prepared_kwargs["additional_tool_origins"] = resolved_additional_tool_origins
                 return await ToolFactory._create_all_tools_prepared(
                     config,
                     **prepared_kwargs,
@@ -483,18 +473,14 @@ class ToolFactory:
         # the contribution actually handed over, before malformed tools are
         # dropped, otherwise dropping one tool would disable structured
         # reconciliation for every other provider.
-        candidate_extension_occurrences = Counter(
-            id(tool) for tool in candidate_extension_tools
-        )
+        candidate_extension_occurrences = Counter(id(tool) for tool in candidate_extension_tools)
         runtime_config = config if isinstance(config, BaseToolConfig) else None
         # Resolved back to the full, pre-policy contribution: the stored value
         # may be a view narrowed by an earlier build, and reconciliation must
         # re-derive from the full one so a widened policy restores what a
         # previous, more restrictive policy removed.
         contribution = _full_stored_contribution(
-            runtime_config.get_task_runtime_contribution()
-            if runtime_config is not None
-            else None
+            runtime_config.get_task_runtime_contribution() if runtime_config is not None else None
         )
         # The structured, provider-owned view of the very same objects that were
         # handed to this call. Resolved up front so the malformed-tool filter
@@ -504,8 +490,7 @@ class ToolFactory:
             contribution
             if isinstance(contribution, TaskRuntimeContribution)
             and contribution.provider_contributions
-            and Counter(id(tool) for tool in contribution.tools)
-            == candidate_extension_occurrences
+            and Counter(id(tool) for tool in contribution.tools) == candidate_extension_occurrences
             else None
         )
         # ``additional_tool_origins`` is keyed by tool NAME, so two providers
@@ -519,9 +504,7 @@ class ToolFactory:
                 provider_contribution,
             ) in structured_contribution.provider_contributions:
                 for tool in provider_contribution.tools:
-                    extension_tool_providers.setdefault(id(tool), []).append(
-                        provider_name
-                    )
+                    extension_tool_providers.setdefault(id(tool), []).append(provider_name)
         extension_tools: list[Tool] = []
         extension_names: set[str] = set()
         if candidate_extension_tools:
@@ -577,9 +560,7 @@ class ToolFactory:
         # ``None`` vs ``[]`` distinction was a runtime truthiness check.
         # Configs that don't carry a spec default to ALL (full set).
         spec = (
-            config.get_tool_selection_spec()
-            if hasattr(config, "get_tool_selection_spec")
-            else None
+            config.get_tool_selection_spec() if hasattr(config, "get_tool_selection_spec") else None
         )
         if spec is not None:
             # Prefer the spec. If a legacy concrete ``allowed_tools`` list
@@ -587,9 +568,7 @@ class ToolFactory:
             # a possibly-stale list (issue #539): the spec is the source
             # of truth once supplied.
             legacy_when_spec = (
-                config.get_allowed_tools()
-                if hasattr(config, "get_allowed_tools")
-                else None
+                config.get_allowed_tools() if hasattr(config, "get_allowed_tools") else None
             )
             if legacy_when_spec is not None:
                 logger.warning(
@@ -616,9 +595,7 @@ class ToolFactory:
             allowed_names = spec.compute_allowed_names(
                 tools,
                 extension_tool_names=frozenset(
-                    tool.name
-                    for tool in extension_tools
-                    if tool.name not in core_tool_names
+                    tool.name for tool in extension_tools if tool.name not in core_tool_names
                 ),
             )
         else:
@@ -633,9 +610,7 @@ class ToolFactory:
             #   []         — explicit zero tools
             #   [...]      — concrete name allow-list
             legacy_list = (
-                config.get_allowed_tools()
-                if hasattr(config, "get_allowed_tools")
-                else None
+                config.get_allowed_tools() if hasattr(config, "get_allowed_tools") else None
             )
             allowed_names = None if legacy_list is None else frozenset(legacy_list)
 
@@ -651,14 +626,10 @@ class ToolFactory:
             overrides = getattr(config, "get_user_tool_overrides", lambda: {})()
             if overrides:
                 disabled_by_hook = {
-                    name
-                    for name, ov in overrides.items()
-                    if ov and ov.get("enabled") is False
+                    name for name, ov in overrides.items() if ov and ov.get("enabled") is False
                 }
                 if disabled_by_hook:
-                    tools = [
-                        tool for tool in tools if tool.name not in disabled_by_hook
-                    ]
+                    tools = [tool for tool in tools if tool.name not in disabled_by_hook]
 
             # Positive allowlist filter (execution layer). When the hook
             # returns a concrete list, keep only tools whose name is in it.
@@ -687,9 +658,7 @@ class ToolFactory:
                 policy_surviving_core_tools.append(tool)
             elif extension_tool_occurrences[tool_id] > 0:
                 policy_surviving_extension_tools.append(tool)
-        policy_surviving_extension_names = {
-            tool.name for tool in policy_surviving_extension_tools
-        }
+        policy_surviving_extension_names = {tool.name for tool in policy_surviving_extension_tools}
         dropped_extension_names = extension_names - policy_surviving_extension_names
         if dropped_extension_names:
             dropped_by_provider: dict[str, list[str]] = {}
@@ -718,15 +687,11 @@ class ToolFactory:
                 reconciled, conflicts = reconcile_task_runtime_contribution_tools(
                     structured_contribution,
                     available_tools=policy_surviving_extension_tools,
-                    reserved_tool_names={
-                        tool.name for tool in policy_surviving_core_tools
-                    },
+                    reserved_tool_names={tool.name for tool in policy_surviving_core_tools},
                 )
                 runtime_config.set_task_runtime_contribution(reconciled)
 
-                accepted_extension_occurrences = Counter(
-                    id(tool) for tool in reconciled.tools
-                )
+                accepted_extension_occurrences = Counter(id(tool) for tool in reconciled.tools)
                 remaining_core_occurrences = core_tool_occurrences.copy()
                 retained_tools: list[Tool] = []
                 for tool in tools:
@@ -776,9 +741,7 @@ class ToolFactory:
             if callable(release):
                 release()
             workspace = (
-                config.get_task_runtime_workspace()
-                if isinstance(config, BaseToolConfig)
-                else None
+                config.get_task_runtime_workspace() if isinstance(config, BaseToolConfig) else None
             )
             if workspace is None:
                 workspace = ToolFactory.create_workspace(config.get_workspace_config())
@@ -795,15 +758,11 @@ class ToolFactory:
                 # unittest.mock.Mock auto-creates an attribute and would make
                 # an unimplemented capability look present. Instance-only
                 # duck-typed capabilities intentionally keep the safe fallback.
-                host_mount_check = getattr(
-                    type(sandbox), "workspace_dirs_are_host_mounted", None
-                )
+                host_mount_check = getattr(type(sandbox), "workspace_dirs_are_host_mounted", None)
                 workspace_is_host_mounted = False
                 if directories_exist_on_backend_storage and callable(host_mount_check):
                     try:
-                        workspace_is_host_mounted = (
-                            host_mount_check(sandbox, directories) is True
-                        )
+                        workspace_is_host_mounted = host_mount_check(sandbox, directories) is True
                     except Exception:
                         # This is an optimization probe. If it cannot prove
                         # coverage, preserve the pre-optimization behavior
@@ -942,9 +901,7 @@ class ToolFactory:
                 allowed_external_dirs=workspace_config.get("allowed_external_dirs"),
                 db_task_id=workspace_config.get("db_task_id"),
                 scope_segments=tuple(workspace_config.get("scope_segments") or ()),
-                durable_storage_segments=workspace_config.get(
-                    "durable_storage_segments"
-                ),
+                durable_storage_segments=workspace_config.get("durable_storage_segments"),
             )
             user_id = workspace_config.get("user_id")
             if isinstance(user_id, int):
@@ -1142,18 +1099,14 @@ class ToolFactory:
                             import shlex
 
                             try:
-                                connection_config["args"] = shlex.split(
-                                    connection_config["args"]
-                                )
+                                connection_config["args"] = shlex.split(connection_config["args"])
                                 logger.info(
                                     f"Converted args string to list: {connection_config['args']}"
                                 )
                             except Exception as e:
                                 logger.warning(f"Failed to parse args string: {e}")
                                 # Fallback to simple split
-                                connection_config["args"] = connection_config[
-                                    "args"
-                                ].split()
+                                connection_config["args"] = connection_config["args"].split()
 
                         configs_by_name[server_name] = config
                         session_identity = session_identities.get(server_name)
@@ -1164,9 +1117,7 @@ class ToolFactory:
                                         server_name=server_name,
                                         server_id=config.get("id"),
                                         reason=ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
-                                        message=(
-                                            "MCP server session runtime is unavailable."
-                                        ),
+                                        message=("MCP server session runtime is unavailable."),
                                     )
                                 )
                                 continue
@@ -1189,8 +1140,7 @@ class ToolFactory:
                             raise
                         except Exception as exc:
                             logger.warning(
-                                "Actor stdio session consumer failed for server "
-                                "'%s' (%s)",
+                                "Actor stdio session consumer failed for server '%s' (%s)",
                                 server_name,
                                 type(exc).__name__,
                             )
@@ -1199,9 +1149,7 @@ class ToolFactory:
                                     server_name=server_name,
                                     server_id=configs_by_name[server_name].get("id"),
                                     reason=ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
-                                    message=(
-                                        "MCP server session runtime is unavailable."
-                                    ),
+                                    message=("MCP server session runtime is unavailable."),
                                 )
                             )
 
@@ -1356,9 +1304,7 @@ class ToolFactory:
             except ConnectorRuntimeError:
                 raise
             except Exception as e:
-                logger.warning(
-                    "Failed to create MCP tools from database (%s)", type(e).__name__
-                )
+                logger.warning("Failed to create MCP tools from database (%s)", type(e).__name__)
                 unavailable_tools.extend(
                     cls._create_unavailable_mcp_tool(
                         server_name=server_name,
@@ -1390,9 +1336,7 @@ class ToolFactory:
         except RequiredMCPUnavailableError:
             raise
         except Exception as e:
-            logger.warning(
-                "Failed to create MCP tools from database (%s)", type(e).__name__
-            )
+            logger.warning("Failed to create MCP tools from database (%s)", type(e).__name__)
             enforce_mcp_failure_policy(
                 mcp_failure_policy,
                 [MCPUnavailableSummary.from_values(None, "config_load_failed")],

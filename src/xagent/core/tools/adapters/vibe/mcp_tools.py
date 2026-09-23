@@ -161,8 +161,7 @@ def _select_config_load_failures(
     from .selection_spec import normalize_mcp_server_name
 
     by_name = {
-        normalize_mcp_server_name(summary.server_name): summary
-        for summary in error.summaries
+        normalize_mcp_server_name(summary.server_name): summary for summary in error.summaries
     }
     return tuple(
         by_name.get(
@@ -189,9 +188,7 @@ def _build_mcp_load_summary(
         if requested_servers is not None
         else _stable_server_names(config.get("name") for config in mcp_configs)
     )
-    display_by_normalized = {
-        normalize_mcp_server_name(name): name for name in requested
-    }
+    display_by_normalized = {normalize_mcp_server_name(name): name for name in requested}
 
     loaded: list[str] = []
     loaded_keys: set[str] = set()
@@ -232,9 +229,7 @@ def _build_mcp_load_summary(
         key = normalize_mcp_server_name(name)
         requested_failure = failures_by_key.get(key)
         if requested_failure is None and key not in loaded_keys:
-            requested_failure = MCPUnavailableSummary.from_values(
-                name, "no_tools_returned"
-            )
+            requested_failure = MCPUnavailableSummary.from_values(name, "no_tools_returned")
         if requested_failure is not None and key not in emitted_failure_keys:
             failures.append(requested_failure)
             emitted_failure_keys.add(key)
@@ -252,9 +247,7 @@ def _build_mcp_load_summary(
     )
 
 
-async def _emit_mcp_load_summary(
-    config: "BaseToolConfig", summary: MCPToolLoadSummary
-) -> None:
+async def _emit_mcp_load_summary(config: "BaseToolConfig", summary: MCPToolLoadSummary) -> None:
     try:
         emitter = getattr(config, "emit_mcp_load_summary", None)
         if not callable(emitter):
@@ -297,11 +290,7 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     actually want MCP tools (see issue #427). The check is redundant with
     the dispatch gate but kept as defense and to cover the spec=None path.
     """
-    spec = (
-        config.get_tool_selection_spec()
-        if hasattr(config, "get_tool_selection_spec")
-        else None
-    )
+    spec = config.get_tool_selection_spec() if hasattr(config, "get_tool_selection_spec") else None
     if spec is not None and not spec.includes_mcp():
         return []
     try:
@@ -333,9 +322,7 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
         if scoped:
             requested_without_configs = _stable_server_names(sorted(scoped))
     if not mcp_configs:
-        summary = _build_mcp_load_summary(
-            [], [], requested_servers=requested_without_configs
-        )
+        summary = _build_mcp_load_summary([], [], requested_servers=requested_without_configs)
         return await _finish_mcp_setup(config, summary, [])
 
     # Pre-build per-server restriction comes from the single policy method
@@ -362,9 +349,7 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
             ]
             if not mcp_configs:
                 requested_servers = _stable_server_names(sorted(scoped))
-                summary = _build_mcp_load_summary(
-                    [], [], requested_servers=requested_servers
-                )
+                summary = _build_mcp_load_summary([], [], requested_servers=requested_servers)
                 return await _finish_mcp_setup(config, summary, [])
 
     # Everything DB-backed is loaded at this point; what follows is pure
@@ -399,12 +384,8 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
         consumer_getter = getattr(config, "get_actor_mcp_stdio_session_consumer", None)
         session_consumer = consumer_getter() if callable(consumer_getter) else None
         workspace_getter = getattr(config, "get_task_runtime_workspace", None)
-        runtime_workspace = (
-            workspace_getter() if callable(workspace_getter) else None
-        )
-        if not callable(
-            getattr(runtime_workspace, "stage_file_for_external_upload", None)
-        ):
+        runtime_workspace = workspace_getter() if callable(workspace_getter) else None
+        if not callable(getattr(runtime_workspace, "stage_file_for_external_upload", None)):
             runtime_workspace = None
         create_kwargs: dict[str, Any] = {"sandbox": config.get_sandbox()}
         if runtime_workspace is not None:
@@ -414,9 +395,7 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
                 actor_stdio_session_identities=session_identities,
                 actor_stdio_session_consumer=session_consumer,
             )
-        tools = await ToolFactory._create_mcp_tools_from_configs(
-            mcp_configs, **create_kwargs
-        )
+        tools = await ToolFactory._create_mcp_tools_from_configs(mcp_configs, **create_kwargs)
     except ConnectorRuntimeError:
         summary = _build_mcp_load_summary(
             mcp_configs,

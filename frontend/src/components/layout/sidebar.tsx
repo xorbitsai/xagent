@@ -131,9 +131,16 @@ interface SidebarProps {
   isCollapsible?: boolean
   className?: string
   allowCollapse?: boolean
+  /**
+   * Secondary line under the signed-in user, supplied by the hosting app.
+   *
+   * Core stays deployment-agnostic: it renders whatever text it is given
+   * (for example a region name) and shows nothing when it is absent.
+   */
+  profileSubtitle?: string
 }
 
-export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
+export function Sidebar({ className, allowCollapse = true, profileSubtitle }: SidebarProps) {
   const pathname = usePathname()
   const router = useRouter()
   const { user, logout } = useAuth()
@@ -141,6 +148,10 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   const { t } = useI18n()
   const { state } = useApp()
   const userLabel = userDisplayLabel(user, t("sidebar.user.defaultName"))
+  const subtitle = profileSubtitle?.trim() || null
+  // The collapsed rail has no room for the identity lines: they become the
+  // profile button's tooltip and accessible name there.
+  const profileLabel = subtitle ? `${userLabel} · ${subtitle}` : userLabel
   const githubUrl = process.env.NEXT_PUBLIC_GITHUB_URL || "https://github.com/xorbitsai/xagent"
   const normalizedGithubUrl = githubUrl.replace(/\.git$/, "").replace(/\/$/, "")
   const githubRepoDisplay = normalizedGithubUrl.replace(/^https?:\/\/github\.com\//i, "")
@@ -690,7 +701,8 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           <button
             onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
             className="flex items-center justify-center w-full p-2 hover:bg-accent rounded-[7px] transition-colors"
-            title={userLabel}
+            aria-label={profileLabel}
+            title={profileLabel}
           >
             <div className="h-7 w-7 rounded-full bg-primary flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
               {userLabel.charAt(0)}
@@ -1091,6 +1103,9 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           </div>
           <div className="flex-1 min-w-0">
             <p className="text-[13px] font-semibold text-foreground truncate">{userLabel}</p>
+            {subtitle && (
+              <p className="text-[11px] text-muted-foreground truncate">{subtitle}</p>
+            )}
           </div>
           <ChevronsUpDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
         </button>

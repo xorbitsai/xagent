@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { Globe } from "lucide-react"
 import React from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -105,5 +105,60 @@ describe("Sidebar collapsible nav groups", () => {
     fireEvent.click(header)
     expect(header).toHaveAttribute("aria-expanded", "false")
     expect(screen.queryByRole("link", { name: "Knowledge Base" })).not.toBeInTheDocument()
+  })
+})
+
+describe("Sidebar profile subtitle", () => {
+  beforeEach(() => {
+    routeState.pathname = "/task"
+    navState.groups = []
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 500 })))
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    cleanup()
+  })
+
+  it("leaves the profile unlabeled without a subtitle", () => {
+    render(<Sidebar />)
+
+    expect(screen.getByText("alice@example.com")).toBeInTheDocument()
+  })
+
+  it("shows the host-supplied subtitle under the signed-in user", () => {
+    render(<Sidebar profileSubtitle="Singapore" />)
+
+    expect(screen.getByText("alice@example.com")).toBeInTheDocument()
+    expect(screen.getByText("Singapore")).toBeInTheDocument()
+  })
+
+  it("treats a blank subtitle as absent", () => {
+    // /agent collapses the rail, so the profile shows only its avatar.
+    routeState.pathname = "/agent"
+    render(<Sidebar profileSubtitle="   " />)
+
+    const profile = screen.getByRole("button", { name: /alice@example\.com/ })
+    expect(profile.getAttribute("title")).not.toContain("\u00b7")
+  })
+
+  it("announces the subtitle from the collapsed profile rail", () => {
+    // The rail has no room for the name and subtitle, so both are announced.
+    routeState.pathname = "/agent"
+    render(<Sidebar profileSubtitle="Singapore" />)
+
+    const profile = screen.getByRole("button", { name: /alice@example\.com.*Singapore/ })
+    expect(profile.getAttribute("title")).toMatch(/alice@example\.com.*Singapore/)
+  })
+
+  it("never reads the host deployment configuration", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 500 }))
+    vi.stubGlobal("fetch", fetchMock)
+    render(<Sidebar profileSubtitle="Singapore" />)
+
+    await act(async () => {})
+
+    // Deployment configuration belongs to the hosting app, not to core.
+    const requested = fetchMock.mock.calls.map(([input]) => String(input))
+    expect(requested).not.toContain("/api/deployment-config")
   })
 })

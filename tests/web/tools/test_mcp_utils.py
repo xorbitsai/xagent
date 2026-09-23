@@ -1648,3 +1648,247 @@ def test_success_with_capped_dict_last_resort_prefers_an_intact_url_over_the_id(
     assert result["truncated"] is True
     assert result["event"] == {}
     assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"
+
+
+# ---------------------------------------------------------------------------
+# _halve_largest_list_fields_until_bounded - list-collapse sharp edge
+# ---------------------------------------------------------------------------
+#
+# Halving a list's element count works at any length above one, but floors
+# to [] in one step for a single-item list: `conflict_response`'s
+# `conflicts`/`unchecked_attendees` and `incomplete_check_response`'s
+# `unchecked_attendees` could silently lose a genuine last item, becoming
+# indistinguishable from "none found" even though `truncated` is True.
+
+
+def test_conflict_response_marks_a_last_conflict_truncated_instead_of_emptying(
+    monkeypatch,
+):
+    """Regression test: with a single real conflict too large to fit
+    alongside the fixed envelope, halving it (`values[: len(values) // 2]`)
+    used to collapse it straight to `[]` in one step -- indistinguishable
+    from "no conflicts found" even though `truncated` is True. It should
+    become a one-item truncation marker instead, as long as there's budget
+    left over once nothing else can be shrunk further (see
+    `_halve_largest_list_fields_until_bounded`)."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "700")
+    conflicts = [
+        {
+            "calendar": "organizer",
+            "summary": "Busy block " + "x" * 400,
+            "start": "2026-08-27T10:00:00+00:00",
+            "end": "2026-08-27T10:30:00+00:00",
+        }
+    ]
+
+    response_text = utils.conflict_response(
+        conflicts, [], "2026-08-27T10:00:00", "2026-08-27T10:30:00"
+    )
+    response = json.loads(response_text)
+
+    assert len(response_text) <= 700
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert response["conflicts"] == [{"truncated": True}]
+
+
+def test_conflict_response_marks_the_last_unchecked_attendee_truncated_instead_of_emptying(
+    monkeypatch,
+):
+    """Same sharp edge as above, for `unchecked_attendees`. Uses a small,
+    realistic `conflicts` list (every real caller only reaches
+    `conflict_response` with at least one conflict already confirmed -
+    see `calendar.py`/`outlook.py`'s `if conflicts:` guards) that fits
+    untouched, isolating the marker behavior to `unchecked_attendees`
+    alone. The marker for a `list[str]` field is a sentinel string rather
+    than the dict marker used for `conflicts`' event objects, since the
+    field must stay a well-formed list of its own element type."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "600")
+    conflicts = [
+        {
+            "calendar": "organizer",
+            "summary": "1:1 with Hazel",
+            "start": "2026-08-27T10:00:00+00:00",
+            "end": "2026-08-27T10:30:00+00:00",
+        }
+    ]
+    unchecked_attendees = ["person" + "y" * 300 + "@example.com"]
+
+    response_text = utils.conflict_response(
+        conflicts, unchecked_attendees, "2026-08-27T10:00:00", "2026-08-27T10:30:00"
+    )
+    response = json.loads(response_text)
+
+    assert len(response_text) <= 600
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert response["conflicts"] == conflicts
+    assert response["unchecked_attendees"] == ["<truncated>"]
+
+
+def test_conflict_response_marks_one_field_while_the_other_keeps_shrinking(
+    monkeypatch,
+):
+    """Regression test: with both `conflicts` and `unchecked_attendees`
+    populated, `conflicts` (one oversized event) reaches its one-item
+    floor and gets marked well before `unchecked_attendees` (200 small
+    entries) is done shrinking - the marker for the first field must not
+    stop the second from continuing to shrink toward the budget on later
+    loop iterations."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "900")
+    conflicts = [
+        {
+            "calendar": "organizer",
+            "summary": "Busy block " + "x" * 300,
+            "start": "2026-08-27T10:00:00+00:00",
+            "end": "2026-08-27T10:30:00+00:00",
+        }
+    ]
+    unchecked_attendees = [f"person{i}@example.com" for i in range(100)]
+
+    response_text = utils.conflict_response(
+        conflicts, unchecked_attendees, "2026-08-27T10:00:00", "2026-08-27T10:30:00"
+    )
+    response = json.loads(response_text)
+
+    assert len(response_text) <= 900
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert response["conflicts"] == [{"truncated": True}]
+    assert 0 < len(response["unchecked_attendees"]) < len(unchecked_attendees)
+    assert (
+        response["unchecked_attendees"]
+        == unchecked_attendees[: len(response["unchecked_attendees"])]
+    )
+
+
+def test_conflict_response_upgrades_only_the_first_floored_field_when_budget_is_tight(
+    monkeypatch,
+):
+    """Regression test: once both `conflicts` and `unchecked_attendees`
+    have floored to [], the marker-upgrade pass spends whatever budget is
+    left over one field at a time, in the order they floored. `conflicts`
+    floors first here (its single event is larger than the single
+    unchecked attendee), so its marker is installed; there's no budget
+    left for `unchecked_attendees`'s own marker, which must stay []
+    rather than push the response over the limit."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "475")
+    conflicts = [
+        {
+            "calendar": "organizer",
+            "summary": "Busy block " + "x" * 300,
+            "start": "2026-08-27T10:00:00+00:00",
+            "end": "2026-08-27T10:30:00+00:00",
+        }
+    ]
+    unchecked_attendees = ["person" + "y" * 250 + "@example.com"]
+
+    response_text = utils.conflict_response(
+        conflicts, unchecked_attendees, "2026-08-27T10:00:00", "2026-08-27T10:30:00"
+    )
+    response = json.loads(response_text)
+
+    assert len(response_text) <= 475
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert response["conflicts"] == [{"truncated": True}]
+    assert response["unchecked_attendees"] == []
+
+
+def test_conflict_response_still_empties_a_last_conflict_when_no_budget_for_the_marker(
+    monkeypatch,
+):
+    """Regression test: the marker upgrade only happens if it actually
+    fits (checked against the real rebuilt response, not just estimated) --
+    a limit too tight for the marker must still fall back to `[]` rather
+    than exceed `max_output_length`. The limit is chosen so the *floored*
+    envelope (conflicts=[], original message/hint intact) already fits on
+    its own - proving this is the marker-upgrade pass declining to install
+    a marker that doesn't fit, not `conflict_response`'s separate, much
+    more aggressive compact-JSON fallback for a limit too tight for the
+    fixed envelope itself (see
+    test_conflict_response_uses_valid_compact_json_below_fixed_envelope)."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "460")
+    conflicts = [
+        {
+            "calendar": "organizer",
+            "summary": "Busy block " + "x" * 400,
+            "start": "2026-08-27T10:00:00+00:00",
+            "end": "2026-08-27T10:30:00+00:00",
+        }
+    ]
+
+    response_text = utils.conflict_response(
+        conflicts, [], "2026-08-27T10:00:00", "2026-08-27T10:30:00"
+    )
+    response = json.loads(response_text)
+
+    assert len(response_text) <= 460
+    assert response["status"] == "conflict"
+    assert response["truncated"] is True
+    assert response["conflicts"] == []
+    assert response["message"] == (
+        "1 existing event(s) overlap 2026-08-27T10:00:00 - 2026-08-27T10:30:00"
+    )
+
+
+def test_incomplete_check_response_uncapped_when_it_fits(monkeypatch):
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "50000")
+    response = json.loads(
+        utils.incomplete_check_response(
+            ["unreachable@example.com"],
+            "2026-08-27T10:00:00",
+            "2026-08-27T10:30:00",
+        )
+    )
+    assert response["status"] == "conflict_check_incomplete"
+    assert response["unchecked_attendees"] == ["unreachable@example.com"]
+    assert response["truncated"] is False
+
+
+def test_incomplete_check_response_marks_the_last_unchecked_attendee_truncated_instead_of_emptying(
+    monkeypatch,
+):
+    """Same sharp edge as `conflict_response`'s, for
+    `incomplete_check_response`'s own (sole) `unchecked_attendees`
+    field -- the last unchecked calendar must not silently vanish to `[]`
+    under a tight limit."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "500")
+    unchecked_attendees = ["person" + "x" * 300 + "@example.com"]
+
+    response_text = utils.incomplete_check_response(
+        unchecked_attendees, "2026-08-27T10:00:00", "2026-08-27T10:30:00"
+    )
+    response = json.loads(response_text)
+
+    assert len(response_text) <= 500
+    assert response["status"] == "conflict_check_incomplete"
+    assert response["truncated"] is True
+    assert response["unchecked_attendees"] == ["<truncated>"]
+
+
+def test_incomplete_check_response_still_empties_when_no_budget_for_the_marker(
+    monkeypatch,
+):
+    """Same distinction as `conflict_response`'s: at this limit the
+    floored envelope (unchecked_attendees=[], original message intact)
+    already fits, so a response reaching that state proves the
+    marker-upgrade pass itself declined a marker that didn't fit - not
+    the separate, much more aggressive compact-JSON fallback for a limit
+    too tight for the fixed envelope itself."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "455")
+    unchecked_attendees = ["person" + "x" * 300 + "@example.com"]
+
+    response_text = utils.incomplete_check_response(
+        unchecked_attendees, "2026-08-27T10:00:00", "2026-08-27T10:30:00"
+    )
+    response = json.loads(response_text)
+
+    assert len(response_text) <= 455
+    assert response["status"] == "conflict_check_incomplete"
+    assert response["truncated"] is True
+    assert response["unchecked_attendees"] == []
+    assert response["message"] == (
+        "Availability could not be checked for 1 calendar(s) for "
+        "2026-08-27T10:00:00 - 2026-08-27T10:30:00. No event was written."
+    )

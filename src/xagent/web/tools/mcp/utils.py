@@ -573,10 +573,37 @@ def normalize_addresses(addresses: list[str] | str) -> list[str]:
 def _halve_largest_list_fields_until_bounded(
     payload: dict[str, Any], field_names: tuple[str, ...], max_output_length: int
 ) -> str:
-    """Serialize ``payload``, halving its largest named list until bounded."""
+    """Serialize ``payload``, halving its largest named list until bounded.
+
+    Halving a list's element count works at any length above one, but
+    floor(1 / 2) is 0: unconditionally halving a single-item list the same
+    way would collapse a genuine last item (a real conflict, the one
+    remaining unchecked calendar) to ``[]`` in a single step, indistinguishable
+    from "none found" even though ``truncated`` is true. A field halved down
+    to its last item is floored to ``[]`` first instead -- never worse than
+    that old unconditional-halving behavior -- while other named fields
+    still have room to shrink. Only once nothing more can be squeezed out
+    of any field does a second pass spend whatever budget is left over
+    upgrading floored fields back to a one-item truncation marker (a dict
+    marker for a list of dicts like ``conflicts``, a sentinel string for a
+    list of strings like ``unchecked_attendees``, keeping the field a
+    well-formed list of its own element type), in the order they floored,
+    checked against the actual rebuilt response each time -- so installing
+    a marker can never cost a still-shrinking sibling field the bytes it
+    needed.
+    """
     response = json.dumps(payload, ensure_ascii=False)
+    # Fields floored to [] (their last item dropped), in the order it
+    # happened, together with the marker that would replace that item --
+    # captured now since the item itself is gone once the field is [].
+    floored_fields: list[str] = []
+    floor_markers: dict[str, Any] = {}
     while len(response) > max_output_length:
-        populated_fields = [name for name in field_names if payload.get(name)]
+        populated_fields = [
+            name
+            for name in field_names
+            if name not in floored_fields and payload.get(name)
+        ]
         if not populated_fields:
             break
         field_name = max(
@@ -584,9 +611,25 @@ def _halve_largest_list_fields_until_bounded(
             key=lambda name: len(json.dumps(payload[name], ensure_ascii=False)),
         )
         values = payload[field_name]
-        payload[field_name] = values[: len(values) // 2]
+        if len(values) > 1:
+            payload[field_name] = values[: len(values) // 2]
+        else:
+            sample = values[0]
+            floor_markers[field_name] = (
+                {"truncated": True} if isinstance(sample, dict) else "<truncated>"
+            )
+            payload[field_name] = []
+            floored_fields.append(field_name)
         payload["truncated"] = True
         response = json.dumps(payload, ensure_ascii=False)
+
+    for field_name in floored_fields:
+        payload[field_name] = [floor_markers[field_name]]
+        upgraded_response = json.dumps(payload, ensure_ascii=False)
+        if len(upgraded_response) <= max_output_length:
+            response = upgraded_response
+        else:
+            payload[field_name] = []
     return response
 
 
@@ -627,10 +670,15 @@ def conflict_response(
     single real conflict isn't fully dropped just to make room for a
     still-oversized `unchecked_attendees` list (unconditionally halving
     `conflicts` first would zero out a 1-item list in a single step,
-    regardless of whether that was actually necessary). If the fixed
-    envelope itself is too large, the response falls back to a compact,
-    valid JSON object instead of relying on the framework to truncate the
-    serialized JSON at an arbitrary character boundary.
+    regardless of whether that was actually necessary). A field halved
+    down to its last item is replaced with a one-item truncation marker
+    rather than emptied to `[]`, budget permitting (see
+    `_halve_largest_list_fields_until_bounded`), so a caller can tell "the
+    last conflict/unchecked calendar was truncated away" apart from "none
+    found". If the fixed envelope itself is too large, the response falls
+    back to a compact, valid JSON object instead of relying on the
+    framework to truncate the serialized JSON at an arbitrary character
+    boundary.
     """
     payload: dict[str, Any] = {
         "status": "conflict",

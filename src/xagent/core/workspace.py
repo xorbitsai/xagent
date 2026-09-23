@@ -346,6 +346,57 @@ class TaskWorkspace:
             self.resolve_path(file_path, default_dir), file_path
         )
 
+    def stage_file_for_external_upload(self, file_id: str) -> Path:
+        """Materialize a durable file into this task's upload-safe temp area.
+
+        Connectors intentionally accept only paths under the current task
+        workspace.  A durable ``FileRef`` may resolve to the shared
+        materialization cache instead, so copy it into the workspace before
+        handing it to an external upload connector.  The staging directory is
+        internal scratch and is removed with the task workspace; it is never
+        registered as a user-visible file.
+        """
+
+        source = self.resolve_file_id_detached(file_id)
+        if source is None:
+            raise FileNotFoundError(f"File not found: {file_id}")
+        source = Path(source).resolve(strict=True)
+        if not source.is_file():
+            raise FileNotFoundError(f"File not found: {file_id}")
+
+        staging_root = (self.internal_temp_dir / "mcp-upload").resolve()
+        staging_dir = staging_root / uuid4().hex
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        target = staging_dir / source.name
+        try:
+            shutil.copy2(source, target)
+            os.chmod(target, 0o600)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        return target
+
+    def discard_staged_external_upload(self, file_path: str | Path) -> None:
+        """Remove a file previously returned by staging.
+
+        Cleanup is deliberately confined to the per-task internal staging
+        root, so a connector cannot cause arbitrary workspace deletion.
+        """
+
+        candidate = Path(file_path).resolve()
+        staging_root = (self.internal_temp_dir / "mcp-upload").resolve()
+        if not candidate.is_relative_to(staging_root) or candidate == staging_root:
+            raise ValueError("staged upload path is outside the task staging area")
+        try:
+            candidate.unlink(missing_ok=True)
+        finally:
+            parent = candidate.parent
+            while parent != staging_root and parent.is_relative_to(staging_root):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
     def register_internal_file(
         self,
         file_path: str,

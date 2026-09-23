@@ -1039,6 +1039,7 @@ class ToolFactory:
     async def _create_mcp_tools_from_configs(
         mcp_configs: list[dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
+        workspace: Any | None = None,
         actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
         actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
     ) -> list[Tool]:
@@ -1206,9 +1207,12 @@ class ToolFactory:
 
                     # Load MCP tools
                     if connections:
+                        load_kwargs: dict[str, Any] = {"sandbox": sandbox}
+                        if workspace is not None:
+                            load_kwargs["workspace"] = workspace
                         load_result = await load_mcp_tools_as_agent_tools(
                             connections,
-                            sandbox=sandbox,
+                            **load_kwargs,
                         )  # type: ignore[arg-type]
                         normal_tools.extend(load_result.tools)
                         unavailable_tools.extend(

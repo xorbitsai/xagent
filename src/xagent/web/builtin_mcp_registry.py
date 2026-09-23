@@ -1660,6 +1660,51 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "freshdesk",
+            "name": "Freshdesk",
+            "description": "Connect your Freshdesk helpdesk (with your tenant subdomain and a per-user API key from Profile settings -> Your API Key) to look up, create and update tickets, read and post conversations, and search contacts and agents.",
+            "icon": "https://www.google.com/s2/favicons?domain=freshdesk.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Support",
+            "oauth_scopes": None,
+            # Hidden until manually verified against a live account, same as
+            # the zendesk and intercom rows above: nothing here has been run
+            # against a real tenant, and this connector can reply to tickets,
+            # which emails the requester. is_visible_in_connector is not
+            # builtin-protected, so flipping it needs no redeploy -- and a
+            # follow-up migration flips it once verification lands
+            # (xorbitsai/xagent-saas#1409).
+            "is_visible_in_connector": False,
+            # Key-based (non-oauth), like chartmogul/posthog/stripe: Freshdesk
+            # has no OAuth flow for its REST API, only a per-user API key from
+            # Profile settings -> Your API Key, sent as the HTTP Basic Auth
+            # username with an ignored password.
+            #
+            # Two required_env, not one: Freshdesk is multi-tenant by hostname
+            # (<subdomain>.freshdesk.com, with no custom-domain support for
+            # programmatic access), so the subdomain identifies the account and
+            # the key authenticates within it. Both are per-user values and ride
+            # the existing encrypted per-user env path. The subdomain IS
+            # user-supplied, so the connector validates it as a bare DNS label
+            # and then resolves the host it composes and rejects a private
+            # address -- a legitimate name can still be rebound by DNS at
+            # request time, which the label check alone does not cover. Same
+            # posture as the zendesk row above.
+            #
+            # This deliberately goes through Freshdesk's REST API rather than
+            # their own remote MCP endpoint: that endpoint is metered separately
+            # and sparsely (100 actions per account per month on Growth, against
+            # 100 REST calls per minute), and a remote row carrying a static
+            # per-tenant header has no per-user shape in this catalog. See
+            # xorbitsai/xagent-saas#1409.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.freshdesk"],
+                "required_env": ["FRESHDESK_SUBDOMAIN", "FRESHDESK_API_KEY"],
+            },
+        },
+        {
             "app_id": "chartmogul",
             "name": "ChartMogul",
             "description": "Connect your ChartMogul account (with a per-user API key from Profile -> API keys) to look up and manage customers, contacts, and sales opportunities.",

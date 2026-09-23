@@ -291,6 +291,32 @@ def test_operation_base_exception_records_error_outcome() -> None:
     assert outcome.warnings == ("_OperationCancelled: cancelled",)
 
 
+def test_operation_exception_after_successful_compensation_clears_flag() -> None:
+    facade = KBOperationCompatibilityFacade()
+
+    with pytest.raises(RuntimeError):
+        with facade.start_operation(
+            operation_type="document_ingestion",
+            collection="demo",
+        ) as operation:
+            operation.record_side_effect(
+                name="remove_document",
+                plane=SideEffectPlane.DOCUMENT,
+                payload={"doc_id": "doc-1"},
+                idempotency_key="document:doc-1",
+                compensation=lambda: None,
+            )
+            assert operation.execute_compensations() == ()
+            raise RuntimeError("boom")
+
+    outcome = facade.last_outcome
+    assert outcome is not None
+    assert outcome.status == "error"
+    assert outcome.rollback_status is RollbackStatus.COMPLETE
+    assert outcome.side_effects_may_remain is False
+    assert outcome.warnings == ("RuntimeError: boom",)
+
+
 def test_operation_exception_warning_includes_exception_type() -> None:
     facade = KBOperationCompatibilityFacade()
 
@@ -406,10 +432,7 @@ def test_engine_recording_helpers_are_none_safe() -> None:
     )
 
 
-def test_finish_ingestion_outcome_preserves_recorded_side_effect_semantics() -> None:
-    """#515 risk 6.3 pin: with the default flag, recorded-but-COMPENSATED side
-    effects still report side_effects_may_remain=True on failure (the
-    historical has_side_effects() facade semantics, not the engine default)."""
+def test_finish_ingestion_outcome_clears_flag_after_successful_compensation() -> None:
     operation = _engine_test_operation()
     operation.record_side_effect(
         name="remove_registered_document",
@@ -428,8 +451,8 @@ def test_finish_ingestion_outcome_preserves_recorded_side_effect_semantics() -> 
     outcome = finish_ingestion_outcome(operation, status="error", message="failed")
 
     assert outcome is not None
-    assert outcome.side_effects_may_remain is True
-    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
+    assert outcome.side_effects_may_remain is False
+    assert outcome.rollback_status is RollbackStatus.COMPLETE
 
 
 def test_finish_ingestion_outcome_success_clears_flag() -> None:

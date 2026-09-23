@@ -223,6 +223,18 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
             loading = SimpleNamespace(
                 message_id=77, edit_text=AsyncMock(), delete=AsyncMock()
             )
+            # Recovery reconstructs aiogram messages from the durable destination;
+            # mock Telegram network methods on both original and recovered messages.
+            from aiogram import types
+
+            monkeypatch.setattr(
+                types.Message, "answer", AsyncMock(return_value=loading)
+            )
+            monkeypatch.setattr(types.Message, "edit_text", loading.edit_text)
+            monkeypatch.setattr(types.Message, "delete", loading.delete)
+            monkeypatch.setattr(
+                types.Message, "answer_document", AsyncMock(side_effect=answer_document)
+            )
             message = SimpleNamespace(
                 message_id=1,
                 message_thread_id=None,
@@ -234,6 +246,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                 caption=None,
                 document=SimpleNamespace(
                     file_id="platform-file",
+                    file_unique_id="stable-platform-file",
                     file_name="source.txt",
                     mime_type="text/plain",
                     file_size=20,
@@ -320,6 +333,7 @@ async def test_channel_callback_runs_remotely_and_returns_answer(
                     bot._process_messages_batch("sender", [message]), 30
                 )
             else:
+                message.message_id = 2
                 message.text = followup_text
                 await asyncio.wait_for(
                     bot._process_user_messages_batch(123, [message]), 30

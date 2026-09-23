@@ -145,6 +145,19 @@ class RollbackFailedIngestionRequest:
 
 
 @dataclass(frozen=True)
+class RollbackFailedUploadIngestionRequest:
+    """Callbacks for ``KBCoordinator.rollback_failed_upload_ingestion`` (#795).
+
+    Local passes ``collection_compensation`` alone or the document/file pair;
+    cloud passes all three and decides inside its collection callback.
+    """
+
+    document_compensation: Optional[Callable[[], Any]] = None
+    file_compensation: Optional[Callable[[], Any]] = None
+    collection_compensation: Optional[Callable[[], Any]] = None
+
+
+@dataclass(frozen=True)
 class RollbackFailedIngestionResult:
     """Outcome of coordinator-owned failed-ingest rollback orchestration."""
 
@@ -155,6 +168,7 @@ class RollbackFailedIngestionResult:
     first_error: Optional[str] = None
     boundary_errors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    error: Optional[Exception] = None  # upload entry: the failing callback's exception
 
 
 @dataclass(frozen=True)

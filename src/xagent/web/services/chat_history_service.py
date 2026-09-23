@@ -36,6 +36,7 @@ from .ops_signals import (
     clear_degradation,
     register_degradation,
 )
+from .task_retention import touch_task_last_activity
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,7 @@ def claim_user_message_delivery(
         attachments=attachments,
     )
     db.add(message)
+    touch_task_last_activity(db, task_id)
     try:
         db.commit()
         db.refresh(message)
@@ -257,6 +259,12 @@ def claim_user_message_delivery_no_commit(
         delivery_status=DELIVERY_PENDING,
         attachments=attachments,
     )
+    # Before the insert, not after it: this is the one staging path that
+    # flushes, and touching afterwards would make it the only site to take
+    # the task row *after* writing task_chat_messages. Every other writer in
+    # the codebase takes the task row first, so the reversed order here would
+    # be a lock cycle waiting for two turns on one task to interleave.
+    touch_task_last_activity(db, task_id)
     db.add(message)
     db.flush()
     return UserMessageDeliveryClaim(
@@ -647,6 +655,7 @@ def persist_user_message_no_commit(
         attachments=attachments,
     )
     db.add(message)
+    touch_task_last_activity(db, task_id)
     return message
 
 
@@ -728,6 +737,7 @@ def persist_assistant_message_no_commit(
         attachments=None,
     )
     db.add(message)
+    touch_task_last_activity(db, task_id)
     return message
 
 
@@ -1066,6 +1076,7 @@ def _persist_message(
         attachments=attachments,
     )
     db.add(message)
+    touch_task_last_activity(db, task_id)
     db.commit()
     db.refresh(message)
     return message

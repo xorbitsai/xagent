@@ -9,12 +9,13 @@ independent implementations (``TaskWorkspace`` and ``WorkspaceFileOperations``,
 which do not delegate to one another).
 """
 
+import os
 from pathlib import Path
 
 import pytest
 
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
-from xagent.core.workspace import TaskWorkspace
+from xagent.core.workspace import SPILL_DIR_NAME, TaskWorkspace
 
 # Relative inputs that resolve outside the workspace and must be rejected.
 # ``plain`` climbs out directly; ``prefixed`` starts under a legit "output/"
@@ -430,3 +431,262 @@ def test_ops_resolve_path_ignores_allowed_external_dirs(tmp_path):
     ops = WorkspaceFileOperations(workspace)
     with pytest.raises(ValueError):
         ops._resolve_path(str(target), "output")
+
+
+# --------------------------------------------------------------------------
+# SITE 3 — the engine-owned output subtree is refused by every write path
+# --------------------------------------------------------------------------
+
+ENGINE_SPELLINGS = [
+    pytest.param(f"{SPILL_DIR_NAME}/x.json", id="no-output-prefix"),
+    pytest.param(f"output/{SPILL_DIR_NAME}/x.json", id="output-prefix"),
+    pytest.param(f"./output/{SPILL_DIR_NAME}/x.json", id="dot-slash"),
+    pytest.param(f"output/sub/../{SPILL_DIR_NAME}/x.json", id="dotdot"),
+    pytest.param(f"output/{SPILL_DIR_NAME}/sub/x.json", id="nested"),
+    pytest.param(f"output/{SPILL_DIR_NAME}", id="directory-itself"),
+]
+
+
+@pytest.fixture
+def engine_file(workspace):
+    spill_dir = workspace.output_dir / SPILL_DIR_NAME
+    spill_dir.mkdir(parents=True)
+    target = spill_dir / "x.json"
+    target.write_text('["engine"]', encoding="utf-8")
+    return target
+
+
+@pytest.mark.parametrize("spelling", ENGINE_SPELLINGS)
+def test_write_file_refuses_the_engine_subtree(ops, workspace, spelling):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.write_file(spelling, "planted")
+    # Nothing was created, not even the directory.
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+@pytest.mark.parametrize("spelling", ENGINE_SPELLINGS)
+def test_create_directory_refuses_the_engine_subtree(ops, workspace, spelling):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.create_directory(spelling)
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_write_json_file_refuses_the_engine_subtree(ops, workspace):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.write_json_file(f"output/{SPILL_DIR_NAME}/x.json", {"planted": True})
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_write_csv_file_refuses_the_engine_subtree(ops, workspace):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.write_csv_file(f"output/{SPILL_DIR_NAME}/x.csv", [{"a": "1"}])
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_delete_file_refuses_an_existing_engine_file(ops, engine_file):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.delete_file(f"output/{SPILL_DIR_NAME}/x.json")
+    assert engine_file.exists()
+
+
+def test_append_file_refuses_an_existing_engine_file(ops, engine_file):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.append_file(f"{SPILL_DIR_NAME}/x.json", "planted")
+    assert engine_file.read_text(encoding="utf-8") == '["engine"]'
+
+
+def test_edit_file_refuses_an_existing_engine_file(ops, engine_file):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.edit_file(
+            f"{SPILL_DIR_NAME}/x.json",
+            [{"operation_type": "replace", "line_number": 1, "content": "planted"}],
+        )
+    assert engine_file.read_text(encoding="utf-8") == '["engine"]'
+
+
+def test_find_and_replace_refuses_an_existing_engine_file(ops, engine_file):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.find_and_replace(f"{SPILL_DIR_NAME}/x.json", "engine", "planted")
+    assert engine_file.read_text(encoding="utf-8") == '["engine"]'
+
+
+@pytest.fixture
+def html_source(workspace):
+    """A real source file: prepare_html_asset resolves its source first."""
+    source = workspace.input_dir / "logo.png"
+    source.write_bytes(b"png")
+    return source
+
+
+def test_prepare_html_asset_refuses_the_engine_subtree_as_html_target(
+    ops, workspace, html_source
+):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.prepare_html_asset("logo.png", f"{SPILL_DIR_NAME}/index.html")
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_prepare_html_asset_refuses_the_engine_subtree_as_assets_dir(
+    ops, workspace, html_source
+):
+    with pytest.raises(ValueError, match="engine-owned"):
+        ops.prepare_html_asset("logo.png", "index.html", assets_subdir=SPILL_DIR_NAME)
+    assert not (workspace.output_dir / SPILL_DIR_NAME).exists()
+
+
+def test_prepare_html_asset_names_the_resolved_asset_directory_it_refuses(
+    ops, html_source
+):
+    """The asset directory is the HTML path's parent joined with
+    assets_subdir, so the refusal names that directory as resolved, in its
+    workspace-relative form, rather than the assets_subdir argument alone."""
+    with pytest.raises(ValueError, match=f"Path 'output/{SPILL_DIR_NAME}' is"):
+        ops.prepare_html_asset("logo.png", "index.html", assets_subdir=SPILL_DIR_NAME)
+
+
+def test_prepare_html_asset_names_the_real_target_when_the_html_parent_is_swapped(
+    ops, workspace, html_source, monkeypatch
+):
+    """When the HTML path's parent becomes a symlink into the engine
+    directory after the HTML path was resolved, the refusal is reached
+    through that side, and only the resolved form names the real target."""
+    reserved = workspace.output_dir / SPILL_DIR_NAME
+    reserved.mkdir()
+    resolve_html_output_path = ops._resolve_html_output_path
+
+    def resolve_then_swap_the_parent(html_path: str) -> Path:
+        resolved = resolve_html_output_path(html_path)
+        os.symlink(reserved, workspace.output_dir / "report")
+        return resolved
+
+    monkeypatch.setattr(ops, "_resolve_html_output_path", resolve_then_swap_the_parent)
+    with pytest.raises(
+        ValueError, match=f"Path 'output/{SPILL_DIR_NAME}/assets' is"
+    ) as refused:
+        ops.prepare_html_asset("logo.png", "report/index.html", assets_subdir="assets")
+    assert "'assets' is" not in str(refused.value)
+    assert not (reserved / "assets").exists()
+
+
+def test_reads_are_unaffected(ops, engine_file):
+    assert ops.read_file(f"{SPILL_DIR_NAME}/x.json") == '["engine"]'
+    assert ops.read_file(f"output/{SPILL_DIR_NAME}/x.json") == '["engine"]'
+    assert ops.file_exists(f"{SPILL_DIR_NAME}/x.json") is True
+
+
+def test_a_near_miss_directory_is_still_writable(ops, workspace):
+    result = ops.write_file(f"{SPILL_DIR_NAME}-mine/x.json", "mine")
+    assert result["success"] is True
+    assert (workspace.output_dir / f"{SPILL_DIR_NAME}-mine" / "x.json").exists()
+
+
+EXISTING_FILE_WRITES = [
+    pytest.param(lambda ops, p: ops.append_file(p, "planted"), id="append_file"),
+    pytest.param(
+        lambda ops, p: ops.edit_file(
+            p, [{"operation_type": "replace", "line_number": 1, "content": "planted"}]
+        ),
+        id="edit_file",
+    ),
+    pytest.param(
+        lambda ops, p: ops.find_and_replace(p, "engine", "planted"),
+        id="find_and_replace",
+    ),
+    pytest.param(lambda ops, p: ops.delete_file(p), id="delete_file"),
+]
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+@pytest.mark.parametrize("directory_exists", [True, False], ids=["dir", "no-dir"])
+def test_a_missing_engine_file_is_refused_before_it_is_reported_missing(
+    ops, workspace, write, directory_exists
+):
+    """The refusal does not depend on existence, so it says the same thing
+    as write_file about the same target and never reports not-found for a
+    name inside the engine's subtree."""
+    if directory_exists:
+        (workspace.output_dir / SPILL_DIR_NAME).mkdir(parents=True)
+    with pytest.raises(ValueError, match="engine-owned"):
+        write(ops, f"{SPILL_DIR_NAME}/nope.json")
+    assert not (workspace.output_dir / SPILL_DIR_NAME / "nope.json").exists()
+    assert (workspace.output_dir / SPILL_DIR_NAME).exists() is directory_exists
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+def test_a_missing_ordinary_file_still_reports_not_found(ops, workspace, write):
+    """Outside the engine's subtree the search resolver's answer is unchanged."""
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(FileNotFoundError):
+        write(ops, f"{SPILL_DIR_NAME}-mine/nope.json")
+    assert not (workspace.output_dir / f"{SPILL_DIR_NAME}-mine").exists()
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+def test_a_symlink_loop_target_still_reports_not_found(ops, workspace, write):
+    """A name the search resolver reports missing but that cannot be resolved
+    as a write target either keeps the not-found answer. On interpreters
+    where ``Path.resolve`` raises RuntimeError on a loop, that error is the
+    write resolver's, and it must not replace the search resolver's."""
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    loop = workspace.output_dir / "loopy"
+    try:
+        os.symlink(loop, loop)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not available on this platform/user")
+    with pytest.raises(FileNotFoundError):
+        write(ops, "output/loopy")
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+@pytest.mark.parametrize(
+    ("target", "written_path"),
+    [
+        pytest.param(
+            f"{SPILL_DIR_NAME}/nope.json",
+            f"{SPILL_DIR_NAME}/nope.json",
+            id="engine-owned",
+        ),
+        pytest.param("output/nope.txt", "nope.txt", id="ordinary"),
+    ],
+)
+def test_a_policy_refusal_still_reports_not_found(
+    ops, workspace, monkeypatch, write, target, written_path
+):
+    """A name the search resolver reports missing but that the write
+    resolver cannot even check -- because its own authority check
+    (``requires_exact_file_operation_scope``) refuses first -- keeps the
+    not-found answer too, whether or not the name would otherwise fall
+    inside the engine's subtree. This pins the ``_resolve_existing_write_path``
+    docstring's "or policy refusal" clause: without it, deleting ``ValueError``
+    from the inner ``except (ValueError, OSError, RuntimeError)`` left every
+    other test in this module green."""
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def deny() -> bool:
+        raise ValueError("policy backend down")
+
+    monkeypatch.setattr(workspace, "requires_exact_file_operation_scope", deny)
+
+    with pytest.raises(FileNotFoundError):
+        write(ops, target)
+    assert not (workspace.output_dir / written_path).exists()
+
+
+@pytest.mark.parametrize("write", EXISTING_FILE_WRITES)
+def test_a_containment_refusal_still_reports_not_found(tmp_path, write):
+    """A relative target that climbs into a directory the search resolver
+    honors via ``allowed_external_dirs`` -- but that ``_resolve_path`` does
+    not, per ``test_ops_resolve_path_ignores_allowed_external_dirs`` above --
+    still keeps the search resolver's not-found answer instead of the write
+    resolver's containment ValueError, when the name does not exist there."""
+    external = tmp_path / "external"
+    external.mkdir(parents=True, exist_ok=True)
+    workspace = TaskWorkspace(
+        "task7", str(tmp_path), allowed_external_dirs=[str(external)]
+    )
+    workspace.output_dir.mkdir(parents=True, exist_ok=True)
+    ops = WorkspaceFileOperations(workspace)
+
+    with pytest.raises(FileNotFoundError):
+        write(ops, "../../external/nope.txt")
+    assert not (external / "nope.txt").exists()

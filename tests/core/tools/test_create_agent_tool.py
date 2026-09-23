@@ -1,6 +1,7 @@
 """Tests for CreateAgentTool - dynamically creating agents during task execution."""
 
 import inspect
+import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,11 +20,13 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
     ListToolCategoriesTool,
     PublishedAgentToolRecord,
     UpdateAgentTool,
+    _assignable_tool_categories,
     _coerce_db_task_id,
     _DelegatedAgentTaskEventTraceHandler,
     build_published_agent_tools_from_records,
     gen_agent_tool_name,
     get_published_agents_tools,
+    resolve_llm_tool_categories,
 )
 from xagent.core.tools.adapters.vibe.agent_tool_names import parse_agent_tool_id
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -36,6 +39,8 @@ from xagent.web.models.model import Model
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services.agent_store import AgentStore
+from xagent.web.services.agent_team_scope import set_agent_team_hooks
 
 
 def _create_session() -> tuple[Session, str, Any]:
@@ -53,6 +58,37 @@ def _create_session() -> tuple[Session, str, Any]:
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return SessionLocal(), temp_db.name, SessionLocal
+
+
+@pytest.fixture
+def session_local(tmp_path: Path) -> Any:
+    engine = create_engine(f"sqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(bind=engine)
+    yield sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    engine.dispose()
+
+
+def _seed_agent(session_local: Any, tool_categories: Any, **fields: Any) -> tuple:
+    with session_local() as db:
+        user = User(username="tc_user", password_hash="x", is_admin=False)
+        db.add(user)
+        db.commit()
+        agent = Agent(
+            user_id=user.id,
+            name="tc_agent",
+            status=AgentStatus.DRAFT,
+            tool_categories=tool_categories,
+            **fields,
+        )
+        db.add(agent)
+        db.commit()
+        return user.id, agent.id
+
+
+def _stored(session_local: Any, agent_id: int) -> tuple:
+    with session_local() as db:
+        agent = db.get(Agent, agent_id)
+        return agent.name, agent.tool_categories
 
 
 @pytest.mark.asyncio
@@ -177,8 +213,7 @@ class TestCreateAgentTool:
 
     @pytest.mark.asyncio
     async def test_assignable_tool_categories_hide_unassignable(self) -> None:
-        """Neither ``other`` (internal fallback) nor ``agent`` (Workforce-only
-        delegation, issue #802) is advertised as assignable."""
+        """``other``, ``agent`` (#802) and connectors are never advertised."""
         categories = (await ListToolCategoriesTool().run_json_async({}))["categories"]
         create_description = CreateAgentTool(
             session_factory=None, user_id=1
@@ -202,11 +237,58 @@ class TestCreateAgentTool:
                 c.strip() for c in line.split("Available categories:")[1].split(",")
             ]
 
-        for hidden in ("other", "agent"):
+        for hidden in ("other", "agent", "mcp"):
             assert hidden not in categories
             assert hidden not in advertised(create_categories_line)
             assert hidden not in advertised(update_categories_line)
         assert "basic" in categories
+
+    def test_resolve_llm_tool_categories_trims_and_deduplicates(self) -> None:
+        assert resolve_llm_tool_categories([" file", "file", "basic "], "x") == [
+            "file",
+            "basic",
+        ]
+        assert resolve_llm_tool_categories([], "x") == []
+
+    @pytest.mark.parametrize(
+        ("requested", "expected"),
+        [
+            (
+                ["file", "email", "File", "MCP:x"],
+                "tool_categories ['email', 'File', 'MCP:x'] are not assignable. "
+                "Choose from: <choices>. Nothing was saved.",
+            ),
+            (
+                "",
+                "tool_categories [''] are not assignable. "
+                "Choose from: <choices>. Nothing was saved.",
+            ),
+            (
+                ["email", "mcp"],
+                "tool_categories ['email'] are not assignable. Choose from: "
+                "<choices>. ['mcp'] <connector error> Nothing was saved.",
+            ),
+            (
+                ["file", " mcp:github"],
+                "[' mcp:github'] <connector error> Nothing was saved.",
+            ),
+            ({"a": 1}, "must be a list"),
+            (True, "must be a list"),
+            (42, "must be a list"),
+            (False, "must be a list"),
+            (0, "must be a list"),
+        ],
+    )
+    def test_resolve_llm_tool_categories_refuses_the_whole_list(
+        self, requested: Any, expected: str
+    ) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            resolve_llm_tool_categories(requested, "<connector error>")
+        choices = ", ".join(_assignable_tool_categories())
+        message = str(excinfo.value)
+        if expected == "must be a list":
+            assert message.endswith(f"Choose from: {choices}.")
+        assert expected.replace("<choices>", choices) in message
 
     def test_coerce_db_task_id_accepts_only_db_task_formats(self) -> None:
         assert _coerce_db_task_id(12) == 12
@@ -1150,6 +1232,163 @@ class TestCreateAgentTool:
             except OSError:
                 pass
 
+    def test_agent_tool_skips_a_delegated_output_the_workspace_refuses_to_claim(
+        self,
+        tmp_path,
+    ) -> None:
+        """A delegated output resolves through the workspace's write-side entry.
+
+        Registering it would make it one of the parent task's own files, so a
+        path the workspace refuses for writing -- the engine-owned subtree --
+        is skipped like any other path that does not resolve, and nothing is
+        registered for it.
+        """
+        db, db_path, SessionLocal = _create_session()
+        try:
+            workspace = Mock()
+            workspace.resolve_write_path.side_effect = ValueError(
+                "Path 'output/tool-results/x.json' is inside the engine-owned "
+                "'tool-results' directory."
+            )
+
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                session_factory=SessionLocal,
+                user_id=1,
+                task_id="77",
+                parent_task_id="77",
+            )
+
+            file_outputs = tool._parent_owned_file_outputs(
+                [{"file_path": "output/tool-results/x.json", "filename": "x.json"}],
+                workspace,
+                db,
+            )
+
+            assert file_outputs == []
+            workspace.resolve_write_path.assert_called_once_with(
+                "output/tool-results/x.json", default_dir="workspace"
+            )
+            workspace.resolve_path.assert_not_called()
+            workspace.register_file.assert_not_called()
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_skips_a_delegated_output_behind_a_symlink_loop(
+        self,
+        tmp_path,
+    ) -> None:
+        """A delegated output whose path cannot be resolved is skipped, and a
+        symlink loop is one such path: on Python 3.11 and 3.12 the write
+        resolver raises RuntimeError for it, which is skipped like the
+        containment ValueError rather than failing the whole registration.
+        On 3.13, where resolve() returns the loop path unresolved, the output
+        does not exist as a file and is skipped by the existence check."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            workspace = TaskWorkspace("task_loop", str(tmp_path))
+            loop = workspace.output_dir / "loopy"
+            try:
+                os.symlink("loopy", loop)
+            except (OSError, NotImplementedError):
+                pytest.skip("symlinks not available on this platform/user")
+
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                session_factory=SessionLocal,
+                user_id=1,
+                task_id="77",
+                parent_task_id="77",
+            )
+
+            file_outputs = tool._parent_owned_file_outputs(
+                [{"file_path": "loopy/report.txt", "filename": "report.txt"}],
+                workspace,
+                db,
+            )
+
+            assert file_outputs == []
+        finally:
+            db.close()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_skips_a_delegated_output_with_a_too_long_path(
+        self,
+        tmp_path,
+    ) -> None:
+        """A delegated output whose filename is too long for the filesystem
+        raises OSError out of resolve(), not RuntimeError or ValueError; it
+        is skipped like any other path that does not resolve, and the rest
+        of the reported outputs still register normally rather than the
+        OSError failing the whole call."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(
+                username="too-long-path-user",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            parent_task = Task(id=77, user_id=user.id, title="Parent task")
+            db.add(parent_task)
+            db.commit()
+
+            with tempfile.TemporaryDirectory() as workspace_root:
+                workspace = TaskWorkspace(
+                    id="agent_1_toolong1",
+                    base_dir=workspace_root,
+                    db_task_id=77,
+                )
+                good_path = workspace.output_dir / "report.txt"
+                good_path.write_text("worker report", encoding="utf-8")
+
+                tool = AgentTool(
+                    agent_id=1,
+                    agent_name="File Worker",
+                    agent_description="Writes files",
+                    session_factory=SessionLocal,
+                    user_id=user.id,
+                    task_id="77",
+                    parent_task_id="77",
+                    workspace_base_dir=workspace_root,
+                )
+
+                too_long_name = "x" * 5000 + ".txt"
+                file_outputs = tool._parent_owned_file_outputs(
+                    [
+                        {"file_path": too_long_name, "filename": too_long_name},
+                        {"file_path": "report.txt", "filename": "report.txt"},
+                    ],
+                    workspace,
+                    db,
+                )
+
+                assert file_outputs is not None
+                assert len(file_outputs) == 1
+                assert file_outputs[0]["filename"] == "report.txt"
+        finally:
+            db.close()
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass
+
     def test_agent_tool_does_not_swallow_delegated_output_registration_errors(
         self,
         tmp_path,
@@ -1159,7 +1398,7 @@ class TestCreateAgentTool:
             output_path = tmp_path / "report.txt"
             output_path.write_text("worker report", encoding="utf-8")
             workspace = Mock()
-            workspace.resolve_path.return_value = output_path
+            workspace.resolve_write_path.return_value = output_path
             workspace.register_file.side_effect = RuntimeError("storage unavailable")
 
             tool = AgentTool(
@@ -1227,6 +1466,7 @@ class TestCreateAgentTool:
                 )
 
                 assert result["status"] == "success"
+                assert result["tool_categories"] == ["file", "knowledge"]
 
                 # Verify filters were saved (use a fresh session)
                 verify_db = SessionLocal()
@@ -1251,7 +1491,7 @@ class TestCreateAgentTool:
                 pass
 
     @pytest.mark.asyncio
-    async def test_create_agent_strips_agent_tool_category(self) -> None:
+    async def test_create_agent_refuses_agent_tool_category(self) -> None:
         """A builder-passed ``agent`` category never reaches the DB (#802)."""
         db, db_path, SessionLocal = _create_session()
         try:
@@ -1288,7 +1528,7 @@ class TestCreateAgentTool:
                     }
                 )
 
-                assert result["status"] == "success"
+                assert result["status"] == "error"
 
                 verify_db = SessionLocal()
                 try:
@@ -1297,8 +1537,7 @@ class TestCreateAgentTool:
                         .filter(Agent.name == "strip_agent")
                         .first()
                     )
-                    assert agent is not None
-                    assert agent.tool_categories == ["file"]
+                    assert agent is None
                 finally:
                     verify_db.close()
 
@@ -1309,6 +1548,38 @@ class TestCreateAgentTool:
                 os.remove(db_path)
             except OSError:
                 pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("requested", "expected"),
+        [
+            (["file", "email"], "['email'] are not assignable"),
+            (["file", "mcp:github"], "do not pass them"),
+            (["mcp"], "do not pass them"),
+            ({"a": 1}, "must be a list"),
+            ("", "are not assignable"),
+            (False, "must be a list"),
+        ],
+    )
+    async def test_create_agent_refuses_invalid_tool_categories(
+        self, session_local: Any, requested: Any, expected: str
+    ) -> None:
+        user_id, _ = _seed_agent(session_local, None)
+        result = await CreateAgentTool(
+            session_factory=session_local, user_id=user_id
+        ).run_json_async(
+            {
+                "name": "refused",
+                "description": "d",
+                "instructions": "i",
+                "tool_categories": requested,
+            }
+        )
+
+        assert result["status"] == "error"
+        assert expected in result["message"]
+        with session_local() as db:
+            assert db.query(Agent).filter(Agent.name == "refused").first() is None
 
     @pytest.mark.asyncio
     async def test_create_agent_omitted_tool_categories_persists_none(self) -> None:
@@ -1353,6 +1624,7 @@ class TestCreateAgentTool:
                 )
 
                 assert result["status"] == "success"
+                assert result["tool_categories"] is None
 
                 verify_db = SessionLocal()
                 try:
@@ -1417,6 +1689,7 @@ class TestCreateAgentTool:
                 )
 
                 assert result["status"] == "success"
+                assert result["tool_categories"] == []
 
                 verify_db = SessionLocal()
                 try:
@@ -1754,6 +2027,170 @@ class TestUpdateAgentTool:
                 pass
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "requested",
+        [
+            ["file", "email"],
+            ["file", "mcp:github"],
+            ["file", "mcp:slack"],
+            ["file", "mcp"],
+            {"a": 1},
+            "",
+            False,
+        ],
+    )
+    async def test_update_agent_refuses_invalid_tool_categories(
+        self, session_local: Any, requested: Any
+    ) -> None:
+        user_id, agent_id = _seed_agent(session_local, ["basic", "mcp:github"])
+        result = await UpdateAgentTool(
+            session_factory=session_local, user_id=user_id
+        ).run_json_async(
+            {"agent_id": agent_id, "name": "Renamed", "tool_categories": requested}
+        )
+
+        assert result["status"] == "error"
+        assert _stored(session_local, agent_id) == (
+            "tc_agent",
+            ["basic", "mcp:github"],
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stored", "requested", "column"),
+        [
+            (["basic", "mcp:github"], ["file"], ["file", "mcp:github"]),
+            (["basic", "mcp:github"], [], ["mcp:github"]),
+            (None, ["file"], ["file"]),
+            ('["basic", "mcp:github"]', ["file"], ["file", "mcp:github"]),
+            # Runtime rule, untrimmed: " mcp" is inert (dropped), "mcp: x" is live.
+            (
+                ["mcpfoo", " mcp", " mcp:x", "mcp: x", "mcp", "mcp"],
+                ["file"],
+                ["file", "mcp: x", "mcp"],
+            ),
+        ],
+    )
+    async def test_update_agent_replaces_only_non_connector_categories(
+        self, session_local: Any, stored: Any, requested: list[str], column: list[str]
+    ) -> None:
+        user_id, agent_id = _seed_agent(session_local, stored)
+        result = await UpdateAgentTool(
+            session_factory=session_local, user_id=user_id
+        ).run_json_async({"agent_id": agent_id, "tool_categories": requested})
+
+        assert result["status"] == "success"
+        assert _stored(session_local, agent_id)[1] == column
+        assert result["tool_categories"] == requested
+        assert "mcp" not in result["message"]
+        assert ("connectors were left unchanged" in result["message"]) is (
+            column != requested
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("args", "stored", "reported"),
+        [
+            ({"tool_categories": None}, ["file", "mcp:github"], ["file"]),
+            ({"name": "Renamed"}, [1, "file", "mcp:github"], ["1", "file"]),
+            ({"name": "Renamed"}, None, None),
+        ],
+    )
+    async def test_update_agent_without_categories_reports_non_connectors(
+        self, session_local: Any, args: dict, stored: Any, reported: Any
+    ) -> None:
+        user_id, agent_id = _seed_agent(session_local, stored)
+        result = await UpdateAgentTool(
+            session_factory=session_local, user_id=user_id
+        ).run_json_async({"agent_id": agent_id, **args})
+
+        assert result["status"] == "success"
+        assert result["tool_categories"] == reported
+        assert _stored(session_local, agent_id)[1] == stored
+
+    @pytest.mark.asyncio
+    async def test_update_agent_takes_connectors_from_the_row_after_awaits(
+        self, session_local: Any
+    ) -> None:
+        user_id, agent_id = _seed_agent(session_local, ["basic", "mcp:github"])
+        refresh = Session.refresh
+        locked_refreshes: list[Any] = []
+
+        def spy_refresh(
+            self: Session, instance: Any, *args: Any, **kwargs: Any
+        ) -> None:
+            locked_refreshes.append(kwargs.get("with_for_update"))
+            refresh(self, instance, *args, **kwargs)
+
+        async def builder_saves_meanwhile(*_args: Any, **_kwargs: Any) -> list[str]:
+            with session_local() as db:
+                AgentStore(db).update_agent_fields(
+                    user_id, agent_id, {"tool_categories": ["basic", "mcp:slack"]}
+                )
+            return []
+
+        with (
+            patch(
+                "xagent.core.tools.adapters.vibe.agent_tool.find_missing_knowledge_bases",
+                new=builder_saves_meanwhile,
+            ),
+            patch.object(Session, "refresh", spy_refresh),
+        ):
+            result = await UpdateAgentTool(
+                session_factory=session_local, user_id=user_id
+            ).run_json_async(
+                {
+                    "agent_id": agent_id,
+                    "tool_categories": ["file"],
+                    "knowledge_bases": ["kb"],
+                }
+            )
+
+        assert result["status"] == "success"
+        assert _stored(session_local, agent_id)[1] == ["file", "mcp:slack"]
+        assert True in locked_refreshes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stored", "unshared", "expected"),
+        [
+            (
+                ["basic", "mcp"],
+                [{"type": "mcp", "id": 3, "name": "gmail"}],
+                "are not shared with the team: gmail. Nothing was saved: it "
+                "grants every MCP server ('mcp')",
+            ),
+            (
+                ["basic", "mcp:ghost", "mcp:drive"],
+                [
+                    {"type": "mcp", "name": "ghost", "reason": "unresolved"},
+                    {"type": "mcp", "id": 4, "name": "drive"},
+                ],
+                "are not shared with the team: drive; not found: ghost. Nothing "
+                "was saved: the user must share or remove them",
+            ),
+        ],
+    )
+    async def test_update_agent_names_connectors_unshared_with_the_team(
+        self, session_local: Any, stored: list[str], unshared: list, expected: str
+    ) -> None:
+        user_id, agent_id = _seed_agent(session_local, stored, team_id=7)
+        set_agent_team_hooks(connector_validator=lambda *_: unshared)
+        try:
+            result = await UpdateAgentTool(
+                session_factory=session_local, user_id=user_id
+            ).run_json_async(
+                {"agent_id": agent_id, "name": "Renamed", "tool_categories": ["file"]}
+            )
+        finally:
+            set_agent_team_hooks()
+
+        assert result["status"] == "error"
+        assert expected in result["message"]
+        assert "Retry without tool_categories" in result["message"]
+        assert _stored(session_local, agent_id) == ("tc_agent", stored)
+
+    @pytest.mark.asyncio
     async def test_update_agent_partial_update(self) -> None:
         """Test partial agent update (only some fields)."""
         db, db_path, SessionLocal = _create_session()
@@ -1802,7 +2239,7 @@ class TestUpdateAgentTool:
                 pass
 
     @pytest.mark.asyncio
-    async def test_update_agent_strips_agent_tool_category(self) -> None:
+    async def test_update_agent_refuses_agent_tool_category(self) -> None:
         """A builder-passed ``agent`` category never reaches the DB (#802)."""
         db, db_path, SessionLocal = _create_session()
         try:
@@ -1832,10 +2269,10 @@ class TestUpdateAgentTool:
                 }
             )
 
-            assert result["status"] == "success"
+            assert result["status"] == "error"
 
             db.refresh(existing_agent)
-            assert existing_agent.tool_categories == ["web_search"]
+            assert existing_agent.tool_categories == ["basic"]
 
         finally:
             db.close()

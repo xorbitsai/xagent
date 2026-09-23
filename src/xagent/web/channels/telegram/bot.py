@@ -6,8 +6,11 @@ import json
 import logging
 import mimetypes
 import os
+from collections import deque
 from datetime import datetime, timezone
+from itertools import groupby
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import (
     Any,
     Callable,
@@ -37,15 +40,26 @@ from ...models.database import get_session_local
 from ...models.task import TaskStatus
 from ...models.user import User
 from ...services.agent_service_manager import get_agent_manager
-from ...services.channel_delivery import ChannelDelivery, recover_channel_results
+from ...services.channel_delivery import (
+    ChannelDelivery,
+    ChannelDeliveryDiscarded,
+    discard_channel_task_results,
+    recover_channel_results,
+)
+from ...services.channel_input_acceptance import (
+    AcceptedChannelInput,
+    ChannelInput,
+    ChannelInputBatchChanged,
+    accept_channel_input,
+    lookup_channel_inputs,
+)
+from ...services.channel_progress import DurableChannelProgress
 from ...services.channel_runtime import (
     TELEGRAM_TASK_LIST_LIMIT,
     ChannelAgentSnapshot,
     ChannelAuthorizationError,
     ChannelConfigurationError,
-    ClaimedChannelTask,
     DownloadedChannelFile,
-    SelectedChannelTask,
     TelegramChannelTaskSnapshot,
     authorize_channel_sender,
     get_channel_owner_agent,
@@ -60,6 +74,7 @@ from ...services.channel_runtime import (
     update_channel_task_fields,
 )
 from ...services.db_runtime import (
+    await_task_settlement,
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
@@ -73,14 +88,20 @@ from ...services.file_turn import (
 from ...services.managed_task_lease import ManagedTaskLease
 from ...services.shared_channel_execution import (
     SharedChannelTurn,
-    prepare_shared_channel_turn,
 )
+from ...services.task_event_bridge import get_task_event_bridge
 from ...services.task_execution_context_service import (
     materialize_task_execution_recovery_state,
 )
 from ...services.task_lease_service import TaskLeaseLostError
-from ...services.task_orchestrator import TaskTurnPayload
+from ...services.task_orchestrator import TaskTurnError, TaskTurnPayload
 from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
+from ...services.uploaded_file_store import (
+    StagedUploadedFile,
+    build_upload_storage_key,
+    compensate_staged_uploaded_files,
+    stage_uploaded_file_from_local_path,
+)
 from ..batch_control import BatchChannelControl
 from .handler import TelegramTraceHandler
 from .utils import (
@@ -159,6 +180,8 @@ class TelegramBotInstance(BatchChannelControl[int]):
         # join the old task's queue and be discarded by the stop path.
         self.user_switch_locks: Dict[int, asyncio.Lock] = {}
         self.user_conversation_generations: Dict[int, int] = {}
+        self._started_at: datetime | None = None
+        self._menu_generation = uuid4().hex[:12]
         self._accepting = True
         self._ingress_stopped = False
         self._stop_lock: asyncio.Lock | None = None
@@ -393,12 +416,74 @@ class TelegramBotInstance(BatchChannelControl[int]):
             self.selected_agents[user_id] = agent_id
         return self._save_selected_agents()
 
+    def _stale_control(self, message: types.Message) -> bool:
+        return (
+            get_shared_task_execution_enabled()
+            and self._started_at is not None
+            and message.date < self._started_at
+        )
+
+    async def _discard_abandoned_results(
+        self, user_id: int, task_id: int | None
+    ) -> bool:
+        if not get_shared_task_execution_enabled() or task_id is None or task_id <= 0:
+            return True
+        channel_id = cast(int, self.channel_id)
+        try:
+            await discard_channel_task_results(
+                channel_id=channel_id,
+                external_user_id=str(user_id),
+                task_id=task_id,
+            )
+        except Exception:
+            logger.exception("Failed to discard abandoned Telegram replies")
+            return False
+        return True
+
+    async def _reset_conversation(
+        self, user_id: int, agent_id: int | None = None
+    ) -> tuple[bool, bool]:
+        """Commit task and Agent selection before awaiting delivery cleanup."""
+        previous = self.active_tasks.get(user_id)
+        _, persisted = self._start_new_conversation(user_id)
+        if not persisted:
+            return False, True
+        self._set_selected_agent(user_id, agent_id)
+        cleaned = await self._discard_abandoned_results(user_id, previous)
+        return True, cleaned
+
+    @staticmethod
+    def _cleanup_warning(cleaned: bool) -> str:
+        return (
+            ""
+            if cleaned
+            else "\nI couldn't finish cleaning up the previous replies. You can send your new request."
+        )
+
+    async def _callback_payload(
+        self, callback: CallbackQuery, prefix: str
+    ) -> str | None:
+        payload = (callback.data or "").removeprefix(prefix)
+        if get_shared_task_execution_enabled():
+            generation, separator, value = payload.partition(":")
+            if not separator or generation != self._menu_generation:
+                await callback.answer(
+                    "This menu has expired. Please send /agents again.", show_alert=True
+                )
+                return None
+            return value
+        return payload
+
     def _register_handlers(self) -> None:
         from aiogram.filters import Command
 
         @self.dp.message(CommandStart())
         async def cmd_start(message: types.Message) -> None:
-            if not self._accepting or message.from_user is None:
+            if (
+                not self._accepting
+                or message.from_user is None
+                or self._stale_control(message)
+            ):
                 return
             logger.info(
                 f"Received /start from {message.from_user.id} on bot {self.instance_id}"
@@ -410,13 +495,21 @@ class TelegramBotInstance(BatchChannelControl[int]):
 
         @self.dp.message(Command("help"))
         async def cmd_help(message: types.Message) -> None:
-            if not self._accepting or message.from_user is None:
+            if (
+                not self._accepting
+                or message.from_user is None
+                or self._stale_control(message)
+            ):
                 return
             await message.answer(self._help_text())
 
         @self.dp.message(Command("new"))
         async def cmd_new(message: types.Message) -> None:
-            if not self._accepting or message.from_user is None:
+            if (
+                not self._accepting
+                or message.from_user is None
+                or self._stale_control(message)
+            ):
                 return
             logger.info(
                 f"Received /new from {message.from_user.id} on bot {self.instance_id}"
@@ -425,14 +518,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
             # lookup before it writes active_tasks, so an unguarded reset here
             # would be silently overwritten when that lookup resumes.
             async with self._switch_lock_for_user(message.from_user.id):
-                _, persisted = self._start_new_conversation(message.from_user.id)
-                # Inside the lock: the active-task reset and the agent clear are
-                # one update, and keeping them together stays correct if agent
-                # persistence ever becomes async.
-                if persisted:
-                    # Only clear the agent once the reset is durable, so a
-                    # failed save leaves the whole previous selection intact.
-                    self._set_selected_agent(message.from_user.id, None)
+                persisted, cleaned = await self._reset_conversation(
+                    message.from_user.id
+                )
             if not persisted:
                 await message.answer(
                     "I couldn't start a new task because the change could not "
@@ -442,23 +530,36 @@ class TelegramBotInstance(BatchChannelControl[int]):
                 return
             await message.answer(
                 "Fresh start. Send me what you'd like to work on next."
+                + self._cleanup_warning(cleaned)
             )
 
         @self.dp.message(Command("list"))
         async def cmd_list(message: types.Message) -> None:
-            if not self._accepting or message.from_user is None:
+            if (
+                not self._accepting
+                or message.from_user is None
+                or self._stale_control(message)
+            ):
                 return
             await self._handle_list_command(message)
 
         @self.dp.message(Command("switch"))
         async def cmd_switch(message: types.Message) -> None:
-            if not self._accepting or message.from_user is None:
+            if (
+                not self._accepting
+                or message.from_user is None
+                or self._stale_control(message)
+            ):
                 return
             await self._handle_switch_command(message)
 
         @self.dp.message(Command("agents"))
         async def cmd_agents(message: types.Message) -> None:
-            if not self._accepting or message.from_user is None:
+            if (
+                not self._accepting
+                or message.from_user is None
+                or self._stale_control(message)
+            ):
                 return
             logger.info(
                 f"Received /agents from {message.from_user.id} on bot {self.instance_id}"
@@ -479,7 +580,11 @@ class TelegramBotInstance(BatchChannelControl[int]):
 
         @self.dp.message(Command("stop", "pause"))
         async def cmd_stop(message: types.Message) -> None:
-            if not self._accepting or message.from_user is None:
+            if (
+                not self._accepting
+                or message.from_user is None
+                or self._stale_control(message)
+            ):
                 return
             logger.info(
                 f"Received stop command from {message.from_user.id} on bot {self.instance_id}"
@@ -515,6 +620,8 @@ class TelegramBotInstance(BatchChannelControl[int]):
 
             user_id = message.from_user.id
             if self._is_stop_request_text(msg_content):
+                if self._stale_control(message):
+                    return
                 logger.info(
                     f"Received stop text from {user_id} on bot {self.instance_id}: {msg_content}"
                 )
@@ -801,10 +908,13 @@ class TelegramBotInstance(BatchChannelControl[int]):
                 telegram_user_id,
                 reason="Telegram task switch requested",
             )
+            cleaned = await self._discard_abandoned_results(
+                telegram_user_id, previous_task_id
+            )
             return (
                 f"Switched to task <code>{task_id}</code>: "
                 f"{html.escape(task.title)}\n"
-                "Send a message to continue it."
+                "Send a message to continue it." + self._cleanup_warning(cleaned)
             )
         except ChannelAuthorizationError:
             await message.answer("🚫 You are not authorized to use this bot.")
@@ -940,7 +1050,15 @@ class TelegramBotInstance(BatchChannelControl[int]):
         page: int,
         *,
         selected_agent_id: Optional[int],
+        menu_generation: str | None = None,
     ) -> InlineKeyboardMarkup:
+        def data(prefix: str, value: str | int) -> str:
+            return (
+                f"{prefix}:{menu_generation}:{value}"
+                if menu_generation is not None
+                else f"{prefix}:{value}"
+            )
+
         page_size = TelegramBotInstance.agents_page_size
         total_pages = max(1, (len(agents) + page_size - 1) // page_size)
         page = max(0, min(page, total_pages - 1))
@@ -950,7 +1068,11 @@ class TelegramBotInstance(BatchChannelControl[int]):
         if selected_agent_id is None:
             default_label += " ✓"
         rows = [
-            [InlineKeyboardButton(text=default_label, callback_data="agsel:default")]
+            [
+                InlineKeyboardButton(
+                    text=default_label, callback_data=data("agsel", "default")
+                )
+            ]
         ]
         for agent in page_agents:
             label = agent.name if len(agent.name) <= 60 else f"{agent.name[:57]}..."
@@ -959,7 +1081,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=label, callback_data=f"agsel:{agent.agent_id}"
+                        text=label, callback_data=data("agsel", agent.agent_id)
                     )
                 ]
             )
@@ -968,13 +1090,13 @@ class TelegramBotInstance(BatchChannelControl[int]):
             if page > 0:
                 nav_row.append(
                     InlineKeyboardButton(
-                        text="⬅ Prev", callback_data=f"agpage:{page - 1}"
+                        text="⬅ Prev", callback_data=data("agpage", page - 1)
                     )
                 )
             if page < total_pages - 1:
                 nav_row.append(
                     InlineKeyboardButton(
-                        text="Next ➡", callback_data=f"agpage:{page + 1}"
+                        text="Next ➡", callback_data=data("agpage", page + 1)
                     )
                 )
             if nav_row:
@@ -1005,23 +1127,27 @@ class TelegramBotInstance(BatchChannelControl[int]):
         await message.answer(
             "Choose the agent for your next conversation:",
             reply_markup=self._build_agents_keyboard(
-                agents, 0, selected_agent_id=self.selected_agents.get(user_id)
+                agents,
+                0,
+                selected_agent_id=self.selected_agents.get(user_id),
+                menu_generation=self._menu_generation
+                if get_shared_task_execution_enabled()
+                else None,
             ),
         )
 
     async def _handle_agent_selection_callback(self, callback: CallbackQuery) -> None:
         user_id = callback.from_user.id
-        payload = (callback.data or "").removeprefix("agsel:")
+        payload = await self._callback_payload(callback, "agsel:")
+        if payload is None:
+            return
         try:
             if payload == "default":
                 # Reset first: applying the selection before the reset is
                 # durable would leave it active after a reported failure, so
                 # the next message would start a fresh task with it anyway.
                 async with self._switch_lock_for_user(user_id):
-                    _, persisted = self._start_new_conversation(user_id)
-                    # Inside the lock: reset and selection are one update.
-                    if persisted:
-                        self._set_selected_agent(user_id, None)
+                    persisted, cleaned = await self._reset_conversation(user_id, None)
                 if not persisted:
                     await callback.answer(
                         "I couldn't save that change. Please try again.",
@@ -1045,10 +1171,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
                     )
                     return
                 async with self._switch_lock_for_user(user_id):
-                    _, persisted = self._start_new_conversation(user_id)
-                    # Inside the lock: reset and selection are one update.
-                    if persisted:
-                        self._set_selected_agent(user_id, agent.agent_id)
+                    persisted, cleaned = await self._reset_conversation(
+                        user_id, agent.agent_id
+                    )
                 if not persisted:
                     await callback.answer(
                         "I couldn't save that change. Please try again.",
@@ -1078,7 +1203,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
         if isinstance(message, types.Message):
             try:
                 # Dropping reply_markup removes the stale keyboard
-                await message.edit_text(confirmation)
+                await message.edit_text(confirmation + self._cleanup_warning(cleaned))
             except Exception as e:
                 if "message is not modified" not in str(e).lower():
                     logger.warning(
@@ -1087,7 +1212,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
 
     async def _handle_agents_page_callback(self, callback: CallbackQuery) -> None:
         user_id = callback.from_user.id
-        payload = (callback.data or "").removeprefix("agpage:")
+        payload = await self._callback_payload(callback, "agpage:")
+        if payload is None:
+            return
         try:
             page = int(payload)
         except ValueError:
@@ -1113,6 +1240,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
                         agents,
                         page,
                         selected_agent_id=self.selected_agents.get(user_id),
+                        menu_generation=self._menu_generation
+                        if get_shared_task_execution_enabled()
+                        else None,
                     )
                 )
             except Exception as e:
@@ -1311,6 +1441,33 @@ class TelegramBotInstance(BatchChannelControl[int]):
         except Exception:
             logger.warning("Failed to close Telegram voice ASR model", exc_info=True)
 
+    async def _download_telegram_file(
+        self, file: Any, target_dir: Path
+    ) -> DownloadedChannelFile:
+        from ...api.websocket import build_unique_target_path
+        from ...services.task_execution import normalize_filename
+
+        remote = await self.bot.get_file(file.file_id)
+        if not remote.file_path:
+            raise FileNotFoundError("Telegram file has no downloadable path")
+        name = getattr(file, "file_name", None)
+        if not name:
+            suffix = Path(remote.file_path).suffix
+            if not suffix and isinstance(file, types.PhotoSize):
+                suffix = ".jpg"
+            name = f"{file.file_id}{suffix}"
+        name = normalize_filename(name)
+        path = build_unique_target_path(target_dir, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        await self.bot.download_file(remote.file_path, destination=path)
+        return DownloadedChannelFile(
+            name=name,
+            path=path,
+            mime_type=self._mime_type_for_telegram_file(file, path),
+            size=int(getattr(file, "file_size", None) or path.stat().st_size),
+            source_id=str(file.file_id),
+        )
+
     async def _download_and_register_files(
         self,
         files: list,
@@ -1333,50 +1490,8 @@ class TelegramBotInstance(BatchChannelControl[int]):
         downloaded_files: list[DownloadedChannelFile] = []
         for f in files:
             try:
-                file_id = f.file_id
-                tg_file = await self.bot.get_file(file_id)
-                if not tg_file.file_path:
-                    raise FileNotFoundError(
-                        f"Telegram file {file_id} has no downloadable path"
-                    )
-
-                if hasattr(f, "file_name") and f.file_name:
-                    file_name = f.file_name
-                else:
-                    ext = Path(tg_file.file_path).suffix
-                    if not ext and type(f).__name__ == "PhotoSize":
-                        ext = ".jpg"
-                    file_name = f"{file_id}{ext}"
-
-                from ...api.websocket import build_unique_target_path
-                from ...services.task_execution import normalize_filename
-
-                try:
-                    normalized_file_name = normalize_filename(file_name)
-                    target_path = build_unique_target_path(
-                        target_dir, normalized_file_name
-                    )
-                except ImportError:
-                    import time
-
-                    normalized_file_name = f"{int(time.time())}_{file_name}"
-                    target_path = Path(target_dir) / normalized_file_name
-
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-
-                await self.bot.download_file(tg_file.file_path, destination=target_path)
-
-                mime_type = self._mime_type_for_telegram_file(f, target_path)
-
-                file_size = getattr(f, "file_size", None) or target_path.stat().st_size
                 downloaded_files.append(
-                    DownloadedChannelFile(
-                        name=normalized_file_name,
-                        path=target_path,
-                        mime_type=mime_type,
-                        size=int(file_size),
-                        source_id=str(file_id),
-                    )
+                    await self._download_telegram_file(f, target_dir)
                 )
             except Exception as e:
                 logger.error(
@@ -1401,9 +1516,593 @@ class TelegramBotInstance(BatchChannelControl[int]):
             )
         return uploaded_files_info
 
+    async def _shared_input(self, user_id: int, message: types.Message) -> ChannelInput:
+        if self.channel_id is None:
+            raise ChannelConfigurationError("Channel is not configured")
+        if not message.message_id:
+            raise TaskTurnError("input_identity_missing")
+        text, files = await self._extract_message_content(message)
+        return ChannelInput(
+            self.channel_id,
+            str(user_id),
+            "telegram",
+            (str(message.chat.id), str(message.message_thread_id or "")),
+            str(message.message_id),
+            text,
+            tuple(f"{type(file).__name__}:{file.file_unique_id}" for file in files),
+            {
+                "chat_id": message.chat.id,
+                "message_thread_id": message.message_thread_id,
+                "message_id": message.message_id,
+                "loading_message_id": None,
+                "telegram_user_id": user_id,
+            },
+        )
+
+    async def _process_shared_messages_batch(
+        self, user_id: int, messages: list[types.Message]
+    ) -> None:
+        generation = self._conversation_generation(user_id)
+        self.user_preparing_executions.add(user_id)
+        self._clear_user_stop_request(user_id)
+        stop_event = self._get_user_stop_event(user_id)
+        reply_to = messages[-1]
+
+        def stopped() -> bool:
+            return (
+                stop_event.is_set()
+                or self._conversation_generation(user_id) != generation
+            )
+
+        try:
+            for _, group in groupby(
+                messages, key=lambda msg: (msg.chat.id, msg.message_thread_id)
+            ):
+                if stopped():
+                    return
+                raw = list(group)
+                reply_to = raw[-1]
+                contents = {
+                    str(msg.message_id): (
+                        msg,
+                        *(await self._extract_message_content(msg)),
+                    )
+                    for msg in raw
+                }
+                # Ignore unsupported empty service messages, as in local mode.
+                raw = [
+                    msg
+                    for msg in raw
+                    if contents[str(msg.message_id)][1]
+                    or contents[str(msg.message_id)][2]
+                ]
+                if not raw:
+                    continue
+                incoming = tuple(
+                    [await self._shared_input(user_id, msg) for msg in raw]
+                )
+                unobserved_replays: deque[AcceptedChannelInput] = deque()
+                observed: set[int] = set()
+                notified: set[tuple[str, str]] = set()
+                try:
+                    while not stopped():
+                        lookup, cancellation = await await_task_settlement(
+                            asyncio.create_task(
+                                asyncio.to_thread(lookup_channel_inputs, incoming)
+                            )
+                        )
+                        owner_id, pending, replays, rejected = lookup
+                        unobserved_replays.extend(replays)
+                        if cancellation is not None:
+                            raise cancellation
+                        if stopped():
+                            return
+                        for rejection in rejected:
+                            if stopped():
+                                return
+                            key = (rejection.incoming.message_id, rejection.reason)
+                            if key not in notified:
+                                await reply_to.answer(
+                                    self._input_error_message(rejection.reason)
+                                )
+                                notified.add(key)
+                        while unobserved_replays:
+                            if stopped():
+                                return
+                            accepted = unobserved_replays.popleft()
+                            if accepted.command_db_id not in observed:
+                                observed.add(accepted.command_db_id)
+                                await self._observe_shared_input(
+                                    user_id, accepted, generation, reply_to
+                                )
+                        if not pending or stopped():
+                            break
+                        get_task_event_bridge().require_ready()
+                        selected_agent = self.selected_agents.get(user_id)
+                        staged: list[StagedUploadedFile] = []
+                        asr_model: Any | None = None
+                        try:
+                            with TemporaryDirectory(
+                                prefix="xagent-telegram-input-"
+                            ) as directory:
+                                pending_contents = [
+                                    contents[item.message_id] for item in pending
+                                ]
+                                voice_ids = [
+                                    str(msg.voice.file_id)
+                                    for msg, _, _ in pending_contents
+                                    if msg.voice is not None
+                                ]
+                                if voice_ids:
+                                    try:
+                                        (
+                                            asr_model,
+                                            cancellation,
+                                        ) = await await_task_settlement(
+                                            asyncio.create_task(
+                                                asyncio.to_thread(
+                                                    self._resolve_voice_asr_model_isolated,
+                                                    owner_id,
+                                                )
+                                            )
+                                        )
+                                    except Exception as error:
+                                        raise TelegramVoiceTranscriptionError(
+                                            "Could not initialize speech recognition"
+                                        ) from error
+                                    if cancellation is not None:
+                                        raise cancellation
+                                    if asr_model is None:
+                                        raise TelegramVoiceTranscriptionError(
+                                            "No speech recognition model is configured"
+                                        )
+                                    if stopped():
+                                        return
+                                downloaded: list[DownloadedChannelFile] = []
+                                for _, _, files in pending_contents:
+                                    for file in files:
+                                        try:
+                                            downloaded.append(
+                                                await drain_async_task_cancellation_safe(
+                                                    asyncio.create_task(
+                                                        self._download_telegram_file(
+                                                            file, Path(directory)
+                                                        )
+                                                    )
+                                                )
+                                            )
+                                        except Exception as error:
+                                            raise TaskTurnError(
+                                                "file_unavailable"
+                                            ) from error
+                                        if stopped():
+                                            return
+                                voice_info = [
+                                    {
+                                        "telegram_file_id": file.source_id,
+                                        "path": str(file.path),
+                                        "name": file.name,
+                                        "type": file.mime_type,
+                                    }
+                                    for file in downloaded
+                                ]
+                                transcripts = (
+                                    await self._transcribe_uploaded_voice_files(
+                                        voice_ids, voice_info, asr_model
+                                    )
+                                    if voice_ids
+                                    else {}
+                                )
+                                if stopped():
+                                    return
+                                for file in downloaded:
+                                    file_id = str(uuid4())
+                                    try:
+                                        (
+                                            uploaded,
+                                            cancellation,
+                                        ) = await await_task_settlement(
+                                            asyncio.create_task(
+                                                asyncio.to_thread(
+                                                    stage_uploaded_file_from_local_path,
+                                                    local_path=file.path,
+                                                    user_id=owner_id,
+                                                    filename=file.name,
+                                                    file_id=file_id,
+                                                    mime_type=file.mime_type,
+                                                    storage_key=build_upload_storage_key(
+                                                        owner_id, file_id, file.name
+                                                    ),
+                                                    upload_source="telegram",
+                                                    execution_scope=None,
+                                                )
+                                            )
+                                        )
+                                    except Exception as error:
+                                        raise TaskTurnError(
+                                            "file_unavailable"
+                                        ) from error
+                                    staged.append(uploaded)
+                                    if cancellation is not None:
+                                        raise cancellation
+                                    if stopped():
+                                        return
+                                attachments = normalize_attachments_for_persistence(
+                                    [
+                                        {
+                                            "file_id": file.file_id,
+                                            "name": file.filename,
+                                            "type": file.mime_type,
+                                            "size": file.file_size,
+                                        }
+                                        for file in staged
+                                    ]
+                                )
+                                text = self._compose_prompt_text(
+                                    pending_contents, transcripts
+                                )
+                                display = self._display_message_for_user(
+                                    text, bool(staged)
+                                )
+                                voice_files = []
+                                file_links = []
+                                for downloaded_file, staged_file, chip in zip(
+                                    downloaded, staged, attachments, strict=True
+                                ):
+                                    if downloaded_file.source_id in voice_ids:
+                                        voice_files.append(chip)
+                                    else:
+                                        file_links.append(
+                                            f"[{staged_file.filename}]"
+                                            f"({build_file_id_ref(staged_file.file_id)})"
+                                        )
+                                links = " ".join(file_links)
+                                execution = (
+                                    f"{text}\n\n{links}"
+                                    if text and links
+                                    else text or links
+                                )
+                                description = execution
+                                title = (
+                                    description
+                                    if voice_ids
+                                    else self._compose_prompt_text(pending_contents, {})
+                                )
+                                title = title or "Untitled Task"
+                                if len(title) > 50:
+                                    title = f"{title[:50]}..."
+                                execution = append_uploaded_files_context(
+                                    execution, build_uploaded_files_context(voice_files)
+                                )
+                                if stopped():
+                                    return
+                                accepted, cancellation = await await_task_settlement(
+                                    asyncio.create_task(
+                                        asyncio.to_thread(
+                                            accept_channel_input,
+                                            pending[0],
+                                            additional_inputs=pending[1:],
+                                            owner_id=owner_id,
+                                            active_task_id=self.active_tasks.get(
+                                                user_id
+                                            ),
+                                            channel_name=self.channel_name,
+                                            agent_id=selected_agent,
+                                            task_title=title,
+                                            task_description=description,
+                                            payload=TaskTurnPayload(
+                                                display,
+                                                execution_message=execution,
+                                                attachments=attachments or None,
+                                                file_ids=tuple(
+                                                    file.file_id for file in staged
+                                                ),
+                                            ),
+                                            staged_files=tuple(staged),
+                                            host_id=get_task_event_bridge().host_id,
+                                        )
+                                    )
+                                )
+                                saved = True
+                                if (
+                                    self._conversation_generation(user_id) == generation
+                                    and not accepted.replayed
+                                ):
+                                    if accepted.selection.is_new_task:
+                                        self.active_tasks[user_id] = accepted.task_id
+                                        saved = self._save_active_tasks()
+                                    elif self._active_tasks_unsaved:
+                                        saved = self._save_active_tasks()
+                                    if accepted.selection.requested_agent_missing:
+                                        self._set_selected_agent(user_id, None)
+                                if stopped():
+                                    turn = accepted.as_turn()
+                                    turn.discard_output = (
+                                        self._conversation_generation(user_id)
+                                        != generation
+                                    )
+                                    await drain_async_task_cancellation_safe(
+                                        asyncio.create_task(turn.stop())
+                                    )
+                                if cancellation is not None:
+                                    raise cancellation
+                                if stopped():
+                                    return
+                                await self._observe_shared_input(
+                                    user_id,
+                                    accepted,
+                                    generation,
+                                    pending_contents[-1][0],
+                                    save_failed=not saved,
+                                )
+                                break
+                        except ChannelInputBatchChanged:
+                            # Reclaim only unused objects and prepare still-pending
+                            # inputs again; committed attachments remain referenced.
+                            continue
+                        finally:
+
+                            async def cleanup() -> None:
+                                try:
+                                    if asr_model is not None:
+                                        await self._close_voice_asr_model(asr_model)
+                                finally:
+                                    if staged:
+                                        await run_db_io_cancellation_safe(
+                                            lambda: compensate_staged_uploaded_files(
+                                                tuple(staged)
+                                            )
+                                        )
+
+                            await drain_async_task_cancellation_safe(
+                                asyncio.create_task(cleanup())
+                            )
+                except (TelegramVoiceTranscriptionError, TaskTurnError) as error:
+                    if (
+                        isinstance(error, TaskTurnError)
+                        and error.reason != "file_unavailable"
+                    ):
+                        raise
+                    if stopped():
+                        return
+                    await reply_to.answer(
+                        "I couldn't prepare the attachment or transcribe the voice message. "
+                        "New messages in this group were not accepted. "
+                        "Please resend them together, or send the request as text."
+                    )
+                finally:
+                    # A replay is already accepted worker work, even before an
+                    # observer exists. Keep its stop obligation across lookup and
+                    # rejection-notice awaits, including shutdown cancellation.
+                    if stopped() and unobserved_replays:
+
+                        async def stop_replays() -> None:
+                            for replay in unobserved_replays:
+                                turn = replay.as_turn()
+                                turn.discard_output = (
+                                    self._conversation_generation(user_id) != generation
+                                )
+                                await turn.stop()
+
+                        await drain_async_task_cancellation_safe(
+                            asyncio.create_task(stop_replays())
+                        )
+        except ChannelAuthorizationError:
+            await reply_to.answer("🚫 You are not authorized to use this bot.")
+        except ChannelConfigurationError:
+            await reply_to.answer("This bot is inactive or not correctly configured.")
+        except TaskTurnError as error:
+            if not stopped():
+                await reply_to.answer(self._input_error_message(error.reason))
+        except Exception:
+            logger.exception("Error accepting Telegram input")
+            if not stopped():
+                await reply_to.answer(
+                    "Sorry, an error occurred while processing your request."
+                )
+        finally:
+            self.user_preparing_executions.discard(user_id)
+            self._clear_user_stop_request(user_id)
+
+    @staticmethod
+    def _input_error_message(reason: str) -> str:
+        return {
+            "busy": "I'm still working on the previous message. Please wait for it to finish.",
+            "input_conflict": "This Telegram message was already accepted with different content. Please send a new message.",
+            "input_unavailable": "The original task is no longer available. Please send a new message.",
+        }.get(reason, "This message could not be accepted. Please try again.")
+
+    async def _observe_shared_input(
+        self,
+        user_id: int,
+        accepted: AcceptedChannelInput,
+        generation: int,
+        reply_to: types.Message,
+        *,
+        save_failed: bool = False,
+    ) -> None:
+        turn = accepted.as_turn()
+        active = (accepted.task_id, turn)
+        retained = False
+        handler = None
+
+        def current() -> bool:
+            selected = self.active_tasks.get(user_id)
+            return self._conversation_generation(user_id) == generation and (
+                selected is None or selected == accepted.task_id
+            )
+
+        async def deliver(delivery: ChannelDelivery, result: dict[str, Any]) -> None:
+            await self._deliver_shared_result(delivery, result, is_current=current)
+
+        async def progress(text: str | None) -> None:
+            async def send(delivery: ChannelDelivery, _: Any) -> None:
+                if not current():
+                    raise ChannelDeliveryDiscarded
+                message, loading = await self._shared_delivery_messages(
+                    delivery, is_current=current
+                )
+                if (
+                    text is not None
+                    and current()
+                    and handler is not None
+                    and not handler.cancelled
+                ):
+                    await self._edit_shared_progress(loading, text, current)
+
+            await DurableChannelProgress(accepted.command_db_id, send, deliver).send()
+
+        try:
+            if (
+                self._conversation_generation(user_id) != generation
+                or self._get_user_stop_event(user_id).is_set()
+            ):
+                turn.discard_output = (
+                    self._conversation_generation(user_id) != generation
+                )
+                await turn.stop()
+                return
+            if not current():
+                # A failed map save can leave a stale selection after restart.
+                # Keep the durable reply for recovery; only an explicit control
+                # or generation change establishes abandonment.
+                return
+            previous = self.user_active_executions.get(user_id)
+            if (
+                accepted.replayed
+                and previous is not None
+                and isinstance(previous[1], SharedChannelTurn)
+                and previous[1].command_db_id is not None
+                and previous[1].command_db_id > accepted.command_db_id
+            ):
+                await turn.deliver(deliver)
+                return
+            self.user_active_executions[user_id] = active
+            retained = True
+            handler = TelegramTraceHandler(
+                accepted.task_id, self.bot, 0, send_update=progress
+            )
+            self.user_active_trace_handlers[user_id] = handler
+            notices = []
+            if save_failed:
+                notices.append(
+                    f"Your request was accepted as task #{accepted.task_id}, but I couldn't save the current conversation locally. Retrying this same message will reuse that task."
+                )
+            if not accepted.replayed and accepted.selection.requested_agent_missing:
+                notices.append(
+                    "The selected agent is no longer available, so I'm using the default assistant for this conversation."
+                )
+            for text in notices:
+                await deliver_cancellation_safe(
+                    lambda: reply_to.answer(text),
+                    is_cancelled=lambda: not current(),
+                    delete=lambda sent: sent.delete(),
+                    description="Telegram acceptance notice",
+                )
+            await progress(None)
+            result = await turn.observe(handler)
+            if not current():
+                await turn.discard_delivery()
+                retained = False
+                return
+            retained = result.get("status") == "accepted"
+            delivered = await turn.deliver(
+                deliver, pending_notice=result.get("status") == "accepted"
+            )
+            retained = (
+                result.get("status") == "accepted" and not delivered and current()
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Error observing accepted Telegram input command_id=%s",
+                accepted.command_db_id,
+            )
+        finally:
+            if self.user_active_trace_handlers.get(user_id) is handler:
+                self.user_active_trace_handlers.pop(user_id, None)
+            if self.user_active_executions.get(user_id) == active and (
+                not retained or not current()
+            ):
+                self.user_active_executions.pop(user_id, None)
+            await drain_async_task_cancellation_safe(asyncio.create_task(turn.close()))
+
+    def _shared_reply_message(self, delivery: ChannelDelivery) -> types.Message:
+        destination = delivery.destination
+        chat_id = destination["chat_id"]
+        return types.Message(
+            message_id=destination["message_id"],
+            date=datetime.now(timezone.utc),
+            chat=types.Chat(
+                id=chat_id, type="private" if chat_id > 0 else "supergroup"
+            ),
+            message_thread_id=destination.get("message_thread_id"),
+            is_topic_message=destination.get("message_thread_id") is not None,
+        ).as_(self.bot)
+
+    async def _shared_delivery_messages(
+        self, delivery: ChannelDelivery, *, is_current: Callable[[], bool]
+    ) -> tuple[types.Message, types.Message]:
+        message = self._shared_reply_message(delivery)
+        if delivery.destination["loading_message_id"] is None:
+            try:
+                loading = await deliver_cancellation_safe(
+                    lambda: message.answer(
+                        "Got it, I'm working on this now.\n<i>I'll update this message as I make progress.</i>",
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    is_cancelled=lambda: not is_current(),
+                    delete=lambda sent: sent.delete(),
+                    description=f"loading message for task {delivery.task_id}",
+                )
+            except CancelledDelivery as error:
+                raise ChannelDeliveryDiscarded from error
+            if loading is None:
+                raise ChannelDeliveryDiscarded
+            delivery.destination["loading_message_id"] = loading.message_id
+        loading = types.Message(
+            message_id=delivery.destination["loading_message_id"],
+            date=datetime.now(timezone.utc),
+            chat=message.chat,
+            message_thread_id=message.message_thread_id,
+            is_topic_message=message.is_topic_message,
+        ).as_(self.bot)
+        return message, loading
+
+    async def _edit_shared_progress(
+        self, loading: types.Message, text: str, current: Callable[[], bool]
+    ) -> None:
+        try:
+            try:
+                await deliver_cancellation_safe(
+                    lambda: loading.edit_text(
+                        markdown_to_tg_html(text[:4000]), parse_mode=ParseMode.HTML
+                    ),
+                    is_cancelled=lambda: not current(),
+                    delete=lambda _: loading.delete(),
+                    description="Telegram progress",
+                )
+            except CancelledDelivery:
+                raise
+            except Exception as error:
+                if "message is not modified" in str(error).lower():
+                    return
+                await deliver_cancellation_safe(
+                    lambda: loading.edit_text(text[:4000], parse_mode=None),
+                    is_cancelled=lambda: not current(),
+                    delete=lambda _: loading.delete(),
+                    description="Telegram progress fallback",
+                )
+        except CancelledDelivery as error:
+            raise ChannelDeliveryDiscarded from error
+
     async def _process_user_messages_batch(
         self, user_id: int, messages: list[types.Message]
     ) -> None:
+        if get_shared_task_execution_enabled():
+            await self._process_shared_messages_batch(user_id, messages)
+            return
         # Mark preparation before the first await so /new, /stop, and /switch
         # cannot miss a batch that has already been dequeued.
         self.user_preparing_executions.add(user_id)
@@ -1441,8 +2140,6 @@ class TelegramBotInstance(BatchChannelControl[int]):
         conversation_generation = self._conversation_generation(user_id)
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
-        awaiting_shared_delivery = False
-        shared_turn: SharedChannelTurn | None = None
         turn_control: ManagedTaskLease | SharedChannelTurn | None = None
         voice_asr_model: Any | None = None
         tg_handler: TelegramTraceHandler | None = None
@@ -1470,12 +2167,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
                         return
 
                 active_task_id = self.active_tasks.get(user_id)
-                prepare = (
-                    prepare_shared_channel_turn
-                    if get_shared_task_execution_enabled()
-                    else prepare_channel_task
-                )
-                prepared_task = await prepare(
+                prepared_task = await prepare_channel_task(
                     channel_id=self.channel_id,
                     external_user_id=str(user_id),
                     active_task_id=(
@@ -1504,15 +2196,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
 
             # No await is allowed between receiving the committed claim and
             # taking ownership of its managed heartbeat in this transport.
-            selected_task: SelectedChannelTask | ClaimedChannelTask
-            if isinstance(prepared_task, SharedChannelTurn):
-                shared_turn = prepared_task
-                selected_task = shared_turn.selection
-                turn_control = shared_turn
-            else:
-                selected_task = prepared_task
-                managed_lease = prepared_task.managed_lease
-                turn_control = managed_lease
+            selected_task = prepared_task
+            managed_lease = prepared_task.managed_lease
+            turn_control = managed_lease
             task_id = selected_task.task_id
             claimed_task_id = task_id
             owner_user_id = selected_task.user_id
@@ -1562,33 +2248,32 @@ class TelegramBotInstance(BatchChannelControl[int]):
                 )
                 return
 
-            if shared_turn is None:
-                setup_snapshot = await run_db_io_cancellation_safe(
-                    lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
-                )
-                if setup_snapshot is None:
-                    raise RuntimeError(f"Task {task_id} disappeared before execution")
+            setup_snapshot = await run_db_io_cancellation_safe(
+                lambda: load_task_setup_snapshot_sync(task_id, owner_user_id)
+            )
+            if setup_snapshot is None:
+                raise RuntimeError(f"Task {task_id} disappeared before execution")
 
-                agent_manager = get_agent_manager()
-                agent_service = await agent_manager.get_agent_for_task(
-                    task_id,
-                    user=setup_snapshot.runtime_user,
-                    task_setup_snapshot=setup_snapshot,
-                    task_owner_user_id=owner_user_id,
-                )
-                agent_service.set_conversation_history(
-                    [dict(message) for message in setup_snapshot.conversation_history],
-                    watermark=setup_snapshot.conversation_watermark,
-                )
-                recovery_state = await materialize_task_execution_recovery_state(
-                    setup_snapshot.execution_recovery
-                )
-                agent_service.set_execution_context_messages(
-                    recovery_state.get("messages", [])
-                )
-                agent_service.set_recovered_skill_context(
-                    recovery_state.get("skill_context")
-                )
+            agent_manager = get_agent_manager()
+            agent_service = await agent_manager.get_agent_for_task(
+                task_id,
+                user=setup_snapshot.runtime_user,
+                task_setup_snapshot=setup_snapshot,
+                task_owner_user_id=owner_user_id,
+            )
+            agent_service.set_conversation_history(
+                [dict(message) for message in setup_snapshot.conversation_history],
+                watermark=setup_snapshot.conversation_watermark,
+            )
+            recovery_state = await materialize_task_execution_recovery_state(
+                setup_snapshot.execution_recovery
+            )
+            agent_service.set_execution_context_messages(
+                recovery_state.get("messages", [])
+            )
+            agent_service.set_recovered_skill_context(
+                recovery_state.get("skill_context")
+            )
 
             message_turn_id = str(uuid4())
             context: dict = {"turn_id": message_turn_id}
@@ -1611,7 +2296,6 @@ class TelegramBotInstance(BatchChannelControl[int]):
                     agent_service=agent_service,
                     task_id=task_id,
                     user_id=owner_user_id,
-                    **({"workspace": shared_turn.workspace} if shared_turn else {}),
                 )
                 if voice_file_ids and not uploaded_info:
                     raise TelegramVoiceTranscriptionError(
@@ -1690,14 +2374,13 @@ class TelegramBotInstance(BatchChannelControl[int]):
                 )
                 return
 
-            if shared_turn is None:
-                await persist_channel_user_message(
-                    task_id=task_id,
-                    user_id=owner_user_id,
-                    content=display_message,
-                    attachments=persisted_attachments or None,
-                    turn_id=message_turn_id,
-                )
+            await persist_channel_user_message(
+                task_id=task_id,
+                user_id=owner_user_id,
+                content=display_message,
+                attachments=persisted_attachments or None,
+                turn_id=message_turn_id,
+            )
 
             # Persisting the user message is awaited, so consume a stop that
             # landed during it. Otherwise the abandoned conversation gets an
@@ -1707,7 +2390,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
                     turn_control,
                     task_id=task_id,
                     reply_to=last_message,
-                    already_persisted=shared_turn is None,
+                    already_persisted=True,
                 )
                 return
 
@@ -1734,7 +2417,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
                     turn_control,
                     task_id=task_id,
                     reply_to=last_message,
-                    already_persisted=shared_turn is None,
+                    already_persisted=True,
                 )
                 return
 
@@ -1753,7 +2436,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
             actual_task_id = str(task_id)
             active_execution = (
                 task_id,
-                shared_turn if shared_turn is not None else agent_service,
+                agent_service,
             )
             self.user_active_executions[user_id] = active_execution
 
@@ -1763,83 +2446,30 @@ class TelegramBotInstance(BatchChannelControl[int]):
                         turn_control,
                         task_id=task_id,
                         reply_to=last_message,
-                        already_persisted=shared_turn is None,
+                        already_persisted=True,
                     )
                     return
 
-                if shared_turn is not None:
-                    shared_turn.delivery_destination = {
-                        "chat_id": last_message.chat.id,
-                        "message_id": last_message.message_id,
-                        "message_thread_id": last_message.message_thread_id,
-                        "loading_message_id": loading_msg.message_id,
-                    }
+                local_service: Any = agent_service
+                local_lease = cast(ManagedTaskLease, managed_lease)
+                with UserContext(owner_user_id):
                     result = await self._await_execution_with_stop_monitor(
                         user_id,
-                        shared_turn.execute(
-                            TaskTurnPayload(
-                                transcript_message=display_message,
-                                execution_message=execution_text,
-                                attachments=persisted_attachments or None,
-                                file_ids=tuple(
-                                    item["file_id"] for item in persisted_attachments
-                                ),
-                            ),
-                            tg_handler,
+                        agent_manager.execute_task(
+                            agent_service=local_service,
+                            task=execution_text,
+                            context=context,
+                            task_id=actual_task_id,
+                            tracking_task_id=actual_task_id,
+                            db_session=None,
+                            manage_task_lease=False,
+                            task_lease=local_lease.lease,
+                            task_lease_heartbeat_task=local_lease.heartbeat_task,
                         ),
                         reason="Telegram stop requested",
                     )
-                    if tg_handler.discard_output:
-                        await shared_turn.discard_delivery()
-                    else:
-
-                        async def deliver_current(
-                            delivery: ChannelDelivery, final_result: dict[str, Any]
-                        ) -> None:
-                            await self._deliver_telegram_result(
-                                project_execution_result_for_channel(
-                                    final_result
-                                ).visible_text,
-                                task_id=task_id,
-                                owner_user_id=owner_user_id,
-                                last_message=last_message,
-                                loading_msg=loading_msg,
-                                tg_handler=tg_handler,
-                                require_delivery=True,
-                            )
-
-                        delivered_final = await shared_turn.deliver(
-                            deliver_current,
-                            pending_notice=result.get("status") == "accepted",
-                        )
-                        awaiting_shared_delivery = (
-                            result.get("status") == "accepted" and not delivered_final
-                        )
-                    return
-                else:
-                    local_service: Any = agent_service
-                    local_lease = cast(ManagedTaskLease, managed_lease)
-                    with UserContext(owner_user_id):
-                        result = await self._await_execution_with_stop_monitor(
-                            user_id,
-                            agent_manager.execute_task(
-                                agent_service=local_service,
-                                task=execution_text,
-                                context=context,
-                                task_id=actual_task_id,
-                                tracking_task_id=actual_task_id,
-                                db_session=None,
-                                manage_task_lease=False,
-                                task_lease=local_lease.lease,
-                                task_lease_heartbeat_task=local_lease.heartbeat_task,
-                            ),
-                            reason="Telegram stop requested",
-                        )
             finally:
-                if (
-                    self.user_active_executions.get(user_id) == active_execution
-                    and not awaiting_shared_delivery
-                ):
+                if self.user_active_executions.get(user_id) == active_execution:
                     self.user_active_executions.pop(user_id, None)
                 if agent_service is not None:
                     agent_service.tracer.remove_handler(tg_handler)
@@ -1958,8 +2588,6 @@ class TelegramBotInstance(BatchChannelControl[int]):
 
             async def _cleanup_message_batch() -> None:
                 try:
-                    if shared_turn is not None:
-                        await shared_turn.close()
                     if managed_lease is not None:
                         await managed_lease.close()
                 finally:
@@ -1984,6 +2612,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
         tg_handler: TelegramTraceHandler | None = None,
         require_delivery: bool = False,
         shared_turn: SharedChannelTurn | None = None,
+        is_current: Callable[[], bool] | None = None,
     ) -> None:
         output, image_refs, file_refs = self._extract_telegram_output_refs(
             output_text,
@@ -1995,7 +2624,8 @@ class TelegramBotInstance(BatchChannelControl[int]):
             # discard_output, not cancelled: a /stop must still deliver
             # (and keep) this answer for the user who is still here.
             return bool(
-                (tg_handler is not None and tg_handler.discard_output)
+                (is_current is not None and not is_current())
+                or (tg_handler is not None and tg_handler.discard_output)
                 or (shared_turn is not None and shared_turn.discard_output)
             )
 
@@ -2117,7 +2747,11 @@ class TelegramBotInstance(BatchChannelControl[int]):
             return
 
     async def _deliver_shared_result(
-        self, delivery: ChannelDelivery, result: dict[str, Any]
+        self,
+        delivery: ChannelDelivery,
+        result: dict[str, Any],
+        *,
+        is_current: Callable[[], bool] | None = None,
     ) -> None:
         active = next(
             (
@@ -2128,23 +2762,27 @@ class TelegramBotInstance(BatchChannelControl[int]):
             ),
             None,
         )
-        if active is not None and active[1].discard_output:
-            self.user_active_executions.pop(active[0], None)
-            return
-        destination = delivery.destination
-        chat_id = destination["chat_id"]
-        chat = types.Chat(id=chat_id, type="private" if chat_id > 0 else "supergroup")
-        message = types.Message(
-            message_id=destination["message_id"],
-            date=datetime.now(timezone.utc),
-            chat=chat,
-            message_thread_id=destination.get("message_thread_id"),
-        ).as_(self.bot)
-        loading = types.Message(
-            message_id=destination["loading_message_id"],
-            date=datetime.now(timezone.utc),
-            chat=chat,
-        ).as_(self.bot)
+        # Older already-accepted commands have no sender in their destination.
+        sender_id = delivery.destination.get("telegram_user_id")
+        generation = (
+            self._conversation_generation(sender_id) if sender_id is not None else None
+        )
+
+        def current() -> bool:
+            if is_current is not None and not is_current():
+                return False
+            if active is not None and active[1].discard_output:
+                return False
+            return (
+                sender_id is None
+                or self._conversation_generation(sender_id) == generation
+            )
+
+        if not current():
+            raise ChannelDeliveryDiscarded
+        message, loading = await self._shared_delivery_messages(
+            delivery, is_current=current
+        )
         await self._deliver_telegram_result(
             project_execution_result_for_channel(result).visible_text,
             task_id=delivery.task_id,
@@ -2153,10 +2791,15 @@ class TelegramBotInstance(BatchChannelControl[int]):
             loading_msg=loading,
             require_delivery=True,
             shared_turn=active[1] if active is not None else None,
+            is_current=current,
         )
-        if active is not None and self.user_active_executions.get(active[0]) == (
-            delivery.task_id,
-            active[1],
+        if not current():
+            raise ChannelDeliveryDiscarded
+        if (
+            result.get("status") != "accepted"
+            and active is not None
+            and self.user_active_executions.get(active[0])
+            == (delivery.task_id, active[1])
         ):
             self.user_active_executions.pop(active[0], None)
 
@@ -2408,8 +3051,13 @@ class TelegramBotInstance(BatchChannelControl[int]):
         if not self._accepting:
             return
         try:
-            # Drop pending updates to ignore messages sent while the bot was offline/inactive
-            await self.bot.delete_webhook(drop_pending_updates=True)
+            self._started_at = datetime.now(timezone.utc)
+            self._menu_generation = uuid4().hex[:12]
+            # Shared ordinary inputs resolve receipts after restart. Old controls
+            # are filtered independently; callbacks carry a startup generation.
+            await self.bot.delete_webhook(
+                drop_pending_updates=not get_shared_task_execution_enabled()
+            )
             if not self._accepting:
                 return
             try:

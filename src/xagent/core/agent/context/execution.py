@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
 from collections import Counter
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -459,6 +462,79 @@ def tool_evidence_state(context: Any) -> EvidenceState:
     )
 
 
+# Runtime coordination only: excluded from snapshots, equality and copies.
+_CHECKPOINT_GATE_ATTR = "_checkpoint_gate"
+
+
+class _ContextCheckpointGate:
+    """Single-event-loop checkpoint coordination with writer preference.
+
+    Ordinary snapshots share the gate; an exclusive operation waits for them
+    to drain and blocks new snapshots. Acquisitions are not reentrant. Waiters
+    recheck their predicate after broadcast wakeup, so cancelling a notified
+    waiter cannot consume another waiter's chance to proceed.
+    """
+
+    def __init__(self) -> None:
+        self._shared = 0
+        self._exclusive = False
+        self._writers_waiting = 0
+        self._waiters: set[asyncio.Future[None]] = set()
+
+    async def _wait(self) -> None:
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.add(waiter)
+        try:
+            await waiter
+        finally:
+            self._waiters.discard(waiter)
+
+    def _wake(self) -> None:
+        for waiter in self._waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    @asynccontextmanager
+    async def shared(self) -> AsyncIterator[None]:
+        while self._exclusive or self._writers_waiting:
+            await self._wait()
+        self._shared += 1
+        try:
+            yield
+        finally:
+            self._shared -= 1
+            if not self._shared:
+                self._wake()
+
+    @asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        self._writers_waiting += 1
+        try:
+            while self._exclusive or self._shared:
+                await self._wait()
+            self._exclusive = True
+        finally:
+            self._writers_waiting -= 1
+            # A cancelled writer may have been the only reason new shared
+            # acquisitions were blocked, even while other readers remain.
+            if not self._exclusive:
+                self._wake()
+        try:
+            yield
+        finally:
+            self._exclusive = False
+            self._wake()
+
+
+def context_checkpoint_gate(context: ExecutionContext) -> _ContextCheckpointGate:
+    """Return the context's transient gate; idle gates retain no event loop."""
+    gate = context.__dict__.get(_CHECKPOINT_GATE_ATTR)
+    if gate is None:
+        gate = _ContextCheckpointGate()
+        context.__dict__[_CHECKPOINT_GATE_ATTR] = gate
+    return cast(_ContextCheckpointGate, gate)
+
+
 @dataclass
 class ExecutionContext:
     """Execution state plus pluggable runtime components."""
@@ -477,6 +553,23 @@ class ExecutionContext:
     def __post_init__(self) -> None:
         self.components.setdefault("workspace", WorkspaceComponent())
         self.components.setdefault("memory", MemoryComponent())
+
+    def __copy__(self) -> ExecutionContext:
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(
+            (key, value)
+            for key, value in self.__dict__.items()
+            if key != _CHECKPOINT_GATE_ATTR
+        )
+        return new
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> ExecutionContext:
+        new = self.__class__.__new__(self.__class__)
+        memo[id(self)] = new
+        for key, value in self.__dict__.items():
+            if key != _CHECKPOINT_GATE_ATTR:
+                new.__dict__[key] = copy.deepcopy(value, memo)
+        return new
 
     def get_component(self, name: str) -> ExecutionComponent | None:
         return self.components.get(name)

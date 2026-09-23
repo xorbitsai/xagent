@@ -159,6 +159,7 @@ interface StepAction {
     sandboxed?: boolean;
     inline?: boolean;
     workforceSummary?: boolean;
+    statusLine?: boolean;
   };
 }
 
@@ -802,6 +803,39 @@ export function processTraceEvents(
           step.status = 'running';
         }
 
+        const unavailable = event.event_type === 'tool_execution_failed'
+          ? (event.data?.result as { unavailable_server?: unknown; error?: unknown } | null | undefined)
+          : undefined;
+        const connector = unavailable?.unavailable_server;
+        if (typeof connector === 'string' && connector.trim()) {
+          const callId = event.data?.tool_call_id;
+          const failedTool = getRawToolName(event);
+          // Sibling calls may reuse an id, so the tool name must also match.
+          const ownCards = step.actions.filter(
+            a => a.type === 'tool' && a.status === 'running'
+              && !!callId && a.data.tool_call_id === callId
+              && a.data.tool === failedTool
+          );
+          const ownCard = ownCards.length === 1 ? ownCards[0] : null;
+          const detail = unavailable?.error;
+          const statusLine: StepAction = {
+            id: ownCard?.id ?? eventId,
+            type: 'info',
+            title: t('traceEventRenderer.connectorUnavailable', { connector: connector.trim() }),
+            status: 'completed',
+            timestamp: ownCard?.timestamp ?? timestamp,
+            data: typeof detail === 'string' && detail.trim()
+              ? { statusLine: true, error: detail.trim() }
+              : { statusLine: true },
+          };
+          if (ownCard) {
+            step.actions[step.actions.indexOf(ownCard)] = statusLine;
+          } else {
+            step.actions.push(statusLine);
+          }
+          return;
+        }
+
         // Extract error message with more fallback options
         const errorData = event.data || {};
         let errorMessage =
@@ -1425,6 +1459,20 @@ function StepActionItem({
       resizeObserver.disconnect();
     };
   }, [updateToolSummaryVisibility]);
+
+  if (displayAction.data.statusLine) {
+    return (
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 px-3 py-1.5 text-xs text-muted-foreground">
+        <Info className="w-3.5 h-3.5 flex-shrink-0" />
+        <span className="break-words [overflow-wrap:anywhere]">{displayAction.title}</span>
+        {typeof displayAction.data.error === 'string' && displayAction.data.error && (
+          <span className="break-words [overflow-wrap:anywhere] text-muted-foreground/70">
+            {displayAction.data.error}
+          </span>
+        )}
+      </div>
+    );
+  }
 
   if (displayAction.type === 'info' && displayAction.data.inline) {
     return (

@@ -6,7 +6,7 @@
 // management, only about the two endpoints that read and write a task's
 // missing runtime inputs.
 import type { ClientErrorCode } from "@/lib/client-errors"
-import { apiRequest, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { apiRequest, isJsonRecord, parseApiResponse, type ParsedApiResponse } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 
 // section and type are closed sets on the wire (schemas/connector_runtime.py);
@@ -116,6 +116,80 @@ export function readConnectorRuntimeReport(value: unknown): ConnectorRuntimeRepo
 // not 200 is still a read failure, it just does not need its own entry here.
 export const READ_FAILURE_STATUSES = [400, 401, 403, 404, 422, 500, 503] as const
 
+/**
+ * How long either call below waits before giving up on a request that is not
+ * answering. Nothing else cancels these two: the dialog's read effect drops a
+ * late answer but does not stop the request behind it, and the save runs to
+ * completion on purpose even when the dialog unmounts mid-flight. Without a
+ * bound here, a request that never finishes answering -- no response at all,
+ * or headers with a body that never arrives -- leaves the dialog unable to
+ * save and, while the save is the call in flight, unable to close at all.
+ *
+ * The one comparable constant in this frontend is api-wrapper's
+ * AUTH_REFRESH_TIMEOUT_MS (15s, for the token refresh). These two calls are
+ * the heavier pair -- the write endpoint runs a full validation pass and one
+ * encryption before it answers -- so this is one notch longer rather than a
+ * number carried in from somewhere outside this repository.
+ */
+const CONNECTOR_RUNTIME_REQUEST_TIMEOUT_MS = 20_000
+
+interface AnsweredConnectorRuntimeRequest {
+  response: Response
+  parsed: ParsedApiResponse
+}
+
+/**
+ * Runs one connector-runtime request under the timeout above and hands back
+ * both the response and its parsed body. Throws if the request does not get
+ * that far in time.
+ *
+ * Both of apiRequest's paths forward the whole RequestInit to fetch -- direct
+ * with no stored token, through withBearer and fetchWithRetry with one -- so
+ * the signal reaches every attempt without api-wrapper's shared helpers
+ * needing to know this timeout exists, and callers that pass no signal keep
+ * behaving exactly as before.
+ *
+ * The body is read here rather than by the callers, because fetch resolves
+ * as soon as the response *headers* arrive: a server that sends headers and
+ * then stalls would leave `response.text()` waiting with no bound on it at
+ * all, which is the unbounded wait this timeout exists to rule out. Holding
+ * the read inside the window costs the callers nothing they did not already
+ * do -- both parse every response they get -- except that a non-200 read
+ * response now has its body parsed too, and that parse is discarded unread
+ * exactly as before (this endpoint's `detail` string is never shown).
+ *
+ * Shaped like api-wrapper's own performTokenRefresh: an explicit controller
+ * and timer rather than AbortSignal.timeout, because the timer has to be
+ * cleared on the way out -- a request that answered in time must not leave a
+ * pending abort behind it.
+ *
+ * No distinct failure kind for a timeout: both callers below already map a
+ * rejection to `transport`, which is what a request that never answered is
+ * from the caller's side.
+ */
+async function requestConnectorRuntime(
+  url: string,
+  init: RequestInit = {},
+): Promise<AnsweredConnectorRuntimeRequest> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), CONNECTOR_RUNTIME_REQUEST_TIMEOUT_MS)
+  try {
+    const response = await apiRequest(url, { ...init, signal: controller.signal })
+    const parsed = await parseApiResponse(response)
+    // An aborted body read does not reach here as a rejection the way an
+    // aborted fetch does: parseApiResponse turns it into an empty body
+    // (`response.text().catch(() => "")`, api-wrapper.ts). So a body this
+    // timeout cut short would arrive looking like a well-formed empty
+    // response, which both callers report as `malformed` -- their word for a
+    // server bug, carrying no retry. Reading the signal is what tells a
+    // cut-short read apart from a genuinely empty one.
+    if (controller.signal.aborted) throw new Error("connector-runtime request timed out")
+    return { response, parsed }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export type FetchTaskConnectorRuntimeRequirementsResult =
   | { ok: true; report: ConnectorRuntimeReport }
   | { ok: false; kind: "transport" }
@@ -129,21 +203,23 @@ export type FetchTaskConnectorRuntimeRequirementsResult =
  * "read a report that says nothing is missing" -- collapsing the two would
  * make a task whose read genuinely fails look permanently satisfied. The
  * response body's `detail` string is never read: it is the server's English
- * safe message, not something to show a user.
+ * safe message, not something to show a user. A request whose headers and
+ * body are not both in hand within CONNECTOR_RUNTIME_REQUEST_TIMEOUT_MS is
+ * abandoned and reported the same way as any other transport failure.
  */
 export async function fetchTaskConnectorRuntimeRequirements(
   taskId: number,
 ): Promise<FetchTaskConnectorRuntimeRequirementsResult> {
-  let response: Response
+  let answered: AnsweredConnectorRuntimeRequest
   try {
-    response = await apiRequest(
+    answered = await requestConnectorRuntime(
       `${getApiUrl()}/api/chat/task/${taskId}/connector-runtime-requirements`,
     )
   } catch {
     return { ok: false, kind: "transport" }
   }
+  const { response, parsed } = answered
   if (!response.ok) return { ok: false, kind: "http", status: response.status }
-  const parsed = await parseApiResponse(response)
   const report = readConnectorRuntimeReport(parsed.data)
   if (!report) return { ok: false, kind: "malformed" }
   return { ok: true, report }
@@ -196,15 +272,19 @@ function readSubmitErrorEnvelope(
  * whose body fails report validation is its own case (a server bug, not a
  * network problem). A 200 response does not by itself mean the connector is
  * now satisfied -- resolveDialogOutcome decides that from the returned
- * report, not from this function's `ok` flag.
+ * report, not from this function's `ok` flag. A request whose headers and
+ * body are not both in hand within CONNECTOR_RUNTIME_REQUEST_TIMEOUT_MS is
+ * abandoned and reported as a transport failure; the values it carried may or
+ * may not have been written, which is already true of every other transport
+ * failure on this endpoint.
  */
 export async function submitTaskConnectorRuntimeValues(
   taskId: number,
   items: ConnectorRuntimeSubmitItem[],
 ): Promise<SubmitTaskConnectorRuntimeValuesResult> {
-  let response: Response
+  let answered: AnsweredConnectorRuntimeRequest
   try {
-    response = await apiRequest(
+    answered = await requestConnectorRuntime(
       `${getApiUrl()}/api/chat/task/${taskId}/connector-runtime-values`,
       {
         method: "POST",
@@ -215,7 +295,7 @@ export async function submitTaskConnectorRuntimeValues(
   } catch {
     return { ok: false, kind: "transport" }
   }
-  const parsed = await parseApiResponse(response)
+  const { response, parsed } = answered
   if (response.ok) {
     const report = readConnectorRuntimeReport(parsed.data)
     return report ? { ok: true, report } : { ok: false, kind: "malformed" }
@@ -285,6 +365,7 @@ export type ConnectorRuntimeErrorMessageKey =
   | "conflict"
   | "typeString"
   | "typeObject"
+  | "typeUnknown"
   | "emptyValue"
   | "keyNameRejected"
   | "configChanged"
@@ -316,7 +397,11 @@ function findDeclaredInputType(
       || connector.connector_ref.connector_id !== connectorRef.connector_id
     ) continue
     for (const input of connector.inputs) {
-      if (input.key === key) return input.type
+      // Every type_mismatch reason this backs is section-scoped to "context"
+      // (see locateFieldError in connector-runtime-dialog.tsx, which filters
+      // the same way): without this filter a same-named "secrets" row could
+      // win the search and report that row's declared type instead.
+      if (input.section === "context" && input.key === key) return input.type
     }
   }
   return null
@@ -339,8 +424,9 @@ const GENERIC_DISPOSITION: ConnectorRuntimeFailureDisposition = {
  * future call site must not loosen that check to "looks like English" --
  * that would misclassify a corrupted-selection failure as a fixable key name.
  * `report` is the dialog's own most recently read report, consulted only to
- * pick between the two field-type dispositions (`typeString`/`typeObject`)
- * for a mismatch reason that does not itself carry the field's declared type.
+ * pick among the field-type dispositions (`typeString`/`typeObject`/
+ * `typeUnknown`) for a mismatch reason that does not itself carry the
+ * field's declared type.
  */
 export function classifySubmitFailure(
   outcome: SubmitTaskConnectorRuntimeValuesFailure,
@@ -380,10 +466,28 @@ export function classifySubmitFailure(
     if (reason.startsWith(TYPE_MISMATCH_CONTEXT_PREFIX)) {
       const key = reason.slice(TYPE_MISMATCH_CONTEXT_PREFIX.length)
       const declaredType = findDeclaredInputType(report, connectorRef, key)
+      // The connector's own edit endpoint writes a new declaration in place,
+      // with no version and no snapshot held by the task -- so the type this
+      // dialog read and the type the write endpoint just checked against can
+      // differ. Refreshing here is what lets the row pick up the new
+      // declaration on its next render, rather than staying keyed to the
+      // stale one. The messageKey below is chosen against the pre-refresh
+      // report passed into this call and is not itself recomputed after the
+      // refresh; isTypeMismatchDispositionStale (below) is what the caller
+      // checks against the refreshed report to clear this hint outright
+      // when the row's type no longer matches it, instead of leaving a
+      // type-specific message attached to a row that has since changed type.
+      // Three answers, not two: "object", "string", and "this report
+      // declares no type for this row at all" -- a rejection that carries
+      // no connector_ref, or a row this report does not carry. Folding the
+      // third into "string" tells the user a field needs text on the
+      // strength of a declaration nobody ever read.
       return {
-        messageKey: declaredType === "object" ? "typeObject" : "typeString",
+        messageKey: declaredType === null
+          ? "typeUnknown"
+          : declaredType === "object" ? "typeObject" : "typeString",
         retry: false,
-        refresh: false,
+        refresh: true,
         locate: { connectorRef, key },
       }
     }
@@ -423,6 +527,86 @@ export function classifySubmitFailure(
 }
 
 /**
+ * Whether a type hint on a disposition no longer matches the row it would
+ * attach to, given a report re-read after the disposition's own
+ * `refresh: true` landed. Three messageKeys carry a type hint:
+ * `typeObject` and `typeString` name a declared type, and `typeUnknown`
+ * says the report the hint was derived from named none. Every other
+ * messageKey is never type-related, so this always reads false for it.
+ *
+ * This answers one question only: does the refreshed report still declare
+ * the type the hint names. A row that report no longer declares under
+ * "context", and one it now reports satisfied, both leave the two named
+ * hints alone -- neither is a changed type, and neither means the save
+ * stopped being rejected. What such a row does change is where the hint
+ * can attach and therefore what it may claim: the dialog's field-error
+ * location falls back to whole-dialog scope, where it is reworded to stop
+ * naming a type no field on screen is asking for
+ * (translateDialogScopeFailure in connector-runtime-dialog.tsx).
+ *
+ * What the dialog should then *do* about a hint this calls stale is not
+ * this predicate's question, and the dialog does not ask it directly:
+ * reconcileTypeMismatchDisposition below is the one caller, because two of
+ * the three hints are dropped on a stale answer and one is re-derived.
+ */
+export function isTypeMismatchDispositionStale(
+  disposition: ConnectorRuntimeFailureDisposition,
+  refreshedReport: ConnectorRuntimeReport,
+): boolean {
+  const { messageKey } = disposition
+  if (messageKey !== "typeObject" && messageKey !== "typeString" && messageKey !== "typeUnknown") return false
+  const { connectorRef, key } = disposition.locate
+  if (key === undefined) return false
+  const currentType = findDeclaredInputType(refreshedReport, connectorRef, key)
+  // The unknown hint's whole claim is "this report declares no type here",
+  // so any declared type in the refreshed report ends that claim -- including
+  // the type the server was enforcing all along, which is the common case.
+  // Ending the claim is not the same as having nothing left to say, which is
+  // why the reconciler below re-derives this one instead of dropping it.
+  if (messageKey === "typeUnknown") return currentType !== null
+  const expectedType = messageKey === "typeObject" ? "object" : "string"
+  return currentType !== null && currentType !== expectedType
+}
+
+/**
+ * What a type hint becomes once a report re-read after its own
+ * `refresh: true` has landed: the same hint, a re-derived one, or none.
+ *
+ * Three answers rather than the two "keep it or drop it" the staleness
+ * check alone gives, because a hint stops matching a refreshed report for
+ * two opposite reasons. `typeObject`/`typeString` name a type the row has
+ * since stopped declaring, and nothing in the refreshed report says what
+ * the server was enforcing instead, so there is nothing left to say and
+ * the hint goes. `typeUnknown` is the other way round: its whole claim is
+ * that the report named no type here, and a refreshed report that does
+ * name one answers exactly the question the hint said it could not. So it
+ * is re-derived into the named hint rather than dropped -- dropping it
+ * would take a rejection the user was shown off the screen while the draft
+ * that provoked it is still in the box and the save button still live, and
+ * the next save would be refused the same way for the same unstated
+ * reason.
+ *
+ * The caller compares the result with what it passed in: the same object
+ * back means nothing changed.
+ */
+export function reconcileTypeMismatchDisposition(
+  disposition: ConnectorRuntimeFailureDisposition,
+  refreshedReport: ConnectorRuntimeReport,
+): ConnectorRuntimeFailureDisposition | null {
+  if (!isTypeMismatchDispositionStale(disposition, refreshedReport)) return disposition
+  if (disposition.messageKey !== "typeUnknown") return null
+  const { connectorRef, key } = disposition.locate
+  const currentType = key === undefined ? null : findDeclaredInputType(refreshedReport, connectorRef, key)
+  // Unreachable: the staleness check calls an unknown-type hint stale only
+  // when the refreshed report declares a type for this row. Kept as a guard
+  // rather than a non-null assertion so that this function proves the fact
+  // instead of assuming it, and so a future loosening of that check cannot
+  // turn it into a hint naming a type nobody read.
+  if (currentType === null) return null
+  return { ...disposition, messageKey: currentType === "object" ? "typeObject" : "typeString" }
+}
+
+/**
  * Whether the connector-runtime dialog is a supported presence on the
  * current page. The failure notification that would open it reaches every
  * page an authenticated user can be on (the triggering frame is filtered
@@ -435,10 +619,8 @@ export function classifySubmitFailure(
  * owner-of-the-task check, and narrowing where the dialog appears can only
  * make it appear less, never grant it access it would not otherwise have.
  *
- * These are the same route shapes components/layout/sidebar.tsx already
- * matches off `usePathname()` to find the viewed conversation, and the
- * static-export server (frontend_static.py) maps the same three shapes to
- * a page shell -- a trailing slash and the `__shell__` placeholder id both
+ * The static-export server (frontend_static.py) maps all three shapes to a
+ * page shell -- a trailing slash and the `__shell__` placeholder id both
  * still match, so this holds under either deployment.
  */
 export const CONNECTOR_RUNTIME_DIALOG_HOST_PATTERNS = [
@@ -526,22 +708,80 @@ export type ConnectorRuntimeDialogAction = "saveAndResend" | "saveOnly" | "ackno
  * stash is non-empty, which is cleared the moment the snapshot is handed to
  * the request; reading the stash here instead would make the resend button
  * disappear right after the handoff that is supposed to enable it.
+ *
+ * Every outcome maps to at least one button, `met` included. A met report
+ * normally closes the dialog before it renders: the first read does, and so
+ * does a save, once any resend it promised has settled. Three paths still
+ * render one in an open dialog -- the refresh a failed save triggers, a
+ * same-task re-request's read that finds nothing missing, and a
+ * save-and-resend's own successful save while its resend is still in flight
+ * -- and returning no buttons there left the footer empty with only the
+ * window chrome's close control to get out of it.
  */
 export function resolveDialogActions(
   outcome: DialogOutcome,
   hasResendPayload: boolean,
 ): ConnectorRuntimeDialogAction[] {
-  if (outcome.kind === "unsupported_only" || outcome.kind === "nothing_fillable") {
-    return ["acknowledge"]
+  switch (outcome.kind) {
+    case "fillable":
+      return hasResendPayload ? ["saveAndResend", "saveOnly"] : ["saveOnly"]
+    case "met":
+    case "unsupported_only":
+    case "nothing_fillable":
+      return ["acknowledge"]
+    default: {
+      // Listing the acknowledge kinds instead of defaulting to them is what
+      // makes this assignment stop compiling once a kind is added to
+      // DialogOutcomeKind without a case here, rather than letting the new
+      // kind inherit a button set nobody chose for it. The return below
+      // still keeps a footer from rendering empty if a value from outside
+      // the union reaches this at runtime.
+      const unhandled: never = outcome
+      void unhandled
+      return ["acknowledge"]
+    }
   }
-  if (outcome.kind === "met") return []
-  return hasResendPayload ? ["saveAndResend", "saveOnly"] : ["saveOnly"]
 }
 
-/** Shared by the dialog's draft state and buildSubmitItems so a draft value
- *  written under one key is always read back under the same key. */
-export function connectorRuntimeInputDraftKey(ref: ConnectorRuntimeRef, key: string): string {
-  return `${ref.connector_type}:${ref.connector_id}:${key}`
+/**
+ * Shared by the dialog's draft state and buildSubmitItems so a draft value
+ * written under one key is always read back under the same key. Keyed by the
+ * input's full identity -- connector, section, key name and declared type --
+ * not just connector and key name: the connector's own edit endpoint can
+ * change a key's declared type in place between the report a draft was
+ * written against and the next one the dialog reads (no version, no
+ * per-task snapshot), and two different sections of the same connector may
+ * legitimately reuse a key name. Including type means a stale draft cannot
+ * silently survive a type change under a new, unrelated meaning; including
+ * section means two same-named rows in different sections never collide,
+ * including as React list keys (the dialog reuses this same string there).
+ */
+export function connectorRuntimeInputDraftKey(
+  ref: ConnectorRuntimeRef,
+  section: ConnectorRuntimeSection,
+  key: string,
+  type: ConnectorRuntimeType,
+): string {
+  return `${ref.connector_type}:${ref.connector_id}:${section}:${key}:${type}`
+}
+
+/**
+ * Whether a parsed JSON value is an object-typed context draft worth
+ * submitting: a plain object (not an array, not null) with at least one key.
+ * An empty object parses as valid JSON, but the server's own blank check
+ * (`not value` for an object-typed context field) treats `{}` as empty and
+ * 400s the whole submission, taking every other filled-in key in the same
+ * batch down with it -- so this is the one predicate both the dialog's blur
+ * validation and buildSubmitItems below read, instead of each hand-rolling
+ * its own "is this submittable" check and drifting apart on `{}`.
+ *
+ * Built on api-wrapper's isJsonRecord rather than restating the plain-object
+ * test, so the dialog -- which needs the two halves apart, to tell an empty
+ * object from a value that is no object at all -- reads the same plain-object
+ * rule this does instead of a second copy of it.
+ */
+export function isSubmittableObjectValue(parsed: unknown): boolean {
+  return isJsonRecord(parsed) && Object.keys(parsed).length > 0
 }
 
 /**
@@ -565,7 +805,7 @@ export function buildSubmitItems(
     const context: Record<string, unknown> = {}
     for (const input of connector.inputs) {
       if (input.section !== "context" || input.satisfied) continue
-      const rawValue = drafts[connectorRuntimeInputDraftKey(connector.connector_ref, input.key)]
+      const rawValue = drafts[connectorRuntimeInputDraftKey(connector.connector_ref, input.section, input.key, input.type)]
       if (rawValue === undefined) continue
       if (input.type === "string") {
         // Submit the trimmed value, not the raw one. The server's merge makes
@@ -583,12 +823,7 @@ export function buildSubmitItems(
         } catch {
           continue
         }
-        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue
-        // An empty object is the object-draft equivalent of a blank string:
-        // the server's own blank check (`not value` for an object-typed
-        // context field) treats `{}` as empty and 400s the whole submission,
-        // taking every other filled-in key in the same batch down with it.
-        if (Object.keys(parsed).length === 0) continue
+        if (!isSubmittableObjectValue(parsed)) continue
         context[input.key] = parsed
       }
     }
@@ -600,12 +835,16 @@ export function buildSubmitItems(
 
 /**
  * The submit button's only enabling rule: at least one submittable key, and
- * no context draft that failed object-JSON parsing. Never adds "every
- * required key filled" -- that would be a second, independently-maintained
- * copy of the server's own completeness rule, the exact drift the design
- * forbids. A malformed key-name warning never participates here either: it
- * is informational, and the row it warns about can still be submitted (the
- * server, not this rule, is the one that will reject it).
+ * `hasInvalidObjectDraft` is false. That flag means an invalid-object draft
+ * on a row the current report still offers an editable control for --
+ * deciding which marks are still live is the caller's job, not this
+ * function's; a mark against a row the report no longer renders as editable
+ * must not reach this parameter. Never adds "every required key filled" --
+ * that would be a second, independently-maintained copy of the server's own
+ * completeness rule, the exact drift the design forbids. A malformed
+ * key-name warning never participates here either: it is informational, and
+ * the row it warns about can still be submitted (the server, not this rule,
+ * is the one that will reject it).
  */
 export function isSubmitEnabled(items: ConnectorRuntimeSubmitItem[], hasInvalidObjectDraft: boolean): boolean {
   return items.length > 0 && !hasInvalidObjectDraft

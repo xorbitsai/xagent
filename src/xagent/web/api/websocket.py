@@ -2983,6 +2983,7 @@ async def handle_builder_chat(
     from ...core.agent.context.enrichment import build_skill_context
     from ...core.agent.service import AgentService
     from ...core.memory.in_memory import InMemoryMemoryStore
+    from ...core.tools.adapters.vibe.agent_tool import without_connector_categories
     from ...skills.utils import create_skill_manager
     from ..services.agent_prompt import apply_user_voice, voice_from_runtime_user
     from ..services.builder_chat_runtime import load_builder_chat_runtime_inputs
@@ -3030,7 +3031,9 @@ async def handle_builder_chat(
             "instructions": message_data.get("instructions", ""),
             "model": models.get("general"),
             "compact_model": models.get("compact"),
-            "tool_categories": message_data.get("tool_categories", []),
+            "tool_categories": without_connector_categories(
+                message_data.get("tool_categories", [])
+            ),
             "skills": message_data.get("selectedSkills", []),
             "knowledge_bases": message_data.get("selectedKbs", []),
             "execution_mode": message_data.get("executionMode", "balanced"),

@@ -1787,6 +1787,96 @@ def test_symlink_target_with_matching_bytes_is_replaced_not_reused(tmp_path):
     assert resolved is not None
 
 
+SPILL_DIR_SYMLINK_SHAPES = [
+    pytest.param("sibling", id="symlink-to-sibling-directory"),
+    pytest.param("outside", id="symlink-outside-the-workspace"),
+    pytest.param("dangling", id="dangling-symlink"),
+    pytest.param("loop", id="symlink-loop"),
+    pytest.param("plain-file", id="plain-file-at-the-reserved-name"),
+]
+
+
+@pytest.mark.parametrize("shape", SPILL_DIR_SYMLINK_SHAPES)
+def test_a_symlink_at_the_spill_directory_is_refused_and_the_value_kept(
+    tmp_path, caplog, shape
+):
+    """The reserved name must be a real directory, never a link.
+
+    The workspace reserves the name, not what the name points at, so bytes
+    written through a link there would land in a directory that is listed
+    and writable. The writer refuses, the run budget gives the slot back,
+    and the value stays in place for ordinary truncation -- the same
+    outcome as any other write failure. A plain file sitting at the reserved
+    name is not a symlink, so the symlink check never fires; the refusal
+    instead comes from ``mkdir()`` raising ``FileExistsError`` against a name
+    that already exists and is not a directory -- the same ``OSError``
+    fallback, reached a different way.
+    """
+    target = _target(tmp_path)
+    spill_dir = Path(target.spill_dir)
+    spill_dir.parent.mkdir(parents=True)
+    link_target = None
+    if shape == "plain-file":
+        spill_dir.write_text("not a directory")
+    else:
+        if shape == "sibling":
+            link_target = spill_dir.parent / "stash"
+            link_target.mkdir()
+        elif shape == "outside":
+            link_target = tmp_path / "elsewhere"
+            link_target.mkdir()
+        elif shape == "dangling":
+            link_target = spill_dir.parent / "does-not-exist"
+        else:
+            link_target = spill_dir
+        try:
+            os.symlink(link_target, spill_dir)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not available on this platform/user")
+    result = {"rows": list(range(60))}
+    budget = SpillRunBudget()
+
+    with caplog.at_level("WARNING"):
+        spilled, records = spill_oversized_values(
+            result, target, tool_name="acme", max_recursion=20, run_budget=budget
+        )
+
+    assert records == []
+    assert spilled == result
+    assert budget.files_written == 0
+    if shape == "plain-file":
+        assert not spill_dir.is_symlink()
+        assert spill_dir.is_file()
+    else:
+        assert spill_dir.is_symlink()
+        if link_target.exists():
+            assert list(link_target.iterdir()) == []
+    assert any("Failed to write spill file" in m for m in caplog.messages)
+    if shape == "plain-file":
+        assert "FileExistsError" in caplog.text
+    else:
+        assert "is a symlink" in caplog.text
+
+
+def test_a_real_spill_directory_is_written_into_as_before(tmp_path):
+    """The symlink check does not touch the ordinary path, created or reused."""
+    target = _target(tmp_path)
+    result = {"rows": list(range(60))}
+    budget = SpillRunBudget()
+    _, records = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20, run_budget=budget
+    )
+    assert len(records) == 1
+    assert budget.files_written == 1
+    assert Path(target.spill_dir).is_dir()
+    assert not Path(target.spill_dir).is_symlink()
+    _, records_again = spill_oversized_values(
+        result, target, tool_name="acme", max_recursion=20, run_budget=budget
+    )
+    assert records_again[0]["relative_path"] == records[0]["relative_path"]
+    assert budget.files_written == 2
+
+
 def test_write_bytes_failure_leaves_no_temp_file(tmp_path, monkeypatch):
     target = _target(tmp_path)
     original_write_bytes = Path.write_bytes

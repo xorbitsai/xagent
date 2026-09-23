@@ -1,5 +1,6 @@
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
 from aiogram import Bot
@@ -20,8 +21,15 @@ class TelegramTraceHandler(TraceHandler):
     MIN_STATUS_UPDATE_INTERVAL_SECONDS = 2.0
 
     def __init__(
-        self, task_id: int, bot: Bot, chat_id: int, message_id: Optional[int] = None
+        self,
+        task_id: int,
+        bot: Bot,
+        chat_id: int,
+        message_id: Optional[int] = None,
+        *,
+        send_update: Callable[[str], Awaitable[None]] | None = None,
     ):
+        self._send_update = send_update
         self.task_id = task_id
         self.bot = bot
         self.chat_id = chat_id
@@ -159,6 +167,11 @@ class TelegramTraceHandler(TraceHandler):
 
         # Avoid updating if text hasn't changed much (to prevent rate limits)
         if self.current_text == display_text:
+            return
+
+        if self._send_update is not None:
+            await self._send_update(display_text)
+            self.current_text = display_text
             return
 
         def is_cancelled() -> bool:

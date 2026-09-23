@@ -86,6 +86,13 @@ describe("translations", () => {
     }
   })
 
+  it("does not describe the basic tool category with tools it does not control", () => {
+    const en = translations.en.builds.configForm.tools.categoryDescriptions.basic
+    const zh = translations.zh.builds.configForm.tools.categoryDescriptions.basic
+    expect(en).not.toContain("date/time retrieval")
+    expect(zh).not.toContain("日期时间获取")
+  })
+
   it("describes the admin account label and searchable identities", () => {
     expect(translations.en.userManagement.list).toEqual(
       expect.objectContaining({

@@ -12,6 +12,8 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Query, Session
 
 from ...config import get_uploads_dir
+from ...core.agent.context.skill_tool import LOAD_SKILL_TOOL_NAME
+from ...core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES
 from ...core.tools.adapters.vibe.config import run_with_tool_runtime_cleanup
 from ..auth_dependencies import get_current_user
 from ..init_tool_configs import get_default_tool_configs
@@ -240,6 +242,7 @@ def _create_tool_info(
         "category": category,
         "display_category": CATEGORY_DISPLAY_NAMES.get(category, category.capitalize()),
         "enabled": enabled,
+        "always_available": tool_name in INTRINSIC_TOOL_NAMES,
         "requires_configuration": False,
         "status": status,
         "status_reason": status_reason,
@@ -472,6 +475,7 @@ async def get_available_tools(
         return {
             "tools": tools,
             "count": len(tools),
+            "skill_loader_tool": LOAD_SKILL_TOOL_NAME,
         }
 
     return await run_with_tool_runtime_cleanup(

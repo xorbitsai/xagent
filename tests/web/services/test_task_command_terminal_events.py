@@ -790,7 +790,8 @@ async def test_actor_snapshot_survives_supported_user_deletion(
 
     if delete_before_staging:
         assert await delete_user(actor_id, deleting_admin, db_session) == {
-            "message": "User deleted successfully"
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
         }
     claimed = claim_task_command(
         db_session,
@@ -805,7 +806,8 @@ async def test_actor_snapshot_survives_supported_user_deletion(
     )
     if not delete_before_staging:
         assert await delete_user(actor_id, deleting_admin, db_session) == {
-            "message": "User deleted successfully"
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
         }
     if actor in db_session:
         db_session.expunge(actor)

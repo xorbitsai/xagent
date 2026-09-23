@@ -18,6 +18,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     WebIngestionResult,
 )
 from xagent.core.tools.core.RAG_tools.kb import (
+    KBCoordinator,
     KBOperationCompatibilityFacade,
     KBPipelineCompatibilityFacade,
     RollbackStatus,
@@ -26,6 +27,9 @@ from xagent.core.tools.core.RAG_tools.kb import (
 from xagent.core.tools.core.RAG_tools.kb.models import (
     RollbackFailedIngestionRequest,
     RollbackFailedIngestionResult,
+)
+from xagent.core.tools.core.RAG_tools.kb.operation_compatibility import (
+    finish_web_ingestion_outcome,
 )
 from xagent.core.tools.core.RAG_tools.web_crawler.crawler import STOPPED_NO_LINKS
 
@@ -1156,6 +1160,181 @@ def test_web_ingestion_root_compensation_success_marks_outcome_complete() -> Non
     assert outcome is not None
     assert outcome.rollback_status is RollbackStatus.COMPLETE
     assert outcome.side_effects_may_remain is False
+
+
+def test_web_page_default_finish_after_successful_compensation_clears_flag() -> None:
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+    url = "https://example.com"
+
+    with operation_facade.start_operation(
+        operation_type="web_ingestion", collection="demo"
+    ) as root:
+        with facade.web_page_operation(collection="demo", url=url) as page:
+            facade.record_web_page_file_side_effect(
+                page,
+                collection="demo",
+                url=url,
+                file_path="/tmp/page.md",
+                file_id="file-1",
+                compensation=lambda: None,
+            )
+            assert facade.compensate_web_page_file_side_effect(page) == ()
+            facade.finish_web_page_operation(page, status="error", message="failed")
+        outcome = finish_web_ingestion_outcome(
+            root,
+            status="error",
+            documents_created=0,
+            pages_crawled=1,
+            pages_failed=1,
+            failed_urls={url: "failed"},
+            message="failed",
+        )
+
+    assert outcome is not None
+    (child,) = outcome.child_outcomes
+    expected = (False, RollbackStatus.COMPLETE)
+    assert (child.side_effects_may_remain, child.rollback_status) == expected
+    assert (outcome.side_effects_may_remain, outcome.rollback_status) == expected
+
+
+@pytest.mark.asyncio
+async def test_web_page_stat_error_after_compensation_reports_no_remaining_side_effects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import (
+        document_ingestion,
+        web_ingestion,
+    )
+
+    operation_facade = KBOperationCompatibilityFacade()
+    facade = KBPipelineCompatibilityFacade(operation_compatibility=operation_facade)
+    api_facade = KBCoordinator(
+        operation_compatibility=operation_facade
+    ).api_compatibility
+    monkeypatch.setattr(web_ingestion, "WebCrawler", _SinglePageCrawler)
+    monkeypatch.setattr(
+        web_ingestion, "run_document_ingestion", facade.run_document_ingestion
+    )
+    persistent = tmp_path / "page.md"
+    persistent.write_text("body")
+    compensated = False
+
+    def fake_run_document_ingestion_impl(**_: object) -> IngestionResult:
+        return IngestionResult(
+            status="partial",
+            doc_id="doc-failed",
+            parse_hash="parse-failed",
+            chunk_count=2,
+            embedding_count=2,
+            vector_count=2,
+            completed_steps=[
+                _ingestion_step("initialize_collection", embedding_model_id="model-a"),
+                _ingestion_step("register_document", doc_id="doc-failed", created=True),
+                _ingestion_step("parse_document", parse_hash="parse-failed"),
+                _ingestion_step("chunk_document", chunk_count=2, created=True),
+                _ingestion_step("write_vectors_to_db", vector_count=2),
+            ],
+            failed_step="finalize_document",
+            message="finalize failed",
+        )
+
+    def file_handler(
+        temp_file: Path, title: str, collection: str, url: str
+    ) -> dict[str, object]:
+        def _file_cb() -> None:
+            nonlocal compensated
+            compensated = True
+
+        return {
+            "file_path": str(persistent),
+            "file_id": "file-1",
+            "file_compensation": _file_cb,
+            "document_compensation": lambda result=None: (lambda: None),
+            "status_compensation": lambda result=None: (lambda: None),
+            "rollback_context": {"rollback_kind": "new_web_file"},
+        }
+
+    real_exists = Path.exists
+
+    def exists_denied_after_compensation(self: Path, *args: Any, **kwargs: Any) -> bool:
+        if compensated and self == persistent:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", exists_denied_after_compensation)
+    monkeypatch.setattr(
+        document_ingestion,
+        "_run_document_ingestion_impl",
+        fake_run_document_ingestion_impl,
+    )
+
+    api_result = await api_facade.run_async_with_operation_outcome(
+        lambda: facade.run_web_ingestion(
+            "demo",
+            WebCrawlConfig(start_url="https://example.com", max_pages=1),
+            file_handler=file_handler,
+        ),
+        operation_type="web_ingestion",
+        collection="demo",
+    )
+
+    assert any("Permission denied" in w for w in api_result.result.warnings)
+    assert api_result.result.side_effects_may_remain is False
+    assert api_result.operation_outcome is not None
+    (child,) = api_result.operation_outcome.child_outcomes
+    assert (child.side_effects_may_remain, child.rollback_status) == (
+        False,
+        RollbackStatus.COMPLETE,
+    )
+    decision = api_facade.failed_ingest_cleanup_decision(api_result)
+    assert decision.side_effects_may_remain is False
+
+
+@pytest.mark.asyncio
+async def test_web_root_exception_after_successful_page_raises_without_remaining_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import web_ingestion
+
+    operation_facade = KBOperationCompatibilityFacade()
+    coordinator = KBCoordinator(operation_compatibility=operation_facade)
+    facade = coordinator.pipeline_compatibility
+    url = "https://example.com"
+
+    async def fake_run_web_ingestion_impl(
+        collection: str, **_: object
+    ) -> WebIngestionResult:
+        with facade.web_page_operation(collection=collection, url=url) as page:
+            facade.record_web_page_file_side_effect(
+                page,
+                collection=collection,
+                url=url,
+                file_path="/tmp/page.md",
+                file_id="file-1",
+            )
+            facade.finish_web_page_operation(page, status="success", message="ok")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        web_ingestion, "_run_web_ingestion_impl", fake_run_web_ingestion_impl
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await coordinator.api_compatibility.run_async_with_operation_outcome(
+            lambda: facade.run_web_ingestion("demo", WebCrawlConfig(start_url=url)),
+            operation_type="web_ingestion",
+            collection="demo",
+        )
+
+    outcome = operation_facade.last_outcome
+    assert outcome is not None
+    assert outcome.operation_type == "web_ingestion"
+    assert [child.status for child in outcome.child_outcomes] == ["success"]
+    # Known pair, out of scope (#795): infer_rollback_status still falls back to
+    # has_side_effects().
+    assert outcome.side_effects_may_remain is False
+    assert outcome.rollback_status is RollbackStatus.INCOMPLETE
 
 
 @pytest.mark.asyncio

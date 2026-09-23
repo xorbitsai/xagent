@@ -13,7 +13,9 @@ import {
   fetchTaskConnectorRuntimeRequirements,
   isConnectorRuntimeDialogHostPath,
   isSubmitEnabled,
+  isTypeMismatchDispositionStale,
   readConnectorRuntimeReport,
+  reconcileTypeMismatchDisposition,
   resolveDialogActions,
   resolveDialogOutcome,
   submitTaskConnectorRuntimeValues,
@@ -24,8 +26,10 @@ import {
   type ConnectorRuntimeSection,
   type ConnectorRuntimeType,
   type DialogOutcome,
+  type DialogOutcomeKind,
   type SubmitTaskConnectorRuntimeValuesFailure,
 } from "./connector-runtime-api"
+import { AUTH_CACHE_KEY } from "@/lib/auth-cache"
 
 const REF_A = { connector_type: "custom_api", connector_id: 1 }
 
@@ -350,6 +354,207 @@ describe("the connector-runtime HTTP calls", () => {
       })
     })
   })
+
+  describe("gives up on a request that never answers", () => {
+    afterEach(() => {
+      vi.useRealTimers()
+      localStorage.removeItem(AUTH_CACHE_KEY)
+    })
+
+    /**
+     * A fetch that answers only when its caller aborts it, which is what a
+     * real one does: the request stays open until the signal fires and then
+     * rejects. Returns the signals it was handed, so a test can check whether
+     * the timer behind one was cleared.
+     */
+    function stubUnansweredFetch(): AbortSignal[] {
+      const signals: AbortSignal[] = []
+      vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+        const signal = init?.signal
+        if (signal) signals.push(signal)
+        return new Promise<Response>((_resolve, reject) => {
+          // Real fetch rejects straight away when it is handed a signal that
+          // has already fired, which is what every retry after the first
+          // abort gets. Without this the retries here would hang instead.
+          if (signal?.aborted) {
+            reject(new Error("aborted"))
+            return
+          }
+          signal?.addEventListener("abort", () => reject(new Error("aborted")))
+        })
+      }))
+      return signals
+    }
+
+    it("abandons a requirements read that never answers", async () => {
+      // Nothing else stops this request: the dialog's read effect ignores a
+      // late answer but does not cancel it, so without the timeout the
+      // promise below never settles and the dialog is left unable to save.
+      vi.useFakeTimers()
+      const signals = stubUnansweredFetch()
+      const pending = fetchTaskConnectorRuntimeRequirements(7)
+
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(true)
+    })
+
+    it("abandons a save that never answers", async () => {
+      // The save is the worse of the two: the dialog refuses to close while
+      // one is in flight, so a request that never answers leaves no way out
+      // of it at all.
+      vi.useFakeTimers()
+      const signals = stubUnansweredFetch()
+      const pending = submitTaskConnectorRuntimeValues(7, [{ connector_ref: REF_A, context: { token: "abc" } }])
+
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(true)
+    })
+
+    it("stops the clock once the response has arrived", async () => {
+      // The timer has to be cleared on the way out. Left running, it fires
+      // against a request that already finished, and every call leaves one
+      // more pending abort behind it.
+      vi.useFakeTimers()
+      const signals: AbortSignal[] = []
+      vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+        if (init?.signal) signals.push(init.signal)
+        return Promise.resolve(new Response(JSON.stringify(rawReport()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }))
+      }))
+
+      await expect(fetchTaskConnectorRuntimeRequirements(7)).resolves.toEqual({
+        ok: true,
+        report: expectedReport,
+      })
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(false)
+    })
+
+    /**
+     * A fetch whose headers arrive at once and whose body then never does.
+     * This is the shape the timeout used to miss entirely: fetch resolves on
+     * the headers, so a body that stalls was read outside the window. The
+     * body stream errors when the signal fires, the same way a real one does.
+     */
+    function stubHeadersOnlyFetch(): AbortSignal[] {
+      const signals: AbortSignal[] = []
+      vi.stubGlobal("fetch", vi.fn((_url: string, init?: RequestInit) => {
+        const signal = init?.signal
+        if (signal) signals.push(signal)
+        const body = new ReadableStream({
+          start(controller) {
+            signal?.addEventListener("abort", () => controller.error(new Error("aborted")))
+          },
+        })
+        return Promise.resolve(new Response(body, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }))
+      }))
+      return signals
+    }
+
+    it("abandons a requirements read whose headers arrive but whose body never does", async () => {
+      // Not `malformed`: parseApiResponse turns the cut-short body read into
+      // an empty body, which would otherwise be reported as a server bug --
+      // no retry button, and the dialog re-reading a report that is never
+      // going to arrive.
+      vi.useFakeTimers()
+      const signals = stubHeadersOnlyFetch()
+      const pending = fetchTaskConnectorRuntimeRequirements(7)
+
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(true)
+    })
+
+    it("abandons a save whose headers arrive but whose body never does", async () => {
+      // The save is the one the dialog refuses to close over, so a body that
+      // never finishes arriving must end the same way a request that never
+      // answered at all does.
+      vi.useFakeTimers()
+      const signals = stubHeadersOnlyFetch()
+      const pending = submitTaskConnectorRuntimeValues(7, [{ connector_ref: REF_A, context: { token: "abc" } }])
+
+      await vi.advanceTimersByTimeAsync(20_000)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(1)
+      expect(signals[0].aborted).toBe(true)
+    })
+
+    /**
+     * A stored session, in the shape auth-cache validates (same fields
+     * api-wrapper's own tests write). With one of these present apiRequest
+     * stops calling fetch directly and goes through fetchWithRetry instead,
+     * which is the path the three cases above never take.
+     */
+    function writeAuthCache() {
+      const now = Date.now()
+      localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
+        schemaVersion: 2,
+        sessionId: "timeout-session",
+        credentialRevision: 0,
+        profileRevision: 0,
+        user: { id: "u1", username: "u1" },
+        token: "access-token",
+        refreshToken: "refresh-token",
+        timestamp: now,
+        expiresAt: now + 3_600_000,
+        refreshExpiresAt: now + 7_200_000,
+      }))
+    }
+
+    it("gives up once, not once per retry, when a signed-in request never answers", async () => {
+      // A signed-in request goes through fetchWithRetry, which retries twice
+      // more on a rejection. One controller covers all three attempts, so the
+      // two retries are handed a signal that has already fired and reject at
+      // once -- the whole call still ends 20 seconds in (plus fetchWithRetry's
+      // own 100ms and 200ms backoffs), not 60. That is why no "do not retry a
+      // timed-out request" rule was added to fetchWithRetry: there is nothing
+      // for one to save.
+      vi.useFakeTimers()
+      writeAuthCache()
+      const signals = stubUnansweredFetch()
+      const pending = fetchTaskConnectorRuntimeRequirements(7)
+      let settled = false
+      void pending.then(() => { settled = true })
+
+      await vi.advanceTimersByTimeAsync(19_999)
+      expect(settled).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1 + 300)
+
+      await expect(pending).resolves.toEqual({ ok: false, kind: "transport" })
+      expect(signals).toHaveLength(3)
+      expect(signals.every(signal => signal.aborted)).toBe(true)
+      expect(signals[1]).toBe(signals[0])
+    })
+
+    it("still reports a genuinely empty body as malformed", async () => {
+      // The guard above keys on the signal, not on the body being empty, so
+      // an empty body that arrived in time keeps its own distinct answer.
+      vi.useFakeTimers()
+      vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("", { status: 200 }))))
+
+      await expect(fetchTaskConnectorRuntimeRequirements(7)).resolves.toEqual({
+        ok: false,
+        kind: "malformed",
+      })
+    })
+  })
 })
 
 describe("buildSubmitItems", () => {
@@ -366,19 +571,19 @@ describe("buildSubmitItems", () => {
     ])
 
     const blankDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "unsatisfiedKey")]: "",
-      [connectorRuntimeInputDraftKey(REF_A, "secretUnsatisfied")]: "value",
-      [connectorRuntimeInputDraftKey(REF_A, "authKey")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "unsatisfiedKey", "string")]: "",
+      [connectorRuntimeInputDraftKey(REF_A, "secrets", "secretUnsatisfied", "string")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "auth_selector", "authKey", "string")]: "value",
     }
     expect(buildSubmitItems(r, blankDrafts)).toEqual([])
 
     const whitespaceDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "unsatisfiedKey")]: "   ",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "unsatisfiedKey", "string")]: "   ",
     }
     expect(buildSubmitItems(r, whitespaceDrafts)).toEqual([])
 
     const tabDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "unsatisfiedKey")]: "\t\n",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "unsatisfiedKey", "string")]: "\t\n",
     }
     expect(buildSubmitItems(r, tabDrafts)).toEqual([])
 
@@ -386,22 +591,22 @@ describe("buildSubmitItems", () => {
     // own blank check on an object-typed field is `not value`, and `{}`
     // fails it, so a submission that includes it 400s the whole batch.
     const emptyObjectDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "objKey")]: "{}",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "objKey", "object")]: "{}",
     }
     expect(buildSubmitItems(r, emptyObjectDrafts)).toEqual([])
 
     const paddedEmptyObjectDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "objKey")]: "  {}  ",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "objKey", "object")]: "  {}  ",
     }
     expect(buildSubmitItems(r, paddedEmptyObjectDrafts)).toEqual([])
 
     const validDrafts: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "unsatisfiedKey")]: "a",
-      [connectorRuntimeInputDraftKey(REF_A, "objKey")]: '{"k":1}',
+      [connectorRuntimeInputDraftKey(REF_A, "context", "unsatisfiedKey", "string")]: "a",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "objKey", "object")]: '{"k":1}',
       // These would 422 if they leaked into the request; proving they never
       // do is this test's whole point.
-      [connectorRuntimeInputDraftKey(REF_A, "secretUnsatisfied")]: "value",
-      [connectorRuntimeInputDraftKey(REF_A, "authKey")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "secrets", "secretUnsatisfied", "string")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "auth_selector", "authKey", "string")]: "value",
     }
     expect(buildSubmitItems(r, validDrafts)).toEqual([
       { connector_ref: REF_A, context: { unsatisfiedKey: "a", objKey: { k: 1 } } },
@@ -419,12 +624,12 @@ describe("buildSubmitItems", () => {
       ]),
     ])
     for (const raw of ["  abc  ", "\tabc\n", "abc ", " abc"]) {
-      expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "token")]: raw })).toEqual([
+      expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "context", "token", "string")]: raw })).toEqual([
         { connector_ref: REF_A, context: { token: "abc" } },
       ])
     }
     // Interior whitespace is part of the value and is left alone.
-    expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "token")]: "  a b  " })).toEqual([
+    expect(buildSubmitItems(r, { [connectorRuntimeInputDraftKey(REF_A, "context", "token", "string")]: "  a b  " })).toEqual([
       { connector_ref: REF_A, context: { token: "a b" } },
     ])
   })
@@ -479,11 +684,15 @@ describe("classifySubmitFailure", () => {
     expect(classifySubmitFailure(coded(409, "runtime_context_immutable", "conflict.context.token", REF_A), baseReport)).toEqual({
       messageKey: "conflict", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "token" },
     })
+    // A type mismatch refreshes: the connector owner can change a key's
+    // declared type between the report this dialog read and the write it
+    // just submitted, and without a refresh every retry keeps failing the
+    // same way against the stale declaration.
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "type_mismatch.context.config", REF_A), baseReport)).toEqual({
-      messageKey: "typeObject", retry: false, refresh: false, locate: { connectorRef: REF_A, key: "config" },
+      messageKey: "typeObject", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "config" },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "type_mismatch.context.token", REF_A), baseReport)).toEqual({
-      messageKey: "typeString", retry: false, refresh: false, locate: { connectorRef: REF_A, key: "token" },
+      messageKey: "typeString", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "token" },
     })
     expect(classifySubmitFailure(coded(400, "invalid_runtime_context", "empty_value.context.token", REF_A), baseReport)).toEqual({
       messageKey: "emptyValue", retry: false, refresh: false, locate: { connectorRef: REF_A, key: "token" },
@@ -542,6 +751,119 @@ describe("classifySubmitFailure", () => {
     expect(classifySubmitFailure(coded(400, "some_future_code", "anything"), baseReport)).toEqual({
       messageKey: "contactAdmin", retry: false, refresh: false, locate: {},
     })
+  })
+
+  it("picks the context declaration's type, not a same-named secrets row that comes first in the report", () => {
+    // A secrets-section row named "shared" is listed before the context row
+    // sharing that name: findDeclaredInputType must not let the first
+    // match-by-key-alone win, or a type_mismatch on the context row would
+    // report the secrets row's type instead.
+    const reportWithSecretsFirst = report(false, [
+      connector(REF_A, "A", [
+        input({ section: "secrets", key: "shared", type: "object", required: false }),
+        input({ section: "context", key: "shared", type: "string", required: true }),
+      ]),
+    ])
+    expect(classifySubmitFailure(
+      coded(400, "invalid_runtime_context", "type_mismatch.context.shared", REF_A),
+      reportWithSecretsFirst,
+    )).toEqual({
+      messageKey: "typeString", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "shared" },
+    })
+  })
+
+  it("reports an undeclared type as unknown instead of as text", () => {
+    // "ghost" is not declared by any connector in baseReport, so there is
+    // no declaration to read a type from at all -- this must not be
+    // reported as "needs text" on the strength of a declaration nobody
+    // read.
+    expect(classifySubmitFailure(
+      coded(400, "invalid_runtime_context", "type_mismatch.context.ghost", REF_A),
+      baseReport,
+    )).toEqual({
+      messageKey: "typeUnknown", retry: false, refresh: true, locate: { connectorRef: REF_A, key: "ghost" },
+    })
+  })
+})
+
+describe("isTypeMismatchDispositionStale", () => {
+  const disposition = (messageKey: ConnectorRuntimeErrorMessageKey, key = "token") => ({
+    messageKey, retry: false as const, refresh: true as const, locate: { connectorRef: REF_A, key },
+  })
+
+  it("clears an unknown-type hint once a refreshed report declares a type", () => {
+    // Both directions must be asserted: a mutation that drops the
+    // typeUnknown-specific branch and falls through to the typeString
+    // comparison would still read true for the "declared as object" case
+    // by accident, and only the "declared as string" case catches it.
+    const declaredObject = report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "object", required: true })]),
+    ])
+    const declaredString = report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])
+    expect(isTypeMismatchDispositionStale(disposition("typeUnknown"), declaredObject)).toBe(true)
+    expect(isTypeMismatchDispositionStale(disposition("typeUnknown"), declaredString)).toBe(true)
+  })
+
+  it("keeps an unknown-type hint while the row is still undeclared", () => {
+    const stillUndeclared = report(false, [connector(REF_A, "A", [])])
+    expect(isTypeMismatchDispositionStale(disposition("typeUnknown"), stillUndeclared)).toBe(false)
+  })
+
+  it("leaves the two named type hints behaving as before", () => {
+    const declaredString = report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])
+    const declaredObject = report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "object", required: true })]),
+    ])
+    const stillUndeclared = report(false, [connector(REF_A, "A", [])])
+    expect(isTypeMismatchDispositionStale(disposition("typeObject"), declaredString)).toBe(true)
+    expect(isTypeMismatchDispositionStale(disposition("typeObject"), declaredObject)).toBe(false)
+    expect(isTypeMismatchDispositionStale(disposition("typeObject"), stillUndeclared)).toBe(false)
+  })
+})
+
+describe("reconcileTypeMismatchDisposition", () => {
+  const disposition = (messageKey: ConnectorRuntimeErrorMessageKey, key = "token") => ({
+    messageKey, retry: false as const, refresh: true as const, locate: { connectorRef: REF_A, key },
+  })
+  const declaredString = report(false, [
+    connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+  ])
+  const declaredObject = report(false, [
+    connector(REF_A, "A", [input({ section: "context", key: "token", type: "object", required: true })]),
+  ])
+  const stillUndeclared = report(false, [connector(REF_A, "A", [])])
+
+  it("re-derives an unknown-type hint into the type the refreshed report declares", () => {
+    // The refresh is what answers the question this hint said it could not,
+    // so the answer replaces the hint. Dropping it instead would take a
+    // rejection the user was shown off the screen while the draft that
+    // provoked it is still in the box and still saveable.
+    expect(reconcileTypeMismatchDisposition(disposition("typeUnknown"), declaredString))
+      .toEqual({ ...disposition("typeUnknown"), messageKey: "typeString" })
+    expect(reconcileTypeMismatchDisposition(disposition("typeUnknown"), declaredObject))
+      .toEqual({ ...disposition("typeUnknown"), messageKey: "typeObject" })
+  })
+
+  it("drops a named type hint the refreshed report contradicts", () => {
+    // Nothing in the refreshed report says what the server was enforcing
+    // instead, so there is no re-derivation to make here.
+    expect(reconcileTypeMismatchDisposition(disposition("typeObject"), declaredString)).toBeNull()
+    expect(reconcileTypeMismatchDisposition(disposition("typeString"), declaredObject)).toBeNull()
+  })
+
+  it("hands back the same disposition when the refreshed report changes nothing", () => {
+    // Identity, not equality: the dialog compares the result with what it
+    // passed in to decide whether to touch its field-error state at all.
+    const unknown = disposition("typeUnknown")
+    expect(reconcileTypeMismatchDisposition(unknown, stillUndeclared)).toBe(unknown)
+    const named = disposition("typeString")
+    expect(reconcileTypeMismatchDisposition(named, declaredString)).toBe(named)
+    const unrelated = disposition("conflict")
+    expect(reconcileTypeMismatchDisposition(unrelated, declaredObject)).toBe(unrelated)
   })
 })
 
@@ -655,6 +977,7 @@ describe("derives the action set from the outcome and the resend snapshot", () =
   const fillable: DialogOutcome = { kind: "fillable", blocking: [] }
   const unsupportedOnly: DialogOutcome = { kind: "unsupported_only", blocking: [] }
   const nothingFillable: DialogOutcome = { kind: "nothing_fillable" }
+  const met: DialogOutcome = { kind: "met" }
 
   it.each([
     ["fillable", fillable, true, ["saveAndResend", "saveOnly"]],
@@ -663,8 +986,27 @@ describe("derives the action set from the outcome and the resend snapshot", () =
     ["unsupported_only", unsupportedOnly, false, ["acknowledge"]],
     ["nothing_fillable", nothingFillable, true, ["acknowledge"]],
     ["nothing_fillable", nothingFillable, false, ["acknowledge"]],
+    // A met report is normally closed before it can render, but the refresh
+    // a failed save triggers can install one into an open dialog. It must
+    // still carry a button, or that dialog has an empty footer.
+    ["met", met, true, ["acknowledge"]],
+    ["met", met, false, ["acknowledge"]],
   ] as const)("derives the action set for %s with resend=%s", (_label, outcome, hasResendPayload, expected) => {
     expect(resolveDialogActions(outcome, hasResendPayload)).toEqual(expected)
+  })
+
+  it("gives every outcome kind at least one action", () => {
+    const byKind: Record<DialogOutcomeKind, DialogOutcome> = {
+      met,
+      unsupported_only: unsupportedOnly,
+      nothing_fillable: nothingFillable,
+      fillable,
+    }
+    for (const kind of DIALOG_OUTCOME_KINDS) {
+      for (const hasResendPayload of [true, false]) {
+        expect(resolveDialogActions(byKind[kind], hasResendPayload).length).toBeGreaterThan(0)
+      }
+    }
   })
 })
 
@@ -689,7 +1031,7 @@ describe("isSubmitEnabled", () => {
       ]),
     ])
     const onlyBadKeyFilled: Record<string, string> = {
-      [connectorRuntimeInputDraftKey(REF_A, "bad key")]: "value",
+      [connectorRuntimeInputDraftKey(REF_A, "context", "bad key", "string")]: "value",
     }
     expect(isSubmitEnabled(buildSubmitItems(fourMissingKeysReport, onlyBadKeyFilled), false)).toBe(true)
   })

@@ -40,6 +40,7 @@ from ...runtime import (
 )
 from ..base import AgentPattern, PatternResult, RequiredToolCallError
 from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
+from ..partial_delivery import request_partial_delivery
 from ..react import ReActPattern, ReActReasoningMode
 from .plan_generator import (
     CallablePlanGenerator,
@@ -53,6 +54,7 @@ from .plan_generator import (
 logger = logging.getLogger(__name__)
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
+DAG_FAILURE_DELIVERY_TIMEOUT_SECONDS = 30.0
 
 # Precedence for _select_winner()'s ranking of a same-wakeup completed
 # batch: lower rank wins. A status not listed here (only "interrupted"
@@ -492,6 +494,9 @@ class DAGPattern(AgentPattern):
         self.active_step_pattern_states: dict[str, dict[str, Any]] = {}
         self.active_step_contexts: dict[str, dict[str, Any]] = {}
         self.step_results: dict[str, Any] = {}
+        # Failed-step observations are evidence only, never dependency results.
+        self.failed_step_evidence: dict[str, Any] = {}
+        self.failure_delivery_attempted = False
         self.planned_user_message_count = 0
         self.replan_owed_step_ids: list[str] = []
         self.memory_input_text: str | None = None
@@ -540,6 +545,10 @@ class DAGPattern(AgentPattern):
                 skill_manager=kwargs.get("skill_manager"),
                 allowed_skills=kwargs.get("allowed_skills"),
             )
+            if result.get("failure_reason") == "step_failed":
+                result = await self._deliver_after_step_failure(
+                    context=context, llm=llm, runtime=runtime, failure=result
+                )
         except RequiredToolCallError as exc:
             result = await self._fail(
                 context=context,
@@ -1159,6 +1168,7 @@ class DAGPattern(AgentPattern):
         except Exception as exc:
             step.status = "failed"
             step.error = str(exc)
+            self._retain_failed_step_evidence(step.id, child_context, react_pattern)
             self._clear_active_step(step.id)
             await runtime.on_dag_step_end(
                 context=root_context,
@@ -1224,6 +1234,7 @@ class DAGPattern(AgentPattern):
         if not result.get("success"):
             step.status = "failed"
             step.error = result.get("error", f"Step {step.id} failed.")
+            self._retain_failed_step_evidence(step.id, child_context, react_pattern)
             await runtime.on_dag_step_end(
                 context=root_context,
                 step_id=step.id,
@@ -1276,6 +1287,8 @@ class DAGPattern(AgentPattern):
             "active_step_pattern_states": dict(self.active_step_pattern_states),
             "active_step_contexts": dict(self.active_step_contexts),
             "step_results": dict(self.step_results),
+            "failed_step_evidence": dict(self.failed_step_evidence),
+            "failure_delivery_attempted": self.failure_delivery_attempted,
             "planned_user_message_count": self.planned_user_message_count,
             "replan_owed_step_ids": list(self.replan_owed_step_ids),
             "memory_input_text": self.memory_input_text,
@@ -1368,6 +1381,10 @@ class DAGPattern(AgentPattern):
             )
         self._sync_legacy_active_step()
         self.step_results = dict(state.get("step_results", {}))
+        self.failed_step_evidence = dict(state.get("failed_step_evidence", {}))
+        self.failure_delivery_attempted = bool(
+            state.get("failure_delivery_attempted", False)
+        )
         self.planned_user_message_count = int(
             state.get("planned_user_message_count", 0)
         )
@@ -1436,6 +1453,161 @@ class DAGPattern(AgentPattern):
             error=error,
             metadata=metadata,
         ).to_dict()
+
+    def _retain_failed_step_evidence(
+        self, step_id: str, context: Any, pattern: ReActPattern
+    ) -> None:
+        # Child contexts inherit root messages, but their durable tool ledger
+        # belongs to this step. Keep only its observations, using the latest
+        # visible result when a provider reuses an inherited tool-call id.
+        tool_call_ids = {
+            record.tool_call_id
+            for record in pattern.tool_ledger.values()
+            if record.status == "completed"
+        }
+        observations = {
+            message["tool_call_id"]: message["content"]
+            for message in context.get_messages_for_llm()
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") in tool_call_ids
+        }
+        self.failed_step_evidence[step_id] = {
+            "evidence_state": evidence_facts(tool_evidence_state(context)),
+            "observations": list(observations.values()),
+        }
+
+    async def _deliver_after_step_failure(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+        failure: dict[str, Any],
+    ) -> dict[str, Any]:
+        # _run has already stopped scheduling and drained concurrent siblings.
+        # Preserve failure dominance over a simultaneous sibling interruption;
+        # a user stop must not start a new LLM call either.
+        if self.failure_delivery_attempted or await runtime.should_interrupt():
+            return failure
+        if not self.step_results and not any(
+            evidence.get("observations")
+            for evidence in self.failed_step_evidence.values()
+        ):
+            return failure
+        self.failure_delivery_attempted = True
+        await runtime.checkpoint(
+            "dag_before_failure_delivery",
+            context=context,
+            pattern=self,
+            metadata={"failure_reason": "step_failed"},
+        )
+        # Reuse the final-answer scope/language/evidence payload, but never send
+        # raw exceptions or planner prose as facts for the handoff.
+        payload = self._delivery_evidence_payload(context)
+        payload.update(
+            failed_step_id=failure.get("failed_step_id"),
+            failed_step_evidence=self.failed_step_evidence,
+        )
+        system_prompt = (
+            "DAG execution stopped because a step failed. No further work or "
+            "verification is possible in this run. Call final_answer exactly "
+            "once to hand over useful existing results and trusted deliverable "
+            "links. Clearly distinguish completed work from incomplete steps "
+            "and list missing or unverified parts of the user's request. Do not "
+            "claim full completion or promise to keep working. Set outcome to "
+            "partial if useful results exist, otherwise blocked. Failed-step "
+            "observations may show individual operations succeeded, not that "
+            "the step completed. Only authoritative_user_requests determine "
+            "required scope. Plan structure is execution status, not facts. "
+            "Do not reproduce raw exceptions or tool payloads. "
+            f"{grounding_rule(can_call_tools=False)}\n\n"
+            f"{final_deliverable_file_reference_instructions(can_lookup=False)}\n\n"
+            f"{final_answer_language_rule(subject='output_language_policy field')}"
+        )
+        user_prompt = json.dumps(payload, ensure_ascii=False) + (
+            "\n\nRuntime notice: work has stopped. Call only final_answer to "
+            "hand over existing results and explain what was not done. "
+            "No other tools are available."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "final_answer",
+                "description": "Deliver existing results after execution stopped.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"},
+                        "outcome": {"type": "string", "enum": ["partial", "blocked"]},
+                    },
+                    "required": ["answer", "outcome"],
+                },
+            },
+        }
+
+        def parse_response(response: Any) -> dict[str, Any] | None:
+            if len(self._response_tool_calls(response)) != 1:
+                return None
+            args = self._extract_tool_arguments(response, "final_answer")
+            answer = args.get("answer")
+            return args if isinstance(answer, str) and answer.strip() else None
+
+        try:
+            args = await request_partial_delivery(
+                context=context,
+                llm=llm,
+                runtime=runtime,
+                messages=messages,
+                schema=schema,
+                parse_response=parse_response,
+                metadata={"phase": "dag_failure_delivery"},
+                timeout=DAG_FAILURE_DELIVERY_TIMEOUT_SECONDS,
+            )
+        except ExecutionInterrupted:
+            return failure
+        if args is None or await runtime.should_interrupt():
+            await runtime.checkpoint(
+                "dag_failed",
+                context=context,
+                pattern=self,
+                metadata={
+                    "failure_reason": "step_failed",
+                    "failed_step_id": failure.get("failed_step_id"),
+                },
+            )
+            return failure
+        outcome = args["outcome"]
+        answer = (
+            "DAG execution stopped after a step failed; this is not a completed task."
+            f"\n\n{args['answer']}"
+        )
+        context.add_assistant_message(answer)
+        self.status = "completed"
+        result = PatternResult(
+            success=True,
+            output=answer,
+            metadata={
+                "status": self.status,
+                "completion_outcome": outcome,
+                "termination_reason": "step_failed",
+                "failed_step_id": failure.get("failed_step_id"),
+                "step_results": dict(self.step_results),
+            },
+        ).to_dict()
+        await runtime.checkpoint(
+            "dag_partial_delivery",
+            context=context,
+            pattern=self,
+            metadata={
+                "completion_outcome": outcome,
+                "termination_reason": "step_failed",
+            },
+        )
+        return result
 
     def _ready_steps(self) -> list[PlanStep]:
         if self.plan is None:
@@ -1644,7 +1816,8 @@ class DAGPattern(AgentPattern):
             await final_answer_stream.finish(assessment.answer)
         return assessment
 
-    def _completion_assessment_messages(self, context: Any) -> list[dict[str, Any]]:
+    def _delivery_evidence_payload(self, context: Any) -> dict[str, Any]:
+        """Shared scope, language, and evidence for completed or stopped DAGs."""
         request = top_level_user_request(context)
         pending_response = latest_pending_user_response(context)
         latest_messages = [
@@ -1657,7 +1830,7 @@ class DAGPattern(AgentPattern):
             for message in getattr(context, "messages", [])
             if getattr(message, "role", None) == "user"
         ]
-        payload = {
+        return {
             "independent_user_request": request.language_text,
             "pending_response": (
                 serialize_pending_user_response(pending_response)
@@ -1671,9 +1844,8 @@ class DAGPattern(AgentPattern):
             ),
             "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,
-            # This call writes the user-facing answer, so it gets structure
-            # only: planner prose is never a fact source here, and `status`
-            # is always "completed" -- its sole entry requires that.
+            # Delivery gets plan structure and actual execution status only:
+            # planner prose must never become a fact source in the answer.
             "plan": (
                 {
                     "steps": [
@@ -1692,6 +1864,9 @@ class DAGPattern(AgentPattern):
             "candidate_output": self._final_output(),
             "previous_completion_feedback": self.completion_feedback,
         }
+
+    def _completion_assessment_messages(self, context: Any) -> list[dict[str, Any]]:
+        payload = self._delivery_evidence_payload(context)
         # This call writes the answer the user receives, with no tool to fetch
         # anything back, and its payload filters out system messages -- so the
         # compaction summary never reaches it and this is the only place the

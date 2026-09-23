@@ -1040,6 +1040,57 @@ async def test_execution_adapter_routes_dag_to_dag() -> None:
     assert result["agent_result"]["pattern"] == "DAGPattern"
 
 
+@pytest.mark.asyncio
+async def test_execution_adapter_preserves_dag_failure_delivery_reason() -> None:
+    class FailingStepLLM(FakeLLM):
+        async def chat(self, **kwargs: Any) -> Any:
+            if len(self.calls) == 2:
+                self.calls.append(kwargs)
+                raise RuntimeError("Step provider failed after the tool result")
+            return await super().chat(**kwargs)
+
+    llm = FailingStepLLM(
+        [
+            dag_plan([{"id": "work", "task": "Run a tool and verify it"}]),
+            {"tool_calls": [{"id": "work", "name": "noop", "args": {}}]},
+            {
+                "tool_calls": [
+                    {
+                        "id": "delivery",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": {
+                                "answer": "Tool ran; verification unfinished.",
+                                "outcome": "partial",
+                            },
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="dag-partial",
+            pattern="dag_plan_execute",
+            llm=llm,
+            tools=[FakeTool()],
+            workspace_enabled=False,
+            skills_enabled=False,
+        )
+    )
+
+    result = await adapter.execute(
+        task="Run a tool and verify it", task_id="dag-partial"
+    )
+
+    assert result["completion_outcome"] == "partial"
+    assert result["termination_reason"] == "step_failed"
+    assert result["metadata"]["termination_reason"] == "step_failed"
+    assert "not a completed task" in result["output"]
+    assert len(llm.calls) == 4
+
+
 def test_execution_adapter_passes_dag_max_concurrency_to_pattern() -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
@@ -1622,7 +1673,8 @@ def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None
     assert result["error"] == "ReActPattern interrupted."
 
 
-def test_execution_adapter_preserves_completion_outcome() -> None:
+@pytest.mark.parametrize("reason", ["max_iterations", "step_failed"])
+def test_execution_adapter_preserves_completion_outcome(reason: str) -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
             name="partial",
@@ -1638,6 +1690,7 @@ def test_execution_adapter_preserves_completion_outcome() -> None:
             "success": True,
             "output": "One item remains.",
             "completion_outcome": "partial",
+            "termination_reason": reason,
         },
         execution_type="agent_react",
         execution_id="partial-exec",
@@ -1645,6 +1698,28 @@ def test_execution_adapter_preserves_completion_outcome() -> None:
 
     assert result["completion_outcome"] == "partial"
     assert result["metadata"]["completion_outcome"] == "partial"
+    assert result["termination_reason"] == reason
+    assert result["metadata"]["termination_reason"] == reason
+
+
+@pytest.mark.parametrize("reason", [None, "provider token=secret", [], {}])
+def test_execution_adapter_does_not_promote_unknown_termination_reason(
+    reason: Any,
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="dag", llm=FakeLLM([]))
+    )
+    result = adapter._normalize_result(
+        result={
+            "success": True,
+            "output": "Partial result",
+            "termination_reason": reason,
+        },
+        execution_type="agent_dag",
+        execution_id="test",
+    )
+    assert "termination_reason" not in result
+    assert "termination_reason" not in result["metadata"]
 
 
 @pytest.mark.asyncio

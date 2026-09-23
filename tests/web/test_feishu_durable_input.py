@@ -258,19 +258,23 @@ async def test_attachment_failure_has_no_acceptance(ingress):
 async def test_control_during_lookup_prevents_acceptance(ingress, monkeypatch, command):
     make, sessions, _ = ingress
     bot = make()
-    entered, release = asyncio.Event(), asyncio.Event()
-    original = module.run_db_io_cancellation_safe
+    import threading
 
-    async def lookup(operation):
+    entered, release = threading.Event(), threading.Event()
+    original = module.lookup_channel_inputs
+
+    def lookup(incoming):
         entered.set()
-        await release.wait()
-        return await original(operation)
+        assert release.wait(10)
+        return original(incoming)
 
-    monkeypatch.setattr(module, "run_db_io_cancellation_safe", lookup)
+    monkeypatch.setattr(module, "lookup_channel_inputs", lookup)
     task = asyncio.create_task(bot._process_messages_batch("sender", [message()]))
-    await asyncio.wait_for(entered.wait(), 5)
-    await bot._handle_control("sender", message(command), command)
-    release.set()
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        await bot._handle_control("sender", message(command), command)
+    finally:
+        release.set()
     await asyncio.wait_for(task, 5)
     with sessions() as db:
         assert db.query(TaskExecutionCommand).count() == 0
@@ -725,3 +729,117 @@ async def test_control_during_rejection_notice_stops_later_notices(ingress, comm
     assert len(notices) == 1
     with sessions() as db:
         assert db.query(TaskInputReceipt).count() == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "control,cancel", [(None, True), ("/stop", False), ("/stop", True), ("/new", True)]
+)
+async def test_control_during_replay_lookup_preserves_stop_obligation(
+    ingress, monkeypatch, control, cancel
+):
+    import threading
+
+    make, sessions, observe = ingress
+    first = make()
+    observe.side_effect = RuntimeError("observer offline")
+    await run(first, message())
+    bot = make()
+    entered, release = threading.Event(), threading.Event()
+    original = module.lookup_channel_inputs
+
+    def lookup(incoming):
+        result = original(incoming)
+        entered.set()
+        assert release.wait(10)
+        return result
+
+    monkeypatch.setattr(module, "lookup_channel_inputs", lookup)
+    task = asyncio.create_task(
+        bot._process_shared_messages_batch("sender", [message()])
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        if control:
+            await bot._handle_control("sender", message(control), control)
+        if cancel:
+            task.cancel()
+    finally:
+        release.set()
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await task
+    with sessions() as db:
+        assert db.query(TaskExecutionCommand).filter_by(kind="pause").count() == (
+            1 if control else 0
+        )
+        assert db.query(TaskChannelDelivery).one().status == (
+            "discarded" if control == "/new" else "pending"
+        )
+    assert not bot.user_preparing_executions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["rejection", "observation"])
+@pytest.mark.parametrize("control", ["/stop", "/new"])
+async def test_control_settles_remaining_replays(ingress, boundary, control):
+    make, sessions, observe = ingress
+    seed = make()
+    observe.side_effect = RuntimeError("observer offline")
+    await run(seed, message("A", "a"))
+    seed.active_tasks.clear()
+    seed.user_active_executions.clear()
+    await run(seed, message("B", "b"))
+    bot = make()
+    bot.active_tasks.clear()
+    controlled = False
+
+    async def trigger():
+        nonlocal controlled
+        if not controlled:
+            controlled = True
+            await bot._handle_control("sender", message(control), control)
+
+    if boundary == "rejection":
+        original = bot._send_text
+
+        async def send(chat, text):
+            if "different content" in text:
+                await trigger()
+            return await original(chat, text)
+
+        bot._send_text = send
+        batch = [message("changed", "a"), message("B", "b")]
+    else:
+
+        async def observing(handler):
+            await trigger()
+            return {"status": "accepted"}
+
+        observe.side_effect = observing
+        batch = [message("A", "a"), message("B", "b")]
+    await bot._process_shared_messages_batch("sender", batch)
+    assert controlled
+    with sessions() as db:
+        starts = db.query(TaskExecutionCommand).filter_by(kind="start").all()
+        assert len({row.task_id for row in starts}) == 2
+        expected = {
+            row.task_id
+            for row in starts
+            if boundary == "observation" or row.payload["message"] == "B"
+        }
+        assert {
+            row.task_id
+            for row in db.query(TaskExecutionCommand).filter_by(kind="pause")
+        } == expected
+        if control == "/new":
+            assert all(
+                row.status == "discarded"
+                for row in db.query(TaskChannelDelivery).filter(
+                    TaskChannelDelivery.command_id.in_(
+                        row.id for row in starts if row.task_id in expected
+                    )
+                )
+            )

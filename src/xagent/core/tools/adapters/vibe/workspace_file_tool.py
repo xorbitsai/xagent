@@ -10,12 +10,23 @@ import os
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from .....core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
-from .....core.workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
+from .....core.workspace import (
+    DEFAULT_USER_FILE_LIST_LIMIT,
+    SPILL_DIR_NAME,
+    TaskWorkspace,
+)
 from ...core.workspace_file_tool import FileInfo, WorkspaceFileOperations
 from .base import ToolCategory
 from .function import FunctionTool
 
 logger = logging.getLogger(__name__)
+
+# Appended to every write-side tool description: the model learns that the
+# engine's directory is reserved before it tries, not by burning a turn on
+# the refusal.
+_RESERVED_OUTPUT_NOTE = (
+    f" output/{SPILL_DIR_NAME}/ is reserved for the engine and refuses writes."
+)
 
 
 class FileTool(FunctionTool):
@@ -212,22 +223,26 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.write_file,
                 name="write_file",
-                description="Write file content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link.\n\nImportant: For HTML files, do not guess paths to uploaded files or files from other tasks. First call prepare_html_asset(file_id, html_path, alias) for every external image/CSS/JS asset, then use the returned html_src in the HTML.",
+                description="Write file content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link.\n\nImportant: For HTML files, do not guess paths to uploaded files or files from other tasks. First call prepare_html_asset(file_id, html_path, alias) for every external image/CSS/JS asset, then use the returned html_src in the HTML."
+                + _RESERVED_OUTPUT_NOTE,
             ),
             FileTool(
                 self.prepare_html_asset,
                 name="prepare_html_asset",
-                description="Prepare an uploaded or registered file for use inside an HTML artifact. Pass the source file_id, the target HTML output path such as 'index.html' or 'reports/index.html', and an optional alias such as 'logo.png'. The tool copies the asset next to that HTML file under assets_subdir and returns html_src relative to the HTML file. Use html_src in <img src>, <link href>, <script src>, or CSS url(). Do not compute ../ paths yourself.",
+                description="Prepare an uploaded or registered file for use inside an HTML artifact. Pass the source file_id, the target HTML output path such as 'index.html' or 'reports/index.html', and an optional alias such as 'logo.png'. The tool copies the asset next to that HTML file under assets_subdir and returns html_src relative to the HTML file. Use html_src in <img src>, <link href>, <script src>, or CSS url(). Do not compute ../ paths yourself."
+                + _RESERVED_OUTPUT_NOTE,
             ),
             FileTool(
                 self.append_file,
                 name="append_file",
-                description="Append content to file in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths.",
+                description="Append content to file in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths."
+                + _RESERVED_OUTPUT_NOTE,
             ),
             FileTool(
                 self.delete_file,
                 name="delete_file",
-                description="Delete file in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths.",
+                description="Delete file in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths."
+                + _RESERVED_OUTPUT_NOTE,
             ),
             FileTool(
                 self.list_files,
@@ -237,7 +252,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.create_directory,
                 name="create_directory",
-                description="Create directory in workspace",
+                description="Create directory in workspace." + _RESERVED_OUTPUT_NOTE,
             ),
             FileTool(
                 self.file_exists,
@@ -257,7 +272,8 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.write_json_file,
                 name="write_json_file",
-                description="Write JSON file in workspace. Use relative paths (e.g., 'data.json'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link.",
+                description="Write JSON file in workspace. Use relative paths (e.g., 'data.json'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link."
+                + _RESERVED_OUTPUT_NOTE,
             ),
             FileTool(
                 self.read_csv_file,
@@ -267,7 +283,8 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.write_csv_file,
                 name="write_csv_file",
-                description="Write CSV file in workspace. Use relative paths (e.g., 'data.csv'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link.",
+                description="Write CSV file in workspace. Use relative paths (e.g., 'data.csv'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link."
+                + _RESERVED_OUTPUT_NOTE,
             ),
             FileTool(
                 self.get_workspace_output_files,
@@ -282,12 +299,14 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.edit_file,
                 name="edit_file",
-                description="Precisely edit file content in workspace, supporting multiple edit operations based on line numbers and pattern matching. Use relative paths (e.g., 'filename.txt'), not absolute paths.",
+                description="Precisely edit file content in workspace, supporting multiple edit operations based on line numbers and pattern matching. Use relative paths (e.g., 'filename.txt'), not absolute paths."
+                + _RESERVED_OUTPUT_NOTE,
             ),
             FileTool(
                 self.find_and_replace,
                 name="find_and_replace",
-                description="Convenience function to find and replace text content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths.",
+                description="Convenience function to find and replace text content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths."
+                + _RESERVED_OUTPUT_NOTE,
             ),
         ]
 

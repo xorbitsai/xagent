@@ -5,9 +5,59 @@ from typing import Any, List, Optional
 
 from xinference_client import RESTfulClient as XinferenceClient
 
-from .base import BaseImageModel
+from ..chat.token_context import MediaCallType
+from .base import (
+    BaseImageModel,
+    InvalidImageResponseError,
+    call_billed_endpoint,
+    image_url_from_item,
+    invalid_response_from,
+    resolve_requested_size,
+)
+from .usage import record_image_usage, record_unusable_response
 
 logger = logging.getLogger(__name__)
+
+
+def _xinference_usage(result: Any) -> Any:
+    """Usage payload from an xinference result, without raising.
+
+    Read before the metering call, so it must not be the thing that loses the
+    row: the client hands back raw server JSON, which may be any shape.
+    """
+    try:
+        if isinstance(result, dict):
+            return result.get("usage") or {}
+        return getattr(result, "usage", {}) or {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Reading xinference usage failed: %s", e)
+        return {}
+
+
+def _xinference_image_url(result: Any) -> Optional[str]:
+    """The image URL from an xinference result, or None when absent.
+
+    Raises on a malformed body rather than guessing; callers classify that as
+    an already-billed invalid response.
+    """
+    if getattr(result, "data", None):
+        # Shared with the OpenAI provider so the two cannot disagree on what
+        # "has a URL" means. `hasattr` read `url=None` as present and returned
+        # the string "None", which image_tool then tried to download.
+        return image_url_from_item(result.data[0])
+    if isinstance(result, dict):
+        data = result.get("data", [])
+        if data:
+            image_item = data[0]
+            # url first, matching image_url_from_item above: the two branches
+            # answer the same question and disagreeing on precedence means one
+            # response shape resolves differently from the other.
+            url = image_item.get("url")
+            if url:
+                return str(url)
+            b64 = image_item.get("b64_json")
+            return f"data:image/png;base64,{b64}" if b64 else None
+    return None
 
 
 class XinferenceImageModel(BaseImageModel):
@@ -24,6 +74,7 @@ class XinferenceImageModel(BaseImageModel):
         api_key: Optional[str] = None,
         timeout: float = 3600.0,
         abilities: Optional[List[str]] = None,
+        model_id: str = "",
     ):
         """
         Initialize Xinference image model client.
@@ -35,8 +86,12 @@ class XinferenceImageModel(BaseImageModel):
             api_key: Optional API key for authentication
             timeout: Request timeout in seconds
             abilities: List of model abilities (generate, edit, etc.)
+            model_id: Configured model id used for usage attribution
         """
         self.model_name = model_name
+        # See OpenAIImageModel: the recording layer lives on the provider, so
+        # the configured id has to reach it here rather than on the wrapper.
+        self.model_id = model_id
         self._model_uid = model_uid or model_name
         self.base_url = (base_url or "http://localhost:9997").rstrip("/")
         self.api_key = api_key
@@ -151,36 +206,71 @@ class XinferenceImageModel(BaseImageModel):
 
         try:
             # Call text_to_image
-            result = self._model_handle.text_to_image(
-                prompt=prompt,
-                n=n,
-                size=normalized_size,
-                response_format=response_format,
-                **kwargs,
-            )
+            # Wrapped because the client decodes the body itself: it raises on a
+            # non-200 and then calls response.json(), so a billed 200 it cannot
+            # parse surfaces from this call rather than from a body walk we
+            # could classify positionally.
+            handle = self._model_handle
+            try:
+                result = call_billed_endpoint(
+                    lambda: handle.text_to_image(
+                        prompt=prompt,
+                        n=n,
+                        size=normalized_size,
+                        response_format=response_format,
+                        **kwargs,
+                    ),
+                    "Xinference returned an undecodable body",
+                )
+            except InvalidImageResponseError:
+                # Metered before re-raising: the server answered 200 and the
+                # call was charged, so it must leave a row even though the
+                # client gave us nothing to read a usage payload from.
+                record_unusable_response(
+                    model_name=self.model_name,
+                    model_id=self.model_id,
+                    call_type=MediaCallType.GENERATE_IMAGE,
+                    image_count=n,
+                    resolution=normalized_size,
+                )
+                raise
 
             # Process result
-            image_url = None
-            if hasattr(result, "data") and result.data:
-                image_item = result.data[0]
-                if hasattr(image_item, "url"):
-                    image_url = image_item.url
-                elif hasattr(image_item, "b64_json"):
-                    image_url = f"data:image/png;base64,{image_item.b64_json}"
-            elif isinstance(result, dict):
-                data = result.get("data", [])
-                if data:
-                    image_item = data[0]
-                    image_url = image_item.get("url") or image_item.get("b64_json")
-                    if image_item.get("b64_json"):
-                        image_url = f"data:image/png;base64,{image_url}"
-
-            return {
-                "image_url": image_url,
-                "usage": getattr(result, "usage", {}) or {},
+            # Metered before the body is walked, matching gemini/dashscope. The
+            # xinference client returns `response.json()` verbatim -- raw server
+            # JSON despite its type annotation -- so a malformed but billed 200
+            # raises while walking it. Recording afterwards lost the row for a
+            # call that was charged, and the plain RuntimeError the blanket
+            # handler produced was retryable, so every attempt was billed and
+            # none recorded.
+            out = {
+                "image_url": None,
+                "usage": _xinference_usage(result),
                 "request_id": getattr(result, "id", None),
             }
+            record_image_usage(
+                out,
+                model_name=self.model_name,
+                model_id=self.model_id,
+                call_type=MediaCallType.GENERATE_IMAGE,
+                image_count=n,
+                resolution=str(normalized_size or ""),
+            )
 
+            try:
+                out["image_url"] = _xinference_image_url(result)
+            except (TypeError, AttributeError, KeyError, IndexError) as e:
+                # Classified positionally, as in the other providers: a failure
+                # walking an already-metered body is an invalid response, and
+                # retrying it only buys another charge.
+                raise invalid_response_from(e, "Invalid response format") from e
+            return out
+
+        except InvalidImageResponseError:
+            # Re-raised unchanged: the handler below would wrap it in a plain
+            # RuntimeError and erase the non-retryable classification,
+            # re-billing an already-billed and already-metered response.
+            raise
         except Exception as e:
             logger.error(f"Xinference image generation failed: {e}")
             raise RuntimeError(f"Xinference image generation failed: {str(e)}") from e
@@ -223,60 +313,83 @@ class XinferenceImageModel(BaseImageModel):
 
         # Extract parameters
         n = kwargs.pop("n", 1)
-        size = self._normalize_size(kwargs.pop("size", "1024*1024"))
+        # Same precedence generate_image applies; popped so they are not
+        # forwarded into the client call as unexpected fields.
+        size = self._normalize_size(
+            resolve_requested_size(
+                kwargs.pop("size", None),
+                resolution=kwargs.pop("resolution", None),
+                width=kwargs.pop("width", None),
+                height=kwargs.pop("height", None),
+            )
+        )
+        kwargs.pop("aspect_ratio", None)
         response_format = kwargs.pop("response_format", "url")
 
         try:
             # For image editing, Xinference may have different methods
-            # Try image_to_image or inpainting depending on the model
+            # Only image_to_image: the client exposes inpainting too, but it
+            # requires a mask this interface has no concept of.
             if hasattr(self._model_handle, "image_to_image"):
                 # image_to_image typically takes: image, prompt, size, negative_prompt, n
-                result = self._model_handle.image_to_image(
-                    image=image_inputs[0],  # Use first image as base
-                    prompt=prompt,
-                    size=size,
-                    negative_prompt=negative_prompt,
-                    n=n,
-                    response_format=response_format,
-                    **kwargs,
-                )
-            elif hasattr(self._model_handle, "inpainting"):
-                # Use inpainting for edits
-                result = self._model_handle.inpainting(
-                    image=image_inputs[0],
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    **kwargs,
-                )
+                handle = self._model_handle
+                try:
+                    result = call_billed_endpoint(
+                        lambda: handle.image_to_image(
+                            image=image_inputs[0],  # Use first image as base
+                            prompt=prompt,
+                            size=size,
+                            negative_prompt=negative_prompt,
+                            n=n,
+                            response_format=response_format,
+                            **kwargs,
+                        ),
+                        "Xinference returned an undecodable body",
+                    )
+                except InvalidImageResponseError:
+                    # See generate_image: a billed 200 must leave a row even
+                    # when the client gives us no payload to read usage from.
+                    record_unusable_response(
+                        model_name=self.model_name,
+                        model_id=self.model_id,
+                        call_type=MediaCallType.EDIT_IMAGE,
+                        image_count=n,
+                        resolution=size,
+                    )
+                    raise
             else:
                 raise RuntimeError(
                     "Image editing is not supported by this Xinference model"
                 )
 
             # Process result
-            result_image_url: str | None = None
-            if hasattr(result, "data") and result.data:
-                image_item = result.data[0]
-                if hasattr(image_item, "url"):
-                    result_image_url = image_item.url
-                elif hasattr(image_item, "b64_json"):
-                    result_image_url = f"data:image/png;base64,{image_item.b64_json}"
-            elif isinstance(result, dict):
-                data = result.get("data", [])
-                if data:
-                    image_item = data[0]
-                    result_image_url = image_item.get("url") or image_item.get(
-                        "b64_json"
-                    )
-                    if image_item.get("b64_json"):
-                        result_image_url = f"data:image/png;base64,{result_image_url}"
-
-            return {
-                "image_url": result_image_url,
-                "usage": getattr(result, "usage", {}) or {},
+            # See generate_image: metered before the body walk, and body-walk
+            # failures classified as invalid responses rather than retried.
+            out = {
+                "image_url": None,
+                "usage": _xinference_usage(result),
                 "request_id": getattr(result, "id", None),
             }
+            record_image_usage(
+                out,
+                model_name=self.model_name,
+                model_id=self.model_id,
+                call_type=MediaCallType.EDIT_IMAGE,
+                image_count=n,
+                resolution=str(size or ""),
+            )
 
+            try:
+                out["image_url"] = _xinference_image_url(result)
+            except (TypeError, AttributeError, KeyError, IndexError) as e:
+                raise invalid_response_from(e, "Invalid response format") from e
+            return out
+
+        except InvalidImageResponseError:
+            # Re-raised unchanged: the handler below would wrap it in a plain
+            # RuntimeError and erase the non-retryable classification,
+            # re-billing an already-billed and already-metered response.
+            raise
         except Exception as e:
             logger.error(f"Xinference image editing failed: {e}")
             raise RuntimeError(f"Xinference image editing failed: {str(e)}") from e

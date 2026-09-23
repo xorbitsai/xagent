@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
@@ -43,6 +44,8 @@ from .context.execution import (
     LLM_COMPACT_CONTEXT_WINDOW_UNKNOWN_KEY,
     LLM_COMPACT_TOKENIZER_UNAVAILABLE_KEY,
     CompactResult,
+    ExecutionContext,
+    context_checkpoint_gate,
     derive_compact_threshold,
 )
 from .result import normalize_tool_failure_code, tool_result_succeeded
@@ -377,6 +380,12 @@ class PatternRuntime:
             kwargs=kwargs,
             resolver=self.context_ref_resolver,
         )
+        # Setup may yield before a provider task exists for cancellation.
+        await self.should_interrupt()
+        if self._interrupt_requested:
+            raise LLMCallInterrupted(
+                self.interrupt_reason or "interrupted before LLM call"
+            )
         call = llm.chat(**kwargs)
         if not inspect.isawaitable(call):
             return call
@@ -890,17 +899,25 @@ class PatternRuntime:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload = self._build_checkpoint_payload(
-            label=label,
-            context=context,
-            pattern=pattern,
-            status=status,
-            metadata=metadata,
+        # Keep ordinary checkpoint writes concurrent. A future exclusive
+        # injection must cover snapshot construction as well as persistence.
+        gate = (
+            context_checkpoint_gate(context).shared()
+            if isinstance(context, ExecutionContext)
+            else nullcontext()
         )
-        self.last_checkpoint = payload
-        self.checkpoints.append(payload)
-        await self._emit_checkpoint(payload)
-        return payload
+        async with gate:
+            payload = self._build_checkpoint_payload(
+                label=label,
+                context=context,
+                pattern=pattern,
+                status=status,
+                metadata=metadata,
+            )
+            self.last_checkpoint = payload
+            self.checkpoints.append(payload)
+            await self._emit_checkpoint(payload)
+            return payload
 
     async def send_message(
         self,

@@ -128,8 +128,14 @@ from ...runtime import (
     resolved_llm_metadata,
 )
 from ...trace import TraceAction, TraceCategory, TraceEventType, TraceScope
-from ..base import AgentPattern, PatternResult, truncate_prompt_preview
+from ..base import (
+    AgentPattern,
+    PatternResult,
+    append_user_message_preserving_turns,
+    truncate_prompt_preview,
+)
 from ..final_answer_stream import ReActFinalAnswerStreamer
+from ..partial_delivery import request_partial_delivery
 from .duplicate_write_guard import (
     DUPLICATE_WRITE_SUPPRESSED_KEY,
     build_suppression_envelope,
@@ -159,6 +165,8 @@ UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
 # module's untrusted-input logging: bounded length, escaped, never raw.
 STRIP_LOG_MAX_TOOL_NAMES = 8
 STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
+# One best-effort delivery turn after the work budget, never another work loop.
+ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS = 30.0
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
@@ -559,6 +567,7 @@ class ReActPattern(AgentPattern):
         )
         self.status = "idle"
         self.current_iteration = 0
+        self.iteration_limit_delivery_attempted = False
         self.last_response: Any = None
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.pending_tool_call_content: dict[str, str] = {}
@@ -1152,6 +1161,22 @@ class ReActPattern(AgentPattern):
                     response=assistant_content or normalized.get("raw"),
                 )
 
+        # A DAG step cannot declare the parent task partially delivered: its
+        # dependencies and sibling results belong to the DAG's failure policy.
+        if not context.metadata.get("dag_step_id"):
+            delivery = await self._deliver_at_iteration_limit(
+                context=context, llm=llm, runtime=runtime
+            )
+            if delivery is not None:
+                return delivery
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="after_failed_iteration_limit_delivery",
+            )
+            if interrupted is not None:
+                return interrupted
+
         self.status = "max_iterations"
         await runtime.checkpoint("max_iterations", context=context, pattern=self)
         return PatternResult(
@@ -1159,6 +1184,115 @@ class ReActPattern(AgentPattern):
             error="ReActPattern reached max iterations without a final answer.",
             metadata={"iterations": self.max_iterations, "status": self.status},
         ).to_dict()
+
+    async def _deliver_at_iteration_limit(
+        self, *, context: Any, llm: Any, runtime: PatternRuntime
+    ) -> dict[str, Any] | None:
+        """Offer one bounded, answer-only turn; do not relax the work budget.
+
+        Buffer the response until validated, so a refused work call or an
+        invalid protocol cannot leak an unaccepted answer into the chat stream.
+        A failed delivery leaves the original failure path intact.
+        """
+        interrupted = await self._interrupt_if_requested(
+            runtime=runtime, context=context, label="before_iteration_limit_delivery"
+        )
+        if interrupted is not None:
+            return interrupted
+        if self.iteration_limit_delivery_attempted or self.max_iterations <= 0:
+            return None
+
+        self.iteration_limit_delivery_attempted = True
+        self.status = "max_iterations"
+        await runtime.checkpoint(
+            "before_iteration_limit_delivery", context=context, pattern=self
+        )
+        # Reuse the forced-answer evidence and file-reference rules. In
+        # particular, do not compact away results when tools can no longer run.
+        messages = self._messages_for_llm(
+            context,
+            has_tools=True,
+            force_final_answer=True,
+            tool_names=["final_answer"],
+        )
+        messages[0] = {
+            **messages[0],
+            "content": (
+                f"{messages[0].get('content', '')}\n\n"
+                "The execution iteration limit has been reached. No further work "
+                "or verification is possible in this run. Call final_answer once "
+                "to hand over only results supported by the retained evidence, "
+                "including trusted links to requested deliverables already made. "
+                "Clearly state that execution stopped at the iteration limit, "
+                "what is done, what is unverified or missing, and what remains. "
+                "Do not claim full completion or promise to keep working. Set "
+                "outcome=partial if useful results exist, otherwise blocked. "
+                "Do not reproduce raw exception messages or tool payloads."
+            ),
+        }
+        messages = append_user_message_preserving_turns(
+            messages,
+            content=(
+                "Runtime notice: the work phase has now stopped at the iteration "
+                "limit. This turn is only for handing over existing results, not "
+                "for performing the outstanding work. Call only final_answer, "
+                "include existing deliverable links, and list what was not done. "
+                "No other tools are available."
+            ),
+        )
+
+        def parse_response(response: Any) -> dict[str, Any] | None:
+            normalized = self._normalize_llm_response(response)
+            calls = normalized.get("tool_calls") or []
+            if (
+                len(calls) == 1
+                and calls[0]["name"] == "final_answer"
+                and bool(self._final_answer_text(calls[0].get("args")).strip())
+            ):
+                return dict(calls[0]["args"])
+            return None
+
+        schema = self._final_answer_tool_schema()
+        schema["function"]["parameters"]["properties"]["outcome"]["enum"] = [
+            "partial",
+            "blocked",
+        ]
+        args = await request_partial_delivery(
+            context=context,
+            llm=llm,
+            runtime=runtime,
+            messages=messages,
+            schema=schema,
+            parse_response=parse_response,
+            metadata={
+                "iteration": self.current_iteration,
+                "phase": "iteration_limit_delivery",
+            },
+            timeout=ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS,
+        )
+        if args is None:
+            return None
+
+        interrupted = await self._interrupt_if_requested(
+            runtime=runtime, context=context, label="after_iteration_limit_delivery"
+        )
+        if interrupted is not None:
+            return interrupted
+        outcome = args["outcome"]
+        answer = (
+            "Execution stopped at the iteration limit; this is not a completed task."
+            f"\n\n{self._final_answer_text(args)}"
+        )
+        context.add_assistant_message(answer)
+        result = await self._finalize_outcome(
+            context=context, runtime=runtime, response=answer, outcome=outcome
+        )
+        # success means a final response was delivered, not that the requested
+        # work succeeded; use the existing partial/blocked outcome contract.
+        result.update(
+            termination_reason="max_iterations", iterations=self.max_iterations
+        )
+        return result
 
     async def _invalid_tool_protocol_result(
         self,
@@ -1811,6 +1945,7 @@ class ReActPattern(AgentPattern):
             "reasoning_mode": self.reasoning_mode.value,
             "status": self.status,
             "current_iteration": self.current_iteration,
+            "iteration_limit_delivery_attempted": self.iteration_limit_delivery_attempted,
             "max_iterations": self.max_iterations,
             "finalize_after_tool_result": self.finalize_after_tool_result,
             "tool_parallel_enabled": self.tool_parallel_enabled,
@@ -1878,6 +2013,9 @@ class ReActPattern(AgentPattern):
         )
         self.status = str(state.get("status", "idle"))
         self.current_iteration = int(state.get("current_iteration", 0))
+        self.iteration_limit_delivery_attempted = bool(
+            state.get("iteration_limit_delivery_attempted", False)
+        )
         self.max_iterations = int(state.get("max_iterations", self.max_iterations))
         self.finalize_after_tool_result = bool(
             state.get("finalize_after_tool_result", self.finalize_after_tool_result)

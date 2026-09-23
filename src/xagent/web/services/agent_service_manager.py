@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_external_upload_dirs,
-    get_uploads_dir,
 )
 from ...core.agent.service import AgentService
 from ...core.execution_scope import (
@@ -24,7 +23,6 @@ from ...core.execution_scope import (
     ScopeFingerprint,
     get_execution_scope,
     resolve_execution_scope,
-    resolve_execution_scope_off_turn,
     scope_fingerprint,
 )
 from ...core.memory.base import MemoryStore
@@ -123,6 +121,11 @@ from .task_setup_snapshot import (
     TaskSetupSnapshot,
     detach_runtime_user_fields,
     load_task_setup_snapshot_sync,
+)
+from .task_workspace_cleanup import (
+    WorkspaceCleanupTarget,
+    capture_workspace_cleanup_target,
+    remove_task_workspace,
 )
 from .workforce_runtime import (
     WorkforceTaskRuntime,
@@ -3175,8 +3178,15 @@ class AgentServiceManager:
         *,
         expected_run_id: Optional[str] = None,
         expected_run_generation: Optional[int] = None,
+        workspace_target: Optional[WorkspaceCleanupTarget] = None,
     ) -> None:
-        """Clean a task runtime only for the run that scheduled cleanup."""
+        """Clean a task runtime only for the run that scheduled cleanup.
+
+        ``workspace_target`` is used only when no agent is cached: a cached one
+        knows its own workspace path and needs no capture. Deletion callers
+        pass a target captured before the task row was deleted, because the
+        path is no longer derivable once the row is gone.
+        """
         current_run_id = self._agent_run_ids.get(task_id)
         current_generation = self._agent_run_generations.get(task_id)
         build_lock = self._agent_build_locks.get(task_id)
@@ -3232,7 +3242,9 @@ class AgentServiceManager:
                 agent.cleanup_workspace()
                 logger.info("Cleaned up workspace for task %s", task_id)
             else:
-                self._cleanup_workspace_directory(task_id, cleanup_user_id)
+                self._cleanup_workspace_directory(
+                    task_id, cleanup_user_id, target=workspace_target
+                )
             cleanup_succeeded = True
         finally:
             if cleanup_succeeded:
@@ -3750,77 +3762,22 @@ class AgentServiceManager:
             await drain_async_task_cancellation_safe(cleanup_task)
 
     def _cleanup_workspace_directory(
-        self, task_id: int, user_id: Optional[int] = None
+        self,
+        task_id: int,
+        user_id: Optional[int] = None,
+        *,
+        target: Optional[WorkspaceCleanupTarget] = None,
     ) -> None:
-        """Clean up workspace directory for a task when agent is not in memory"""
-        from ...core.workspace import TaskWorkspace
+        """Clean up workspace directory for a task when agent is not in memory.
 
-        workspace_id = f"web_task_{task_id}"
+        ``target`` is a capture taken while the task row still existed. Without
+        one this resolves the candidates now, which is correct only while the
+        row is still there -- see ``task_workspace_cleanup``.
+        """
 
-        # Scoped workspace first (when a resolver maps this task to a scope),
-        # then the user-isolated one, then the legacy uploads-root fallback.
-        # One spelling per candidate: the uploads root is rejected at
-        # configuration time unless its two readings name the same directory
-        # (see ``config.get_uploads_dir``), so the canonical spelling and the
-        # raw one reach the same place and a second candidate would only
-        # re-probe what the first already probed. A tree written under a root
-        # spelling that configuration now refuses is not reachable from any
-        # spelling of the current value, so recovering it is an operator
-        # migration rather than a candidate this loop can enumerate.
-        base_dirs: list[str] = []
-        if user_id:
-            # Contextvar-first for the same reason as get_agent_for_task:
-            # cleanup inside an activated turn reuses the turn's resolution.
-            scope = get_execution_scope()
-            if scope is None:
-                # Off-turn: this runs when the agent is no longer in memory,
-                # so there is no turn left to fail. An authority mismatch here
-                # would abandon the directory instead of deleting it, and the
-                # resolver has already given an authoritative answer to delete
-                # against -- so the off-turn helper takes that answer and
-                # warns. Every other resolution failure still propagates.
-                scope = resolve_execution_scope_off_turn(task_id)
-            segments = scope.workspace_segments if scope is not None else ()
-            for base_dir in (
-                canonical_workspace_base(user_id, segments),
-                canonical_workspace_base(user_id),
-            ):
-                if base_dir not in base_dirs:
-                    base_dirs.append(base_dir)
-        legacy_root = str(get_uploads_dir())
-        if legacy_root not in base_dirs:
-            base_dirs.append(legacy_root)
-
-        # Build allowed external directories (user's upload directory for knowledge base files).
-        # Use only_existing=True here because cleanup runs against on-disk state.
-        allowed_external_dirs = _build_allowed_external_dirs(
-            user_id, only_existing=True
-        )
-
-        for base_dir in base_dirs:
-            # Probed before constructing: TaskWorkspace's constructor creates
-            # the workspace tree, so building one per candidate would make
-            # every probe succeed and delete a directory it had just created,
-            # leaving the task's real workspace untouched.
-            if not (Path(base_dir) / workspace_id).exists():
-                continue
-
-            workspace = TaskWorkspace(
-                workspace_id, base_dir, allowed_external_dirs=allowed_external_dirs
-            )
-            workspace_path = str(workspace.workspace_dir)
-            logger.info(
-                f"Found existing workspace directory for task {task_id} (user {user_id}): {workspace_path}"
-            )
-            workspace.cleanup()
-            logger.info(
-                f"Cleaned up workspace directory for task {task_id} (user {user_id}): {workspace_path}"
-            )
-            break
-        else:
-            logger.info(
-                f"No workspace directory found for task {task_id} (user {user_id})"
-            )
+        if target is None:
+            target = capture_workspace_cleanup_target(task_id, user_id)
+        remove_task_workspace(target)
 
     async def _reconstruct_agent_from_history(
         self,

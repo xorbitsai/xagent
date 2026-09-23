@@ -2169,6 +2169,9 @@ class _UnavailableMCPToolResult(BaseModel):
     reason: str | None = Field(
         default=None, description="Public-safe MCP unavailability reason"
     )
+    unavailable_server: str | None = Field(
+        default=None, description="Name of the unavailable MCP server"
+    )
     content: List[Dict[str, Any]] = Field(
         default_factory=list, description="Tool execution result content"
     )
@@ -2183,13 +2186,13 @@ class UnavailableMCPTool(AbstractBaseTool):
 
     The tool exists to explain an outage, so it always reports that outage to
     whoever invokes it: it carries no allow-list and performs no caller check.
-    Its result holds only a constant message plus a ``reason`` and a
-    ``failure_code``. ``failure_code`` is normalized against the public failure
-    allowlist here and dropped when it is not on it; ``reason`` is stored as
-    given, so an allowlisted value is a guarantee callers make, enforced where
-    the unavailable config is built. The server name it is built from is
-    already exposed in the tool listing, so there is nothing here to withhold
-    from a caller.
+    Its result holds only a constant message, the ``unavailable_server`` name,
+    a ``reason`` and a ``failure_code``. ``failure_code`` is normalized against
+    the public failure allowlist here and dropped when it is not on it;
+    ``reason`` is stored as given, so an allowlisted value is a guarantee
+    callers make, enforced where the unavailable config is built.
+    ``unavailable_server`` is the raw configured name, shown to anyone who can
+    see the trace, including anonymous share viewers (#1041).
     """
 
     read_only = True
@@ -2266,6 +2269,8 @@ class UnavailableMCPTool(AbstractBaseTool):
             result["reason"] = self._reason
         if self._failure_code is not None:
             result["failure_code"] = self._failure_code
+        # Output filtering truncates keys in insertion order; keep this after reason.
+        result["unavailable_server"] = self._server_name
         return result
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:

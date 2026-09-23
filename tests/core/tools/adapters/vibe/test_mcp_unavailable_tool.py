@@ -20,6 +20,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     UnavailableMCPTool,
 )
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+from xagent.web.services.public_trace_events import normalize_public_trace_event
 
 
 def _unavailable_tool(
@@ -127,6 +128,7 @@ async def test_unavailable_tool_returns_classified_failure():
         "is_error": True,
         "error": "MCP server credentials are unavailable.",
         "failure_code": "oauth_token_required",
+        "unavailable_server": "Google Drive",
         "content": [
             {
                 "text": (
@@ -154,6 +156,7 @@ async def test_unavailable_tool_accepts_public_runtime_reason_and_message():
         "is_error": True,
         "error": "MCP server initialization failed.",
         "reason": "initialize",
+        "unavailable_server": "Google Drive",
         "content": [{"text": "MCP server initialization failed."}],
     }
 
@@ -224,6 +227,7 @@ async def test_unavailable_tool_async_reports_the_outage_to_any_caller(monkeypat
         "status": "error",
         "is_error": True,
         "error": "MCP server credentials are unavailable.",
+        "unavailable_server": "Google Drive",
         "content": [
             {
                 "text": (
@@ -404,6 +408,10 @@ async def test_unavailable_config_failure_code_reaches_tool_failure_trace():
 
     assert tracer.events[0]["type"] == "action_error_tool"
     assert tracer.events[0]["data"]["failure_code"] == "oauth_token_required"
+    _, public_data = normalize_public_trace_event(
+        "tool_execution_failed", tracer.events[0]["data"]
+    )
+    assert public_data["result"]["unavailable_server"] == "Google Drive"
     public_payload = repr(result) + repr(tracer.events)
     assert "internal-" not in public_payload
     assert "webhook" not in public_payload

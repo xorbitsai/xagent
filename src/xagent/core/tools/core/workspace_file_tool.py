@@ -348,7 +348,7 @@ class WorkspaceFileOperations:
             self.workspace.id,
         )
 
-        resolved_path = self._resolve_path(file_path, "output")
+        resolved_path = self._resolve_write_path(file_path, "output")
         logger.debug("Resolved path: %s", resolved_path)
 
         if create_dirs:
@@ -417,6 +417,14 @@ class WorkspaceFileOperations:
             and not resolved_target_dir.is_relative_to(output_root)
         ):
             raise ValueError("assets_subdir must resolve inside output")
+        # The refusal names the directory as resolved: the target depends on
+        # the HTML path's parent as well as on assets_subdir, and a symlink
+        # planted there after the HTML path was resolved reaches the refusal
+        # through that side.
+        self.workspace.refuse_engine_owned_write(
+            resolved_target_dir,
+            (Path("output") / resolved_target_dir.relative_to(output_root)).as_posix(),
+        )
 
         target_dir.mkdir(parents=True, exist_ok=True)
         target_path = self._build_unique_asset_path(target_dir / asset_name)
@@ -447,7 +455,7 @@ class WorkspaceFileOperations:
         if path.parts and path.parts[0] in {"input", "temp"}:
             raise ValueError("html_path must be inside output")
 
-        resolved_path = self._resolve_path(str(path), "output")
+        resolved_path = self._resolve_write_path(str(path), "output")
         output_root = self.workspace.output_dir.resolve()
         resolved_path = resolved_path.resolve()
         if resolved_path != output_root and not resolved_path.is_relative_to(
@@ -485,7 +493,7 @@ class WorkspaceFileOperations:
         create_dirs: bool = True,
     ) -> bool:
         """Append content to file in workspace"""
-        resolved_path = self._resolve_path_with_search(file_path)
+        resolved_path = self._resolve_existing_write_path(file_path)
 
         if create_dirs:
             resolved_path.parent.mkdir(parents=True, exist_ok=True)
@@ -496,7 +504,7 @@ class WorkspaceFileOperations:
 
     def delete_file(self, file_path: str) -> bool:
         """Delete file in workspace"""
-        resolved_path = self._resolve_path_with_search(file_path)
+        resolved_path = self._resolve_existing_write_path(file_path)
 
         if not resolved_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -541,6 +549,20 @@ class WorkspaceFileOperations:
                 for item in current_path.iterdir():
                     if not show_hidden and item.name.startswith("."):
                         continue
+                    # Not gated on show_hidden, unlike the hidden-name rule
+                    # above: this check runs on every entry it is reached
+                    # for. Skipping the directory entry itself also stops
+                    # the recursive descent into it. The only entry that
+                    # passes unanswered is one whose path cannot be
+                    # resolved, which then fails at stat() below.
+                    try:
+                        if self.workspace.is_engine_owned_path(item):
+                            continue
+                    except RuntimeError:
+                        # A symlink loop cannot be resolved. Let the entry
+                        # reach the stat() below, which reports it the way it
+                        # always has.
+                        pass
 
                     stat = item.stat()
                     file_info = FileInfo(
@@ -570,7 +592,7 @@ class WorkspaceFileOperations:
 
     def create_directory(self, directory_path: str, parents: bool = True) -> bool:
         """Create directory in workspace"""
-        resolved_path = self._resolve_path(directory_path)
+        resolved_path = self._resolve_write_path(directory_path)
         resolved_path.mkdir(parents=parents, exist_ok=True)
         return True
 
@@ -619,7 +641,7 @@ class WorkspaceFileOperations:
         """Write JSON file in workspace"""
         from .file_tool import write_json_file as basic_write_json_file
 
-        resolved_path = self._resolve_path(file_path, "output")
+        resolved_path = self._resolve_write_path(file_path, "output")
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
         with self.workspace.auto_register_files():
@@ -661,7 +683,7 @@ class WorkspaceFileOperations:
         """Write CSV file in workspace"""
         from .file_tool import write_csv_file as basic_write_csv_file
 
-        resolved_path = self._resolve_path(file_path, "output")
+        resolved_path = self._resolve_write_path(file_path, "output")
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
         with self.workspace.auto_register_files():
@@ -758,7 +780,7 @@ class WorkspaceFileOperations:
         from .file_tool import edit_file as basic_edit_file
 
         # Resolve the file path within the workspace
-        resolved_path = self._resolve_path_with_search(file_path)
+        resolved_path = self._resolve_existing_write_path(file_path)
         logger.debug("Resolved path: %s", resolved_path)
 
         # Convert to string path for the basic edit_file function
@@ -792,7 +814,7 @@ class WorkspaceFileOperations:
         from .file_tool import find_and_replace as basic_find_and_replace
 
         # Resolve the file path within the workspace
-        resolved_path = self._resolve_path_with_search(file_path)
+        resolved_path = self._resolve_existing_write_path(file_path)
         logger.debug("Resolved path: %s", resolved_path)
 
         # Convert to string path for the basic find_and_replace function
@@ -805,6 +827,47 @@ class WorkspaceFileOperations:
 
         logger.debug("find_and_replace result: %s", result)
         return result
+
+    def _resolve_write_path(self, file_path: str, default_dir: str = "output") -> Path:
+        """Resolve a write target that need not exist yet, then apply the policy.
+
+        Every write, edit, delete and directory creation of this class
+        resolves through this method or :meth:`_resolve_existing_write_path`;
+        reads never do. The decision and its message belong to the workspace
+        (:meth:`TaskWorkspace.refuse_engine_owned_write`); this class only
+        keeps its own resolvers in front of it, because they read a leading
+        ``output/`` segment differently from ``TaskWorkspace.resolve_path``.
+        """
+
+        return self.workspace.refuse_engine_owned_write(
+            self._resolve_path(file_path, default_dir), file_path
+        )
+
+    def _resolve_existing_write_path(self, file_path: str) -> Path:
+        """Resolve an existing file this call is about to modify, then apply the policy.
+
+        The refusal does not depend on whether the name exists. When the
+        search resolver finds nothing, the place the name denotes as a write
+        target -- the one :meth:`_resolve_write_path` would compute -- is
+        checked, and a name inside the engine's subtree is refused with the
+        same ValueError ``write_file`` raises for it; only a name outside
+        the subtree gets the ordinary FileNotFoundError. A name the write
+        resolver refuses or cannot resolve either -- a containment or policy
+        refusal, or a symlink loop -- keeps the not-found answer, so every
+        other outcome of the search resolver is unchanged.
+        """
+
+        try:
+            resolved_path = self._resolve_path_with_search(file_path)
+        except FileNotFoundError:
+            try:
+                intended: Path | None = self._resolve_path(file_path)
+            except (ValueError, OSError, RuntimeError):
+                intended = None
+            if intended is not None:
+                self.workspace.refuse_engine_owned_write(intended, file_path)
+            raise
+        return self.workspace.refuse_engine_owned_write(resolved_path, file_path)
 
     def _resolve_path_with_search(self, file_path: str) -> Path:
         """Intelligently resolve file path in workspace (first in input directory, then in output directory)"""

@@ -26,6 +26,7 @@ from xagent.core.tools.adapters.vibe.ssh_tools import (
     _egress_from_env,
     _numeric_task_id,
 )
+from xagent.core.workspace import SPILL_DIR_NAME
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
@@ -174,6 +175,15 @@ class _FakeWorkspace:
     def resolve_path(self, p: str, default_dir: str = "output"):
         return self._contained(p)
 
+    def resolve_write_path(self, p: str, default_dir: str = "output"):
+        resolved = self._contained(p)
+        relative = resolved.relative_to(self.root.resolve())
+        if SPILL_DIR_NAME in relative.parts:
+            raise ValueError(
+                f"Path '{p}' is inside the engine-owned '{SPILL_DIR_NAME}' directory."
+            )
+        return resolved
+
 
 async def test_upload_tool_passes_resolved_path_to_executor(tmp_path) -> None:
     (tmp_path / "f.txt").write_text("x")
@@ -212,6 +222,38 @@ async def test_download_tool_writes_into_workspace(tmp_path) -> None:
     )
     assert out["ok"] is True
     assert ex.calls[0][0] == "download"
+
+
+def test_the_download_description_names_the_reserved_directory(tmp_path) -> None:
+    """local_path is a write target, so the download tool says up front what
+    the upload tool, which only reads the workspace, has no reason to say."""
+    ex = _RecordingTransferExecutor()
+    workspace = _FakeWorkspace(tmp_path)
+    note = f"output/{SPILL_DIR_NAME}/ is reserved for the engine and refuses writes."
+    download = SshDownloadTool(executor=ex, workspace=workspace, context=_ctx())
+    upload = SshUploadTool(executor=ex, workspace=workspace, context=_ctx())
+    assert note in download.description
+    assert note not in upload.description
+
+
+async def test_download_tool_refuses_the_engine_owned_subtree(tmp_path) -> None:
+    """local_path is model-facing; the download resolves through the
+    write-side entry, so a destination inside the engine's tool-results
+    directory is refused before the executor is ever reached."""
+    ex = _RecordingTransferExecutor()
+    tool = SshDownloadTool(
+        executor=ex, workspace=_FakeWorkspace(tmp_path), context=_ctx()
+    )
+    out = await tool.run_json_async(
+        {
+            "target": "prod",
+            "remote_path": "/srv/f",
+            "local_path": f"{SPILL_DIR_NAME}/f.txt",
+        }
+    )
+    assert out["ok"] is False
+    assert out["error_code"] == "ssh_operation_not_allowed"
+    assert ex.calls == []  # executor never reached
 
 
 async def test_transfer_tool_without_workspace_fails_closed() -> None:

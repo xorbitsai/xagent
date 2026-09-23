@@ -34,6 +34,116 @@ def _stable_server_names(values: Any) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _apply_stdio_output_limit_env(
+    mcp_configs: list[dict[str, Any]],
+    config: "BaseToolConfig",
+    *,
+    exempt_server_names: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
+    """Mirror this process's output-length budget into stdio child env vars.
+
+    ``OutputFilteredToolWrapper`` (see factory.py) truncates a stdio MCP
+    tool's result in THIS process using ``config.get_max_output_length()``.
+    Builtin connectors under ``xagent.web.tools.mcp`` size their own
+    bounded, valid-JSON output against the *same-named* env var read inside
+    their own subprocess. ``_create_stdio_session`` launches that subprocess
+    with a minimal, explicitly-built env (credentials + caller id only)
+    rather than inheriting this process's environment, so the two budgets
+    can silently disagree and the wrapper's blind slice can then cut valid
+    JSON produced by the child mid-structure.
+
+    ``_apply_output_filters`` (factory.py) computes ``max_chars`` once from
+    ``config.get_max_output_length()`` and applies it uniformly to every
+    tool -- there is no per-server override on the parent side. A config's
+    own env can still carry an explicit, narrower cap for one connector
+    (e.g. an operator deliberately limiting a noisy one to 4096 chars via
+    its ``UserMCPServer.env``/global env, on a deployment whose parent
+    budget defaults to 50k) -- that's a legitimate, self-imposed limit on
+    what the CHILD produces, orthogonal to the parent/child alignment
+    problem this function exists to fix, and it never risks corrupting
+    anything: the parent's slice point only matters once a response is
+    already at or beyond it, so a child bounded to less than the parent's
+    budget is never touched by the parent's filter at all. So a
+    pre-existing value is preserved exactly when it validates as a
+    positive integer AT OR BELOW the parent's effective value; anything
+    else (missing, not a positive integer, or larger than the parent's
+    budget) is replaced with the parent's effective value -- a larger
+    existing value in particular would otherwise let the parent's blind
+    slice cut a child response sized to a bigger, unaligned budget.
+
+    ``exempt_server_names`` must list every server that bypasses the
+    generic MCP loader for its own actor/execution-scoped session consumer
+    (e.g. chrome-devtools via ``bind_chrome_execution_scope``): that path
+    fail-closes on any unexpected env key, so injecting into it would take
+    down the connector instead of just fixing its output budget.
+
+    Returns a new list (stdio entries needing an env change are shallow
+    copies); ``mcp_configs`` and its dicts are never mutated in place, since
+    they may be the same objects a config's own request-scoped cache holds
+    onto and returns again on a later call within this request.
+    """
+    from .....config import TOOL_MAX_OUTPUT_LENGTH
+
+    # Lazy and computed at most once: some BaseToolConfig implementations
+    # used in practice (e.g. a fixture built for a non-stdio-only test)
+    # don't define get_max_output_length() at all, and the old, per-entry
+    # call site never reached it when there were no stdio entries to act
+    # on -- calling it unconditionally up front would call it even then.
+    effective_value: int | None = None
+
+    result: list[dict[str, Any]] = []
+    for cfg in mcp_configs:
+        server_name = cfg.get("name")
+        inner_config = cfg.get("config")
+        if (
+            cfg.get("transport") != "stdio"
+            or (isinstance(server_name, str) and server_name in exempt_server_names)
+            or not isinstance(inner_config, dict)
+            or inner_config.get("unavailable")
+        ):
+            result.append(cfg)
+            continue
+        existing_env = inner_config.get("env")
+        if existing_env is not None and not isinstance(existing_env, dict):
+            logger.warning(
+                "Stdio MCP server %r has a non-dict env (%s); skipping "
+                "output-limit mirroring for it",
+                server_name,
+                type(existing_env).__name__,
+            )
+            result.append(cfg)
+            continue
+        if effective_value is None:
+            effective_value = config.get_max_output_length()
+        env = dict(existing_env or {})
+        existing = env.get(TOOL_MAX_OUTPUT_LENGTH)
+        parsed: int | None = None
+        if isinstance(existing, str) or (
+            isinstance(existing, int) and not isinstance(existing, bool)
+        ):
+            try:
+                parsed = int(existing)
+            except (TypeError, ValueError):
+                parsed = None
+        if parsed is not None and 0 < parsed <= effective_value:
+            env[TOOL_MAX_OUTPUT_LENGTH] = str(parsed)
+        else:
+            if existing is not None:
+                logger.warning(
+                    "Stdio MCP server %r had a %s override (%r) that isn't a "
+                    "valid, positive value at or below the parent's own "
+                    "effective budget (%s); replacing it with the effective "
+                    "value",
+                    server_name,
+                    TOOL_MAX_OUTPUT_LENGTH,
+                    existing,
+                    effective_value,
+                )
+            env[TOOL_MAX_OUTPUT_LENGTH] = str(effective_value)
+        result.append({**cfg, "config": {**inner_config, "env": env}})
+    return result
+
+
 def _select_config_load_failures(
     error: MCPConfigLoadError,
     spec: Any,
@@ -269,10 +379,23 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     try:
         from .factory import ToolFactory
 
+        # Actor/execution-scoped stdio sessions (e.g. chrome-devtools)
+        # bypass the generic MCP loader for their own session consumer,
+        # which fail-closes on any env key it didn't itself put there — so
+        # they must be resolved (and exempted) before mirroring the
+        # output-limit env var below. Both steps sit inside this try block
+        # on purpose: if either raises, the whole call must degrade to the
+        # same "loader_failed" fallback as any other dispatch failure
+        # (fail closed) rather than silently treating every stdio server as
+        # if it weren't actor-scoped (fail open).
         identity_getter = getattr(
             config, "get_actor_mcp_stdio_session_identities", None
         )
         session_identities = identity_getter() if callable(identity_getter) else {}
+        mcp_configs = _apply_stdio_output_limit_env(
+            mcp_configs, config, exempt_server_names=frozenset(session_identities)
+        )
+
         consumer_getter = getattr(config, "get_actor_mcp_stdio_session_consumer", None)
         session_consumer = consumer_getter() if callable(consumer_getter) else None
         create_kwargs: dict[str, Any] = {"sandbox": config.get_sandbox()}

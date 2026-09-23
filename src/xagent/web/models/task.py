@@ -316,6 +316,41 @@ class Task(Base):  # type: ignore
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    # Retention anchor: the time of the last *conversational* activity on this
+    # task, written only when a row is persisted to ``task_chat_messages``
+    # (the insert paths in chat_history_service, via
+    # ``services.task_retention.touch_task_last_activity``). Owner: #2562.
+    #
+    # "Conversational" means it landed in the transcript the user reads. That
+    # includes system notices rendered as assistant turns -- an interruption
+    # or failure message moves this column, because the user sees it. It
+    # excludes everything that never reaches the transcript, which is the
+    # class ``updated_at`` cannot distinguish.
+    #
+    # ``updated_at`` above cannot serve this purpose: it carries
+    # ``onupdate=func.now()``, so every unrelated write to this row advances
+    # it -- the token tracker's periodic counter writes
+    # (tracking/task_tracker.py), lease acquisition and heartbeat renewal,
+    # completion writes, and checkpoint-pointer maintenance. A retention
+    # period anchored on it would be postponed indefinitely by execution
+    # bookkeeping that no user ever saw.
+    #
+    # NULL on rows written before this column existed *and* not yet reached
+    # by the backfill in revision 20260922_task_last_activity_at, and on any
+    # task that has never carried a message. Readers must not treat NULL as
+    # "infinitely recent" -- ``retention_anchor()`` coalesces it to
+    # ``created_at`` so a message-less task cannot become immortal. The
+    # column deliberately carries no server default: one would have made
+    # ``ALTER TABLE`` stamp every pre-existing row with the migration's own
+    # clock, which is exactly the value the backfill exists to avoid.
+    #
+    # No index yet. The set-scanning consumer is the purge job (#2563), not
+    # the read-only preview in this revision, and a plain CREATE INDEX on a
+    # multi-million-row ``tasks`` table takes a lock for its duration --
+    # PostgreSQL wants CONCURRENTLY, which cannot run inside Alembic's
+    # migration transaction. Whoever adds the scan adds the index, with the
+    # deployment procedure that goes with it.
+    last_activity_at = Column(DateTime(timezone=True), nullable=True)
     runner_id = Column(String(255), nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)

@@ -249,6 +249,8 @@ def accept_channel_input(
     host_id: str,
     additional_inputs: tuple[ChannelInput, ...] = (),
     agent_id: int | None = None,
+    task_title: str | None = None,
+    task_description: str | None = None,
 ) -> AcceptedChannelInput:
     """Commit receipt, selection, files, transcript, START and reply mapping once."""
     _validate_batch((incoming, *additional_inputs))
@@ -323,6 +325,14 @@ def accept_channel_input(
         if selection is None:
             raise TaskTurnError("busy")
         selection = cast(SelectedChannelTask, selection)
+        if selection.is_new_task and (
+            task_title is not None or task_description is not None
+        ):
+            task = cast(Task, db.get(Task, selection.task_id))
+            if task_title is not None:
+                setattr(task, "title", task_title)
+            if task_description is not None:
+                setattr(task, "description", task_description)
         for staged in staged_files:
             if staged.user_id != owner_id or staged.task_id is not None:
                 raise TaskTurnError("file_unavailable")

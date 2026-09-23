@@ -133,21 +133,25 @@ async def test_control_fences_late_preparation(bot, monkeypatch, command, retain
         )
         old.request_stop = Mock(return_value=True)
         bot.user_active_executions["sender"] = (45, old)
-    entered, release = asyncio.Event(), asyncio.Event()
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
     accept = Mock(side_effect=AssertionError("Stopped preparation cannot accept"))
 
-    async def lookup(operation):
+    def lookup(incoming):
         entered.set()
-        await release.wait()
+        assert release.wait(5)
         return 5, (), (), ()
 
-    monkeypatch.setattr(module, "run_db_io_cancellation_safe", lookup)
+    monkeypatch.setattr(module, "lookup_channel_inputs", lookup)
     monkeypatch.setattr(module, "accept_channel_input", accept)
     bot._handle_message_sync(message("request"))
-    await asyncio.wait_for(entered.wait(), 2)
-    await control(bot, command)
     task = bot.user_message_tasks["sender"]
-    release.set()
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        await control(bot, command)
+    finally:
+        release.set()
     await asyncio.wait_for(task, 2)
     accept.assert_not_called()
     assert bot.active_tasks["sender"] == ("-1" if command == "/new" else "45")

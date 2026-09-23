@@ -106,6 +106,7 @@ class SqlQueryTool:
                             output_file: (OPTIONAL) Export results to file instead of returning them.
                                 Supported: .csv, .parquet, .json, .jsonl, .ndjson (relative to workspace).
                                 Use for large datasets to avoid response size limits.
+                                output/tool-results/ is reserved for the engine and refuses writes.
 
                         Returns:
                             dict with keys:

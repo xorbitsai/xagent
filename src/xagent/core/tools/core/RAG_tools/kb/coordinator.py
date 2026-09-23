@@ -31,6 +31,7 @@ from ..core.schemas import (
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
+from .async_utils import maybe_await
 from .collection_handle import (
     KBHandleProvider,
     KBMainPointerSnapshot,
@@ -52,6 +53,7 @@ from .models import (
     KBVectorStorageCleanupResult,
     RollbackFailedIngestionRequest,
     RollbackFailedIngestionResult,
+    RollbackFailedUploadIngestionRequest,
 )
 from .operation_compatibility import (
     KBOperationCompatibilityFacade,
@@ -2137,6 +2139,39 @@ class KBCoordinator:
         """Async twin (coordinator convention; first awaited in #795)."""
         return await asyncio.to_thread(self.rollback_failed_ingestion_sync, request)
 
+    async def rollback_failed_upload_ingestion(
+        self, request: RollbackFailedUploadIngestionRequest
+    ) -> RollbackFailedIngestionResult:
+        """Run direct-upload failed-ingest compensation DOCUMENT->FILE->COLLECTION.
+
+        Stops at the first failing callback and returns its exception in
+        ``result.error``; never raises for a failing callback.
+        """
+        # Not to_thread: callbacks use the caller's Session, which is not
+        # thread-safe (/ingest-cloud also shares it across gather siblings).
+        attempted = False
+        for boundary, callback in (
+            ("DOCUMENT", request.document_compensation),
+            ("FILE", request.file_compensation),
+            ("COLLECTION", request.collection_compensation),
+        ):
+            if callback is None:
+                continue
+            attempted = True
+            try:
+                await maybe_await(callback())
+            except Exception as exc:  # noqa: BLE001 - returned in result.error
+                return self._callbacks_only_result(
+                    attempted=True,
+                    boundary_errors={boundary: (str(exc),)},
+                    first_error=f"{boundary} boundary compensation failed: {exc}",
+                    warnings=(),
+                    error=exc,
+                )
+        return self._callbacks_only_result(
+            attempted=attempted, boundary_errors={}, first_error=None, warnings=()
+        )
+
     def _rollback_boundaries_with_operation(
         self, request: RollbackFailedIngestionRequest
     ) -> RollbackFailedIngestionResult:
@@ -2423,6 +2458,22 @@ class KBCoordinator:
                 except Exception as exc:  # noqa: BLE001 - fold into the result
                     _fold("SNAPSHOT", exc)
 
+        return self._callbacks_only_result(
+            attempted=attempted,
+            boundary_errors=boundary_errors,
+            first_error=first_error,
+            warnings=warnings,
+        )
+
+    @staticmethod
+    def _callbacks_only_result(
+        *,
+        attempted: bool,
+        boundary_errors: dict[str, tuple[str, ...]],
+        first_error: Optional[str],
+        warnings: Sequence[str],
+        error: Optional[Exception] = None,
+    ) -> RollbackFailedIngestionResult:
         if boundary_errors:
             status, rollback_status = "incomplete", RollbackStatus.INCOMPLETE
         elif attempted:
@@ -2437,6 +2488,7 @@ class KBCoordinator:
             first_error=first_error,
             boundary_errors=boundary_errors,
             warnings=tuple(warnings),
+            error=error,
         )
 
     # --- Rollback vector cleanup router (#515) ---

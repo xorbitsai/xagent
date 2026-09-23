@@ -141,11 +141,17 @@ def execute_sql_query(
             if output_file and workspace:
                 file_ext = Path(output_file).suffix.lower()
                 if file_ext == ".csv":
-                    # Streaming export for large datasets
+                    # Streaming export for large datasets. The export target
+                    # is resolved -- and the engine-owned subtree refused --
+                    # before the statement runs, in every branch below, so a
+                    # refused export executes nothing on the database.
+                    resolved_path = workspace.resolve_write_path(
+                        output_file, default_dir="output"
+                    )
                     result = conn.execute(stmt)
                     with workspace.auto_register_files():
                         exported_path, exported_count, columns = _stream_export_to_csv(
-                            workspace, output_file, result
+                            resolved_path, result
                         )
                     return _build_export_result(
                         workspace=workspace,
@@ -157,13 +163,16 @@ def execute_sql_query(
                     )
                 elif file_ext == ".parquet":
                     # Streaming export with Parquet (better compression & type preservation)
+                    resolved_path = workspace.resolve_write_path(
+                        output_file, default_dir="output"
+                    )
                     result = conn.execute(stmt)
                     with workspace.auto_register_files():
                         (
                             exported_path,
                             exported_count,
                             columns,
-                        ) = _stream_export_to_parquet(workspace, output_file, result)
+                        ) = _stream_export_to_parquet(resolved_path, result)
                     return _build_export_result(
                         workspace=workspace,
                         exported_path=exported_path,
@@ -174,13 +183,16 @@ def execute_sql_query(
                     )
                 elif file_ext in (".json", ".jsonl", ".ndjson"):
                     # Streaming JSON Lines (NDJSON) export
+                    resolved_path = workspace.resolve_write_path(
+                        output_file, default_dir="output"
+                    )
                     result = conn.execute(stmt)
                     with workspace.auto_register_files():
                         (
                             exported_path,
                             exported_count,
                             columns,
-                        ) = _stream_export_to_jsonlines(workspace, output_file, result)
+                        ) = _stream_export_to_jsonlines(resolved_path, result)
                     return _build_export_result(
                         workspace=workspace,
                         exported_path=exported_path,
@@ -262,8 +274,7 @@ def _build_export_result(
 
 
 def _stream_export_to_csv(
-    workspace: "TaskWorkspace",
-    file_path: str,
+    resolved_path: Path,
     result: CursorResult,
     batch_size: int = 1000,
 ) -> tuple[str, int, list[str]]:
@@ -272,7 +283,6 @@ def _stream_export_to_csv(
     Returns:
         Tuple of (exported_file_path, row_count, column_names)
     """
-    resolved_path = workspace.resolve_path(file_path, default_dir="output")
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Get column names BEFORE iteration
@@ -305,8 +315,7 @@ def _stream_export_to_csv(
 
 
 def _stream_export_to_jsonlines(
-    workspace: "TaskWorkspace",
-    file_path: str,
+    resolved_path: Path,
     result: CursorResult,
     batch_size: int = 1000,
 ) -> tuple[str, int, list[str]]:
@@ -315,7 +324,6 @@ def _stream_export_to_jsonlines(
     Returns:
         Tuple of (exported_file_path, row_count, column_names)
     """
-    resolved_path = workspace.resolve_path(file_path, default_dir="output")
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Get column names BEFORE iteration
@@ -340,8 +348,7 @@ def _stream_export_to_jsonlines(
 
 
 def _stream_export_to_parquet(
-    workspace: "TaskWorkspace",
-    file_path: str,
+    resolved_path: Path,
     result: CursorResult,
     batch_size: int = 5000,
 ) -> tuple[str, int, list[str]]:
@@ -362,7 +369,6 @@ def _stream_export_to_parquet(
             "Install it with: pip install pyarrow"
         )
 
-    resolved_path = workspace.resolve_path(file_path, default_dir="output")
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Get column names BEFORE iteration

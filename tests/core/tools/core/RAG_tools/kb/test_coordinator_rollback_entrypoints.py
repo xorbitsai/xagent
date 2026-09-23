@@ -9,6 +9,7 @@ Per-plane compensation mechanics arrive as request callbacks or saga steps.
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Any, Callable, Optional
 
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from xagent.core.tools.core.RAG_tools.kb.coordinator import KBCoordinator
 from xagent.core.tools.core.RAG_tools.kb.models import (
     RollbackFailedIngestionRequest,
+    RollbackFailedUploadIngestionRequest,
 )
 from xagent.core.tools.core.RAG_tools.kb.operation_compatibility import (
     KBOperation,
@@ -326,3 +328,96 @@ class TestAsyncTwin:
         assert order == ["document", "file", "status", "snapshot"]
         assert result.status == "complete"
         assert result.rollback_complete is True
+
+
+class TestUploadRollback:
+    """#795: the upload entry awaits on the caller's loop and stops at the first failure."""
+
+    @staticmethod
+    def _request(
+        order: list[str], *, file_raises: Optional[Exception] = None
+    ) -> RollbackFailedUploadIngestionRequest:
+        def _file() -> None:
+            order.append("file")
+            if file_raises is not None:
+                raise file_raises
+
+        return RollbackFailedUploadIngestionRequest(
+            document_compensation=lambda: order.append("document"),
+            file_compensation=_file,
+            collection_compensation=lambda: order.append("collection"),
+        )
+
+    def test_runs_document_file_collection_in_order(self) -> None:
+        order: list[str] = []
+
+        result = asyncio.run(
+            _make_coordinator().rollback_failed_upload_ingestion(self._request(order))
+        )
+
+        assert order == ["document", "file", "collection"]
+        assert result.status == "complete"
+        assert result.rollback_status is RollbackStatus.COMPLETE
+        assert result.rollback_complete is True
+        assert result.error is None
+
+    def test_stops_at_first_failure_and_returns_original_exception(self) -> None:
+        order: list[str] = []
+        boom = ValueError("boom")
+
+        result = asyncio.run(
+            _make_coordinator().rollback_failed_upload_ingestion(
+                self._request(order, file_raises=boom)
+            )
+        )
+
+        assert order == ["document", "file"]
+        assert result.error is boom
+        assert result.first_error == "FILE boundary compensation failed: boom"
+        assert result.boundary_errors == {"FILE": ("boom",)}
+        assert result.warnings == ()
+        assert result.status == "incomplete"
+        assert result.rollback_status is RollbackStatus.INCOMPLETE
+        assert result.rollback_complete is False
+        assert result.side_effects_may_remain is True
+
+    def test_awaits_async_callbacks(self) -> None:
+        order: list[str] = []
+
+        async def _collection() -> None:
+            await asyncio.sleep(0)
+            order.append("collection")
+
+        request = RollbackFailedUploadIngestionRequest(
+            collection_compensation=_collection
+        )
+
+        result = asyncio.run(
+            _make_coordinator().rollback_failed_upload_ingestion(request)
+        )
+
+        assert order == ["collection"]
+        assert result.status == "complete"
+
+    def test_runs_callbacks_on_caller_thread(self) -> None:
+        threads: list[int] = []
+        request = RollbackFailedUploadIngestionRequest(
+            document_compensation=lambda: threads.append(threading.get_ident())
+        )
+
+        asyncio.run(_make_coordinator().rollback_failed_upload_ingestion(request))
+
+        assert threads == [threading.get_ident()]
+
+    def test_not_needed_without_callbacks(self) -> None:
+        result = asyncio.run(
+            _make_coordinator().rollback_failed_upload_ingestion(
+                RollbackFailedUploadIngestionRequest()
+            )
+        )
+
+        assert result.status == "not_needed"
+        assert result.rollback_status is RollbackStatus.NOT_NEEDED
+        assert result.rollback_complete is True
+        assert result.side_effects_may_remain is False
+        assert result.error is None

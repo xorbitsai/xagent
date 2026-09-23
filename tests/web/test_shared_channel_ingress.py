@@ -52,31 +52,24 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
     )
     turn.close = AsyncMock()
     turn.deliver = AsyncMock(return_value=True)
-    if platform == "telegram":
-        monkeypatch.setattr(
-            module, "prepare_shared_channel_turn", AsyncMock(return_value=turn)
-        )
-    else:
-        from xagent.web.services.channel_input_acceptance import AcceptedChannelInput
+    from xagent.web.services.channel_input_acceptance import AcceptedChannelInput
 
-        accepted = AcceptedChannelInput(
-            45, 1, "command", "run", 5, False, turn.selection
-        )
-        monkeypatch.setattr(AcceptedChannelInput, "as_turn", lambda self: turn)
-        monkeypatch.setattr(
-            module, "lookup_channel_inputs", lambda incoming: (5, incoming, (), ())
-        )
-        accept = Mock(return_value=accepted)
-        monkeypatch.setattr(module, "accept_channel_input", accept)
-        monkeypatch.setattr(module, "get_task_event_bridge", Mock())
-        monkeypatch.setattr(module.DurableChannelProgress, "send", AsyncMock())
-        turn.observe = AsyncMock(
-            return_value={
-                "success": True,
-                "status": "completed",
-                "output": "Worker answer",
-            }
-        )
+    accepted = AcceptedChannelInput(45, 1, "command", "run", 5, False, turn.selection)
+    monkeypatch.setattr(AcceptedChannelInput, "as_turn", lambda self: turn)
+    monkeypatch.setattr(
+        module, "lookup_channel_inputs", lambda incoming: (5, incoming, (), ())
+    )
+    accept = Mock(return_value=accepted)
+    monkeypatch.setattr(module, "accept_channel_input", accept)
+    monkeypatch.setattr(module, "get_task_event_bridge", Mock())
+    monkeypatch.setattr(module.DurableChannelProgress, "send", AsyncMock())
+    turn.observe = AsyncMock(
+        return_value={
+            "success": True,
+            "status": "completed",
+            "output": "Worker answer",
+        }
+    )
     local_agent = Mock(
         side_effect=AssertionError("Web ingress must not create an agent")
     )
@@ -125,6 +118,7 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
             message_id=77, edit_text=AsyncMock(), delete=AsyncMock()
         )
         message = SimpleNamespace(
+            voice=None,
             message_id=76,
             message_thread_id=None,
             from_user=SimpleNamespace(id=123),
@@ -132,8 +126,10 @@ async def test_channel_entry_submits_shared_turn_without_local_agent(
             answer=AsyncMock(return_value=loading),
         )
         await bot._process_user_messages_batch(123, [message])
-        assert turn.delivery_destination["chat_id"] == 456
-        assert turn.execute.await_args.args[0].transcript_message == "hello"
+        assert accept.call_args.args[0].destination["chat_id"] == 456
+        assert accept.call_args.kwargs["payload"].transcript_message == "hello"
+        turn.execute.assert_not_awaited()
+        turn.observe.assert_awaited_once()
     turn.deliver.assert_awaited_once()
     assert callable(turn.deliver.await_args.args[0])
     assert turn.deliver.await_args.kwargs == {"pending_notice": False}

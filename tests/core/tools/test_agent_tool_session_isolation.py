@@ -362,6 +362,21 @@ def test_classifier_leaves_statusless_results_untouched():
     assert mod._classify_delegated_child_failure({"output": ""}) is None
 
 
+@pytest.mark.parametrize("outcome", ["partial", "blocked"])
+def test_classifier_does_not_treat_partial_delivery_as_completed_work(outcome):
+    result = mod._classify_delegated_child_failure(
+        {
+            "status": "completed",
+            "success": True,
+            "completion_outcome": outcome,
+            "output": "File saved, verification not run.",
+        }
+    )
+    assert result is not None
+    assert tool_result_succeeded(result) is False
+    assert "File saved, verification not run." in result["output"]
+
+
 def test_classify_delegated_child_failure_reads_raw_output_over_backfill():
     """The classifier reads the child's own raw answer, not the backfilled one.
 

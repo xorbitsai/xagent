@@ -247,8 +247,7 @@ primary-key conflicts trigger repartition; unrelated integrity failures propagat
 `ChannelInputBatchChanged` is a retry signal for the caller's partition loop, not a
 user-facing `TaskTurnError`.
 
-Slack and Feishu use this foundation in shared execution mode. Telegram
-continues to use its existing input acceptance path.
+Slack, Feishu and Telegram use this foundation in shared execution mode.
 
 
 ### Slack input acceptance
@@ -371,3 +370,34 @@ Deactivating the channel suspends that delivery recovery until it is active agai
 Local execution keeps
 its previous behavior. Inputs still waiting in the in-memory queue are not made
 durable by this change; external sends remain at least once.
+
+
+### Telegram input acceptance
+
+Shared Telegram inputs use durable receipts keyed by configured channel, sender,
+chat, topic and physical message ID. Attachment fingerprints use `file_unique_id`;
+downloads use `file_id`. Replays reuse the original command before downloading or
+resolving speech recognition, even when the current Agent or ASR configuration
+has changed. Authorization is checked again on replay.
+
+Contiguous chat/topic groups are accepted separately. All new inputs in a group
+are rejected together if an attachment cannot be downloaded or a voice message
+cannot be transcribed; resend the group together. Later groups continue. Voice
+messages are transcribed in message order; regular audio remains an attachment.
+Files, transcript, receipt, START and reply destination commit together. A local
+conversation-map save failure does not undo an accepted request.
+
+Loading messages, progress and final output use the durable delivery claim.
+Recovery can create a loading message when acceptance committed before the
+initial send. `/stop` pauses work while preserving its answer; `/new`, `/switch`
+and Agent selection suppress abandoned replies. Shutdown detaches observation
+without cancelling accepted worker work. Local execution behavior is unchanged.
+
+Shared startup retains Telegram's pending ordinary messages. Commands and text
+stop aliases predating startup are ignored. Telegram message timestamps have
+second precision, so controls in the same second as startup are conservatively
+ignored too. Agent selection and pagination keyboards from previous bot starts
+expire; send `/agents` for a new menu. Local startup still clears pending updates.
+This does not make aiogram's in-memory queue a durable inbox: messages already
+acknowledged to Telegram but not accepted into the database can still be lost
+on a crash. Platform sends remain at least once.

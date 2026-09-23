@@ -258,6 +258,251 @@ describe("processTraceEvents tool_call_id attribution", () => {
   })
 })
 
+describe("processTraceEvents unavailable connector placeholder", () => {
+  const tc = (key: string, vars?: Record<string, string | number>) =>
+    vars?.connector ? `${key}:${vars.connector}` : t(key, vars)
+  const failedCall = (toolName: string, result: unknown) =>
+    [
+      stepStart,
+      ev("tool_execution_start", { tool_name: toolName, tool_call_id: "A" }),
+      ev("tool_execution_failed", {
+        tool_name: toolName,
+        tool_call_id: "A",
+        error: "MCP server tools could not be loaded.",
+        result,
+      }),
+    ].map((event, index) => ({ ...event, timestamp: index + 1 }))
+  const failedToolAction = (toolName: string, title: string) => ({
+    id: "event-1",
+    type: "tool",
+    title: `traceEventRenderer.executeTool:${title}`,
+    status: "failed",
+    timestamp: 2000,
+    data: {
+      tool: toolName,
+      args: undefined,
+      code: "",
+      tool_call_id: "A",
+      sandboxed: false,
+      error: "MCP server tools could not be loaded.",
+    },
+  })
+
+  it("renders a call carrying unavailable_server as a connector status line", () => {
+    const steps = processTraceEvents(
+      failedCall("mcp_google_drive_42_unavailable", {
+        success: false,
+        is_error: true,
+        unavailable_server: "Google Drive",
+      }) as never,
+      tc,
+    )
+
+    expect(steps[0].actions).toEqual([
+      {
+        id: "event-1",
+        type: "info",
+        title: "traceEventRenderer.connectorUnavailable:Google Drive",
+        status: "completed",
+        timestamp: 2000,
+        data: { statusLine: true },
+      },
+    ])
+  })
+
+  it.each([
+    ["a non-empty error", "MCP server credentials are unavailable.", { statusLine: true, error: "MCP server credentials are unavailable." }],
+    ["a blank error", "  ", { statusLine: true }],
+    ["a non-string error", 42, { statusLine: true }],
+  ])("sets the status line detail from result.error given %s", (_, error, data) => {
+    const steps = processTraceEvents(
+      failedCall("mcp_google_drive_42_unavailable", {
+        success: false,
+        is_error: true,
+        error,
+        unavailable_server: "Google Drive",
+      }) as never,
+      tc,
+    )
+
+    expect(steps[0].actions).toEqual([
+      expect.objectContaining({ type: "info", data }),
+    ])
+  })
+
+  it("only converts tool failures into a connector status line", () => {
+    const steps = processTraceEvents(
+      [
+        stepStart,
+        ev("dag_step_failed", {
+          error: "step failed",
+          result: { unavailable_server: "Google Drive" },
+        }),
+      ].map((event, index) => ({ ...event, timestamp: index + 1 })) as never,
+      tc,
+    )
+
+    expect(steps[0].actions).toEqual([
+      {
+        id: "event-1",
+        type: "error",
+        title: "traceEventRenderer.executionFailed",
+        status: "failed",
+        timestamp: 2000,
+        data: { error: "step failed" },
+      },
+    ])
+  })
+
+  it("keeps an ordinary MCP tool failure as a failed tool call", () => {
+    const steps = processTraceEvents(
+      failedCall("mcp_notion_search", {
+        success: false,
+        is_error: true,
+        content: [{ text: "boom" }],
+      }) as never,
+      tc,
+    )
+
+    expect(steps[0].actions).toEqual([
+      failedToolAction("mcp_notion_search", "Mcp Notion Search"),
+    ])
+  })
+
+  it.each([
+    ["missing", { success: false, is_error: true }],
+    ["empty", { success: false, is_error: true, unavailable_server: " " }],
+    ["non-string", { success: false, is_error: true, unavailable_server: 42 }],
+    ["non-object result", "MCP server tools could not be loaded."],
+  ])("falls back to the tool failure when unavailable_server is %s", (_, result) => {
+    const steps = processTraceEvents(
+      failedCall("mcp_google_drive_42_unavailable", result) as never,
+      tc,
+    )
+
+    expect(steps[0].actions).toEqual([
+      failedToolAction(
+        "mcp_google_drive_42_unavailable",
+        "Mcp Google Drive 42 Unavailable",
+      ),
+    ])
+  })
+
+  const placeholderFailure = (toolCallId?: string) =>
+    ev("tool_execution_failed", {
+      tool_name: "mcp_google_drive_42_unavailable",
+      ...(toolCallId ? { tool_call_id: toolCallId } : {}),
+      error: "MCP server tools could not be loaded.",
+      result: { success: false, is_error: true, unavailable_server: "Google Drive" },
+    })
+  const statusLineAction = (id: string, timestamp: number) => ({
+    id,
+    type: "info",
+    title: "traceEventRenderer.connectorUnavailable:Google Drive",
+    status: "completed",
+    timestamp,
+    data: { statusLine: true },
+  })
+
+  const S = "web_search"
+  const P = "mcp_google_drive_42_unavailable"
+  const start = (tool: string, id?: string) =>
+    ev("tool_execution_start", { tool_name: tool, ...(id ? { tool_call_id: id } : {}) })
+  const endS = ev("tool_execution_end", {
+    tool_name: S,
+    tool_call_id: "A",
+    result: { output: "RESULT_S" },
+  })
+  const run = (...events: Array<ReturnType<typeof ev>>) =>
+    processTraceEvents(
+      [stepStart, ...events, ev("dag_step_end", {})].map((event, index) => ({
+        ...event,
+        timestamp: index + 1,
+      })) as never,
+      tc,
+    )[0].actions
+  const webSearchCards = (actions: ReturnType<typeof run>) =>
+    actions.filter((a) => a.data.tool === S)
+  const placeholderCards = (actions: ReturnType<typeof run>) =>
+    actions.filter((a) => a.data.tool === P)
+
+  it("replaces the placeholder card when a sibling reuses its id and ends later", () => {
+    const actions = run(start(S, "A"), start(P, "A"), placeholderFailure("A"), endS)
+
+    expect(actions).toHaveLength(2)
+    expect(webSearchCards(actions)).toEqual([
+      expect.objectContaining({ status: "completed", data: expect.objectContaining({ output: "RESULT_S" }) }),
+    ])
+    expect(placeholderCards(actions)).toEqual([])
+    expect(actions[1]).toEqual(statusLineAction("event-2", 3000))
+  })
+
+  it("appends a status line without removing cards when a sibling reusing the id ends first", () => {
+    const actions = run(start(S, "A"), start(P, "A"), endS, placeholderFailure("A"))
+
+    expect(actions).toHaveLength(3)
+    // The end lookup ignores tool names (baseline, out of scope): S's result lands on P's card.
+    expect(actions[0]).toMatchObject({ type: "tool", status: "completed", data: { tool: S } })
+    expect(actions[0].data.output).toBeUndefined()
+    expect(actions[1]).toMatchObject({
+      type: "tool",
+      status: "completed",
+      data: { tool: P, output: "RESULT_S" },
+    })
+    expect(actions[2]).toEqual(statusLineAction("event-4", 5000))
+  })
+
+  it.each([
+    ["does not match the placeholder card", "B", "C"],
+    ["is missing", undefined, undefined],
+  ])("appends a status line and keeps every card when the failure id %s", (_, startId, failedId) => {
+    const actions = run(start(S, "A"), start(P, startId), placeholderFailure(failedId), endS)
+
+    expect(actions).toHaveLength(3)
+    expect(webSearchCards(actions)).toEqual([
+      expect.objectContaining({ status: "completed", data: expect.objectContaining({ output: "RESULT_S" }) }),
+    ])
+    expect(placeholderCards(actions)).toHaveLength(1)
+    expect(actions[2]).toEqual(statusLineAction("event-3", 4000))
+  })
+
+  it("replaces only the running placeholder card when a completed card shares its id", () => {
+    const endP = ev("tool_execution_end", {
+      tool_name: P,
+      tool_call_id: "A",
+      result: { output: "RESULT_P" },
+    })
+    const actions = run(start(P, "A"), endP, start(P, "A"), placeholderFailure("A"))
+
+    expect(actions).toHaveLength(2)
+    expect(actions[0]).toMatchObject({
+      type: "tool",
+      status: "completed",
+      data: { tool: P, output: "RESULT_P" },
+    })
+    expect(actions[1]).toEqual(statusLineAction("event-3", 4000))
+  })
+
+  it("appends a status line when two running cards share the id and tool name", () => {
+    const actions = run(start(P, "A"), start(P, "A"), placeholderFailure("A"))
+
+    expect(actions).toHaveLength(3)
+    expect(placeholderCards(actions)).toHaveLength(2)
+    expect(actions[2]).toEqual(statusLineAction("event-3", 4000))
+  })
+
+  it("renders a failure without a matching start as only a status line", () => {
+    const events = [stepStart, placeholderFailure("A")].map((event, index) => ({
+      ...event,
+      timestamp: index + 1,
+    }))
+
+    const steps = processTraceEvents(events as never, tc)
+
+    expect(steps[0].actions).toEqual([statusLineAction("event-1", 2000)])
+  })
+})
+
 describe("getFriendlyToolName", () => {
   it("prettifies an unmapped snake_case tool name", () => {
     expect(getFriendlyToolName("some_future_tool")).toBe("Some Future Tool")

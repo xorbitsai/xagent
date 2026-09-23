@@ -180,6 +180,42 @@ def test_builder_state_rejects_unused_or_failed_staged_agents() -> None:
         state.to_plan()
 
 
+def test_builder_state_validates_tool_categories_like_create_agent() -> None:
+    state = WorkforcePromptBuilderState.from_agents([])
+    for categories, expected in (
+        (["web_search", "email"], "['email'] are not assignable"),
+        (
+            ["web_search", "mcp:github"],
+            "cannot grant; once it is created, the user can add connectors to its worker agents",
+        ),
+        (["mcp"], "built from a prompt cannot grant"),
+        ({"a": 1}, "must be a list"),
+        (False, "must be a list"),
+    ):
+        result = state.stage_agent(
+            {
+                "name": "研究员",
+                "description": "检索资料时使用。",
+                "instructions": "检索并核验资料。",
+                "tool_categories": categories,
+            }
+        )
+        assert result["status"] == "error", categories
+        assert expected in result["message"], categories
+    assert state.created_agents == {}
+
+    staged = state.stage_agent(
+        {
+            "name": "研究员",
+            "description": "检索资料时使用。",
+            "instructions": "检索并核验资料。",
+            "tool_categories": [" web_search", "web_search"],
+        }
+    )
+    assert staged["status"] == "success"
+    assert state.created_agents[staged["agent_ref"]].tool_categories == ["web_search"]
+
+
 def test_builder_state_enforces_staged_agent_limit() -> None:
     state = WorkforcePromptBuilderState.from_agents([])
     for index in range(MAX_WORKFORCE_BUILDER_AGENTS):

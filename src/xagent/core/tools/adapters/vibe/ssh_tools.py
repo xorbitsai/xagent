@@ -235,15 +235,19 @@ class SshDownloadTool(_SshTransferTool):
 
     @property
     def description(self) -> str:
-        return "Download a file from a bound SSH target into the task workspace."
+        return (
+            "Download a file from a bound SSH target into the task workspace. "
+            "output/tool-results/ is reserved for the engine and refuses writes."
+        )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         if self._workspace is None:
             return self._fail(None, "no task workspace available for file transfer")
         # The destination need not exist yet, but must resolve within the
-        # workspace (defaults under output/); resolve_path raises on escape.
+        # workspace (defaults under output/); resolve_write_path raises on
+        # escape and on a target inside the engine-owned tool-results subtree.
         try:
-            local = self._workspace.resolve_path(
+            local = self._workspace.resolve_write_path(
                 str(args.get("local_path", "")), default_dir="output"
             )
         except ValueError as exc:

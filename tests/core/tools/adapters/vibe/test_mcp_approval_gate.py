@@ -12,6 +12,7 @@ import pytest
 from pydantic import BaseModel
 
 from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolMetadata
+from xagent.core.tools.adapters.vibe.interaction_types import TYPES_REQUIRING_OPTIONS
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     GatedCall,
     GateDecision,
@@ -233,7 +234,10 @@ def test_metadata_passes_through_untouched_with_no_registrations() -> None:
     target = _Target(concurrency_safe=True)
     (tool,) = gate_mcp_tools([target], connection={"id": 41})
 
-    assert tool.metadata is target.metadata
+    # Value equality, not identity: a real tool builds a fresh ToolMetadata on
+    # every access (AbstractBaseTool.metadata), so an identity assertion passes
+    # here only because this fake happens to cache one.
+    assert tool.metadata == target.metadata
 
 
 @pytest.mark.asyncio
@@ -285,6 +289,16 @@ async def test_approval_stops_both_transports_before_dispatch(
     assert _gated_interaction_source(result["interaction_id"]) == (
         "slack",
         "interaction-1",
+    )
+    # A `confirm` must carry NO options: it is not in TYPES_REQUIRING_OPTIONS,
+    # the write-side validator refuses options on it (`options_forbidden`), and
+    # the renderer draws it as a boolean switch that ignores them.
+    assert result["interactions"] == [
+        {"type": "confirm", "field": "approve", "label": "Approve"}
+    ]
+    assert all(
+        interaction["type"] in TYPES_REQUIRING_OPTIONS or "options" not in interaction
+        for interaction in result["interactions"]
     )
     assert target.calls == []
     assert seen[0].connector_ref.to_wire() == {
@@ -756,22 +770,31 @@ async def test_external_cancellation_does_not_kill_an_in_flight_write(
 
 
 @pytest.mark.asyncio
-async def test_cancellation_after_dispatch_warns_when_the_write_outlasts_the_drain(
+async def test_cancellation_after_dispatch_reclaims_a_write_that_outlasts_the_drain(
     registrations: list[Any], monkeypatch: Any, caplog: Any
 ) -> None:
-    """The bounded drain gives up loudly instead of hanging the cancellation."""
+    """The bounded drain gives up loudly, then reclaims the connector call.
+
+    Giving up on *observing* the write must not mean giving up on its socket
+    and (for stdio) its child process, so the hook task is cancelled rather
+    than left detached.
+    """
 
     monkeypatch.setattr(
-        "xagent.core.tools.adapters.vibe.mcp_approval_gate."
-        "_POST_DISPATCH_DRAIN_SECONDS",
+        "xagent.core.tools.adapters.vibe.mcp_approval_gate._DISPATCH_OBSERVE_SECONDS",
         0.05,
     )
     started = asyncio.Event()
 
+    torn_down = asyncio.Event()
+
     class HangingTarget(_Target):
         async def run_json_async(self, args: Mapping[str, Any]) -> Any:
             started.set()
-            await asyncio.sleep(30)
+            try:
+                await asyncio.sleep(30)
+            finally:
+                torn_down.set()
             return {"success": True}
 
     async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
@@ -798,10 +821,12 @@ async def test_cancellation_after_dispatch_warns_when_the_write_outlasts_the_dra
 
     # Cancellation completed (it was not blocked forever by the hung RPC)...
     assert task.cancelled()
-    # ...and the unobservable write was reported rather than silently dropped.
-    assert any("may still land" in record.message for record in caplog.records), [
-        record.message for record in caplog.records
-    ]
+    # ...the unobservable write was reported rather than silently dropped...
+    assert any(
+        "may still have landed" in record.message for record in caplog.records
+    ), [record.message for record in caplog.records]
+    # ...and its transport was actually unwound rather than left detached.
+    await asyncio.wait_for(torn_down.wait(), timeout=5)
 
 
 @pytest.mark.asyncio
@@ -865,3 +890,451 @@ def test_registration_is_scoped_and_not_last_writer_wins(
         register_mcp_approval_gate(
             task_source="slack", gate=lambda _: None, resume=lambda **_: None
         )
+
+
+@pytest.mark.asyncio
+async def test_hung_connector_settles_as_dispatch_unknown(
+    registrations: list[Any], monkeypatch: Any
+) -> None:
+    """A connector that never answers must not park the resume forever.
+
+    The registration deadline is already spent by the time dispatch starts, so
+    without a second bound the success path waits on the RPC indefinitely.
+    """
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_approval_gate._DISPATCH_OBSERVE_SECONDS",
+        0.05,
+    )
+    started = asyncio.Event()
+
+    class HungTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            started.set()
+            await asyncio.sleep(30)
+            return {"success": True}
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(await executor({"text": "ok"}))
+
+    _register(registrations, lambda _: None, resume, timeout_seconds=30)
+    target = HungTarget()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        settlement = await asyncio.wait_for(
+            tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            ),
+            timeout=5,
+        )
+
+    assert settlement is not None
+    # Never "failed": the write may have reached the external system.
+    assert settlement.status == "dispatch_unknown"
+    assert started.is_set()
+
+
+@pytest.mark.asyncio
+async def test_unobserved_dispatch_is_cancelled_and_its_transport_torn_down(
+    registrations: list[Any], monkeypatch: Any
+) -> None:
+    """Bounded observation must also bound the connector's resource lifetime.
+
+    Only the ``shield`` wrapper is cancelled when the observation budget
+    expires, so the real hook task keeps running unless the gate cancels it:
+    its MCP session, socket and (for stdio, which has no read deadline of its
+    own) child process would stay alive for as long as the remote stays
+    silent, once per approval. The ``finally`` in the target below stands in
+    for ``async with create_session(...)`` unwinding.
+    """
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_approval_gate._DISPATCH_OBSERVE_SECONDS",
+        0.05,
+    )
+    torn_down = asyncio.Event()
+
+    class HungTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                torn_down.set()
+            return {"success": True}
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(await executor({"text": "ok"}))
+
+    _register(registrations, lambda _: None, resume, timeout_seconds=30)
+    (tool,) = gate_mcp_tools([HungTarget()], connection={"id": 41})
+
+    before = {task for task in asyncio.all_tasks()}
+    with bind_tool_call_execution_context(_context()):
+        settlement = await asyncio.wait_for(
+            tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            ),
+            timeout=5,
+        )
+
+    # The caller's contract is unchanged: the write may have landed.
+    assert settlement is not None
+    assert settlement.status == "dispatch_unknown"
+
+    # ...and the connector call is actually unwound, not merely logged.
+    await asyncio.wait_for(torn_down.wait(), timeout=5)
+    for _ in range(50):
+        leaked = {
+            task
+            for task in asyncio.all_tasks()
+            if task not in before and task is not asyncio.current_task()
+        }
+        if not leaked:
+            break
+        await asyncio.sleep(0.01)
+    assert not leaked, f"dispatch left {len(leaked)} task(s) running"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_observe_seconds_overrides_the_module_default(
+    registrations: list[Any], monkeypatch: Any
+) -> None:
+    """A registration's own budget is honored even when it differs from the
+    module default - proves the value actually threads through to
+    ``_call_resume_hook``, not just validated at registration and discarded.
+    """
+
+    # Pin the module default far above the test's patience. The assertions
+    # below can only pass if the per-registration override - not this
+    # constant - is what actually bounds the observation wait.
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_approval_gate._DISPATCH_OBSERVE_SECONDS",
+        999.0,
+    )
+    torn_down = asyncio.Event()
+
+    class HungTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                torn_down.set()
+            return {"success": True}
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(await executor({"text": "ok"}))
+
+    _register(
+        registrations,
+        lambda _: None,
+        resume,
+        timeout_seconds=30,
+        dispatch_observe_seconds=0.05,
+    )
+    (tool,) = gate_mcp_tools([HungTarget()], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        settlement = await asyncio.wait_for(
+            tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            ),
+            timeout=5,
+        )
+
+    assert settlement is not None
+    assert settlement.status == "dispatch_unknown"
+    await asyncio.wait_for(torn_down.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_mid_observation_shares_the_deadline_not_restarts_it(
+    registrations: list[Any],
+) -> None:
+    """Cancellation mid-observation must not re-arm a fresh full budget.
+
+    Regression test for the #2582 review finding on the cancellation branch:
+    previously, only the ``TimeoutError`` raised by the first post-dispatch
+    ``wait_for`` set ``observed = True``. A cancellation that instead
+    interrupted that same wait bypassed it, so the ``finally`` drain re-armed
+    a brand-new ``dispatch_observe_seconds`` window regardless of how much of
+    the first one had already elapsed - roughly doubling worst-case
+    dispatch-to-cancel-completion latency. The fix records a monotonic
+    deadline once and shares it between both waits.
+    """
+
+    dispatch_observe_seconds = 0.4
+    started = asyncio.Event()
+
+    class HangingTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            started.set()
+            await asyncio.Event().wait()  # never completes on its own
+            return {"success": True}
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(await executor({"text": "ok"}))
+
+    _register(
+        registrations,
+        lambda _: None,
+        resume,
+        timeout_seconds=30,
+        dispatch_observe_seconds=dispatch_observe_seconds,
+    )
+    (tool,) = gate_mcp_tools([HangingTarget()], connection={"id": 41})
+
+    async def run() -> Any:
+        with bind_tool_call_execution_context(_context()):
+            return await tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            )
+
+    task = asyncio.ensure_future(run())
+    await started.wait()
+    # Let the observation wait consume roughly half its budget before the
+    # external cancellation arrives - the shape that used to restart it.
+    await asyncio.sleep(dispatch_observe_seconds / 2)
+    loop = asyncio.get_running_loop()
+    cancel_time = loop.time()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=dispatch_observe_seconds * 3)
+    elapsed_after_cancel = loop.time() - cancel_time
+
+    # The fix bounds this to roughly the REMAINING half of the shared budget
+    # (~0.2s here). The bug re-armed a fresh full budget in `finally`
+    # (~0.4s), so a threshold at 75% of the full budget cleanly separates the
+    # two without being sensitive to ordinary scheduling jitter.
+    assert elapsed_after_cancel < dispatch_observe_seconds * 0.75, elapsed_after_cancel
+
+
+def test_wrapper_delegates_unknown_attributes_to_the_wrapped_tool() -> None:
+    """Call sites duck-type tools with getattr, so losses would be silent."""
+
+    target = _Target()
+    target.source_server = "notion"  # type: ignore[attr-defined]
+    target.category = "mcp"  # type: ignore[attr-defined]
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    assert tool.source_server == "notion"
+    assert tool.category == "mcp"
+    assert tool.target is target
+    # Wrapper-defined members keep priority over the delegation.
+    assert tool.name == target.name
+    assert tool.is_async() is True
+    # A private name must not be delegated, or a missing internal would be
+    # masked instead of raising.
+    with pytest.raises(AttributeError):
+        tool._nonexistent_internal  # noqa: B018
+
+
+def test_wrapper_category_is_none_when_the_target_has_none() -> None:
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    assert tool.category is None
+
+
+@pytest.mark.asyncio
+async def test_denied_decision_returns_the_documented_shape(
+    registrations: list[Any],
+) -> None:
+    async def gate(_: GatedCall) -> GateDecision:
+        return GateDecision.deny(message="Connector is out of policy.")
+
+    _register(registrations, gate, _unused_resume)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        result = await tool.run_json_async({"text": "must not publish"})
+
+    assert result == {
+        "success": False,
+        "status": "denied",
+        "error": "Connector is out of policy.",
+    }
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_denied_decision_falls_back_to_a_default_message(
+    registrations: list[Any],
+) -> None:
+    async def gate(_: GatedCall) -> GateDecision:
+        return GateDecision.deny()
+
+    _register(registrations, gate, _unused_resume)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        result = await tool.run_json_async({"text": "must not publish"})
+
+    assert result["status"] == "denied"
+    assert result["success"] is False
+    assert result["error"] == "The connector call was denied."
+
+
+@pytest.mark.asyncio
+async def test_allowed_call_dispatches_the_snapshot_the_hook_approved(
+    registrations: list[Any],
+) -> None:
+    """A hook that mutates the caller's dict cannot change what is dispatched.
+
+    The canonical snapshot is what ``arguments_sha256`` covers, so dispatching
+    it - rather than the caller's live object - is what makes "the approved
+    call is the executed call" hold on the allow path.
+    """
+
+    original: dict[str, Any] = {"text": "approved", "target": {"id": "safe"}}
+
+    async def gate(_: GatedCall) -> GateDecision:
+        # A hook that decides on one payload and then rewrites the caller's
+        # object must not be able to redirect the dispatch.
+        original["target"]["id"] = "attacker-controlled"
+        return GateDecision.allow()
+
+    _register(registrations, gate, _unused_resume)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        await tool.run_json_async(original)
+
+    assert target.calls == [{"text": "approved", "target": {"id": "safe"}}]
+
+
+@pytest.mark.parametrize(
+    "task_source",
+    [None, 1, "", "  ", " slack", "slack "],
+    ids=["none", "int", "empty", "blank", "leading-ws", "trailing-ws"],
+)
+def test_register_refuses_an_unusable_task_source(task_source: Any) -> None:
+    with pytest.raises(ValueError):
+        register_mcp_approval_gate(
+            task_source=task_source, gate=lambda _: None, resume=lambda **_: None
+        )
+
+
+@pytest.mark.parametrize("bad", ["gate", "resume"])
+def test_register_refuses_a_non_callable_hook(bad: str) -> None:
+    hooks: dict[str, Any] = {"gate": lambda _: None, "resume": lambda **_: None}
+    hooks[bad] = "not callable"
+
+    with pytest.raises(TypeError):
+        register_mcp_approval_gate(task_source="slack", **hooks)
+
+
+@pytest.mark.parametrize(
+    "timeout_seconds",
+    [0, -1, float("nan"), float("inf")],
+    ids=["zero", "neg", "nan", "inf"],
+)
+def test_register_refuses_an_unusable_timeout(timeout_seconds: float) -> None:
+    with pytest.raises(ValueError):
+        register_mcp_approval_gate(
+            task_source="slack",
+            gate=lambda _: None,
+            resume=lambda **_: None,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+@pytest.mark.parametrize(
+    "dispatch_observe_seconds",
+    [0, -1, float("nan"), float("inf")],
+    ids=["zero", "neg", "nan", "inf"],
+)
+def test_register_refuses_an_unusable_dispatch_observe_seconds(
+    dispatch_observe_seconds: float,
+) -> None:
+    with pytest.raises(ValueError):
+        register_mcp_approval_gate(
+            task_source="slack",
+            gate=lambda _: None,
+            resume=lambda **_: None,
+            dispatch_observe_seconds=dispatch_observe_seconds,
+        )
+
+
+def test_unregister_refuses_a_stale_handle() -> None:
+    handle = register_mcp_approval_gate(
+        task_source="slack", gate=lambda _: None, resume=lambda **_: None
+    )
+    assert unregister_mcp_approval_gate(handle) is True
+    # Already gone: a second removal must not report success, and must not
+    # remove whatever a later registration put in that slot.
+    assert unregister_mcp_approval_gate(handle) is False
+
+    replacement = register_mcp_approval_gate(
+        task_source="slack", gate=lambda _: None, resume=lambda **_: None
+    )
+    try:
+        assert unregister_mcp_approval_gate(handle) is False
+    finally:
+        assert unregister_mcp_approval_gate(replacement) is True
+
+
+def test_execution_context_requires_a_tool_call_id() -> None:
+    with pytest.raises(ValueError, match="tool_call_id"):
+        replace(_context(), tool_call_id="")
+
+
+def test_require_approval_needs_an_interaction_id() -> None:
+    with pytest.raises(ValueError, match="interaction_id"):
+        GateDecision.require_approval("")
+
+
+def test_gate_decision_refuses_an_unknown_verdict() -> None:
+    with pytest.raises(ValueError, match="invalid gate decision"):
+        GateDecision(decision="maybe")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_gated_resume_with_incomplete_identity_fails_closed(
+    registrations: list[Any],
+) -> None:
+    """The resume half of the registered-source identity guard."""
+
+    _register(registrations, lambda _: None, _unused_resume)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(replace(_context(), run_id=None)):
+        settlement = await tool.resume_user_interaction(
+            interaction_id=_gated_interaction_id("slack", "interaction-1"),
+            response="approve",
+        )
+
+    assert settlement is not None
+    assert settlement.status == "failed"
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_resume_returning_a_non_settlement_is_rejected(
+    registrations: list[Any],
+) -> None:
+    """A never-gated tool may return a settlement or None - nothing else."""
+
+    class BadResumeTarget(_Target):
+        async def resume_user_interaction(
+            self, *, interaction_id: str, response: str
+        ) -> Any:
+            return {"success": True}
+
+    _register(registrations, lambda _: None, _unused_resume)
+    target = BadResumeTarget()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        with pytest.raises(TypeError, match="ToolInteractionSettlement or None"):
+            await tool.resume_user_interaction(
+                interaction_id="host-owned-interaction", response="Continue"
+            )

@@ -63,8 +63,19 @@ def test_terminal_task_error_payload_marks_unowned_task_failed(_test_db):
         assert payload["message"] == websocket_api.CLIENT_SAFE_TASK_FAILURE
         assert payload["task"]["id"] == task_id
         assert payload["task"]["status"] == "failed"
-        assert len(task_updates) == 1
-        assert "tasks.runner_id IS NULL" in task_updates[0]
+        # Exactly one *status* write, and it still carries the ownership
+        # fence -- that is what this test exists to protect. The path now
+        # emits a second `UPDATE tasks` as well: persisting the client-safe
+        # failure message advances the retention anchor (#2562), and it runs
+        # only after the fenced transition above reported rowcount 1, so it
+        # cannot touch a task this path failed to claim. Asserting the split
+        # rather than a bumped count keeps an unfenced *status* write from
+        # slipping in behind the anchor.
+        status_updates = [s for s in task_updates if "tasks.runner_id IS NULL" in s]
+        anchor_updates = [s for s in task_updates if "last_activity_at" in s]
+        assert len(status_updates) == 1
+        assert len(anchor_updates) == 1
+        assert len(task_updates) == len(status_updates) + len(anchor_updates)
 
         db.expire_all()
         persisted_task = db.query(Task).filter(Task.id == task_id).one()

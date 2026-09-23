@@ -595,6 +595,6 @@ def test_remove_agent_evicts_runtime_and_retains_failed_cleanup_owner(
 
     manager.remove_agent(42)
     manager._cleanup_workspace_directory.assert_called_once_with(
-        42, 7 if cleanup_fails else None
+        42, 7 if cleanup_fails else None, target=None
     )
     assert 42 not in manager._agent_cleanup_owner_ids

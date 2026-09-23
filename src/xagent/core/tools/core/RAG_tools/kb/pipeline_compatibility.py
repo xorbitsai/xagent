@@ -472,16 +472,8 @@ class KBPipelineCompatibilityFacade:
     ) -> None:
         if operation is None or operation.outcome is not None:
             return
-        if side_effects_may_remain is None:
-            side_effects_may_remain = (
-                status != "success" and operation.has_side_effects()
-            )
         operation.finish(
             status=status,
-            rollback_status=operation.infer_rollback_status(
-                status,
-                side_effects_may_remain=side_effects_may_remain,
-            ),
             side_effects_may_remain=side_effects_may_remain,
             details={"message": message},
         )

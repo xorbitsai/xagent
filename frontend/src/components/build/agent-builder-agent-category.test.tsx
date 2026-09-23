@@ -1,6 +1,7 @@
 import React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
 // Issue #802: the `agent` tool category (multi-agent delegation) is a
 // Workforce concern and must not be assignable from the agent builder.
@@ -60,7 +61,9 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     locale: "en",
     t: (key: string, vars?: Record<string, string>) =>
-      vars?.appName ? `${key}:${vars.appName}` : key,
+      key === "builds.configForm.tools.alwaysAvailable"
+        ? resolveTranslation("en", key as TranslationKey, vars)
+        : vars?.appName ? `${key}:${vars.appName}` : key,
   }),
 }))
 
@@ -161,7 +164,9 @@ function agentResponse(toolCategories: string[]) {
 function installApi(
   toolCategories: string[],
   putResponse: () => Response = () =>
-    new Response(JSON.stringify(agentResponse(toolCategories)), { status: 200 })
+    new Response(JSON.stringify(agentResponse(toolCategories)), { status: 200 }),
+  toolsBody: unknown = { tools: AVAILABLE_TOOLS },
+  skills: unknown[] = []
 ) {
   apiRequestMock.mockImplementation((url: string, opts?: { method?: string }) => {
     if (opts?.method === "PUT")
@@ -169,11 +174,9 @@ function installApi(
     if (url.endsWith("/api/kb/collections"))
       return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))
     if (url.endsWith("/api/skills/"))
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      return Promise.resolve(new Response(JSON.stringify(skills), { status: 200 }))
     if (url.endsWith("/api/tools/available"))
-      return Promise.resolve(
-        new Response(JSON.stringify({ tools: AVAILABLE_TOOLS }), { status: 200 })
-      )
+      return Promise.resolve(new Response(JSON.stringify(toolsBody), { status: 200 }))
     if (url.endsWith("/api/models/?category=llm"))
       return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
     if (url.endsWith("/api/models/user-default"))
@@ -369,5 +372,102 @@ describe("AgentBuilder update error handling (issue #956)", () => {
       )
     })
     expect(screen.getByDisplayValue("Updated Agent")).toBeInTheDocument()
+  })
+})
+
+describe("AgentBuilder extra built-in tools (issue #306)", () => {
+  const PREFIX = "The agent may also use these built-in tools: "
+  const block = () => screen.queryByText((text) => text.startsWith(PREFIX))
+  const toolsBody = (tools: Record<string, unknown>[]) => ({
+    tools: [
+      { name: "calculator", description: "", category: "basic", enabled: true, always_available: false },
+      ...tools,
+    ],
+    skill_loader_tool: "skill_loader_x",
+  })
+
+  it("lists backend-flagged tools and adds the skill loader only once a skill is selected", async () => {
+    installApi(
+      ["basic"],
+      undefined,
+      toolsBody([{ name: "clock_a", description: "", category: "other", enabled: true, always_available: true }]),
+      [{ name: "writer" }]
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    await waitFor(() => expect(block()?.textContent).toBe(`${PREFIX}clock_a`))
+
+    fireEvent.click(document.getElementById("selectAllSkills")!)
+
+    await waitFor(() => expect(block()?.textContent).toBe(`${PREFIX}clock_a, skill_loader_x`))
+  })
+
+  it("lists an always-available tool even when an admin disabled it", async () => {
+    installApi(
+      ["basic"],
+      undefined,
+      toolsBody([{ name: "clock_off", description: "", category: "other", enabled: false, always_available: true }])
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    await waitFor(() => expect(block()?.textContent).toContain("clock_off"))
+  })
+
+  it("hides the block for an agent saved with zero tools", async () => {
+    installApi(
+      [],
+      undefined,
+      toolsBody([{ name: "clock_a", description: "", category: "other", enabled: true, always_available: true }])
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText("builds.configForm.name.placeholder")).toHaveValue("Legacy Agent")
+      expect(toolCategorySelector()?.textContent).toContain("basic")
+    })
+    expect(block()).toBeNull()
+
+    fireEvent.click(document.getElementById("selectAllTools")!)
+
+    await waitFor(() => expect(block()).not.toBeNull())
+  })
+
+  it.each([
+    { source: "a knowledge base", patch: { knowledge_bases: ["kb1"] } },
+    { source: "an MCP connector", patch: { tool_categories: ["mcp:foo"] } },
+  ])("lists always-available tools when only $source configures tools", async ({ patch }) => {
+    installApi(
+      [],
+      undefined,
+      toolsBody([{ name: "clock_a", description: "", category: "other", enabled: true, always_available: true }])
+    )
+    const baseImpl = apiRequestMock.getMockImplementation()!
+    apiRequestMock.mockImplementation(async (url: string, opts?: { method?: string }) =>
+      url.endsWith(`/api/agents/${AGENT_ID}`)
+        ? new Response(JSON.stringify({ ...agentResponse([]), ...patch }), { status: 200 })
+        : baseImpl(url, opts)
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    await waitFor(() => expect(block()?.textContent).toBe(`${PREFIX}clock_a`))
+  })
+
+  it("lists only the skill loader for a zero-tool agent with a skill selected", async () => {
+    installApi(
+      [],
+      undefined,
+      toolsBody([{ name: "clock_a", description: "", category: "other", enabled: true, always_available: true }]),
+      [{ name: "writer" }]
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText("builds.configForm.name.placeholder")).toHaveValue("Legacy Agent")
+      expect(toolCategorySelector()?.textContent).toContain("basic")
+    })
+
+    fireEvent.click(document.getElementById("selectAllSkills")!)
+
+    await waitFor(() => expect(block()?.textContent).toBe(`${PREFIX}skill_loader_x`))
   })
 })

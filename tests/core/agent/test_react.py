@@ -43,6 +43,7 @@ from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     GatedCall,
     GateDecision,
+    _gated_interaction_source,
     current_tool_call_execution_context,
     gate_mcp_tools,
     register_mcp_approval_gate,
@@ -7264,6 +7265,124 @@ async def _never_called_gate(*_: Any, **__: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_gated_call_survives_a_real_checkpoint_rebuild_and_resumes() -> None:
+    """The PR's core scenario, end to end, across a full runtime rebuild.
+
+    gated call -> require_approval -> real checkpoint -> rebuild every
+    runtime-owned object from that checkpoint -> resume, with the gate
+    recognizing the ``xgate:`` id *it* issued and settling the original call.
+
+    The pieces were covered in isolation; what this pins is that they compose
+    across the serialization boundary - the stamped interaction id and the
+    issuing step id both survive by value, which is the whole reason the id
+    carries the source instead of process memory.
+    """
+
+    target = FakeTool()
+    target.name = "mcp_LinkedIn_create_post"
+    (gated,) = gate_mcp_tools([target], connection={"id": 41})
+
+    async def gate(call: GatedCall) -> GateDecision:
+        return GateDecision.require_approval("host-1", message="Publish this?")
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(
+            await executor({"expression": "2+2"})
+        )
+
+    registration = register_mcp_approval_gate(
+        task_source="slack", gate=gate, resume=resume, timeout_seconds=30
+    )
+    try:
+        first_context = ExecutionContext(
+            execution_id="gated-rebuild-task",
+            metadata={"task_source": "slack", "run_id": "run-1"},
+        )
+        first_context.add_user_message("Publish it.", metadata={"turn_id": "turn-1"})
+        first_pattern = ReActPattern(max_iterations=3)
+        first_runtime = PatternRuntime(execution_id="gated-rebuild-task")
+        waiting = await first_pattern.run(
+            context=first_context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "gated-call-1",
+                                "function": {
+                                    "name": "mcp_LinkedIn_create_post",
+                                    "arguments": '{"expression":"2+2"}',
+                                },
+                            }
+                        ]
+                    }
+                ]
+            ),
+            runtime=first_runtime,
+        )
+
+        assert waiting["status"] == "waiting_for_user"
+        assert target.calls == []
+        paused_record = first_pattern.tool_ledger["gated-call-1"]
+        stamped_id = paused_record.result["interaction_id"]
+        # The gate stamped its own source into the id the host will see back.
+        assert _gated_interaction_source(stamped_id) == ("slack", "host-1")
+
+        checkpoint = next(
+            checkpoint
+            for checkpoint in reversed(first_runtime.checkpoints)
+            if checkpoint["label"] == "waiting_for_user"
+        )
+
+        # Rebuild every runtime-owned object from the durable checkpoint.
+        restored_context = ExecutionContext.from_dict(checkpoint["context"])
+        restored_context.add_user_message("approve")
+        restored_pattern = ReActPattern(max_iterations=3)
+        restored_pattern.load_state(checkpoint["pattern_state"])
+
+        # The stamped id and the issuing step survived serialization by value.
+        restored_record = restored_pattern.tool_ledger["gated-call-1"]
+        assert restored_record.result["interaction_id"] == stamped_id
+        assert restored_record.step_id == paused_record.step_id
+
+        resumed = await restored_pattern.run(
+            context=restored_context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "final-call",
+                                "function": {
+                                    "name": "final_answer",
+                                    "arguments": (
+                                        '{"response_language":"English",'
+                                        '"answer":"Published.",'
+                                        '"outcome":"completed"}'
+                                    ),
+                                },
+                            }
+                        ]
+                    }
+                ]
+            ),
+            runtime=PatternRuntime(execution_id="gated-rebuild-task"),
+        )
+    finally:
+        unregister_mcp_approval_gate(registration)
+
+    assert resumed["success"] is True
+    # The approved write ran exactly once, on the rebuilt runtime.
+    assert target.calls == [{"expression": "2+2"}]
+    settled = restored_pattern.tool_ledger["gated-call-1"]
+    assert settled.status == "completed"
+    assert settled.settlement_status == "succeeded"
+    assert restored_pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
 async def test_pending_interaction_delivery_is_exact_and_retryable() -> None:
     class ResumableTool:
         def __init__(self) -> None:
@@ -7526,9 +7645,10 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
     record = restored_pattern.tool_ledger["original-publish-call"]
     assert record.status == "completed"
     assert record.settlement_status == "succeeded"
-    # The issuing ReAct step survives the checkpoint round-trip, so a resumed
-    # gated call can rebuild the exact execution identity it paused with.
-    assert record.step_id
+    # The issuing ReAct step survives the checkpoint round-trip BY VALUE, so a
+    # resumed gated call rebuilds the exact execution identity it paused with.
+    # A truthy-only assertion here would pass on any regenerated step id.
+    assert record.step_id == first_pattern.tool_ledger["original-publish-call"].step_id
     assert record.result == {"success": True, "post_urn": "urn:li:share:123"}
     assert (
         restored_pattern._consecutive_successful_tool_group_count("approval_gate") == 1

@@ -565,34 +565,10 @@ def finish_ingestion_outcome(
     *,
     status: str,
     message: Optional[str],
-    treat_recorded_side_effects_as_remaining: bool = True,
 ) -> KBOperationOutcome | None:
-    """Finish an ingestion operation with facade-compatible inference.
-
-    ``treat_recorded_side_effects_as_remaining=True`` preserves the historical
-    facade semantics (has_side_effects()-based) instead of the engine default
-    (has_uncompensated_side_effects()) - the over-cautious direction. The
-    precision switch is tracked in #795 (spec §6.3).
-    """
     if operation is None or operation.outcome is not None:
         return None
-    if status != "success":
-        if treat_recorded_side_effects_as_remaining:
-            side_effects_may_remain = operation.has_side_effects()
-        else:
-            side_effects_may_remain = operation.has_uncompensated_side_effects()
-    else:
-        side_effects_may_remain = False
-    operation.finish(
-        status=status,
-        rollback_status=operation.infer_rollback_status(
-            status,
-            side_effects_may_remain=side_effects_may_remain,
-        ),
-        side_effects_may_remain=side_effects_may_remain,
-        details={"message": message},
-    )
-    return operation.outcome
+    return operation.finish(status=status, details={"message": message})
 
 
 def finish_web_ingestion_outcome(
@@ -699,7 +675,6 @@ class KBOperationCompatibilityFacade:
             if operation.outcome is None:
                 operation.finish(
                     status="error",
-                    side_effects_may_remain=operation.has_side_effects(),
                     warnings=(_format_exception_warning(exc),),
                 )
             raise

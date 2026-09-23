@@ -355,6 +355,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
             ):
                 if stopped():
                     return
+                unobserved_replays: deque[AcceptedChannelInput] = deque()
                 try:
                     raw = list(group)
                     incoming = tuple(self._shared_input(open_id, item) for item in raw)
@@ -367,14 +368,15 @@ class FeishuBotInstance(BatchChannelControl[str]):
                     observed: set[int] = set()
                     notified_rejections: set[tuple[str, str]] = set()
                     while not stopped():
-                        (
-                            owner_id,
-                            pending,
-                            replays,
-                            rejected,
-                        ) = await run_db_io_cancellation_safe(
-                            lambda: lookup_channel_inputs(incoming)
+                        lookup, cancellation = await await_task_settlement(
+                            asyncio.create_task(
+                                asyncio.to_thread(lookup_channel_inputs, incoming)
+                            )
                         )
+                        owner_id, pending, replays, rejected = lookup
+                        unobserved_replays.extend(replays)
+                        if cancellation is not None:
+                            raise cancellation
                         if stopped():
                             return
                         for rejection in rejected:
@@ -386,9 +388,10 @@ class FeishuBotInstance(BatchChannelControl[str]):
                                     chat_id, self._input_error_message(rejection.reason)
                                 )
                                 notified_rejections.add(key)
-                        for accepted in replays:
+                        while unobserved_replays:
                             if stopped():
                                 return
+                            accepted = unobserved_replays.popleft()
                             if accepted.command_db_id not in observed:
                                 observed.add(accepted.command_db_id)
                                 await self._observe_shared_input(
@@ -549,6 +552,22 @@ class FeishuBotInstance(BatchChannelControl[str]):
                         "New messages in this group were not accepted. "
                         "Please resend them together.",
                     )
+                finally:
+                    # Keep responsibility for accepted work until observation
+                    # takes over, even when lookup or a notice is cancelled.
+                    if stopped() and unobserved_replays:
+
+                        async def stop_replays() -> None:
+                            for replay in unobserved_replays:
+                                turn = replay.as_turn()
+                                turn.discard_output = (
+                                    self._conversation_generation(open_id) != generation
+                                )
+                                await turn.stop()
+
+                        await drain_async_task_cancellation_safe(
+                            asyncio.create_task(stop_replays())
+                        )
         except ChannelAuthorizationError:
             await self._send_text(chat_id, "🚫 You are not authorized to use this bot.")
         except ChannelConfigurationError:

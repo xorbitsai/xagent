@@ -39,6 +39,13 @@ class MockResponse:
                 response=self,
             )
 
+    def iter_content(self, chunk_size=1):
+        for offset in range(0, len(self.content), chunk_size):
+            yield self.content[offset : offset + chunk_size]
+
+    def close(self):
+        return None
+
 
 class _FakeSession:
     """Stand-in for requests.Session() used by _upload_large_file_content --
@@ -504,12 +511,58 @@ def test_normalize_path_rejects_dot_segments_directly():
     assert onedrive._normalize_path("Documents/report.pdf") == "Documents/report.pdf"
 
 
+def test_download_file_streams_to_task_output_and_hashes_content(monkeypatch, tmp_path):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    content = b"binary office content"
+    metadata = MockResponse(
+        {
+            "id": "item-1",
+            "name": "Issue Tracker.xlsx",
+            "size": len(content),
+            "file": {
+                "mimeType": (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            },
+        }
+    )
+    # Deliberately omit downloadUrl to exercise the authenticated /content
+    # fallback used by personal OneDrive accounts.
+    content_response = MockResponse(content=content)
+    mock_request = Mock(side_effect=[metadata, content_response])
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_download_file("Issue Tracker.xlsx"))
+
+    assert result["status"] == "success"
+    assert result["size"] == len(content)
+    assert result["sha256"]
+    output_path = task_dir / "output" / "Issue Tracker.xlsx"
+    assert output_path.read_bytes() == content
+    download_call = mock_request.call_args_list[1]
+    assert download_call.kwargs["url"].endswith(
+        "/me/drive/root:/Issue%20Tracker.xlsx:/content"
+    )
+    assert download_call.kwargs["headers"]["Authorization"] == "Bearer test-graph-token"
+    assert download_call.kwargs["stream"] is True
+
+
+def test_download_file_requires_task_workspace(monkeypatch):
+    monkeypatch.delenv("XAGENT_ONEDRIVE_OUTPUT_DIR", raising=False)
+    result = json.loads(onedrive.onedrive_download_file("Issue Tracker.xlsx"))
+    assert result["status"] == "error"
+    assert "XAGENT_ONEDRIVE_OUTPUT_DIR" in result["message"]
+
+
 @pytest.mark.parametrize(
     "call",
     [
         lambda: onedrive.onedrive_list_items(folder_path="../../etc"),
         lambda: onedrive.onedrive_get_item(path="../../etc/passwd"),
         lambda: onedrive.onedrive_get_file_content("../../etc/passwd"),
+        lambda: onedrive.onedrive_download_file("../../etc/passwd"),
         lambda: onedrive.onedrive_create_folder("new-folder", parent_path="../../etc"),
         lambda: onedrive.onedrive_upload_text_file("../../etc/passwd", "x"),
     ],
@@ -517,6 +570,7 @@ def test_normalize_path_rejects_dot_segments_directly():
         "onedrive_list_items",
         "onedrive_get_item",
         "onedrive_get_file_content",
+        "onedrive_download_file",
         "onedrive_create_folder",
         "onedrive_upload_text_file",
     ],

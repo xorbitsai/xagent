@@ -533,6 +533,78 @@ async def test_mcp_upload_file_ref_is_staged_and_cleaned_after_connector_call(
     assert workspace.discarded == ["/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"]
 
 
+@pytest.mark.asyncio
+async def test_mcp_binary_download_is_registered_as_durable_file_ref(monkeypatch):
+    mcp_tool = SimpleNamespace(
+        name="onedrive_download_file",
+        description="Download a binary file",
+        inputSchema={"type": "object", "properties": {"file_path": {"type": "string"}}},
+    )
+
+    class FakeWorkspace:
+        def resolve_path(self, path):
+            assert path == "/task/output/Deck.pptx"
+            return path
+
+    workspace = FakeWorkspace()
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "build_workspace_file_ref",
+        lambda **kwargs: {
+            "file_id": "file-123",
+            "filename": "Deck.pptx",
+            "mime_type": kwargs["mime_type"],
+            "file_path": kwargs["file_path"],
+        },
+    )
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "sanitize_file_ref_for_context",
+        lambda file_ref: {"file_id": file_ref["file_id"], "filename": file_ref["filename"]},
+    )
+    adapter = _build_mcp_tool_adapter(
+        "OneDrive",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=workspace,
+    )
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "status": "success",
+                                "file_path": "/task/output/Deck.pptx",
+                                "mime_type": (
+                                    "application/vnd.openxmlformats-officedocument."
+                                    "presentationml.presentation"
+                                ),
+                            }
+                        ),
+                    )
+                ],
+                isError=False,
+            )
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+
+    result = await adapter.run_json_async({"file_path": "Deck.pptx"})
+
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["file_ref"] == {"file_id": "file-123", "filename": "Deck.pptx"}
+
+
 def test_exception_indicates_http_401_uses_bounded_status_signals():
     class StatusError(RuntimeError):
         status_code = 401

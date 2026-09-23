@@ -38,7 +38,11 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
-from ....file_ref import parse_file_id_ref
+from ....file_ref import (
+    build_workspace_file_ref,
+    parse_file_id_ref,
+    sanitize_file_ref_for_context,
+)
 from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
@@ -248,6 +252,15 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("sharepoint", "sharepoint_upload_file"): ("local_file_path",),
     ("google_drive", "google_drive_upload_file"): ("file_path",),
     ("slack", "slack_upload_file"): ("file_path",),
+}
+
+# Built-in connector tools that create a real binary under the current task
+# workspace. Their result is converted into a durable FileRef at the host
+# boundary before the path reaches the model, so a later turn does not depend
+# on the original process-local output directory still existing.
+_WORKSPACE_DOWNLOAD_FIELDS: dict[tuple[str, str], str] = {
+    ("onedrive", "onedrive_download_file"): "file_path",
+    ("google_drive", "google_drive_download_file"): "path",
 }
 
 
@@ -1339,6 +1352,17 @@ class MCPToolAdapter(AbstractBaseTool):
                 "the local upload argument; it will be staged in the current "
                 "task workspace before this connector runs."
             )
+        from .selection_spec import normalize_mcp_server_name
+
+        if (
+            self._workspace is not None
+            and (normalize_mcp_server_name(self.source_server or ""), self.mcp_tool.name)
+            in _WORKSPACE_DOWNLOAD_FIELDS
+        ):
+            description += (
+                " The successful result includes a durable file_ref; use its "
+                "file_id for later turns or connector uploads."
+            )
         return description
 
     @property
@@ -1821,6 +1845,51 @@ class MCPToolAdapter(AbstractBaseTool):
                     self.mcp_tool.name,
                 )
 
+    def _register_workspace_download_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Attach a durable FileRef to a trusted connector download result."""
+        if self._workspace is None:
+            return result
+        from .selection_spec import normalize_mcp_server_name
+
+        path_field = _WORKSPACE_DOWNLOAD_FIELDS.get(
+            (normalize_mcp_server_name(self.source_server or ""), self.mcp_tool.name)
+        )
+        if path_field is None:
+            return result
+
+        for content_item in result.get("content", []):
+            if not isinstance(content_item, dict):
+                continue
+            text = content_item.get("text")
+            if not isinstance(text, str):
+                continue
+            try:
+                payload = json.loads(text)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict) or payload.get("status") != "success":
+                continue
+            raw_path = payload.get(path_field)
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            try:
+                resolved_path = self._workspace.resolve_path(raw_path)
+                file_ref = build_workspace_file_ref(
+                    workspace=self._workspace,
+                    file_path=resolved_path,
+                    mime_type=payload.get("mime_type"),
+                )
+                payload["file_ref"] = sanitize_file_ref_for_context(file_ref)
+                content_item["text"] = json.dumps(payload, ensure_ascii=False)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to register %s download as a FileRef: %s",
+                    self.mcp_tool.name,
+                    type(exc).__name__,
+                )
+            break
+        return result
+
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute MCP tool asynchronously with user validation and context."""
         try:
@@ -1937,7 +2006,8 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            return _normalized_mcp_call_result(result)
+            normalized = _normalized_mcp_call_result(result)
+            return self._register_workspace_download_result(normalized)
 
     async def _retry_after_authorization_failure(
         self,

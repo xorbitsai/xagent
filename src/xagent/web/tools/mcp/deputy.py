@@ -367,23 +367,38 @@ def deputy_query_resource(
 def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     """
     Create a new record (POST /resource/{resource}).
-    resource: a Deputy Resource API object name, e.g. "Employee", "Roster",
-    "Timesheet", or "Leave".
-    data: field name -> value pairs for the new record. For "Employee",
-    Deputy's V1 schema requires "Company", "FirstName", "LastName",
-    "DisplayName", "Active", "Contact", "Role", and "AllowAppraisal" --
-    there is no "Email" field. "Company"/"Contact"/"Role" are ids
-    referencing existing Company/Contact/EmployeeRole records, not
-    literal values; look up a valid id first (e.g. via
-    deputy_list_resource("Company")) rather than guessing one.
-    Use deputy_resource_info first to learn Deputy's required/optional
-    fields for other resource types -- deputy_get_resource needs an id,
-    which isn't available yet when creating the first record of a type.
+    resource: a Deputy Resource API object name, e.g. "Roster", "Timesheet",
+    "Leave", or "Contact" -- NOT "Employee": use deputy_add_employee for
+    that instead, which this tool refuses (see its docstring for why).
+    data: field name -> value pairs for the new record. Use
+    deputy_resource_info first to learn Deputy's required/optional fields
+    for a resource type -- deputy_get_resource needs an id, which isn't
+    available yet when creating the first record of a type.
     This is not idempotent: retrying after a timeout or connection error
     can create a duplicate record. Use deputy_query_resource to check
     whether the record already exists before retrying a failed call.
     """
     try:
+        if resource == "Employee":
+            # A bare POST /resource/Employee inserts an Employee row with
+            # no location/workplace membership -- Deputy's permission
+            # model is scoped by location, so the resulting record is then
+            # neither listable nor directly readable (a 403 "Access to
+            # object denied", not a 404) even though Deputy accepted the
+            # write and returned a plausible-looking record with an id.
+            # That's indistinguishable from "nothing was created" to both
+            # the caller and Deputy's own UI (root-caused from a
+            # production incident on 2026-09-21, where this produced two
+            # such orphaned records). deputy_add_employee wraps Deputy's
+            # own recommended management/supervise endpoint instead, which
+            # sets up that membership as part of the same call.
+            return _error(
+                "Employee creation isn't supported here -- use "
+                "deputy_add_employee instead. A bare POST /resource/Employee "
+                "creates a record with no location/workplace membership, "
+                "which Deputy's permission model then hides from list/get "
+                "calls even though the write itself succeeds."
+            )
         # "Id" is server-assigned on create; dropping any caller-supplied
         # value rather than forwarding it removes any ambiguity about
         # whether Deputy would honor, ignore, or reject a client-chosen
@@ -420,6 +435,117 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
         return _record_response(resource, result)
     except Exception as e:
         logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
+        return _error(str(e))
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
+def deputy_add_employee(
+    first_name: str,
+    last_name: str,
+    company_id: int,
+    *,
+    email: str | None = None,
+    mobile_phone: str | None = None,
+    role_id: int | None = None,
+    stress_profile_id: int | None = None,
+    start_date: str | None = None,
+    date_of_birth: str | None = None,
+    gender: int | None = None,
+    country_code: str | None = None,
+    payroll_id: str | None = None,
+    weekday_rate: float | None = None,
+    send_invite: bool = False,
+) -> str:
+    """
+    Add a new employee (POST /supervise/employee) -- Deputy's own docs
+    recommend this management endpoint for adding employees, not the
+    generic Resource API. deputy_create_resource refuses resource=
+    "Employee" for exactly this reason: a bare POST /resource/Employee
+    inserts a row with no location/workplace membership, and Deputy's
+    permission model is scoped by location, so the record gets created but
+    is then neither listable nor directly readable -- indistinguishable
+    from "nothing was created" to both the caller and Deputy's own UI.
+
+    first_name, last_name: the employee's name.
+    company_id: the Deputy Company (location) id to add the employee to --
+    look one up first (e.g. via deputy_list_resource("Company")) rather
+    than guessing.
+    email: primary email address, if any.
+    mobile_phone: mobile phone number, if any.
+    role_id: the EmployeeRole (access level) id to grant -- look one up
+    via deputy_list_resource("EmployeeRole") if unsure.
+    stress_profile_id: the working-hours/StressProfile id to assign --
+    look one up via deputy_list_resource("StressProfile") if unsure.
+    start_date, date_of_birth: "YYYY-MM-DD".
+    gender: 0 = prefer not to say, 1 = male, 2 = female, 3 = non-binary.
+    country_code: country code for the employee's address.
+    payroll_id: external payroll id to set.
+    weekday_rate: weekday pay rate.
+    send_invite: if true, Deputy emails the employee an invitation to set
+    up their own Deputy login. Defaults to false -- only set true once
+    the caller has confirmed this employee should get app access.
+
+    This is not idempotent: retrying after a timeout or connection error
+    can create a duplicate record. Use deputy_query_resource("Employee",
+    ...) to check whether the record already exists before retrying a
+    failed call.
+    """
+    try:
+        # Flattened, individually-named parameters rather than a generic
+        # data: dict[str, Any] (unlike deputy_create_resource): Deputy's
+        # supervise/employee field names (strFirstName, intCompanyId,
+        # intStressProfile, ...) don't match the Resource API's Employee
+        # field names (FirstName, Company, StressProfile), and the
+        # incident this tool fixes was partly caused by the caller
+        # guessing at a field name ("Stress Profile" with a space) that
+        # silently didn't match what Deputy expected. Typed keyword
+        # arguments make that whole class of mistake impossible.
+        body: dict[str, Any] = {
+            "strFirstName": first_name,
+            "strLastName": last_name,
+            "intCompanyId": company_id,
+            # Sent explicitly either way, rather than omitted when False,
+            # so this call's behavior doesn't depend on Deputy's own
+            # undocumented default for an absent field.
+            "blnSendInvite": 1 if send_invite else 0,
+        }
+        if email is not None:
+            body["strEmail"] = email
+        if mobile_phone is not None:
+            body["strMobilePhone"] = mobile_phone
+        if role_id is not None:
+            body["intRoleId"] = role_id
+        if stress_profile_id is not None:
+            body["intStressProfile"] = stress_profile_id
+        if start_date is not None:
+            body["strStartDate"] = start_date
+        if date_of_birth is not None:
+            body["strDob"] = date_of_birth
+        if gender is not None:
+            body["intGender"] = gender
+        if country_code is not None:
+            body["strCountryCode"] = country_code
+        if payroll_id is not None:
+            body["strPayrollId"] = payroll_id
+        if weekday_rate is not None:
+            body["fltWeekDayRate"] = weekday_rate
+        result = _request("POST", "/supervise/employee", json_data=body)
+        # See deputy_create_resource's identical empty-response handling --
+        # a 204/empty body here is equally ambiguous for a non-idempotent
+        # employee create.
+        if isinstance(result, dict) and not result:
+            return _success(
+                record={},
+                warning=(
+                    "Deputy returned no content for this employee create -- "
+                    "the record may or may not have been created, and its "
+                    "id is unknown. Use deputy_query_resource to check "
+                    "before retrying."
+                ),
+            )
+        return _record_response("Employee", result)
+    except Exception as e:
+        logger.error(f"Error adding Deputy employee: {e}", exc_info=True)
         return _error(str(e))
 
 

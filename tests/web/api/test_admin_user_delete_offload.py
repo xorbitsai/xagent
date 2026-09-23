@@ -79,7 +79,10 @@ async def test_admin_user_delete_runs_task_purge_off_the_event_loop() -> None:
 
         response = await delete_user(target_id, admin, db)
 
-        assert response == {"message": "User deleted successfully"}
+        assert response == {
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
+        }
         assert delete_threads, "no DELETE FROM tasks statement was observed"
         assert loop_thread_ident not in delete_threads, (
             "user deletion issued its task DELETE on the event loop thread"
@@ -155,7 +158,10 @@ async def test_admin_user_delete_is_fk_safe_under_enforced_foreign_keys() -> Non
 
         response = await delete_user(target_id, admin, db)
 
-        assert response == {"message": "User deleted successfully"}
+        assert response == {
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
+        }
         assert db.query(User).filter(User.id == target_id).count() == 0
         assert db.query(Task).filter(Task.id.in_(task_ids)).count() == 0
         assert (
@@ -244,7 +250,10 @@ async def test_admin_user_delete_runs_keyset_pages_off_the_event_loop(
 
         response = await delete_user(target_id, admin, db)
 
-        assert response == {"message": "User deleted successfully"}
+        assert response == {
+            "message": "User deleted successfully",
+            "workspace_cleanup_pending": False,
+        }
         # 5 tasks / page size 2 -> 3 full pages plus the terminating empty page.
         assert len(page_threads) == 4, page_threads
         on_loop = [ident for ident in page_threads if ident == loop_thread_ident]

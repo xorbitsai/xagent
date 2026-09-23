@@ -1333,6 +1333,59 @@ def test_capped_single_result_keeps_bounded_warning_summary(monkeypatch):
     assert result["warnings_truncated"] is True
 
 
+def test_capped_single_result_degrades_to_a_marker_instead_of_erasing_the_record(
+    monkeypatch,
+):
+    """Regression test: _success_capped's own tail loop (used to make room
+    for `warnings` once success_with_capped_dict's own capping isn't
+    enough) halves the record's keys like the shared helper does -- and
+    once the record is down to a single key, that halving used to floor to
+    zero and wipe the whole record to {} in a single step, exactly the
+    sharp edge the shared helper was fixed for. Via halve_dict_or_mark the
+    record degrades to a small marker instead whenever that marker is
+    smaller than the single remaining key's value and still lets the
+    response fit."""
+    monkeypatch.setattr(shopify, "get_tool_max_output_length", lambda: 135)
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 135)
+
+    raw = shopify._success_capped(
+        "product",
+        {"id": "gid://shopify/Product/1", "title": "Shirt"},
+        [{"message": "warning-" + "w" * 2000}],
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 135
+    assert result["status"] == "success"
+    assert result["product"] == {"truncated": True}
+
+
+def test_capped_single_result_empties_the_record_when_even_the_marker_cannot_fit(
+    monkeypatch,
+):
+    """Unlike success_with_capped_dict, this tail loop has no fallback tier
+    below {}: once the marker is installed and the payload is still over
+    the limit, the record is emptied outright. At this limit the fixed
+    envelope (status, warnings marker, flags) alone exceeds the budget, so
+    the response stays oversized no matter what -- an inherent floor this
+    loop can't get under, asserted here so the shape is explicit rather
+    than accidental."""
+    monkeypatch.setattr(shopify, "get_tool_max_output_length", lambda: 90)
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 90)
+
+    raw = shopify._success_capped(
+        "product",
+        {"id": "gid://shopify/Product/1", "title": "Shirt"},
+        [{"message": "warning-" + "w" * 2000}],
+    )
+    result = json.loads(raw)
+
+    assert len(raw) > 90
+    assert result["status"] == "success"
+    assert result["product"] == {}
+    assert result["warnings_truncated"] is True
+
+
 def test_create_product_requires_title():
     result = json.loads(shopify.shopify_create_product(""))
 

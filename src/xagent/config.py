@@ -19,6 +19,7 @@ configuration management with validation, type safety, and better structure.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import math
@@ -58,6 +59,13 @@ UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
 )
 UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
 UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
+CONVERSATION_RETENTION_DAYS = "XAGENT_CONVERSATION_RETENTION_DAYS"
+TRACE_RETENTION_DAYS = "XAGENT_TRACE_RETENTION_DAYS"
+RETENTION_ENABLED = "XAGENT_RETENTION_ENABLED"
+RETENTION_DRY_RUN = "XAGENT_RETENTION_DRY_RUN"
+RETENTION_BATCH_SIZE = "XAGENT_RETENTION_BATCH_SIZE"
+RETENTION_SWEEP_INTERVAL_SECONDS = "XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS"
+RETENTION_BATCH_PAUSE_SECONDS = "XAGENT_RETENTION_BATCH_PAUSE_SECONDS"
 TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS = (
     "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
 )
@@ -3239,3 +3247,281 @@ def get_max_trace_payload_bytes() -> int:
         except ValueError:
             logger.warning(f"Invalid {MAX_TRACE_PAYLOAD_BYTES} value: {env_str!r}")
     return 50_000
+
+
+# ---------------------------------------------------------------------------
+# Conversation data retention (#2557).
+#
+# Nothing in this repository reads these yet; the job that expires data is a
+# follow-up change. They are settings, and the docstrings below describe what
+# each one means rather than what a consumer will do with it.
+#
+# All of them are read once per process. These getters call ``os.getenv`` at
+# call time, but ``.env`` is loaded at start-up and no code assigns these names
+# afterwards, so within one process each returns the same value forever:
+# changing any of them takes a restart. ``RETENTION_ENV_VARS`` names the set,
+# and ``test_no_module_assigns_a_retention_environment_variable`` pins it.
+#
+# Two rules run through the whole section:
+#   * a value that cannot be read disables the leg it configures, rather than
+#     falling back to a working default -- a default here is a number of days,
+#     and a number of days deletes conversations;
+#   * a switch that cannot be read resolves to whichever side deletes nothing.
+# ---------------------------------------------------------------------------
+
+#: Every environment variable this section reads. One list, consumed by the
+#: getters' tests and by the guard that checks none of them is assigned at run
+#: time, so a new setting cannot be added to only some of those places.
+RETENTION_ENV_VARS: tuple[str, ...] = (
+    CONVERSATION_RETENTION_DAYS,
+    TRACE_RETENTION_DAYS,
+    RETENTION_ENABLED,
+    RETENTION_DRY_RUN,
+    RETENTION_BATCH_SIZE,
+    RETENTION_SWEEP_INTERVAL_SECONDS,
+    RETENTION_BATCH_PAUSE_SECONDS,
+)
+
+#: The largest period the date arithmetic downstream can express. Above it,
+#: ``retention_cutoff``'s ``now - timedelta(days=days)`` raises OverflowError
+#: instead of returning a cutoff, so an operator pasting a date (``20260923``)
+#: would otherwise configure a period that fails on every use.
+#:
+#: The true limit is the distance back to ``datetime.min``, about 739,900 days
+#: today and growing daily; this sits far below so it needs no clock. A period
+#: of 1,900 years already means "keep everything", which is spelled by leaving
+#: the variable unset. It does not catch every mistyped date -- ``260923`` is
+#: 714 years and passes -- but such a value is inert rather than broken.
+#:
+#: ``retention_cli.py`` deliberately asks the arithmetic instead of bounding:
+#: it reports which of an operator's candidate periods are unrepresentable and
+#: needs the exact boundary. This decides only whether to accept a value, which
+#: a ceiling answers without knowing where the boundary is.
+MAX_RETENTION_DAYS = 700_000
+
+
+class _RetentionDays(enum.Enum):
+    """How a period variable was configured.
+
+    Four cases rather than a nullable int, because the two getters read them
+    differently: ``ZERO`` disables the conversation period and inherits it for
+    the trace period. Classifying once is what keeps those two readings from
+    disagreeing about which spellings are zero.
+    """
+
+    UNSET = "unset"
+    ZERO = "zero"
+    DAYS = "days"
+    INVALID = "invalid"
+
+
+def _classify_retention_days(env_var: str) -> tuple[_RetentionDays, int | None]:
+    """Read one period variable into (case, days).
+
+    ``days`` is set only for :attr:`_RetentionDays.DAYS`; no other case names a
+    period. ``0`` is a documented spelling and is classified silently, while a
+    negative, unparsable or too-large value warns.
+    """
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return _RetentionDays.UNSET, None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; expiry for this period is disabled", env_var, value
+        )
+        return _RetentionDays.INVALID, None
+    if parsed == 0:
+        return _RetentionDays.ZERO, None
+    if parsed < 0 or parsed > MAX_RETENTION_DAYS:
+        logger.warning(
+            "Invalid %s=%r; expiry for this period is disabled", env_var, value
+        )
+        return _RetentionDays.INVALID, None
+    return _RetentionDays.DAYS, parsed
+
+
+def _get_retention_bool_env(env_var: str, *, permissive: bool) -> bool:
+    """Parse a retention switch, resolving what it cannot read to "delete nothing".
+
+    ``permissive`` is the value that lets expiry proceed, and is also the
+    default: both switches ship in their permissive position, since neither is
+    meant to restrain a deployment that has configured no period. An
+    unrecognised value therefore resolves to ``not permissive``.
+
+    Deliberately not :func:`_get_bool_env`, which reads anything unrecognised
+    as ``False`` -- fine for a feature flag, wrong here, where that turns
+    ``XAGENT_RETENTION_DRY_RUN=enabled`` into a real purge and
+    ``XAGENT_RETENTION_ENABLED=y`` into a silent stop.
+
+    Blank counts as unset, matching :func:`_classify_retention_days`: a compose
+    file interpolating an unset shell variable passes an empty string, which
+    states nothing and must not warn on every read.
+    """
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return permissive
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    logger.warning(
+        "Unrecognised %s=%r; reading it as %r so that nothing is deleted",
+        env_var,
+        value,
+        not permissive,
+    )
+    return not permissive
+
+
+def get_conversation_retention_days() -> int | None:
+    """Days of conversation retention, or ``None`` when conversations never expire.
+
+    Priority:
+        1. XAGENT_CONVERSATION_RETENTION_DAYS environment variable
+        2. Default ``None``
+
+    ``None`` disables conversation expiry only. Traces can still expire under
+    their own period, which is a supported configuration.
+
+    Returns:
+        Retention period in days, or None.
+    """
+    return _classify_retention_days(CONVERSATION_RETENTION_DAYS)[1]
+
+
+def get_trace_retention_days() -> int | None:
+    """Days of execution-trace retention.
+
+    Priority:
+        1. XAGENT_TRACE_RETENTION_DAYS environment variable
+        2. XAGENT_CONVERSATION_RETENTION_DAYS (traces expire with the
+           conversation they belong to)
+        3. Default ``None`` -- no trace ever expires
+
+    Unset and ``0`` both mean "same as the conversation period", which is
+    deliberately not what ``0`` means for the conversation period itself: a
+    trace period normally shortens the conversation period, so its
+    unconfigured value is the period it shortens.
+
+    A value that is set but unusable is a third case and does *not* inherit:
+    an operator who typos ``XAGENT_TRACE_RETENTION_DAYS=90d`` was asking for
+    90 days and must not silently receive 365. It disables trace expiry,
+    leaving the conversation period to act alone.
+
+    Configuring this alone is supported rather than accidental -- traces are
+    the bulk of the stored bytes and are debugging data, so "keep
+    conversations indefinitely, expire traces after N days" is one of the
+    shapes #2567 has on the table.
+
+    A trace period longer than the conversation period is accepted and will
+    have no effect, because whole-conversation expiry removes the traces with
+    the conversation.
+
+    Returns:
+        Retention period in days, or None when traces never expire.
+    """
+    case, days = _classify_retention_days(TRACE_RETENTION_DAYS)
+    if case is _RetentionDays.DAYS:
+        return days
+    if case is _RetentionDays.INVALID:
+        return None
+    return get_conversation_retention_days()
+
+
+def get_retention_enabled() -> bool:
+    """Kill switch for retention expiry.
+
+    Priority:
+        1. XAGENT_RETENTION_ENABLED environment variable
+        2. Default ``True``
+
+    Defaulting to true enables nothing on its own: with no period configured
+    there is nothing to expire. The switch exists so that stopping expiry does
+    not mean editing the periods, which are the settings an operator would
+    otherwise have to restore correctly afterwards.
+
+    It takes effect on restart, like every setting in this section. Making it
+    changeable under a running process would need a source that process
+    re-reads, such as a database setting; that is not built.
+
+    An unrecognised value resolves to ``False``.
+
+    Returns:
+        False when explicitly disabled, and when the value cannot be read.
+    """
+    return _get_retention_bool_env(RETENTION_ENABLED, permissive=True)
+
+
+def get_retention_dry_run() -> bool:
+    """Whether expiry should report what it would delete and delete nothing.
+
+    Priority:
+        1. XAGENT_RETENTION_DRY_RUN environment variable
+        2. Default ``False``
+
+    An unrecognised value resolves to ``True``. This is the setting an
+    operator is meant to reach for before a first real run, so a typo in it
+    must not be the difference between a report and a deletion.
+
+    Returns:
+        True when no writes may be performed, including when the configured
+        value cannot be read.
+    """
+    return _get_retention_bool_env(RETENTION_DRY_RUN, permissive=False)
+
+
+def get_retention_batch_size() -> int:
+    """How many tasks one expiry batch may consider.
+
+    Priority:
+        1. XAGENT_RETENTION_BATCH_SIZE environment variable
+        2. Default ``100``
+
+    Blank counts as unset, matching the rest of this section.
+
+    Returns:
+        Positive batch size.
+    """
+    value = os.getenv(RETENTION_BATCH_SIZE)
+    if value is None or not value.strip():
+        return 100
+    return _get_positive_int_env(RETENTION_BATCH_SIZE, 100)
+
+
+def get_retention_sweep_interval_seconds() -> float:
+    """Seconds between expiry sweeps once the eligible backlog is drained.
+
+    Priority:
+        1. XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS environment variable
+        2. Default ``86400`` (daily)
+
+    Daily by default because #2557 proposes wording the customer-facing
+    commitment as "within 7 days after the retention period ends"; a daily
+    sweep leaves six days of headroom for a backlog.
+
+    Returns:
+        Interval in seconds.
+    """
+    value = _get_positive_float_env(RETENTION_SWEEP_INTERVAL_SECONDS, None)
+    return 86400.0 if value is None else value
+
+
+def get_retention_batch_pause_seconds() -> float:
+    """Seconds to pause between batches while a backlog remains.
+
+    Priority:
+        1. XAGENT_RETENTION_BATCH_PAUSE_SECONDS environment variable
+        2. Default ``5``
+
+    This is the rate limit. Deleting millions of rows pressures autovacuum and
+    replication on PostgreSQL (item H of the side-effect review on #2557), so
+    a drained backlog can wait a full interval while a live one only pauses.
+
+    Returns:
+        Pause in seconds.
+    """
+    value = _get_positive_float_env(RETENTION_BATCH_PAUSE_SECONDS, None)
+    return 5.0 if value is None else value

@@ -85,6 +85,51 @@ def _empty_create_response(subject: str) -> str:
     )
 
 
+def _verify_created_record(
+    resource: str, result: Any, *, field_name: str = "record"
+) -> str:
+    """Confirm a just-created record is actually retrievable before
+    reporting success, rather than trusting the create response at face
+    value. Deputy's create endpoints can return a 200 with a plausible,
+    fully-formed record body (Id, timestamps, ...) for a record that
+    turns out to be permission-orphaned and unreadable by every other
+    endpoint -- confirmed in a 2026-09-21 production incident, where a
+    bare POST /resource/Employee did exactly this twice (see
+    deputy_create_resource's Employee rejection and deputy_add_employee).
+    Shared by both create tools rather than duplicated, since the same
+    "success" response shape can mislead regardless of which endpoint
+    produced it.
+    """
+    if not isinstance(result, dict) or not result or result.get("Id") is None:
+        # Already-empty ({}) is handled by each caller before this is
+        # reached; a non-dict is a malformed response _record_response
+        # already errors on; and a dict with no "Id" has nothing to verify
+        # against -- in all three cases, pass the result through as-is.
+        return _record_response(resource, result, field_name=field_name)
+    record_id = result["Id"]
+    detail: str | None = None
+    try:
+        safe_resource = url_path_id(resource, "resource")
+        safe_id = url_path_id(str(record_id), "resource_id")
+        readback = _request("GET", f"/resource/{safe_resource}/{safe_id}")
+        verified = isinstance(readback, dict) and bool(readback)
+    except Exception as e:
+        verified = False
+        detail = str(e)
+    if verified:
+        return _record_response(resource, result, field_name=field_name)
+    warning = (
+        f"Deputy reported this {resource} create as successful (Id "
+        f"{record_id}), but reading it back "
+        + (f"failed: {detail}" if detail else "returned no record")
+        + ". Treat this as unconfirmed -- verify in Deputy directly before "
+        "relying on it."
+    )
+    return success_with_capped_dict(
+        field_name, result, extra_fields={"warning": warning}
+    )
+
+
 def _success_with_capped_list(
     list_field: str, items: list[Any], *, truncated: bool = False, **extra: Any
 ) -> str:
@@ -400,6 +445,10 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     This is not idempotent: retrying after a timeout or connection error
     can create a duplicate record. Use deputy_query_resource to check
     whether the record already exists before retrying a failed call.
+    After Deputy reports success, this reads the new record back before
+    confirming -- if that fails, the result is still returned but with a
+    "warning" field flagging it as unconfirmed; treat that the same as a
+    failure until you've verified it directly in Deputy.
     """
     try:
         # Case/whitespace-insensitive: Deputy's own resource-name routing
@@ -441,7 +490,7 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
         result = _request("POST", f"/resource/{safe_resource}", json_data=create_data)
         if isinstance(result, dict) and not result:
             return _empty_create_response(resource)
-        return _record_response(resource, result)
+        return _verify_created_record(resource, result)
     except Exception as e:
         logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
         return _error(str(e))
@@ -512,6 +561,11 @@ def deputy_add_employee(
     can create a duplicate record. Use deputy_query_resource("Employee",
     ...) to check whether the record already exists before retrying a
     failed call.
+    After Deputy reports success, this reads the new employee back before
+    confirming -- if that fails, the result is still returned but with a
+    "warning" field flagging it as unconfirmed; treat that the same as a
+    failure until you've verified it directly in Deputy. This is exactly
+    the check that was missing during the 2026-09-21 incident.
     """
     try:
         # Flattened, individually-named parameters rather than a generic
@@ -555,7 +609,7 @@ def deputy_add_employee(
         result = _request("POST", "/supervise/employee", json_data=body)
         if isinstance(result, dict) and not result:
             return _empty_create_response("employee")
-        return _record_response("Employee", result)
+        return _verify_created_record("Employee", result)
     except Exception as e:
         logger.error(f"Error adding Deputy employee: {e}", exc_info=True)
         return _error(str(e))

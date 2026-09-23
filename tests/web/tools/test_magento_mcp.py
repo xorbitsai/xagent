@@ -1038,6 +1038,34 @@ def test_list_products_falls_back_to_compact_response_when_still_over_cap(
     assert result["truncated"] is True
 
 
+def test_list_products_reports_truncated_when_the_outer_loop_drops_items(monkeypatch):
+    # Confirmed bug: the outer while loop in _list_search halves `summaries`
+    # itself before calling success_with_capped_dict, so a halved page that
+    # then fits on its own first try comes back from success_with_capped_dict
+    # with truncated=false -- success_with_capped_dict only knows about
+    # shrinking *it* did, not items the outer loop already dropped before
+    # ever calling it. At this exact limit, a 4-item page gets halved down
+    # to 1 item by the outer loop, and that 1-item payload fits without any
+    # further internal shrinking -- silently reporting a complete page when
+    # 3 of the 4 items were actually dropped.
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "420")
+    items = [{"sku": f"SKU-{i}", "name": "x" * 10} for i in range(4)]
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(
+            return_value=MockResponse(json_data={"items": items, "total_count": 1000})
+        ),
+    )
+
+    raw = magento.magento_list_products(limit=4, page=1)
+    result = json.loads(raw)
+
+    assert len(raw) <= 420
+    assert len(result["products"]["products"]) < len(items)
+    assert result["truncated"] is True
+
+
 def test_list_products_drops_malformed_items_instead_of_phantom_records(monkeypatch):
     # A malformed item (not a dict) would otherwise summarize to {} via
     # _as_record() and appear as a phantom all-None record indistinguishable

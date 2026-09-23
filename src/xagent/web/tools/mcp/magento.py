@@ -693,6 +693,8 @@ def _list_search(
             result_key,
         )
 
+    original_summaries_count = len(summaries)
+
     def _build(page_summaries: list[dict[str, Any]]) -> str:
         capped = json.loads(
             success_with_capped_dict(result_key, {result_key: page_summaries})
@@ -706,6 +708,15 @@ def _list_search(
         result_wrapper.setdefault(result_key, [])
         capped["has_more"] = has_more
         capped["next_page"] = current_page + 1 if has_more else None
+        # success_with_capped_dict only marks truncated=True when *it*
+        # shrinks page_summaries -- it has no way to know the outer while
+        # loop below already dropped items from the page before ever
+        # calling it. Without this, a page halved down to a size that
+        # fits on the first try would come back with truncated=false,
+        # silently misleading the caller into thinking this page's items
+        # are complete.
+        if len(page_summaries) < original_summaries_count:
+            capped["truncated"] = True
         return json.dumps(capped, ensure_ascii=False)
 
     max_output_length = get_tool_max_output_length()

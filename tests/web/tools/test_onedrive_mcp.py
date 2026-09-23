@@ -11,10 +11,14 @@ from xagent.web.tools.mcp import onedrive
 
 
 class MockResponse:
-    def __init__(self, json_data=None, status_code=200, content=None, url=None, headers=None):
+    def __init__(
+        self, json_data=None, status_code=200, content=None, url=None, headers=None
+    ):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
-        self.content = json.dumps(self._json_data).encode("utf-8") if content is None else content
+        self.content = (
+            json.dumps(self._json_data).encode("utf-8") if content is None else content
+        )
         self.text = self.content.decode("utf-8", errors="replace")
         # Real requests.HTTPError messages embed the request URL (e.g.
         # "500 Server Error: ... for url: https://...") -- defaulting this
@@ -56,7 +60,9 @@ class _FakeSession:
             if get is not None
             else Mock(return_value=MockResponse({"nextExpectedRanges": ["0-"]}))
         )
-        self.delete = delete if delete is not None else Mock(return_value=MockResponse({}))
+        self.delete = (
+            delete if delete is not None else Mock(return_value=MockResponse({}))
+        )
 
     def __enter__(self):
         return self
@@ -124,9 +130,13 @@ def test_quickxor_hash_matches_microsoft_reference_vector_across_updates():
     # Values generated from Microsoft's published per-byte 160-bit rotate/XOR
     # reference algorithm, rather than from the implementation under test.
     assert _quickxor_hash(b"hello world", 1, 5, 9) == ("aCgDG9jwBhDc4Q1yawMZAAAAAAA=")
-    assert _quickxor_hash(bytes(range(21)), 7, 19, 20) == ("4AmQiIZEpkIZ4AAIXYACFsCABjg=")
+    assert _quickxor_hash(bytes(range(21)), 7, 19, 20) == (
+        "4AmQiIZEpkIZ4AAIXYACFsCABjg="
+    )
     periodic_data = bytes(range(256)) * 2
-    assert _quickxor_hash(periodic_data, 7, 159, 160, 161, 333) == ("edJlP68QDhntUYpkxf/vpP5uDuY=")
+    assert _quickxor_hash(periodic_data, 7, 159, 160, 161, 333) == (
+        "edJlP68QDhntUYpkxf/vpP5uDuY="
+    )
 
 
 @pytest.mark.parametrize("size", [21, 159, 160, 161, 512, 4097])
@@ -180,7 +190,9 @@ def test_upload_file_sends_real_binary_content(monkeypatch, _upload_allowed_dirs
 
     kwargs = mock_request.call_args.kwargs
     assert kwargs["method"] == "PUT"
-    assert kwargs["url"].endswith("/me/drive/root:/Regional_Performance_Data-v3.xlsx:/content")
+    assert kwargs["url"].endswith(
+        "/me/drive/root:/Regional_Performance_Data-v3.xlsx:/content"
+    )
     assert kwargs["data"] == b"PK\x03\x04 fake xlsx bytes"
     assert kwargs["headers"]["Content-Type"] == (
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -237,7 +249,9 @@ def test_upload_file_accepts_explicit_remote_path_and_mime_type(
     assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
 
 
-def test_upload_file_defaults_mime_type_when_unguessable(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_defaults_mime_type_when_unguessable(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "mystery_file_no_extension"
     local_file.write_bytes(b"some bytes")
 
@@ -251,30 +265,42 @@ def test_upload_file_defaults_mime_type_when_unguessable(monkeypatch, _upload_al
     assert kwargs["headers"]["Content-Type"] == "application/octet-stream"
 
 
-def test_upload_file_guesses_mime_type_from_remote_name(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_guesses_mime_type_from_remote_name(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "generated-artifact"
     local_file.write_bytes(b"%PDF-1.7")
     mock_request = Mock(return_value=MockResponse({"id": "item-1"}))
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
     result = json.loads(
-        onedrive.onedrive_upload_file(str(local_file), remote_path="Documents/report.pdf")
+        onedrive.onedrive_upload_file(
+            str(local_file), remote_path="Documents/report.pdf"
+        )
     )
 
     assert result["status"] == "success"
-    assert mock_request.call_args.kwargs["headers"]["Content-Type"] == ("application/pdf")
+    assert mock_request.call_args.kwargs["headers"]["Content-Type"] == (
+        "application/pdf"
+    )
 
 
-def test_upload_file_falls_back_to_local_name_for_mime_type(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_falls_back_to_local_name_for_mime_type(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"%PDF-1.7")
     mock_request = Mock(return_value=MockResponse({"id": "item-1"}))
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
-    result = json.loads(onedrive.onedrive_upload_file(str(local_file), remote_path="report"))
+    result = json.loads(
+        onedrive.onedrive_upload_file(str(local_file), remote_path="report")
+    )
 
     assert result["status"] == "success"
-    assert mock_request.call_args.kwargs["headers"]["Content-Type"] == ("application/pdf")
+    assert mock_request.call_args.kwargs["headers"]["Content-Type"] == (
+        "application/pdf"
+    )
 
 
 @pytest.mark.parametrize(
@@ -303,7 +329,9 @@ def test_upload_file_resolves_gzip_content_type_not_the_inner_type(
     result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
 
     assert result["status"] == "success"
-    assert mock_request.call_args.kwargs["headers"]["Content-Type"] == ("application/gzip")
+    assert mock_request.call_args.kwargs["headers"]["Content-Type"] == (
+        "application/gzip"
+    )
 
 
 @pytest.mark.parametrize(
@@ -339,10 +367,14 @@ def test_upload_file_resolves_ooxml_mime_type_without_relying_on_host_mime_db(
     result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
 
     assert result["status"] == "success"
-    assert mock_request.call_args.kwargs["headers"]["Content-Type"] == expected_mime_type
+    assert (
+        mock_request.call_args.kwargs["headers"]["Content-Type"] == expected_mime_type
+    )
 
 
-def test_upload_file_rejects_empty_or_root_remote_path(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_rejects_empty_or_root_remote_path(
+    monkeypatch, _upload_allowed_dirs_env
+):
     """Regression guard: remote_path="/" previously reached _content_path
     (simple-PUT path) as an effectively empty target, raising a confusing
     "file_path is required" that names the wrong parameter, or reached
@@ -377,21 +409,27 @@ def test_upload_file_rejects_trailing_slash_remote_path(
     mock_request = Mock()
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
-    result = json.loads(onedrive.onedrive_upload_file(str(local_file), remote_path=remote_path))
+    result = json.loads(
+        onedrive.onedrive_upload_file(str(local_file), remote_path=remote_path)
+    )
 
     assert result["status"] == "error"
     assert "filename" in result["message"]
     mock_request.assert_not_called()
 
 
-def test_upload_file_rejects_trailing_period_remote_path(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_rejects_trailing_period_remote_path(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"content")
     mock_request = Mock()
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
     result = json.loads(
-        onedrive.onedrive_upload_file(str(local_file), remote_path="Documents/report.pdf.")
+        onedrive.onedrive_upload_file(
+            str(local_file), remote_path="Documents/report.pdf."
+        )
     )
 
     assert result["status"] == "error"
@@ -411,7 +449,9 @@ def test_upload_file_accepts_remote_path_with_folder_and_filename(
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
     result = json.loads(
-        onedrive.onedrive_upload_file(str(local_file), remote_path="Documents/report.pdf")
+        onedrive.onedrive_upload_file(
+            str(local_file), remote_path="Documents/report.pdf"
+        )
     )
 
     assert result["status"] == "success"
@@ -447,7 +487,9 @@ def test_upload_file_rejects_dot_segments_in_remote_path(
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
     result = json.loads(
-        onedrive.onedrive_upload_file(str(local_file), remote_path=traversal_remote_path)
+        onedrive.onedrive_upload_file(
+            str(local_file), remote_path=traversal_remote_path
+        )
     )
 
     assert result["status"] == "error"
@@ -479,7 +521,9 @@ def test_download_file_streams_to_task_output_and_hashes_content(monkeypatch, tm
             "name": "Issue Tracker.xlsx",
             "size": len(content),
             "file": {
-                "mimeType": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                "mimeType": (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
             },
         }
     )
@@ -497,7 +541,9 @@ def test_download_file_streams_to_task_output_and_hashes_content(monkeypatch, tm
     output_path = task_dir / "output" / "Issue Tracker.xlsx"
     assert output_path.read_bytes() == content
     download_call = mock_request.call_args_list[1]
-    assert download_call.kwargs["url"].endswith("/me/drive/root:/Issue%20Tracker.xlsx:/content")
+    assert download_call.kwargs["url"].endswith(
+        "/me/drive/root:/Issue%20Tracker.xlsx:/content"
+    )
     assert download_call.kwargs["headers"]["Authorization"] == "Bearer test-graph-token"
     assert download_call.kwargs["stream"] is True
 
@@ -547,7 +593,9 @@ def test_path_based_tools_reject_dot_segments_end_to_end(monkeypatch, call):
     mock_request.assert_not_called()
 
 
-def test_upload_file_uses_upload_session_for_large_files(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_uses_upload_session_for_large_files(
+    monkeypatch, _upload_allowed_dirs_env
+):
     """Files over Graph's ~4MB simple-PUT cap must go through
     createUploadSession + chunked PUTs instead of a single content PUT."""
     local_file = _upload_allowed_dirs_env / "big.bin"
@@ -583,8 +631,12 @@ def test_upload_file_uses_upload_session_for_large_files(monkeypatch, _upload_al
 
     session_call = mock_request.call_args
     assert session_call.kwargs["method"] == "POST"
-    assert session_call.kwargs["url"].endswith("/me/drive/root:/big.bin:/createUploadSession")
-    assert session_call.kwargs["json"] == {"item": {"@microsoft.graph.conflictBehavior": "replace"}}
+    assert session_call.kwargs["url"].endswith(
+        "/me/drive/root:/big.bin:/createUploadSession"
+    )
+    assert session_call.kwargs["json"] == {
+        "item": {"@microsoft.graph.conflictBehavior": "replace"}
+    }
 
     assert mock_put.call_count == 2
     first_call, second_call = mock_put.call_args_list
@@ -746,7 +798,9 @@ def test_upload_large_file_content_does_not_forward_chunk_error_body(
     )
 
     with pytest.raises(RuntimeError, match="HTTP 400") as exc_info:
-        onedrive._upload_large_file_content("big.bin", fh, total_size, "application/octet-stream")
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
 
     assert "Invalid upload session" not in str(exc_info.value)
 
@@ -761,7 +815,9 @@ def test_upload_large_file_content_does_not_forward_chunk_error_body(
     )
 
 
-def test_upload_large_file_content_never_leaks_upload_url_on_chunk_failure(monkeypatch, caplog):
+def test_upload_large_file_content_never_leaks_upload_url_on_chunk_failure(
+    monkeypatch, caplog
+):
     """Regression guard: Graph's preauthenticated upload-session URL is
     itself usable for PUT/GET/DELETE without the OAuth bearer token, so a
     rejected chunk must never format requests' own HTTPError (whose default
@@ -833,7 +889,9 @@ def test_upload_large_file_content_never_forwards_encoded_url_from_response_body
     assert "SECRETVALUE" not in caplog.text
 
 
-def test_upload_large_file_content_never_leaks_upload_url_on_transport_failure(monkeypatch, caplog):
+def test_upload_large_file_content_never_leaks_upload_url_on_transport_failure(
+    monkeypatch, caplog
+):
     """Regression guard: a chunk PUT that fails at the transport layer
     (connection error, timeout, TLS failure) before any HTTP response
     exists at all raises a requests exception whose own default message
@@ -942,7 +1000,9 @@ def test_upload_large_file_content_treats_cleanup_404_as_fine(monkeypatch, caplo
             )
 
     mock_delete.assert_called_once()
-    assert not any("cancellation returned" in record.getMessage() for record in caplog.records)
+    assert not any(
+        "cancellation returned" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_upload_large_file_content_rejects_non_positive_total(monkeypatch):
@@ -1069,7 +1129,9 @@ def test_upload_large_file_content_retries_then_cancels_transient_http_failure(
     assert "Retrying OneDrive upload fragment" in caplog.text
 
 
-def test_upload_large_file_content_retries_then_cancels_network_failure(monkeypatch, caplog):
+def test_upload_large_file_content_retries_then_cancels_network_failure(
+    monkeypatch, caplog
+):
     """Transport failures use the same bounded retry and cleanup path."""
     total_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE + 10
     fh = io.BytesIO(b"\x00" * total_size)
@@ -1128,7 +1190,9 @@ def test_upload_large_file_content_recovers_from_transient_failure(monkeypatch):
         MockResponse({}, status_code=416),
     ],
 )
-def test_upload_large_file_content_advances_when_server_has_fragment(monkeypatch, ambiguous_result):
+def test_upload_large_file_content_advances_when_server_has_fragment(
+    monkeypatch, ambiguous_result
+):
     """A lost response or 416 is reconciled before resending the range."""
     chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
     total_size = chunk_size + 10
@@ -1144,7 +1208,9 @@ def test_upload_large_file_content_advances_when_server_has_fragment(monkeypatch
             MockResponse({"id": "item-1", "size": total_size}),
         ]
     )
-    mock_get = Mock(return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size}-"]}))
+    mock_get = Mock(
+        return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size}-"]})
+    )
     mock_delete = Mock(return_value=MockResponse({}))
     _patch_session(
         monkeypatch,
@@ -1157,7 +1223,11 @@ def test_upload_large_file_content_advances_when_server_has_fragment(monkeypatch
 
     assert result["id"] == "item-1"
     assert mock_put.call_count == 2
-    assert mock_put.call_args_list[0].kwargs["headers"]["Content-Range"].startswith("bytes 0-")
+    assert (
+        mock_put.call_args_list[0]
+        .kwargs["headers"]["Content-Range"]
+        .startswith("bytes 0-")
+    )
     assert (
         mock_put.call_args_list[1]
         .kwargs["headers"]["Content-Range"]
@@ -1190,7 +1260,9 @@ def test_upload_large_file_content_resumes_inside_ambiguous_fragment(monkeypatch
             MockResponse({"id": "item-1"}, status_code=201),
         ]
     )
-    mock_get = Mock(return_value=MockResponse({"nextExpectedRanges": [f"{partial_offset}-"]}))
+    mock_get = Mock(
+        return_value=MockResponse({"nextExpectedRanges": [f"{partial_offset}-"]})
+    )
     _patch_session(monkeypatch, _FakeSession(put=mock_put, get=mock_get))
 
     result = onedrive._upload_large_file_content(
@@ -1203,7 +1275,9 @@ def test_upload_large_file_content_resumes_inside_ambiguous_fragment(monkeypatch
         f"bytes {partial_offset}-{partial_offset + chunk_size - 1}/{total_size}"
     )
     assert "Content-Length" not in resumed["headers"]
-    assert bytes(resumed["data"]) == content[partial_offset : partial_offset + chunk_size]
+    assert (
+        bytes(resumed["data"]) == content[partial_offset : partial_offset + chunk_size]
+    )
     final = mock_put.call_args_list[2].kwargs
     assert final["headers"]["Content-Range"] == (
         f"bytes {partial_offset + chunk_size}-{total_size - 1}/{total_size}"
@@ -1299,7 +1373,8 @@ def test_upload_large_file_content_resets_failures_after_forward_progress(monkey
     )
     mock_get = Mock(
         side_effect=[
-            MockResponse({"nextExpectedRanges": [f"{offset}-"]}) for offset in partial_offsets
+            MockResponse({"nextExpectedRanges": [f"{offset}-"]})
+            for offset in partial_offsets
         ]
     )
     mock_delete = Mock(return_value=MockResponse({}))
@@ -1332,7 +1407,9 @@ def test_upload_large_file_content_bounds_repeated_dribbling_progress(monkeypatc
     )
     mock_put = Mock(side_effect=requests.ConnectionError("response lost"))
     mock_get = Mock(
-        side_effect=[MockResponse({"nextExpectedRanges": [f"{offset}-"]}) for offset in offsets]
+        side_effect=[
+            MockResponse({"nextExpectedRanges": [f"{offset}-"]}) for offset in offsets
+        ]
     )
     mock_delete = Mock(return_value=MockResponse({}, status_code=204))
     _patch_session(
@@ -1489,7 +1566,9 @@ def test_upload_large_file_content_recognizes_completed_status_then_verifies_des
 
 
 @pytest.mark.parametrize("fragment_status", [404, 409])
-def test_upload_large_file_content_reconciles_final_fragment_status(monkeypatch, fragment_status):
+def test_upload_large_file_content_reconciles_final_fragment_status(
+    monkeypatch, fragment_status
+):
     chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
     total_size = chunk_size + 10
     content = b"\x00" * total_size
@@ -1572,7 +1651,9 @@ def test_upload_large_file_content_rejects_same_size_concurrent_item(
     )
 
     with pytest.raises(RuntimeError, match="could not be confirmed"):
-        onedrive._upload_large_file_content("big.bin", fh, total_size, "application/octet-stream")
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
 
     mock_delete.assert_called_once()
 
@@ -1602,7 +1683,9 @@ def test_completed_upload_item_waits_for_delayed_quickxor_hash(monkeypatch):
     )
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
-    assert onedrive._completed_upload_item("big.bin", 123, expected_hash) == completed_item
+    assert (
+        onedrive._completed_upload_item("big.bin", 123, expected_hash) == completed_item
+    )
     assert mock_request.call_count == 4
     assert onedrive.time.sleep.call_count == 3
 
@@ -1623,7 +1706,9 @@ def test_upload_large_file_content_honors_bounded_retry_after(monkeypatch):
         _FakeSession(put=Mock(side_effect=[throttled, intermediate, completed])),
     )
 
-    onedrive._upload_large_file_content("big.bin", fh, total_size, "application/octet-stream")
+    onedrive._upload_large_file_content(
+        "big.bin", fh, total_size, "application/octet-stream"
+    )
 
     onedrive.time.sleep.assert_called_once_with(onedrive._UPLOAD_RETRY_MAX_SECONDS)
 
@@ -1638,15 +1723,17 @@ def test_upload_retry_delay_accepts_http_date(monkeypatch):
 
 @pytest.mark.parametrize("invalid_delay", ["nan", "inf", "-inf"])
 def test_upload_retry_delay_rejects_non_finite_seconds(invalid_delay):
-    assert onedrive._retry_delay({"Retry-After": invalid_delay}, 2) == pytest.approx(2.0)
+    assert onedrive._retry_delay({"Retry-After": invalid_delay}, 2) == pytest.approx(
+        2.0
+    )
 
 
 def test_upload_retry_delay_treats_naive_http_date_as_utc(monkeypatch):
     monkeypatch.setattr(onedrive.time, "time", Mock(return_value=0.0))
 
-    assert onedrive._retry_delay({"Retry-After": "Thu, 01 Jan 1970 00:00:07"}, 1) == pytest.approx(
-        7.0
-    )
+    assert onedrive._retry_delay(
+        {"Retry-After": "Thu, 01 Jan 1970 00:00:07"}, 1
+    ) == pytest.approx(7.0)
 
 
 def test_upload_large_file_content_still_cancels_on_a_non_retriable_failure(
@@ -1672,7 +1759,9 @@ def test_upload_large_file_content_still_cancels_on_a_non_retriable_failure(
     )
 
     with pytest.raises(RuntimeError):
-        onedrive._upload_large_file_content("big.bin", fh, total_size, "application/octet-stream")
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
 
     mock_delete.assert_called_once()
 
@@ -1698,9 +1787,12 @@ def test_upload_large_file_content_fails_on_a_non_first_chunk(monkeypatch):
         content=b'{"error": {"message": "range conflict"}}',
     )
     mock_put = Mock(
-        side_effect=[MockResponse({}, status_code=202, content=b"")] + [error_response] * 3
+        side_effect=[MockResponse({}, status_code=202, content=b"")]
+        + [error_response] * 3
     )
-    mock_get = Mock(return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size}-"]}))
+    mock_get = Mock(
+        return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size}-"]})
+    )
     mock_delete = Mock(return_value=MockResponse({}))
     _patch_session(
         monkeypatch,
@@ -1708,7 +1800,9 @@ def test_upload_large_file_content_fails_on_a_non_first_chunk(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="made no forward progress"):
-        onedrive._upload_large_file_content("big.bin", fh, total_size, "application/octet-stream")
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
 
     assert mock_put.call_count == 4
     mock_delete.assert_called_once()
@@ -1740,7 +1834,9 @@ def test_upload_large_file_content_recovers_when_final_response_is_202(
     mock_put = Mock(
         side_effect=[
             MockResponse({}, status_code=202, content=b""),
-            MockResponse({"expirationDateTime": "2099-01-01T00:00:00Z"}, status_code=202),
+            MockResponse(
+                {"expirationDateTime": "2099-01-01T00:00:00Z"}, status_code=202
+            ),
         ]
     )
     mock_get = Mock(return_value=MockResponse({}, status_code=404))
@@ -1786,7 +1882,9 @@ def test_upload_large_file_content_recovers_from_missing_or_unparsable_final_res
     final_response = MockResponse({}, status_code=201, content=final_content)
     if final_content:
         final_response.json = Mock(side_effect=ValueError("Expecting value"))
-    mock_put = Mock(side_effect=[MockResponse({}, status_code=202, content=b""), final_response])
+    mock_put = Mock(
+        side_effect=[MockResponse({}, status_code=202, content=b""), final_response]
+    )
     mock_delete = Mock(return_value=MockResponse({}))
     _patch_session(monkeypatch, _FakeSession(put=mock_put, delete=mock_delete))
 
@@ -1822,7 +1920,9 @@ def test_upload_large_file_content_retries_nested_metadata_failure(monkeypatch):
     malformed_final.json = Mock(side_effect=ValueError("Expecting value"))
     _patch_session(
         monkeypatch,
-        _FakeSession(put=Mock(side_effect=[MockResponse({}, status_code=202), malformed_final])),
+        _FakeSession(
+            put=Mock(side_effect=[MockResponse({}, status_code=202), malformed_final])
+        ),
     )
 
     result = onedrive._upload_large_file_content(
@@ -1855,10 +1955,14 @@ def test_reconcile_exhaustion_preserves_retriable_cause(monkeypatch):
 def test_reconcile_rejects_progress_beyond_submitted_fragment():
     chunk_size = onedrive._UPLOAD_SESSION_CHUNK_SIZE
     http = _FakeSession(
-        get=Mock(return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size + 1}-"]}))
+        get=Mock(
+            return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size + 1}-"]})
+        )
     )
 
-    with pytest.raises(onedrive._UploadError, match="progress beyond the submitted fragment"):
+    with pytest.raises(
+        onedrive._UploadError, match="progress beyond the submitted fragment"
+    ):
         onedrive._reconcile_upload_progress(
             http,
             "https://upload.example/s",
@@ -1911,7 +2015,9 @@ def test_reconcile_rejects_invalid_progress(payload):
 
 
 def test_reconcile_rejects_progress_behind_submitted_fragment():
-    http = _FakeSession(get=Mock(return_value=MockResponse({"nextExpectedRanges": ["50-"]})))
+    http = _FakeSession(
+        get=Mock(return_value=MockResponse({"nextExpectedRanges": ["50-"]}))
+    )
 
     with pytest.raises(onedrive._UploadError, match="inconsistent.*progress"):
         onedrive._reconcile_upload_progress(
@@ -1954,7 +2060,9 @@ def test_upload_large_file_content_retries_unaccepted_final_202(monkeypatch):
             MockResponse({"id": "item-1"}, status_code=201),
         ]
     )
-    mock_get = Mock(return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size}-"]}))
+    mock_get = Mock(
+        return_value=MockResponse({"nextExpectedRanges": [f"{chunk_size}-"]})
+    )
     _patch_session(monkeypatch, _FakeSession(put=mock_put, get=mock_get))
 
     result = onedrive._upload_large_file_content(
@@ -2000,7 +2108,9 @@ def test_upload_large_file_content_rejects_short_chunk_read(monkeypatch):
     _patch_session(monkeypatch, _FakeSession(put=mock_put))
 
     with pytest.raises(RuntimeError, match="changed size during upload"):
-        onedrive._upload_large_file_content("big.bin", fh, total_size, "application/octet-stream")
+        onedrive._upload_large_file_content(
+            "big.bin", fh, total_size, "application/octet-stream"
+        )
 
     # Must fail before ever sending the short chunk to Graph.
     mock_put.assert_not_called()
@@ -2042,7 +2152,9 @@ def test_simple_upload_max_bytes_is_at_or_below_graphs_4mb_limit():
     assert onedrive._SIMPLE_UPLOAD_MAX_BYTES <= 4_000_000
 
 
-def test_upload_file_at_exact_boundary_uses_simple_put(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_at_exact_boundary_uses_simple_put(
+    monkeypatch, _upload_allowed_dirs_env
+):
     """Regression guard: a purely static assertion on the constant (see
     above) can't catch a routing-condition regression like `<=` silently
     flipped to `<` -- this exercises onedrive_upload_file itself with a
@@ -2059,7 +2171,9 @@ def test_upload_file_at_exact_boundary_uses_simple_put(monkeypatch, _upload_allo
     assert mock_request.call_args.kwargs["method"] == "PUT"
 
 
-def test_upload_file_bounds_the_actual_read_before_upload(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_bounds_the_actual_read_before_upload(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "growing.bin"
     local_file.write_bytes(b"initially small")
     real_file = local_file.open("rb")
@@ -2100,7 +2214,9 @@ def test_upload_file_one_byte_over_boundary_uses_upload_session(
     local_file = _upload_allowed_dirs_env / "over_boundary.bin"
     local_file.write_bytes(b"\x00" * (onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1))
 
-    mock_request = Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/s"}))
+    mock_request = Mock(
+        return_value=MockResponse({"uploadUrl": "https://upload.example/s"})
+    )
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
     mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
     _patch_session(monkeypatch, _FakeSession(put=mock_put))
@@ -2239,7 +2355,9 @@ def test_upload_text_file_allows_known_text_extensions_regardless_of_host_mimety
         "guess_type",
         lambda name: ("application/octet-stream", None),
     )
-    monkeypatch.setattr(onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"})))
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
+    )
 
     result = json.loads(onedrive.onedrive_upload_text_file(file_path, "some text"))
 
@@ -2252,7 +2370,9 @@ def test_upload_text_file_allows_extensionless_names(monkeypatch):
     unrecognized extension is -- _name_looks_binary's default-deny design
     only rejects a *recognized-as-suspicious* extension, not the absence of
     one."""
-    monkeypatch.setattr(onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"})))
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
+    )
 
     for name in ["Dockerfile", "README", "LICENSE"]:
         result = json.loads(onedrive.onedrive_upload_text_file(name, "some text"))
@@ -2280,7 +2400,9 @@ def test_upload_text_file_rejects_nested_dotfile_shaped_binary_extension(
     mock_request = Mock()
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
-    result = json.loads(onedrive.onedrive_upload_text_file("Documents/.pdf", "some text"))
+    result = json.loads(
+        onedrive.onedrive_upload_text_file("Documents/.pdf", "some text")
+    )
 
     assert result["status"] == "error"
     assert "onedrive_upload_file" in result["message"]
@@ -2311,7 +2433,9 @@ def test_upload_file_resolves_real_mime_type_for_ambiguous_extensions(
     under test is that _guess_mime_type's real answer reaches Content-Type
     unmodified, not what that real answer happens to be for ".ts"
     specifically."""
-    monkeypatch.setattr(onedrive.mimetypes, "guess_type", lambda name: ("video/mp2t", None))
+    monkeypatch.setattr(
+        onedrive.mimetypes, "guess_type", lambda name: ("video/mp2t", None)
+    )
     local_file = _upload_allowed_dirs_env / "segment001.ts"
     local_file.write_bytes(b"\x47" * 100)  # MPEG-TS sync byte, not text
 
@@ -2451,7 +2575,9 @@ def test_upload_file_allows_symlink_whose_target_is_inside_allowed_dir(
     link = _upload_allowed_dirs_env / "alias.pdf"
     link.symlink_to(real_file)
 
-    monkeypatch.setattr(onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"})))
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
+    )
 
     result = json.loads(onedrive.onedrive_upload_file(str(link)))
 
@@ -2467,7 +2593,9 @@ def test_upload_file_rejects_relative_traversal_outside_allowed_dir(
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
     result = json.loads(
-        onedrive.onedrive_upload_file(str(_upload_allowed_dirs_env / ".." / "secret.txt"))
+        onedrive.onedrive_upload_file(
+            str(_upload_allowed_dirs_env / ".." / "secret.txt")
+        )
     )
 
     assert result["status"] == "error"
@@ -2493,7 +2621,9 @@ def test_allowed_upload_dirs_denies_entryless_legacy_value(monkeypatch):
     assert onedrive.allowed_dirs_from_env(onedrive._UPLOAD_ALLOWED_DIRS_ENV_VAR) == []
 
 
-def test_upload_file_honors_explicit_empty_allowed_dirs(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_honors_explicit_empty_allowed_dirs(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"content")
     monkeypatch.setenv("XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS", "[]")
@@ -2540,7 +2670,9 @@ def test_upload_file_rejects_missing_file(monkeypatch, _upload_allowed_dirs_env)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation requires privileges")
-def test_upload_file_does_not_leak_path_from_symlink_loop(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_does_not_leak_path_from_symlink_loop(
+    monkeypatch, _upload_allowed_dirs_env
+):
     loop = _upload_allowed_dirs_env / "loop.pdf"
     loop.symlink_to(loop)
     mock_request = Mock()
@@ -2618,7 +2750,9 @@ def test_upload_file_rejects_empty_file(monkeypatch, _upload_allowed_dirs_env):
     mock_request.assert_not_called()
 
 
-def test_upload_file_rejects_file_over_max_upload_bytes(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_rejects_file_over_max_upload_bytes(
+    monkeypatch, _upload_allowed_dirs_env
+):
     """Regression guard: onedrive_upload_file previously had no upper size
     bound at all (only rejected 0 bytes), so a mistargeted large file (an
     unrelated log directory, the wrong generated artifact) would trigger
@@ -2657,7 +2791,9 @@ def test_upload_file_rejects_file_over_max_upload_bytes(monkeypatch, _upload_all
     mock_request.assert_not_called()
 
 
-def test_upload_file_accepts_exact_max_upload_bytes(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_accepts_exact_max_upload_bytes(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "max-size.bin"
     local_file.write_bytes(b"x")
     monkeypatch.setattr(
@@ -2674,7 +2810,9 @@ def test_upload_file_accepts_exact_max_upload_bytes(monkeypatch, _upload_allowed
     assert upload_large.call_args.args[2] == onedrive._MAX_UPLOAD_BYTES
 
 
-def test_upload_file_returns_error_payload_on_api_failure(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_returns_error_payload_on_api_failure(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"content")
 
@@ -2694,7 +2832,9 @@ def test_upload_file_returns_error_payload_on_api_failure(monkeypatch, _upload_a
     assert "boom" in result["message"]
 
 
-def test_upload_file_requires_completed_item_confirmation(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_requires_completed_item_confirmation(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"content")
     monkeypatch.setattr(
@@ -2736,14 +2876,18 @@ def test_upload_text_file_rejects_folder_shaped_path(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
 
-    result = json.loads(onedrive.onedrive_upload_text_file("Documents/Reports/", "text"))
+    result = json.loads(
+        onedrive.onedrive_upload_text_file("Documents/Reports/", "text")
+    )
 
     assert result["status"] == "error"
     assert "filename" in result["message"]
     mock_request.assert_not_called()
 
 
-@pytest.mark.parametrize("file_path", ["report.pdf.", "Documents/archive.zip.", "model.pkl. "])
+@pytest.mark.parametrize(
+    "file_path", ["report.pdf.", "Documents/archive.zip.", "model.pkl. "]
+)
 def test_upload_text_file_rejects_trailing_period_names(monkeypatch, file_path):
     mock_request = Mock()
     monkeypatch.setattr(onedrive.requests, "request", mock_request)
@@ -2793,7 +2937,9 @@ def test_upload_text_file_allows_plain_text_names(monkeypatch, file_path):
     round -- which is exactly how ".sh" shipped genuinely broken for a
     whole round before anyone tested it. This covers a broader set of
     everyday text formats an agent is likely to actually generate."""
-    monkeypatch.setattr(onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"})))
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(return_value=MockResponse({"id": "f1"}))
+    )
 
     result = json.loads(onedrive.onedrive_upload_text_file(file_path, "hello world"))
 

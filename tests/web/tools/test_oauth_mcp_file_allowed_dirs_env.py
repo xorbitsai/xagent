@@ -102,7 +102,9 @@ def test_drive_output_dir_excludes_external_dirs_unlike_the_read_allowlists(
     # The read allowlists, by contrast, legitimately include the external
     # dir alongside the task dir.
     for env_var in _READ_ALLOWLIST_ENV_VARS:
-        assert str(external_dir.resolve()) in json.loads(transport_config["env"][env_var])
+        assert str(external_dir.resolve()) in json.loads(
+            transport_config["env"][env_var]
+        )
 
 
 def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
@@ -125,7 +127,9 @@ def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
     assert "XAGENT_ONEDRIVE_OUTPUT_DIR" not in transport_config["env"]
     for env_var in _READ_ALLOWLIST_ENV_VARS:
-        assert str(external_dir.resolve()) in json.loads(transport_config["env"][env_var])
+        assert str(external_dir.resolve()) in json.loads(
+            transport_config["env"][env_var]
+        )
 
 
 def test_read_allowlists_preserve_comma_in_directory_name(tmp_path: Path) -> None:

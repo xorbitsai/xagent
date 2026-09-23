@@ -57,7 +57,9 @@ def test_inline_delivery_rejects_registration_without_durable_task_owner(
     from xagent.core.inline_file_delivery import InlineFileDelivery
 
     engine, SessionLocal, db = constrained_workspace_db
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local", lambda: SessionLocal
+    )
     monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
     workspace = TaskWorkspace(id="web_task_9999", base_dir=str(tmp_path))
     delivery = InlineFileDelivery(workspace)
@@ -106,7 +108,9 @@ async def test_inline_delivery_uses_task_owned_durable_file_registration(
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
     monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "false")
     get_unscoped_file_storage.cache_clear()
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local", lambda: SessionLocal
+    )
     monkeypatch.setattr(
         "xagent.web.services.uploaded_file_store.get_session_local",
         lambda: SessionLocal,
@@ -200,7 +204,9 @@ async def test_inline_delivery_uses_task_owned_durable_file_registration(
                         assert list(downloaded.active.values) == list(map(tuple, rows))
                         downloaded.close()
                     assert (await client.get(url)).status_code in (401, 403)
-                    assert (await client.get(url, headers=other_headers)).status_code == 403
+                    assert (
+                        await client.get(url, headers=other_headers)
+                    ).status_code == 403
             assert engine.pool.checkedout() == 0
     finally:
         get_unscoped_file_storage.cache_clear()
@@ -339,7 +345,9 @@ def test_workspace_registration_commit_survives_caller_rollback(
 
     assert engine.pool.checkedout() == 0
     with SessionLocal() as verify_db:
-        record = verify_db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        record = (
+            verify_db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
         assert record.user_id == user_id
         storage_key = str(record.storage_key)
     assert get_user_file_storage(user_id).exists(storage_key) is True
@@ -447,7 +455,12 @@ def test_workspace_delegated_registration_releases_pool_before_canonical_copy(
     assert observed_checked_out == [0]
     record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
     assert record.storage_path == str(
-        tmp_path / "workspaces" / f"user_{user.id}" / "web_task_9003" / "output" / "report.txt"
+        tmp_path
+        / "workspaces"
+        / f"user_{user.id}"
+        / "web_task_9003"
+        / "output"
+        / "report.txt"
     )
 
 
@@ -552,7 +565,11 @@ def test_workspace_register_cas_collision_compensates_only_losing_generation(
         staged_files.append(staged)
         winner = storage.put_bytes(b"concurrent winner", winner_key, "text/plain")
         with SessionLocal() as winner_db:
-            record = winner_db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+            record = (
+                winner_db.query(UploadedFile)
+                .filter(UploadedFile.file_id == file_id)
+                .one()
+            )
             record.storage_backend = storage.backend
             record.storage_key = winner.key
             record.storage_uri = winner.uri
@@ -582,14 +599,18 @@ def test_workspace_register_cas_collision_compensates_only_losing_generation(
     assert current.checksum == storage.content_hash(winner_key)
 
 
-def test_workspace_register_file_writes_durable_storage(monkeypatch, tmp_path, mock_workspace_db):
+def test_workspace_register_file_writes_durable_storage(
+    monkeypatch, tmp_path, mock_workspace_db
+):
     # Override the global autouse fixture from tests/conftest.py for this module.
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     get_unscoped_file_storage.cache_clear()
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -601,7 +622,9 @@ def test_workspace_register_file_writes_durable_storage(monkeypatch, tmp_path, m
         db.add(task)
         db.commit()
 
-        workspace = TaskWorkspace(id="web_task_123", base_dir=str(tmp_path / "workspaces"))
+        workspace = TaskWorkspace(
+            id="web_task_123", base_dir=str(tmp_path / "workspaces")
+        )
         output_path = workspace.output_dir / "report.txt"
         output_path.write_text("workspace output", encoding="utf-8")
 
@@ -639,7 +662,9 @@ def test_agent_workspace_register_file_uses_explicit_db_task_id(
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     get_unscoped_file_storage.cache_clear()
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -664,7 +689,12 @@ def test_agent_workspace_register_file_uses_explicit_db_task_id(
 
         record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
         canonical_path = (
-            tmp_path / "workspaces" / f"user_{user.id}" / "web_task_321" / "output" / "report.txt"
+            tmp_path
+            / "workspaces"
+            / f"user_{user.id}"
+            / "web_task_321"
+            / "output"
+            / "report.txt"
         )
         assert workspace.current_task_id == 321
         assert record.user_id == user.id
@@ -694,7 +724,9 @@ def test_agent_workspace_register_file_rebinds_existing_output_to_db_task_id(
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     get_unscoped_file_storage.cache_clear()
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -736,7 +768,12 @@ def test_agent_workspace_register_file_rebinds_existing_output_to_db_task_id(
         assert file_id == "worker-output"
         db.refresh(record)
         canonical_path = (
-            tmp_path / "workspaces" / f"user_{user.id}" / "web_task_321" / "output" / "report.txt"
+            tmp_path
+            / "workspaces"
+            / f"user_{user.id}"
+            / "web_task_321"
+            / "output"
+            / "report.txt"
         )
         assert record.user_id == user.id
         assert record.task_id == 321
@@ -765,7 +802,9 @@ def test_agent_workspace_register_file_avoids_parent_output_name_collision(
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     get_unscoped_file_storage.cache_clear()
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -778,7 +817,12 @@ def test_agent_workspace_register_file_avoids_parent_output_name_collision(
         db.commit()
 
         parent_output_path = (
-            tmp_path / "workspaces" / f"user_{user.id}" / "web_task_321" / "output" / "report.txt"
+            tmp_path
+            / "workspaces"
+            / f"user_{user.id}"
+            / "web_task_321"
+            / "output"
+            / "report.txt"
         )
         parent_output_path.parent.mkdir(parents=True)
         parent_output_path.write_text("existing parent output", encoding="utf-8")
@@ -810,7 +854,9 @@ def test_agent_workspace_register_file_avoids_parent_output_name_collision(
 
         record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
         canonical_path = parent_output_path.with_name("report_1.txt")
-        assert parent_output_path.read_text(encoding="utf-8") == "existing parent output"
+        assert (
+            parent_output_path.read_text(encoding="utf-8") == "existing parent output"
+        )
         assert canonical_path.read_text(encoding="utf-8") == "delegated output"
         assert record.storage_path == str(canonical_path)
         assert record.workspace_relative_path == "output/report_1.txt"
@@ -834,7 +880,9 @@ def test_agent_workspace_register_file_is_idempotent_after_canonicalization(
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     get_unscoped_file_storage.cache_clear()
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -866,7 +914,12 @@ def test_agent_workspace_register_file_is_idempotent_after_canonicalization(
         assert len(records) == 1
         record = records[0]
         canonical_path = (
-            tmp_path / "workspaces" / f"user_{user.id}" / "web_task_321" / "output" / "report.txt"
+            tmp_path
+            / "workspaces"
+            / f"user_{user.id}"
+            / "web_task_321"
+            / "output"
+            / "report.txt"
         )
         assert record.storage_path == str(canonical_path)
         assert record.workspace_relative_path == "output/report.txt"
@@ -888,7 +941,9 @@ def test_agent_workspace_register_file_is_idempotent_after_canonicalization(
         ((), ()),
     ],
 )
-def test_tool_factory_workspace_preserves_db_task_id(tmp_path, durable_segments, expected):
+def test_tool_factory_workspace_preserves_db_task_id(
+    tmp_path, durable_segments, expected
+):
     workspace = ToolFactory.create_workspace(
         {
             "base_dir": str(tmp_path / "workspaces"),
@@ -897,7 +952,11 @@ def test_tool_factory_workspace_preserves_db_task_id(tmp_path, durable_segments,
             "__xagent_file_operation_access_version": 1,
             "user_id": 7,
             "scope_segments": ("tenant-a",),
-            **({} if durable_segments is None else {"durable_storage_segments": durable_segments}),
+            **(
+                {}
+                if durable_segments is None
+                else {"durable_storage_segments": durable_segments}
+            ),
         }
     )
 
@@ -937,7 +996,9 @@ def test_workspace_manager_updates_cached_workspace_db_task_id(tmp_path):
         ((), ()),
     ],
 )
-def test_agent_service_workspace_preserves_config_db_task_id(tmp_path, durable_segments, expected):
+def test_agent_service_workspace_preserves_config_db_task_id(
+    tmp_path, durable_segments, expected
+):
     class ToolConfig:
         _workspace_config = {
             "base_dir": str(tmp_path / "workspaces"),
@@ -946,7 +1007,11 @@ def test_agent_service_workspace_preserves_config_db_task_id(tmp_path, durable_s
             "user_id": 7,
             "scope_segments": ("tenant-a",),
             "__xagent_file_operation_access_version": 1,
-            **({} if durable_segments is None else {"durable_storage_segments": durable_segments}),
+            **(
+                {}
+                if durable_segments is None
+                else {"durable_storage_segments": durable_segments}
+            ),
         }
 
         def get_allowed_skills(self):
@@ -1005,7 +1070,9 @@ def test_workspace_register_file_stages_then_uses_already_durable_upsert(
         upsert_spy,
     )
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -1017,7 +1084,9 @@ def test_workspace_register_file_stages_then_uses_already_durable_upsert(
         db.add(task)
         db.commit()
 
-        workspace = TaskWorkspace(id="web_task_456", base_dir=str(tmp_path / "workspaces"))
+        workspace = TaskWorkspace(
+            id="web_task_456", base_dir=str(tmp_path / "workspaces")
+        )
         output_path = workspace.output_dir / "report.txt"
         output_path.write_text("workspace output", encoding="utf-8")
 
@@ -1057,7 +1126,9 @@ def test_workspace_register_file_resyncs_existing_modified_file(
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     get_unscoped_file_storage.cache_clear()
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -1069,7 +1140,9 @@ def test_workspace_register_file_resyncs_existing_modified_file(
         db.add(task)
         db.commit()
 
-        workspace = TaskWorkspace(id="web_task_654", base_dir=str(tmp_path / "workspaces"))
+        workspace = TaskWorkspace(
+            id="web_task_654", base_dir=str(tmp_path / "workspaces")
+        )
         output_path = workspace.output_dir / "report.txt"
         output_path.write_text("old", encoding="utf-8")
 
@@ -1085,7 +1158,9 @@ def test_workspace_register_file_resyncs_existing_modified_file(
         assert record.file_size == len("new content")
         assert record.storage_status == "available"
 
-        assert (object_root / str(record.storage_key)).read_text(encoding="utf-8") == "new content"
+        assert (object_root / str(record.storage_key)).read_text(
+            encoding="utf-8"
+        ) == "new content"
     finally:
         db.close()
         engine.dispose()
@@ -1100,7 +1175,9 @@ def test_auto_register_files_resyncs_modified_existing_file(
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     get_unscoped_file_storage.cache_clear()
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -1112,7 +1189,9 @@ def test_auto_register_files_resyncs_modified_existing_file(
         db.add(task)
         db.commit()
 
-        workspace = TaskWorkspace(id="web_task_655", base_dir=str(tmp_path / "workspaces"))
+        workspace = TaskWorkspace(
+            id="web_task_655", base_dir=str(tmp_path / "workspaces")
+        )
         output_path = workspace.output_dir / "report.txt"
         output_path.write_text("old", encoding="utf-8")
         file_id = workspace.register_file(str(output_path), db_session=db)
@@ -1125,7 +1204,9 @@ def test_auto_register_files_resyncs_modified_existing_file(
 
         record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
         assert record.file_size == len("new content")
-        assert (object_root / str(record.storage_key)).read_text(encoding="utf-8") == "new content"
+        assert (object_root / str(record.storage_key)).read_text(
+            encoding="utf-8"
+        ) == "new content"
     finally:
         db.close()
         engine.dispose()
@@ -1279,7 +1360,9 @@ def test_concurrent_registration_of_one_path_uses_one_workspace_owner(
     original_load = workspace._load_file_registration_plans
 
     def checked_load(*args, **kwargs):
-        assert getattr(ownership, "depth", 0) > 0, "registration read must hold the lock"
+        assert getattr(ownership, "depth", 0) > 0, (
+            "registration read must hold the lock"
+        )
         return original_load(*args, **kwargs)
 
     monkeypatch.setattr(workspace, "_load_file_registration_plans", checked_load)
@@ -1350,7 +1433,9 @@ def test_workspace_register_file_resyncs_external_file_without_reclassifying_upl
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     get_unscoped_file_storage.cache_clear()
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -1387,7 +1472,9 @@ def test_workspace_register_file_resyncs_external_file_without_reclassifying_upl
         )
 
         external_path.write_text("new upload", encoding="utf-8")
-        second_file_id = workspace.register_file(str(external_path), file_id=file_id, db_session=db)
+        second_file_id = workspace.register_file(
+            str(external_path), file_id=file_id, db_session=db
+        )
         db.commit()
 
         assert second_file_id == file_id
@@ -1404,7 +1491,9 @@ def test_workspace_register_file_resyncs_external_file_without_reclassifying_upl
         assert record.workspace_category is None
         assert record.file_size == len("new upload")
 
-        assert (object_root / str(record.storage_key)).read_text(encoding="utf-8") == "new upload"
+        assert (object_root / str(record.storage_key)).read_text(
+            encoding="utf-8"
+        ) == "new upload"
     finally:
         db.close()
         engine.dispose()
@@ -1414,7 +1503,9 @@ def test_list_all_user_files_includes_durable_only_uploads(tmp_path, mock_worksp
     # Override the global autouse fixture from tests/conftest.py for this module.
     del mock_workspace_db
 
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
@@ -1452,7 +1543,9 @@ def test_list_all_user_files_includes_durable_only_uploads(tmp_path, mock_worksp
         result = workspace.list_all_user_files(include_workspace_files=False)
 
         assert result["success"] is True
-        assert [file_info["file_id"] for file_info in result["files"]] == [file_record.file_id]
+        assert [file_info["file_id"] for file_info in result["files"]] == [
+            file_record.file_id
+        ]
         assert result["files"][0]["filename"] == "durable-only.txt"
         assert result["files"][0]["in_current_workspace"] is False
     finally:
@@ -1478,7 +1571,10 @@ def test_stage_and_discard_external_upload_file(tmp_path, monkeypatch):
     assert staged.read_bytes() == b"workbook"
     assert staged.is_relative_to(workspace.temp_dir / ".xagent-internal" / "mcp-upload")
     assert str(staged) not in workspace.get_allowed_dirs()
-    assert any(staged.is_relative_to(Path(directory)) for directory in workspace.get_allowed_dirs())
+    assert any(
+        staged.is_relative_to(Path(directory))
+        for directory in workspace.get_allowed_dirs()
+    )
 
     workspace.discard_staged_external_upload(staged)
     assert not staged.exists()

@@ -210,7 +210,9 @@ async def test_mcp_loader_classifies_direct_failure_phase(
 
 
 @pytest.mark.asyncio
-async def test_mcp_loader_direct_retry_exhaustion_logs_debug_traceback(monkeypatch, caplog):
+async def test_mcp_loader_direct_retry_exhaustion_logs_debug_traceback(
+    monkeypatch, caplog
+):
     # Companion to test_mcp_loader_classifies_direct_failure_phase above:
     # that test pins WARNING and checks no secret leaks into the always-on
     # log; this one pins DEBUG and checks the opt-in traceback is actually
@@ -246,7 +248,9 @@ async def test_mcp_loader_reports_no_tools(monkeypatch):
         yield FakeSession()
 
     monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
-    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        mcp_adapter_module, "load_mcp_tools", AsyncMock(return_value=[])
+    )
 
     result = await load_mcp_tools_as_agent_tools(
         {"empty": {"transport": "stdio", "command": "python", "args": []}}
@@ -530,7 +534,9 @@ async def test_mcp_upload_file_ref_is_staged_and_cleaned_after_connector_call(
     assert captured["name"] == "onedrive_upload_file"
     assert captured["arguments"]["local_file_path"].endswith("/file.xlsx")
     assert captured["arguments"]["remote_path"].endswith(".xlsx")
-    assert workspace.discarded == ["/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"]
+    assert workspace.discarded == [
+        "/task/temp/.xagent-internal/mcp-upload/staged/file.xlsx"
+    ]
 
 
 @pytest.mark.asyncio
@@ -560,7 +566,10 @@ async def test_mcp_binary_download_is_registered_as_durable_file_ref(monkeypatch
     monkeypatch.setattr(
         mcp_adapter_module,
         "sanitize_file_ref_for_context",
-        lambda file_ref: {"file_id": file_ref["file_id"], "filename": file_ref["filename"]},
+        lambda file_ref: {
+            "file_id": file_ref["file_id"],
+            "filename": file_ref["filename"],
+        },
     )
     adapter = _build_mcp_tool_adapter(
         "OneDrive",
@@ -613,7 +622,9 @@ def test_exception_indicates_http_401_uses_bounded_status_signals():
     assert _exception_indicates_http_401(RuntimeError("HTTP status 401"))
     assert _exception_indicates_http_401(RuntimeError("401 Unauthorized"))
     assert not _exception_indicates_http_401(RuntimeError("Unauthorized"))
-    assert not _exception_indicates_http_401(RuntimeError("connection reset on port 401"))
+    assert not _exception_indicates_http_401(
+        RuntimeError("connection reset on port 401")
+    )
     assert not _exception_indicates_http_401(RuntimeError("tool returned id 40123"))
 
 
@@ -645,7 +656,9 @@ def test_resolver_challenge_traversal_handles_cycles():
 
 
 def test_resolver_challenge_traversal_stops_at_named_node_budget():
-    current: BaseException = _http_status_error(authenticate=['Bearer error="invalid_token"'])
+    current: BaseException = _http_status_error(
+        authenticate=['Bearer error="invalid_token"']
+    )
     for index in range(mcp_adapter_module._EXCEPTION_WALK_NODE_LIMIT):
         wrapper = RuntimeError(f"wrapper-{index}")
         wrapper.__cause__ = current
@@ -668,7 +681,9 @@ def test_resolver_challenge_uses_all_www_authenticate_header_values():
     challenge = mcp_adapter_module._resolver_invalid_token_challenge(exc)
 
     assert challenge is not None
-    assert challenge.resource_metadata_url == ("https://mcp.example.test/.well-known/resource")
+    assert challenge.resource_metadata_url == (
+        "https://mcp.example.test/.well-known/resource"
+    )
 
 
 @pytest.mark.parametrize(
@@ -679,7 +694,9 @@ def test_resolver_challenge_uses_all_www_authenticate_header_values():
         _http_status_error(authenticate=['Basic error="invalid_token"']),
         _http_status_error(authenticate=['Bearer error="insufficient_scope"']),
         _http_status_error(authenticate=['Bearer scope="records.read"']),
-        _http_status_error(status_code=403, authenticate=['Bearer error="invalid_token"']),
+        _http_status_error(
+            status_code=403, authenticate=['Bearer error="invalid_token"']
+        ),
         RuntimeError("HTTP 401 Unauthorized; Bearer error=invalid_token"),
     ],
 )
@@ -899,7 +916,9 @@ async def test_execute_mcp_call_structured_content_reaches_the_model_observation
     result = await adapter._execute_mcp_call(adapter.connection, {}, {})
 
     context = ExecutionContext()
-    message = context.add_tool_result("coding_agent_status", result, tool_call_id="tool-1")
+    message = context.add_tool_result(
+        "coding_agent_status", result, tool_call_id="tool-1"
+    )
 
     assert message.content.startswith("Tool coding_agent_status returned: ")
     assert "completed" in message.content
@@ -1159,7 +1178,9 @@ def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_digit_limit_value_er
     sys.get_int_max_str_digits() limit (default 4300) makes json.loads raise
     a plain ValueError that is NOT a json.JSONDecodeError. That must still
     fall back to the raw wrap rather than propagate uncaught."""
-    monkeypatch.setattr(MCPToolAdapter, "_ARRAY_ARG_JSON_RECOVERY_MAX_CHARS", 10_000, raising=True)
+    monkeypatch.setattr(
+        MCPToolAdapter, "_ARRAY_ARG_JSON_RECOVERY_MAX_CHARS", 10_000, raising=True
+    )
     adapter = MCPToolAdapter(
         mcp_tool=_google_analytics_run_report_mcp_tool(),
         connection={"transport": "stdio", "command": "python", "args": []},
@@ -1425,7 +1446,9 @@ async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
     args_model = adapter.args_type()
     assert "account_id" not in args_model.model_fields
 
-    result = await adapter.run_json_async({"query": "active", "account_id": "llm-supplied"})
+    result = await adapter.run_json_async(
+        {"query": "active", "account_id": "llm-supplied"}
+    )
 
     assert result["is_error"] is False
     assert captured["name"] == "list_clients"
@@ -1461,7 +1484,10 @@ def test_mcp_runtime_tool_argument_missing_source_warns(caplog):
 
     caplog.set_level("WARNING")
     assert adapter._runtime_tool_arguments() == {}
-    assert "Skipping runtime MCP tool argument binding for missing context source" in caplog.text
+    assert (
+        "Skipping runtime MCP tool argument binding for missing context source"
+        in caplog.text
+    )
     assert "account_id" in caplog.text
     assert "list_clients" in caplog.text
 
@@ -1516,7 +1542,9 @@ def test_mcp_runtime_tool_argument_undeclared_target_warns_and_is_skipped(caplog
 
 
 @pytest.mark.parametrize("target_key", [123, None])
-def test_mcp_runtime_tool_argument_non_string_target_key_is_skipped_silently(caplog, target_key):
+def test_mcp_runtime_tool_argument_non_string_target_key_is_skipped_silently(
+    caplog, target_key
+):
     """A binding whose target key is not a string is dropped without any log
     line, unlike a string key the tool's schema does not declare, which warns."""
     adapter = MCPToolAdapter(
@@ -1727,7 +1755,11 @@ async def test_real_mcp_session_retries_nested_resolver_401_once(monkeypatch, ca
         assert payload["method"] == "initialize"
         return httpx.Response(
             401,
-            headers={"WWW-Authenticate": ('Bearer error="invalid_token", scope="records.read"')},
+            headers={
+                "WWW-Authenticate": (
+                    'Bearer error="invalid_token", scope="records.read"'
+                )
+            },
             extensions={"reason_phrase": raw_exception_secret.encode()},
             request=request,
         )
@@ -1849,10 +1881,14 @@ async def test_real_mcp_session_retries_nested_resolver_401_once(monkeypatch, ca
         ]
         return await retry(exc, attempted_args, attempted_meta)
 
-    monkeypatch.setattr(adapter, "_retry_after_authorization_failure", _observe_nested_failure)
+    monkeypatch.setattr(
+        adapter, "_retry_after_authorization_failure", _observe_nested_failure
+    )
     caplog.set_level("DEBUG")
 
-    result = await adapter.run_json_async({"query": "active", "account_id": "llm-supplied"})
+    result = await adapter.run_json_async(
+        {"query": "active", "account_id": "llm-supplied"}
+    )
 
     assert result == {
         "content": [
@@ -1874,7 +1910,9 @@ async def test_real_mcp_session_retries_nested_resolver_401_once(monkeypatch, ca
     assert len(nested_failures) == 1
     assert raw_exception_secret in repr(nested_failures[0])
     assert len(initial_requests) == 1
-    assert initial_requests[0][0].headers["Authorization"] == (f"Bearer {initial_token}")
+    assert initial_requests[0][0].headers["Authorization"] == (
+        f"Bearer {initial_token}"
+    )
     tool_calls = [
         (request, payload)
         for request, payload in refreshed_requests
@@ -2184,7 +2222,9 @@ async def test_resolver_retry_ignores_rewrapped_initial_401_response(monkeypatch
 
     assert execution_calls == 2
     assert result == {
-        "content": [{"text": "Error executing MCP tool after delegated authorization retry."}],
+        "content": [
+            {"text": "Error executing MCP tool after delegated authorization retry."}
+        ],
         "is_error": True,
     }
 
@@ -2207,7 +2247,9 @@ async def test_resolver_retry_prunes_over_budget_initial_exception_subtree(
             "_oauth_token_resolver_refresh": _resolver_refresh,
         }
     )
-    deep_original: BaseException = _http_status_error(authenticate=['Bearer error="invalid_token"'])
+    deep_original: BaseException = _http_status_error(
+        authenticate=['Bearer error="invalid_token"']
+    )
     for index in range(mcp_adapter_module._EXCEPTION_WALK_NODE_LIMIT + 1):
         wrapper = RuntimeError(f"initial-wrapper-{index}")
         wrapper.__cause__ = deep_original
@@ -2234,13 +2276,17 @@ async def test_resolver_retry_prunes_over_budget_initial_exception_subtree(
 
     assert execution_calls == 2
     assert result == {
-        "content": [{"text": "Error executing MCP tool after delegated authorization retry."}],
+        "content": [
+            {"text": "Error executing MCP tool after delegated authorization retry."}
+        ],
         "is_error": True,
     }
 
 
 @pytest.mark.asyncio
-async def test_resolver_retry_non_401_failure_does_not_leak_secrets(monkeypatch, caplog):
+async def test_resolver_retry_non_401_failure_does_not_leak_secrets(
+    monkeypatch, caplog
+):
     initial_secret = "initial-resolver-secret"
     refreshed_secret = "refreshed-resolver-secret"
 
@@ -2270,7 +2316,9 @@ async def test_resolver_retry_non_401_failure_does_not_leak_secrets(monkeypatch,
     result = await adapter.run_json_async({})
 
     assert result == {
-        "content": [{"text": "Error executing MCP tool after delegated authorization retry."}],
+        "content": [
+            {"text": "Error executing MCP tool after delegated authorization retry."}
+        ],
         "is_error": True,
     }
     public_output = repr(result) + caplog.text
@@ -2302,7 +2350,9 @@ async def test_connector_refresh_empty_dict_preserves_legacy_retry_failure(
 
     assert attempted_connections == [connection, {}]
     assert result == {
-        "content": [{"text": "Error executing MCP tool after delegated authorization retry."}],
+        "content": [
+            {"text": "Error executing MCP tool after delegated authorization retry."}
+        ],
         "is_error": True,
     }
 
@@ -2457,9 +2507,13 @@ async def test_delegated_authorization_401_refresh_classifies_team_hook_failure(
             "headers": {"Authorization": "Bearer expired-token"},
             mcp_adapter_module._RUNTIME_CONNECTION_REFRESH_KEY: refresh,
         }
-        adapter = MCPToolAdapter(mcp_tool=_mcp_tool("list_clients"), connection=connection)
+        adapter = MCPToolAdapter(
+            mcp_tool=_mcp_tool("list_clients"), connection=connection
+        )
 
-        result = await adapter._retry_after_authorization_failure(_http_status_error(), {}, {})
+        result = await adapter._retry_after_authorization_failure(
+            _http_status_error(), {}, {}
+        )
     finally:
         connector_team_scope.set_connector_team_hooks()
 
@@ -2637,7 +2691,9 @@ async def test_mcp_tool_execution_error_redacts_prefixed_credential_assignments(
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_execution_error_redacts_url_query_and_userinfo(monkeypatch, caplog):
+async def test_mcp_tool_execution_error_redacts_url_query_and_userinfo(
+    monkeypatch, caplog
+):
     """httpx.HTTPStatusError formats its own message as "... for url
     '<url>'". Connector URLs commonly carry secrets (API keys, tokens) in
     the query string, so the logged message must have the query string
@@ -2704,7 +2760,9 @@ async def test_mcp_tool_execution_error_redacts_url_userinfo(monkeypatch, caplog
 
     class _FakeSession:
         async def initialize(self):
-            raise RuntimeError("upstream refused connection to https://user:pw@host/path?x=1")
+            raise RuntimeError(
+                "upstream refused connection to https://user:pw@host/path?x=1"
+            )
 
     @asynccontextmanager
     async def _fake_create_session(connection):
@@ -2722,11 +2780,15 @@ async def test_mcp_tool_execution_error_redacts_url_userinfo(monkeypatch, caplog
         "content": [{"text": "Error executing MCP tool."}],
         "is_error": True,
     }
-    assert caplog.records[-1].args[-1] == ("upstream refused connection to https://host/path")
+    assert caplog.records[-1].args[-1] == (
+        "upstream refused connection to https://host/path"
+    )
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_execution_error_group_logs_each_sub_exception(monkeypatch, caplog):
+async def test_mcp_tool_execution_error_group_logs_each_sub_exception(
+    monkeypatch, caplog
+):
     """The exception-group handler must log each leaf exception's own class
     and message (bounded), not just the group's class name -- a fan-out MCP
     call raises one group per failed leg (and the MCP client's own two
@@ -2797,7 +2859,9 @@ async def _run_json_with_failure(monkeypatch, exc: BaseException) -> dict[str, A
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_execution_error_group_logs_every_member_before_chains(monkeypatch, caplog):
+async def test_mcp_tool_execution_error_group_logs_every_member_before_chains(
+    monkeypatch, caplog
+):
     """A fan-out call raises one group member per failed leg. If one leg's
     own __cause__/__context__ chain runs deep, a depth-first walk spends the
     whole per-call log budget on that one leg's chain and the other legs
@@ -2826,7 +2890,9 @@ async def test_mcp_tool_execution_error_group_logs_every_member_before_chains(mo
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_execution_error_group_survives_exploding_context_str(monkeypatch, caplog):
+async def test_mcp_tool_execution_error_group_survives_exploding_context_str(
+    monkeypatch, caplog
+):
     """A group member's __context__ can itself be an exception whose
     __str__ raises. ``_exception_indicates_http_401`` only recurses into a
     group's own members, not its __cause__/__context__ chain, so that
@@ -3259,7 +3325,9 @@ def test_an_authored_default_is_emitted_as_written(declared):
 
 
 def test_enum_containing_non_finite_number_is_not_emitted():
-    schema = _emitted_schema({"f": {"type": "number", "enum": [1, float("inf")]}}, ["f"])
+    schema = _emitted_schema(
+        {"f": {"type": "number", "enum": [1, float("inf")]}}, ["f"]
+    )
 
     assert "enum" not in schema["properties"]["f"]
     _compact_json(schema)
@@ -3280,7 +3348,9 @@ def test_enum_containing_non_finite_number_is_not_emitted():
         ({"enum": [{"k": 1}, {"k": 2}], "default": {"k": 1}}, True),
     ],
 )
-def test_enum_dropped_when_authored_default_is_not_a_member(field_schema, enum_expected):
+def test_enum_dropped_when_authored_default_is_not_a_member(
+    field_schema, enum_expected
+):
     carrier = _emitted_metadata({"f": field_schema})
 
     assert ("enum" in carrier) is enum_expected
@@ -3437,7 +3507,9 @@ def test_no_report_when_every_metadata_key_is_kept(caplog):
         )
 
     assert not [
-        record for record in caplog.records if "field schema metadata keys" in record.getMessage()
+        record
+        for record in caplog.records
+        if "field schema metadata keys" in record.getMessage()
     ]
 
 
@@ -3461,7 +3533,9 @@ def test_enum_survives_when_the_server_declared_no_default(is_required):
 
 def test_enum_survives_when_a_non_finite_default_was_replaced():
     """Replacing an unusable default makes it this adapter's, not the author's."""
-    field = _emitted_field({"f": {"type": "number", "enum": [1, 2], "default": float("inf")}}, [])
+    field = _emitted_field(
+        {"f": {"type": "number", "enum": [1, 2], "default": float("inf")}}, []
+    )
 
     assert _metadata_carrier(field)["enum"] == [1, 2]
     assert field["default"] is None
@@ -3621,7 +3695,9 @@ def test_length_bounds_accept_zero_and_above(value):
 def test_nested_bool_and_number_enum_members_stay_apart(
     enum_members, declared_default, enum_expected
 ):
-    carrier = _emitted_metadata({"f": {"enum": enum_members, "default": declared_default}}, [])
+    carrier = _emitted_metadata(
+        {"f": {"enum": enum_members, "default": declared_default}}, []
+    )
 
     assert ("enum" in carrier) is enum_expected
 
@@ -3638,7 +3714,9 @@ def test_nested_field_metadata_is_not_extracted():
             "address": {
                 "type": "object",
                 "description": "Postal address.",
-                "properties": {"street": {"type": "string", "description": "STREET_DESC"}},
+                "properties": {
+                    "street": {"type": "string", "description": "STREET_DESC"}
+                },
             },
             "tags": {
                 "type": "array",
@@ -3776,7 +3854,10 @@ def _hints_from_wire(*annotations: object) -> list[MCPWriteHint]:
     and a test built that way cannot see the difference it claims to check.
     """
     tools = _tools_with_raw_annotations(_listing(*annotations))
-    return [_build_mcp_tool_adapter("srv", SimpleNamespace(), tool).write_hint for tool in tools]
+    return [
+        _build_mcp_tool_adapter("srv", SimpleNamespace(), tool).write_hint
+        for tool in tools
+    ]
 
 
 @pytest.mark.parametrize(
@@ -3816,7 +3897,9 @@ def test_coercible_hint_is_indistinguishable_after_the_sdk_parses_it():
     sidecar this module carries could be simplified away -- but until then,
     a test that assigns to a parsed model is testing nothing.
     """
-    tools = _tools_with_raw_annotations(_listing({"readOnlyHint": True}, {"readOnlyHint": "true"}))
+    tools = _tools_with_raw_annotations(
+        _listing({"readOnlyHint": True}, {"readOnlyHint": "true"})
+    )
     declared, coerced = tools
 
     # The SDK cannot tell them apart...
@@ -4345,7 +4428,9 @@ def test_truncated_error_message_does_not_leak_userinfo_split_by_the_raw_cap(
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_execution_error_redacts_query_value_containing_quote(monkeypatch, caplog):
+async def test_mcp_tool_execution_error_redacts_query_value_containing_quote(
+    monkeypatch, caplog
+):
     """A query value that itself contains a single quote used to end the
     URL token early: HTTPX wraps its own error message's URL in single
     quotes, so the token stopped at the first quote inside the query

@@ -204,7 +204,9 @@ class TaskWorkspace:
         # write-side durable segments explicit so marked reads validate the key
         # layout that UploadedFileStore actually produced.
         self.durable_storage_segments: tuple[str, ...] = tuple(
-            self.scope_segments if durable_storage_segments is None else durable_storage_segments
+            self.scope_segments
+            if durable_storage_segments is None
+            else durable_storage_segments
         )
         for segment in self.durable_storage_segments:
             validate_scope_component(segment, field_name="workspace_segments entry")
@@ -224,7 +226,9 @@ class TaskWorkspace:
         # persisted, server-stamped task marker.
         self.file_operation_access_version: Any = None
         self.current_task_id: Optional[int] = (
-            db_task_id if db_task_id is not None else self._parse_task_id_from_workspace_id(id)
+            db_task_id
+            if db_task_id is not None
+            else self._parse_task_id_from_workspace_id(id)
         )
 
         # Create workspace directory
@@ -241,7 +245,9 @@ class TaskWorkspace:
                 if path.exists():
                     self.allowed_external_dirs.append(path)
                 else:
-                    logger.warning(f"Allowed external directory does not exist: {dir_path}")
+                    logger.warning(
+                        f"Allowed external directory does not exist: {dir_path}"
+                    )
 
         # Create directory structure
         self._ensure_directories()
@@ -336,7 +342,9 @@ class TaskWorkspace:
         is refused on that path as well.
         """
 
-        return self.refuse_engine_owned_write(self.resolve_path(file_path, default_dir), file_path)
+        return self.refuse_engine_owned_write(
+            self.resolve_path(file_path, default_dir), file_path
+        )
 
     def stage_file_for_external_upload(self, file_id: str) -> Path:
         """Materialize a durable file into this task's upload-safe temp area.
@@ -414,7 +422,9 @@ class TaskWorkspace:
         with _internal_file_registry_lock:
             existing_file_id = _internal_path_registry.get(path_key)
             if existing_file_id is not None:
-                registered_path = _internal_file_registry.get((workspace_key, existing_file_id))
+                registered_path = _internal_file_registry.get(
+                    (workspace_key, existing_file_id)
+                )
                 if registered_path == resolved_path:
                     final_file_id = existing_file_id
                 else:
@@ -546,7 +556,9 @@ class TaskWorkspace:
         with _announced_reserved_names_lock:
             _announced_reserved_names.discard(str(self.engine_owned_output_dir))
         with _internal_file_registry_lock:
-            file_keys = [key for key in _internal_file_registry if key[0] == workspace_key]
+            file_keys = [
+                key for key in _internal_file_registry if key[0] == workspace_key
+            ]
             for key in file_keys:
                 registered_path = _internal_file_registry.pop(key)
                 _internal_path_registry.pop(
@@ -584,7 +596,8 @@ class TaskWorkspace:
             return ()
         if in_sandbox_tool_runner():
             return tuple(
-                self._remember_sandbox_registration(path, file_id) for path, file_id in files
+                self._remember_sandbox_registration(path, file_id)
+                for path, file_id in files
             )
         with self._registration_lock:
             return self._register_files_locked(files, db_session=db_session)
@@ -801,7 +814,9 @@ class TaskWorkspace:
 
         task_row = None
         if task_id is not None:
-            task_row = db.query(Task.id, Task.user_id).filter(Task.id == int(task_id)).first()
+            task_row = (
+                db.query(Task.id, Task.user_id).filter(Task.id == int(task_id)).first()
+            )
         if task_row is None:
             if task_id is not None:
                 logger.warning("Task %s not found, cannot create file record", task_id)
@@ -852,7 +867,9 @@ class TaskWorkspace:
                 file_id=str(existing_record.file_id),
                 user_id=record_user_id,
                 task_id=(
-                    int(existing_record.task_id) if existing_record.task_id is not None else None
+                    int(existing_record.task_id)
+                    if existing_record.task_id is not None
+                    else None
                 ),
                 mime_type=(
                     str(existing_record.mime_type)
@@ -872,7 +889,9 @@ class TaskWorkspace:
             )
 
         final_file_id = (
-            existing.file_id if existing is not None else requested_file_id or str(uuid4())
+            existing.file_id
+            if existing is not None
+            else requested_file_id or str(uuid4())
         )
         occupied_storage_paths = tuple(
             (str(storage_path), str(file_id))
@@ -964,11 +983,15 @@ class TaskWorkspace:
         assert plan.user_id is not None
 
         relative_parts = Path(relative_path).parts
-        output_parts = [part for part in relative_parts[1:] if part not in ("", ".", "..")]
+        output_parts = [
+            part for part in relative_parts[1:] if part not in ("", ".", "..")
+        ]
         if not output_parts:
             output_parts = [source_path.name]
 
-        task_root = self._user_workspace_base_dir(plan.user_id) / (f"web_task_{plan.task_id}")
+        task_root = self._user_workspace_base_dir(plan.user_id) / (
+            f"web_task_{plan.task_id}"
+        )
         output_root = (task_root / "output").resolve()
         candidate = (task_root / Path("output", *output_parts)).resolve()
         try:
@@ -985,9 +1008,13 @@ class TaskWorkspace:
             candidate_resolved = candidate.resolve()
             occupying_file_id = occupied_by_path.get(str(candidate))
             same_record = occupying_file_id == plan.file_id
-            record_conflicts = occupying_file_id is not None and occupying_file_id != plan.file_id
+            record_conflicts = (
+                occupying_file_id is not None and occupying_file_id != plan.file_id
+            )
             path_conflicts = (
-                candidate.exists() and candidate_resolved != source_resolved and not same_record
+                candidate.exists()
+                and candidate_resolved != source_resolved
+                and not same_record
             )
             if not record_conflicts and not path_conflicts:
                 break
@@ -1025,12 +1052,17 @@ class TaskWorkspace:
                     is not None
                 )
                 if not task_exists:
-                    raise ValueError(f"Task {plan.task_id} is not owned by user {plan.user_id}")
+                    raise ValueError(
+                        f"Task {plan.task_id} is not owned by user {plan.user_id}"
+                    )
                 applied = UploadedFileStore(db).upsert_already_durable(
                     item.staged,
-                    expected=(plan.existing.version if plan.existing is not None else None),
+                    expected=(
+                        plan.existing.version if plan.existing is not None else None
+                    ),
                     allow_task_rebind=(
-                        plan.existing is not None and plan.existing.task_id != plan.task_id
+                        plan.existing is not None
+                        and plan.existing.task_id != plan.task_id
                     ),
                 )
                 if applied.superseded_cleanup_claim is not None:
@@ -1059,7 +1091,9 @@ class TaskWorkspace:
             compensate_staged_uploaded_files,
         )
 
-        failed_file_ids = compensate_staged_uploaded_files(tuple(item.staged for item in prepared))
+        failed_file_ids = compensate_staged_uploaded_files(
+            tuple(item.staged for item in prepared)
+        )
         if failed_file_ids:
             logger.warning(
                 "Failed to compensate %s staged workspace file generation(s)",
@@ -1109,7 +1143,9 @@ class TaskWorkspace:
 
         resolved_path = self._resolve_file_for_registration(file_path)
         try:
-            relative_path = resolved_path.relative_to(self.workspace_dir.resolve()).as_posix()
+            relative_path = resolved_path.relative_to(
+                self.workspace_dir.resolve()
+            ).as_posix()
             is_workspace_file = True
         except ValueError:
             relative_path = resolved_path.name
@@ -1144,10 +1180,14 @@ class TaskWorkspace:
                     pass
 
         if not is_valid:
-            raise ValueError(f"Path {file_path} is outside workspace and allowed directories")
+            raise ValueError(
+                f"Path {file_path} is outside workspace and allowed directories"
+            )
         return resolved_path
 
-    def _remember_sandbox_registration(self, file_path: str, file_id: Optional[str]) -> str:
+    def _remember_sandbox_registration(
+        self, file_path: str, file_id: Optional[str]
+    ) -> str:
         """Mint a process-local id inside the sandbox runner.
 
         The sandbox reaches no real database or object storage, so the host
@@ -1183,12 +1223,16 @@ class TaskWorkspace:
         # base_dir may already be the (scoped) user base
         # (``.../user_{id}[/{segments}]``) or a raw uploads root; in the
         # latter case the user root + scope segments are appended.
-        expected_tail = scoped_user_root(Path("/"), user_id, self.scope_segments).parts[1:]
+        expected_tail = scoped_user_root(Path("/"), user_id, self.scope_segments).parts[
+            1:
+        ]
         if self.base_dir.parts[-len(expected_tail) :] == expected_tail:
             return self.base_dir
         return scoped_user_root(self.base_dir, user_id, self.scope_segments)
 
-    def _get_file_id_from_db(self, file_path: Path, db_session: Any = None) -> Optional[str]:
+    def _get_file_id_from_db(
+        self, file_path: Path, db_session: Any = None
+    ) -> Optional[str]:
         """Get file_id from database by file path."""
         from .storage.manager import create_db_session
 
@@ -1292,12 +1336,17 @@ class TaskWorkspace:
         try:
             task = db.query(Task).filter(Task.id == self.db_task_id).first()
             if task is None:
-                raise FileOperationAccessPolicyError("Marked File Operation task no longer exists")
+                raise FileOperationAccessPolicyError(
+                    "Marked File Operation task no longer exists"
+                )
             if not requires_exact_file_operation_scope(task):
                 raise FileOperationAccessPolicyError(
                     "Marked File Operation task lost its persisted policy"
                 )
-            if int(task.id) != self.db_task_id or int(task.user_id) != self.owner_user_id:
+            if (
+                int(task.id) != self.db_task_id
+                or int(task.user_id) != self.owner_user_id
+            ):
                 raise FileOperationAccessPolicyError(
                     "Marked File Operation workspace authority disagrees with task"
                 )
@@ -1305,11 +1354,15 @@ class TaskWorkspace:
         finally:
             db.close()
 
-    def _file_record_allowed_for_workspace(self, record: Any, path: Optional[Path] = None) -> bool:
+    def _file_record_allowed_for_workspace(
+        self, record: Any, path: Optional[Path] = None
+    ) -> bool:
         if path is not None:
             workspace_abs = self.workspace_dir.resolve()
             resolved_path = path.resolve()
-            if resolved_path == workspace_abs or resolved_path.is_relative_to(workspace_abs):
+            if resolved_path == workspace_abs or resolved_path.is_relative_to(
+                workspace_abs
+            ):
                 return True
 
         owner_user_id = self.owner_user_id
@@ -1332,9 +1385,13 @@ class TaskWorkspace:
         record_task_id = getattr(record, "task_id", None)
         if record_task_id is None:
             return True
-        return self.current_task_id is not None and record_task_id == self.current_task_id
+        return (
+            self.current_task_id is not None and record_task_id == self.current_task_id
+        )
 
-    def _record_in_scope_subtree(self, record: Any, path: Optional[Path] = None) -> bool:
+    def _record_in_scope_subtree(
+        self, record: Any, path: Optional[Path] = None
+    ) -> bool:
         """Whether a file record lives under this workspace's scope subtree.
 
         Only meaningful when ``scope_segments`` is non-empty. Validates the
@@ -1412,10 +1469,14 @@ class TaskWorkspace:
             cached_path = self._file_id_to_path.get(file_id)
         if cached_path is not None:
             if cached_path.exists():
-                logger.debug(f"resolve_file_id: Found in cache: {file_id} -> {cached_path}")
+                logger.debug(
+                    f"resolve_file_id: Found in cache: {file_id} -> {cached_path}"
+                )
                 return cached_path
             else:
-                logger.warning(f"resolve_file_id: Cached path doesn't exist: {cached_path}")
+                logger.warning(
+                    f"resolve_file_id: Cached path doesn't exist: {cached_path}"
+                )
                 # Remove stale cache entry
                 with self._registration_lock:
                     if self._file_id_to_path.get(file_id) == cached_path:
@@ -1457,11 +1518,17 @@ class TaskWorkspace:
                 db = create_db_session()
                 should_close = True
             try:
-                record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+                record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == file_id)
+                    .first()
+                )
                 if record and record.storage_path:
                     resolved_path = Path(record.storage_path)
                     if resolved_path.exists() and resolved_path.is_file():
-                        if not self._file_record_allowed_for_workspace(record, resolved_path):
+                        if not self._file_record_allowed_for_workspace(
+                            record, resolved_path
+                        ):
                             logger.warning(
                                 "Rejected file_id outside workspace scope: %s",
                                 file_id,
@@ -1491,7 +1558,9 @@ class TaskWorkspace:
             # sees ``None`` -- so this is its only record. A durable-storage
             # fault arrives here from ``materialize()`` carrying just the
             # storage key; its cause lives in ``__cause__`` (#1467).
-            logger.warning(f"Failed to resolve file_id from database: {e}", exc_info=True)
+            logger.warning(
+                f"Failed to resolve file_id from database: {e}", exc_info=True
+            )
             return None
 
     def _file_operation_path_in_authorized_storage(self, path: Path) -> bool:
@@ -1588,7 +1657,11 @@ class TaskWorkspace:
         try:
             candidate_ref = Path(normalized)
             if normalized and len(candidate_ref.parts) == 1 and "/" not in normalized:
-                record = db.query(UploadedFile).filter(UploadedFile.file_id == normalized).first()
+                record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == normalized)
+                    .first()
+                )
                 if record is not None and (
                     int(getattr(record, "user_id", 0) or 0) == self.owner_user_id
                     and int(getattr(record, "task_id", 0) or 0) == self.db_task_id
@@ -1726,16 +1799,24 @@ class TaskWorkspace:
                 for allowed_dir in self.allowed_external_dirs:
                     allowed_abs = allowed_dir.resolve()
                     if abs_path.is_relative_to(allowed_abs):
-                        logger.debug(f"Accessing external file via allowed directory: {abs_path}")
+                        logger.debug(
+                            f"Accessing external file via allowed directory: {abs_path}"
+                        )
                         return abs_path
         except (OSError, RuntimeError) as exc:
             raise ValueError(f"Failed to resolve path {file_path}") from exc
 
         allowed_dirs_str = ", ".join(
             [str(self.workspace_dir)]
-            + ([str(d) for d in self.allowed_external_dirs] if include_external_dirs else [])
+            + (
+                [str(d) for d in self.allowed_external_dirs]
+                if include_external_dirs
+                else []
+            )
         )
-        raise ValueError(f"Path {file_path} is outside allowed directories: {allowed_dirs_str}")
+        raise ValueError(
+            f"Path {file_path} is outside allowed directories: {allowed_dirs_str}"
+        )
 
     def _resolve_existing_cwd_relative_path(self, path: Path) -> Optional[Path]:
         """Resolve a CWD-relative path if it exists and is explicitly allowed."""
@@ -1949,13 +2030,19 @@ class TaskWorkspace:
                     if not existing_file.is_file():
                         continue
                     all_files.append(f"{dir_name}/{existing_file.name}")
-                    if request_suffix and existing_file.suffix.lower() != request_suffix:
+                    if (
+                        request_suffix
+                        and existing_file.suffix.lower() != request_suffix
+                    ):
                         continue
                     existing_stem = existing_file.stem.replace(" ", "").replace("_", "")
                     if (
                         request_stem
                         and existing_stem
-                        and (request_stem in existing_stem or existing_stem in request_stem)
+                        and (
+                            request_stem in existing_stem
+                            or existing_stem in request_stem
+                        )
                     ):
                         # Containment gate, mirroring the exact-match and
                         # normalized-name branches. ``iterdir`` can surface a
@@ -1967,7 +2054,9 @@ class TaskWorkspace:
                             self._resolve_allowed_absolute_path(resolved)
                         except ValueError:
                             continue
-                        logger.info(f"File '{file_path}' fuzzy matched to: '{existing_file.name}'")
+                        logger.info(
+                            f"File '{file_path}' fuzzy matched to: '{existing_file.name}'"
+                        )
                         return resolved
 
             # 4. Not found — include available files in error message
@@ -1998,12 +2087,16 @@ class TaskWorkspace:
         if include_subdirs:
             # Recursively scan output directory
             for file_path in self.output_dir.rglob("*"):
-                if file_path.is_file() and not self._is_internal_workspace_path(file_path):
+                if file_path.is_file() and not self._is_internal_workspace_path(
+                    file_path
+                ):
                     output_files.append(self._get_file_info(file_path, "output"))
         else:
             # Only scan top-level of output directory
             for file_path in self.output_dir.iterdir():
-                if file_path.is_file() and not self._is_internal_workspace_path(file_path):
+                if file_path.is_file() and not self._is_internal_workspace_path(
+                    file_path
+                ):
                     output_files.append(self._get_file_info(file_path, "output"))
 
         return output_files
@@ -2158,7 +2251,9 @@ class TaskWorkspace:
             for file_path in files_after & files_before:
                 with self._registration_lock:
                     cached_file_id = self._recently_registered_files.get(str(file_path))
-                if cached_file_id or self._get_file_id_from_db(file_path, self.db_session):
+                if cached_file_id or self._get_file_id_from_db(
+                    file_path, self.db_session
+                ):
                     changed_files.add(file_path)
             self._release_registration_session_if_clean(self.db_session)
 
@@ -2174,7 +2269,9 @@ class TaskWorkspace:
                             str(file_path),
                             db_session=self.db_session,
                         )
-                        logger.debug("Auto-registered file: %s -> %s", file_path, file_id)
+                        logger.debug(
+                            "Auto-registered file: %s -> %s", file_path, file_id
+                        )
                     except Exception as e:
                         logger.error(
                             "Failed to auto-register workspace file %s: %s. "
@@ -2195,7 +2292,10 @@ class TaskWorkspace:
                 # Skip hidden files and cache directories
                 if any(part.startswith(".") for part in file_path.parts):
                     continue
-                if "__pycache__" in file_path.parts or "node_modules" in file_path.parts:
+                if (
+                    "__pycache__" in file_path.parts
+                    or "node_modules" in file_path.parts
+                ):
                     continue
                 if self._is_internal_workspace_path(file_path):
                     continue
@@ -2314,7 +2414,9 @@ class TaskWorkspace:
                 query = db.query(UploadedFile).filter(UploadedFile.user_id == user_id)
                 if _exact_task_scope:
                     if self.owner_user_id is None or int(user_id) != self.owner_user_id:
-                        raise RuntimeError("Marked File Operation listing authority disagrees")
+                        raise RuntimeError(
+                            "Marked File Operation listing authority disagrees"
+                        )
                     from sqlalchemy import and_, or_
 
                     owner_prefix = build_user_key_prefix(
@@ -2363,14 +2465,20 @@ class TaskWorkspace:
                     # Task-bound only: deleting a task detaches its files, not drops them.
                     query = query.filter(UploadedFile.task_id == self.current_task_id)
                 total_count = query.count()
-                files = query.order_by(UploadedFile.id.desc()).offset(offset).limit(limit).all()
+                files = (
+                    query.order_by(UploadedFile.id.desc())
+                    .offset(offset)
+                    .limit(limit)
+                    .all()
+                )
 
                 # Build file list from database
                 for file_record in files:
                     file_path = Path(file_record.storage_path)
                     has_local_file = file_path.exists()
                     has_durable_file = bool(
-                        file_record.storage_key and file_record.storage_status == "available"
+                        file_record.storage_key
+                        and file_record.storage_status == "available"
                     )
                     if has_local_file or has_durable_file:
                         result_files.append(
@@ -2385,7 +2493,9 @@ class TaskWorkspace:
                                 "uploaded_at": file_record.created_at.isoformat()
                                 if file_record.created_at
                                 else None,
-                                "in_current_workspace": file_path.is_relative_to(self.workspace_dir)
+                                "in_current_workspace": file_path.is_relative_to(
+                                    self.workspace_dir
+                                )
                                 if has_local_file
                                 else False,
                             }
@@ -2406,7 +2516,11 @@ class TaskWorkspace:
                                 f.get("storage_path") == file_path for f in result_files
                             )
                             if not is_already_listed:
-                                stat = os.stat(file_path) if os.path.exists(file_path) else None
+                                stat = (
+                                    os.stat(file_path)
+                                    if os.path.exists(file_path)
+                                    else None
+                                )
                                 if stat:
                                     result_files.append(
                                         {
@@ -2481,7 +2595,9 @@ def create_workspace(
     )
 
 
-def get_workspace_output_files(id: str, base_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_workspace_output_files(
+    id: str, base_dir: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """
     Get output files for a specific workspace.
 
@@ -2590,7 +2706,9 @@ def get_global_workspace() -> TaskWorkspace:
     """Get the global workspace instance."""
     global _global_workspace
     if _global_workspace is None:
-        raise RuntimeError("Global workspace not initialized. Call init_global_workspace() first.")
+        raise RuntimeError(
+            "Global workspace not initialized. Call init_global_workspace() first."
+        )
     return _global_workspace
 
 
@@ -2629,7 +2747,9 @@ class MockWorkspace:
         # No external allowed directories for mock
         self.allowed_external_dirs: List[Path] = []
 
-        logger.debug(f"Created mock workspace: {self.workspace_dir} (not created on disk)")
+        logger.debug(
+            f"Created mock workspace: {self.workspace_dir} (not created on disk)"
+        )
 
     def get_allowed_dirs(self) -> List[str]:
         """Get list of allowed directories for this workspace (virtual paths)."""

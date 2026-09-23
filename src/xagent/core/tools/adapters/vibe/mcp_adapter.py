@@ -91,7 +91,9 @@ _MCP_LOAD_FAILURE_MESSAGES: dict[MCPFailurePhase, str] = {
     MCPFailurePhase.SESSION_START: "MCP server could not be started.",
     MCPFailurePhase.INITIALIZE: "MCP server initialization failed.",
     MCPFailurePhase.LIST_TOOLS: "MCP server tools could not be loaded.",
-    MCPFailurePhase.ADAPTER_CONSTRUCTION: ("Some MCP server tools could not be prepared."),
+    MCPFailurePhase.ADAPTER_CONSTRUCTION: (
+        "Some MCP server tools could not be prepared."
+    ),
     MCPFailurePhase.SANDBOX_LIST_TOOLS: "MCP server tools could not be loaded.",
     MCPFailurePhase.SANDBOX_TOOL_WRAP: ("Some MCP server tools could not be prepared."),
     MCPFailurePhase.NO_TOOLS_RETURNED: "MCP server returned no available tools.",
@@ -267,7 +269,9 @@ _WORKSPACE_DOWNLOAD_FIELDS: dict[tuple[str, str], str] = {
 def _durable_upload_fields(server_name: str, tool_name: str) -> tuple[str, ...]:
     from .selection_spec import normalize_mcp_server_name
 
-    return _DURABLE_UPLOAD_FIELDS.get((normalize_mcp_server_name(server_name), tool_name), ())
+    return _DURABLE_UPLOAD_FIELDS.get(
+        (normalize_mcp_server_name(server_name), tool_name), ()
+    )
 
 
 def _file_ref_value(value: Any) -> str | None:
@@ -386,7 +390,9 @@ def _json_equal(a: Any, b: Any) -> bool:
     if isinstance(a, bool) != isinstance(b, bool):
         return False
     if isinstance(a, list) and isinstance(b, list):
-        return len(a) == len(b) and all(_json_equal(item_a, item_b) for item_a, item_b in zip(a, b))
+        return len(a) == len(b) and all(
+            _json_equal(item_a, item_b) for item_a, item_b in zip(a, b)
+        )
     if isinstance(a, dict) and isinstance(b, dict):
         return a.keys() == b.keys() and all(_json_equal(a[key], b[key]) for key in a)
     if isinstance(a, (list, dict)) or isinstance(b, (list, dict)):
@@ -710,7 +716,9 @@ def _bounded_exception_nodes(
     while pending and visited_count < _EXCEPTION_WALK_NODE_LIMIT:
         current, is_root = pending.pop()
         current_id = id(current)
-        if current_id in visited or (current_id in excluded_subtree_ids and not is_root):
+        if current_id in visited or (
+            current_id in excluded_subtree_ids and not is_root
+        ):
             continue
         visited.add(current_id)
         visited_count += 1
@@ -961,7 +969,9 @@ def _truncated_error_message(exc: BaseException) -> str:
         raw = str(exc)
         if len(raw) > _MCP_TOOL_ERROR_RAW_MAX_CHARS:
             raw = raw[:_MCP_TOOL_ERROR_RAW_MAX_CHARS] + _TEXT_TRUNCATION_MARK
-        text = redact_sensitive_text(redact_urls_in_text(raw)).replace(_TEXT_TRUNCATION_MARK, "")
+        text = redact_sensitive_text(redact_urls_in_text(raw)).replace(
+            _TEXT_TRUNCATION_MARK, ""
+        )
     except BaseException:
         # Every caller is an ``except`` handler whose contract is to return
         # a result dict, so a custom ``__str__`` that raises must not escape
@@ -980,7 +990,9 @@ def _strict_http_401_responses(
     excluded_response_ids: frozenset[int] = frozenset(),
     excluded_subtree_ids: frozenset[int] = frozenset(),
 ) -> Iterator[httpx.Response]:
-    for current in _bounded_exception_nodes(exc, excluded_subtree_ids=excluded_subtree_ids):
+    for current in _bounded_exception_nodes(
+        exc, excluded_subtree_ids=excluded_subtree_ids
+    ):
         if not isinstance(current, httpx.HTTPStatusError):
             continue
         response = current.response
@@ -1012,7 +1024,9 @@ def _resolver_401_evidence(exc: BaseException) -> tuple[Any | None, frozenset[in
         response_ids.add(id(response))
         if challenge is not None or parse_www_authenticate_bearer is None:
             continue
-        candidate = parse_www_authenticate_bearer(response.headers.get_list("WWW-Authenticate"))
+        candidate = parse_www_authenticate_bearer(
+            response.headers.get_list("WWW-Authenticate")
+        )
         if candidate is not None and candidate.params.get("error") == "invalid_token":
             challenge = candidate
     return challenge, frozenset(response_ids)
@@ -1049,7 +1063,9 @@ def _exception_indicates_http_401(exc: BaseException) -> bool:
     return bool(_HTTP_401_TEXT_RE.search(text))
 
 
-def _delegated_authorization_failed_result(*, failure_code: object = None) -> dict[str, Any]:
+def _delegated_authorization_failed_result(
+    *, failure_code: object = None
+) -> dict[str, Any]:
     from ....agent.result import normalize_tool_failure_code
 
     result: dict[str, Any] = {
@@ -1071,7 +1087,9 @@ def _delegated_authorization_failed_result(*, failure_code: object = None) -> di
 
 def _delegated_retry_failed_result() -> dict[str, Any]:
     return {
-        "content": [{"text": ("Error executing MCP tool after delegated authorization retry.")}],
+        "content": [
+            {"text": ("Error executing MCP tool after delegated authorization retry.")}
+        ],
         "is_error": True,
     }
 
@@ -1115,11 +1133,15 @@ def _get_current_mcp_user_id() -> Optional[str]:
 
     # If no user ID found, this might be a system-level execution
     # In production, this should be replaced with proper context passing
-    logger.warning("No user ID found in environment, MCP tool may not be properly isolated")
+    logger.warning(
+        "No user ID found in environment, MCP tool may not be properly isolated"
+    )
     return None
 
 
-def _is_mcp_user_allowed(user_id: Optional[str], allow_users: Optional[List[str]]) -> bool:
+def _is_mcp_user_allowed(
+    user_id: Optional[str], allow_users: Optional[List[str]]
+) -> bool:
     if not user_id:
         # If no user ID, this might be a system execution. For security, deny
         # access unless the tool explicitly allows the system identity.
@@ -1165,7 +1187,9 @@ def _mcp_return_value_as_string(value: Any) -> str:
 
             structured_content = value.get("structured_content")
             if structured_content is not None:
-                texts.append("Structured result: " + json.dumps(structured_content, default=str))
+                texts.append(
+                    "Structured result: " + json.dumps(structured_content, default=str)
+                )
 
             if not texts:
                 texts.append("No content returned")
@@ -1177,16 +1201,23 @@ def _mcp_return_value_as_string(value: Any) -> str:
         return str(value)
 
 
-def _normalized_mcp_call_result(value: Any, *, validate_wire: bool = False) -> dict[str, Any]:
+def _normalized_mcp_call_result(
+    value: Any, *, validate_wire: bool = False
+) -> dict[str, Any]:
     """Validate a wire result and render the stable agent-facing shape."""
 
     if validate_wire:
-        if not isinstance(value, Mapping) or type(value.get("isError", False)) is not bool:
+        if (
+            not isinstance(value, Mapping)
+            or type(value.get("isError", False)) is not bool
+        ):
             raise ChromeSessionContractError("Chrome daemon returned invalid result")
         try:
             result = CallToolResult.model_validate(value)
         except ValidationError as exc:
-            raise ChromeSessionContractError("Chrome daemon returned invalid result") from exc
+            raise ChromeSessionContractError(
+                "Chrome daemon returned invalid result"
+            ) from exc
     else:
         result = value
     content = []
@@ -1318,7 +1349,9 @@ class MCPToolAdapter(AbstractBaseTool):
             # outright (`^[a-zA-Z0-9_-]+$` is the pattern OpenAI/DeepSeek
             # enforce on `tools[].function.name`), and a name that fails it
             # 400s the whole LLM call, not just this one tool.
-            return re.sub(r"[^A-Za-z0-9_-]", "_", value.replace(" ", "_").replace("-", "_"))
+            return re.sub(
+                r"[^A-Za-z0-9_-]", "_", value.replace(" ", "_").replace("-", "_")
+            )
 
         sanitized_prefix = _sanitize(self._name_prefix)
         sanitized_tool = _sanitize(self.mcp_tool.name)
@@ -1345,7 +1378,9 @@ class MCPToolAdapter(AbstractBaseTool):
     @property
     def description(self) -> str:
         """Get tool description from MCP tool."""
-        description = self.mcp_tool.description or (f"Execute MCP tool: {self.mcp_tool.name}")
+        description = self.mcp_tool.description or (
+            f"Execute MCP tool: {self.mcp_tool.name}"
+        )
         if self._workspace is not None and self._durable_upload_fields:
             description += (
                 " A registered file_id (or file:<id>) may be supplied for "
@@ -1356,7 +1391,10 @@ class MCPToolAdapter(AbstractBaseTool):
 
         if (
             self._workspace is not None
-            and (normalize_mcp_server_name(self.source_server or ""), self.mcp_tool.name)
+            and (
+                normalize_mcp_server_name(self.source_server or ""),
+                self.mcp_tool.name,
+            )
             in _WORKSPACE_DOWNLOAD_FIELDS
         ):
             description += (
@@ -1457,7 +1495,9 @@ class MCPToolAdapter(AbstractBaseTool):
             schema = self.mcp_tool.inputSchema
 
             if not isinstance(schema, dict):
-                logger.warning(f"Invalid input schema for MCP tool {self.mcp_tool.name}")
+                logger.warning(
+                    f"Invalid input schema for MCP tool {self.mcp_tool.name}"
+                )
 
                 return EmptyArgsModel
 
@@ -1471,7 +1511,9 @@ class MCPToolAdapter(AbstractBaseTool):
             # Build field definitions for create_model
             fields: Dict[str, Any] = {}
             runtime_bound_args = self._runtime_bound_tool_argument_names(properties)
-            tool_metadata = _tool_field_metadata(properties, required, runtime_bound_args)
+            tool_metadata = _tool_field_metadata(
+                properties, required, runtime_bound_args
+            )
             metadata = tool_metadata.fields
 
             for field_name, field_schema in properties.items():
@@ -1522,7 +1564,9 @@ class MCPToolAdapter(AbstractBaseTool):
             return create_model(model_name, **fields)
 
         except Exception as e:
-            logger.error(f"Failed to build args model for MCP tool {self.mcp_tool.name}: {e}")
+            logger.error(
+                f"Failed to build args model for MCP tool {self.mcp_tool.name}: {e}"
+            )
 
             return EmptyArgsModel
 
@@ -1579,8 +1623,13 @@ class MCPToolAdapter(AbstractBaseTool):
             concrete_types = [item for item in schema_type if item != "null"]
             concrete_resolved_types: list[Type[Any]] = []
             for concrete_type in concrete_types:
-                resolved_type = self._json_schema_to_python_type({"type": concrete_type})
-                if resolved_type is not Any and resolved_type not in concrete_resolved_types:
+                resolved_type = self._json_schema_to_python_type(
+                    {"type": concrete_type}
+                )
+                if (
+                    resolved_type is not Any
+                    and resolved_type not in concrete_resolved_types
+                ):
                     concrete_resolved_types.append(resolved_type)
             return self._build_union_type(concrete_resolved_types)
 
@@ -1642,7 +1691,10 @@ class MCPToolAdapter(AbstractBaseTool):
             if value is None:
                 continue
             if self._schema_is_array_only(field_schema) and not isinstance(value, list):
-                if isinstance(value, str) and len(value) <= self._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS:
+                if (
+                    isinstance(value, str)
+                    and len(value) <= self._ARRAY_ARG_JSON_RECOVERY_MAX_CHARS
+                ):
                     # Tool-calling models sometimes double-encode an
                     # array-only argument as a JSON string instead of a real
                     # array — e.g. '["date"]', or even a lone item as
@@ -1845,7 +1897,9 @@ class MCPToolAdapter(AbstractBaseTool):
                     self.mcp_tool.name,
                 )
 
-    def _register_workspace_download_result(self, result: dict[str, Any]) -> dict[str, Any]:
+    def _register_workspace_download_result(
+        self, result: dict[str, Any]
+    ) -> dict[str, Any]:
         """Attach a durable FileRef to a trusted connector download result."""
         if self._workspace is None:
             return result
@@ -1936,7 +1990,9 @@ class MCPToolAdapter(AbstractBaseTool):
             try:
                 with user_context.set_context():
                     try:
-                        return await self._execute_mcp_call(self.connection, tool_args, tool_meta)
+                        return await self._execute_mcp_call(
+                            self.connection, tool_args, tool_meta
+                        )
                     except (BaseExceptionGroup, Exception) as exc:
                         retry_result = await self._retry_after_authorization_failure(
                             exc, tool_args, tool_meta
@@ -2046,7 +2102,9 @@ class MCPToolAdapter(AbstractBaseTool):
         if not isinstance(refreshed, dict):
             return _delegated_authorization_failed_result()
         try:
-            return await self._execute_mcp_call(cast(Connection, refreshed), tool_args, tool_meta)
+            return await self._execute_mcp_call(
+                cast(Connection, refreshed), tool_args, tool_meta
+            )
         except (BaseExceptionGroup, Exception) as retry_exc:
             if _exception_indicates_http_401(retry_exc):
                 return _delegated_authorization_failed_result()
@@ -2090,15 +2148,21 @@ class MCPToolAdapter(AbstractBaseTool):
         from ....agent.result import ClassifiedToolFailure
 
         if isinstance(refreshed, ClassifiedToolFailure):
-            return _delegated_authorization_failed_result(failure_code=refreshed.failure_code)
+            return _delegated_authorization_failed_result(
+                failure_code=refreshed.failure_code
+            )
 
         if not _is_executable_remote_connection(refreshed):
             return _delegated_authorization_failed_result()
 
         try:
-            return await self._execute_mcp_call(cast(Connection, refreshed), tool_args, tool_meta)
+            return await self._execute_mcp_call(
+                cast(Connection, refreshed), tool_args, tool_meta
+            )
         except (BaseExceptionGroup, Exception) as retry_exc:
-            excluded_response_ids = frozenset() if retry_exc is exc else initial_response_ids
+            excluded_response_ids = (
+                frozenset() if retry_exc is exc else initial_response_ids
+            )
             if (
                 next(
                     _strict_http_401_responses(
@@ -2129,7 +2193,9 @@ class MCPToolAdapter(AbstractBaseTool):
         properties = schema.get("properties")
         return properties if isinstance(properties, dict) else {}
 
-    def _runtime_bound_tool_argument_names(self, properties: Mapping[str, Any]) -> set[str]:
+    def _runtime_bound_tool_argument_names(
+        self, properties: Mapping[str, Any]
+    ) -> set[str]:
         bound: set[str] = set()
         for binding in self._runtime_bindings:
             target = binding_target(binding)
@@ -2272,7 +2338,9 @@ class _UnavailableMCPToolResult(BaseModel):
     failure_code: str | None = Field(
         default=None, description="Allowlisted public tool failure classification"
     )
-    reason: str | None = Field(default=None, description="Public-safe MCP unavailability reason")
+    reason: str | None = Field(
+        default=None, description="Public-safe MCP unavailability reason"
+    )
     content: List[Dict[str, Any]] = Field(
         default_factory=list, description="Tool execution result content"
     )
@@ -2829,7 +2897,9 @@ async def load_mcp_tools_as_agent_tools(
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
             if sandbox is not None and should_sandbox_mcp_connection(connection):
-                concurrency_safe, concurrent_tools = _connection_concurrency_config(connection)
+                concurrency_safe, concurrent_tools = _connection_concurrency_config(
+                    connection
+                )
 
                 def tool_builder(
                     mcp_tool: MCPTool,

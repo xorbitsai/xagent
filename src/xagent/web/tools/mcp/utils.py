@@ -510,36 +510,30 @@ def success_with_capped_dict(
             degraded_extras[largest_key] = True
             extras_steps.append(dict(degraded_extras))
 
-        # Rungs, top to bottom: id + intact extras; empty record + intact
-        # extras; id + degraded extras; id alone; empty record + degraded
-        # extras; empty record alone. The id is given up for extras only
-        # while they are intact: a Meet link that fits beside {} beats
-        # keeping only the id (without that rung it vanished just because
-        # it didn't fit beside the id). Once the extras are degraded to a
-        # `True` placeholder, the id is worth keeping again over losing it
-        # for that placeholder -- id-alone outranks a degraded placeholder
-        # that dropped the id -- but the id still keeps any degraded extra
-        # that fits beside it, since keeping both costs nothing once the
-        # id already fits.
+        # Rungs, top to bottom -- see this function's docstring ("the last
+        # resort walks a ladder...") for the order and its rationale. Built
+        # here as plain (record, extras) pairs, in rank order, so "rung N
+        # before rung N+1" is a property of this list's order rather than
+        # of the statements that build it; the pairs are then rendered via
+        # `_build` in one pass below.
         full_extras, degraded_steps = extras_steps[0], extras_steps[1:]
-        candidates = [_build(compact_data, True, extras_override=full_extras)]
+        rungs: list[tuple[dict[str, Any], dict[str, Any]]] = [
+            (compact_data, full_extras)
+        ]
         if compact_data:
-            candidates.append(_build({}, True, extras_override=full_extras))
-        candidates.extend(
-            _build(compact_data, True, extras_override=step) for step in degraded_steps
-        )
-        candidates.append(_build(compact_data, True, extras_override={}))
+            rungs.append(({}, full_extras))
+        rungs.extend((compact_data, step) for step in degraded_steps)
+        rungs.append((compact_data, {}))
         if compact_data:
-            candidates.extend(
-                _build({}, True, extras_override=step) for step in degraded_steps
-            )
-        candidates.extend(
-            (
-                _build({}, True, extras_override={}),
-                json.dumps(
-                    {"status": "success", "truncated": True}, ensure_ascii=False
-                ),
-            )
+            rungs.extend(({}, step) for step in degraded_steps)
+        rungs.append(({}, {}))
+
+        candidates = [
+            _build(record, True, extras_override=step_extras)
+            for record, step_extras in rungs
+        ]
+        candidates.append(
+            json.dumps({"status": "success", "truncated": True}, ensure_ascii=False)
         )
         for candidate in candidates:
             if len(candidate) <= max_output_length:

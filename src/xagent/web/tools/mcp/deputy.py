@@ -130,12 +130,11 @@ def _verify_created_record(
         # since a full GET is already being paid for, there's no reason to
         # return the staler of the two.
         return _record_response(resource, readback, field_name=field_name)
+    reason = f"failed: {detail}" if detail else "returned no record"
     warning = (
         f"Deputy reported this {resource} create as successful (Id "
-        f"{record_id}), but reading it back "
-        + (f"failed: {detail}" if detail else "returned no record")
-        + ". Treat this as unconfirmed -- verify in Deputy directly before "
-        "relying on it."
+        f"{record_id}), but reading it back {reason}. Treat this as "
+        "unconfirmed -- verify in Deputy directly before relying on it."
     )
     # critical_fields, not extra_fields: this warning is the entire point
     # of this function, so it must survive even success_with_capped_dict's

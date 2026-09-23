@@ -373,9 +373,7 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
         # same "loader_failed" fallback as any other dispatch failure
         # (fail closed) rather than silently treating every stdio server as
         # if it weren't actor-scoped (fail open).
-        identity_getter = getattr(
-            config, "get_actor_mcp_stdio_session_identities", None
-        )
+        identity_getter = getattr(config, "get_actor_mcp_stdio_session_identities", None)
         session_identities = identity_getter() if callable(identity_getter) else {}
         mcp_configs = _apply_stdio_output_limit_env(
             mcp_configs, config, exempt_server_names=frozenset(session_identities)

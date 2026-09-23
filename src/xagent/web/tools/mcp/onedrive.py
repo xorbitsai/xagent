@@ -116,9 +116,7 @@ class _QuickXorHash:
             if len(data) < needed:
                 self._tail += bytes(data)
                 return
-            self._column_xor ^= int.from_bytes(
-                self._tail + bytes(data[:needed]), "little"
-            )
+            self._column_xor ^= int.from_bytes(self._tail + bytes(data[:needed]), "little")
             data = data[needed:]
             self._tail = b""
 
@@ -137,14 +135,10 @@ class _QuickXorHash:
             columns ^= int.from_bytes(self._tail, "little")
 
         value = 0
-        for index, byte in enumerate(
-            columns.to_bytes(self._INPUT_PERIOD_BYTES, "little")
-        ):
+        for index, byte in enumerate(columns.to_bytes(self._INPUT_PERIOD_BYTES, "little")):
             shift = (index * 11) % self._WIDTH_BITS
             rotated = (
-                byte
-                if shift == 0
-                else ((byte << shift) | (byte >> (self._WIDTH_BITS - shift)))
+                byte if shift == 0 else ((byte << shift) | (byte >> (self._WIDTH_BITS - shift)))
             )
             value ^= rotated & self._MASK
 
@@ -310,9 +304,7 @@ def _raise_upload_status(response: Any) -> None:
         response.raise_for_status()
     except requests.HTTPError as exc:
         status_code = getattr(response, "status_code", "unknown")
-        raise _UploadError(
-            f"OneDrive upload fragment failed with HTTP {status_code}"
-        ) from exc
+        raise _UploadError(f"OneDrive upload fragment failed with HTTP {status_code}") from exc
 
 
 def _safe_upload_error_message(exc: BaseException) -> str:
@@ -446,9 +438,7 @@ def _completed_upload_item(
             item = _current_upload_item(remote_path)
             file_facet = item.get("file") if isinstance(item, dict) else None
             hashes = file_facet.get("hashes") if isinstance(file_facet, dict) else None
-            remote_hash = (
-                hashes.get("quickXorHash") if isinstance(hashes, dict) else None
-            )
+            remote_hash = hashes.get("quickXorHash") if isinstance(hashes, dict) else None
             if (
                 isinstance(item, dict)
                 and item.get("id")
@@ -489,16 +479,12 @@ def _reconcile_upload_progress(
                 if end == total:
                     completed = True
                     break
-                raise _UploadError(
-                    "OneDrive upload session disappeared before completion"
-                )
+                raise _UploadError("OneDrive upload session disappeared before completion")
             _raise_upload_status(response)
             try:
                 payload = response.json()
             except ValueError as exc:
-                raise _UploadError(
-                    "OneDrive returned invalid upload-session progress"
-                ) from exc
+                raise _UploadError("OneDrive returned invalid upload-session progress") from exc
             if (
                 isinstance(payload, dict)
                 and payload.get("id")
@@ -512,17 +498,11 @@ def _reconcile_upload_progress(
                 break
             next_offset = _next_expected_upload_offset(payload, total)
             if next_offset < start:
-                raise _UploadError(
-                    "OneDrive returned inconsistent upload-session progress"
-                )
+                raise _UploadError("OneDrive returned inconsistent upload-session progress")
             if next_offset > end:
-                raise _UploadError(
-                    "OneDrive returned progress beyond the submitted fragment"
-                )
+                raise _UploadError("OneDrive returned progress beyond the submitted fragment")
             if next_offset == total and end < total:
-                raise _UploadError(
-                    "OneDrive reported completion before the local final fragment"
-                )
+                raise _UploadError("OneDrive reported completion before the local final fragment")
             if next_offset < end:
                 return next_offset, None
             if end == total:
@@ -537,12 +517,8 @@ def _reconcile_upload_progress(
                 break
             time.sleep(_upload_retry_delay(exc, attempt))
     if completed:
-        return total, _completed_upload_item(
-            remote_path, total, expected_final_quickxor_hash
-        )
-    raise _UploadError(
-        "Could not determine OneDrive upload-session progress"
-    ) from last_error
+        return total, _completed_upload_item(remote_path, total, expected_final_quickxor_hash)
+    raise _UploadError("Could not determine OneDrive upload-session progress") from last_error
 
 
 def _graph_request(
@@ -625,9 +601,7 @@ def _children_path(folder_path: str | None) -> str:
 def _content_path(file_path: str, *, field_name: str = "file_path") -> str:
     stripped_path = file_path.strip()
     if stripped_path.endswith("/"):
-        raise ValueError(
-            f"{field_name} must include a filename, not end with a folder separator"
-        )
+        raise ValueError(f"{field_name} must include a filename, not end with a folder separator")
     if Path(stripped_path).name.endswith("."):
         raise ValueError(f"{field_name} filename must not end with a period")
     normalized = _normalize_path(file_path)
@@ -720,9 +694,7 @@ def _stream_download_to_path(
         response.close()
 
     if total != expected_size:
-        raise RuntimeError(
-            "OneDrive file size changed while it was being downloaded"
-        )
+        raise RuntimeError("OneDrive file size changed while it was being downloaded")
     return total, digest.hexdigest()
 
 
@@ -770,9 +742,7 @@ def _resolve_upload_file_path(local_file_path: str) -> Path:
         if candidate_path.is_symlink():
             local_path = candidate_path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        logger.warning(
-            "Could not resolve OneDrive upload path %r: %s", local_file_path, exc
-        )
+        logger.warning("Could not resolve OneDrive upload path %r: %s", local_file_path, exc)
         raise ValueError("Could not resolve local_file_path") from exc
 
     try:
@@ -844,9 +814,7 @@ def _upload_large_file_content(
         result: dict[str, Any] = {}
         quickxor_hash = _QuickXorHash()
 
-        def refill_fragment(
-            chunk: bytearray, fragment_start: int, next_offset: int
-        ) -> int:
+        def refill_fragment(chunk: bytearray, fragment_start: int, next_offset: int) -> int:
             """Drop an accepted prefix and refill a non-final fragment.
 
             Graph can report an arbitrary missing-byte offset. Sending only
@@ -869,9 +837,7 @@ def _upload_large_file_content(
                 quickxor_hash.update(extra)
                 chunk.extend(extra)
                 if new_end == total and fh.read(1):
-                    raise _UploadError(
-                        "the local file may have changed size during upload"
-                    )
+                    raise _UploadError("the local file may have changed size during upload")
             return new_end
 
         try:
@@ -901,9 +867,7 @@ def _upload_large_file_content(
                 # truncated final item is committed. Keeping this as a
                 # separate read preserves the one-chunk memory bound.
                 if end == total and fh.read(1):
-                    raise _UploadError(
-                        "the local file may have changed size during upload"
-                    )
+                    raise _UploadError("the local file may have changed size during upload")
                 fragment_start = start
                 # The upload session URL is itself pre-authenticated (a
                 # token in its query string) -- Microsoft's own docs for
@@ -928,9 +892,7 @@ def _upload_large_file_content(
                             upload_url,
                             data=chunk,
                             headers={
-                                "Content-Range": (
-                                    f"bytes {fragment_start}-{end - 1}/{total}"
-                                ),
+                                "Content-Range": (f"bytes {fragment_start}-{end - 1}/{total}"),
                                 "Content-Type": mime_type,
                             },
                             timeout=_BINARY_UPLOAD_TIMEOUT_SECONDS,
@@ -939,18 +901,14 @@ def _upload_large_file_content(
                         if response.status_code in (200, 201):
                             if end < total:
                                 raise _UploadError(
-                                    "OneDrive reported completion before the local "
-                                    "final fragment"
+                                    "OneDrive reported completion before the local final fragment"
                                 )
                             break
                         if end < total and response.status_code == 202:
                             break
                     except Exception as exc:
                         status_code = _upload_status_code(exc)
-                        if not (
-                            _is_retriable_upload_error(exc)
-                            or status_code in (404, 409, 416)
-                        ):
+                        if not (_is_retriable_upload_error(exc) or status_code in (404, 409, 416)):
                             raise
                         upload_error = exc
 
@@ -973,9 +931,7 @@ def _upload_large_file_content(
                             raise _UploadError(
                                 "Could not determine OneDrive upload-session progress"
                             ) from reconcile_error
-                        delay = _upload_retry_delay(
-                            reconcile_error, consecutive_failures
-                        )
+                        delay = _upload_retry_delay(reconcile_error, consecutive_failures)
                     else:
                         if completed_item is not None:
                             result = completed_item
@@ -996,9 +952,7 @@ def _upload_large_file_content(
                         delay = (
                             _upload_retry_delay(upload_error, retry_number)
                             if upload_error is not None
-                            else _retry_delay(
-                                getattr(response, "headers", None), retry_number
-                            )
+                            else _retry_delay(getattr(response, "headers", None), retry_number)
                         )
 
                     if recovery_cycles >= _UPLOAD_CHUNK_MAX_RECOVERY_CYCLES:
@@ -1024,9 +978,7 @@ def _upload_large_file_content(
                     if result.get("id"):
                         break
                     if response is None:
-                        raise _UploadError(
-                            "OneDrive did not return a final upload response"
-                        )
+                        raise _UploadError("OneDrive did not return a final upload response")
                     try:
                         final_item = response.json() if response.content else {}
                     except ValueError:
@@ -1047,9 +999,7 @@ def _upload_large_file_content(
                 start = end
         except Exception as exc:
             cause = _request_error_cause(exc)
-            if isinstance(exc, _UploadError) or isinstance(
-                cause, requests.RequestException
-            ):
+            if isinstance(exc, _UploadError) or isinstance(cause, requests.RequestException):
                 logger.error(
                     "OneDrive large-file upload failed: %s",
                     _safe_upload_error_message(exc),
@@ -1063,9 +1013,7 @@ def _upload_large_file_content(
             # are exhausted, cancel the unusable session instead of leaving
             # partial data until its provider-defined expiration time.
             try:
-                cancel_response = http.delete(
-                    upload_url, timeout=DEFAULT_TIMEOUT_SECONDS
-                )
+                cancel_response = http.delete(upload_url, timeout=DEFAULT_TIMEOUT_SECONDS)
             except Exception as cleanup_exc:
                 # Never log cleanup exception text: requests exceptions can
                 # contain the preauthenticated upload URL.
@@ -1079,8 +1027,7 @@ def _upload_large_file_content(
                     and cancel_response.status_code != 404
                 ):
                     logger.warning(
-                        "OneDrive upload session cancellation returned HTTP %s "
-                        "instead of success",
+                        "OneDrive upload session cancellation returned HTTP %s instead of success",
                         cancel_response.status_code,
                     )
             raise RuntimeError(_safe_upload_error_message(exc)) from None
@@ -1188,9 +1135,7 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
         metadata = _graph_request(
             "GET",
             _item_path(file_path),
-            params={
-                "$select": "id,name,size,file,@microsoft.graph.downloadUrl"
-            },
+            params={"$select": "id,name,size,file,@microsoft.graph.downloadUrl"},
         )
         if not isinstance(metadata, dict) or not metadata.get("id"):
             raise RuntimeError("OneDrive did not return file metadata")
@@ -1206,9 +1151,7 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
         remote_name = str(metadata.get("name") or Path(file_path).name)
         output_name = _safe_download_filename(filename or remote_name)
         output_path = _unique_download_path(output_dir, output_name)
-        temporary_path = output_path.with_name(
-            f".{output_path.name}.{uuid4().hex}.part"
-        )
+        temporary_path = output_path.with_name(f".{output_path.name}.{uuid4().hex}.part")
         download_url = metadata.get("@microsoft.graph.downloadUrl")
         if isinstance(download_url, str) and download_url:
             total, sha256 = _stream_download_to_path(
@@ -1228,10 +1171,10 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
         temporary_path = None
         file_metadata = metadata.get("file")
         mime_type = (
-            file_metadata.get("mimeType")
-            if isinstance(file_metadata, dict)
-            else None
-        ) or _guess_mime_type(output_path.name) or "application/octet-stream"
+            (file_metadata.get("mimeType") if isinstance(file_metadata, dict) else None)
+            or _guess_mime_type(output_path.name)
+            or "application/octet-stream"
+        )
         return _success(
             file_path=str(output_path),
             filename=output_path.name,
@@ -1290,9 +1233,7 @@ def onedrive_upload_text_file(
 
 
 @mcp.tool()
-def onedrive_upload_file(
-    local_file_path: str, remote_path: str = "", mime_type: str = ""
-) -> str:
+def onedrive_upload_file(local_file_path: str, remote_path: str = "", mime_type: str = "") -> str:
     """
     Upload a local file's real bytes to OneDrive -- use this (not
     onedrive_upload_text_file) for a PDF, image, Office document, or any
@@ -1321,9 +1262,7 @@ def onedrive_upload_file(
         content_path = _content_path(resolved_remote_path, field_name="remote_path")
         resolved_mime_type = mime_type.strip() or _guess_mime_type(resolved_remote_path)
         if resolved_mime_type is None:
-            resolved_mime_type = (
-                _guess_mime_type(local_path.name) or "application/octet-stream"
-            )
+            resolved_mime_type = _guess_mime_type(local_path.name) or "application/octet-stream"
 
         # Read from one open handle throughout -- the size check, the small-
         # file read, and the large-file chunk reads all use this same fh
@@ -1395,9 +1334,7 @@ def onedrive_upload_file(
         if isinstance(e, (OSError, ValueError, RuntimeError)):
             logger.error("Error uploading OneDrive file %s: %s", local_file_path, e)
         else:
-            logger.exception(
-                "Unexpected error uploading OneDrive file %s", local_file_path
-            )
+            logger.exception("Unexpected error uploading OneDrive file %s", local_file_path)
         return _error(str(e))
 
 

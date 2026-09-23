@@ -29,9 +29,7 @@ class MockResponse:
     def __init__(self, json_data=None, status_code=200, content=None, url=None):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
-        self.content = (
-            json.dumps(self._json_data).encode("utf-8") if content is None else content
-        )
+        self.content = json.dumps(self._json_data).encode("utf-8") if content is None else content
         self.text = self.content.decode("utf-8", errors="replace")
         self.url = url or "https://graph.microsoft.com/v1.0/example"
 
@@ -122,9 +120,9 @@ def test_outcome_envelopes_survive_platform_string_filter(
     monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: max_chars)
 
     raw = response_factory()
-    filtered = OutputValueFilter(
-        max_chars=max_chars, max_fields=100, max_recursion=10
-    ).filter(raw, "powerpoint_mutation")
+    filtered = OutputValueFilter(max_chars=max_chars, max_fields=100, max_recursion=10).filter(
+        raw, "powerpoint_mutation"
+    )
 
     assert filtered == raw
     assert len(raw) <= max_chars
@@ -149,9 +147,7 @@ def test_success_envelope_preserves_provider_metadata_when_it_fits(monkeypatch):
 
 
 def test_item_path_defaults_to_own_onedrive():
-    assert (
-        powerpoint._item_path("Deck.pptx", None, None) == "/me/drive/root:/Deck.pptx:"
-    )
+    assert powerpoint._item_path("Deck.pptx", None, None) == "/me/drive/root:/Deck.pptx:"
 
 
 def test_item_path_sharepoint_path_form_site_id_closes_colon_before_drive():
@@ -167,9 +163,7 @@ def test_item_path_sharepoint_path_form_site_id_closes_colon_before_drive():
 
 def test_item_path_sharepoint_path_form_site_id_with_drive_id():
     assert (
-        powerpoint._item_path(
-            "Deck.pptx", "contoso.sharepoint.com:/teams/hr", "drive-1"
-        )
+        powerpoint._item_path("Deck.pptx", "contoso.sharepoint.com:/teams/hr", "drive-1")
         == "/sites/contoso.sharepoint.com:/teams/hr:/drives/drive-1/root:/Deck.pptx:"
     )
 
@@ -184,10 +178,7 @@ def test_item_path_sharepoint_composite_site_id_unaffected():
 
 
 def test_content_path_appends_content():
-    assert (
-        powerpoint._content_path("Deck.pptx", None, None)
-        == "/me/drive/root:/Deck.pptx:/content"
-    )
+    assert powerpoint._content_path("Deck.pptx", None, None) == "/me/drive/root:/Deck.pptx:/content"
 
 
 def test_normalize_relative_path_rejects_trailing_period():
@@ -399,9 +390,7 @@ def test_delete_slide_rejects_section_reference_without_mutating():
     section.set("name", "Section 1")
     section.set("id", "{00000000-0000-0000-0000-000000000001}")
     section_slide_list = etree.SubElement(section, f"{{{powerpoint_2010}}}sldIdLst")
-    section_slide_id = etree.SubElement(
-        section_slide_list, f"{{{powerpoint_2010}}}sldId"
-    )
+    section_slide_id = etree.SubElement(section_slide_list, f"{{{powerpoint_2010}}}sldId")
     section_slide_id.set("id", target.get("id"))
 
     with pytest.raises(ValueError, match="presentation section"):
@@ -441,9 +430,7 @@ def test_create_presentation_rejects_unsupported_extension_before_graph(monkeypa
 
 def test_create_presentation_rejects_when_session_creation_conflicts(monkeypatch):
     mock_request = Mock(
-        return_value=MockResponse(
-            {"error": {"code": "nameAlreadyExists"}}, status_code=409
-        )
+        return_value=MockResponse({"error": {"code": "nameAlreadyExists"}}, status_code=409)
     )
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
 
@@ -455,9 +442,7 @@ def test_create_presentation_rejects_when_session_creation_conflicts(monkeypatch
 
 
 def test_create_presentation_keeps_final_upload_conflict_definite(monkeypatch):
-    mock_request = Mock(
-        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
-    )
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/session"}))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
     monkeypatch.setattr(
         powerpoint.requests,
@@ -528,9 +513,7 @@ def test_create_presentation_upload_connection_error_does_not_leak_session_url(
     secret_url = "https://upload.example/session?token=super-secret-value"
     mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
-    mock_put = Mock(
-        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
-    )
+    mock_put = Mock(side_effect=requests.ConnectionError(f"Connection refused: {secret_url}"))
     monkeypatch.setattr(powerpoint.requests, "put", mock_put)
 
     result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptx"))
@@ -562,9 +545,7 @@ def test_create_only_upload_connection_error_does_not_chain_exception(monkeypatc
     secret_url = "https://upload.example/session?token=super-secret-value"
     mock_request = Mock(return_value=MockResponse({"uploadUrl": secret_url}))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
-    mock_put = Mock(
-        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
-    )
+    mock_put = Mock(side_effect=requests.ConnectionError(f"Connection refused: {secret_url}"))
     monkeypatch.setattr(powerpoint.requests, "put", mock_put)
 
     with pytest.raises(powerpoint._IndeterminateWriteError) as exc_info:
@@ -574,9 +555,7 @@ def test_create_only_upload_connection_error_does_not_chain_exception(monkeypatc
 
 
 def test_create_presentation_uploads_blank_presentation(monkeypatch):
-    mock_request = Mock(
-        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
-    )
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/session"}))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
     mock_put = Mock(return_value=MockResponse({"id": "new-item"}, status_code=201))
     monkeypatch.setattr(powerpoint.requests, "put", mock_put)
@@ -586,14 +565,10 @@ def test_create_presentation_uploads_blank_presentation(monkeypatch):
     assert result["status"] == "success"
     assert result["item"]["id"] == "new-item"
     session_call = mock_request.call_args
-    assert session_call.kwargs["json"] == {
-        "item": {"@microsoft.graph.conflictBehavior": "fail"}
-    }
+    assert session_call.kwargs["json"] == {"item": {"@microsoft.graph.conflictBehavior": "fail"}}
     put_call = mock_put.call_args
     assert put_call.args[0] == "https://upload.example/session"
-    assert (
-        put_call.kwargs["headers"]["Content-Type"] == powerpoint._POWERPOINT_MIME_TYPE
-    )
+    assert put_call.kwargs["headers"]["Content-Type"] == powerpoint._POWERPOINT_MIME_TYPE
     assert "Authorization" not in put_call.kwargs.get("headers", {})
     # Re-parses as a real, valid (if blank) pptx.
     Presentation(io.BytesIO(put_call.kwargs["data"]))
@@ -616,9 +591,7 @@ def test_get_presentation_text(monkeypatch):
     result = json.loads(powerpoint.powerpoint_get_presentation_text("Deck.pptx"))
 
     assert result["status"] == "success"
-    assert result["slides"] == [
-        {"slide_index": 0, "shapes": ["Title A", "Body A"], "notes": None}
-    ]
+    assert result["slides"] == [{"slide_index": 0, "shapes": ["Title A", "Body A"], "notes": None}]
     assert result["etag"] == '"etag-1"'
     assert mock_get.call_args.kwargs["timeout"] == powerpoint._BINARY_TIMEOUT_SECONDS
     assert "headers" not in mock_get.call_args.kwargs
@@ -660,9 +633,7 @@ def test_get_presentation_text_returns_resumable_bounded_pages(monkeypatch):
     cursor = None
     slide_indices = []
     while True:
-        result_text = powerpoint.powerpoint_get_presentation_text(
-            "Deck.pptx", cursor=cursor
-        )
+        result_text = powerpoint.powerpoint_get_presentation_text("Deck.pptx", cursor=cursor)
         assert len(result_text) <= 430
         result = json.loads(result_text)
         assert result["status"] == "success"
@@ -706,13 +677,9 @@ def test_get_presentation_text_skips_oversized_slide_and_continues(
     assert first["truncated"] is True
 
     second = json.loads(
-        powerpoint.powerpoint_get_presentation_text(
-            "Deck.pptx", cursor=first["next_cursor"]
-        )
+        powerpoint.powerpoint_get_presentation_text("Deck.pptx", cursor=first["next_cursor"])
     )
-    assert second["slides"] == [
-        {"slide_index": 1, "shapes": ["Later slide"], "notes": None}
-    ]
+    assert second["slides"] == [{"slide_index": 1, "shapes": ["Later slide"], "notes": None}]
     assert second["truncated"] is False
 
 
@@ -728,9 +695,7 @@ def test_list_slides_cursor_is_rejected_after_presentation_changes(monkeypatch):
     assert first["truncated"] is True
 
     _mock_download(monkeypatch, content, etag='"etag-2"')
-    second = json.loads(
-        powerpoint.powerpoint_list_slides("Deck.pptx", cursor=first["next_cursor"])
-    )
+    second = json.loads(powerpoint.powerpoint_list_slides("Deck.pptx", cursor=first["next_cursor"]))
 
     assert second["status"] == "conflict"
     assert "changed while reading" in second["message"]
@@ -742,13 +707,9 @@ def test_get_presentation_text_includes_group_table_and_notes(monkeypatch):
         box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(1), Inches(1))
         box.text_frame.text = "Top level"
         group = slide.shapes.add_group_shape([box])
-        nested_box = group.shapes.add_textbox(
-            Inches(2), Inches(2), Inches(1), Inches(1)
-        )
+        nested_box = group.shapes.add_textbox(Inches(2), Inches(2), Inches(1), Inches(1))
         nested_box.text_frame.text = "Nested"
-        table_shape = slide.shapes.add_table(
-            1, 2, Inches(0), Inches(3), Inches(4), Inches(1)
-        )
+        table_shape = slide.shapes.add_table(1, 2, Inches(0), Inches(3), Inches(4), Inches(1))
         table_shape.table.cell(0, 0).text_frame.text = "Cell A"
         table_shape.table.cell(0, 1).text_frame.text = "Cell B"
         slide.notes_slide.notes_text_frame.text = "Speaker notes"
@@ -860,9 +821,7 @@ def test_get_slide_text_skips_oversized_shape_and_continues(monkeypatch):
     assert first["truncated"] is True
 
     second = json.loads(
-        powerpoint.powerpoint_get_slide_text(
-            "Deck.pptx", 0, cursor=first["next_cursor"]
-        )
+        powerpoint.powerpoint_get_slide_text("Deck.pptx", 0, cursor=first["next_cursor"])
     )
     assert len(second["shapes"]) == 1
     assert second["shapes"][0]["shape_index"] == 1
@@ -960,9 +919,9 @@ def test_committed_add_slide_result_survives_low_platform_output_cap(monkeypatch
     monkeypatch.setattr(powerpoint, "get_tool_max_output_length", lambda: max_chars)
 
     raw = powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"')
-    filtered = OutputValueFilter(
-        max_chars=max_chars, max_fields=100, max_recursion=10
-    ).filter(raw, "powerpoint_add_slide")
+    filtered = OutputValueFilter(max_chars=max_chars, max_fields=100, max_recursion=10).filter(
+        raw, "powerpoint_add_slide"
+    )
 
     assert filtered == raw
     assert len(raw) <= max_chars
@@ -974,9 +933,7 @@ def test_add_slide_rejects_out_of_range_layout(monkeypatch):
     mock_session_cls = MagicMock()
     monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
 
-    result = json.loads(
-        powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"', layout_index=999)
-    )
+    result = json.loads(powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"', layout_index=999))
     assert result["status"] == "error"
     assert result["message"].startswith("layout_index 999 is out of range")
     mock_session_cls.assert_not_called()
@@ -1002,14 +959,10 @@ def test_add_slide_rejects_stale_etag_before_download(monkeypatch):
         ({"body_text": "Not applicable", "layout_index": 6}, "body_text"),
     ],
 )
-def test_add_slide_rejects_content_missing_from_layout(
-    monkeypatch, kwargs, missing_field
-):
+def test_add_slide_rejects_content_missing_from_layout(monkeypatch, kwargs, missing_field):
     mock_request, _ = _mock_download(monkeypatch, _pptx_bytes())
 
-    result = json.loads(
-        powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"', **kwargs)
-    )
+    result = json.loads(powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"', **kwargs))
 
     assert result["status"] == "error"
     assert missing_field in result["message"]
@@ -1020,9 +973,7 @@ def test_add_slide_rejects_non_int_layout_index(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
 
-    result = json.loads(
-        powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"', layout_index="1")
-    )
+    result = json.loads(powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"', layout_index="1"))
 
     assert result["status"] == "error"
     assert "layout_index must be an integer" in result["message"]
@@ -1078,9 +1029,7 @@ def test_set_shape_text_rejects_shape_without_text_frame(monkeypatch):
     content = _pptx_bytes(build)
     _mock_download(monkeypatch, content)
 
-    result = json.loads(
-        powerpoint.powerpoint_set_shape_text("Deck.pptx", 0, 0, "text", '"etag-1"')
-    )
+    result = json.loads(powerpoint.powerpoint_set_shape_text("Deck.pptx", 0, 0, "text", '"etag-1"'))
 
     assert result["status"] == "error"
     assert "no text frame" in result["message"]
@@ -1195,9 +1144,7 @@ def test_delete_slide_tool_rejects_non_int_slide_index(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
 
-    result = json.loads(
-        powerpoint.powerpoint_delete_slide("Deck.pptx", "0", '"etag-1"')
-    )
+    result = json.loads(powerpoint.powerpoint_delete_slide("Deck.pptx", "0", '"etag-1"'))
 
     assert result["status"] == "error"
     assert "slide_index must be an integer" in result["message"]
@@ -1209,42 +1156,32 @@ def test_upload_presentation_rejects_oversized_content(monkeypatch):
     monkeypatch.setattr(powerpoint, "_MAX_PRESENTATION_BYTES", 10)
 
     with pytest.raises(ValueError, match="MB limit"):
-        powerpoint._upload_presentation(
-            presentation, "Deck.pptx", None, None, '"etag-1"'
-        )
+        powerpoint._upload_presentation(presentation, "Deck.pptx", None, None, '"etag-1"')
 
 
 def test_upload_presentation_conditionally_creates_upload_session(monkeypatch):
     """Every replacement uses If-Match when its upload session is created."""
     presentation = Presentation()
     monkeypatch.setattr(powerpoint, "_UPLOAD_SESSION_CHUNK_BYTES", 10)
-    mock_request = Mock(
-        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
-    )
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/session"}))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
     put_calls: list[MockResponse] = []
 
     def fake_put(url, *, data, headers, timeout):
         put_calls.append((url, data, headers))
-        range_part, total_str = (
-            headers["Content-Range"].removeprefix("bytes ").split("/")
-        )
+        range_part, total_str = headers["Content-Range"].removeprefix("bytes ").split("/")
         _, end_str = range_part.split("-")
         is_last = int(end_str) + 1 == int(total_str)
         if is_last:
             return MockResponse({"id": "item-1"}, status_code=200)
-        return MockResponse(
-            {"nextExpectedRanges": [f"{int(end_str) + 1}-"]}, status_code=202
-        )
+        return MockResponse({"nextExpectedRanges": [f"{int(end_str) + 1}-"]}, status_code=202)
 
     mock_session_put = Mock(side_effect=fake_put)
     mock_session_cls = MagicMock()
     mock_session_cls.return_value.__enter__.return_value.put = mock_session_put
     monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
 
-    item = powerpoint._upload_presentation(
-        presentation, "Deck.pptx", None, None, '"etag-1"'
-    )
+    item = powerpoint._upload_presentation(presentation, "Deck.pptx", None, None, '"etag-1"')
 
     assert item["id"] == "item-1"
     assert len(put_calls) > 1
@@ -1259,9 +1196,7 @@ def test_upload_presentation_session_rejects_when_no_upload_url(monkeypatch):
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
 
     with pytest.raises(RuntimeError, match="did not return an upload session URL"):
-        powerpoint._upload_presentation_session(
-            b"content", "Deck.pptx", None, None, '"etag-1"'
-        )
+        powerpoint._upload_presentation_session(b"content", "Deck.pptx", None, None, '"etag-1"')
 
 
 def test_upload_presentation_session_failure_does_not_leak_session_url(monkeypatch):
@@ -1304,9 +1239,7 @@ def test_upload_session_cancels_after_definite_nonfinal_failure(monkeypatch):
     monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
 
     with pytest.raises(powerpoint._GraphRequestError) as exc_info:
-        powerpoint._upload_presentation_session(
-            b"0123456789", "Deck.pptx", None, None, '"etag-1"'
-        )
+        powerpoint._upload_presentation_session(b"0123456789", "Deck.pptx", None, None, '"etag-1"')
 
     assert "super-secret-value" not in str(exc_info.value)
     mock_http.delete.assert_called_once_with(
@@ -1324,15 +1257,11 @@ def test_upload_session_cancels_after_invalid_progress(monkeypatch):
     )
     mock_session_cls = MagicMock()
     mock_http = mock_session_cls.return_value.__enter__.return_value
-    mock_http.put = Mock(
-        return_value=MockResponse({"nextExpectedRanges": []}, status_code=202)
-    )
+    mock_http.put = Mock(return_value=MockResponse({"nextExpectedRanges": []}, status_code=202))
     monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
 
     with pytest.raises(RuntimeError, match="empty.*progress"):
-        powerpoint._upload_presentation_session(
-            b"0123456789", "Deck.pptx", None, None, '"etag-1"'
-        )
+        powerpoint._upload_presentation_session(b"0123456789", "Deck.pptx", None, None, '"etag-1"')
 
     mock_http.delete.assert_called_once_with(
         upload_url, timeout=powerpoint._UPLOAD_CANCEL_TIMEOUT_SECONDS
@@ -1341,9 +1270,7 @@ def test_upload_session_cancels_after_invalid_progress(monkeypatch):
 
 def test_upload_session_follows_server_reported_next_offset(monkeypatch):
     monkeypatch.setattr(powerpoint, "_UPLOAD_SESSION_CHUNK_BYTES", 5)
-    mock_request = Mock(
-        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
-    )
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/session"}))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
     responses = iter(
         [
@@ -1362,9 +1289,11 @@ def test_upload_session_follows_server_reported_next_offset(monkeypatch):
     )
 
     assert item["id"] == "item-1"
-    assert [
-        call.kwargs["headers"]["Content-Range"] for call in mock_put.call_args_list
-    ] == ["bytes 0-4/10", "bytes 3-7/10", "bytes 8-9/10"]
+    assert [call.kwargs["headers"]["Content-Range"] for call in mock_put.call_args_list] == [
+        "bytes 0-4/10",
+        "bytes 3-7/10",
+        "bytes 8-9/10",
+    ]
 
 
 def test_add_slide_maps_upload_precondition_failure_to_conflict(monkeypatch):
@@ -1392,9 +1321,7 @@ def test_add_slide_maps_upload_precondition_failure_to_conflict(monkeypatch):
 def test_add_slide_maps_final_fragment_precondition_failure_to_conflict(monkeypatch):
     content = _pptx_bytes()
     _, _, mock_put = _mock_versioned_write(monkeypatch, content)
-    mock_put.return_value = MockResponse(
-        {"error": {"code": "preconditionFailed"}}, status_code=412
-    )
+    mock_put.return_value = MockResponse({"error": {"code": "preconditionFailed"}}, status_code=412)
 
     result = json.loads(powerpoint.powerpoint_add_slide("Deck.pptx", '"etag-1"'))
 
@@ -1462,9 +1389,7 @@ def test_graph_request_connection_error_does_not_leak_redirect_url(monkeypatch):
     embeds the URL just like HTTPError's does, so this path must be
     sanitized too."""
     secret_url = "https://blob.example/deck.pptx?token=super-secret-value"
-    mock_request = Mock(
-        side_effect=requests.ConnectionError(f"Connection refused: {secret_url}")
-    )
+    mock_request = Mock(side_effect=requests.ConnectionError(f"Connection refused: {secret_url}"))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -1517,9 +1442,7 @@ def test_upload_presentation_session_marks_non_json_final_response_indeterminate
     monkeypatch,
 ):
     """A 2xx final response without an item may follow a committed write."""
-    mock_request = Mock(
-        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
-    )
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/session"}))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
     mock_put = Mock(return_value=_non_json_success_response())
     mock_session_cls = MagicMock()
@@ -1527,15 +1450,11 @@ def test_upload_presentation_session_marks_non_json_final_response_indeterminate
     monkeypatch.setattr(powerpoint.requests, "Session", mock_session_cls)
 
     with pytest.raises(powerpoint._IndeterminateWriteError, match="did not return"):
-        powerpoint._upload_presentation_session(
-            b"content", "Deck.pptx", None, None, '"etag-1"'
-        )
+        powerpoint._upload_presentation_session(b"content", "Deck.pptx", None, None, '"etag-1"')
 
 
 def test_create_only_upload_handles_non_json_final_response(monkeypatch):
-    mock_request = Mock(
-        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
-    )
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/session"}))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
     mock_put = Mock(return_value=_non_json_success_response())
     monkeypatch.setattr(powerpoint.requests, "put", mock_put)
@@ -1547,13 +1466,9 @@ def test_create_only_upload_handles_non_json_final_response(monkeypatch):
 def test_create_presentation_reports_non_json_final_response_as_indeterminate(
     monkeypatch,
 ):
-    mock_request = Mock(
-        return_value=MockResponse({"uploadUrl": "https://upload.example/session"})
-    )
+    mock_request = Mock(return_value=MockResponse({"uploadUrl": "https://upload.example/session"}))
     monkeypatch.setattr(powerpoint.requests, "request", mock_request)
-    monkeypatch.setattr(
-        powerpoint.requests, "put", Mock(return_value=_non_json_success_response())
-    )
+    monkeypatch.setattr(powerpoint.requests, "put", Mock(return_value=_non_json_success_response()))
 
     result = json.loads(powerpoint.powerpoint_create_presentation("Deck.pptx"))
 
@@ -1663,9 +1578,7 @@ def test_set_shape_text_preserves_formatting(monkeypatch):
     content = _pptx_bytes(build)
     _, _, mock_put = _mock_versioned_write(monkeypatch, content)
 
-    result = json.loads(
-        powerpoint.powerpoint_set_shape_text("Deck.pptx", 0, 0, "New", '"etag-1"')
-    )
+    result = json.loads(powerpoint.powerpoint_set_shape_text("Deck.pptx", 0, 0, "New", '"etag-1"'))
 
     assert result["status"] == "success"
     put_call = mock_put.call_args
@@ -1732,9 +1645,7 @@ def test_set_shape_text_allows_equivalently_formatted_runs(monkeypatch):
     content = _pptx_bytes(build)
     _, _, mock_put = _mock_versioned_write(monkeypatch, content)
 
-    result = json.loads(
-        powerpoint.powerpoint_set_shape_text("Deck.pptx", 0, 0, "New", '"etag-1"')
-    )
+    result = json.loads(powerpoint.powerpoint_set_shape_text("Deck.pptx", 0, 0, "New", '"etag-1"'))
 
     assert result["status"] == "success"
     uploaded = Presentation(io.BytesIO(mock_put.call_args.kwargs["data"]))

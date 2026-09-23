@@ -1289,20 +1289,25 @@ def test_success_with_capped_dict_last_resort_degrades_extras_before_dropping_th
     full-extras candidate didn't fit. A caller-registered extra field
     (e.g. a per-field truncation flag) should keep its key -- even
     degraded to a generic placeholder -- for as long as there's room,
-    instead of the whole `extra_fields` dict vanishing in one step."""
-    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "100")
+    instead of the whole `extra_fields` dict vanishing in one step. Uses a
+    lowercase `id` and a limit distinct from
+    test_success_with_capped_dict_last_resort_fallback_keeps_capitalized_id
+    in test_deputy_mcp.py, which pins a different contract (capitalized
+    `Id` survives) via the same shared helper -- so the two tests don't
+    duplicate the same call."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "80")
 
     raw = utils.success_with_capped_dict(
         "record",
-        {"Id": 123, "Notes": "x" * 5000},
+        {"id": "REC1", "Notes": "x" * 5000},
         extra_fields={"note": "y" * 60},
     )
     result = json.loads(raw)
 
-    assert len(raw) <= 100
+    assert len(raw) <= 80
     assert result["status"] == "success"
     assert result["truncated"] is True
-    assert result["record"] == {"Id": 123}
+    assert result["record"] == {"id": "REC1"}
     assert "note" in result
     assert result["note"] is True
 
@@ -1334,6 +1339,33 @@ def test_success_with_capped_dict_last_resort_falls_back_to_dropping_extras(
     assert "note_two" not in result
 
 
+def test_success_with_capped_dict_last_resort_degrades_the_larger_extra_first(
+    monkeypatch,
+):
+    """Pins the "largest first" claim in the degradation-order docstring
+    with two extras of genuinely different sizes (unlike the
+    same-size-extras fallback test above, which can't distinguish "largest
+    first" from any other tie-break). At a limit that fits the id plus one
+    intact extra but not both intact, the larger extra ("big") must be the
+    one degraded to `True` while the smaller ("small") stays intact -- a
+    regression that degraded by iteration/insertion order instead of size,
+    or picked the smallest first, would flip this."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "110")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 123, "Notes": "x" * 5000},
+        extra_fields={"big": "b" * 80, "small": "s" * 20},
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 110
+    assert result["truncated"] is True
+    assert result["record"] == {"Id": 123}
+    assert result["big"] is True
+    assert result["small"] == "s" * 20
+
+
 def test_halve_dict_or_mark_halves_while_more_than_one_key_remains():
     """The shared per-step helper both success_with_capped_dict's phase 1
     and shopify.py's local tail loop delegate to: drops the trailing half of
@@ -1360,6 +1392,23 @@ def test_halve_dict_or_mark_falls_back_to_empty_when_the_marker_would_grow_it():
     shrunk, floored = utils.halve_dict_or_mark({"a": 1})
 
     assert shrunk == {}
+    assert floored is True
+
+
+def test_halve_dict_or_mark_uses_the_marker_on_an_exact_size_tie():
+    """When the marker and the value it would replace serialize to the
+    exact same length, the marker must still win: installing it costs
+    nothing extra here, so there's no reason to throw away the
+    "truncated" signal for a byte-neutral swap. `{"num": 1234567890}` and
+    `{"truncated": true}` both serialize to 19 bytes."""
+    value = {"num": 1234567890}
+    assert len(json.dumps(value, ensure_ascii=False)) == len(
+        json.dumps({"truncated": True}, ensure_ascii=False)
+    )
+
+    shrunk, floored = utils.halve_dict_or_mark(value)
+
+    assert shrunk == {"truncated": True}
     assert floored is True
 
 
@@ -1572,3 +1621,30 @@ def test_success_with_capped_dict_last_resort_ranks_a_degraded_extra_below_the_i
     assert result["truncated"] is True
     assert result["record"] == {}
     assert result["note"] is True
+
+
+def test_success_with_capped_dict_last_resort_prefers_an_intact_url_over_the_id(
+    monkeypatch,
+):
+    """Regression test for a reviewer-reported case: a calendar-shaped event
+    (a 26-character id plus a long description) with a real, still-intact
+    Meet link as `extra_fields`. Before the ladder was reordered, `id +
+    degraded extras` (the id beside a `True` placeholder for the link) was
+    tried -- and fit -- before `{} + intact extras` got a chance, so the
+    usable URL was thrown away in favor of an id next to a flag that only
+    says "there was a link". The reordered ladder tries the empty record
+    with the link still intact before ever degrading that link, so the
+    real, followable URL wins over the id."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "109")
+
+    raw = utils.success_with_capped_dict(
+        "event",
+        {"id": "e" * 26, "description": "d" * 5000},
+        extra_fields={"hangout_link": "https://meet.google.com/abc-defg-hij"},
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 109
+    assert result["truncated"] is True
+    assert result["event"] == {}
+    assert result["hangout_link"] == "https://meet.google.com/abc-defg-hij"

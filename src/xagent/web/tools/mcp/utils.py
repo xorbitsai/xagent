@@ -214,11 +214,13 @@ def _halve_dict_keys(value: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _truncation_marker_or_empty(value: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of ``_FIELD_TRUNCATION_MARKER`` if it's smaller
-    (serialized) than ``value``, otherwise ``{}``."""
+    """Return a copy of ``_FIELD_TRUNCATION_MARKER`` if it's no bigger
+    (serialized) than ``value``, otherwise ``{}``. A tie still installs the
+    marker: it costs nothing extra there, so there's no reason to throw
+    away the "this was truncated" signal for a byte-neutral swap."""
     marker_size = len(json.dumps(_FIELD_TRUNCATION_MARKER, ensure_ascii=False))
     current_size = len(json.dumps(value, ensure_ascii=False))
-    return dict(_FIELD_TRUNCATION_MARKER) if marker_size < current_size else {}
+    return dict(_FIELD_TRUNCATION_MARKER) if marker_size <= current_size else {}
 
 
 def halve_dict_or_mark(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -311,15 +313,22 @@ def success_with_capped_dict(
     Reserved envelope keys cannot be overridden. If the payload is still too
     large once ``data`` itself is fully truncated, the last resort walks a
     ladder from most to least informative: the record's id (if it has one)
-    with the extras intact, then with each extra field whose value is
-    bigger than the ``True`` placeholder degraded to ``True`` (largest
-    first, same size-gate as the field marker above); then an empty record
-    with the extras intact; then the id alone; then an empty record with
-    the degraded extras; and only then an empty record with no extras at
-    all. The id is given up for extras only while those extras are intact:
-    a real Meet link that fits beside an empty record beats keeping only
-    the id (that rung is what stops a long id from crowding the link out
-    entirely), but a ``True`` placeholder for it does not beat the id.
+    with the extras intact; then an empty record with the extras intact;
+    then the id with each extra field whose value is bigger than the
+    ``True`` placeholder degraded to ``True`` (largest first, same
+    size-gate as the field marker above); then the id alone; then an empty
+    record with those same degraded extras; and only then an empty record
+    with no extras at all. The id is given up for extras only while those
+    extras are intact: a real Meet link that fits beside an empty record
+    beats keeping only the id (that rung is what stops a long id from
+    crowding the link out entirely). Once the extras are degraded to an
+    uninformative ``True`` placeholder, though, the id is worth keeping
+    again over losing it for that placeholder: id-alone outranks a
+    degraded placeholder that dropped the id (an id you can look the
+    record up by beats a flag that says nothing). But the id still keeps
+    any degraded extra that fits beside it -- id with degraded extras
+    outranks id alone, since keeping both costs nothing once the id
+    already fits.
 
     With two or more ``extra_fields``, the degradation order (largest
     field first) is a fixed chain, not a search: it never tries "degrade
@@ -493,19 +502,24 @@ def success_with_capped_dict(
             degraded_extras[largest_key] = True
             extras_steps.append(dict(degraded_extras))
 
-        # Rungs, top to bottom: id + extras (intact, then degraded); empty
-        # record + intact extras; id alone; empty record + degraded extras;
-        # empty record alone. The id is given up for extras only while they
-        # are intact: a Meet link that fits beside {} beats keeping only the
-        # id (without that rung it vanished just because it didn't fit
-        # beside the id), but a `True` placeholder for it does not -- the
-        # id is worth more than a flag that only says "there was a link".
+        # Rungs, top to bottom: id + intact extras; empty record + intact
+        # extras; id + degraded extras; id alone; empty record + degraded
+        # extras; empty record alone. The id is given up for extras only
+        # while they are intact: a Meet link that fits beside {} beats
+        # keeping only the id (without that rung it vanished just because
+        # it didn't fit beside the id). Once the extras are degraded to a
+        # `True` placeholder, the id is worth keeping again over losing it
+        # for that placeholder -- id-alone outranks a degraded placeholder
+        # that dropped the id -- but the id still keeps any degraded extra
+        # that fits beside it, since keeping both costs nothing once the
+        # id already fits.
         full_extras, degraded_steps = extras_steps[0], extras_steps[1:]
-        candidates = [
-            _build(compact_data, True, extras_override=step) for step in extras_steps
-        ]
+        candidates = [_build(compact_data, True, extras_override=full_extras)]
         if compact_data:
             candidates.append(_build({}, True, extras_override=full_extras))
+        candidates.extend(
+            _build(compact_data, True, extras_override=step) for step in degraded_steps
+        )
         candidates.append(_build(compact_data, True, extras_override={}))
         if compact_data:
             candidates.extend(

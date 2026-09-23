@@ -1796,6 +1796,17 @@ def _load_prepared_trigger_start(run_id: int) -> _PreparedTriggerStart | None:
 
 
 def _mark_trigger_run_started(start: _PreparedTriggerStart) -> None:
+    """Stamp the run's start without dragging an advanced run back to running.
+
+    ``_start_prepared_trigger_run_id`` schedules the turn through ``begin_turn``
+    and only reaches this afterwards, so the worker may already have parked the
+    task and had its run projected to ``paused`` -- which also releases the
+    lease, leaving nothing that could repair a later overwrite (#2177). The
+    dispatch claim already moved the run to RUNNING, so this call only has to
+    preserve that state for a run that has not advanced; the update is therefore
+    a single conditional statement rather than a read-then-check, because the
+    park can commit between any read and this write.
+    """
     db = _with_session()
     try:
         run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).first()
@@ -1805,12 +1816,22 @@ def _mark_trigger_run_started(start: _PreparedTriggerStart) -> None:
         if run is None or trigger is None:
             return
         started_at = run.started_at or _now()
-        setattr(run, "status", TriggerRunStatus.RUNNING.value)
-        setattr(run, "started_at", started_at)
-        setattr(run, "error_message", None)
+        # Parked and terminal states: the run left the start behind and keeps it.
+        advanced = sorted(
+            TriggerRunStatus.terminal_values() | {TriggerRunStatus.PAUSED.value}
+        )
+        db.execute(
+            update(TriggerRun)
+            .where(TriggerRun.id == start.run_id, TriggerRun.status.notin_(advanced))
+            .values(
+                status=TriggerRunStatus.RUNNING.value,
+                started_at=started_at,
+                error_message=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
         setattr(trigger, "last_run_at", started_at)
         setattr(trigger, "last_error", None)
-        db.add(run)
         db.add(trigger)
         db.commit()
     finally:

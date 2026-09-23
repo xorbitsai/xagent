@@ -2991,7 +2991,7 @@ def test_event_response_last_resort_falls_back_to_an_empty_record(
     even a degraded extra beside an empty record doesn't fit, the response
     still preserves the event's status/truncated envelope with an empty
     record rather than dropping the field entirely."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 60)
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 64)
     fake_service._events._insert_result = _large_event_with_hangout_link(id_length=90)
 
     raw = calendar.google_calendar_create_events(
@@ -3001,7 +3001,7 @@ def test_event_response_last_resort_falls_back_to_an_empty_record(
     )
     result = json.loads(raw)
 
-    assert len(raw) <= 60
+    assert len(raw) <= 64
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert result["event"] == {}

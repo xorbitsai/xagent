@@ -424,6 +424,72 @@ def test_delete_worksheet_server_failure_is_indeterminate(monkeypatch):
     assert "HTTP 503" in result["message"]
 
 
+@pytest.mark.parametrize(
+    ("start_column", "end_column", "expected"),
+    [("L", "M", "L:M"), (" a ", "xFd", "A:XFD")],
+)
+def test_delete_columns_uses_structural_left_shift(
+    monkeypatch, start_column, end_column, expected
+):
+    mock_request = Mock(return_value=MockResponse({}, status_code=204, content=b""))
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_delete_columns(
+            "book.xlsx", "Sheet1", start_column, end_column
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["deleted_range"] == expected
+    kwargs = mock_request.call_args.kwargs
+    assert kwargs["method"] == "POST"
+    assert kwargs["url"].endswith(
+        f"worksheets('Sheet1')/range(address='{expected.replace(':', '%3A')}')/delete"
+    )
+    assert kwargs["json"] == {"shift": "Left"}
+
+
+@pytest.mark.parametrize(
+    ("start_column", "end_column", "message"),
+    [
+        ("", "M", "column must be an Excel column label"),
+        ("L", "XFE", "column must be an Excel column label"),
+        ("M", "L", "start_column must not be after end_column"),
+    ],
+)
+def test_delete_columns_rejects_invalid_ranges(
+    monkeypatch, start_column, end_column, message
+):
+    mock_request = Mock()
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_delete_columns(
+            "book.xlsx", "Sheet1", start_column, end_column
+        )
+    )
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_delete_columns_transport_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(side_effect=requests.ConnectionError("connection dropped")),
+    )
+
+    result = json.loads(
+        excel.excel_delete_columns("book.xlsx", "Sheet1", "L", "M")
+    )
+
+    assert result["status"] == "indeterminate"
+    assert result["retry_safe"] is False
+
+
 # ---------------------------------------------------------------------------
 # ranges
 # ---------------------------------------------------------------------------

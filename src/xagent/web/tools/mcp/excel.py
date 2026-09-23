@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from typing import Annotated, Any
 from urllib.parse import quote, unquote, urlsplit
 
@@ -27,6 +28,8 @@ StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 StrictPageSize = Annotated[int, Field(strict=True, ge=1, le=MAX_COLLECTION_PAGE_SIZE)]
 
 _VALID_CLEAR_APPLY_TO = frozenset({"All", "Formats", "Contents"})
+_EXCEL_MAX_COLUMN_NUMBER = 16_384  # XFD, the last column in an Excel worksheet
+_EXCEL_COLUMN_RE = re.compile(r"^[A-Za-z]{1,3}$")
 
 
 class _GraphRequestError(RuntimeError):
@@ -218,6 +221,34 @@ def _graph_mutation_request(
             "non-idempotent request. The mutation may already have been applied; "
             "inspect the workbook before retrying."
         ) from exc
+
+
+def _column_number(column: str) -> int:
+    """Return an Excel column's one-based number after strict validation."""
+    if not isinstance(column, str):
+        raise TypeError("column must be a string")
+    normalized = column.strip().upper()
+    if not _EXCEL_COLUMN_RE.fullmatch(normalized):
+        raise ValueError(
+            "column must be an Excel column label from A through XFD"
+        )
+    number = 0
+    for char in normalized:
+        number = number * 26 + ord(char) - ord("A") + 1
+    if number > _EXCEL_MAX_COLUMN_NUMBER:
+        raise ValueError("column must be an Excel column label from A through XFD")
+    return number
+
+
+def _normalize_column_range(start_column: str, end_column: str) -> str:
+    """Build a canonical full-column range and reject reversed ranges."""
+    start = start_column.strip().upper() if isinstance(start_column, str) else start_column
+    end = end_column.strip().upper() if isinstance(end_column, str) else end_column
+    start_number = _column_number(start)
+    end_number = _column_number(end)
+    if start_number > end_number:
+        raise ValueError("start_column must not be after end_column")
+    return f"{start}:{end}"
 
 
 def _validate_page_size(page_size: int) -> int:
@@ -647,6 +678,55 @@ def excel_update_range(
         logger.error(
             "Error updating range %s on worksheet %s in %s: %s",
             address,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _error(str(e))
+
+
+@mcp.tool()
+def excel_delete_columns(
+    file_path: str,
+    worksheet: str,
+    start_column: str,
+    end_column: str,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+) -> str:
+    """Delete one or more complete worksheet columns and shift later columns left.
+
+    start_column and end_column are Excel column labels such as ``L`` and ``M``.
+    The operation removes the columns structurally, so formulas and formatting
+    move with the remaining cells. Use this instead of clearing a range when the
+    user's intent is to remove columns; clearing cells cannot delete a column and
+    may be rejected when the range contains formulas.
+    """
+    try:
+        address = _normalize_column_range(start_column, end_column)
+        base = _workbook_base(file_path, site_id, drive_id)
+        segment = _odata_key_segment("worksheets", worksheet)
+        path = f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/delete"
+        _graph_mutation_request("POST", path, body={"shift": "Left"})
+        return _success(
+            message="Columns deleted successfully",
+            worksheet=worksheet,
+            deleted_range=address,
+        )
+    except _GraphMutationIndeterminateError as e:
+        logger.error(
+            "Column deletion outcome is indeterminate for %s on worksheet %s in %s: %s",
+            start_column,
+            worksheet,
+            file_path,
+            e,
+        )
+        return _indeterminate(str(e))
+    except Exception as e:
+        logger.error(
+            "Error deleting columns %s:%s on worksheet %s in %s: %s",
+            start_column,
+            end_column,
             worksheet,
             file_path,
             e,

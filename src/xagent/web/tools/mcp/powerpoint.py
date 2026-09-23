@@ -35,9 +35,7 @@ DEFAULT_TIMEOUT_SECONDS = 30
 # _MAX_PRESENTATION_BYTES.
 _BINARY_TIMEOUT_SECONDS = 120
 
-_POWERPOINT_MIME_TYPE = (
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-)
+_POWERPOINT_MIME_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
 # Microsoft Graph exposes a PowerPoint (.pptx) file only as a driveItem
 # content blob -- there is no structured "PowerPoint API" resource (no
@@ -99,9 +97,7 @@ def _compact_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _bounded_envelope(
-    candidates: list[dict[str, Any]], *, fallback: dict[str, Any]
-) -> str:
+def _bounded_envelope(candidates: list[dict[str, Any]], *, fallback: dict[str, Any]) -> str:
     """Choose the richest valid JSON envelope that the string filter won't cut."""
     max_chars = get_tool_max_output_length()
     for payload in candidates:
@@ -129,9 +125,7 @@ def _success(**payload: Any) -> str:
     compact_payload = dict(payload)
     if "item" in compact_payload:
         compact_payload["item"] = _caller_safe_item(compact_payload["item"])
-    without_item = {
-        key: value for key, value in compact_payload.items() if key != "item"
-    }
+    without_item = {key: value for key, value in compact_payload.items() if key != "item"}
     return _bounded_envelope(
         [
             {"status": "success", **payload},
@@ -182,9 +176,7 @@ def _encode_read_cursor(index: int, etag: str, scope: str) -> str:
     return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
 
 
-def _decode_read_cursor(
-    cursor: str | None, *, etag: str, scope: str, total_count: int
-) -> int:
+def _decode_read_cursor(cursor: str | None, *, etag: str, scope: str, total_count: int) -> int:
     if cursor is None:
         return 0
     if not isinstance(cursor, str) or not cursor:
@@ -205,8 +197,7 @@ def _decode_read_cursor(
         raise ValueError("cursor is invalid") from exc
     if cursor_etag != etag:
         raise _ConflictError(
-            "The presentation changed while reading a paginated result; restart "
-            "without a cursor"
+            "The presentation changed while reading a paginated result; restart without a cursor"
         )
     if cursor_scope != scope:
         raise ValueError("cursor does not belong to this PowerPoint read operation")
@@ -256,9 +247,7 @@ def _bounded_page_response(
     next_index = start_index
     empty_page = render(items, next_index)
     if len(empty_page) > max_chars:
-        return _bounded_error(
-            "PowerPoint pagination metadata exceeds the configured output limit"
-        )
+        return _bounded_error("PowerPoint pagination metadata exceeds the configured output limit")
 
     while next_index < total_count:
         item = item_at(next_index)
@@ -290,8 +279,7 @@ def _bounded_page_response(
                 if len(omitted_response) <= max_chars:
                     return omitted_response
                 return _bounded_error(
-                    "PowerPoint oversized-item metadata exceeds the configured "
-                    "output limit"
+                    "PowerPoint oversized-item metadata exceeds the configured output limit"
                 )
             break
         items.append(item)
@@ -379,8 +367,7 @@ def _site_segment(site_id: str) -> str:
     value = site_id.strip()
     if any(segment in (".", "..", "") for segment in value.split("/")):
         raise ValueError(
-            f"site_id must not contain '.', '..', or empty (e.g. '//') segments: "
-            f"{site_id!r}"
+            f"site_id must not contain '.', '..', or empty (e.g. '//') segments: {site_id!r}"
         )
     return quote(value, safe=":/,")
 
@@ -395,15 +382,12 @@ def _normalize_relative_path(path: str) -> str:
     if not value:
         raise ValueError("file_path is required")
     if path.strip().endswith("/"):
-        raise ValueError(
-            "file_path must include a filename, not end with a folder separator"
-        )
+        raise ValueError("file_path must include a filename, not end with a folder separator")
     if "\\" in value:
         raise ValueError("file_path must use '/' separators and must not contain '\\'")
     if any(segment in (".", "..", "") for segment in value.split("/")):
         raise ValueError(
-            f"file_path must not contain '.', '..', or empty (e.g. '//') segments: "
-            f"{path!r}"
+            f"file_path must not contain '.', '..', or empty (e.g. '//') segments: {path!r}"
         )
     if value.rsplit("/", 1)[-1].endswith("."):
         raise ValueError(f"file_path filename must not end with a period: {path!r}")
@@ -480,9 +464,7 @@ def _presentation_metadata(
         )
     _require_etag(item.get("eTag"), "Graph presentation eTag")
     download_url = item.get("@microsoft.graph.downloadUrl")
-    if download_url is not None and (
-        not isinstance(download_url, str) or not download_url
-    ):
+    if download_url is not None and (not isinstance(download_url, str) or not download_url):
         raise RuntimeError("Graph returned an invalid presentation download URL")
     return item
 
@@ -503,8 +485,7 @@ def _download_preauthenticated_content(download_url: str, expected_size: int) ->
             response.raise_for_status()
         except requests.HTTPError:
             raise _GraphRequestError(
-                "PowerPoint presentation download failed with HTTP "
-                f"{response.status_code}",
+                f"PowerPoint presentation download failed with HTTP {response.status_code}",
                 status_code=response.status_code,
             ) from None
 
@@ -525,15 +506,11 @@ def _download_preauthenticated_content(download_url: str, expected_size: int) ->
         response.close()
 
     if len(content) != expected_size:
-        raise RuntimeError(
-            "PowerPoint presentation size changed while it was being downloaded"
-        )
+        raise RuntimeError("PowerPoint presentation size changed while it was being downloaded")
     return bytes(content)
 
 
-def _download_authenticated_content(
-    content_path: str, expected_size: int
-) -> bytes:
+def _download_authenticated_content(content_path: str, expected_size: int) -> bytes:
     """Download Graph ``/content`` when metadata has no signed URL.
 
     Personal OneDrive and some Graph-compatible drives omit
@@ -558,8 +535,7 @@ def _download_authenticated_content(
             response.raise_for_status()
         except requests.HTTPError:
             raise _GraphRequestError(
-                "PowerPoint presentation download failed with HTTP "
-                f"{response.status_code}",
+                f"PowerPoint presentation download failed with HTTP {response.status_code}",
                 status_code=response.status_code,
             ) from None
 
@@ -580,9 +556,7 @@ def _download_authenticated_content(
         response.close()
 
     if len(content) != expected_size:
-        raise RuntimeError(
-            "PowerPoint presentation size changed while it was being downloaded"
-        )
+        raise RuntimeError("PowerPoint presentation size changed while it was being downloaded")
     return bytes(content)
 
 
@@ -591,18 +565,12 @@ def _validate_presentation_archive(content: bytes) -> None:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             infos = archive.infolist()
             if len(infos) > _MAX_PRESENTATION_PARTS:
-                raise ValueError(
-                    "The presentation contains too many OOXML parts to process safely"
-                )
+                raise ValueError("The presentation contains too many OOXML parts to process safely")
             expanded_size = sum(info.file_size for info in infos)
             if expanded_size > _MAX_PRESENTATION_UNCOMPRESSED_BYTES:
-                raise ValueError(
-                    "The presentation expands beyond the safe OOXML processing limit"
-                )
+                raise ValueError("The presentation expands beyond the safe OOXML processing limit")
     except zipfile.BadZipFile as exc:
-        raise ValueError(
-            "The file is not a valid PowerPoint presentation OOXML archive"
-        ) from exc
+        raise ValueError("The file is not a valid PowerPoint presentation OOXML archive") from exc
 
 
 def _download_presentation(
@@ -736,8 +704,7 @@ def _upload_presentation_session(
                     ) from None
                 _cancel_upload_session(http, upload_url)
                 raise _GraphRequestError(
-                    "PowerPoint presentation upload failed with HTTP "
-                    f"{response.status_code}",
+                    f"PowerPoint presentation upload failed with HTTP {response.status_code}",
                     status_code=response.status_code,
                 ) from None
             except requests.RequestException:
@@ -771,15 +738,11 @@ def _upload_presentation_session(
                 ) from exc
             if not offsets:
                 _cancel_upload_session(http, upload_url)
-                raise RuntimeError(
-                    "Graph returned empty PowerPoint upload-session progress"
-                )
+                raise RuntimeError("Graph returned empty PowerPoint upload-session progress")
             next_start = min(offsets)
             if not start < next_start <= end:
                 _cancel_upload_session(http, upload_url)
-                raise RuntimeError(
-                    "Graph returned inconsistent PowerPoint upload-session progress"
-                )
+                raise RuntimeError("Graph returned inconsistent PowerPoint upload-session progress")
             start = next_start
 
     if not isinstance(result, dict) or not result.get("id"):
@@ -960,11 +923,7 @@ def _select_body_placeholder(slide: Any) -> Any | None:
     regardless of whether it can actually hold text.
     """
     return next(
-        (
-            ph
-            for ph in slide.placeholders
-            if ph.placeholder_format.idx != 0 and ph.has_text_frame
-        ),
+        (ph for ph in slide.placeholders if ph.placeholder_format.idx != 0 and ph.has_text_frame),
         None,
     )
 
@@ -1016,9 +975,7 @@ def _text_frame_has_distinct_run_formatting(text_frame: Any) -> bool:
         formatting: set[str | None] = set()
         for run in paragraph.runs:
             run_properties = run._r.find(qn("a:rPr"))
-            formatting.add(
-                str(run_properties.xml) if run_properties is not None else None
-            )
+            formatting.add(str(run_properties.xml) if run_properties is not None else None)
         # A DrawingML line break may carry direct character properties even
         # though python-pptx does not expose it through paragraph.runs. An
         # absent br/rPr inherits surrounding formatting and is therefore not a
@@ -1145,17 +1102,14 @@ def _delete_slide(presentation: PresentationType, slide_index: int) -> None:
                     "The slide is referenced by a custom slide show or other "
                     "presentation feature and cannot be deleted safely"
                 )
-            local_name = (
-                element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else ""
-            )
+            local_name = element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else ""
             if (
                 local_name == "sldId"
                 and target_slide_id is not None
                 and element.get("id") == target_slide_id
             ):
                 raise ValueError(
-                    "The slide is referenced by a presentation section and cannot "
-                    "be deleted safely"
+                    "The slide is referenced by a presentation section and cannot be deleted safely"
                 )
 
         target_part = presentation.part.related_part(relationship_id)
@@ -1163,13 +1117,9 @@ def _delete_slide(presentation: PresentationType, slide_index: int) -> None:
             if other_slide.part is target_part:
                 continue
             for relationship in other_slide.part.rels.values():
-                if (
-                    not relationship.is_external
-                    and relationship.target_part is target_part
-                ):
+                if not relationship.is_external and relationship.target_part is target_part:
                     raise ValueError(
-                        "The slide is linked from another slide and cannot be "
-                        "deleted safely"
+                        "The slide is linked from another slide and cannot be deleted safely"
                     )
 
     slide_id_list.remove(target)
@@ -1240,9 +1190,7 @@ def powerpoint_get_presentation_text(
     except _ConflictError as e:
         return _conflict(str(e))
     except Exception as e:
-        logger.error(
-            "Error getting text for PowerPoint presentation %s: %s", file_path, e
-        )
+        logger.error("Error getting text for PowerPoint presentation %s: %s", file_path, e)
         return _error(str(e))
 
 
@@ -1287,9 +1235,7 @@ def powerpoint_list_slides(
     except _ConflictError as e:
         return _conflict(str(e))
     except Exception as e:
-        logger.error(
-            "Error listing slides for PowerPoint presentation %s: %s", file_path, e
-        )
+        logger.error("Error listing slides for PowerPoint presentation %s: %s", file_path, e)
         return _error(str(e))
 
 
@@ -1376,9 +1322,7 @@ def powerpoint_set_shape_text(
         slide_index = _require_int(slide_index, "slide_index")
         shape_index = _require_int(shape_index, "shape_index")
         expected_etag = _require_etag(expected_etag)
-        snapshot = _download_presentation(
-            file_path, site_id, drive_id, expected_etag=expected_etag
-        )
+        snapshot = _download_presentation(file_path, site_id, drive_id, expected_etag=expected_etag)
         presentation = snapshot.presentation
         slide = _require_slide(presentation, slide_index)
         shape_count = len(slide.shapes)
@@ -1407,9 +1351,7 @@ def powerpoint_set_shape_text(
                 "replacement -- edit this shape directly in PowerPoint instead"
             )
         _replace_text_frame_text(shape.text_frame, text)
-        item = _upload_presentation(
-            presentation, file_path, site_id, drive_id, expected_etag
-        )
+        item = _upload_presentation(presentation, file_path, site_id, drive_id, expected_etag)
         return _success(item=item)
     except _ConflictError as e:
         return _conflict(str(e))
@@ -1455,9 +1397,7 @@ def powerpoint_add_slide(
     try:
         layout_index = _require_int(layout_index, "layout_index")
         expected_etag = _require_etag(expected_etag)
-        snapshot = _download_presentation(
-            file_path, site_id, drive_id, expected_etag=expected_etag
-        )
+        snapshot = _download_presentation(file_path, site_id, drive_id, expected_etag=expected_etag)
         presentation = snapshot.presentation
         layouts = presentation.slide_layouts
         if not 0 <= layout_index < len(layouts):
@@ -1470,8 +1410,7 @@ def powerpoint_add_slide(
         if title is not None:
             if slide.shapes.title is None:
                 raise ValueError(
-                    f"slide layout {layout_index} has no title placeholder; "
-                    "title was not applied"
+                    f"slide layout {layout_index} has no title placeholder; title was not applied"
                 )
             slide.shapes.title.text = title
             title_applied = True
@@ -1485,9 +1424,7 @@ def powerpoint_add_slide(
                 )
             body_placeholder.text_frame.text = body_text
             body_applied = True
-        item = _upload_presentation(
-            presentation, file_path, site_id, drive_id, expected_etag
-        )
+        item = _upload_presentation(presentation, file_path, site_id, drive_id, expected_etag)
         return _success(
             item=item,
             slide_index=len(presentation.slides) - 1,
@@ -1499,9 +1436,7 @@ def powerpoint_add_slide(
     except _IndeterminateWriteError as e:
         return _indeterminate(str(e))
     except Exception as e:
-        logger.error(
-            "Error adding slide to PowerPoint presentation %s: %s", file_path, e
-        )
+        logger.error("Error adding slide to PowerPoint presentation %s: %s", file_path, e)
         return _error(str(e))
 
 
@@ -1563,14 +1498,10 @@ def powerpoint_delete_slide(
     try:
         slide_index = _require_int(slide_index, "slide_index")
         expected_etag = _require_etag(expected_etag)
-        snapshot = _download_presentation(
-            file_path, site_id, drive_id, expected_etag=expected_etag
-        )
+        snapshot = _download_presentation(file_path, site_id, drive_id, expected_etag=expected_etag)
         presentation = snapshot.presentation
         _delete_slide(presentation, slide_index)
-        item = _upload_presentation(
-            presentation, file_path, site_id, drive_id, expected_etag
-        )
+        item = _upload_presentation(presentation, file_path, site_id, drive_id, expected_etag)
         return _success(item=item)
     except _ConflictError as e:
         return _conflict(str(e))

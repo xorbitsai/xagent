@@ -14,10 +14,18 @@ budget into every stdio config's env before tools are built from it. The
 parent's own filter (``ToolFactory._apply_output_filters``) computes its
 budget once from ``config.get_max_output_length()`` and applies it
 uniformly to every tool -- there is no per-server override on the parent
-side -- so a pre-existing per-server env value is always OVERWRITTEN, never
-preserved: keeping a larger existing value would still let the parent's
-blind slice cut a child response sized to a budget the parent itself has
-no way to honor, exactly reproducing the bug this mechanism exists to fix.
+side. A config's own env can still carry a legitimate, narrower cap for
+one connector (e.g. an operator deliberately limiting a noisy one below
+the parent's default) -- that's never a corruption risk, since the
+parent's blind slice only fires once a response is at or beyond ITS
+budget, so a child bounded below that is never touched. A pre-existing
+value is therefore PRESERVED exactly when it's a valid positive integer
+at or below the parent's effective budget; anything else (missing, not a
+positive integer, or LARGER than the parent's budget) is overwritten with
+the parent's effective value -- a larger existing value in particular
+would otherwise let the parent's blind slice cut a child response sized
+to a bigger, unaligned budget, exactly reproducing the bug this mechanism
+exists to fix.
 
 The one exception is a server that bypasses the generic MCP loader for its
 own actor/execution-scoped session consumer (e.g. chrome-devtools), which
@@ -145,13 +153,54 @@ async def test_other_env_entries_survive_untouched(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "existing",
+    ["4096", 4096, "12345", 12345],
+    ids=["smaller-str", "smaller-int", "equal-str", "equal-int"],
+)
+async def test_valid_override_at_or_below_parent_budget_is_preserved(
+    monkeypatch, caplog, existing
+):
+    """A config's own env can carry a legitimate, narrower cap for one
+    connector (e.g. an operator deliberately limiting a noisy one below the
+    parent's default) -- overwriting it unconditionally would silently
+    widen a resource bound someone set on purpose, even though it poses no
+    corruption risk: the parent's blind slice only fires once a response
+    is at or beyond ITS budget, so a child bounded at or below that is
+    never touched. It must survive, canonicalized to a plain string, with
+    no warning (nothing here is actually wrong)."""
+    captured: dict = {}
+    _capture_create(monkeypatch, captured)
+
+    config = _FakeConfig(
+        [
+            {
+                "name": "jira",
+                "transport": "stdio",
+                "config": {
+                    "command": "python",
+                    "args": [],
+                    "env": {TOOL_MAX_OUTPUT_LENGTH: existing},
+                },
+            }
+        ]
+    )
+    with caplog.at_level(logging.WARNING):
+        await create_mcp_tools(config)
+
+    (cfg,) = captured["mcp_configs"]
+    env = cfg["config"]["env"]
+    assert env[TOOL_MAX_OUTPUT_LENGTH] == str(int(existing))
+    assert not any("isn't a valid" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "existing",
     [
-        "4096",  # a SMALLER numeric string -- harmless on its own, but the
-        4096,  # parent has no way to honor a per-server value either way
-        400,  # LARGER than the parent's effective budget: the actual bug
-        "400",  # this round fixes -- a valid, larger child budget must not
-        # survive, or the parent's blind slice (which knows only its own,
-        # smaller budget) still corrupts a response sized to this one.
+        99999,  # LARGER than the parent's effective budget (12345): the
+        "99999",  # actual bug this whole mechanism exists to fix -- a
+        # valid, larger child budget must not survive, or the parent's
+        # blind slice (which knows only its own, smaller budget) still
+        # corrupts a response sized to this one.
         True,
         False,
         3.7,
@@ -163,8 +212,6 @@ async def test_other_env_entries_survive_untouched(monkeypatch):
         "not-a-number",
     ],
     ids=[
-        "smaller-str",
-        "smaller-int",
         "larger-int",
         "larger-str",
         "bool-true",
@@ -178,17 +225,16 @@ async def test_other_env_entries_survive_untouched(monkeypatch):
         "non-numeric-str",
     ],
 )
-async def test_any_existing_output_limit_override_is_overwritten_and_warned(
+async def test_invalid_or_larger_existing_override_is_overwritten_and_warned(
     monkeypatch, caplog, existing
 ):
-    """The parent's own filter (``ToolFactory._apply_output_filters``) has
-    no per-server override of its own -- it always uses
-    ``config.get_max_output_length()`` -- so ANY pre-existing per-server
-    value, valid or not, smaller or larger, must be overwritten with that
-    same effective value rather than preserved. Preserving a larger one
-    would leave the child able to produce a response the parent's blind
-    slice still cuts mid-structure, exactly reproducing the bug this
-    mechanism exists to fix."""
+    """Anything that ISN'T a valid, positive integer at or below the
+    parent's own effective budget must be overwritten with that effective
+    value rather than preserved. A larger value in particular would leave
+    the child able to produce a response the parent's blind slice still
+    cuts mid-structure, exactly reproducing the bug this mechanism exists
+    to fix; the rest (wrong type, non-numeric, non-positive) would simply
+    make the real child-side getter fall back to its own default anyway."""
     captured: dict = {}
     _capture_create(monkeypatch, captured)
 
@@ -211,15 +257,15 @@ async def test_any_existing_output_limit_override_is_overwritten_and_warned(
     (cfg,) = captured["mcp_configs"]
     env = cfg["config"]["env"]
     assert env[TOOL_MAX_OUTPUT_LENGTH] == "12345"
-    assert any("has no way to honor" in r.message for r in caplog.records)
+    assert any("isn't a valid" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_existing_override_already_matching_is_not_re_warned(monkeypatch, caplog):
     """An existing value that already equals the parent's effective budget
     (e.g. this function ran once already, or the value was set to match on
-    purpose) is still normalized in place, but doesn't spam a warning on
-    every call -- only an actual mismatch is worth flagging."""
+    purpose) is preserved without spamming a warning on every call -- only
+    an actual replacement is worth flagging."""
     captured: dict = {}
     _capture_create(monkeypatch, captured)
 
@@ -241,7 +287,7 @@ async def test_existing_override_already_matching_is_not_re_warned(monkeypatch, 
 
     (cfg,) = captured["mcp_configs"]
     assert cfg["config"]["env"][TOOL_MAX_OUTPUT_LENGTH] == "12345"
-    assert not any("has no way to honor" in r.message for r in caplog.records)
+    assert not any("isn't a valid" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio

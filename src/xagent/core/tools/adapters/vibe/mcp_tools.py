@@ -54,12 +54,22 @@ def _apply_stdio_output_limit_env(
 
     ``_apply_output_filters`` (factory.py) computes ``max_chars`` once from
     ``config.get_max_output_length()`` and applies it uniformly to every
-    tool -- there is no per-server override on the parent side. So a
-    pre-existing per-server value in a config's own env is *always*
-    overwritten here rather than preserved: keeping a value the parent
-    itself has no way to honor would defeat the whole point of mirroring
-    one, and would still let the parent's blind slice cut a child response
-    sized to a larger, unaligned budget.
+    tool -- there is no per-server override on the parent side. A config's
+    own env can still carry an explicit, narrower cap for one connector
+    (e.g. an operator deliberately limiting a noisy one to 4096 chars via
+    its ``UserMCPServer.env``/global env, on a deployment whose parent
+    budget defaults to 50k) -- that's a legitimate, self-imposed limit on
+    what the CHILD produces, orthogonal to the parent/child alignment
+    problem this function exists to fix, and it never risks corrupting
+    anything: the parent's slice point only matters once a response is
+    already at or beyond it, so a child bounded to less than the parent's
+    budget is never touched by the parent's filter at all. So a
+    pre-existing value is preserved exactly when it validates as a
+    positive integer AT OR BELOW the parent's effective value; anything
+    else (missing, not a positive integer, or larger than the parent's
+    budget) is replaced with the parent's effective value -- a larger
+    existing value in particular would otherwise let the parent's blind
+    slice cut a child response sized to a bigger, unaligned budget.
 
     ``exempt_server_names`` must list every server that bypasses the
     generic MCP loader for its own actor/execution-scoped session consumer
@@ -79,7 +89,7 @@ def _apply_stdio_output_limit_env(
     # don't define get_max_output_length() at all, and the old, per-entry
     # call site never reached it when there were no stdio entries to act
     # on -- calling it unconditionally up front would call it even then.
-    effective_value: str | None = None
+    effective_value: int | None = None
 
     result: list[dict[str, Any]] = []
     for cfg in mcp_configs:
@@ -104,20 +114,32 @@ def _apply_stdio_output_limit_env(
             result.append(cfg)
             continue
         if effective_value is None:
-            effective_value = str(config.get_max_output_length())
+            effective_value = config.get_max_output_length()
         env = dict(existing_env or {})
         existing = env.get(TOOL_MAX_OUTPUT_LENGTH)
-        if existing is not None and str(existing) != effective_value:
-            logger.warning(
-                "Stdio MCP server %r had its own %s override (%r), which the "
-                "parent's own output filter has no way to honor; overwriting "
-                "it with the effective value (%s) to keep both sides aligned",
-                server_name,
-                TOOL_MAX_OUTPUT_LENGTH,
-                existing,
-                effective_value,
-            )
-        env[TOOL_MAX_OUTPUT_LENGTH] = effective_value
+        parsed: int | None = None
+        if isinstance(existing, str) or (
+            isinstance(existing, int) and not isinstance(existing, bool)
+        ):
+            try:
+                parsed = int(existing)
+            except (TypeError, ValueError):
+                parsed = None
+        if parsed is not None and 0 < parsed <= effective_value:
+            env[TOOL_MAX_OUTPUT_LENGTH] = str(parsed)
+        else:
+            if existing is not None:
+                logger.warning(
+                    "Stdio MCP server %r had a %s override (%r) that isn't a "
+                    "valid, positive value at or below the parent's own "
+                    "effective budget (%s); replacing it with the effective "
+                    "value",
+                    server_name,
+                    TOOL_MAX_OUTPUT_LENGTH,
+                    existing,
+                    effective_value,
+                )
+            env[TOOL_MAX_OUTPUT_LENGTH] = str(effective_value)
         result.append({**cfg, "config": {**inner_config, "env": env}})
     return result
 

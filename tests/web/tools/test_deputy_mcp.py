@@ -641,6 +641,24 @@ def test_create_resource_rejects_employee_without_calling_api(monkeypatch):
     mock_request.assert_not_called()
 
 
+@pytest.mark.parametrize("resource", ["employee", "EMPLOYEE", " Employee", "Employee "])
+def test_create_resource_rejects_employee_regardless_of_case_or_whitespace(
+    monkeypatch, resource
+):
+    """The guard must not be an exact-string match a caller can bypass by
+    guessing a different casing -- that would silently fall through to a
+    live POST and reproduce the exact incident this rejection exists to
+    prevent."""
+    mock_request = Mock()
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource(resource, {"FirstName": "Peter"}))
+
+    assert result["status"] == "error"
+    assert "deputy_add_employee" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_create_resource_returns_error_on_failure(monkeypatch):
     monkeypatch.setattr(
         deputy.requests,
@@ -876,14 +894,19 @@ def test_add_employee_warns_instead_of_confident_success_on_empty_response(
     assert "deputy_query_resource" in result["warning"]
 
 
-def test_add_employee_is_annotated_as_non_idempotent_destructive_write():
+def test_add_employee_is_annotated_as_non_idempotent_non_destructive_write():
     """Must declare idempotentHint=False (a retried create on a timeout
     can duplicate the employee, like deputy_create_resource) so the ReAct
-    duplicate-write guard enrolls it."""
+    duplicate-write guard enrolls it, and destructiveHint=False to match
+    deputy_create_resource -- this is a pure additive create (per
+    mcp_adapter.py's own definition, "destructiveHint false = only
+    additive updates"), not an overwrite of an existing record like
+    deputy_update_resource."""
     tool = deputy.mcp._tool_manager.get_tool("deputy_add_employee")
 
     assert tool.annotations is not None
     assert tool.annotations.idempotentHint is False
+    assert tool.annotations.destructiveHint is False
 
 
 # ---------------------------------------------------------------------------

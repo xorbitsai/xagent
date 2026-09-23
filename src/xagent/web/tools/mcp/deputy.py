@@ -49,8 +49,9 @@ def _record_response(context: str, result: Any, *, field_name: str = "record") -
     """Wrap a single dict-shaped Deputy API response, or an error if it
     isn't one. Shared by every tool that expects exactly one record back
     (deputy_get_current_user's "/me", deputy_get_resource's/
-    deputy_create_resource's/deputy_update_resource's {resource}), which
-    otherwise repeat this same isinstance-check-then-cap shape verbatim.
+    deputy_create_resource's/deputy_update_resource's {resource}/
+    deputy_add_employee's "Employee"), which otherwise repeat this same
+    isinstance-check-then-cap shape verbatim.
 
     ``context`` is the resource name (or "/me") to name in the error
     message on a malformed response -- not necessarily the same string as
@@ -60,6 +61,28 @@ def _record_response(context: str, result: Any, *, field_name: str = "record") -
     if not isinstance(result, dict):
         return _error(f"Deputy returned an unexpected response for {context}")
     return success_with_capped_dict(field_name, result)
+
+
+def _empty_create_response(subject: str) -> str:
+    """Shared by every create tool (deputy_create_resource,
+    deputy_add_employee): an empty ``{}`` (a 204, or a 200 with no body --
+    both normalized by ``_request``) after an otherwise-successful POST is
+    a genuine "we don't know" for a create -- unlike a get/list, an empty
+    response here isn't a valid "no data" result, but it's also not
+    necessarily a failure, since Deputy already returned a non-error
+    status. A flat ``_error`` here would be misleading (it reads as
+    "nothing happened, safe to retry"), which is exactly the wrong signal
+    for a non-idempotent write -- so this stays a success, with an
+    explicit warning instead of a silent, confident-looking blank record.
+    """
+    return _success(
+        record={},
+        warning=(
+            f"Deputy returned no content for this {subject} create -- the "
+            "record may or may not have been created, and its id is "
+            "unknown. Use deputy_query_resource to check before retrying."
+        ),
+    )
 
 
 def _success_with_capped_list(
@@ -379,7 +402,12 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
     whether the record already exists before retrying a failed call.
     """
     try:
-        if resource == "Employee":
+        # Case/whitespace-insensitive: Deputy's own resource-name routing
+        # is not guaranteed to be case-sensitive, and an LLM caller
+        # guessing "employee"/"EMPLOYEE" instead of the exact string
+        # "Employee" must not bypass this guard and reproduce the exact
+        # incident it exists to prevent.
+        if resource.strip().casefold() == "employee":
             # A bare POST /resource/Employee inserts an Employee row with
             # no location/workplace membership -- Deputy's permission
             # model is scoped by location, so the resulting record is then
@@ -411,34 +439,15 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
             return _error("No data provided to create record")
         safe_resource = url_path_id(resource, "resource")
         result = _request("POST", f"/resource/{safe_resource}", json_data=create_data)
-        # An empty {} (a 204, or a 200 with no body -- both normalized by
-        # _request) is a genuine "we don't know" for a create: unlike a
-        # get/list, an empty response here isn't a valid "no data" result,
-        # but it's also not necessarily a failure -- Deputy already
-        # returned a non-error status, so the record may well exist with
-        # no id available to confirm it or retry safely against. A flat
-        # `_error` here would be misleading (it reads as "nothing
-        # happened, safe to retry"), which is exactly the wrong signal
-        # for a non-idempotent write -- so this stays a success, with an
-        # explicit warning instead of a silent, confident-looking blank
-        # record.
         if isinstance(result, dict) and not result:
-            return _success(
-                record={},
-                warning=(
-                    f"Deputy returned no content for this {resource} create -- "
-                    "the record may or may not have been created, and its id "
-                    "is unknown. Use deputy_query_resource to check before "
-                    "retrying."
-                ),
-            )
+            return _empty_create_response(resource)
         return _record_response(resource, result)
     except Exception as e:
         logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
         return _error(str(e))
 
 
-@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
 def deputy_add_employee(
     first_name: str,
     last_name: str,
@@ -485,6 +494,20 @@ def deputy_add_employee(
     up their own Deputy login. Defaults to false -- only set true once
     the caller has confirmed this employee should get app access.
 
+    This endpoint has no field for AllowAppraisal (or any Employee field
+    outside the ones listed above) -- to set those, follow up with
+    deputy_update_resource("Employee", <new id>, {...}) after this call.
+
+    Deputy's official field reference for this endpoint
+    (developer.deputy.com/reference/addanemployee) does not document
+    email/role/stress-profile/invite fields at all; the names used here
+    (strEmail, intRoleId, intStressProfile, blnSendInvite) come from a
+    separate example in Deputy's own docs that is not confirmed against a
+    live account. If a create reports success but email/role/stress
+    profile/invite don't show up on the resulting record, Deputy is
+    silently ignoring that field -- verify with deputy_get_resource
+    afterward rather than trusting this call's reported success alone.
+
     This is not idempotent: retrying after a timeout or connection error
     can create a duplicate record. Use deputy_query_resource("Employee",
     ...) to check whether the record already exists before retrying a
@@ -530,19 +553,8 @@ def deputy_add_employee(
         if weekday_rate is not None:
             body["fltWeekDayRate"] = weekday_rate
         result = _request("POST", "/supervise/employee", json_data=body)
-        # See deputy_create_resource's identical empty-response handling --
-        # a 204/empty body here is equally ambiguous for a non-idempotent
-        # employee create.
         if isinstance(result, dict) and not result:
-            return _success(
-                record={},
-                warning=(
-                    "Deputy returned no content for this employee create -- "
-                    "the record may or may not have been created, and its "
-                    "id is unknown. Use deputy_query_resource to check "
-                    "before retrying."
-                ),
-            )
+            return _empty_create_response("employee")
         return _record_response("Employee", result)
     except Exception as e:
         logger.error(f"Error adding Deputy employee: {e}", exc_info=True)
@@ -565,7 +577,10 @@ def deputy_update_resource(
     "Timesheet", or "Leave".
     resource_id: the record's numeric id, as a string (e.g. "123").
     data: field name -> value pairs to change, e.g. {"Active": False} to
-    deactivate an Employee.
+    deactivate an Employee. For "Employee", fields like "Company",
+    "Contact", "Role", and "StressProfile" are ids referencing other
+    records, not literal values -- look up a valid id first (e.g. via
+    deputy_list_resource) rather than guessing one.
     """
     try:
         # "Id" is identified by resource_id/the URL, not data: the URL's

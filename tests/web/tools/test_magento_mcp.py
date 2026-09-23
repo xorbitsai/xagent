@@ -978,6 +978,66 @@ def test_list_products_survives_an_aggressively_low_output_limit(monkeypatch):
     assert result["products"]["products"] == []
 
 
+def test_list_products_re_caps_after_merging_pagination_metadata(monkeypatch):
+    # Confirmed bug: success_with_capped_dict("products", {"products": items})
+    # sizes its response to fit XAGENT_TOOL_MAX_OUTPUT_LENGTH, but
+    # has_more/next_page are merged in as top-level siblings *after* that
+    # capping decision, with no re-check that the enlarged payload still
+    # fits -- the same patch-after-the-fact anti-pattern zendesk.py's
+    # _list_offset_paginated docstring calls out by name elsewhere in this
+    # package. At this exact limit the capped dict alone is 70 bytes (fits),
+    # but naively appending has_more/next_page grows it to 104 bytes (no
+    # longer fits) -- confirmed by calling success_with_capped_dict directly
+    # and merging in has_more/next_page the old, unchecked way.
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "80")
+    items = [{"sku": f"SKU-{i}", "name": "x" * 20} for i in range(20)]
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(return_value=MockResponse(json_data={"items": items, "total_count": 100})),
+    )
+
+    capped_alone = mcp_utils.success_with_capped_dict("products", {"products": items})
+    assert len(capped_alone) <= 80
+    unchecked_merge = json.loads(capped_alone)
+    unchecked_merge.setdefault("products", {}).setdefault("products", [])
+    unchecked_merge["has_more"] = True
+    unchecked_merge["next_page"] = 2
+    assert len(json.dumps(unchecked_merge, ensure_ascii=False)) > 80
+
+    raw = magento.magento_list_products(limit=20, page=1)
+    result = json.loads(raw)
+
+    assert len(raw) <= 80
+    assert result["status"] == "success"
+    assert result["has_more"] is True
+    assert result["next_page"] == 2
+
+
+def test_list_products_falls_back_to_compact_response_when_still_over_cap(
+    monkeypatch,
+):
+    # Even after dropping every returned item, the required has_more/
+    # next_page/truncated fields plus the envelope skeleton can still
+    # exceed an aggressively low limit. The tool must still return a
+    # bounded, valid response instead of one that exceeds the configured
+    # cap.
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "70")
+    items = [{"sku": f"SKU-{i}", "name": "x" * 20} for i in range(20)]
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        Mock(return_value=MockResponse(json_data={"items": items, "total_count": 100})),
+    )
+
+    raw = magento.magento_list_products(limit=20, page=1)
+    result = json.loads(raw)
+
+    assert len(raw) <= 70
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
 def test_list_products_drops_malformed_items_instead_of_phantom_records(monkeypatch):
     # A malformed item (not a dict) would otherwise summarize to {} via
     # _as_record() and appear as a phantom all-None record indistinguishable

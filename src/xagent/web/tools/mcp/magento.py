@@ -14,6 +14,7 @@ import requests
 import urllib3.util.connection as urllib3_connection
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from ....core.tools.core.web_content import get_trusted_proxy_url
 from ....core.utils.security import (
     PrivateNetworkHostError,
@@ -691,17 +692,76 @@ def _list_search(
             len(items) - len(summaries),
             result_key,
         )
-    capped = json.loads(success_with_capped_dict(result_key, {result_key: summaries}))
-    # Under an aggressively low XAGENT_TOOL_MAX_OUTPUT_LENGTH, the compact
-    # fallback may omit the outer result field entirely because even the
-    # normal success skeleton cannot fit. Rebuild the list wrapper before
-    # adding pagination metadata so this adapter never indexes a field the
-    # shared capper was allowed to discard.
-    result_wrapper = capped.setdefault(result_key, {})
-    result_wrapper.setdefault(result_key, [])
-    capped["has_more"] = has_more
-    capped["next_page"] = current_page + 1 if has_more else None
-    return json.dumps(capped, ensure_ascii=False)
+
+    def _build(page_summaries: list[dict[str, Any]]) -> str:
+        capped = json.loads(
+            success_with_capped_dict(result_key, {result_key: page_summaries})
+        )
+        # Under an aggressively low XAGENT_TOOL_MAX_OUTPUT_LENGTH, the compact
+        # fallback may omit the outer result field entirely because even the
+        # normal success skeleton cannot fit. Rebuild the list wrapper before
+        # adding pagination metadata so this adapter never indexes a field the
+        # shared capper was allowed to discard.
+        result_wrapper = capped.setdefault(result_key, {})
+        result_wrapper.setdefault(result_key, [])
+        capped["has_more"] = has_more
+        capped["next_page"] = current_page + 1 if has_more else None
+        return json.dumps(capped, ensure_ascii=False)
+
+    max_output_length = get_tool_max_output_length()
+    response = _build(summaries)
+    # success_with_capped_dict only sizes the payload up to result_key's own
+    # contents -- it has no visibility into has_more/next_page, which are
+    # merged in afterward as top-level siblings (see the comment above).
+    # That patch-after-the-fact append can itself push the response back
+    # over the cap -- the exact anti-pattern zendesk.py's
+    # _list_offset_paginated docstring calls out by name. Re-check and keep
+    # shrinking the item list here rather than trusting the capper's
+    # internal budget to already account for fields it never saw.
+    while len(response) > max_output_length and summaries:
+        summaries = summaries[: len(summaries) // 2]
+        response = _build(summaries)
+    if len(response) <= max_output_length:
+        return response
+
+    # Even an empty item list plus the required pagination metadata doesn't
+    # fit. Fall back to progressively smaller, still contract-preserving
+    # payloads (mirrors conflict_response's own candidates fallback in
+    # utils.py) instead of returning something over budget -- dropping the
+    # (already-empty) result wrapper before dropping next_page, since a
+    # caller can still resume pagination without the former but not the
+    # latter.
+    next_page = current_page + 1 if has_more else None
+    candidates = (
+        json.dumps(
+            {
+                "status": "success",
+                result_key: {result_key: []},
+                "has_more": has_more,
+                "next_page": next_page,
+                "truncated": True,
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "status": "success",
+                "has_more": has_more,
+                "next_page": next_page,
+                "truncated": True,
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {"status": "success", "has_more": has_more, "truncated": True},
+            ensure_ascii=False,
+        ),
+        json.dumps({"status": "success", "truncated": True}, ensure_ascii=False),
+    )
+    for candidate in candidates:
+        if len(candidate) <= max_output_length:
+            return candidate
+    return json.dumps({"status": "success"}, ensure_ascii=False)
 
 
 def _as_record(value: Any) -> dict[str, Any] | None:

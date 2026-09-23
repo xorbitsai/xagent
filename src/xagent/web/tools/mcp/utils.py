@@ -267,6 +267,7 @@ def success_with_capped_dict(
     data: Any,
     *,
     extra_fields: dict[str, Any] | None = None,
+    critical_fields: dict[str, Any] | None = None,
 ) -> str:
     """Build a ``{"status": "success", ...}`` payload, trimming a dict
     until it fits the platform's output limit.
@@ -317,26 +318,33 @@ def success_with_capped_dict(
     guarantee they won't be the ones to empty it needlessly.
 
     ``extra_fields`` adds fixed top-level response fields that must be counted
-    while trimming the dict, such as a calendar event's derived Meet link.
-    Reserved envelope keys cannot be overridden. If the payload is still too
-    large once ``data`` itself is fully truncated, the last resort walks a
-    ladder from most to least informative: the record's id (if it has one)
-    with the extras intact; then an empty record with the extras intact;
-    then the id with each extra field whose value is bigger than the
-    ``True`` placeholder degraded to ``True`` (largest first, same
-    size-gate as the field marker above); then the id alone; then an empty
-    record with those same degraded extras; and only then an empty record
-    with no extras at all. The id is given up for extras only while those
-    extras are intact: a real Meet link that fits beside an empty record
-    beats keeping only the id (that rung is what stops a long id from
-    crowding the link out entirely). Once the extras are degraded to an
-    uninformative ``True`` placeholder, though, the id is worth keeping
-    again over losing it for that placeholder: id-alone outranks a
-    degraded placeholder that dropped the id (an id you can look the
-    record up by beats a flag that says nothing). But the id still keeps
-    any degraded extra that fits beside it -- id with degraded extras
-    outranks id alone, since keeping both costs nothing once the id
-    already fits.
+    while trimming the dict, such as a calendar event's derived Meet link --
+    these can still be dropped by the last-resort fallback below if space
+    runs out. ``critical_fields`` are the same shape but survive even that
+    fallback, including every rung of the ladder described below: a signal
+    like "this create's record could not be confirmed" matters more than
+    the record data it's attached to, and silently dropping it under size
+    pressure would defeat the reason it exists. Reserved envelope keys
+    cannot be overridden by either, and the two must not share a key.
+
+    If the payload is still too large once ``data`` itself is fully
+    truncated, the last resort walks a ladder from most to least
+    informative: the record's id (if it has one) with the extras intact;
+    then an empty record with the extras intact; then the id with each
+    extra field whose value is bigger than the ``True`` placeholder
+    degraded to ``True`` (largest first, same size-gate as the field
+    marker above); then the id alone; then an empty record with those same
+    degraded extras; and only then an empty record with no extras at all.
+    The id is given up for extras only while those extras are intact: a
+    real Meet link that fits beside an empty record beats keeping only the
+    id (that rung is what stops a long id from crowding the link out
+    entirely). Once the extras are degraded to an uninformative ``True``
+    placeholder, though, the id is worth keeping again over losing it for
+    that placeholder: id-alone outranks a degraded placeholder that
+    dropped the id (an id you can look the record up by beats a flag that
+    says nothing). But the id still keeps any degraded extra that fits
+    beside it -- id with degraded extras outranks id alone, since keeping
+    both costs nothing once the id already fits.
 
     With two or more ``extra_fields``, the degradation order (largest
     field first) is a fixed chain, not a search: it never tries "degrade
@@ -348,7 +356,9 @@ def success_with_capped_dict(
     only ever sets one ``extra_fields`` key at a time, so this doesn't
     arise in practice; a caller that starts passing several extras at
     once should be aware the ladder doesn't search for the best-fitting
-    combination, only degrades in size order.
+    combination, only degrades in size order. ``critical_fields`` never
+    enters this degradation ladder at all -- it's simply present in every
+    candidate the ladder produces, at full size, unconditionally.
     """
     if field_name in ("status", "truncated"):
         # Not just an extra_fields collision: `field_name: payload` would
@@ -361,11 +371,15 @@ def success_with_capped_dict(
             f"field_name must not be a reserved envelope key: {field_name!r}"
         )
     extras = extra_fields or {}
+    critical = critical_fields or {}
     reserved_fields = {"status", field_name, "truncated"}
-    if reserved_fields.intersection(extras):
+    if reserved_fields.intersection(extras) or reserved_fields.intersection(critical):
         raise ValueError(
-            "extra_fields must not override status, the capped field, or truncated"
+            "extra_fields/critical_fields must not override status, the "
+            "capped field, or truncated"
         )
+    if set(extras) & set(critical):
+        raise ValueError("extra_fields and critical_fields must not share a key")
 
     max_output_length = max(_MIN_OUTPUT_LENGTH, get_tool_max_output_length())
 
@@ -380,6 +394,7 @@ def success_with_capped_dict(
                 "status": "success",
                 field_name: payload,
                 **(extras if extras_override is None else extras_override),
+                **critical,
                 "truncated": truncated,
             },
             ensure_ascii=False,
@@ -533,12 +548,20 @@ def success_with_capped_dict(
             for record, step_extras in rungs
         ]
         candidates.append(
-            json.dumps({"status": "success", "truncated": True}, ensure_ascii=False)
+            json.dumps(
+                {"status": "success", **critical, "truncated": True},
+                ensure_ascii=False,
+            )
         )
         for candidate in candidates:
             if len(candidate) <= max_output_length:
                 return candidate
-        return json.dumps({"status": "success"}, ensure_ascii=False)
+        # Even this absolute last resort keeps critical_fields -- dropping
+        # them here would mean the one guarantee this parameter exists to
+        # make ("this signal is never silently lost to truncation") holds
+        # everywhere except the single case it matters most: when nothing
+        # else fit at all.
+        return json.dumps({"status": "success", **critical}, ensure_ascii=False)
     return response
 
 

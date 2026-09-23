@@ -791,6 +791,26 @@ def test_create_resource_downgrades_to_warning_when_readback_fails(monkeypatch):
     assert mock_request.call_count == 2
 
 
+def test_create_resource_returns_the_freshly_read_record_when_verified(monkeypatch):
+    """A verified create returns what the readback GET actually found, not
+    the stale POST response -- since a full GET is already being paid for
+    to verify existence, prefer it over data Deputy may have normalized or
+    defaulted differently by the time it's read back."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "FirstName": "Peter"}),
+            MockResponse(json_data={"Id": 123, "FirstName": "Peter", "Active": True}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "FirstName": "Peter", "Active": True}
+    assert "warning" not in result
+
+
 def test_create_resource_downgrades_to_warning_when_readback_returns_empty(
     monkeypatch,
 ):
@@ -1342,3 +1362,56 @@ def test_success_with_capped_dict_last_resort_fallback_keeps_capitalized_id(
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert result["record"] == {"Id": 123}
+
+
+def test_success_with_capped_dict_critical_fields_survive_last_resort_fallback(
+    monkeypatch,
+):
+    """Unlike extra_fields (previous test), critical_fields must NOT be
+    dropped by the last-resort fallback -- this is what
+    _verify_created_record relies on so an unconfirmed-create warning is
+    never silently lost to truncation, which would reproduce the exact
+    "confident-looking success" failure this mechanism exists to catch."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 140)
+
+    raw = mcp_utils.success_with_capped_dict(
+        "record",
+        {"Id": 123, "Notes": "x" * 5000},
+        critical_fields={"warning": "y" * 60},
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["record"] == {"Id": 123}
+    assert result["warning"] == "y" * 60
+
+
+def test_success_with_capped_dict_critical_fields_survive_absolute_fallback(
+    monkeypatch,
+):
+    """Even when nothing else fits at all (the id-only candidate and the
+    bare-status candidate both still exceed the limit), critical_fields
+    must still come through -- silently dropping them here, of all
+    places, would be the worst possible time to lose the signal."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 10)
+
+    raw = mcp_utils.success_with_capped_dict(
+        "record",
+        {"Id": 123, "Notes": "x" * 5000},
+        critical_fields={"warning": "unconfirmed"},
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["warning"] == "unconfirmed"
+
+
+def test_success_with_capped_dict_rejects_overlapping_extra_and_critical_fields():
+    with pytest.raises(ValueError, match="must not share a key"):
+        mcp_utils.success_with_capped_dict(
+            "record",
+            {"Id": 1},
+            extra_fields={"note": "a"},
+            critical_fields={"note": "b"},
+        )

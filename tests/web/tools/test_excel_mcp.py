@@ -12,9 +12,7 @@ class MockResponse:
     def __init__(self, json_data=None, status_code=200, content=None, url=None):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
-        self.content = (
-            json.dumps(self._json_data).encode("utf-8") if content is None else content
-        )
+        self.content = json.dumps(self._json_data).encode("utf-8") if content is None else content
         self.text = self.content.decode("utf-8", errors="replace")
         self.url = url or "https://graph.microsoft.com/v1.0/example"
         self.closed = False
@@ -84,9 +82,7 @@ def test_workbook_base_terminates_path_form_site_before_default_drive():
 
 def test_workbook_base_terminates_path_form_site_before_specific_drive():
     assert (
-        excel._workbook_base(
-            "book.xlsx", "contoso.sharepoint.com:/teams/finance", "drive-1"
-        )
+        excel._workbook_base("book.xlsx", "contoso.sharepoint.com:/teams/finance", "drive-1")
         == "/sites/contoso.sharepoint.com:/teams/finance:/drives/drive-1/root:/book.xlsx:/workbook"
     )
 
@@ -188,16 +184,11 @@ def test_site_segment_encodes_each_path_component_without_losing_structure():
 
 
 def test_odata_key_segment_escapes_quote():
-    assert (
-        excel._odata_key_segment("worksheets", "O'Brien")
-        == "worksheets('O%27%27Brien')"
-    )
+    assert excel._odata_key_segment("worksheets", "O'Brien") == "worksheets('O%27%27Brien')"
 
 
 def test_odata_key_segment_preserves_padded_worksheet_name():
-    assert (
-        excel._odata_key_segment("worksheets", " Sheet ") == "worksheets('%20Sheet%20')"
-    )
+    assert excel._odata_key_segment("worksheets", " Sheet ") == "worksheets('%20Sheet%20')"
 
 
 def test_odata_string_literal_escapes_quote():
@@ -255,9 +246,7 @@ def test_parse_values_json_rejects_non_string():
 
 
 def test_list_worksheets_success(monkeypatch):
-    mock_request = Mock(
-        return_value=MockResponse({"value": [{"id": "1", "name": "Sheet1"}]})
-    )
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "1", "name": "Sheet1"}]}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
     result = json.loads(excel.excel_list_worksheets("book.xlsx"))
@@ -321,9 +310,7 @@ def test_list_worksheets_exposes_next_link(monkeypatch):
 
 
 def test_list_worksheets_next_link_is_none_on_last_page(monkeypatch):
-    mock_request = Mock(
-        return_value=MockResponse({"value": [{"id": "1", "name": "Sheet1"}]})
-    )
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "1", "name": "Sheet1"}]}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
     result = json.loads(excel.excel_list_worksheets("book.xlsx"))
@@ -428,17 +415,11 @@ def test_delete_worksheet_server_failure_is_indeterminate(monkeypatch):
     ("start_column", "end_column", "expected"),
     [("L", "M", "L:M"), (" a ", "xFd", "A:XFD")],
 )
-def test_delete_columns_uses_structural_left_shift(
-    monkeypatch, start_column, end_column, expected
-):
+def test_delete_columns_uses_structural_left_shift(monkeypatch, start_column, end_column, expected):
     mock_request = Mock(return_value=MockResponse({}, status_code=204, content=b""))
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_delete_columns(
-            "book.xlsx", "Sheet1", start_column, end_column
-        )
-    )
+    result = json.loads(excel.excel_delete_columns("book.xlsx", "Sheet1", start_column, end_column))
 
     assert result["status"] == "success"
     assert result["deleted_range"] == expected
@@ -458,17 +439,11 @@ def test_delete_columns_uses_structural_left_shift(
         ("M", "L", "start_column must not be after end_column"),
     ],
 )
-def test_delete_columns_rejects_invalid_ranges(
-    monkeypatch, start_column, end_column, message
-):
+def test_delete_columns_rejects_invalid_ranges(monkeypatch, start_column, end_column, message):
     mock_request = Mock()
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_delete_columns(
-            "book.xlsx", "Sheet1", start_column, end_column
-        )
-    )
+    result = json.loads(excel.excel_delete_columns("book.xlsx", "Sheet1", start_column, end_column))
 
     assert result["status"] == "error"
     assert message in result["message"]
@@ -482,9 +457,7 @@ def test_delete_columns_transport_failure_is_indeterminate(monkeypatch):
         Mock(side_effect=requests.ConnectionError("connection dropped")),
     )
 
-    result = json.loads(
-        excel.excel_delete_columns("book.xlsx", "Sheet1", "L", "M")
-    )
+    result = json.loads(excel.excel_delete_columns("book.xlsx", "Sheet1", "L", "M"))
 
     assert result["status"] == "indeterminate"
     assert result["retry_safe"] is False
@@ -544,14 +517,10 @@ def test_update_range_sends_parsed_values(monkeypatch):
 
 def test_update_range_omits_oversized_confirmed_response(monkeypatch):
     max_output_length = get_tool_max_output_length()
-    mock_request = Mock(
-        return_value=MockResponse({"values": [["x" * (max_output_length + 1000)]]})
-    )
+    mock_request = Mock(return_value=MockResponse({"values": [["x" * (max_output_length + 1000)]]}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_update_range("book.xlsx", "Sheet1", "A1", '[["x"]]')
-    )
+    result = json.loads(excel.excel_update_range("book.xlsx", "Sheet1", "A1", '[["x"]]'))
 
     assert result["status"] == "success"
     assert result["response_omitted"] is True
@@ -559,17 +528,13 @@ def test_update_range_omits_oversized_confirmed_response(monkeypatch):
 
 
 def test_update_range_rejects_invalid_values_json():
-    result = json.loads(
-        excel.excel_update_range("book.xlsx", "Sheet1", "A1:B1", "not json")
-    )
+    result = json.loads(excel.excel_update_range("book.xlsx", "Sheet1", "A1:B1", "not json"))
     assert result["status"] == "error"
     assert "not valid JSON" in result["message"]
 
 
 def test_clear_range_validates_apply_to():
-    result = json.loads(
-        excel.excel_clear_range("book.xlsx", "Sheet1", "A1:B1", apply_to="Bogus")
-    )
+    result = json.loads(excel.excel_clear_range("book.xlsx", "Sheet1", "A1:B1", apply_to="Bogus"))
     assert result["status"] == "error"
     assert "apply_to must be one of" in result["message"]
 
@@ -598,9 +563,7 @@ def test_get_range_rejects_oversized_ingress(monkeypatch):
     max_output_length = get_tool_max_output_length()
     oversized_row = ["x" * (max_output_length + 1000)]
     mock_request = Mock(
-        return_value=MockResponse(
-            {"address": "Sheet1!A1:B2", "values": [oversized_row]}
-        )
+        return_value=MockResponse({"address": "Sheet1!A1:B2", "values": [oversized_row]})
     )
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
@@ -632,9 +595,7 @@ def test_get_used_range_with_values_only(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"address": "Sheet1!A1:C3"}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_get_used_range("book.xlsx", "Sheet1", values_only=True)
-    )
+    result = json.loads(excel.excel_get_used_range("book.xlsx", "Sheet1", values_only=True))
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["url"].endswith("usedRange(valuesOnly=true)")
@@ -644,9 +605,7 @@ def test_get_used_range_rejects_non_boolean_values_only(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_get_used_range("book.xlsx", "Sheet1", values_only="false")
-    )
+    result = json.loads(excel.excel_get_used_range("book.xlsx", "Sheet1", values_only="false"))
 
     assert result["status"] == "error"
     assert "values_only must be a boolean" in result["message"]
@@ -657,9 +616,7 @@ def test_get_used_range_rejects_oversized_ingress(monkeypatch):
     max_output_length = get_tool_max_output_length()
     oversized_row = ["x" * (max_output_length + 1000)]
     mock_request = Mock(
-        return_value=MockResponse(
-            {"address": "Sheet1!A1:C3", "values": [oversized_row]}
-        )
+        return_value=MockResponse({"address": "Sheet1!A1:C3", "values": [oversized_row]})
     )
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
@@ -745,9 +702,7 @@ def test_add_table_rejects_non_boolean_has_headers(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_add_table("book.xlsx", "Sheet1!A1:C5", has_headers="false")
-    )
+    result = json.loads(excel.excel_add_table("book.xlsx", "Sheet1!A1:C5", has_headers="false"))
 
     assert result["status"] == "error"
     assert "has_headers must be a boolean" in result["message"]
@@ -773,9 +728,7 @@ def test_list_table_rows_exposes_offset_continuation_for_full_page(monkeypatch):
     )
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_list_table_rows("book.xlsx", "Table1", page_size=2, skip=4)
-    )
+    result = json.loads(excel.excel_list_table_rows("book.xlsx", "Table1", page_size=2, skip=4))
 
     assert result["next_skip"] == 6
     assert mock_request.call_args.kwargs["params"] == {"$top": 2, "$skip": 4}
@@ -785,9 +738,7 @@ def test_list_table_rows_advances_after_short_nonempty_offset_page(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"value": [{"index": 6}]}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_list_table_rows("book.xlsx", "Table1", page_size=2, skip=6)
-    )
+    result = json.loads(excel.excel_list_table_rows("book.xlsx", "Table1", page_size=2, skip=6))
 
     assert result["rows"] == [{"index": 6}]
     assert result["next_skip"] == 7
@@ -798,9 +749,7 @@ def test_list_table_rows_stops_offset_paging_on_empty_page(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"value": []}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_list_table_rows("book.xlsx", "Table1", page_size=2, skip=7)
-    )
+    result = json.loads(excel.excel_list_table_rows("book.xlsx", "Table1", page_size=2, skip=7))
 
     assert result["rows"] == []
     assert result["next_skip"] is None
@@ -861,9 +810,7 @@ def test_list_table_rows_consumes_equivalently_encoded_next_link(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"value": [{"index": 1}]}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_list_table_rows("book.xlsx", "Table1", next_link=next_link)
-    )
+    result = json.loads(excel.excel_list_table_rows("book.xlsx", "Table1", next_link=next_link))
 
     assert result["rows"] == [{"index": 1}]
     assert mock_request.call_args.kwargs["url"] == next_link
@@ -903,9 +850,7 @@ def test_list_table_rows_rejects_oversized_page_without_advancing_cursor(monkeyp
 )
 def test_list_collections_reject_oversized_final_page(monkeypatch, tool_name, args):
     max_output_length = get_tool_max_output_length()
-    response = MockResponse(
-        {"value": [{"values": [["x" * (max_output_length + 1000)]]}]}
-    )
+    response = MockResponse({"value": [{"values": [["x" * (max_output_length + 1000)]]}]})
     mock_request = Mock(return_value=response)
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
@@ -922,9 +867,7 @@ def test_add_table_rows_with_index(monkeypatch):
     mock_request = Mock(return_value=MockResponse({"index": 0}))
     monkeypatch.setattr(excel.requests, "request", mock_request)
 
-    result = json.loads(
-        excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]", index=0)
-    )
+    result = json.loads(excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]", index=0))
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["json"] == {"values": [[1, 2, 3]], "index": 0}
@@ -1007,9 +950,7 @@ async def test_row_indexes_are_strict_at_mcp_ingress(monkeypatch, tool_name, arg
         ),
     ],
 )
-def test_non_idempotent_mutation_transport_failure_is_indeterminate(
-    monkeypatch, call, side_effect
-):
+def test_non_idempotent_mutation_transport_failure_is_indeterminate(monkeypatch, call, side_effect):
     monkeypatch.setattr(excel.requests, "request", Mock(side_effect=side_effect))
 
     result = json.loads(call())
@@ -1023,9 +964,7 @@ def test_non_idempotent_mutation_truncated_response_is_indeterminate(monkeypatch
     monkeypatch.setattr(
         excel.requests,
         "request",
-        Mock(
-            side_effect=requests.exceptions.ChunkedEncodingError("response truncated")
-        ),
+        Mock(side_effect=requests.exceptions.ChunkedEncodingError("response truncated")),
     )
 
     result = json.loads(excel.excel_add_worksheet("book.xlsx"))
@@ -1056,9 +995,7 @@ def test_non_idempotent_mutation_server_failure_is_indeterminate(monkeypatch):
         Mock(return_value=MockResponse({"error": "gateway"}, status_code=504)),
     )
 
-    result = json.loads(
-        excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]")
-    )
+    result = json.loads(excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]"))
 
     assert result["status"] == "indeterminate"
     assert result["retry_safe"] is False
@@ -1080,9 +1017,7 @@ def test_add_table_rows_caps_oversized_response(monkeypatch):
 
 
 def test_add_table_rows_rejects_negative_index():
-    result = json.loads(
-        excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]", index=-1)
-    )
+    result = json.loads(excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]", index=-1))
     assert result["status"] == "error"
     assert "index" in result["message"]
 
@@ -1099,9 +1034,7 @@ def test_add_table_rows_rejects_bool_index():
 
 
 def test_add_table_rows_rejects_non_integer_index():
-    result = json.loads(
-        excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]", index="0")
-    )
+    result = json.loads(excel.excel_add_table_rows("book.xlsx", "Table1", "[[1, 2, 3]]", index="0"))
     assert result["status"] == "error"
     assert "index" in result["message"]
 

@@ -1184,6 +1184,7 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
     """
     temporary_path: Path | None = None
     try:
+        output_dir = _download_output_dir()
         metadata = _graph_request(
             "GET",
             _item_path(file_path),
@@ -1204,7 +1205,7 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
 
         remote_name = str(metadata.get("name") or Path(file_path).name)
         output_name = _safe_download_filename(filename or remote_name)
-        output_path = _unique_download_path(_download_output_dir(), output_name)
+        output_path = _unique_download_path(output_dir, output_name)
         temporary_path = output_path.with_name(
             f".{output_path.name}.{uuid4().hex}.part"
         )

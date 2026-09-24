@@ -37,7 +37,9 @@ def _columns_present(
 
 
 def _set_visibility(bind: sa.engine.Connection, visible: bool) -> None:
-    if not _columns_present(bind, "public_mcp_apps", {"app_id", "is_visible_in_connector"}):
+    if not _columns_present(
+        bind, "public_mcp_apps", {"app_id", "is_visible_in_connector"}
+    ):
         return
     bind.execute(
         sa.update(PUBLIC_MCP_APPS_TABLE)

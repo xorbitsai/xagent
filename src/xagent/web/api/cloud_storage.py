@@ -31,7 +31,9 @@ GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
     """Load Google OAuth client credentials from admin provider config."""
-    provider = db.query(OAuthProvider).filter(OAuthProvider.provider_name == "google").first()
+    provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == "google").first()
+    )
     if not provider:
         return None, None
 
@@ -40,7 +42,9 @@ def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
     return decrypt_value(client_id), decrypt_value(client_secret)
 
 
-def get_google_credentials(user_id: int, db: Session, account_id: Optional[int] = None) -> Any:
+def get_google_credentials(
+    user_id: int, db: Session, account_id: Optional[int] = None
+) -> Any:
     """Get Google Credentials for user, refreshing if necessary"""
     query = scoped_user_oauth_query(
         db,
@@ -55,8 +59,12 @@ def get_google_credentials(user_id: int, db: Session, account_id: Optional[int] 
 
     if not oauth_account:
         if account_id:
-            raise HTTPException(status_code=404, detail="Selected Google Drive account not found")
-        raise HTTPException(status_code=401, detail="Google Drive account not connected")
+            raise HTTPException(
+                status_code=404, detail="Selected Google Drive account not found"
+            )
+        raise HTTPException(
+            status_code=401, detail="Google Drive account not connected"
+        )
     if not oauth_account.access_token:
         raise HTTPException(
             status_code=401,
@@ -69,7 +77,9 @@ def get_google_credentials(user_id: int, db: Session, account_id: Optional[int] 
         client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
 
     if not client_id or not client_secret:
-        raise HTTPException(status_code=500, detail="Google OAuth configuration missing")
+        raise HTTPException(
+            status_code=500, detail="Google OAuth configuration missing"
+        )
 
     creds = Credentials(
         token=oauth_account.access_token,
@@ -205,7 +215,9 @@ async def delete_connected_account(
         provider=str(account.provider),
         access_token=str(account.access_token) if account.access_token else "",
         provider_user_id=(
-            str(account.provider_user_id) if account.provider_user_id is not None else None
+            str(account.provider_user_id)
+            if account.provider_user_id is not None
+            else None
         ),
     )
 

@@ -97,7 +97,9 @@ async def test_google_drive_picker_config_returns_access_token_without_refresh_s
 
 
 @pytest.mark.asyncio
-async def test_google_drive_picker_config_requires_picker_credentials(monkeypatch) -> None:
+async def test_google_drive_picker_config_requires_picker_credentials(
+    monkeypatch,
+) -> None:
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_PICKER_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_PICKER_APP_ID", raising=False)

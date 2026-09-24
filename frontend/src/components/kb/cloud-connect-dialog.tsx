@@ -45,21 +45,10 @@ const MAX_CLOUD_INGEST_FILES = 5
 let googlePickerScriptPromise: Promise<void> | null = null
 
 function loadGooglePicker(): Promise<void> {
-  if (window.gapi) {
-    return new Promise((resolve, reject) => {
-      window.gapi?.load("picker", {
-        callback: () => resolve(),
-        onerror: () => reject(new Error("Google Picker failed to load")),
-      })
-    })
-  }
   if (googlePickerScriptPromise) return googlePickerScriptPromise
 
   googlePickerScriptPromise = new Promise<void>((resolve, reject) => {
-    const script = document.createElement("script")
-    script.src = "https://apis.google.com/js/api.js"
-    script.async = true
-    script.onload = () => {
+    const loadPicker = () => {
       if (!window.gapi) {
         reject(new Error("Google Picker API is unavailable"))
         return
@@ -68,6 +57,18 @@ function loadGooglePicker(): Promise<void> {
         callback: () => resolve(),
         onerror: () => reject(new Error("Google Picker failed to load")),
       })
+    }
+
+    if (window.gapi) {
+      loadPicker()
+      return
+    }
+
+    const script = document.createElement("script")
+    script.src = "https://apis.google.com/js/api.js"
+    script.async = true
+    script.onload = () => {
+      loadPicker()
     }
     script.onerror = () => reject(new Error("Google Picker failed to load"))
     document.head.appendChild(script)

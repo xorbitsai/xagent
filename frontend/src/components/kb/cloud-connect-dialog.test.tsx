@@ -36,6 +36,7 @@ vi.mock("lucide-react", () => {
     ChevronRight: Icon,
     Folder: Icon,
     File: Icon,
+    FolderOpen: Icon,
     Loader2: Icon,
     Search: Icon,
     RefreshCw: Icon,

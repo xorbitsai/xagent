@@ -70,7 +70,10 @@ def test_upgrade_hides_drive_updates_canonical_description_and_preserves_custom(
             migration.upgrade()
             migration.upgrade()
 
-        rows = {row["app_id"]: dict(row) for row in connection.execute(sa.select(table)).mappings()}
+        rows = {
+            row["app_id"]: dict(row)
+            for row in connection.execute(sa.select(table)).mappings()
+        }
 
     assert rows["google-drive"]["description"] == migration.CURRENT_DESCRIPTION
     assert rows["google-drive"]["is_visible_in_connector"] is False

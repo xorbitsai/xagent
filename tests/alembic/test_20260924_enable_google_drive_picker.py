@@ -58,7 +58,10 @@ def test_upgrade_enables_google_drive_idempotently(tmp_path) -> None:
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.upgrade()
-        rows = {row["app_id"]: dict(row) for row in connection.execute(sa.select(table)).mappings()}
+        rows = {
+            row["app_id"]: dict(row)
+            for row in connection.execute(sa.select(table)).mappings()
+        }
 
     assert rows["google-drive"]["is_visible_in_connector"] is True
     assert rows["other"]["is_visible_in_connector"] is False
@@ -94,7 +97,10 @@ def test_upgrade_is_noop_when_catalog_columns_are_missing() -> None:
     )
     metadata.create_all(engine)
 
-    with engine.begin() as connection, patch.object(migration, "op", _operations(connection)):
+    with (
+        engine.begin() as connection,
+        patch.object(migration, "op", _operations(connection)),
+    ):
         migration.upgrade()
 
 

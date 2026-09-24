@@ -288,41 +288,39 @@ def _fit_critical_fields(critical: dict[str, Any], max_output_length: int) -> st
     than inventing a new one:
 
     1. Shrink the largest string value (by its own serialized size, same
-       comparison ``halve_dict_or_mark``'s siblings use) down toward
-       ``_TRUNCATION_SUFFIX``, but size-gated the same way
-       ``_truncation_marker_or_empty`` gates its own marker: only replace
-       a value with the marker if that's no bigger than the value already
-       is. Without this gate, a value shorter than the marker would get
-       *replaced by something bigger* -- inflating the response instead of
-       shrinking it, and then, once marked, being permanently excluded
-       from further shrinking with no way back. A field the gate rejects
-       is tracked in ``floored`` (an explicit set, not a fragile
-       equality-against-the-marker-string check -- the same reason phase 1
-       tracks ``floored_keys`` explicitly rather than re-detecting a
-       marker by value) and is skipped from then on, since nothing further
-       can be done to it here.
-    2. If every string is floored (or ``critical`` has no string to shrink
-       at all -- nothing currently passes a non-string critical field, but
-       the type is ``dict[str, Any]``, not ``dict[str, str]``, so nothing
-       stops a future caller from doing that) and the envelope is still
-       oversized, drop whole fields outright (largest serialized cost
-       first) until it fits. Losing a critical field entirely is a worse
-       outcome than shrinking it, but a response this function still can't
-       guarantee fits is worse still: a stdio MCP child's own budget is
-       mirrored into a *separate*, JSON-unaware truncation the parent
-       applies to this exact string (see ``success_with_capped_dict``),
-       and that blind slice corrupts an oversized response into invalid
-       JSON rather than merely truncating it.
+       comparison ``halve_dict_or_mark``'s siblings use) toward
+       ``_TRUNCATION_SUFFIX``. The target length for each cut is derived
+       from how much the *whole envelope* needs to shrink by (not a fixed
+       step), and is provably always smaller than the field's current
+       length whenever this loop body runs at all (the loop only runs
+       while the envelope is still oversized, so there's always at least
+       one byte of "how much shorter" to cut) -- so, unlike a naive
+       "replace with a fixed marker" approach, this can never inflate a
+       value that started out shorter than the marker itself. A value
+       that shrinks to "" is excluded from the next round by the
+       ``and value`` filter below, moving on to the next-largest field.
+    2. If nothing is left to shrink (every string is now "", or
+       ``critical`` had no string to begin with -- nothing currently
+       passes a non-string critical field, but the type is
+       ``dict[str, Any]``, not ``dict[str, str]``, so nothing stops a
+       future caller from doing that) and the envelope is still oversized,
+       drop whole fields outright (largest serialized cost first) until it
+       fits. Losing a critical field entirely is a worse outcome than
+       shrinking it, but a response this function still can't guarantee
+       fits is worse still: a stdio MCP child's own budget is mirrored
+       into a *separate*, JSON-unaware truncation the parent applies to
+       this exact string (see ``success_with_capped_dict``), and that
+       blind slice corrupts an oversized response into invalid JSON rather
+       than merely truncating it.
     """
     working = dict(critical)
-    floored: set[str] = set()
     response = _envelope_with_critical(working)
 
     while len(response) > max_output_length:
         shrinkable = {
             key: value
             for key, value in working.items()
-            if key not in floored and isinstance(value, str) and value
+            if isinstance(value, str) and value
         }
         if not shrinkable:
             break
@@ -334,27 +332,21 @@ def _fit_critical_fields(critical: dict[str, Any], max_output_length: int) -> st
         # JSON-escaping growth (e.g. a quote or backslash newly exposed at
         # the cut point costs an extra backslash once re-escaped) -- an
         # exact-excess target could otherwise still overshoot by a byte or
-        # two and force another round trip.
+        # two and force another round trip. Always strictly less than
+        # len(current) here (excess is at least 1 whenever this loop body
+        # runs), so this can never replace a value with something bigger.
         target_len = max(0, len(current) - excess - 8)
         if target_len >= len(_TRUNCATION_SUFFIX):
             # Room for some real content plus the marker.
-            candidate = (
+            working[target_key] = (
                 current[: target_len - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
             )
         else:
             # Not even enough room left for the marker text -- keep
-            # whatever raw content still fits, unmarked. The envelope's
-            # own top-level "truncated" flag still signals that
+            # whatever raw content still fits, unmarked (possibly ""). The
+            # envelope's own top-level "truncated" flag still signals that
             # something, somewhere, was cut.
-            candidate = current[:target_len]
-        if len(candidate) >= len(current):
-            # Shortening this field wouldn't actually shrink it (it's
-            # already this short or shorter) -- leave it untouched and
-            # stop selecting it, rather than replacing a short value with
-            # something bigger.
-            floored.add(target_key)
-            continue
-        working[target_key] = candidate
+            working[target_key] = current[:target_len]
         response = _envelope_with_critical(working)
 
     remaining = list(working.keys())
@@ -663,12 +655,7 @@ def success_with_capped_dict(
             _build(record, True, extras_override=step_extras)
             for record, step_extras in rungs
         ]
-        candidates.append(
-            json.dumps(
-                {"status": "success", **critical, "truncated": True},
-                ensure_ascii=False,
-            )
-        )
+        candidates.append(_envelope_with_critical(critical))
         for candidate in candidates:
             if len(candidate) <= max_output_length:
                 return candidate

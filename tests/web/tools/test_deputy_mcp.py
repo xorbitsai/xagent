@@ -829,6 +829,29 @@ def test_create_resource_downgrades_to_warning_when_readback_returns_empty(
 
     assert result["status"] == "success"
     assert "warning" in result
+    assert "returned no record" in result["warning"]
+
+
+def test_create_resource_warning_distinguishes_unexpected_shape_from_empty(
+    monkeypatch,
+):
+    """A readback that succeeds and returns *something* -- just not a
+    record (e.g. a list) -- is a different, more informative diagnostic
+    than a plain empty response; the warning text must say so rather than
+    claiming "no record" when something was in fact returned."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "FirstName": "Peter"}),
+            MockResponse(json_data=["unexpected", "list"]),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert "unexpected response shape" in result["warning"]
+    assert "no record" not in result["warning"]
 
 
 def test_create_resource_skips_verification_when_response_has_no_id(monkeypatch):

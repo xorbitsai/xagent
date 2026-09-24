@@ -130,7 +130,16 @@ def _verify_created_record(
         # since a full GET is already being paid for, there's no reason to
         # return the staler of the two.
         return _record_response(resource, readback, field_name=field_name)
-    reason = f"failed: {detail}" if detail else "returned no record"
+    if detail:
+        reason = f"failed: {detail}"
+    elif not readback:
+        reason = "returned no record"
+    else:
+        # verified is False here only because readback wasn't a dict (see
+        # the isinstance check above) -- something came back, just not
+        # record-shaped, which is a different, more informative case than
+        # a plain empty response.
+        reason = "returned an unexpected response shape"
     # The actionable instruction comes first and the (potentially long,
     # up to MAX_ERROR_RESPONSE_TEXT_CHARS) diagnostic detail comes last:
     # success_with_capped_dict's last-resort fallback cuts an oversized

@@ -202,6 +202,80 @@ def test_xero_catalog_login_scopes(db_session, monkeypatch):
     assert verify_token(params["state"][0])["app_id"] == "xero"
 
 
+def test_google_drive_login_does_not_reuse_previous_granted_scopes(db_session):
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            description="Drive",
+            transport="oauth",
+            provider_name="google",
+            category="Support",
+            oauth_scopes=["https://www.googleapis.com/auth/drive.file"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+    provider = _provider(
+        auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+        default_scopes=["openid"],
+        redirect_uri="https://app.example.com/api/auth/google/callback",
+    )
+
+    response = generic_oauth_login(
+        provider="google",
+        token=_token_for(user),
+        app_id="google-drive",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    params = parse_qs(urlparse(_location(response)).query)
+    assert params["include_granted_scopes"] == ["false"]
+    assert set(params["scope"][0].split()) == {
+        "openid",
+        "https://www.googleapis.com/auth/drive.file",
+    }
+
+
+def test_other_google_connector_keeps_incremental_authorization(db_session):
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-calendar",
+            name="Google Calendar",
+            description="Calendar",
+            transport="oauth",
+            provider_name="google",
+            category="Scheduling",
+            oauth_scopes=["https://www.googleapis.com/auth/calendar.events"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+    provider = _provider(
+        auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+        default_scopes=["openid"],
+        redirect_uri="https://app.example.com/api/auth/google/callback",
+    )
+
+    response = generic_oauth_login(
+        provider="google",
+        token=_token_for(user),
+        app_id="google-calendar",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    params = parse_qs(urlparse(_location(response)).query)
+    assert params["include_granted_scopes"] == ["true"]
+
+
 def test_auth_url_with_query_uses_ampersand_separator(db_session):
     """If db_provider.auth_url already has '?', params must be appended with '&'."""
     db, user = db_session

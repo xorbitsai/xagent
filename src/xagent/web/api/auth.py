@@ -2986,7 +2986,12 @@ def _generic_oauth_login(
     }
     if provider.lower() == "google":
         params["access_type"] = "offline"
-        params["include_granted_scopes"] = "true"
+        # Do not carry a previously granted full-Drive permission into a
+        # narrowed drive.file reconnect. Other Google connectors still use
+        # incremental authorization so their independent grants compose.
+        params["include_granted_scopes"] = (
+            "false" if app_id == "google-drive" else "true"
+        )
         params["prompt"] = "consent"
     if provider.lower() == "zoom":
         params["prompt"] = "login"

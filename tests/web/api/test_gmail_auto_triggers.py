@@ -1867,6 +1867,7 @@ def test_build_gmail_service_passes_persisted_token_expiry_to_credentials(
         build_gmail_service(db, oauth)
 
         assert captured_kwargs["expiry"] == oauth.expires_at
+        assert captured_kwargs["scopes"] == []
     finally:
         db.close()
 

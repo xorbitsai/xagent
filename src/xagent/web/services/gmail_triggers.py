@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GMAIL_API_ROOT = "https://gmail.googleapis.com/gmail/v1"
-DEFAULT_GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 GmailServiceFactory = Callable[[Session, UserOAuth], Any]
 
@@ -186,10 +185,9 @@ def _get_google_oauth_config(db: Session) -> tuple[str | None, str | None]:
 
 
 def _gmail_oauth_scopes(oauth_account: UserOAuth) -> list[str]:
-    scopes = [
+    return [
         scope for scope in str(oauth_account.scope or "").split(" ") if scope.strip()
     ]
-    return scopes or DEFAULT_GMAIL_SCOPES
 
 
 def _credentials_expiry(value: datetime | None) -> datetime | None:

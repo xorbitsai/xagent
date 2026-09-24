@@ -1,5 +1,6 @@
 """Tests for updating the Google Drive connector's description."""
 
+import importlib
 import importlib.util
 from pathlib import Path
 from unittest.mock import patch
@@ -231,5 +232,11 @@ def test_migration_fields_match_registry():
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "google-drive"
     )
-    assert registry_row["description"] == migration.CURRENT_DESCRIPTION
+    # The later drive.file rollout supersedes this sharing-capable
+    # description; its follow-up migration owns the current registry match.
+    latest_migration = importlib.import_module(
+        "xagent.migrations.versions.20260924_hide_google_drive_until_picker"
+    )
+    assert registry_row["description"] == latest_migration.CURRENT_DESCRIPTION
+    assert registry_row["description"] != migration.CURRENT_DESCRIPTION
     assert registry_row["category"] == "Support"

@@ -721,7 +721,7 @@ class ReActPattern(AgentPattern):
         self.settlement_fence_turn_id: str | None = None
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
-        self.pending_tool_interaction_responses: list[dict[str, str]] = []
+        self.pending_tool_interaction_responses: list[dict[str, Any]] = []
         self.task_text: str | None = None
         self.memory_input_text: str | None = None
         self._memory_store: Any | None = None

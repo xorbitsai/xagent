@@ -1651,8 +1651,7 @@ def _load_tool_runtime_policy_snapshot(
         fail_closed = unresolved_tool_policy_allowlist()
         if fail_closed is not None:
             logger.error(
-                "Tool policy unresolved for user %s (%s); denying every tool "
-                "for this turn",
+                "Tool policy unresolved for user %s (%s); denying every tool for this turn",
                 user_id,
                 ", ".join(sorted(unresolved)),
             )
@@ -2634,8 +2633,7 @@ class WebToolConfig(BaseToolConfig):
             self._tool_allowlist_cached = False
             self._cached_tool_allowlist = None
         logger.error(
-            "Tool policy %s unresolved for user %s (%s); denying every tool "
-            "for this turn",
+            "Tool policy %s unresolved for user %s (%s); denying every tool for this turn",
             input_name,
             self._user_id,
             reason,
@@ -3786,6 +3784,7 @@ class WebToolConfig(BaseToolConfig):
             task_output_dir = self._build_mcp_task_output_dir()
             if task_output_dir:
                 env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir
+                env["XAGENT_ONEDRIVE_OUTPUT_DIR"] = task_output_dir
             transport_config["env"] = env
             return transport_config
 

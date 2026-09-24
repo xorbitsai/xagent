@@ -1,8 +1,5 @@
-"""Tests for injecting the file-upload allowlist directory into OAuth-transport
-MCP subprocess environments (LinkedIn's image upload, Slack's file upload,
-Gmail's message attachments, OneDrive's file upload, SharePoint's file
-upload, Google Drive's file upload) and Google Drive's dedicated
-write-target output directory."""
+"""Tests for injecting connector file directories into OAuth-transport MCP
+subprocess environments, including dedicated binary-download output paths."""
 
 import json
 from pathlib import Path
@@ -50,6 +47,7 @@ def test_transport_config_sets_all_allowlist_vars_when_workspace_has_a_task(
     for env_var in _READ_ALLOWLIST_ENV_VARS:
         assert json.loads(transport_config["env"][env_var]) == [expected_dir]
     assert transport_config["env"]["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] == expected_dir
+    assert transport_config["env"]["XAGENT_ONEDRIVE_OUTPUT_DIR"] == expected_dir
 
 
 def test_transport_config_omits_allowlist_vars_without_a_task_id() -> None:
@@ -72,6 +70,7 @@ def test_transport_config_omits_allowlist_vars_without_a_task_id() -> None:
     assert "XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
+    assert "XAGENT_ONEDRIVE_OUTPUT_DIR" not in transport_config["env"]
 
 
 def test_drive_output_dir_excludes_external_dirs_unlike_the_read_allowlists(
@@ -99,6 +98,7 @@ def test_drive_output_dir_excludes_external_dirs_unlike_the_read_allowlists(
 
     task_dir = str((tmp_path / "task-123").resolve())
     assert transport_config["env"]["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] == task_dir
+    assert transport_config["env"]["XAGENT_ONEDRIVE_OUTPUT_DIR"] == task_dir
     # The read allowlists, by contrast, legitimately include the external
     # dir alongside the task dir.
     for env_var in _READ_ALLOWLIST_ENV_VARS:
@@ -125,6 +125,7 @@ def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
     )
 
     assert "XAGENT_GOOGLE_DRIVE_OUTPUT_DIR" not in transport_config["env"]
+    assert "XAGENT_ONEDRIVE_OUTPUT_DIR" not in transport_config["env"]
     for env_var in _READ_ALLOWLIST_ENV_VARS:
         assert str(external_dir.resolve()) in json.loads(
             transport_config["env"][env_var]

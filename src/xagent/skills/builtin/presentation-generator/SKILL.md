@@ -5,14 +5,29 @@ description: |
   content extraction, templates, speaker notes, combining or splitting decks.
   Not for posters, images, or social graphics.
 when_to_use: |
-  The user asks for a deck, slides, a presentation, PPT/PPTX, or names a .pptx
-  file. Use pptx-editorial instead when magazine-grade editorial styling is
-  wanted.
+  The user asks for a deck, slides, a presentation, Google Slides, PPT/PPTX,
+  or names a .pptx file. Use pptx-editorial instead when magazine-grade
+  editorial styling is wanted.
 ---
 
 # Presentation Generator
 
 Generate PowerPoint presentations using JavaScript code with the pptxgenjs library.
+
+## Google Slides output
+
+When the requested output is Google Slides, this skill is the local deck
+creation step, not the final delivery step:
+
+1. Generate and inspect the designed local PPTX in the workspace.
+2. Call `google_slides_import_pptx` with that PPTX path to convert it into an
+   editable native Google Slides presentation.
+3. Call `google_slides_get_presentation` to verify slide count and text before
+   returning the Google Slides link.
+
+Do not build a new outlined deck with repeated `google_slides_create_presentation`
+and `google_slides_add_slide` calls. Those tools are for explicitly requested
+simple text/layout edits and do not preserve visual design.
 
 ## ⚠️ CRITICAL REQUIREMENTS - READ FIRST
 

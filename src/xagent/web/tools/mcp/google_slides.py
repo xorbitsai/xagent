@@ -308,29 +308,46 @@ def get_drive_service() -> Any:
 
 def _resolve_pptx_upload_path(file_path: str) -> Path:
     """Resolve a generated PPTX and keep uploads inside approved roots."""
-    local_path = Path(file_path).expanduser()
-    if not local_path.is_absolute():
-        local_path = Path.cwd() / local_path
-    local_path = local_path.resolve()
-
     try:
         allowed_dirs = allowed_dirs_from_env(_PPTX_UPLOAD_ALLOWED_DIRS_ENV_VAR)
     except ValueError:
         logger.warning("Invalid PPTX upload directory configuration")
         raise ValueError("Upload directory configuration is invalid") from None
 
-    if not any(local_path.is_relative_to(directory) for directory in allowed_dirs):
-        logger.warning(
-            "Rejected PPTX path %s outside allowed directories: %s",
-            local_path,
-            ", ".join(str(directory) for directory in allowed_dirs),
-        )
-        raise PermissionError(
-            "file path is outside the allowed directories; provide a PPTX "
-            "inside the task workspace"
-        )
-    if not local_path.is_file():
+    requested_path = Path(file_path).expanduser()
+    candidates = (
+        [requested_path]
+        if requested_path.is_absolute()
+        else [Path.cwd() / requested_path]
+        + [directory / requested_path for directory in allowed_dirs]
+    )
+    local_path: Path | None = None
+    authorized_candidate: Path | None = None
+    for candidate in candidates:
+        resolved_candidate = candidate.resolve()
+        if not any(
+            resolved_candidate.is_relative_to(directory) for directory in allowed_dirs
+        ):
+            continue
+        authorized_candidate = authorized_candidate or resolved_candidate
+        if resolved_candidate.is_file():
+            local_path = resolved_candidate
+            break
+
+    if local_path is None:
+        if authorized_candidate is None:
+            rejected_path = candidates[0].resolve()
+            logger.warning(
+                "Rejected PPTX path %s outside allowed directories: %s",
+                rejected_path,
+                ", ".join(str(directory) for directory in allowed_dirs),
+            )
+            raise PermissionError(
+                "file path is outside the allowed directories; provide a PPTX "
+                "inside the task workspace"
+            )
         raise FileNotFoundError(f"File not found: {file_path}")
+
     if local_path.suffix.lower() != ".pptx":
         raise ValueError("file_path must point to a .pptx file")
     if local_path.stat().st_size == 0:
@@ -364,6 +381,28 @@ def _slide_summary(slide: dict[str, Any], index: int) -> dict[str, Any]:
         "object_id": slide.get("objectId"),
         "text": texts,
     }
+
+
+def _slide_is_empty(slide: dict[str, Any]) -> bool:
+    """Return whether a slide has no meaningful page content.
+
+    A visual slide may intentionally contain only an image, chart, line, or
+    other non-text element. Treating "no text" as empty would reject those
+    legitimate slides after PPTX import. Empty placeholder shapes do not count
+    as content, but any non-placeholder shape or non-shape page element does.
+    """
+    page_elements = slide.get("pageElements", [])
+    if not page_elements:
+        return True
+    for element in page_elements:
+        shape = element.get("shape")
+        if shape is None:
+            return False
+        if _element_text(element).strip():
+            return False
+        if "placeholder" not in shape:
+            return False
+    return True
 
 
 @mcp.tool()
@@ -405,10 +444,11 @@ def google_slides_create_presentation(title: str) -> str:
     design, create a styled PPTX first and call google_slides_import_pptx;
     do not build the deck by repeatedly calling google_slides_add_slide.
 
-    Google creates a default, empty slide as part of this operation. Remove
-    that implementation detail before returning so callers can append exactly
-    the slides they requested with google_slides_add_slide. The response is
-    verified after cleanup and reports the resulting slide count.
+    Google creates a default, empty slide as part of this operation. Keep it
+    until the first content slide is created: google_slides_add_slide removes
+    it in the same batchUpdate after creating the real slide, so the API never
+    has to delete the only page from the presentation. The response reports
+    the default slide id so callers can diagnose the initial state.
     """
     try:
         service = get_slides_service()
@@ -428,40 +468,23 @@ def google_slides_create_presentation(title: str) -> str:
             )
             slides = created.get("slides", [])
 
-        removed_default_slide = False
-        if len(slides) == 1 and not _slide_summary(slides[0], 0)["text"]:
+        default_slide_id = None
+        if len(slides) == 1 and _slide_is_empty(slides[0]):
             default_slide_id = slides[0].get("objectId")
             if not default_slide_id:
                 raise ValueError(
                     "Google Slides returned an empty initial slide without an object_id"
                 )
 
-            service.presentations().batchUpdate(
-                presentationId=pres_id,
-                body={"requests": [{"deleteObject": {"objectId": default_slide_id}}]},
-            ).execute()
-            removed_default_slide = True
-
-        # Confirm the postcondition rather than assuming deleteObject removed
-        # the page. This keeps the tool from handing the agent a link that
-        # still contains the blank first slide.
-        final_presentation = (
-            service.presentations().get(presentationId=pres_id).execute()
-        )
-        final_slides = final_presentation.get("slides", [])
-        if removed_default_slide and any(
-            slide.get("objectId") == default_slide_id for slide in final_slides
-        ):
-            raise RuntimeError("Google Slides default blank slide was not removed")
-
         return json.dumps(
             {
                 "status": "success",
                 "presentation_id": pres_id,
-                "title": final_presentation.get("title") or presentation.get("title"),
+                "title": presentation.get("title"),
                 "link": f"https://docs.google.com/presentation/d/{pres_id}/edit",
-                "slide_count": len(final_slides),
-                "default_slide_removed": removed_default_slide,
+                "slide_count": len(slides),
+                "default_slide_id": default_slide_id,
+                "default_slide_removed": False,
             },
             ensure_ascii=False,
         )
@@ -538,9 +561,9 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
                 ensure_ascii=False,
             )
         empty_slide_numbers = [
-            summary["slide_number"]
+            index + 1
             for index, slide in enumerate(slides)
-            if not (summary := _slide_summary(slide, index))["text"]
+            if _slide_is_empty(slide)
         ]
         if empty_slide_numbers:
             return json.dumps(
@@ -685,6 +708,21 @@ def google_slides_add_slide(
         pres_id = _resolve_presentation_id(presentation_id)
         service = get_slides_service()
 
+        # A Slides API create call starts with one default blank page. Read
+        # the current pages before creating the first real page, then delete
+        # that default only after the new page has been created in this same
+        # atomic batch. This avoids relying on an undocumented zero-page
+        # presentation state and keeps the requested slide count exact.
+        existing = service.presentations().get(presentationId=pres_id).execute()
+        default_slide_id = None
+        existing_slides = existing.get("slides", [])
+        if len(existing_slides) == 1 and _slide_is_empty(existing_slides[0]):
+            default_slide_id = existing_slides[0].get("objectId")
+            if not default_slide_id:
+                raise ValueError(
+                    "Google Slides returned an empty slide without an object_id"
+                )
+
         slide_id = f"slide_{uuid.uuid4().hex[:12]}"
         title_id = f"{slide_id}_title"
         body_id = f"{slide_id}_body"
@@ -719,6 +757,8 @@ def google_slides_add_slide(
             )
         if body.strip():
             requests.extend(_body_insert_requests(body_id, body, is_bulleted))
+        if default_slide_id:
+            requests.append({"deleteObject": {"objectId": default_slide_id}})
 
         service.presentations().batchUpdate(
             presentationId=pres_id, body={"requests": requests}
@@ -730,6 +770,7 @@ def google_slides_add_slide(
                 "presentation_id": pres_id,
                 "slide_id": slide_id,
                 "layout": normalized_layout,
+                "default_slide_removed": bool(default_slide_id),
             },
             ensure_ascii=False,
         )

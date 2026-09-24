@@ -85,34 +85,57 @@ def _empty_create_response(subject: str) -> str:
     )
 
 
-def _verify_created_record(resource: str, safe_resource: str, result: Any) -> str:
-    """Confirm a just-created record is actually retrievable before
-    reporting success, rather than trusting the create response at face
-    value. Deputy's create endpoints can return a 200 with a plausible,
-    fully-formed record body (Id, timestamps, ...) for a record that
-    turns out to be permission-orphaned and unreadable by every other
-    endpoint -- confirmed in a 2026-09-21 production incident, where a
-    bare POST /resource/Employee did exactly this twice (see
-    deputy_create_resource's Employee rejection and deputy_add_employee).
-    Shared by both create tools rather than duplicated, since the same
-    "success" response shape can mislead regardless of which endpoint
-    produced it.
+def _verify_record_readable(
+    resource: str, safe_resource: str, result: Any, *, record_id: Any = None
+) -> str:
+    """Confirm a just-written record is actually retrievable before
+    reporting success, rather than trusting the create/update response at
+    face value. Deputy's write endpoints can return a 200 with a
+    plausible, fully-formed record body (Id, timestamps, ...) for a
+    record that turns out to be permission-orphaned and unreadable by
+    every other endpoint -- confirmed in a 2026-09-21 production
+    incident, where a bare POST /resource/Employee did exactly this
+    twice (see deputy_create_resource's Employee rejection and
+    deputy_add_employee).
+
+    The same risk exists on update, not just create: Deputy's own
+    Employee schema (developer.deputy.com's "Replace a Employee"/"Update
+    a Employee" references) lists "Company" -- the exact
+    location/workplace-membership field the 2026-09-21 incident traced
+    the orphaning to -- as a regular, caller-writable, required field on
+    POST /resource/Employee/{id}, the very endpoint
+    deputy_update_resource's generic GET-then-merge-then-POST writes to.
+    A caller-supplied Company reassignment via deputy_update_resource can
+    therefore orphan a record exactly like a bad create. Shared by every
+    write path (both create tools and deputy_update_resource) rather
+    than duplicated, since the same "success" response shape can mislead
+    regardless of which endpoint or HTTP verb produced it.
 
     ``safe_resource`` is the already-``url_path_id``-sanitized form of
-    ``resource``, passed in rather than re-derived here: both callers have
-    already computed it for their own POST, and a caller that ever
+    ``resource``, passed in rather than re-derived here: every caller has
+    already computed it for its own POST, and a caller that ever
     sanitizes ``resource`` differently before its POST than what it hands
     this helper (e.g. adds trimming/casefolding to one call site only)
     should not be able to silently point the readback GET somewhere other
-    than the record it just created.
+    than the record it just wrote.
+
+    ``record_id`` lets a caller that already knows the record's id from
+    somewhere other than the response body (deputy_update_resource gets
+    it from the URL, not from Deputy's write response, which isn't
+    guaranteed to echo "Id" back) verify against that id directly.
+    Defaults to ``result.get("Id")``, matching the create tools' original
+    behavior -- including the "no id to verify against" warning below,
+    which a caller that always supplies its own ``record_id`` can never
+    hit.
     """
     if not isinstance(result, dict):
         # A malformed response _record_response already errors on.
         return _record_response(resource, result)
-    if result.get("Id") is None:
-        # Already-empty ({}) is handled by each caller before this is
-        # reached, so this is a non-empty body with nothing to read back
-        # and verify against -- not a different, safer case than a
+    verify_id = record_id if record_id is not None else result.get("Id")
+    if verify_id is None:
+        # Already-empty ({}) is handled by each create caller before this
+        # is reached, so this is a non-empty body with nothing to read
+        # back and verify against -- not a different, safer case than a
         # present-but-orphaned Id, just a differently-shaped instance of
         # the same "can't confirm this succeeded" risk this function
         # exists to catch. This matters most for deputy_add_employee:
@@ -120,20 +143,21 @@ def _verify_created_record(resource: str, safe_resource: str, result: Any) -> st
         # response as an undocumented, empty schema (unlike the Resource
         # API's Employee object, which always has an Id), so a body
         # that comes back anyway without an Id is exactly the
-        # unconfirmed-shape case, not a clean pass-through.
+        # unconfirmed-shape case, not a clean pass-through. Unreachable
+        # from deputy_update_resource, which always supplies its own
+        # ``record_id`` from the URL.
         warning = (
-            f"Unconfirmed Deputy {resource} create -- verify directly in "
-            "Deputy before relying on it. The create response had no Id "
+            f"Unconfirmed Deputy {resource} write -- verify directly in "
+            "Deputy before relying on it. The write response had no Id "
             "to read back and confirm."
         )
         return success_with_capped_dict(
             "record", result, critical_fields={"warning": warning}
         )
-    record_id = result["Id"]
     detail: str | None = None
     readback: Any = None
     try:
-        safe_id = url_path_id(str(record_id), "resource_id")
+        safe_id = url_path_id(str(verify_id), "resource_id")
         readback = _request("GET", f"/resource/{safe_resource}/{safe_id}")
         verified = isinstance(readback, dict) and bool(readback)
     except Exception as e:
@@ -146,11 +170,11 @@ def _verify_created_record(resource: str, safe_resource: str, result: Any) -> st
         # followed by nothing.
         detail = str(e) or type(e).__name__
         logger.warning(
-            f"Deputy readback failed for {resource} Id {record_id}: {detail}",
+            f"Deputy readback failed for {resource} Id {verify_id}: {detail}",
             exc_info=True,
         )
     if verified:
-        # The freshly-read record, not the create response: Deputy may
+        # The freshly-read record, not the write response: Deputy may
         # normalize or default fields between the write and this read, and
         # since a full GET is already being paid for, there's no reason to
         # return the staler of the two.
@@ -170,15 +194,15 @@ def _verify_created_record(resource: str, safe_resource: str, result: Any) -> st
     # success_with_capped_dict's last-resort fallback cuts an oversized
     # critical field from the end, so if this ever needs shortening, it
     # must eat into "reason" -- not into the one instruction a caller
-    # actually needs to act on. "Do not retry" is explicit rather than
-    # implied by "verify directly": the POST that got this far already
-    # returned an Id, so Deputy most likely did create the record --
-    # retrying the create on an unconfirmed *readback* risks a genuine
-    # duplicate, not just a redundant no-op.
+    # actually needs to act on. No blanket "do not retry" instruction
+    # here (unlike the old create-only wording this replaces): that's
+    # correct for create (a retry after an unconfirmed *readback* risks a
+    # genuine duplicate, since the POST already returned an Id), but
+    # wrong for deputy_update_resource, whose retries are idempotent by
+    # design -- each tool's own docstring covers its retry semantics.
     warning = (
-        f"Unconfirmed Deputy {resource} create (Id {record_id}) -- verify "
-        "directly in Deputy before relying on it; do not retry the create, "
-        f"which likely already succeeded. Reading it back {reason}."
+        f"Unconfirmed Deputy {resource} write (Id {verify_id}) -- verify "
+        f"directly in Deputy before relying on it. Reading it back {reason}."
     )
     # critical_fields, not extra_fields: this warning is the entire point
     # of this function, so it must survive even success_with_capped_dict's
@@ -549,7 +573,7 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
         result = _request("POST", f"/resource/{safe_resource}", json_data=create_data)
         if isinstance(result, dict) and not result:
             return _empty_create_response(resource)
-        return _verify_created_record(resource, safe_resource, result)
+        return _verify_record_readable(resource, safe_resource, result)
     except Exception as e:
         logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
         return _error(str(e))
@@ -667,7 +691,7 @@ def deputy_add_employee(
         result = _request("POST", "/supervise/employee", json_data=body)
         if isinstance(result, dict) and not result:
             return _empty_create_response("employee")
-        return _verify_created_record("Employee", "Employee", result)
+        return _verify_record_readable("Employee", "Employee", result)
     except Exception as e:
         logger.error(f"Error adding Deputy employee: {e}", exc_info=True)
         return _error(str(e))
@@ -692,7 +716,18 @@ def deputy_update_resource(
     deactivate an Employee. For "Employee", fields like "Company",
     "Contact", "Role", and "StressProfile" are ids referencing other
     records, not literal values -- look up a valid id first (e.g. via
-    deputy_list_resource) rather than guessing one.
+    deputy_list_resource) rather than guessing one. Reassigning an
+    Employee's "Company" carries the same risk as a bad create -- see the
+    note below.
+    After Deputy reports success, this reads the record back before
+    confirming -- if that fails, the result is still returned but with a
+    "warning" field flagging it as unconfirmed; treat that the same as a
+    failure until you've verified it directly in Deputy. This guards
+    against the same failure mode as deputy_create_resource's Employee
+    rejection/deputy_add_employee: Deputy's permission model is scoped by
+    location, so a write that changes an Employee's Company can leave it
+    just as unreadable as a bad create, even though Deputy reports
+    success.
     """
     try:
         # "Id" is identified by resource_id/the URL, not data: the URL's
@@ -745,7 +780,18 @@ def deputy_update_resource(
             f"/resource/{safe_resource}/{safe_resource_id}",
             json_data=merged,
         )
-        return _record_response(resource, result)
+        # Verify against resource_id (already known from the URL, and
+        # already validated by url_path_id above), not result.get("Id"):
+        # unlike a create response, Deputy's update response isn't
+        # guaranteed to echo "Id" back, and the record being written is
+        # never in doubt here the way it is for a create's server-assigned
+        # id. See _verify_record_readable's docstring for why an update
+        # needs this at all -- Employee's "Company" field is a regular,
+        # writable field on this same POST, so a caller-supplied Company
+        # change can orphan the record exactly like a bad create.
+        return _verify_record_readable(
+            resource, safe_resource, result, record_id=resource_id
+        )
     except Exception as e:
         logger.error(
             f"Error updating Deputy {resource} record {resource_id}: {e}",

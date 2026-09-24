@@ -1652,7 +1652,6 @@ def test_create_presentation_returns_link_and_id(monkeypatch):
     assert result["link"] == "https://docs.google.com/presentation/d/pres1/edit"
     assert result["slide_count"] == 1
     assert result["default_slide_id"] == "p"
-    assert result["default_slide_removed"] is False
     presentations.batchUpdate.assert_not_called()
 
 
@@ -1672,7 +1671,6 @@ def test_create_presentation_reads_initial_slide_when_create_omits_slides(monkey
     assert result["status"] == "success"
     assert result["slide_count"] == 1
     assert result["default_slide_id"] == "p"
-    assert result["default_slide_removed"] is False
     assert presentations.get.call_count == 1
 
 
@@ -1699,7 +1697,6 @@ def test_create_presentation_does_not_delete_nonempty_initial_slide(monkeypatch)
 
     assert result["status"] == "success"
     assert result["slide_count"] == 1
-    assert result["default_slide_removed"] is False
     presentations.batchUpdate.assert_not_called()
 
 
@@ -1724,7 +1721,7 @@ def test_add_slide_removes_default_blank_slide_in_same_batch(monkeypatch):
     assert requests[-1] == {"deleteObject": {"objectId": "p"}}
 
 
-def test_add_slide_uses_default_slide_tracked_by_create(monkeypatch):
+def test_add_slide_removes_default_slide_across_mcp_processes(monkeypatch):
     presentations = Mock()
     presentations.create.return_value.execute.return_value = {
         "presentationId": "pres1",
@@ -1738,6 +1735,7 @@ def test_add_slide_uses_default_slide_tracked_by_create(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     created = json.loads(google_slides.google_slides_create_presentation("New Deck"))
+    google_slides._CREATED_DEFAULT_SLIDES.clear()
     added = json.loads(
         google_slides.google_slides_add_slide(
             created["presentation_id"], title="Title", body="Detail"
@@ -1759,7 +1757,12 @@ def test_add_slide_keeps_untracked_intentional_blank_slide(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="Title", body="Detail")
+        google_slides.google_slides_add_slide(
+            "pres1",
+            title="Title",
+            body="Detail",
+            preserve_blank_slide=True,
+        )
     )
 
     assert result["status"] == "success"
@@ -1975,6 +1978,53 @@ def test_import_pptx_rejects_empty_slide_after_conversion(monkeypatch, tmp_path)
 
     assert result["status"] == "validation_failed"
     assert result["empty_slide_numbers"] == [1]
+    drive.files.return_value.delete.assert_called_once_with(
+        fileId="pres1", supportsAllDrives=True
+    )
+
+
+def test_element_text_reads_grouped_shapes():
+    element = {
+        "elementGroup": {
+            "children": [
+                {
+                    "shape": {
+                        "text": {
+                            "textElements": [{"textRun": {"content": "Grouped text"}}]
+                        }
+                    }
+                }
+            ]
+        }
+    }
+
+    assert google_slides._element_text(element) == "Grouped text"
+
+
+def test_import_pptx_allows_intentional_blank_source_slide(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "blank-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "")
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Blank Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Blank Deck",
+        "slides": [{"objectId": "slide1", "pageElements": []}],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_import_pptx(str(pptx_path)))
+
+    assert result["status"] == "success"
 
 
 def test_import_pptx_allows_image_only_slide_after_conversion(monkeypatch, tmp_path):

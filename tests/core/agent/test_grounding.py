@@ -53,6 +53,22 @@ def test_grounding_rule_without_tools_omits_tool_verification() -> None:
     assert "invented values. Never fill a gap" in rule
 
 
+@pytest.mark.parametrize("can_call_tools", [True, False])
+def test_grounding_rule_requires_source_content_for_inspection_claims(
+    can_call_tools: bool,
+) -> None:
+    rule = grounding_rule(can_call_tools=can_call_tools)
+
+    assert "A citation or search snippet is not evidence" in rule
+    assert "attribute only claims supported by text actually available" in rule
+    if can_call_tools:
+        assert "retrieve its relevant content" in rule
+        assert "if retrieval fails" in rule
+    else:
+        assert "retrieve its relevant content" not in rule
+        assert "If requested source content was not inspected, disclose" in rule
+
+
 def test_grounding_rule_covers_fact_carrying_tool_arguments() -> None:
     """A fabricated value is worse as a tool argument than as answer text.
 

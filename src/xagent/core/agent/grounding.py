@@ -151,6 +151,19 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         "something else; when it did not, report the fact under the record "
         "it actually came from instead. "
     )
+    source_evidence_rule = (
+        " A citation or search snippet is not evidence that you inspected the "
+        "source body: attribute only claims supported by text actually "
+        "available in this conversation or tool results. "
+    )
+    source_inspection_rule = (
+        "When the user asks you to read or inspect a source, retrieve its "
+        "relevant content before claiming to have done so; if retrieval fails, "
+        "disclose what you could and could not inspect."
+        if can_call_tools
+        else "If requested source content was not inspected, disclose that "
+        "limitation rather than implying that a source was read."
+    )
     return (
         "Do not introduce specific entities, incidents, dates, sources, "
         "causal explanations, or quantitative data (metrics, figures, "
@@ -182,6 +195,7 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         "explaining that some values are not real, remove those values and "
         "report the gap instead."
         f"{tool_argument_rule}"
+        f"{source_evidence_rule}{source_inspection_rule}"
     )
 
 

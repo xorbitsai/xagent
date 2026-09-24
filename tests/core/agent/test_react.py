@@ -1587,6 +1587,7 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
 
     for prompt in (tool_prompt, lookup_tool_prompt, forced_prompt):
         assert "quantitative data" in prompt
+        assert "A citation or search snippet is not evidence" in prompt
         assert (
             "a current user request that explicitly asks you to write a template"
             in prompt
@@ -1607,6 +1608,24 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
     )
     assert forced_prompt.count("## FINAL DELIVERABLE FILE REFERENCES") == 1
     assert "call get_workspace_output_files once before finalizing" not in forced_prompt
+
+
+@pytest.mark.parametrize("user_interaction_enabled", [True, False])
+def test_react_defaults_presentation_without_guessing_required_information(
+    user_interaction_enabled: bool,
+) -> None:
+    pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Analyze the available evidence")
+
+    prompt = pattern._messages_for_llm(context, has_tools=True)[0]["content"]
+
+    assert "Clarify only when missing user information prevents correct" in prompt
+    assert "including an unspecified output format" in prompt
+    assert "deliver the supported work without pausing" in prompt
+    assert "does not permit guessing facts, action targets, or authorization" in prompt
+    # Presentation defaults must not weaken the existing missing-fact policy.
+    assert "fact-carrying argument value" in prompt
 
 
 def test_react_forced_final_answer_respects_prior_clarification_scope() -> None:

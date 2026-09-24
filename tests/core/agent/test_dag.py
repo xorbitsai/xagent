@@ -6899,14 +6899,23 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     assert interrupted["status"] == "interrupted"
     assert checkpoint is not None
     assert checkpoint["label"] == "dag_interrupted"
-    assert checkpoint["pattern_state"]["active_step_pattern_states"]["calc"][
+    [pending_call] = checkpoint["pattern_state"]["active_step_pattern_states"]["calc"][
         "pending_tool_calls"
-    ] == [{"id": "dag-call", "name": "calculator", "args": {"expression": "6*7"}}]
+    ]
+    assert pending_call["id"] == "dag-call"
+    assert pending_call["name"] == "calculator"
+    assert pending_call["args"] == {"expression": "6*7"}
+    checkpointed_invocation_id = pending_call["invocation_id"]
+    assert checkpointed_invocation_id
 
     restored_pattern = DAGPattern(
         lambda **_: build_plan(PlanStep(id="calc", task="Calculate 6*7"))
     )
     restored_pattern.load_state(checkpoint["pattern_state"])
+    [restored_pending_call] = restored_pattern.active_step_pattern_states["calc"][
+        "pending_tool_calls"
+    ]
+    assert restored_pending_call["invocation_id"] == checkpointed_invocation_id
     restored_context = ExecutionContext.from_dict(checkpoint["context"])
     restored_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["audio"]
     restored_tool = FakeTool()

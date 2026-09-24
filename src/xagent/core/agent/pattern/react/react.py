@@ -5659,22 +5659,13 @@ class ReActPattern(AgentPattern):
         # dict that _backfill_result / _reorder_ledger_for_batch read desyncs
         # from the ledger (I2/I3). No await runs before the first record below,
         # so concurrent batch members get distinct fallback ids.
-        pending_call = tool_call
         if not tool_call.get("id"):
-            tool_call = {
-                **tool_call,
-                "id": f"tool_call_{len(self.tool_ledger)}",
-            }
+            tool_call["id"] = f"tool_call_{len(self.tool_ledger)}"
         # New LLM responses are stamped during normalization. This fallback is
         # only for restored legacy pending calls that predate invocation IDs.
         if not tool_call.get("invocation_id"):
-            tool_call = {**tool_call, "invocation_id": uuid.uuid4().hex}
-        if tool_call is not pending_call:
-            self.pending_tool_calls = [
-                tool_call if candidate is pending_call else candidate
-                for candidate in self.pending_tool_calls
-            ]
-            pending_call = tool_call
+            tool_call["invocation_id"] = uuid.uuid4().hex
+        pending_call = tool_call
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
         tool_call = self._with_runtime_turn_id(tool_call, runtime)

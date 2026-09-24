@@ -41,7 +41,10 @@ async def test_ordered_backfill_despite_out_of_order_completion() -> None:
     pattern = make_react(parallel=True, max_concurrency=3)
     runtime = FakeRuntime()
     context = RecordingContext()
-    batch = [make_tool_call(name) for name in names]
+    batch = [
+        {**make_tool_call(name), "invocation_id": f"invocation-{name}"}
+        for name in names
+    ]
 
     task = asyncio.create_task(
         pattern._run_concurrent_batch(batch, tools, runtime, context)
@@ -61,6 +64,9 @@ async def test_ordered_backfill_despite_out_of_order_completion() -> None:
     assert [r["tool_name"] for r in context.tool_results] == names
     assert [r["tool_call_id"] for r in context.tool_results] == [
         tc["id"] for tc in batch
+    ]
+    assert [r["invocation_id"] for r in context.tool_results] == [
+        tc["invocation_id"] for tc in batch
     ]
 
 

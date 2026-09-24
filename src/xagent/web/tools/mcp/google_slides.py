@@ -1,3 +1,7 @@
+# The repository's Ruff and isort configurations classify the MCP package
+# differently; keep this module's import grouping stable for both hooks.
+# isort: skip_file
+
 import json
 import logging
 import os
@@ -24,9 +28,7 @@ setup_proxy_env()
 mcp = FastMCP("google-slides-mcp")
 
 _PRESENTATION_URL_ID_PATTERN = re.compile(r"/presentation/d/([a-zA-Z0-9_-]+)")
-_PPTX_MIME_TYPE = (
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-)
+_PPTX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 _GOOGLE_SLIDES_MIME_TYPE = "application/vnd.google-apps.presentation"
 _PPTX_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
 
@@ -207,15 +209,11 @@ def _prepare_body_text(body: str, is_bulleted: bool) -> str:
     return "\n".join(line for line in body.split("\n") if line.strip())
 
 
-def _body_insert_requests(
-    body_id: str, body: str, is_bulleted: bool
-) -> list[dict[str, Any]]:
+def _body_insert_requests(body_id: str, body: str, is_bulleted: bool) -> list[dict[str, Any]]:
     """insertText for `body_id` — `body` must already be prepared via
     _prepare_body_text — plus createParagraphBullets when the target
     placeholder is a real bulleted-list BODY (not e.g. a plain SUBTITLE)."""
-    requests: list[dict[str, Any]] = [
-        {"insertText": {"objectId": body_id, "text": body}}
-    ]
+    requests: list[dict[str, Any]] = [{"insertText": {"objectId": body_id, "text": body}}]
     if is_bulleted:
         requests.append(
             {
@@ -244,11 +242,7 @@ _BODY_PLACEHOLDER_TYPES = {"BODY", "SUBTITLE", "OBJECT"}
 
 def _find_slide(presentation: dict[str, Any], slide_id: str) -> dict[str, Any] | None:
     return next(
-        (
-            slide
-            for slide in presentation.get("slides", [])
-            if slide.get("objectId") == slide_id
-        ),
+        (slide for slide in presentation.get("slides", []) if slide.get("objectId") == slide_id),
         None,
     )
 
@@ -331,10 +325,12 @@ def _resolve_pptx_upload_path(file_path: str) -> Path:
     local_path: Path | None = None
     authorized_candidate: Path | None = None
     for candidate in candidates:
-        resolved_candidate = candidate.resolve()
-        if not any(
-            resolved_candidate.is_relative_to(directory) for directory in allowed_dirs
-        ):
+        try:
+            resolved_candidate = candidate.resolve()
+        except (OSError, RuntimeError) as exc:
+            logger.warning("Could not resolve PPTX path %s: %s", candidate, exc)
+            raise ValueError("file path could not be resolved safely") from None
+        if not any(resolved_candidate.is_relative_to(directory) for directory in allowed_dirs):
             continue
         authorized_candidate = authorized_candidate or resolved_candidate
         if resolved_candidate.is_file():
@@ -400,16 +396,13 @@ def _record_created_default_slide(presentation_id: str, slide_id: str) -> None:
 
 def _resolve_presentation_id(presentation_id: str) -> str:
     """Accept either a bare presentation id or a full Google Slides URL."""
-    return resolve_id_from_url(
-        presentation_id, _PRESENTATION_URL_ID_PATTERN, "presentation_id"
-    )
+    return resolve_id_from_url(presentation_id, _PRESENTATION_URL_ID_PATTERN, "presentation_id")
 
 
 def _element_text(element: dict[str, Any]) -> str:
     text_elements = element.get("shape", {}).get("text", {}).get("textElements", [])
     return "".join(
-        text_element.get("textRun", {}).get("content", "")
-        for text_element in text_elements
+        text_element.get("textRun", {}).get("content", "") for text_element in text_elements
     )
 
 
@@ -506,9 +499,7 @@ def google_slides_create_presentation(title: str) -> str:
         # safe across client/API versions.
         slides = presentation.get("slides")
         if slides is None:
-            created = (
-                service.presentations().get(presentationId=pres_id).execute()
-            )
+            created = service.presentations().get(presentationId=pres_id).execute()
             slides = created.get("slides", [])
 
         default_slide_id = None
@@ -565,9 +556,7 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
 
         drive_service = get_drive_service()
         with local_path.open("rb") as file_handle:
-            media = MediaIoBaseUpload(
-                file_handle, mimetype=_PPTX_MIME_TYPE, resumable=True
-            )
+            media = MediaIoBaseUpload(file_handle, mimetype=_PPTX_MIME_TYPE, resumable=True)
             imported_file = (
                 drive_service.files()
                 .create(
@@ -587,10 +576,7 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
             raise ValueError("Google Drive did not return the imported file id")
 
         presentation = (
-            get_slides_service()
-            .presentations()
-            .get(presentationId=presentation_id)
-            .execute()
+            get_slides_service().presentations().get(presentationId=presentation_id).execute()
         )
         link = imported_file.get("webViewLink") or (
             f"https://docs.google.com/presentation/d/{presentation_id}/edit"
@@ -626,9 +612,7 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
                 ensure_ascii=False,
             )
         empty_slide_numbers = [
-            index + 1
-            for index, slide in enumerate(slides)
-            if _slide_is_empty(slide)
+            index + 1 for index, slide in enumerate(slides) if _slide_is_empty(slide)
         ]
         actual_slide_text = [
             _normalize_comparison_text(" ".join(_slide_summary(slide, index)["text"]))
@@ -643,9 +627,7 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
             return json.dumps(
                 {
                     "status": "validation_failed",
-                    "message": (
-                        "Imported presentation contains empty slides or missing text"
-                    ),
+                    "message": ("Imported presentation contains empty slides or missing text"),
                     "presentation_id": presentation_id,
                     "title": presentation.get("title") or resolved_title,
                     "link": link,
@@ -800,9 +782,7 @@ def google_slides_add_slide(
         existing = service.presentations().get(presentationId=pres_id).execute()
         requested_default_slide_id = default_slide_id.strip()
         tracked_default_slide_id = _CREATED_DEFAULT_SLIDES.get(pres_id)
-        candidate_default_slide_id = (
-            requested_default_slide_id or tracked_default_slide_id
-        )
+        candidate_default_slide_id = requested_default_slide_id or tracked_default_slide_id
         slide_to_remove = None
         existing_slides = existing.get("slides", [])
         if candidate_default_slide_id and len(existing_slides) == 1:
@@ -844,9 +824,7 @@ def google_slides_add_slide(
 
         requests: list[dict[str, Any]] = [{"createSlide": create_slide}]
         if title.strip():
-            requests.append(
-                {"insertText": {"objectId": title_id, "text": title.strip()}}
-            )
+            requests.append({"insertText": {"objectId": title_id, "text": title.strip()}})
         if body.strip():
             requests.extend(_body_insert_requests(body_id, body, is_bulleted))
         if slide_to_remove:
@@ -917,13 +895,11 @@ def google_slides_update_slide(
 
         if title and "title" not in placeholders:
             return _error(
-                f"Slide '{slide_id}' has no title placeholder, so 'title' "
-                "has nowhere to go."
+                f"Slide '{slide_id}' has no title placeholder, so 'title' has nowhere to go."
             )
         if body and "body" not in placeholders:
             return _error(
-                f"Slide '{slide_id}' has no body/subtitle placeholder, so "
-                "'body' has nowhere to go."
+                f"Slide '{slide_id}' has no body/subtitle placeholder, so 'body' has nowhere to go."
             )
 
         if body:
@@ -965,9 +941,7 @@ def google_slides_update_slide(
             if role == "title":
                 requests.append({"insertText": {"objectId": object_id, "text": text}})
             else:
-                requests.extend(
-                    _body_insert_requests(object_id, text, placeholder_type == "BODY")
-                )
+                requests.extend(_body_insert_requests(object_id, text, placeholder_type == "BODY"))
 
         service.presentations().batchUpdate(
             presentationId=pres_id, body={"requests": requests}

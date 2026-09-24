@@ -78,12 +78,9 @@ def test_add_slide_default_layout_creates_title_and_body_with_bullets(monkeypatc
     requests = _batch_update_requests(presentations)
 
     create_slide = requests[0]["createSlide"]
-    assert create_slide["slideLayoutReference"] == {
-        "predefinedLayout": "TITLE_AND_BODY"
-    }
+    assert create_slide["slideLayoutReference"] == {"predefinedLayout": "TITLE_AND_BODY"}
     mappings = {
-        m["layoutPlaceholder"]["type"]: m["objectId"]
-        for m in create_slide["placeholderIdMappings"]
+        m["layoutPlaceholder"]["type"]: m["objectId"] for m in create_slide["placeholderIdMappings"]
     }
     assert set(mappings) == {"TITLE", "BODY"}
 
@@ -114,9 +111,7 @@ def test_add_slide_default_layout_creates_title_and_body_with_bullets(monkeypatc
         for i, r in enumerate(requests)
         if "insertText" in r and r["insertText"]["objectId"] == mappings["BODY"]
     )
-    bullets_index = next(
-        i for i, r in enumerate(requests) if "createParagraphBullets" in r
-    )
+    bullets_index = next(i for i, r in enumerate(requests) if "createParagraphBullets" in r)
     assert bullets_index > body_insert_index
 
 
@@ -126,9 +121,7 @@ def test_add_slide_strips_literal_bullet_markers_before_inserting(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     body = "• First point\n- Second point\n* Third point\nFourth point (no marker)"
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", body=body)
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="T", body=body))
 
     assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
@@ -138,9 +131,7 @@ def test_add_slide_strips_literal_bullet_markers_before_inserting(monkeypatch):
         for r in requests
         if "insertText" in r and r["insertText"]["objectId"] == body_object_id
     )
-    assert body_text == (
-        "First point\nSecond point\nThird point\nFourth point (no marker)"
-    )
+    assert body_text == ("First point\nSecond point\nThird point\nFourth point (no marker)")
 
 
 def test_add_slide_strips_marker_glued_to_text_without_trailing_space(monkeypatch):
@@ -152,9 +143,7 @@ def test_add_slide_strips_marker_glued_to_text_without_trailing_space(monkeypatc
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide(
-            "pres1", title="T", body="•First point\n-Nospace"
-        )
+        google_slides.google_slides_add_slide("pres1", title="T", body="•First point\n-Nospace")
     )
 
     assert result["status"] == "success"
@@ -178,9 +167,7 @@ def test_add_slide_preserves_nested_bullet_indentation(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     body = "- Top\n  - Nested\n    - Deeper"
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", body=body)
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="T", body=body))
 
     assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
@@ -206,9 +193,7 @@ def test_add_slide_preserves_literal_tab_indentation(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     body = "- Top\n\t- Nested\n\t\t- Deeper"
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", body=body)
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="T", body=body))
 
     assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
@@ -230,9 +215,7 @@ def test_add_slide_mixed_tab_and_space_indentation_uses_tab_count_only(monkeypat
     _mock_slides_service(monkeypatch, presentations)
 
     body = "- Top\n\t  - Mixed"
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", body=body)
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="T", body=body))
 
     assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
@@ -263,9 +246,7 @@ def test_add_slide_does_not_corrupt_non_bullet_content_starting_with_marker_char
         "-5% growth\n-$5m loss\n-.5% decline\n-- Author Name\n-– Author\n"
         "**Note\n*emphasis* not a bullet"
     )
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", body=body)
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="T", body=body))
 
     assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
@@ -289,9 +270,7 @@ def test_add_slide_strips_bare_marker_with_nothing_after_it(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide(
-            "pres1", title="T", body="Point one\n•\nPoint two"
-        )
+        google_slides.google_slides_add_slide("pres1", title="T", body="Point one\n•\nPoint two")
     )
 
     assert result["status"] == "success"
@@ -353,9 +332,7 @@ def test_add_slide_drops_blank_lines_and_trailing_newline_from_bulleted_body(
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
 
-    google_slides.google_slides_add_slide(
-        "pres1", title="T", body="Point one\n\nPoint two\n"
-    )
+    google_slides.google_slides_add_slide("pres1", title="T", body="Point one\n\nPoint two\n")
 
     requests = _batch_update_requests(presentations)
     body_object_id = _placeholder_object_id(requests[0]["createSlide"], "BODY")
@@ -409,8 +386,7 @@ def test_add_slide_title_layout_uses_subtitle_and_skips_bullets(monkeypatch):
     create_slide = requests[0]["createSlide"]
     assert create_slide["slideLayoutReference"] == {"predefinedLayout": "TITLE"}
     mappings = {
-        m["layoutPlaceholder"]["type"]: m["objectId"]
-        for m in create_slide["placeholderIdMappings"]
+        m["layoutPlaceholder"]["type"]: m["objectId"] for m in create_slide["placeholderIdMappings"]
     }
     assert set(mappings) == {"CENTERED_TITLE", "SUBTITLE"}
     assert not any("createParagraphBullets" in r for r in requests)
@@ -423,18 +399,14 @@ def test_add_slide_title_only_layouts_need_no_body(monkeypatch, layout):
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide(
-            "pres1", title="Section Break", layout=layout
-        )
+        google_slides.google_slides_add_slide("pres1", title="Section Break", layout=layout)
     )
 
     assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
     create_slide = requests[0]["createSlide"]
     assert create_slide["slideLayoutReference"] == {"predefinedLayout": layout}
-    mappings = {
-        m["layoutPlaceholder"]["type"] for m in create_slide["placeholderIdMappings"]
-    }
+    mappings = {m["layoutPlaceholder"]["type"] for m in create_slide["placeholderIdMappings"]}
     assert mappings == {"TITLE"}
 
 
@@ -465,9 +437,7 @@ def test_add_slide_rejects_title_that_is_only_a_newline(monkeypatch, layout):
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="\n", layout=layout)
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="\n", layout=layout))
 
     assert result["status"] == "error"
     assert "completely empty slide" in result["message"]
@@ -503,8 +473,7 @@ def test_add_slide_skips_whitespace_only_title_insertion(monkeypatch):
     requests = _batch_update_requests(presentations)
     title_object_id = _placeholder_object_id(requests[0]["createSlide"], "TITLE")
     assert not any(
-        "insertText" in r and r["insertText"]["objectId"] == title_object_id
-        for r in requests
+        "insertText" in r and r["insertText"]["objectId"] == title_object_id for r in requests
     )
 
 
@@ -529,9 +498,7 @@ def test_add_slide_rejects_non_string_layout_from_direct_call(monkeypatch):
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", layout=123)
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="T", layout=123))
 
     assert result["status"] == "error"
     assert "'layout' must be a string" in result["message"]
@@ -570,9 +537,7 @@ def test_add_slide_allows_whitespace_only_body_on_layout_without_body_placeholde
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide(
-            "pres1", title="T", body="\n", layout=layout
-        )
+        google_slides.google_slides_add_slide("pres1", title="T", body="\n", layout=layout)
     )
 
     assert result["status"] == "success"
@@ -586,9 +551,7 @@ def test_add_slide_allows_whitespace_only_title_on_blank_layout(monkeypatch):
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="   ", layout="BLANK")
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="   ", layout="BLANK"))
 
     assert result["status"] == "success"
 
@@ -693,17 +656,14 @@ def test_add_slide_skips_whitespace_only_body_insertion_on_title_layout(monkeypa
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide(
-            "pres1", title="Cover", body="   ", layout="TITLE"
-        )
+        google_slides.google_slides_add_slide("pres1", title="Cover", body="   ", layout="TITLE")
     )
 
     assert result["status"] == "success"
     requests = _batch_update_requests(presentations)
     subtitle_object_id = _placeholder_object_id(requests[0]["createSlide"], "SUBTITLE")
     assert not any(
-        "insertText" in r and r["insertText"]["objectId"] == subtitle_object_id
-        for r in requests
+        "insertText" in r and r["insertText"]["objectId"] == subtitle_object_id for r in requests
     )
 
 
@@ -724,9 +684,7 @@ def test_add_slide_blank_layout_rejects_title_alone(monkeypatch):
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", layout="BLANK")
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="T", layout="BLANK"))
 
     assert result["status"] == "error"
     assert "has no title placeholder" in result["message"]
@@ -737,9 +695,7 @@ def test_add_slide_blank_layout_rejects_body_alone(monkeypatch):
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", body="B", layout="BLANK")
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", body="B", layout="BLANK"))
 
     assert result["status"] == "error"
     assert "has no body placeholder" in result["message"]
@@ -770,9 +726,7 @@ def test_add_slide_resolves_full_presentation_url(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     url = "https://docs.google.com/presentation/d/abc123/edit#slide=id.p"
-    result = json.loads(
-        google_slides.google_slides_add_slide(url, title="T", body="detail line")
-    )
+    result = json.loads(google_slides.google_slides_add_slide(url, title="T", body="detail line"))
 
     assert result["status"] == "success"
     assert presentations.batchUpdate.call_args.kwargs["presentationId"] == "abc123"
@@ -783,9 +737,7 @@ def test_add_slide_returns_error_payload_on_api_failure(monkeypatch):
     presentations.batchUpdate.return_value.execute.side_effect = RuntimeError("boom")
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", body="detail")
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="T", body="detail"))
 
     assert result["status"] == "error"
     assert "boom" in result["message"]
@@ -797,9 +749,7 @@ def test_add_slide_returns_error_payload_without_ascii_escaping(monkeypatch):
     echoed back, or a non-ASCII exception message) gets mangled into
     \\uXXXX escapes instead of staying human-readable."""
     presentations = Mock()
-    presentations.batchUpdate.return_value.execute.side_effect = RuntimeError(
-        "读取失败 — 😀"
-    )
+    presentations.batchUpdate.return_value.execute.side_effect = RuntimeError("读取失败 — 😀")
     _mock_slides_service(monkeypatch, presentations)
 
     raw = google_slides.google_slides_add_slide("pres1", title="T", body="detail")
@@ -827,9 +777,7 @@ def test_add_slide_normalizes_layout_case_and_whitespace(
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide(
-            "pres1", title="T", layout=layout, **kwargs
-        )
+        google_slides.google_slides_add_slide("pres1", title="T", layout=layout, **kwargs)
     )
 
     assert result["status"] == "success"
@@ -843,9 +791,7 @@ def test_add_slide_echoes_the_effective_layout_on_success(monkeypatch):
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", body="detail")
-    )
+    result = json.loads(google_slides.google_slides_add_slide("pres1", title="T", body="detail"))
 
     assert result["layout"] == "TITLE_AND_BODY"
 
@@ -967,9 +913,7 @@ async def test_update_slide_via_mcp_layer(monkeypatch):
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
-    _mock_presentation_get(
-        presentations, "slide1", [_placeholder_element("title_obj", "TITLE")]
-    )
+    _mock_presentation_get(presentations, "slide1", [_placeholder_element("title_obj", "TITLE")])
 
     content, _ = await google_slides.mcp.call_tool(
         "google_slides_update_slide",
@@ -1047,20 +991,12 @@ def test_update_slide_replaces_title_and_body_and_reapplies_bullets(monkeypatch)
     def _index_of(predicate):
         return next(i for i, r in enumerate(requests) if predicate(r))
 
-    title_delete_index = _index_of(
-        lambda r: r.get("deleteText", {}).get("objectId") == "title_obj"
-    )
-    title_insert_index = _index_of(
-        lambda r: r.get("insertText", {}).get("objectId") == "title_obj"
-    )
+    title_delete_index = _index_of(lambda r: r.get("deleteText", {}).get("objectId") == "title_obj")
+    title_insert_index = _index_of(lambda r: r.get("insertText", {}).get("objectId") == "title_obj")
     assert title_delete_index < title_insert_index
 
-    body_delete_index = _index_of(
-        lambda r: r.get("deleteText", {}).get("objectId") == "body_obj"
-    )
-    body_insert_index = _index_of(
-        lambda r: r.get("insertText", {}).get("objectId") == "body_obj"
-    )
+    body_delete_index = _index_of(lambda r: r.get("deleteText", {}).get("objectId") == "body_obj")
+    body_insert_index = _index_of(lambda r: r.get("insertText", {}).get("objectId") == "body_obj")
     bullets_index = _index_of(lambda r: "createParagraphBullets" in r)
     assert body_delete_index < body_insert_index < bullets_index
 
@@ -1168,9 +1104,7 @@ def test_update_slide_subtitle_body_is_not_bulleted_or_stripped(monkeypatch):
         ],
     )
 
-    google_slides.google_slides_update_slide(
-        "pres1", "slide1", body="- Literal dash subtitle"
-    )
+    google_slides.google_slides_update_slide("pres1", "slide1", body="- Literal dash subtitle")
 
     requests = _batch_update_requests(presentations)
     body_insert = next(
@@ -1199,9 +1133,7 @@ def test_update_slide_rejects_whitespace_only_title(monkeypatch):
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_update_slide("pres1", "slide1", title="   ")
-    )
+    result = json.loads(google_slides.google_slides_update_slide("pres1", "slide1", title="   "))
 
     assert result["status"] == "error"
     presentations.get.assert_not_called()
@@ -1236,9 +1168,7 @@ def test_update_slide_rejects_marker_only_body(monkeypatch):
         [_placeholder_element("body_obj", "BODY", text="Old body")],
     )
 
-    result = json.loads(
-        google_slides.google_slides_update_slide("pres1", "slide1", body="•   ")
-    )
+    result = json.loads(google_slides.google_slides_update_slide("pres1", "slide1", body="•   "))
 
     assert result["status"] == "error"
     presentations.batchUpdate.assert_not_called()
@@ -1249,9 +1179,7 @@ def test_update_slide_rejects_unknown_slide_id(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
     _mock_presentation_get(presentations, "other_slide", [])
 
-    result = json.loads(
-        google_slides.google_slides_update_slide("pres1", "slide1", title="T")
-    )
+    result = json.loads(google_slides.google_slides_update_slide("pres1", "slide1", title="T"))
 
     assert result["status"] == "error"
     assert "slide1" in result["message"]
@@ -1265,9 +1193,7 @@ def test_update_slide_rejects_title_when_slide_has_no_title_placeholder(monkeypa
         presentations, "slide1", [_placeholder_element("body_obj", "BODY", text="x")]
     )
 
-    result = json.loads(
-        google_slides.google_slides_update_slide("pres1", "slide1", title="T")
-    )
+    result = json.loads(google_slides.google_slides_update_slide("pres1", "slide1", title="T"))
 
     assert result["status"] == "error"
     assert "title" in result["message"]
@@ -1298,13 +1224,9 @@ def test_update_slide_collapses_embedded_newline_in_title(monkeypatch):
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
-    _mock_presentation_get(
-        presentations, "slide1", [_placeholder_element("title_obj", "TITLE")]
-    )
+    _mock_presentation_get(presentations, "slide1", [_placeholder_element("title_obj", "TITLE")])
 
-    google_slides.google_slides_update_slide(
-        "pres1", "slide1", title="Line one\nLine two"
-    )
+    google_slides.google_slides_update_slide("pres1", "slide1", title="Line one\nLine two")
 
     requests = _batch_update_requests(presentations)
     title_insert = next(
@@ -1360,9 +1282,7 @@ def test_update_slide_rejects_whole_call_when_body_becomes_empty_even_with_title
     )
 
     result = json.loads(
-        google_slides.google_slides_update_slide(
-            "pres1", "slide1", title="New title", body="•   "
-        )
+        google_slides.google_slides_update_slide("pres1", "slide1", title="New title", body="•   ")
     )
 
     assert result["status"] == "error"
@@ -1466,14 +1386,10 @@ def test_update_slide_resolves_full_presentation_url(monkeypatch):
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
-    _mock_presentation_get(
-        presentations, "slide1", [_placeholder_element("title_obj", "TITLE")]
-    )
+    _mock_presentation_get(presentations, "slide1", [_placeholder_element("title_obj", "TITLE")])
 
     url = "https://docs.google.com/presentation/d/abc123/edit#slide=id.p"
-    result = json.loads(
-        google_slides.google_slides_update_slide(url, "slide1", title="T")
-    )
+    result = json.loads(google_slides.google_slides_update_slide(url, "slide1", title="T"))
 
     assert result["status"] == "success"
     assert presentations.get.call_args.kwargs["presentationId"] == "abc123"
@@ -1485,9 +1401,7 @@ def test_update_slide_returns_error_payload_on_api_failure(monkeypatch):
     presentations.get.return_value.execute.side_effect = RuntimeError("boom")
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_update_slide("pres1", "slide1", title="T")
-    )
+    result = json.loads(google_slides.google_slides_update_slide("pres1", "slide1", title="T"))
 
     assert result["status"] == "error"
     assert "boom" in result["message"]
@@ -1500,13 +1414,9 @@ def test_update_slide_returns_error_payload_on_batch_update_failure(monkeypatch)
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.side_effect = RuntimeError("boom")
     _mock_slides_service(monkeypatch, presentations)
-    _mock_presentation_get(
-        presentations, "slide1", [_placeholder_element("title_obj", "TITLE")]
-    )
+    _mock_presentation_get(presentations, "slide1", [_placeholder_element("title_obj", "TITLE")])
 
-    result = json.loads(
-        google_slides.google_slides_update_slide("pres1", "slide1", title="T")
-    )
+    result = json.loads(google_slides.google_slides_update_slide("pres1", "slide1", title="T"))
 
     assert result["status"] == "error"
     assert "boom" in result["message"]
@@ -1542,9 +1452,7 @@ def test_delete_slide_rejects_id_that_is_not_a_slide(monkeypatch):
         [_placeholder_element("slide1_title", "TITLE", text="Real title")],
     )
 
-    result = json.loads(
-        google_slides.google_slides_delete_slide("pres1", "slide1_title")
-    )
+    result = json.loads(google_slides.google_slides_delete_slide("pres1", "slide1_title"))
 
     assert result["status"] == "error"
     presentations.batchUpdate.assert_not_called()
@@ -1587,11 +1495,7 @@ def test_get_presentation_returns_slide_summaries(monkeypatch):
                 "pageElements": [
                     {
                         "objectId": "shape1",
-                        "shape": {
-                            "text": {
-                                "textElements": [{"textRun": {"content": "Hello"}}]
-                            }
-                        },
+                        "shape": {"text": {"textElements": [{"textRun": {"content": "Hello"}}]}},
                     }
                 ],
             }
@@ -1682,9 +1586,7 @@ def test_create_presentation_does_not_delete_nonempty_initial_slide(monkeypatch)
         "slides": [
             {
                 "objectId": "p",
-                "pageElements": [
-                    _placeholder_element("p_title", "CENTERED_TITLE", "Existing")
-                ],
+                "pageElements": [_placeholder_element("p_title", "CENTERED_TITLE", "Existing")],
             }
         ],
     }
@@ -1743,9 +1645,7 @@ def test_add_slide_uses_default_slide_tracked_by_create(monkeypatch):
     )
 
     assert added["default_slide_removed"] is True
-    assert _batch_update_requests(presentations)[-1] == {
-        "deleteObject": {"objectId": "p"}
-    }
+    assert _batch_update_requests(presentations)[-1] == {"deleteObject": {"objectId": "p"}}
 
 
 def test_add_slide_keeps_untracked_intentional_blank_slide(monkeypatch):
@@ -1757,9 +1657,7 @@ def test_add_slide_keeps_untracked_intentional_blank_slide(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide(
-            "pres1", title="Title", body="Detail"
-        )
+        google_slides.google_slides_add_slide("pres1", title="Title", body="Detail")
     )
 
     assert result["status"] == "success"
@@ -1782,9 +1680,7 @@ def test_add_slide_keeps_image_only_existing_slide(monkeypatch):
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide(
-            "pres1", title="Title", body="Detail"
-        )
+        google_slides.google_slides_add_slide("pres1", title="Title", body="Detail")
     )
 
     assert result["status"] == "success"
@@ -1824,9 +1720,7 @@ def test_import_pptx_converts_and_verifies_native_google_slides(monkeypatch, tmp
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_import_pptx(
-            str(pptx_path), title="Designed Deck"
-        )
+        google_slides.google_slides_import_pptx(str(pptx_path), title="Designed Deck")
     )
 
     assert result["status"] == "success"
@@ -1849,14 +1743,10 @@ def test_extract_pptx_slide_text_reads_title_and_body(tmp_path):
     slide.placeholders[1].text = "Detail one\nDetail two"
     presentation.save(pptx_path)
 
-    assert google_slides._extract_pptx_slide_text(pptx_path) == [
-        "Title Detail one Detail two"
-    ]
+    assert google_slides._extract_pptx_slide_text(pptx_path) == ["Title Detail one Detail two"]
 
 
-def test_import_pptx_resolves_relative_generated_file_from_allowed_root(
-    monkeypatch, tmp_path
-):
+def test_import_pptx_resolves_relative_generated_file_from_allowed_root(monkeypatch, tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()
     pptx_path = output_dir / "designed-deck.pptx"
@@ -1889,15 +1779,10 @@ def test_import_pptx_resolves_relative_generated_file_from_allowed_root(
     }
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_import_pptx("output/designed-deck.pptx")
-    )
+    result = json.loads(google_slides.google_slides_import_pptx("output/designed-deck.pptx"))
 
     assert result["status"] == "success"
-    assert (
-        drive.files.return_value.create.call_args.kwargs["media_body"]._fd.name
-        == str(pptx_path)
-    )
+    assert drive.files.return_value.create.call_args.kwargs["media_body"]._fd.name == str(pptx_path)
 
 
 def test_import_pptx_rejects_missing_text_after_conversion(monkeypatch, tmp_path):
@@ -1982,9 +1867,7 @@ def test_import_pptx_allows_image_only_slide_after_conversion(monkeypatch, tmp_p
         "slides": [
             {
                 "objectId": "slide1",
-                "pageElements": [
-                    {"image": {"contentUrl": "https://example.com/a.png"}}
-                ],
+                "pageElements": [{"image": {"contentUrl": "https://example.com/a.png"}}],
             }
         ],
     }
@@ -2027,9 +1910,7 @@ def test_import_pptx_rejects_conversion_with_no_slides(monkeypatch, tmp_path):
 def test_import_pptx_rejects_path_outside_allowlist(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
 
-    result = json.loads(
-        google_slides.google_slides_import_pptx("/private/tmp/not-allowed.pptx")
-    )
+    result = json.loads(google_slides.google_slides_import_pptx("/private/tmp/not-allowed.pptx"))
 
     assert result["status"] == "error"
     assert "outside the allowed directories" in result["message"]
@@ -2070,9 +1951,7 @@ def test_batch_update_rejects_non_list_json(monkeypatch):
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_batch_update("pres1", '{"not": "a list"}')
-    )
+    result = json.loads(google_slides.google_slides_batch_update("pres1", '{"not": "a list"}'))
 
     assert result["status"] == "error"
     presentations.batchUpdate.assert_not_called()
@@ -2085,9 +1964,7 @@ def test_batch_update_rejects_malformed_json(monkeypatch):
     presentations = Mock()
     _mock_slides_service(monkeypatch, presentations)
 
-    result = json.loads(
-        google_slides.google_slides_batch_update("pres1", "{not valid json")
-    )
+    result = json.loads(google_slides.google_slides_batch_update("pres1", "{not valid json"))
 
     assert result["status"] == "error"
     presentations.batchUpdate.assert_not_called()

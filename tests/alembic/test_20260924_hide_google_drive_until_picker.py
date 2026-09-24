@@ -70,10 +70,7 @@ def test_upgrade_hides_drive_updates_canonical_description_and_preserves_custom(
             migration.upgrade()
             migration.upgrade()
 
-        rows = {
-            row["app_id"]: dict(row)
-            for row in connection.execute(sa.select(table)).mappings()
-        }
+        rows = {row["app_id"]: dict(row) for row in connection.execute(sa.select(table)).mappings()}
 
     assert rows["google-drive"]["description"] == migration.CURRENT_DESCRIPTION
     assert rows["google-drive"]["is_visible_in_connector"] is False
@@ -181,7 +178,9 @@ def test_registry_matches_migration() -> None:
     app = get_builtin_public_mcp_app("google-drive")
     assert app is not None
     assert app["description"] == migration.CURRENT_DESCRIPTION
-    assert app["is_visible_in_connector"] is False
+    # The follow-up Picker migration re-enables this seeded row after the
+    # restricted-scope flow is available; this migration only owns the
+    # temporary hidden state.
 
 
 def test_revision_metadata() -> None:

@@ -482,11 +482,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "provider_name": "google",
             "category": "Support",
             "oauth_scopes": ["https://www.googleapis.com/auth/drive.file"],
-            # The backend currently browses Drive with files.list rather than
-            # using Google's Picker API. Showing this connector with drive.file
-            # would therefore make pre-existing user files appear unavailable;
-            # keep the catalog row for stable IDs and re-enable it with Picker.
-            "is_visible_in_connector": False,
+            "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.google_drive"],

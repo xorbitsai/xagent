@@ -17,6 +17,7 @@ import {
   Search,
   RefreshCw,
   Trash2,
+  FolderOpen,
 } from "lucide-react"
 import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
@@ -40,6 +41,43 @@ interface ConnectedAccount {
 
 // Keep in sync with CloudIngestRequest.files max_length in src/xagent/web/api/kb.py.
 const MAX_CLOUD_INGEST_FILES = 5
+
+let googlePickerScriptPromise: Promise<void> | null = null
+
+function loadGooglePicker(): Promise<void> {
+  if (window.gapi) {
+    return new Promise((resolve, reject) => {
+      window.gapi?.load("picker", {
+        callback: () => resolve(),
+        onerror: () => reject(new Error("Google Picker failed to load")),
+      })
+    })
+  }
+  if (googlePickerScriptPromise) return googlePickerScriptPromise
+
+  googlePickerScriptPromise = new Promise<void>((resolve, reject) => {
+    const script = document.createElement("script")
+    script.src = "https://apis.google.com/js/api.js"
+    script.async = true
+    script.onload = () => {
+      if (!window.gapi) {
+        reject(new Error("Google Picker API is unavailable"))
+        return
+      }
+      window.gapi.load("picker", {
+        callback: () => resolve(),
+        onerror: () => reject(new Error("Google Picker failed to load")),
+      })
+    }
+    script.onerror = () => reject(new Error("Google Picker failed to load"))
+    document.head.appendChild(script)
+  }).catch(error => {
+    googlePickerScriptPromise = null
+    throw error
+  })
+
+  return googlePickerScriptPromise!
+}
 
 interface CloudConnectDialogProps {
   open: boolean
@@ -79,6 +117,7 @@ export function CloudConnectDialog({
   const [refreshTrigger, setRefreshTrigger] = useState(0)
   const [accountToDelete, setAccountToDelete] = useState<{ id: number | null, email: string | null }>({ id: null, email: null })
   const [isDeletingAccount, setIsDeletingAccount] = useState(false)
+  const [pickerLoading, setPickerLoading] = useState(false)
 
   // Helper to check if selected
   const isSelected = (id: string) => selectedFiles.some(f => f.id === id)
@@ -116,6 +155,91 @@ export function CloudConnectDialog({
       `${provider?.name} Auth`,
       `width=${width},height=${height},left=${left},top=${top}`
     )
+  }
+
+  const openGooglePicker = async () => {
+    if (!provider || provider.id !== "google-drive" || !cloudUser) return
+
+    const selectedAccount = connectedAccounts.find(
+      account => (account.email || `Account ${account.id}`) === cloudUser,
+    )
+    if (!selectedAccount) return
+
+    setPickerLoading(true)
+    try {
+      const response = await apiRequest(
+        `${getApiUrl()}/api/cloud/google-drive/picker-config?account_id=${selectedAccount.id}`,
+      )
+      if (!response.ok) {
+        throw new Error(t("kb.dialog.cloudConnect.picker.notConfigured"))
+      }
+      const config = await response.json() as {
+        access_token?: string
+        developer_key?: string
+        app_id?: string
+      }
+      if (!config.access_token || !config.developer_key || !config.app_id) {
+        throw new Error(t("kb.dialog.cloudConnect.picker.notConfigured"))
+      }
+
+      await loadGooglePicker()
+      const pickerApi = window.google?.picker
+      if (!pickerApi) throw new Error(t("kb.dialog.cloudConnect.picker.error"))
+
+      const docsView = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
+        .setIncludeFolders(true)
+        .setSelectFolderEnabled(true)
+      const picker = new pickerApi.PickerBuilder()
+        .setDeveloperKey(config.developer_key)
+        .setAppId(config.app_id)
+        .setOAuthToken(config.access_token)
+        .addView(docsView)
+        .setCallback(data => {
+          if (data.action !== pickerApi.Action.PICKED) return
+
+          const pickedFiles: CloudFile[] = []
+          let pickedFolder: CloudFile | null = null
+          for (const document of data.docs || []) {
+            if (!document.id) continue
+            const isFolder = document.mimeType === "application/vnd.google-apps.folder"
+            const file: CloudFile = {
+              id: document.id,
+              name: document.name || document.id,
+              type: isFolder ? "folder" : "file",
+              resourceKey: document.resourceKey,
+              size: document.sizeBytes,
+            }
+            if (isFolder) {
+              pickedFolder = file
+            } else {
+              pickedFiles.push(file)
+            }
+          }
+
+          if (pickedFolder) {
+            setCurrentPath([{ id: pickedFolder.id, name: pickedFolder.name }])
+            setSearchQuery("")
+          }
+          if (pickedFiles.length > 0) {
+            setSelectedFiles(prev => {
+              const merged = [...prev, ...pickedFiles]
+              return merged.filter(
+                (file, index, all) => all.findIndex(item => item.id === file.id) === index,
+              ).slice(0, MAX_CLOUD_INGEST_FILES)
+            })
+          }
+          setRefreshTrigger(value => value + 1)
+        })
+        .build()
+      picker.setVisible(true)
+    } catch (error) {
+      console.error("Failed to open Google Drive Picker", error)
+      toast.error(error instanceof Error
+        ? error.message
+        : t("kb.dialog.cloudConnect.picker.error"))
+    } finally {
+      setPickerLoading(false)
+    }
   }
 
   useEffect(() => {
@@ -347,6 +471,20 @@ export function CloudConnectDialog({
               ]}
               placeholder={t("kb.dialog.cloudConnect.select.accountPlaceholder")}
             />
+            {provider?.id === "google-drive" && cloudUser && (
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full"
+                onClick={openGooglePicker}
+                disabled={pickerLoading}
+              >
+                {pickerLoading
+                  ? <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  : <FolderOpen className="mr-2 h-4 w-4" />}
+                {t("kb.dialog.cloudConnect.picker.open")}
+              </Button>
+            )}
           </div>
 
           {/* Drive Selection */}

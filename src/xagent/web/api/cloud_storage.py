@@ -31,9 +31,7 @@ GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
     """Load Google OAuth client credentials from admin provider config."""
-    provider = (
-        db.query(OAuthProvider).filter(OAuthProvider.provider_name == "google").first()
-    )
+    provider = db.query(OAuthProvider).filter(OAuthProvider.provider_name == "google").first()
     if not provider:
         return None, None
 
@@ -42,9 +40,7 @@ def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
     return decrypt_value(client_id), decrypt_value(client_secret)
 
 
-def get_google_credentials(
-    user_id: int, db: Session, account_id: Optional[int] = None
-) -> Any:
+def get_google_credentials(user_id: int, db: Session, account_id: Optional[int] = None) -> Any:
     """Get Google Credentials for user, refreshing if necessary"""
     query = scoped_user_oauth_query(
         db,
@@ -59,12 +55,8 @@ def get_google_credentials(
 
     if not oauth_account:
         if account_id:
-            raise HTTPException(
-                status_code=404, detail="Selected Google Drive account not found"
-            )
-        raise HTTPException(
-            status_code=401, detail="Google Drive account not connected"
-        )
+            raise HTTPException(status_code=404, detail="Selected Google Drive account not found")
+        raise HTTPException(status_code=401, detail="Google Drive account not connected")
     if not oauth_account.access_token:
         raise HTTPException(
             status_code=401,
@@ -77,9 +69,7 @@ def get_google_credentials(
         client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
 
     if not client_id or not client_secret:
-        raise HTTPException(
-            status_code=500, detail="Google OAuth configuration missing"
-        )
+        raise HTTPException(status_code=500, detail="Google OAuth configuration missing")
 
     creds = Credentials(
         token=oauth_account.access_token,
@@ -140,6 +130,53 @@ async def list_connected_accounts(
     ]
 
 
+@cloud_router.get("/google-drive/picker-config")
+async def get_google_drive_picker_config(
+    account_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    """Return the short-lived credentials needed by Google's file picker.
+
+    ``drive.file`` deliberately exposes only files selected in Picker (or
+    created by the app).  The browser therefore needs a Picker access token
+    before the Drive browser can operate on an existing file or folder.  The
+    refresh token and client secret never leave the server; the returned access
+    token is scoped to the authenticated user and expires normally.
+    """
+    creds = get_google_credentials(cast(int, user.id), db, account_id)
+    client_id, _ = get_google_oauth_config(db)
+    client_id = client_id or os.environ.get("GOOGLE_CLIENT_ID")
+
+    developer_key = (
+        os.environ.get("GOOGLE_PICKER_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+    )
+    picker_app_id = os.environ.get("GOOGLE_PICKER_APP_ID", "").strip()
+    if not picker_app_id and client_id:
+        # Google OAuth client IDs start with the numeric Cloud project number.
+        # Keep this as a fallback for existing deployments; an explicit
+        # GOOGLE_PICKER_APP_ID remains preferred because it is unambiguous.
+        candidate = client_id.split("-", 1)[0]
+        if candidate.isdigit():
+            picker_app_id = candidate
+
+    if not developer_key or not picker_app_id:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Google Drive Picker is not configured. Set "
+                "GOOGLE_PICKER_API_KEY and GOOGLE_PICKER_APP_ID."
+            ),
+        )
+
+    return {
+        "access_token": str(creds.token),
+        "developer_key": developer_key,
+        "app_id": picker_app_id,
+    }
+
+
 @cloud_router.delete("/accounts/{account_id}")
 async def delete_connected_account(
     account_id: int,
@@ -168,9 +205,7 @@ async def delete_connected_account(
         provider=str(account.provider),
         access_token=str(account.access_token) if account.access_token else "",
         provider_user_id=(
-            str(account.provider_user_id)
-            if account.provider_user_id is not None
-            else None
+            str(account.provider_user_id) if account.provider_user_id is not None else None
         ),
     )
 
@@ -252,8 +287,7 @@ async def list_google_drive_files(
                 q=query,
                 pageSize=100,
                 fields=(
-                    "nextPageToken, "
-                    "files(id, name, mimeType, size, modifiedTime, resourceKey)"
+                    "nextPageToken, files(id, name, mimeType, size, modifiedTime, resourceKey)"
                 ),
                 orderBy="folder,name",
                 supportsAllDrives=supports_all_drives,

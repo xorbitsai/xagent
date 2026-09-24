@@ -2318,6 +2318,7 @@ Build when you need.`,
         },
         picker: {
           open: "Choose files or folders with Google Picker",
+          authorized: "Google Drive files and folders authorized",
           notConfigured: "Google Drive Picker is not configured",
           error: "Google Drive Picker could not be opened",
         },

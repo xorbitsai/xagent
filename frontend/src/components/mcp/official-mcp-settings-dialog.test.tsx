@@ -98,6 +98,21 @@ describe("OfficialMcpSettingsDialog connected-state actions", () => {
     expect(onManageKey).toHaveBeenCalledTimes(1)
   })
 
+  it("offers Google Picker authorization for a connected Google Drive app", () => {
+    renderDialog({
+      app: app({
+        id: "google-drive",
+        name: "Google Drive",
+        auth_type: "builtin_oauth",
+        connected_account: "user@example.com",
+      }),
+    })
+
+    expect(
+      screen.getByRole("button", { name: "kb.dialog.cloudConnect.picker.open" }),
+    ).toBeInTheDocument()
+  })
+
   it("offers Configure for an unconnected entry the viewer may still configure", () => {
     // This is the bug's shape in the settings dialog: is_connected is false
     // (no grant was ever written for a hook-resolved connector), yet the

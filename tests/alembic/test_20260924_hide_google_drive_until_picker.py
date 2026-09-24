@@ -181,6 +181,7 @@ def test_registry_matches_migration() -> None:
     app = get_builtin_public_mcp_app("google-drive")
     assert app is not None
     assert app["description"] == migration.CURRENT_DESCRIPTION
+    assert app["is_visible_in_connector"] is True
     # The follow-up Picker migration re-enables this seeded row after the
     # restricted-scope flow is available; this migration only owns the
     # temporary hidden state.

@@ -2,9 +2,10 @@
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
@@ -27,6 +28,18 @@ cloud_router = APIRouter(prefix="/api/cloud", tags=["Cloud Storage"])
 
 # Google OAuth Constants
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+def _google_credentials_expiry(value: datetime | None) -> datetime | None:
+    """Return the naive UTC datetime required by google-auth.
+
+    ``UserOAuth.expires_at`` is timezone-aware on PostgreSQL but google-auth
+    compares ``Credentials.expiry`` with a naive UTC value.  Normalize here so
+    expired Drive tokens refresh before they are handed to the API or Picker.
+    """
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
@@ -88,6 +101,9 @@ def get_google_credentials(
         client_id=client_id,
         client_secret=client_secret,
         scopes=oauth_account.scope.split(" ") if oauth_account.scope else None,
+        expiry=_google_credentials_expiry(
+            cast("datetime | None", oauth_account.expires_at)
+        ),
     )
 
     # Check if token needs refresh
@@ -142,6 +158,7 @@ async def list_connected_accounts(
 
 @cloud_router.get("/google-drive/picker-config")
 async def get_google_drive_picker_config(
+    response: Response,
     account_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -154,14 +171,27 @@ async def get_google_drive_picker_config(
     refresh token and client secret never leave the server; the returned access
     token is scoped to the authenticated user and expires normally.
     """
+    response.headers["Cache-Control"] = "no-store"
     creds = get_google_credentials(cast(int, user.id), db, account_id)
+    granted_scopes = set(creds.scopes or ())
+    if "https://www.googleapis.com/auth/drive" in granted_scopes or (
+        "https://www.googleapis.com/auth/drive.file" not in granted_scopes
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Google Drive connection uses an outdated permission. "
+                "Reconnect it before opening Google Drive Picker."
+            ),
+        )
     client_id, _ = get_google_oauth_config(db)
     client_id = client_id or os.environ.get("GOOGLE_CLIENT_ID")
 
-    developer_key = (
-        os.environ.get("GOOGLE_PICKER_API_KEY", "").strip()
-        or os.environ.get("GOOGLE_API_KEY", "").strip()
-    )
+    # Picker keys are browser-facing and must be a dedicated, referrer-
+    # restricted key.  GOOGLE_API_KEY is also used for server-side Gemini and
+    # Custom Search calls, so returning it here would expose a billable
+    # operator credential to every authenticated Drive user.
+    developer_key = os.environ.get("GOOGLE_PICKER_API_KEY", "").strip()
     picker_app_id = os.environ.get("GOOGLE_PICKER_APP_ID", "").strip()
     if not picker_app_id and client_id:
         # Google OAuth client IDs start with the numeric Cloud project number.

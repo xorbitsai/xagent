@@ -22,6 +22,10 @@ import {
 import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
+import {
+  loadGooglePicker,
+  sanitizeGooglePickerDocuments,
+} from "@/lib/google-picker"
 
 export interface CloudFile {
   id: string
@@ -41,70 +45,6 @@ interface ConnectedAccount {
 
 // Keep in sync with CloudIngestRequest.files max_length in src/xagent/web/api/kb.py.
 const MAX_CLOUD_INGEST_FILES = 5
-
-interface SanitizedGooglePickerDocument {
-  id: string
-  name?: string
-  mimeType?: string
-  resourceKey?: string
-  sizeBytes?: string
-}
-
-function sanitizeGooglePickerDocuments(value: unknown): SanitizedGooglePickerDocument[] {
-  if (!Array.isArray(value)) return []
-
-  return value.flatMap(item => {
-    if (!item || typeof item !== "object") return []
-    const document = item as Record<string, unknown>
-    if (typeof document.id !== "string" || document.id.trim() === "") return []
-
-    return [{
-      id: document.id,
-      name: typeof document.name === "string" ? document.name : undefined,
-      mimeType: typeof document.mimeType === "string" ? document.mimeType : undefined,
-      resourceKey: typeof document.resourceKey === "string" ? document.resourceKey : undefined,
-      sizeBytes: typeof document.sizeBytes === "string" ? document.sizeBytes : undefined,
-    }]
-  })
-}
-
-let googlePickerScriptPromise: Promise<void> | null = null
-
-function loadGooglePicker(): Promise<void> {
-  if (googlePickerScriptPromise) return googlePickerScriptPromise
-
-  googlePickerScriptPromise = new Promise<void>((resolve, reject) => {
-    const loadPicker = () => {
-      if (!window.gapi) {
-        reject(new Error("Google Picker API is unavailable"))
-        return
-      }
-      window.gapi.load("picker", {
-        callback: () => resolve(),
-        onerror: () => reject(new Error("Google Picker failed to load")),
-      })
-    }
-
-    if (window.gapi) {
-      loadPicker()
-      return
-    }
-
-    const script = document.createElement("script")
-    script.src = "https://apis.google.com/js/api.js"
-    script.async = true
-    script.onload = () => {
-      loadPicker()
-    }
-    script.onerror = () => reject(new Error("Google Picker failed to load"))
-    document.head.appendChild(script)
-  }).catch(error => {
-    googlePickerScriptPromise = null
-    throw error
-  })
-
-  return googlePickerScriptPromise!
-}
 
 interface CloudConnectDialogProps {
   open: boolean
@@ -198,7 +138,13 @@ export function CloudConnectDialog({
         `${getApiUrl()}/api/cloud/google-drive/picker-config?account_id=${selectedAccount.id}`,
       )
       if (!response.ok) {
-        throw new Error(t("kb.dialog.cloudConnect.picker.notConfigured"))
+        throw new Error(
+          response.status === 401 || response.status === 409
+            ? t("kb.dialog.cloudConnect.auth.expired")
+            : response.status === 503
+              ? t("kb.dialog.cloudConnect.picker.notConfigured")
+              : t("kb.dialog.cloudConnect.picker.error"),
+        )
       }
       const config = await response.json() as {
         access_token?: string
@@ -221,6 +167,7 @@ export function CloudConnectDialog({
         .setAppId(config.app_id)
         .setOAuthToken(config.access_token)
         .addView(docsView)
+        .enableFeature(pickerApi.Feature.MULTISELECT_ENABLED)
         .setCallback(data => {
           if (data.action !== pickerApi.Action.PICKED) return
 
@@ -233,7 +180,9 @@ export function CloudConnectDialog({
               name: document.name || document.id,
               type: isFolder ? "folder" : "file",
               resourceKey: document.resourceKey,
-              size: document.sizeBytes,
+              size: typeof document.sizeBytes === "number"
+                ? String(document.sizeBytes)
+                : undefined,
             }
             if (isFolder) {
               pickedFolder = file
@@ -247,16 +196,18 @@ export function CloudConnectDialog({
             setSearchQuery("")
           }
           if (pickedFiles.length > 0) {
-            const merged = [...selectedFiles, ...pickedFiles]
-            const unique = merged.filter(
-              (file, index, all) => all.findIndex(item => item.id === file.id) === index,
-            )
-            if (unique.length > MAX_CLOUD_INGEST_FILES) {
-              toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
-                count: MAX_CLOUD_INGEST_FILES,
-              }))
-            }
-            setSelectedFiles(unique.slice(0, MAX_CLOUD_INGEST_FILES))
+            setSelectedFiles(previous => {
+              const merged = [...previous, ...pickedFiles]
+              const unique = merged.filter(
+                (file, index, all) => all.findIndex(item => item.id === file.id) === index,
+              )
+              if (unique.length > MAX_CLOUD_INGEST_FILES) {
+                toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
+                  count: MAX_CLOUD_INGEST_FILES,
+                }))
+              }
+              return unique.slice(0, MAX_CLOUD_INGEST_FILES)
+            })
           }
           setRefreshTrigger(value => value + 1)
         })
@@ -456,7 +407,7 @@ export function CloudConnectDialog({
   const fileItems = filteredFiles.filter(f => f.type === 'file')
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog modal={false} open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[900px] h-[80vh] max-h-[800px] flex flex-col">
         <DialogHeader>
           <DialogTitle>

@@ -5,7 +5,7 @@ interface GooglePickerDocument {
   name?: string
   mimeType?: string
   resourceKey?: string
-  sizeBytes?: string
+  sizeBytes?: number
   lastEditedUtc?: string
 }
 
@@ -24,12 +24,14 @@ interface GooglePickerBuilder {
   setAppId(appId: string): GooglePickerBuilder
   setOAuthToken(accessToken: string): GooglePickerBuilder
   addView(view: GooglePickerView): GooglePickerBuilder
+  enableFeature(feature: string): GooglePickerBuilder
   setCallback(callback: (data: GooglePickerData) => void): GooglePickerBuilder
   build(): { setVisible(visible: boolean): void }
 }
 
 interface GooglePickerNamespace {
   Action: { PICKED: string }
+  Feature: { MULTISELECT_ENABLED: string }
   ViewId: { DOCS: string }
   DocsView: new (viewId: string) => GooglePickerView
   PickerBuilder: new () => GooglePickerBuilder

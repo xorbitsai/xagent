@@ -706,8 +706,6 @@ def _list_search(
         # shared capper was allowed to discard.
         result_wrapper = capped.setdefault(result_key, {})
         result_wrapper.setdefault(result_key, [])
-        capped["has_more"] = has_more
-        capped["next_page"] = current_page + 1 if has_more else None
         # success_with_capped_dict only marks truncated=True when *it*
         # shrinks page_summaries -- it has no way to know the outer while
         # loop below already dropped items from the page before ever
@@ -715,8 +713,22 @@ def _list_search(
         # fits on the first try would come back with truncated=false,
         # silently misleading the caller into thinking this page's items
         # are complete.
-        if len(page_summaries) < original_summaries_count:
-            capped["truncated"] = True
+        truncated = (
+            bool(capped.get("truncated"))
+            or len(page_summaries) < original_summaries_count
+        )
+        capped["truncated"] = truncated
+        # has_more/next_page from _paginated_result only reflect Magento's
+        # own total_count -- they say nothing about items *this adapter*
+        # just dropped for size. A page that Magento says is the last one
+        # can still be truncated here, and without forcing has_more here
+        # too, the caller would see has_more=false/next_page=None and
+        # have no way to know (or recover) the dropped items. Mirrors
+        # zendesk.py's _list_offset_paginated's identical
+        # `has_more=has_more or truncated`.
+        effective_has_more = has_more or truncated
+        capped["has_more"] = effective_has_more
+        capped["next_page"] = current_page + 1 if effective_has_more else None
         return json.dumps(capped, ensure_ascii=False)
 
     max_output_length = get_tool_max_output_length()
@@ -736,19 +748,26 @@ def _list_search(
         return response
 
     # Even an empty item list plus the required pagination metadata doesn't
-    # fit. Fall back to progressively smaller, still contract-preserving
-    # payloads (mirrors conflict_response's own candidates fallback in
-    # utils.py) instead of returning something over budget -- dropping the
-    # (already-empty) result wrapper before dropping next_page, since a
-    # caller can still resume pagination without the former but not the
-    # latter.
-    next_page = current_page + 1 if has_more else None
+    # fit. Fall back to progressively more degraded payloads (mirrors
+    # conflict_response's own candidates fallback in utils.py) instead of
+    # returning something over budget -- dropping the (already-empty)
+    # result wrapper before dropping next_page, since a caller can still
+    # tell there's more to fetch without the former but not the latter.
+    # These are NOT contract-preserving: once result_key is dropped,
+    # result[result_key][result_key] is no longer indexable, which is why
+    # each candidate is tried in order from least to most degraded rather
+    # than jumping straight to the smallest one.
+    # Reaching this branch means the page was truncated to empty, so
+    # has_more is unconditionally true here (see _build's identical
+    # has_more-or-truncated reasoning above) regardless of what Magento's
+    # own total_count said.
+    next_page = current_page + 1
     candidates = (
         json.dumps(
             {
                 "status": "success",
                 result_key: {result_key: []},
-                "has_more": has_more,
+                "has_more": True,
                 "next_page": next_page,
                 "truncated": True,
             },
@@ -757,14 +776,14 @@ def _list_search(
         json.dumps(
             {
                 "status": "success",
-                "has_more": has_more,
+                "has_more": True,
                 "next_page": next_page,
                 "truncated": True,
             },
             ensure_ascii=False,
         ),
         json.dumps(
-            {"status": "success", "has_more": has_more, "truncated": True},
+            {"status": "success", "has_more": True, "truncated": True},
             ensure_ascii=False,
         ),
         json.dumps({"status": "success", "truncated": True}, ensure_ascii=False),
@@ -901,7 +920,14 @@ def magento_list_products(
     server-side, e.g. "shirt" matches any SKU containing "shirt").
     status: optional filter, 1 (Enabled) or 2 (Disabled).
     limit: max products to return (default 25, hard cap 100).
-    page: 1-based page number; pass the previous page + 1 to continue.
+    page: 1-based page number; pass the previous page + 1 to continue. If a
+    call is truncated for size (`truncated: true` in the response, `has_more`
+    forced true), the dropped items are not recoverable by retrying this same
+    `page` with a smaller `limit` -- Magento's `page` means a different item
+    range once `limit` changes. Instead, re-run this search with a smaller
+    `limit` starting from `page=1` and page through normally; that
+    re-partitions the same result set into pieces small enough to avoid
+    truncation.
     """
     try:
         if status is not None:
@@ -1057,7 +1083,14 @@ def magento_list_orders(
     customer/support agent actually sees, since magento_get_order requires
     the internal entity id instead.
     limit: max orders to return (default 25, hard cap 100).
-    page: 1-based page number; pass the previous page + 1 to continue.
+    page: 1-based page number; pass the previous page + 1 to continue. If a
+    call is truncated for size (`truncated: true` in the response, `has_more`
+    forced true), the dropped items are not recoverable by retrying this same
+    `page` with a smaller `limit` -- Magento's `page` means a different item
+    range once `limit` changes. Instead, re-run this search with a smaller
+    `limit` starting from `page=1` and page through normally; that
+    re-partitions the same result set into pieces small enough to avoid
+    truncation.
     """
     try:
         filters: list[tuple[str, str, str]] = []
@@ -1155,7 +1188,14 @@ def magento_list_customers(email_like: str = "", limit: int = 25, page: int = 1)
     email_like: optional substring to match against email (wrapped in %
     wildcards server-side).
     limit: max customers to return (default 25, hard cap 100).
-    page: 1-based page number; pass the previous page + 1 to continue.
+    page: 1-based page number; pass the previous page + 1 to continue. If a
+    call is truncated for size (`truncated: true` in the response, `has_more`
+    forced true), the dropped items are not recoverable by retrying this same
+    `page` with a smaller `limit` -- Magento's `page` means a different item
+    range once `limit` changes. Instead, re-run this search with a smaller
+    `limit` starting from `page=1` and page through normally; that
+    re-partitions the same result set into pieces small enough to avoid
+    truncation.
     """
     try:
         filters: list[tuple[str, str, str]] = []

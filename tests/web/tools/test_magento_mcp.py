@@ -978,7 +978,7 @@ def test_list_products_survives_an_aggressively_low_output_limit(monkeypatch):
     assert result["products"]["products"] == []
 
 
-def test_list_products_re_caps_after_merging_pagination_metadata(monkeypatch):
+def test_list_products_falls_back_to_candidate_without_result_wrapper(monkeypatch):
     # Confirmed bug: success_with_capped_dict("products", {"products": items})
     # sizes its response to fit XAGENT_TOOL_MAX_OUTPUT_LENGTH, but
     # has_more/next_page are merged in as top-level siblings *after* that
@@ -987,8 +987,16 @@ def test_list_products_re_caps_after_merging_pagination_metadata(monkeypatch):
     # _list_offset_paginated docstring calls out by name elsewhere in this
     # package. At this exact limit the capped dict alone is 70 bytes (fits),
     # but naively appending has_more/next_page grows it to 104 bytes (no
-    # longer fits) -- confirmed by calling success_with_capped_dict directly
-    # and merging in has_more/next_page the old, unchecked way.
+    # longer fits) -- confirmed below by calling success_with_capped_dict
+    # directly and merging in has_more/next_page the old, unchecked way.
+    #
+    # At this same limit, halving the item list all the way down to empty
+    # still doesn't fit alongside has_more/next_page/truncated (even
+    # {"products": {"products": []}} is too large on its own), so the real
+    # call below falls through past the outer loop to the second fallback
+    # candidate, which drops the result_key wrapper but keeps has_more/
+    # next_page/truncated intact -- not "the outer loop settles on a
+    # smaller-but-nonempty page."
     monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "80")
     items = [{"sku": f"SKU-{i}", "name": "x" * 20} for i in range(20)]
     monkeypatch.setattr(
@@ -1009,7 +1017,7 @@ def test_list_products_re_caps_after_merging_pagination_metadata(monkeypatch):
     result = json.loads(raw)
 
     assert len(raw) <= 80
-    assert result["status"] == "success"
+    assert set(result) == {"status", "has_more", "next_page", "truncated"}
     assert result["has_more"] is True
     assert result["next_page"] == 2
 
@@ -1018,10 +1026,14 @@ def test_list_products_falls_back_to_compact_response_when_still_over_cap(
     monkeypatch,
 ):
     # Even after dropping every returned item, the required has_more/
-    # next_page/truncated fields plus the envelope skeleton can still
-    # exceed an aggressively low limit. The tool must still return a
-    # bounded, valid response instead of one that exceeds the configured
-    # cap.
+    # truncated fields plus the envelope skeleton can still exceed an
+    # aggressively low limit -- here even next_page has to be dropped, one
+    # candidate further than
+    # test_list_products_falls_back_to_candidate_without_result_wrapper.
+    # The tool must still return a bounded, valid response instead of one
+    # that exceeds the configured cap, and has_more must still be forced
+    # true (this page is not actually complete) even though next_page
+    # itself didn't fit.
     monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "70")
     items = [{"sku": f"SKU-{i}", "name": "x" * 20} for i in range(20)]
     monkeypatch.setattr(
@@ -1034,8 +1046,40 @@ def test_list_products_falls_back_to_compact_response_when_still_over_cap(
     result = json.loads(raw)
 
     assert len(raw) <= 70
-    assert result["status"] == "success"
+    assert set(result) == {"status", "has_more", "truncated"}
+    assert result["has_more"] is True
     assert result["truncated"] is True
+
+
+def test_list_products_forces_has_more_when_a_truncated_page_is_the_last_one(
+    monkeypatch,
+):
+    # Confirmed bug: has_more/next_page came straight from
+    # _paginated_result's current_page*page_size < total_count check, with
+    # no awareness of whether this adapter then had to drop items from the
+    # page for size. A page that's genuinely the last one by Magento's own
+    # total_count (has_more=False) can still be truncated here -- without
+    # forcing has_more too, the caller would see has_more=false/
+    # next_page=null and have no way to know (or recover) the dropped
+    # items. Mirrors zendesk.py's _list_offset_paginated's identical
+    # has_more=has_more or truncated.
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "420")
+    items = [{"sku": f"SKU-{i}", "name": "x" * 10} for i in range(4)]
+    monkeypatch.setattr(
+        magento,
+        "_make_request",
+        # total_count == limit * page, so Magento's own has_more is False --
+        # this really is the last page.
+        Mock(return_value=MockResponse(json_data={"items": items, "total_count": 4})),
+    )
+
+    raw = magento.magento_list_products(limit=4, page=1)
+    result = json.loads(raw)
+
+    assert len(result["products"]["products"]) < len(items)
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["next_page"] == 2
 
 
 def test_list_products_reports_truncated_when_the_outer_loop_drops_items(monkeypatch):

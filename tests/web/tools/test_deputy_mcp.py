@@ -2,6 +2,7 @@ import json
 from unittest.mock import Mock
 
 import pytest
+import requests
 
 from xagent.web.tools.mcp import deputy
 from xagent.web.tools.mcp import utils as mcp_utils
@@ -854,17 +855,20 @@ def test_create_resource_warning_distinguishes_unexpected_shape_from_empty(
     assert "no record" not in result["warning"]
 
 
-def test_create_resource_skips_verification_when_response_has_no_id(monkeypatch):
+def test_create_resource_warns_when_response_has_no_id(monkeypatch):
     """Nothing to read back without an id -- must not raise or attempt a
-    verification call, and must not be flagged as unconfirmed either
-    (there was never anything to confirm)."""
+    verification call, but also must not be silently treated as a clean
+    success: a non-empty create response missing the one field this
+    check relies on is exactly the same "can't confirm this succeeded"
+    situation as a present-but-unreadable one, just shaped differently."""
     mock_request = Mock(return_value=MockResponse(json_data={"FirstName": "Peter"}))
     monkeypatch.setattr(deputy.requests, "request", mock_request)
 
     result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
 
     assert result["status"] == "success"
-    assert "warning" not in result
+    assert "warning" in result
+    assert "no Id" in result["warning"]
     mock_request.assert_called_once()
 
 
@@ -1038,6 +1042,66 @@ def test_add_employee_downgrades_to_warning_when_readback_fails(monkeypatch):
     assert result["record"] == {"Id": 5, "DisplayName": "Peter Parker"}
     assert "warning" in result
     assert "5" in result["warning"]
+
+
+def test_add_employee_downgrades_to_warning_when_readback_returns_empty(monkeypatch):
+    """A readback that succeeds but comes back empty is just as
+    unconfirmed as one that errors outright -- mirrors
+    deputy_create_resource's identical case, which _verify_created_record
+    handles the same way for both callers."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 5, "DisplayName": "Peter Parker"}),
+            MockResponse(status_code=204),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "returned no record" in result["warning"]
+
+
+def test_add_employee_warns_when_response_has_no_id(monkeypatch):
+    """POST /supervise/employee's response schema is undocumented in
+    Deputy's own OpenAPI spec (unlike the Resource API's Employee object,
+    which always has an Id) -- a body that comes back anyway without an
+    Id must still be flagged as unconfirmed, not treated as a clean
+    pass-through, since there was never anything to verify it against."""
+    monkeypatch.setattr(
+        deputy.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"DisplayName": "Peter Parker"})),
+    )
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "no Id" in result["warning"]
+
+
+def test_add_employee_downgrades_to_warning_on_transport_exception(monkeypatch):
+    """A readback that fails before ever getting a response (a timeout or
+    connection error, not a 4xx/5xx Deputy responded with) must be caught
+    the same way as any other unconfirmed readback -- exercises a genuine
+    ``requests`` exception raised directly by the HTTP call, distinct from
+    the RuntimeError _request raises itself for an error status."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 5, "DisplayName": "Peter Parker"}),
+            requests.exceptions.ConnectionError("Connection refused"),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "failed: Connection refused" in result["warning"]
 
 
 def test_add_employee_is_annotated_as_non_idempotent_non_destructive_write():
@@ -1364,187 +1428,6 @@ def test_get_current_user_caps_output_size(monkeypatch):
     assert result["truncated"] is True
 
 
-def test_success_with_capped_dict_last_resort_fallback_keeps_capitalized_id(
-    monkeypatch,
-):
-    """The severe-truncation last resort used to check only lowercase "id",
-    so Deputy's capitalized "Id" (and MYOB's "Uid") was silently dropped
-    once a record got truncated all the way down -- exercised directly
-    against the shared utility (not through a deputy_* tool) because
-    reaching this exact branch also requires extra_fields to push the
-    unstripped candidate over the limit, which no deputy_* call site uses."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
-
-    raw = mcp_utils.success_with_capped_dict(
-        "record",
-        {"Id": 123, "Notes": "x" * 5000},
-        extra_fields={"note": "y" * 60},
-    )
-    result = json.loads(raw)
-
-    assert result["status"] == "success"
-    assert result["truncated"] is True
-    assert result["record"] == {"Id": 123}
-
-
-def test_success_with_capped_dict_critical_fields_survive_id_only_candidate(
-    monkeypatch,
-):
-    """Unlike extra_fields (previous test), critical_fields must NOT be
-    dropped once the ladder is down to its id-only candidate -- this is
-    what _verify_created_record relies on so an unconfirmed-create warning
-    is never silently lost to truncation, which would reproduce the exact
-    "confident-looking success" failure this mechanism exists to catch.
-    (At this budget the id-only candidate already fits, so this doesn't
-    reach _fit_critical_fields -- see the dedicated tests for that.)"""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 140)
-
-    raw = mcp_utils.success_with_capped_dict(
-        "record",
-        {"Id": 123, "Notes": "x" * 5000},
-        critical_fields={"warning": "y" * 60},
-    )
-    result = json.loads(raw)
-
-    assert result["status"] == "success"
-    assert result["truncated"] is True
-    assert result["record"] == {"Id": 123}
-    assert result["warning"] == "y" * 60
-
-
-def test_success_with_capped_dict_critical_fields_survive_tiny_requested_budget(
-    monkeypatch,
-):
-    """Even with an aggressively low requested budget (floored back up to
-    _MIN_OUTPUT_LENGTH=64), a critical value short enough to already fit
-    within that floor's own fixed envelope overhead must come through
-    completely untouched -- this is satisfied by the ladder's own
-    bare-status-plus-critical candidate at this size, not by
-    _fit_critical_fields itself (see the dedicated tests below for that
-    function's own guarantee, including for values too long to fit)."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 10)
-
-    raw = mcp_utils.success_with_capped_dict(
-        "record",
-        {"Id": 123, "Notes": "x" * 5000},
-        critical_fields={"warning": "unconf"},
-    )
-    result = json.loads(raw)
-
-    assert result["status"] == "success"
-    assert result["warning"] == "unconf"
-
-
-def test_success_with_capped_dict_fits_the_exact_reviewer_reported_budget(
-    monkeypatch,
-):
-    """Verified against rogercloud's own PR #2592 review numbers exactly:
-    XAGENT_TOOL_MAX_OUTPUT_LENGTH=64, an Id=1 "returned no record" warning.
-    At this budget there isn't even room left for the truncation marker
-    once the fixed envelope overhead is accounted for -- the response must
-    still fit, even if that means the surviving warning content is just a
-    character or two; a stdio MCP child's own budget is mirrored into a
-    *separate*, JSON-unaware truncation the parent process applies to this
-    exact string, and an oversized response here would be blindly sliced
-    mid-structure by that parent-side filter, producing invalid JSON
-    instead of a valid-but-abbreviated one."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 64)
-    warning = (
-        "Deputy reported this Roster create as successful (Id 1), but "
-        "reading it back returned no record. Treat this as unconfirmed -- "
-        "verify in Deputy directly before relying on it."
-    )
-    assert len(warning) > 64  # the scenario only arises when it doesn't fit whole
-
-    raw = mcp_utils.success_with_capped_dict(
-        "record",
-        {"Id": 1, "Notes": "x" * 5000},
-        critical_fields={"warning": warning},
-    )
-
-    assert len(raw) <= 64
-    result = json.loads(raw)
-    assert result["status"] == "success"
-    assert result["truncated"] is True
-
-
-def test_success_with_capped_dict_shortens_an_oversized_critical_field(monkeypatch):
-    """With a bit more room than the tightest possible budget, shortening
-    must keep a real prefix of the original content plus the truncation
-    marker, not just whatever survives is dropped down to nothing."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
-    warning = (
-        "Deputy reported this Roster create as successful (Id 1), but "
-        "reading it back returned no record. Treat this as unconfirmed -- "
-        "verify in Deputy directly before relying on it."
-    )
-    assert len(warning) > 100
-
-    raw = mcp_utils.success_with_capped_dict(
-        "record",
-        {"Id": 1, "Notes": "x" * 5000},
-        critical_fields={"warning": warning},
-    )
-
-    assert len(raw) <= 100
-    result = json.loads(raw)
-    assert result["status"] == "success"
-    assert result["truncated"] is True
-    assert result["warning"].endswith("... [truncated]")
-    assert warning.startswith(result["warning"].removesuffix("... [truncated]"))
-
-
-def test_success_with_capped_dict_never_inflates_a_critical_field_below_marker_size(
-    monkeypatch,
-):
-    """A critical field whose value is already SHORTER than the truncation
-    marker must be left alone, not replaced by something bigger -- without
-    a size gate matching _truncation_marker_or_empty's own ("only install
-    the marker if it's no bigger than what it replaces"), a long key name
-    paired with a short value could get "shortened" into a larger, still
-    oversized response with nothing left to shrink afterward."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 64)
-
-    raw = mcp_utils.success_with_capped_dict(
-        "record",
-        {"Id": 1, "Notes": "x" * 5000},
-        critical_fields={"a_very_long_critical_field_key_name_here": "x"},
-    )
-
-    assert len(raw) <= 64
-    result = json.loads(raw)
-    assert result["status"] == "success"
-    assert result["truncated"] is True
-    # The field itself may have been dropped entirely (nothing left to
-    # shrink), but the response must never come back larger than what a
-    # short value would have produced on its own.
-    assert (
-        "a_very_long_critical_field_key_name_here" not in result
-        or result["a_very_long_critical_field_key_name_here"] == "x"
-    )
-
-
-def test_success_with_capped_dict_drops_a_critical_field_that_cannot_shrink(
-    monkeypatch,
-):
-    """A non-string critical value can't be shortened the way a string
-    can -- once every shrinkable string is exhausted and the envelope is
-    still oversized, the field must be dropped outright rather than the
-    function ever handing back something wider than max_output_length."""
-    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 64)
-
-    raw = mcp_utils.success_with_capped_dict(
-        "record",
-        {"Id": 1, "Notes": "x" * 5000},
-        critical_fields={"stats": {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6}},
-    )
-
-    assert len(raw) <= 64
-    result = json.loads(raw)
-    assert result["status"] == "success"
-    assert result["truncated"] is True
-
-
 def test_create_resource_warning_survives_truncation_with_instruction_intact(
     monkeypatch,
 ):
@@ -1579,13 +1462,3 @@ def test_create_resource_warning_survives_truncation_with_instruction_intact(
     assert result["status"] == "success"
     assert "verify directly in Deputy" in result["warning"]
     assert "Unconfirmed Deputy Roster create" in result["warning"]
-
-
-def test_success_with_capped_dict_rejects_overlapping_extra_and_critical_fields():
-    with pytest.raises(ValueError, match="must not share a key"):
-        mcp_utils.success_with_capped_dict(
-            "record",
-            {"Id": 1},
-            extra_fields={"note": "a"},
-            critical_fields={"note": "b"},
-        )

@@ -1892,3 +1892,194 @@ def test_incomplete_check_response_still_empties_when_no_budget_for_the_marker(
         "Availability could not be checked for 1 calendar(s) for "
         "2026-08-27T10:00:00 - 2026-08-27T10:30:00. No event was written."
     )
+
+
+def test_success_with_capped_dict_last_resort_fallback_keeps_capitalized_id(
+    monkeypatch,
+):
+    """The severe-truncation last resort used to check only lowercase "id",
+    so Deputy's capitalized "Id" (and MYOB's "Uid") was silently dropped
+    once a record got truncated all the way down -- exercised directly
+    against the shared utility (not through a deputy_* tool) because
+    reaching this exact branch also requires extra_fields to push the
+    unstripped candidate over the limit, which no deputy_* call site uses."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "100")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 123, "Notes": "x" * 5000},
+        extra_fields={"note": "y" * 60},
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["record"] == {"Id": 123}
+
+
+def test_success_with_capped_dict_critical_fields_survive_id_only_candidate(
+    monkeypatch,
+):
+    """Unlike extra_fields (previous test), critical_fields must NOT be
+    dropped once the ladder is down to its id-only candidate -- this is
+    what _verify_created_record relies on so an unconfirmed-create warning
+    is never silently lost to truncation, which would reproduce the exact
+    "confident-looking success" failure this mechanism exists to catch.
+    (At this budget the id-only candidate already fits, so this doesn't
+    reach _fit_critical_fields -- see the dedicated tests for that.)"""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "140")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 123, "Notes": "x" * 5000},
+        critical_fields={"warning": "y" * 60},
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["record"] == {"Id": 123}
+    assert result["warning"] == "y" * 60
+
+
+def test_success_with_capped_dict_critical_fields_survive_tiny_requested_budget(
+    monkeypatch,
+):
+    """Even with an aggressively low requested budget (floored back up to
+    _MIN_OUTPUT_LENGTH=64), a critical value short enough to already fit
+    within that floor's own fixed envelope overhead must come through
+    completely untouched -- this is satisfied by the ladder's own
+    bare-status-plus-critical candidate at this size, not by
+    _fit_critical_fields itself (see the dedicated tests below for that
+    function's own guarantee, including for values too long to fit)."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "10")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 123, "Notes": "x" * 5000},
+        critical_fields={"warning": "unconf"},
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    assert result["warning"] == "unconf"
+
+
+def test_success_with_capped_dict_fits_the_exact_reviewer_reported_budget(
+    monkeypatch,
+):
+    """Verified against rogercloud's own PR #2592 review numbers exactly:
+    XAGENT_TOOL_MAX_OUTPUT_LENGTH=64, an Id=1 "returned no record" warning.
+    At this budget there isn't even room left for the truncation marker
+    once the fixed envelope overhead is accounted for -- the response must
+    still fit, even if that means the surviving warning content is just a
+    character or two; a stdio MCP child's own budget is mirrored into a
+    *separate*, JSON-unaware truncation the parent process applies to this
+    exact string, and an oversized response here would be blindly sliced
+    mid-structure by that parent-side filter, producing invalid JSON
+    instead of a valid-but-abbreviated one."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "64")
+    warning = (
+        "Deputy reported this Roster create as successful (Id 1), but "
+        "reading it back returned no record. Treat this as unconfirmed -- "
+        "verify in Deputy directly before relying on it."
+    )
+    assert len(warning) > 64  # the scenario only arises when it doesn't fit whole
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 1, "Notes": "x" * 5000},
+        critical_fields={"warning": warning},
+    )
+
+    assert len(raw) <= 64
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def test_success_with_capped_dict_shortens_an_oversized_critical_field(monkeypatch):
+    """With a bit more room than the tightest possible budget, shortening
+    must keep a real prefix of the original content plus the truncation
+    marker, not just whatever survives is dropped down to nothing."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "100")
+    warning = (
+        "Deputy reported this Roster create as successful (Id 1), but "
+        "reading it back returned no record. Treat this as unconfirmed -- "
+        "verify in Deputy directly before relying on it."
+    )
+    assert len(warning) > 100
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 1, "Notes": "x" * 5000},
+        critical_fields={"warning": warning},
+    )
+
+    assert len(raw) <= 100
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["warning"].endswith("... [truncated]")
+    assert warning.startswith(result["warning"].removesuffix("... [truncated]"))
+
+
+def test_success_with_capped_dict_never_inflates_a_critical_field_below_marker_size(
+    monkeypatch,
+):
+    """A critical field whose value is already SHORTER than the truncation
+    marker must be left alone, not replaced by something bigger -- without
+    a size gate matching _truncation_marker_or_empty's own ("only install
+    the marker if it's no bigger than what it replaces"), a long key name
+    paired with a short value could get "shortened" into a larger, still
+    oversized response with nothing left to shrink afterward."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "64")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 1, "Notes": "x" * 5000},
+        critical_fields={"a_very_long_critical_field_key_name_here": "x"},
+    )
+
+    assert len(raw) <= 64
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    # Even the bare key name alone ("a_very_long_critical_field_key_name_here",
+    # 41 chars) plus the envelope skeleton already exceeds this 64-char
+    # budget regardless of its value, so this field is always dropped here
+    # -- never left alone at "x" -- which is what should be asserted,
+    # rather than an OR that would also pass if shrinking somehow mangled
+    # the value into something other than "x".
+    assert "a_very_long_critical_field_key_name_here" not in result
+
+
+def test_success_with_capped_dict_drops_a_critical_field_that_cannot_shrink(
+    monkeypatch,
+):
+    """A non-string critical value can't be shortened the way a string
+    can -- once every shrinkable string is exhausted and the envelope is
+    still oversized, the field must be dropped outright rather than the
+    function ever handing back something wider than max_output_length."""
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "64")
+
+    raw = utils.success_with_capped_dict(
+        "record",
+        {"Id": 1, "Notes": "x" * 5000},
+        critical_fields={"stats": {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6}},
+    )
+
+    assert len(raw) <= 64
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def test_success_with_capped_dict_rejects_overlapping_extra_and_critical_fields():
+    with pytest.raises(ValueError, match="must not share a key"):
+        utils.success_with_capped_dict(
+            "record",
+            {"Id": 1},
+            extra_fields={"note": "a"},
+            critical_fields={"note": "b"},
+        )

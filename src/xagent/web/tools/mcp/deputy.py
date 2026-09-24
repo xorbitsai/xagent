@@ -85,9 +85,7 @@ def _empty_create_response(subject: str) -> str:
     )
 
 
-def _verify_created_record(
-    resource: str, safe_resource: str, result: Any, *, field_name: str = "record"
-) -> str:
+def _verify_created_record(resource: str, safe_resource: str, result: Any) -> str:
     """Confirm a just-created record is actually retrievable before
     reporting success, rather than trusting the create response at face
     value. Deputy's create endpoints can return a 200 with a plausible,
@@ -108,12 +106,29 @@ def _verify_created_record(
     should not be able to silently point the readback GET somewhere other
     than the record it just created.
     """
-    if not isinstance(result, dict) or result.get("Id") is None:
+    if not isinstance(result, dict):
+        # A malformed response _record_response already errors on.
+        return _record_response(resource, result)
+    if result.get("Id") is None:
         # Already-empty ({}) is handled by each caller before this is
-        # reached; a non-dict is a malformed response _record_response
-        # already errors on; and a dict with no "Id" has nothing to verify
-        # against -- in both cases, pass the result through as-is.
-        return _record_response(resource, result, field_name=field_name)
+        # reached, so this is a non-empty body with nothing to read back
+        # and verify against -- not a different, safer case than a
+        # present-but-orphaned Id, just a differently-shaped instance of
+        # the same "can't confirm this succeeded" risk this function
+        # exists to catch. This matters most for deputy_add_employee:
+        # Deputy's own OpenAPI spec documents POST /supervise/employee's
+        # response as an undocumented, empty schema (unlike the Resource
+        # API's Employee object, which always has an Id), so a body
+        # that comes back anyway without an Id is exactly the
+        # unconfirmed-shape case, not a clean pass-through.
+        warning = (
+            f"Unconfirmed Deputy {resource} create -- verify directly in "
+            "Deputy before relying on it. The create response had no Id "
+            "to read back and confirm."
+        )
+        return success_with_capped_dict(
+            "record", result, critical_fields={"warning": warning}
+        )
     record_id = result["Id"]
     detail: str | None = None
     readback: Any = None
@@ -123,14 +138,24 @@ def _verify_created_record(
         verified = isinstance(readback, dict) and bool(readback)
     except Exception as e:
         verified = False
-        detail = str(e)
+        # `str(e)` is "" for an exception raised with no args (e.g. a bare
+        # `raise SomeError()`) -- `detail` would then be falsy even though
+        # an exception genuinely happened, so this is checked with
+        # `detail is not None` below rather than truthiness, and falls
+        # back to the exception's type name so "failed: " is never
+        # followed by nothing.
+        detail = str(e) or type(e).__name__
+        logger.warning(
+            f"Deputy readback failed for {resource} Id {record_id}: {detail}",
+            exc_info=True,
+        )
     if verified:
         # The freshly-read record, not the create response: Deputy may
         # normalize or default fields between the write and this read, and
         # since a full GET is already being paid for, there's no reason to
         # return the staler of the two.
-        return _record_response(resource, readback, field_name=field_name)
-    if detail:
+        return _record_response(resource, readback)
+    if detail is not None:
         reason = f"failed: {detail}"
     elif not readback:
         reason = "returned no record"
@@ -145,17 +170,22 @@ def _verify_created_record(
     # success_with_capped_dict's last-resort fallback cuts an oversized
     # critical field from the end, so if this ever needs shortening, it
     # must eat into "reason" -- not into the one instruction a caller
-    # actually needs to act on.
+    # actually needs to act on. "Do not retry" is explicit rather than
+    # implied by "verify directly": the POST that got this far already
+    # returned an Id, so Deputy most likely did create the record --
+    # retrying the create on an unconfirmed *readback* risks a genuine
+    # duplicate, not just a redundant no-op.
     warning = (
         f"Unconfirmed Deputy {resource} create (Id {record_id}) -- verify "
-        f"directly in Deputy before relying on it. Reading it back {reason}."
+        "directly in Deputy before relying on it; do not retry the create, "
+        f"which likely already succeeded. Reading it back {reason}."
     )
     # critical_fields, not extra_fields: this warning is the entire point
     # of this function, so it must survive even success_with_capped_dict's
     # last-resort truncation fallback, which otherwise drops ordinary
     # extra_fields to make room.
     return success_with_capped_dict(
-        field_name, result, critical_fields={"warning": warning}
+        "record", result, critical_fields={"warning": warning}
     )
 
 
@@ -593,8 +623,7 @@ def deputy_add_employee(
     After Deputy reports success, this reads the new employee back before
     confirming -- if that fails, the result is still returned but with a
     "warning" field flagging it as unconfirmed; treat that the same as a
-    failure until you've verified it directly in Deputy. This is exactly
-    the check that was missing during the 2026-09-21 incident.
+    failure until you've verified it directly in Deputy.
     """
     try:
         # Flattened, individually-named parameters rather than a generic

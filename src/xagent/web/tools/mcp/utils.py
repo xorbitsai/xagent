@@ -269,36 +269,64 @@ def halve_dict_or_mark(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
 _TRUNCATION_SUFFIX = "... [truncated]"
 
 
-def _envelope_with_critical(critical: dict[str, Any]) -> str:
+def _envelope_with_critical(
+    critical: dict[str, Any], *, extra: dict[str, Any] | None = None
+) -> str:
     return json.dumps(
-        {"status": "success", **critical, "truncated": True}, ensure_ascii=False
+        {"status": "success", **(extra or {}), **critical, "truncated": True},
+        ensure_ascii=False,
     )
 
 
-def _fit_critical_fields(critical: dict[str, Any], max_output_length: int) -> str:
-    """Build the ``{"status": "success", **critical, "truncated": true}``
-    envelope, shortening or dropping ``critical`` as needed until the
-    serialized result actually fits ``max_output_length`` -- the
+def _fit_critical_fields(
+    critical: dict[str, Any],
+    max_output_length: int,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Build the ``{"status": "success", **extra, **critical, "truncated":
+    true}`` envelope, shortening or dropping ``critical`` as needed until
+    the serialized result actually fits ``max_output_length`` -- the
     guaranteed-fits counterpart to ``success_with_capped_dict``'s
     last-resort call site, which needs critical_fields present but must
     never hand back something this function can't promise is within
     budget (see that call site for why).
 
+    ``extra`` carries the one piece of ``data`` this function otherwise
+    knows nothing about: the compact ``{field_name: {id_key: ...}}`` record
+    the caller had already isolated before falling back this far, kept
+    alongside ``critical`` rather than left behind -- shrinking or dropping
+    ``critical`` still leaves a record whose id can be looked up, which a
+    bare ``critical``-only envelope can't offer. ``extra`` itself is never
+    shrunk (an id is already about as small as a value gets); if ``critical``
+    fully dropped still doesn't leave room for it, ``extra`` is dropped too
+    rather than risk exceeding ``max_output_length``.
+
+    Even the bare ``{"status": "success", "truncated": true}`` skeleton
+    this function falls back to is not free -- ``max_output_length`` must
+    be at least its length (40 chars) for that fallback itself to fit.
+    This function has no floor of its own; it relies on its one caller
+    always passing ``max(_MIN_OUTPUT_LENGTH, get_tool_max_output_length())``
+    (``_MIN_OUTPUT_LENGTH`` is 64), never a raw, unclamped budget.
+
     Two passes, each mirroring an existing pattern in this module rather
     than inventing a new one:
 
-    1. Shrink the largest string value (by its own serialized size, same
-       comparison ``halve_dict_or_mark``'s siblings use) toward
-       ``_TRUNCATION_SUFFIX``. The target length for each cut is derived
-       from how much the *whole envelope* needs to shrink by (not a fixed
-       step), and is provably always smaller than the field's current
-       length whenever this loop body runs at all (the loop only runs
-       while the envelope is still oversized, so there's always at least
-       one byte of "how much shorter" to cut) -- so, unlike a naive
-       "replace with a fixed marker" approach, this can never inflate a
-       value that started out shorter than the marker itself. A value
-       that shrinks to "" is excluded from the next round by the
-       ``and value`` filter below, moving on to the next-largest field.
+    1. Shrink the largest string value (by its own raw length, not a
+       json.dumps-serialized size -- unlike the drop pass below, this
+       doesn't need to account for quoting/escaping overhead since it's
+       choosing which value to shrink, not computing an exact byte
+       budget) toward ``_TRUNCATION_SUFFIX``. The target length for each
+       cut is derived from how much the *whole envelope* needs to shrink
+       by (not a fixed step), and is provably always smaller than the
+       field's current length whenever this loop body runs at all (the
+       loop only runs while the envelope is still oversized, so there's
+       always at least one byte of "how much shorter" to cut) -- so,
+       unlike a naive "replace with a fixed marker" approach, this can
+       never inflate a value that started out shorter than the marker
+       itself. A value that shrinks to "" is excluded from the next round
+       by the ``and value`` filter below, moving on to the next-largest
+       field.
     2. If nothing is left to shrink (every string is now "", or
        ``critical`` had no string to begin with -- nothing currently
        passes a non-string critical field, but the type is
@@ -314,7 +342,7 @@ def _fit_critical_fields(critical: dict[str, Any], max_output_length: int) -> st
        than merely truncating it.
     """
     working = dict(critical)
-    response = _envelope_with_critical(working)
+    response = _envelope_with_critical(working, extra=extra)
 
     while len(response) > max_output_length:
         shrinkable = {
@@ -347,7 +375,7 @@ def _fit_critical_fields(critical: dict[str, Any], max_output_length: int) -> st
             # envelope's own top-level "truncated" flag still signals that
             # something, somewhere, was cut.
             working[target_key] = current[:target_len]
-        response = _envelope_with_critical(working)
+        response = _envelope_with_critical(working, extra=extra)
 
     remaining = list(working.keys())
     while len(response) > max_output_length and remaining:
@@ -356,8 +384,14 @@ def _fit_critical_fields(critical: dict[str, Any], max_output_length: int) -> st
         )
         del working[drop_key]
         remaining.remove(drop_key)
-        response = _envelope_with_critical(working)
+        response = _envelope_with_critical(working, extra=extra)
     if len(response) > max_output_length:
+        if extra:
+            # `extra` (a bare id, typically a handful of bytes) doesn't fit
+            # even alongside every critical field fully dropped -- an
+            # extreme budget this function still must not exceed, so drop
+            # `extra` too rather than return something oversized.
+            return _fit_critical_fields(critical, max_output_length)
         return json.dumps({"status": "success", "truncated": True}, ensure_ascii=False)
     return response
 
@@ -674,8 +708,16 @@ def success_with_capped_dict(
         # "unconfirmed" safety signal. So once nothing else is left to
         # drop, shorten critical_fields' own string values (longest first)
         # until the envelope fits, rather than emitting something this
-        # function can't guarantee is parseable downstream.
-        return _fit_critical_fields(critical, max_output_length)
+        # function can't guarantee is parseable downstream. Still try to
+        # keep compact_data (the bare id) alongside the shrunk critical
+        # fields first -- every rung above already treated a bare id as
+        # worth keeping over a fuller payload, and this last resort
+        # shouldn't be the one place that guarantee quietly stops applying.
+        return _fit_critical_fields(
+            critical,
+            max_output_length,
+            extra={field_name: compact_data} if compact_data else None,
+        )
     return response
 
 

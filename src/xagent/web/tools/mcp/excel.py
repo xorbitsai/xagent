@@ -6,10 +6,9 @@ from typing import Annotated, Any
 from urllib.parse import quote, unquote, urlsplit
 
 import requests
-from pydantic import Field
-
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from ....config import get_tool_max_output_length
 from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
@@ -340,7 +339,9 @@ def _site_segment(site_id: str) -> str:
         raise ValueError("site_id has an invalid hostname/path form")
     segments = relative_path.split("/")
     if any(segment in (".", "..", "") for segment in segments):
-        raise ValueError(f"site_id must not contain '.', '..', or empty segments: {site_id!r}")
+        raise ValueError(
+            f"site_id must not contain '.', '..', or empty segments: {site_id!r}"
+        )
     encoded_path = "/".join(quote(segment, safe="") for segment in segments)
     suffix = ":" if terminated else ""
     return f"{quote(hostname, safe='')}:/{encoded_path}{suffix}"
@@ -379,13 +380,17 @@ def _normalize_relative_path(path: str) -> str:
     if path.startswith("/"):
         raise ValueError("file_path must be relative and must not start with '/'")
     if path.endswith("/"):
-        raise ValueError("file_path must include a filename, not end with a folder separator")
+        raise ValueError(
+            "file_path must include a filename, not end with a folder separator"
+        )
     value = path
     if "\\" in value:
         raise ValueError("file_path must use '/' separators and must not contain '\\'")
     segments = value.split("/")
     if any(segment in (".", "..", "") for segment in segments):
-        raise ValueError(f"file_path must not contain '.', '..', or empty segments: {path!r}")
+        raise ValueError(
+            f"file_path must not contain '.', '..', or empty segments: {path!r}"
+        )
     for segment in segments:
         if segment != segment.strip():
             raise ValueError(
@@ -512,7 +517,11 @@ def excel_list_worksheets(
         validated_page_size = _validate_page_size(page_size)
         base = _workbook_base(file_path, site_id, drive_id)
         collection_path = f"{base}/worksheets"
-        path = collection_path if next_link is None else _next_page_path(next_link, collection_path)
+        path = (
+            collection_path
+            if next_link is None
+            else _next_page_path(next_link, collection_path)
+        )
         result = _graph_request(
             "GET",
             path,
@@ -556,7 +565,9 @@ def excel_add_worksheet(
         result = _graph_mutation_request("POST", f"{base}/worksheets/add", body=body)
         return _success(worksheet=result)
     except _GraphMutationIndeterminateError as e:
-        logger.error("Worksheet creation outcome is indeterminate for %s: %s", file_path, e)
+        logger.error(
+            "Worksheet creation outcome is indeterminate for %s: %s", file_path, e
+        )
         return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding worksheet to %s: %s", file_path, e)
@@ -608,7 +619,9 @@ def excel_get_range(
         path = f"{base}/{segment}/range"
         if address is not None:
             path += f"(address='{_odata_string_literal(address)}')"
-        result = _graph_request("GET", path, max_response_bytes=get_tool_max_output_length())
+        result = _graph_request(
+            "GET", path, max_response_bytes=get_tool_max_output_length()
+        )
         return _success_with_bounded_range(result)
     except _GraphResponseTooLargeError:
         return _error(
@@ -693,7 +706,9 @@ def excel_delete_columns(
         address = _normalize_column_range(start_column, end_column)
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("worksheets", worksheet)
-        path = f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/delete"
+        path = (
+            f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/delete"
+        )
         _graph_mutation_request("POST", path, body={"shift": "Left"})
         return _success(
             message="Columns deleted successfully",
@@ -742,7 +757,9 @@ def excel_clear_range(
             )
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("worksheets", worksheet)
-        path = f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/clear"
+        path = (
+            f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/clear"
+        )
         _graph_request("POST", path, body={"applyTo": apply_to})
         return _success(message="Range cleared successfully")
     except Exception as e:
@@ -775,7 +792,9 @@ def excel_get_used_range(
         path = f"{base}/{segment}/usedRange"
         if values_only:
             path += "(valuesOnly=true)"
-        result = _graph_request("GET", path, max_response_bytes=get_tool_max_output_length())
+        result = _graph_request(
+            "GET", path, max_response_bytes=get_tool_max_output_length()
+        )
         return _success_with_bounded_range(result)
     except _GraphResponseTooLargeError:
         return _error(
@@ -808,7 +827,11 @@ def excel_list_tables(
         validated_page_size = _validate_page_size(page_size)
         base = _workbook_base(file_path, site_id, drive_id)
         collection_path = f"{base}/tables"
-        path = collection_path if next_link is None else _next_page_path(next_link, collection_path)
+        path = (
+            collection_path
+            if next_link is None
+            else _next_page_path(next_link, collection_path)
+        )
         result = _graph_request(
             "GET",
             path,
@@ -879,7 +902,11 @@ def excel_list_table_rows(
         base = _workbook_base(file_path, site_id, drive_id)
         segment = _odata_key_segment("tables", table)
         collection_path = f"{base}/{segment}/rows"
-        path = collection_path if next_link is None else _next_page_path(next_link, collection_path)
+        path = (
+            collection_path
+            if next_link is None
+            else _next_page_path(next_link, collection_path)
+        )
         result = _graph_request(
             "GET",
             path,

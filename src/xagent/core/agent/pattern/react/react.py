@@ -61,8 +61,9 @@ import inspect
 import itertools
 import json
 import logging
+import uuid
 from dataclasses import dataclass, replace
-from datetime import timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, cast
 from uuid import uuid4
@@ -231,6 +232,10 @@ class ToolCallRecord:
     args: dict[str, Any]
     args_hash: str
     status: str
+    # Xagent identity for one concrete invocation. ``None`` denotes a legacy
+    # checkpoint whose exact identity was never recorded; those rows retain
+    # provider-id fallback semantics rather than fabricating history.
+    invocation_id: str | None = None
     result: Any = None
     error: str | None = None
     # Terminal outcome supplied by a resumable tool callback. Kept separate
@@ -248,10 +253,14 @@ class ToolCallRecord:
     # The ReAct step that issued the call. Persisted so a rebuilt runtime can
     # resume the exact gate identity instead of inventing a new execution slot.
     step_id: str | None = None
+    # First registration time. Legacy rows keep ``None`` because their real
+    # invocation time cannot be reconstructed safely.
+    issued_at: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "tool_call_id": self.tool_call_id,
+            "invocation_id": self.invocation_id,
             "tool_name": self.tool_name,
             "args": self.args,
             "args_hash": self.args_hash,
@@ -262,6 +271,7 @@ class ToolCallRecord:
             "turn_id": self.turn_id,
             "settlement_turn_id": self.settlement_turn_id,
             "step_id": self.step_id,
+            "issued_at": self.issued_at,
         }
 
     @classmethod
@@ -272,6 +282,11 @@ class ToolCallRecord:
             args=dict(data.get("args") or {}),
             args_hash=str(data.get("args_hash", "")),
             status=str(data.get("status", "pending")),
+            invocation_id=(
+                str(data["invocation_id"])
+                if data.get("invocation_id") is not None
+                else None
+            ),
             result=data.get("result"),
             error=data.get("error"),
             settlement_status=(
@@ -286,6 +301,9 @@ class ToolCallRecord:
                 else None
             ),
             step_id=str(data["step_id"]) if data.get("step_id") else None,
+            issued_at=(
+                float(data["issued_at"]) if data.get("issued_at") is not None else None
+            ),
         )
 
 
@@ -2602,20 +2620,23 @@ class ReActPattern(AgentPattern):
             dict(waiting_request) if isinstance(waiting_request, dict) else None
         )
         pending_interaction_responses = state.get("pending_tool_interaction_responses")
-        self.pending_tool_interaction_responses = [
-            {
+        self.pending_tool_interaction_responses = []
+        for item in (
+            pending_interaction_responses
+            if isinstance(pending_interaction_responses, list)
+            else []
+        ):
+            if not isinstance(item, dict):
+                continue
+            restored_pending = {
                 "tool_name": str(item.get("tool_name") or ""),
                 "tool_call_id": str(item.get("tool_call_id") or ""),
                 "interaction_id": str(item.get("interaction_id") or ""),
                 "response": str(item.get("response") or ""),
             }
-            for item in (
-                pending_interaction_responses
-                if isinstance(pending_interaction_responses, list)
-                else []
-            )
-            if isinstance(item, dict)
-        ]
+            if item.get("invocation_id"):
+                restored_pending["invocation_id"] = str(item["invocation_id"])
+            self.pending_tool_interaction_responses.append(restored_pending)
         stored_task_text = state.get("task_text")
         self.task_text = str(stored_task_text) if stored_task_text else None
         stored_memory_input = state.get("memory_input_text")
@@ -2789,18 +2810,17 @@ class ReActPattern(AgentPattern):
                 # Callback-less tools resume through the normal ReAct replan. The
                 # user's answer remains in context with waiting-response metadata.
                 continue
-            self.pending_tool_interaction_responses.append(
-                {
-                    "tool_name": tool_name,
-                    "tool_call_id": str(request.get("tool_call_id") or ""),
-                    "interaction_id": str(
-                        request.get("interaction_id")
-                        or request.get("tool_call_id")
-                        or ""
-                    ),
-                    "response": response,
-                }
-            )
+            queued = {
+                "tool_name": tool_name,
+                "tool_call_id": str(request.get("tool_call_id") or ""),
+                "interaction_id": str(
+                    request.get("interaction_id") or request.get("tool_call_id") or ""
+                ),
+                "response": response,
+            }
+            if request.get("invocation_id"):
+                queued["invocation_id"] = str(request["invocation_id"])
+            self.pending_tool_interaction_responses.append(queued)
 
     async def _deliver_pending_tool_interaction_responses(
         self,
@@ -2875,6 +2895,7 @@ class ReActPattern(AgentPattern):
             # turn, ReAct step) instead of inventing a new one.
             resume_call = {
                 "id": str(pending.get("tool_call_id") or ""),
+                "invocation_id": record.invocation_id,
                 "name": tool_name,
                 "turn_id": record.turn_id,
                 "step_id": record.step_id,
@@ -2934,7 +2955,7 @@ class ReActPattern(AgentPattern):
                     },
                 )
             except BaseException:
-                self.tool_ledger[record_before.tool_call_id] = record_before
+                self._restore_tool_record(record_before)
                 if messages_before is not None and isinstance(messages, list):
                     messages[:] = messages_before
                 self.force_final_answer_next = force_final_before
@@ -2981,7 +3002,10 @@ class ReActPattern(AgentPattern):
 
         tool_name = str(pending.get("tool_name") or "")
         tool_call_id = str(pending.get("tool_call_id") or "")
-        candidate = self.tool_ledger.get(tool_call_id)
+        candidate = self._find_tool_record(
+            tool_call_id=tool_call_id,
+            invocation_id=str(pending.get("invocation_id") or "") or None,
+        )
         # Only a record for this exact call AND this exact tool is ours.
         record = (
             candidate
@@ -3062,7 +3086,7 @@ class ReActPattern(AgentPattern):
                 },
             )
         except BaseException:
-            self.tool_ledger[record_before.tool_call_id] = record_before
+            self._restore_tool_record(record_before)
             self.force_final_answer_next = force_final_before
             self.settlement_final_answer_fence = settlement_fence_before
             self.settlement_fence_turn_id = settlement_fence_turn_before
@@ -3136,6 +3160,8 @@ class ReActPattern(AgentPattern):
             "settlement_delivery": True,
             "settlement_status": settlement.status,
         }
+        if record.invocation_id:
+            base["invocation_id"] = record.invocation_id
         turn_id = getattr(runtime, "active_turn_id", None)
         if turn_id:
             base["turn_id"] = str(turn_id)
@@ -3217,7 +3243,10 @@ class ReActPattern(AgentPattern):
         """Validate every durable identity before a resume callback can run."""
 
         tool_call_id = str(pending.get("tool_call_id") or "")
-        record = self.tool_ledger.get(tool_call_id)
+        record = self._find_tool_record(
+            tool_call_id=tool_call_id,
+            invocation_id=str(pending.get("invocation_id") or "") or None,
+        )
         if record is None:
             raise RuntimeError(
                 "Cannot settle resumed tool interaction without its original "
@@ -3243,6 +3272,11 @@ class ReActPattern(AgentPattern):
             for message in messages
             if getattr(message, "role", None) == "tool"
             and getattr(message, "tool_call_id", None) == tool_call_id
+            and (
+                not record.invocation_id
+                or (getattr(message, "metadata", None) or {}).get("invocation_id")
+                == record.invocation_id
+            )
         ]
         if len(matches) != 1:
             raise RuntimeError(
@@ -3266,6 +3300,7 @@ class ReActPattern(AgentPattern):
             context=context,
             tool_name=record.tool_name,
             tool_call_id=record.tool_call_id,
+            invocation_id=record.invocation_id,
             result=result,
         )
         self._record_settled_tool_call(
@@ -3287,6 +3322,7 @@ class ReActPattern(AgentPattern):
 
         tool_call: dict[str, Any] = {
             "id": record.tool_call_id,
+            "invocation_id": record.invocation_id,
             "name": record.tool_name,
             "args": copy.deepcopy(record.args),
         }
@@ -3369,6 +3405,7 @@ class ReActPattern(AgentPattern):
         context: Any,
         tool_name: str,
         tool_call_id: str,
+        invocation_id: str | None,
         result: Any,
     ) -> None:
         """Replace the waiting observation without creating a second tool row.
@@ -3389,6 +3426,11 @@ class ReActPattern(AgentPattern):
             for index, message in enumerate(messages)
             if getattr(message, "role", None) == "tool"
             and getattr(message, "tool_call_id", None) == tool_call_id
+            and (
+                not invocation_id
+                or (getattr(message, "metadata", None) or {}).get("invocation_id")
+                == invocation_id
+            )
         ]
         if len(matching_indexes) != 1:
             raise RuntimeError(
@@ -3400,6 +3442,7 @@ class ReActPattern(AgentPattern):
             tool_name=tool_name,
             result=result,
             tool_call_id=tool_call_id,
+            invocation_id=invocation_id,
         )
         if not messages or messages[-1] is not replacement:
             raise RuntimeError(
@@ -3486,6 +3529,7 @@ class ReActPattern(AgentPattern):
             normalized.append(
                 {
                     "id": call_id or f"tool_call_{index}",
+                    "invocation_id": uuid.uuid4().hex,
                     "name": name,
                     "args": self._coerce_arguments(arguments, tool_name=name),
                 }
@@ -3506,9 +3550,9 @@ class ReActPattern(AgentPattern):
         for tool_call in tool_calls:
             if tool_call.get("name") in control_tool_names:
                 continue
-            tool_call_id = str(tool_call.get("id") or "")
-            if tool_call_id:
-                self.pending_tool_call_content[tool_call_id] = content
+            content_key = self._tool_call_content_key(tool_call)
+            if content_key:
+                self.pending_tool_call_content[content_key] = content
             return
 
     def _coerce_arguments(
@@ -3913,6 +3957,8 @@ class ReActPattern(AgentPattern):
             "tool_call_id": tool_call["id"],
             "tool_name": tool_call["name"],
         }
+        if tool_call.get("invocation_id"):
+            source["invocation_id"] = tool_call["invocation_id"]
         for key in (
             "step_id",
             "dag_step_id",
@@ -4391,6 +4437,11 @@ class ReActPattern(AgentPattern):
             tool_name=tool_call["name"],
             result=result,
             tool_call_id=tool_call.get("id"),
+            invocation_id=(
+                str(tool_call["invocation_id"])
+                if tool_call.get("invocation_id")
+                else None
+            ),
         )
         self._forget_tool_call_content(tool_call)
 
@@ -4503,6 +4554,7 @@ class ReActPattern(AgentPattern):
             requests.append(
                 {
                     "tool_call_id": str(tool_call.get("id") or ""),
+                    "invocation_id": str(tool_call.get("invocation_id") or ""),
                     "tool_name": str(tool_call.get("name") or ""),
                     "interaction_id": str(
                         result.get("interaction_id") or tool_call.get("id") or ""
@@ -4669,16 +4721,22 @@ class ReActPattern(AgentPattern):
         original tool-call order. Records keep their latest (final) state; only
         their relative position is restored.
         """
-        ids = [str(tool_call.get("id") or "") for tool_call in batch]
-        records = {
-            tool_id: self.tool_ledger.pop(tool_id)
-            for tool_id in ids
-            if tool_id in self.tool_ledger
-        }
-        for tool_id in ids:
-            record = records.get(tool_id)
-            if record is not None:
-                self.tool_ledger[tool_id] = record
+        ordered: list[tuple[str, ToolCallRecord]] = []
+        for tool_call in batch:
+            record = self._find_tool_record(
+                tool_call_id=str(tool_call.get("id") or ""),
+                invocation_id=str(tool_call.get("invocation_id") or "") or None,
+            )
+            if record is None:
+                continue
+            key = next(
+                key
+                for key, candidate in self.tool_ledger.items()
+                if candidate is record
+            )
+            ordered.append((key, self.tool_ledger.pop(key)))
+        for key, record in ordered:
+            self.tool_ledger[key] = record
 
     def _disabled_control_tool_index(
         self,
@@ -5601,9 +5659,22 @@ class ReActPattern(AgentPattern):
         # dict that _backfill_result / _reorder_ledger_for_batch read desyncs
         # from the ledger (I2/I3). No await runs before the first record below,
         # so concurrent batch members get distinct fallback ids.
-        if not tool_call.get("id"):
-            tool_call["id"] = f"tool_call_{len(self.tool_ledger)}"
         pending_call = tool_call
+        if not tool_call.get("id"):
+            tool_call = {
+                **tool_call,
+                "id": f"tool_call_{len(self.tool_ledger)}",
+            }
+        # New LLM responses are stamped during normalization. This fallback is
+        # only for restored legacy pending calls that predate invocation IDs.
+        if not tool_call.get("invocation_id"):
+            tool_call = {**tool_call, "invocation_id": uuid.uuid4().hex}
+        if tool_call is not pending_call:
+            self.pending_tool_calls = [
+                tool_call if candidate is pending_call else candidate
+                for candidate in self.pending_tool_calls
+            ]
+            pending_call = tool_call
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
         tool_call = self._with_runtime_turn_id(tool_call, runtime)
@@ -5636,7 +5707,13 @@ class ReActPattern(AgentPattern):
                 # Never overwrite the matched genuine record with the
                 # envelope: on provider id reuse the genuine result must stay
                 # in the ledger so later duplicates still find it.
-                if str(tool_call["id"]) not in self.tool_ledger:
+                if (
+                    self._find_tool_record(
+                        tool_call_id=str(tool_call["id"]),
+                        invocation_id=str(tool_call["invocation_id"]),
+                    )
+                    is None
+                ):
                     self._record_tool_call(
                         tool_call, status="completed", result=suppressed
                     )
@@ -5749,18 +5826,12 @@ class ReActPattern(AgentPattern):
             await runtime.on_tool_end(tool_call=tool_call, result=result)
             return result
         except (ToolCallInterrupted, asyncio.CancelledError) as exc:
-            if (
-                is_control
-                and self.tool_ledger[str(tool_call["id"])].status == "running"
-            ):
+            if is_control and self._tool_record_for_call(tool_call).status == "running":
                 self._record_tool_call(tool_call, status="interrupted", error=str(exc))
                 recorded_terminal = True
             raise
         except Exception as exc:
-            if (
-                is_control
-                and self.tool_ledger[str(tool_call["id"])].status == "running"
-            ):
+            if is_control and self._tool_record_for_call(tool_call).status == "running":
                 self._record_tool_call(tool_call, status="failed", error=str(exc))
                 recorded_terminal = True
             raise
@@ -5769,7 +5840,7 @@ class ReActPattern(AgentPattern):
             # raises. Preserve that outcome, like an ordinary on_tool_end error.
             if is_control:
                 recorded_terminal = (
-                    self.tool_ledger[str(tool_call["id"])].status != "running"
+                    self._tool_record_for_call(tool_call).status != "running"
                 )
             # Sends and infra callbacks must propagate without leaving a
             # running ledger entry or becoming a model-visible business error.
@@ -5872,8 +5943,12 @@ class ReActPattern(AgentPattern):
         return {**tool_call, "turn_id": str(turn_id)}
 
     def _with_tool_call_content(self, tool_call: dict[str, Any]) -> dict[str, Any]:
-        tool_call_id = str(tool_call.get("id") or "")
-        content = self.pending_tool_call_content.get(tool_call_id)
+        content = self.pending_tool_call_content.get(
+            self._tool_call_content_key(tool_call)
+        )
+        if not content and tool_call.get("invocation_id"):
+            # Legacy checkpoints keyed the cache by provider id.
+            content = self.pending_tool_call_content.get(str(tool_call.get("id") or ""))
         if not content:
             return tool_call
         return {
@@ -5882,9 +5957,15 @@ class ReActPattern(AgentPattern):
         }
 
     def _forget_tool_call_content(self, tool_call: dict[str, Any]) -> None:
-        tool_call_id = str(tool_call.get("id") or "")
-        if tool_call_id:
-            self.pending_tool_call_content.pop(tool_call_id, None)
+        content_key = self._tool_call_content_key(tool_call)
+        if content_key:
+            self.pending_tool_call_content.pop(content_key, None)
+        if tool_call.get("invocation_id"):
+            self.pending_tool_call_content.pop(str(tool_call.get("id") or ""), None)
+
+    @staticmethod
+    def _tool_call_content_key(tool_call: dict[str, Any]) -> str:
+        return str(tool_call.get("invocation_id") or tool_call.get("id") or "")
 
     def _record_tool_call(
         self,
@@ -5897,10 +5978,26 @@ class ReActPattern(AgentPattern):
         settlement_turn_id: str | None = None,
     ) -> None:
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
+        if "invocation_id" in tool_call:
+            raw_invocation_id = tool_call.get("invocation_id")
+            invocation_id = str(raw_invocation_id) if raw_invocation_id else None
+        else:
+            invocation_id = uuid.uuid4().hex
+        tool_call["invocation_id"] = invocation_id
         args = self._tool_call_args_dict(tool_call)
         args_hash = self._args_hash(args)
-        self.tool_ledger[tool_call_id] = ToolCallRecord(
+        existing = self._find_tool_record(
             tool_call_id=tool_call_id,
+            invocation_id=invocation_id,
+        )
+        issued_at = (
+            datetime.now(timezone.utc).timestamp()
+            if existing is None
+            else existing.issued_at
+        )
+        record = ToolCallRecord(
+            tool_call_id=tool_call_id,
+            invocation_id=invocation_id,
             tool_name=str(tool_call["name"]),
             args=args,
             args_hash=args_hash,
@@ -5913,7 +6010,64 @@ class ReActPattern(AgentPattern):
                 str(settlement_turn_id) if settlement_turn_id else None
             ),
             step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
+            issued_at=issued_at,
         )
+        self.tool_ledger[self._ledger_key_for_record(record)] = record
+
+    def _ledger_key_for_record(self, record: ToolCallRecord) -> str:
+        """Keep the historical first key; use invocation identity on collision."""
+
+        existing = self.tool_ledger.get(record.tool_call_id)
+        if existing is None or existing.invocation_id == record.invocation_id:
+            return record.tool_call_id
+        assert record.invocation_id is not None
+        return record.invocation_id
+
+    def _find_tool_record(
+        self, *, tool_call_id: str, invocation_id: str | None
+    ) -> ToolCallRecord | None:
+        if invocation_id:
+            direct = self.tool_ledger.get(invocation_id)
+            if direct is not None and direct.invocation_id == invocation_id:
+                return direct
+            provider_keyed = self.tool_ledger.get(tool_call_id)
+            if (
+                provider_keyed is not None
+                and provider_keyed.invocation_id == invocation_id
+            ):
+                return provider_keyed
+            return next(
+                (
+                    record
+                    for record in self.tool_ledger.values()
+                    if record.invocation_id == invocation_id
+                ),
+                None,
+            )
+        # A legacy row has no exact identity. Retain the old provider-id lookup
+        # and do not guess among newer colliding rows.
+        return self.tool_ledger.get(tool_call_id)
+
+    def _tool_record_for_call(self, tool_call: dict[str, Any]) -> ToolCallRecord:
+        record = self._find_tool_record(
+            tool_call_id=str(tool_call.get("id") or ""),
+            invocation_id=str(tool_call.get("invocation_id") or "") or None,
+        )
+        if record is None:
+            raise KeyError(str(tool_call.get("id") or ""))
+        return record
+
+    def _restore_tool_record(self, record: ToolCallRecord) -> None:
+        """Replace the exact invocation during transactional rollback."""
+
+        for key, candidate in self.tool_ledger.items():
+            if record.invocation_id and candidate.invocation_id == record.invocation_id:
+                self.tool_ledger[key] = record
+                return
+            if record.invocation_id is None and key == record.tool_call_id:
+                self.tool_ledger[key] = record
+                return
+        self.tool_ledger[self._ledger_key_for_record(record)] = record
 
     @staticmethod
     def _tool_call_turn_id(tool_call: dict[str, Any]) -> str | None:

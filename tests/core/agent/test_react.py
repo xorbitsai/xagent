@@ -8457,10 +8457,14 @@ async def test_react_pattern_emits_runtime_checkpoints() -> None:
         "final",
     ]
     after_llm = runtime.checkpoints[1]
-    assert after_llm["pattern_state"]["pending_tool_calls"] == [
-        {"id": "call_1", "name": "calculator", "args": {"expression": "3+3"}}
-    ]
-    assert after_llm["context"]["messages"][1]["tool_calls"][0]["id"] == "call_1"
+    [checkpointed_call] = after_llm["pattern_state"]["pending_tool_calls"]
+    assert checkpointed_call["id"] == "call_1"
+    assert checkpointed_call["name"] == "calculator"
+    assert checkpointed_call["args"] == {"expression": "3+3"}
+    assert checkpointed_call["invocation_id"]
+    context_call = after_llm["context"]["messages"][1]["tool_calls"][0]
+    assert context_call["id"] == "call_1"
+    assert "invocation_id" not in context_call
 
 
 @pytest.mark.asyncio
@@ -8606,9 +8610,11 @@ async def test_react_pattern_interrupts_at_tool_boundary() -> None:
     assert result["status"] == "interrupted"
     assert tool.calls == []
     assert runtime.last_checkpoint["label"] == "interrupted"
-    assert pattern.pending_tool_calls == [
-        {"id": "call_1", "name": "calculator", "args": {"expression": "4+4"}}
-    ]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call["id"] == "call_1"
+    assert pending_call["name"] == "calculator"
+    assert pending_call["args"] == {"expression": "4+4"}
+    assert pending_call["invocation_id"]
 
 
 @pytest.mark.asyncio
@@ -13000,7 +13006,12 @@ async def test_react_control_send_failure_settles_lifecycle_and_propagates(
         status,
     ]
     assert pattern.tool_ledger["send-1"].error == "send aborted"
-    assert pattern.pending_tool_calls == [call]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call["id"] == call["id"]
+    assert pending_call["name"] == call["name"]
+    assert pending_call["args"] == call["args"]
+    assert pending_call["invocation_id"]
+    assert "invocation_id" not in call
     assert context.get_messages_by_role("tool") == []
 
 
@@ -13278,3 +13289,207 @@ async def test_resumed_settlement_fact_failure_stops_delivery(
             runtime=runtime,
         )
     assert attempted[-1] == failed_action
+
+
+def test_invocation_identity_is_fresh_per_normalized_provider_call() -> None:
+    pattern = ReActPattern()
+
+    [same_step_first] = pattern._normalize_tool_calls(
+        [{"function": {"name": "calculator", "arguments": "{}"}}]
+    )
+    [same_step_second] = pattern._normalize_tool_calls(
+        [{"function": {"name": "calculator", "arguments": "{}"}}]
+    )
+
+    assert same_step_first["id"] == same_step_second["id"] == "tool_call_0"
+    assert same_step_first["invocation_id"] != same_step_second["invocation_id"]
+    assert pattern._tool_call_for_context(same_step_first) == {
+        "id": "tool_call_0",
+        "type": "function",
+        "function": {"name": "calculator", "arguments": "{}"},
+    }
+
+
+def test_reused_provider_id_keeps_distinct_records_and_start_times() -> None:
+    pattern = ReActPattern()
+    [first] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "calculator", "args": {"value": 1}}]
+    )
+    [second] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "calculator", "args": {"value": 2}}]
+    )
+    first["step_id"] = "react_same"
+    second["step_id"] = "react_other"
+
+    pattern._record_tool_call(first, status="running")
+    first_issued_at = pattern._tool_record_for_call(first).issued_at
+    pattern._record_tool_call(first, status="completed", result={"value": 1})
+    pattern._record_tool_call(second, status="running")
+
+    first_record = pattern._tool_record_for_call(first)
+    second_record = pattern._tool_record_for_call(second)
+    assert first_record is not second_record
+    assert first_record.step_id == "react_same"
+    assert second_record.step_id == "react_other"
+    assert first_record.issued_at == first_issued_at
+    assert first_record.issued_at is not None
+    assert second_record.issued_at is not None
+    assert second_record.issued_at >= first_record.issued_at
+    assert len(pattern.tool_ledger) == 2
+
+
+def test_invocation_identity_survives_checkpoint_and_legacy_rows_stay_unknown() -> None:
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "calculator", "args": {}}]
+    )
+    pattern._record_tool_call(call, status="running")
+    pattern.pending_tool_calls = [call]
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "calculator",
+            "tool_call_id": "provider-1",
+            "invocation_id": call["invocation_id"],
+            "interaction_id": "interaction-1",
+            "response": "continue",
+        }
+    ]
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+    restored_call = restored.pending_tool_calls[0]
+    restored_record = restored._tool_record_for_call(restored_call)
+    issued_at = restored_record.issued_at
+    restored._record_tool_call(
+        restored_call, status="completed", result={"success": True}
+    )
+
+    assert (
+        restored._tool_record_for_call(restored_call).invocation_id
+        == (call["invocation_id"])
+    )
+    assert restored._tool_record_for_call(restored_call).issued_at == issued_at
+    assert (
+        restored.pending_tool_interaction_responses[0]["invocation_id"]
+        == (call["invocation_id"])
+    )
+
+    legacy = ToolCallRecord.from_dict(
+        {
+            "tool_call_id": "legacy-provider-id",
+            "tool_name": "calculator",
+            "args": {},
+            "status": "completed",
+        }
+    )
+    assert legacy.invocation_id is None
+    assert legacy.issued_at is None
+
+
+@pytest.mark.asyncio
+async def test_same_provider_id_resume_updates_only_the_exact_invocation() -> None:
+    pattern = ReActPattern()
+    [first] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "approval_gate", "args": {}}]
+    )
+    [second] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "approval_gate", "args": {}}]
+    )
+    for call in (first, second):
+        call.update(step_id="react_same", turn_id="original-turn")
+    pattern._record_tool_call(first, status="completed", result={"value": "first"})
+    pattern._record_tool_call(
+        second,
+        status="waiting_for_user",
+        result={"success": False, "status": "waiting_for_user"},
+    )
+
+    context = ExecutionContext(execution_id="exact-resume")
+    context.add_tool_result(
+        "approval_gate",
+        {"value": "first"},
+        "provider-1",
+        invocation_id=first["invocation_id"],
+    )
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "provider-1",
+        invocation_id=second["invocation_id"],
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "provider-1",
+            "invocation_id": second["invocation_id"],
+            "interaction_id": "interaction-2",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="exact-resume", tracer=tracer)
+    runtime.active_turn_id = "settlement-turn"
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded(
+                    {"success": True, "value": "settled"}
+                )
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert pattern._tool_record_for_call(first).result == {"value": "first"}
+    settled = pattern._tool_record_for_call(second)
+    assert settled.result == {"success": True, "value": "settled"}
+    assert settled.invocation_id == second["invocation_id"]
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("settlement_delivery") is True
+    ]
+    assert len(settlement_events) == 2
+    assert {event["data"]["invocation_id"] for event in settlement_events} == {
+        second["invocation_id"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_every_runtime_tool_lifecycle_event_carries_invocation_identity() -> None:
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="trace-identity", tracer=tracer)
+    cases = [
+        ("success", {"success": True}),
+        ("waiting", {"success": False, "status": "waiting_for_user"}),
+        ("error", {"success": False, "error": "failed"}),
+        ("cancelled", None),
+    ]
+
+    for label, result in cases:
+        tool_call = {
+            "id": "provider-reused",
+            "invocation_id": f"invocation-{label}",
+            "name": "calculator",
+            "args": {},
+            "step_id": "public-step",
+        }
+        await runtime.on_tool_start(tool_call=tool_call)
+        if label == "error":
+            await runtime.on_tool_error(
+                tool_call=tool_call,
+                error=RuntimeError("failed"),
+                result=result,
+            )
+        elif label == "cancelled":
+            await runtime.on_tool_cancelled(tool_call=tool_call, reason="stop")
+        else:
+            await runtime.on_tool_end(tool_call=tool_call, result=result)
+
+    tool_events = [event for event in tracer.events if "tool" in event["event_type"]]
+    assert len(tool_events) == 8
+    for start, terminal in zip(tool_events[::2], tool_events[1::2]):
+        assert start["data"]["invocation_id"] == terminal["data"]["invocation_id"]
+        assert start["step_id"] == terminal["step_id"] == "public-step"

@@ -30,6 +30,13 @@ _PPTX_MIME_TYPE = (
 _GOOGLE_SLIDES_MIME_TYPE = "application/vnd.google-apps.presentation"
 _PPTX_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
 
+# Keep track of default pages created by this MCP process.  A presentation can
+# legitimately contain an intentional blank page, so add_slide must not infer
+# that every sole empty page is Google's implementation detail.  The returned
+# id can also be passed explicitly for calls that cross process boundaries.
+_CREATED_DEFAULT_SLIDES: dict[str, str] = {}
+_MAX_TRACKED_DEFAULT_SLIDES = 256
+
 
 def _normalize_layout(value: object) -> object:
     """Case/whitespace-normalize `layout` before FastMCP's Pydantic layer
@@ -355,6 +362,42 @@ def _resolve_pptx_upload_path(file_path: str) -> Path:
     return local_path
 
 
+def _normalize_comparison_text(value: str) -> str:
+    """Normalize whitespace for PPTX/Slides text-preservation checks."""
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _shape_texts(shape: Any) -> list[str]:
+    """Extract text from a python-pptx shape, including grouped shapes."""
+    texts: list[str] = []
+    text = getattr(shape, "text", "")
+    if text and str(text).strip():
+        texts.append(str(text))
+    grouped_shapes = getattr(shape, "shapes", None)
+    if grouped_shapes is not None:
+        for child in grouped_shapes:
+            texts.extend(_shape_texts(child))
+    return texts
+
+
+def _extract_pptx_slide_text(file_path: Path) -> list[str]:
+    """Return normalized visible text for each local PPTX slide."""
+    from pptx import Presentation
+
+    presentation = Presentation(str(file_path))
+    slide_texts: list[str] = []
+    for slide in presentation.slides:
+        texts = [text for shape in slide.shapes for text in _shape_texts(shape)]
+        slide_texts.append(_normalize_comparison_text(" ".join(texts)))
+    return slide_texts
+
+
+def _record_created_default_slide(presentation_id: str, slide_id: str) -> None:
+    if len(_CREATED_DEFAULT_SLIDES) >= _MAX_TRACKED_DEFAULT_SLIDES:
+        _CREATED_DEFAULT_SLIDES.pop(next(iter(_CREATED_DEFAULT_SLIDES)))
+    _CREATED_DEFAULT_SLIDES[presentation_id] = slide_id
+
+
 def _resolve_presentation_id(presentation_id: str) -> str:
     """Accept either a bare presentation id or a full Google Slides URL."""
     return resolve_id_from_url(
@@ -475,6 +518,7 @@ def google_slides_create_presentation(title: str) -> str:
                 raise ValueError(
                     "Google Slides returned an empty initial slide without an object_id"
                 )
+            _record_created_default_slide(pres_id, default_slide_id)
 
         return json.dumps(
             {
@@ -513,6 +557,11 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
         resolved_title = title.strip() or local_path.stem
         if not resolved_title:
             return _error("title cannot be empty")
+        try:
+            expected_slide_text = _extract_pptx_slide_text(local_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not inspect PPTX text before import: %s", exc)
+            return _error(f"Could not inspect PPTX text before import: {exc}")
 
         drive_service = get_drive_service()
         with local_path.open("rb") as file_handle:
@@ -557,6 +606,22 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
                     "link": link,
                     "slide_count": 0,
                     "empty_slide_numbers": [],
+                    "missing_text_slide_numbers": [],
+                },
+                ensure_ascii=False,
+            )
+        if len(expected_slide_text) != len(slides):
+            return json.dumps(
+                {
+                    "status": "validation_failed",
+                    "message": "Imported presentation slide count differs from the PPTX",
+                    "presentation_id": presentation_id,
+                    "title": presentation.get("title") or resolved_title,
+                    "link": link,
+                    "slide_count": len(slides),
+                    "expected_slide_count": len(expected_slide_text),
+                    "empty_slide_numbers": [],
+                    "missing_text_slide_numbers": [],
                 },
                 ensure_ascii=False,
             )
@@ -565,16 +630,28 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
             for index, slide in enumerate(slides)
             if _slide_is_empty(slide)
         ]
-        if empty_slide_numbers:
+        actual_slide_text = [
+            _normalize_comparison_text(" ".join(_slide_summary(slide, index)["text"]))
+            for index, slide in enumerate(slides)
+        ]
+        missing_text_slide_numbers = [
+            index + 1
+            for index, expected_text in enumerate(expected_slide_text)
+            if expected_text and expected_text not in actual_slide_text[index]
+        ]
+        if empty_slide_numbers or missing_text_slide_numbers:
             return json.dumps(
                 {
                     "status": "validation_failed",
-                    "message": "Imported presentation contains empty slides",
+                    "message": (
+                        "Imported presentation contains empty slides or missing text"
+                    ),
                     "presentation_id": presentation_id,
                     "title": presentation.get("title") or resolved_title,
                     "link": link,
                     "slide_count": len(slides),
                     "empty_slide_numbers": empty_slide_numbers,
+                    "missing_text_slide_numbers": missing_text_slide_numbers,
                 },
                 ensure_ascii=False,
             )
@@ -587,6 +664,7 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
                 "link": link,
                 "slide_count": len(slides),
                 "empty_slide_numbers": [],
+                "missing_text_slide_numbers": [],
             },
             ensure_ascii=False,
         )
@@ -601,6 +679,7 @@ def google_slides_add_slide(
     title: str = "",
     body: str = "",
     layout: _Layout = "TITLE_AND_BODY",
+    default_slide_id: str = "",
 ) -> str:
     """
     Append a slide with a title and body text to a Google Slides presentation.
@@ -641,6 +720,11 @@ def google_slides_add_slide(
     underlying batchUpdate call rather than a friendly one — use
     google_slides_batch_update directly for presentations with a
     non-standard theme.
+
+    When the presentation was created with google_slides_create_presentation,
+    pass its returned default_slide_id when this call may run in another MCP
+    process. Calls in the same process track that id automatically. An
+    unrelated intentional blank slide is never deleted without that id.
 
     To fix a slide this call already created (wrong/missing text), use
     google_slides_update_slide with its slide_id — do NOT call
@@ -714,14 +798,22 @@ def google_slides_add_slide(
         # atomic batch. This avoids relying on an undocumented zero-page
         # presentation state and keeps the requested slide count exact.
         existing = service.presentations().get(presentationId=pres_id).execute()
-        default_slide_id = None
+        requested_default_slide_id = default_slide_id.strip()
+        tracked_default_slide_id = _CREATED_DEFAULT_SLIDES.get(pres_id)
+        candidate_default_slide_id = (
+            requested_default_slide_id or tracked_default_slide_id
+        )
+        slide_to_remove = None
         existing_slides = existing.get("slides", [])
-        if len(existing_slides) == 1 and _slide_is_empty(existing_slides[0]):
-            default_slide_id = existing_slides[0].get("objectId")
-            if not default_slide_id:
-                raise ValueError(
-                    "Google Slides returned an empty slide without an object_id"
-                )
+        if candidate_default_slide_id and len(existing_slides) == 1:
+            existing_slide = existing_slides[0]
+            if existing_slide.get("objectId") == candidate_default_slide_id:
+                if _slide_is_empty(existing_slide):
+                    slide_to_remove = candidate_default_slide_id
+                elif tracked_default_slide_id == candidate_default_slide_id:
+                    # The caller used the page before asking us to append a
+                    # slide, so it is no longer the untouched default page.
+                    _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
 
         slide_id = f"slide_{uuid.uuid4().hex[:12]}"
         title_id = f"{slide_id}_title"
@@ -757,12 +849,14 @@ def google_slides_add_slide(
             )
         if body.strip():
             requests.extend(_body_insert_requests(body_id, body, is_bulleted))
-        if default_slide_id:
-            requests.append({"deleteObject": {"objectId": default_slide_id}})
+        if slide_to_remove:
+            requests.append({"deleteObject": {"objectId": slide_to_remove}})
 
         service.presentations().batchUpdate(
             presentationId=pres_id, body={"requests": requests}
         ).execute()
+        if slide_to_remove and _CREATED_DEFAULT_SLIDES.get(pres_id) == slide_to_remove:
+            _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
 
         return json.dumps(
             {
@@ -770,7 +864,7 @@ def google_slides_add_slide(
                 "presentation_id": pres_id,
                 "slide_id": slide_id,
                 "layout": normalized_layout,
-                "default_slide_removed": bool(default_slide_id),
+                "default_slide_removed": bool(slide_to_remove),
             },
             ensure_ascii=False,
         )

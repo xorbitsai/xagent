@@ -22,6 +22,8 @@ creation step, not the final delivery step:
 1. Generate and inspect the designed local PPTX in the workspace.
 2. Call `google_slides_import_pptx` with that PPTX path to convert it into an
    editable native Google Slides presentation.
+   Treat `validation_failed` as a failed delivery; it means the conversion
+   changed the slide count, dropped text, or left a blank slide.
 3. Call `google_slides_get_presentation` to verify slide count and text before
    returning the Google Slides link.
 

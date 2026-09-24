@@ -25,7 +25,8 @@ and a 1-line layout summary.
 
 When the requested deliverable is Google Slides, import the validated PPTX with
 `google_slides_import_pptx` and then verify it with
-`google_slides_get_presentation`. Do not use the native Google Slides
+`google_slides_get_presentation`. If the import returns `validation_failed`,
+repair the PPTX instead of delivering the link. Do not use the native Google Slides
 title/body placeholder tools to create a new designed deck.
 
 ## ⚠️ Hard rules — NO exceptions

@@ -16,7 +16,6 @@ from googleapiclient.http import (  # type: ignore[import-not-found]
     MediaIoBaseDownload,
     MediaIoBaseUpload,
 )
-
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
@@ -386,7 +385,9 @@ def _extract_resource_key(file_id: str) -> str | None:
     return candidate
 
 
-def _attach_resource_keys(request: Any, resource_keys: list[tuple[str, str | None]]) -> Any:
+def _attach_resource_keys(
+    request: Any, resource_keys: list[tuple[str, str | None]]
+) -> Any:
     """Attach one or more Drive resource keys to an unexecuted request.
 
     Most connector calls address one link-shared object, but a move request
@@ -1147,7 +1148,9 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
             # as a text format by the _is_text_mime_type check above).
             export_mime_type = mime_type
             if mime_type == "text/plain":
-                export_mime_type = _TEXT_PLAIN_EXPORT_FALLBACK.get(file_mime_type, mime_type)
+                export_mime_type = _TEXT_PLAIN_EXPORT_FALLBACK.get(
+                    file_mime_type, mime_type
+                )
             request = service.files().export_media(
                 fileId=resolved_file_id, mimeType=export_mime_type
             )
@@ -1181,7 +1184,9 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
                     },
                     ensure_ascii=False,
                 )
-            request = service.files().get_media(fileId=resolved_file_id, supportsAllDrives=True)
+            request = service.files().get_media(
+                fileId=resolved_file_id, supportsAllDrives=True
+            )
         _attach_resource_key(request, resolved_file_id, resource_key)
 
         raw_bytes = _download_media(request)
@@ -1209,7 +1214,9 @@ def google_drive_get_file_content(file_id: str, mime_type: str = "text/plain") -
 
 
 @mcp.tool()
-def google_drive_download_file(file_id: str, mime_type: str = "", filename: str = "") -> str:
+def google_drive_download_file(
+    file_id: str, mime_type: str = "", filename: str = ""
+) -> str:
     """
     Download or export a Google Drive file to a real file in the task
     workspace, returning its path — use this for any binary content (PDF,
@@ -1256,10 +1263,14 @@ def google_drive_download_file(file_id: str, mime_type: str = "", filename: str 
                     },
                     ensure_ascii=False,
                 )
-            request = service.files().export_media(fileId=resolved_file_id, mimeType=mime_type)
+            request = service.files().export_media(
+                fileId=resolved_file_id, mimeType=mime_type
+            )
             extension = mimetypes.guess_extension(mime_type) or ""
         else:
-            request = service.files().get_media(fileId=resolved_file_id, supportsAllDrives=True)
+            request = service.files().get_media(
+                fileId=resolved_file_id, supportsAllDrives=True
+            )
             extension = ""
         _attach_resource_key(request, resolved_file_id, resource_key)
 
@@ -1341,7 +1352,9 @@ def google_drive_upload_file(
             "name": resolved_name,
             "mimeType": resolved_mime_type,
         }
-        resolved_parent_id, parent_resource_key = _apply_parent_id(file_metadata, parent_id)
+        resolved_parent_id, parent_resource_key = _apply_parent_id(
+            file_metadata, parent_id
+        )
 
         service = get_drive_service()
 
@@ -1388,7 +1401,9 @@ def google_drive_upload_file(
                 fields="id, name, webViewLink, mimeType",
             )
             if resolved_parent_id is not None:
-                _attach_resource_key(create_request, resolved_parent_id, parent_resource_key)
+                _attach_resource_key(
+                    create_request, resolved_parent_id, parent_resource_key
+                )
             file = create_request.execute()
 
         return json.dumps({"status": "success", "file": file}, ensure_ascii=False)
@@ -1514,10 +1529,14 @@ def google_drive_create_file(
                     "google_drive_upload_file with that file's path "
                     "instead."
                 )
-            return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+            return json.dumps(
+                {"status": "error", "message": message}, ensure_ascii=False
+            )
 
         file_metadata: dict[str, Any] = {"name": name, "mimeType": mime_type}
-        resolved_parent_id, parent_resource_key = _apply_parent_id(file_metadata, parent_id)
+        resolved_parent_id, parent_resource_key = _apply_parent_id(
+            file_metadata, parent_id
+        )
 
         service = get_drive_service()
         fh = io.BytesIO(content.encode("utf-8"))
@@ -1533,7 +1552,9 @@ def google_drive_create_file(
             fields="id, name, webViewLink, mimeType",
         )
         if resolved_parent_id is not None:
-            _attach_resource_key(create_request, resolved_parent_id, parent_resource_key)
+            _attach_resource_key(
+                create_request, resolved_parent_id, parent_resource_key
+            )
         file = create_request.execute()
 
         return json.dumps({"status": "success", "file": file}, ensure_ascii=False)
@@ -1552,7 +1573,9 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
             "name": name,
             "mimeType": "application/vnd.google-apps.folder",
         }
-        resolved_parent_id, parent_resource_key = _apply_parent_id(file_metadata, parent_id)
+        resolved_parent_id, parent_resource_key = _apply_parent_id(
+            file_metadata, parent_id
+        )
 
         service = get_drive_service()
         create_request = service.files().create(
@@ -1561,7 +1584,9 @@ def google_drive_create_folder(name: str, parent_id: str | None = None) -> str:
             fields="id, name, webViewLink, mimeType",
         )
         if resolved_parent_id is not None:
-            _attach_resource_key(create_request, resolved_parent_id, parent_resource_key)
+            _attach_resource_key(
+                create_request, resolved_parent_id, parent_resource_key
+            )
         folder = create_request.execute()
 
         return json.dumps({"status": "success", "folder": folder}, ensure_ascii=False)
@@ -1590,7 +1615,9 @@ def google_drive_rename_file(file_id: str, new_name: str) -> str:
         _attach_resource_key(update_request, resolved_file_id, resource_key)
         updated_file = update_request.execute()
 
-        return json.dumps({"status": "success", "file": updated_file}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "success", "file": updated_file}, ensure_ascii=False
+        )
     except Exception as e:
         logger.error(f"Error renaming file: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -1613,7 +1640,9 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
-        resolved_destination_id = _resolve_file_id(destination_folder_id, "destination_folder_id")
+        resolved_destination_id = _resolve_file_id(
+            destination_folder_id, "destination_folder_id"
+        )
         source_resource_key = _extract_resource_key(file_id)
         destination_resource_key = _extract_resource_key(destination_folder_id)
 
@@ -1630,7 +1659,7 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
         source_get = service.files().get(
             fileId=resolved_file_id,
             supportsAllDrives=True,
-            fields="id,name,mimeType,parents,driveId,trashed",
+            fields="id,name,webViewLink,mimeType,parents,driveId,trashed",
         )
         _attach_resource_keys(source_get, [(resolved_file_id, source_resource_key)])
         source = source_get.execute()
@@ -1653,9 +1682,11 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
         if source.get("trashed"):
             raise ValueError("file_id refers to a trashed file or folder")
 
-        current_parents = [
-            parent for parent in source.get("parents", []) if isinstance(parent, str)
-        ]
+        current_parents = source.get("parents", [])
+        if not isinstance(current_parents, list) or not all(
+            isinstance(parent, str) for parent in current_parents
+        ):
+            raise ValueError("Drive returned an invalid parents list for file_id")
         if resolved_destination_id in current_parents:
             return json.dumps(
                 {
@@ -1686,25 +1717,23 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
             ],
         )
         updated_file = update_request.execute()
-
-        verify_get = service.files().get(
-            fileId=resolved_file_id,
-            supportsAllDrives=True,
-            fields="id,name,mimeType,parents,driveId,webViewLink",
-        )
-        _attach_resource_keys(verify_get, [(resolved_file_id, source_resource_key)])
-        verified_file = verify_get.execute()
-        verified_parents = verified_file.get("parents", [])
-        if resolved_destination_id not in verified_parents:
+        if not isinstance(updated_file, dict):
+            raise RuntimeError("Drive move returned an invalid file response")
+        updated_parents = updated_file.get("parents", [])
+        if not isinstance(updated_parents, list) or not all(
+            isinstance(parent, str) for parent in updated_parents
+        ):
+            raise RuntimeError("Drive move returned an invalid parents list")
+        if resolved_destination_id not in updated_parents:
             raise RuntimeError(
                 "Drive move returned successfully, but the destination folder "
-                "was not present when the result was verified"
+                "was not present in the response"
             )
 
         return json.dumps(
             {
                 "status": "success",
-                "file": verified_file or updated_file,
+                "file": updated_file,
                 "destination_folder_id": resolved_destination_id,
                 "already_in_destination": False,
             },
@@ -1763,7 +1792,9 @@ def _execute_ignoring_204_ssl_eof(
     except Exception as e:
         if "UNEXPECTED_EOF_WHILE_READING" not in str(e):
             raise
-        logger.warning(f"Ignored SSL EOF error (often caused by proxy on 204 response): {e}")
+        logger.warning(
+            f"Ignored SSL EOF error (often caused by proxy on 204 response): {e}"
+        )
         try:
             verify_done()
         except Exception as verify_err:
@@ -1791,12 +1822,20 @@ def google_drive_delete_file(file_id: str) -> str:
         service = get_drive_service()
 
         def _delete() -> Any:
-            request = service.files().delete(fileId=resolved_file_id, supportsAllDrives=True)
-            return _attach_resource_key(request, resolved_file_id, resource_key).execute()
+            request = service.files().delete(
+                fileId=resolved_file_id, supportsAllDrives=True
+            )
+            return _attach_resource_key(
+                request, resolved_file_id, resource_key
+            ).execute()
 
         def _verify_deleted() -> Any:
-            request = service.files().get(fileId=resolved_file_id, supportsAllDrives=True)
-            return _attach_resource_key(request, resolved_file_id, resource_key).execute()
+            request = service.files().get(
+                fileId=resolved_file_id, supportsAllDrives=True
+            )
+            return _attach_resource_key(
+                request, resolved_file_id, resource_key
+            ).execute()
 
         _execute_ignoring_204_ssl_eof(_delete, _verify_deleted)
 
@@ -1890,7 +1929,9 @@ def google_drive_list_permissions(file_id: str, page_token: str | None = None) -
             # the true, smaller size and leave truncated=False, silently
             # under-reporting collaborators while claiming a complete
             # result.
-            approx_length += sum(len(json.dumps(p, ensure_ascii=False)) for p in new_permissions)
+            approx_length += sum(
+                len(json.dumps(p, ensure_ascii=False)) for p in new_permissions
+            )
             next_token = results.get("nextPageToken")
             current_page_token = next_token
             if not next_token:
@@ -1905,7 +1946,9 @@ def google_drive_list_permissions(file_id: str, page_token: str | None = None) -
         # signals "more data exists beyond what was fetched" without
         # needing a separate branch for the loop-safety-bound case.
 
-        return _capped_permissions_response(pages, current_page_token, max_output_length)
+        return _capped_permissions_response(
+            pages, current_page_token, max_output_length
+        )
     except Exception as e:
         logger.error(f"Error listing permissions: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -1968,7 +2011,9 @@ def google_drive_share_file(
         _attach_resource_key(create_request, resolved_file_id, resource_key)
         permission = create_request.execute()
 
-        return json.dumps({"status": "success", "permission": permission}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "success", "permission": permission}, ensure_ascii=False
+        )
     except Exception as e:
         logger.error(f"Error sharing file: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -2000,7 +2045,9 @@ def google_drive_update_permission(file_id: str, permission_id: str, role: str) 
         _attach_resource_key(update_request, resolved_file_id, resource_key)
         permission = update_request.execute()
 
-        return json.dumps({"status": "success", "permission": permission}, ensure_ascii=False)
+        return json.dumps(
+            {"status": "success", "permission": permission}, ensure_ascii=False
+        )
     except Exception as e:
         logger.error(f"Error updating permission: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
@@ -2025,7 +2072,9 @@ def google_drive_remove_permission(file_id: str, permission_id: str) -> str:
                 permissionId=resolved_permission_id,
                 supportsAllDrives=True,
             )
-            return _attach_resource_key(request, resolved_file_id, resource_key).execute()
+            return _attach_resource_key(
+                request, resolved_file_id, resource_key
+            ).execute()
 
         def _verify_deleted() -> Any:
             request = service.permissions().get(
@@ -2033,7 +2082,9 @@ def google_drive_remove_permission(file_id: str, permission_id: str) -> str:
                 permissionId=resolved_permission_id,
                 supportsAllDrives=True,
             )
-            return _attach_resource_key(request, resolved_file_id, resource_key).execute()
+            return _attach_resource_key(
+                request, resolved_file_id, resource_key
+            ).execute()
 
         _execute_ignoring_204_ssl_eof(_delete, _verify_deleted)
 

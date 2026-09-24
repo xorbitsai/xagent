@@ -224,7 +224,10 @@ def test_resolve_file_id_does_not_mistake_published_link_e_segment_for_id(url):
 def test_resolve_file_id_still_matches_a_real_id_starting_with_e():
     """The "/d/e/" exclusion for published links must be specific to that
     literal segment, not reject any id that happens to start with "e"."""
-    assert google_drive._resolve_file_id("https://drive.google.com/file/d/e5f6g7/view") == "e5f6g7"
+    assert (
+        google_drive._resolve_file_id("https://drive.google.com/file/d/e5f6g7/view")
+        == "e5f6g7"
+    )
 
 
 @pytest.mark.parametrize(
@@ -261,7 +264,9 @@ def test_resolve_file_id_rejects_malformed_path_segment_instead_of_truncating(ur
         ("drive.google.com/file/d/ABCID123//view", "ABCID123"),
     ],
 )
-def test_resolve_file_id_handles_scheme_less_urls_containing_another_scheme(url, expected):
+def test_resolve_file_id_handles_scheme_less_urls_containing_another_scheme(
+    url, expected
+):
     assert google_drive._resolve_file_id(url) == expected
 
 
@@ -494,9 +499,15 @@ def _stub_happy_path(service):
     others behave."""
     service.files.return_value.delete.return_value.execute.return_value = {}
     service.files.return_value.get.return_value.execute.return_value = {}
-    service.permissions.return_value.list.return_value.execute.return_value = {"permissions": []}
-    service.permissions.return_value.create.return_value.execute.return_value = {"id": "perm1"}
-    service.permissions.return_value.update.return_value.execute.return_value = {"id": "perm1"}
+    service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": []
+    }
+    service.permissions.return_value.create.return_value.execute.return_value = {
+        "id": "perm1"
+    }
+    service.permissions.return_value.update.return_value.execute.return_value = {
+        "id": "perm1"
+    }
     service.permissions.return_value.delete.return_value.execute.return_value = {}
     service.permissions.return_value.get.return_value.execute.return_value = {}
 
@@ -518,7 +529,9 @@ def _stub_happy_path(service):
         ),
         (
             lambda s: s.permissions.return_value.update,
-            lambda fid: google_drive.google_drive_update_permission(fid, "perm1", "reader"),
+            lambda fid: google_drive.google_drive_update_permission(
+                fid, "perm1", "reader"
+            ),
         ),
         (
             lambda s: s.permissions.return_value.delete,
@@ -572,8 +585,13 @@ def test_search_caps_oversized_output(monkeypatch):
     # override could otherwise make this flaky in either direction.
     monkeypatch.setattr(google_drive, "get_tool_max_output_length", lambda: 3000)
     service = _mock_drive_service(monkeypatch)
-    huge_files = [{"id": f"f{i}", "name": "x" * 200, "mimeType": "text/plain"} for i in range(2000)]
-    service.files.return_value.list.return_value.execute.return_value = {"files": huge_files}
+    huge_files = [
+        {"id": f"f{i}", "name": "x" * 200, "mimeType": "text/plain"}
+        for i in range(2000)
+    ]
+    service.files.return_value.list.return_value.execute.return_value = {
+        "files": huge_files
+    }
 
     result = json.loads(google_drive.google_drive_search("x"))
 
@@ -603,7 +621,9 @@ def test_search_validates_max_results_before_building_service(monkeypatch):
     get_service = Mock()
     monkeypatch.setattr(google_drive, "get_drive_service", get_service)
 
-    result = json.loads(google_drive.google_drive_search("x", max_results="not-a-number"))
+    result = json.loads(
+        google_drive.google_drive_search("x", max_results="not-a-number")
+    )
 
     assert result["status"] == "error"
     get_service.assert_not_called()
@@ -617,7 +637,9 @@ def test_create_file_resolves_parent_id_url_and_supports_shared_drives(monkeypat
     }
 
     result = json.loads(
-        google_drive.google_drive_create_file("notes.txt", "hello", parent_id=_FOLDER_URL_WITH_ID)
+        google_drive.google_drive_create_file(
+            "notes.txt", "hello", parent_id=_FOLDER_URL_WITH_ID
+        )
     )
 
     assert result["status"] == "success"
@@ -634,7 +656,9 @@ def test_create_folder_resolves_parent_id_url_and_supports_shared_drives(monkeyp
     }
 
     result = json.loads(
-        google_drive.google_drive_create_folder("Subfolder", parent_id=_FOLDER_URL_WITH_ID)
+        google_drive.google_drive_create_folder(
+            "Subfolder", parent_id=_FOLDER_URL_WITH_ID
+        )
     )
 
     assert result["status"] == "success"
@@ -689,7 +713,9 @@ def test_create_file_validates_parent_id_before_building_service(monkeypatch):
     get_service = Mock()
     monkeypatch.setattr(google_drive, "get_drive_service", get_service)
 
-    result = json.loads(google_drive.google_drive_create_file("notes.txt", "hello", parent_id=123))
+    result = json.loads(
+        google_drive.google_drive_create_file("notes.txt", "hello", parent_id=123)
+    )
 
     assert result["status"] == "error"
     assert "parent_id must be a string" in result["message"]
@@ -700,7 +726,9 @@ def test_create_folder_validates_parent_id_before_building_service(monkeypatch):
     get_service = Mock()
     monkeypatch.setattr(google_drive, "get_drive_service", get_service)
 
-    result = json.loads(google_drive.google_drive_create_folder("Subfolder", parent_id=123))
+    result = json.loads(
+        google_drive.google_drive_create_folder("Subfolder", parent_id=123)
+    )
 
     assert result["status"] == "error"
     assert "parent_id must be a string" in result["message"]
@@ -886,11 +914,18 @@ def test_get_file_content_defaults_spreadsheet_export_to_csv(monkeypatch):
     result = json.loads(google_drive.google_drive_get_file_content("sheet1"))
 
     assert result["status"] == "success"
-    assert service.files.return_value.export_media.call_args.kwargs["mimeType"] == "text/csv"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "text/csv"
+    )
 
 
-@pytest.mark.parametrize("mime_type", ["TEXT/PLAIN", "text/plain; charset=utf-8", "  text/plain  "])
-def test_get_file_content_normalizes_mime_type_before_detecting_the_default(monkeypatch, mime_type):
+@pytest.mark.parametrize(
+    "mime_type", ["TEXT/PLAIN", "text/plain; charset=utf-8", "  text/plain  "]
+)
+def test_get_file_content_normalizes_mime_type_before_detecting_the_default(
+    monkeypatch, mime_type
+):
     """Regression guard: the "did the caller leave mime_type at its
     text/plain default" check must compare against the *normalized* value
     -- a case variant or one with a trailing ";charset=..." passes the
@@ -918,7 +953,10 @@ def test_get_file_content_normalizes_mime_type_before_detecting_the_default(monk
     result = json.loads(google_drive.google_drive_get_file_content("sheet1", mime_type))
 
     assert result["status"] == "success"
-    assert service.files.return_value.export_media.call_args.kwargs["mimeType"] == "text/csv"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "text/csv"
+    )
 
 
 def test_get_file_content_google_apps_detection_requires_the_real_prefix(monkeypatch):
@@ -980,12 +1018,15 @@ def test_get_file_content_respects_explicit_mime_type_for_spreadsheet(monkeypatc
     monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
 
     result = json.loads(
-        google_drive.google_drive_get_file_content("sheet1", mime_type="application/json")
+        google_drive.google_drive_get_file_content(
+            "sheet1", mime_type="application/json"
+        )
     )
 
     assert result["status"] == "success"
     assert (
-        service.files.return_value.export_media.call_args.kwargs["mimeType"] == "application/json"
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "application/json"
     )
 
 
@@ -1015,7 +1056,10 @@ def test_get_file_content_defaults_drawing_export_to_svg(monkeypatch):
     result = json.loads(google_drive.google_drive_get_file_content("drawing1"))
 
     assert result["status"] == "success"
-    assert service.files.return_value.export_media.call_args.kwargs["mimeType"] == "image/svg+xml"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "image/svg+xml"
+    )
 
 
 def test_get_file_content_respects_explicit_mime_type_for_drawing(monkeypatch):
@@ -1042,12 +1086,15 @@ def test_get_file_content_respects_explicit_mime_type_for_drawing(monkeypatch):
     monkeypatch.setattr(google_drive, "MediaIoBaseDownload", _FakeDownloader)
 
     result = json.loads(
-        google_drive.google_drive_get_file_content("drawing1", mime_type="application/json")
+        google_drive.google_drive_get_file_content(
+            "drawing1", mime_type="application/json"
+        )
     )
 
     assert result["status"] == "success"
     assert (
-        service.files.return_value.export_media.call_args.kwargs["mimeType"] == "application/json"
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "application/json"
     )
 
 
@@ -1106,7 +1153,10 @@ def test_get_file_content_keeps_text_plain_default_for_docs(monkeypatch):
     result = json.loads(google_drive.google_drive_get_file_content("doc1"))
 
     assert result["status"] == "success"
-    assert service.files.return_value.export_media.call_args.kwargs["mimeType"] == "text/plain"
+    assert (
+        service.files.return_value.export_media.call_args.kwargs["mimeType"]
+        == "text/plain"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1217,7 +1267,9 @@ def test_rename_file_resolves_full_drive_url(monkeypatch):
         "name": "renamed",
     }
 
-    result = json.loads(google_drive.google_drive_rename_file(_FOLDER_URL_WITH_ID, "renamed"))
+    result = json.loads(
+        google_drive.google_drive_rename_file(_FOLDER_URL_WITH_ID, "renamed")
+    )
 
     assert result["status"] == "success"
     kwargs = service.files.return_value.update.call_args.kwargs
@@ -1237,7 +1289,7 @@ def test_rename_file_attaches_resource_key_header(monkeypatch):
     assert update_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
 
 
-def test_move_file_updates_parents_and_verifies_destination(monkeypatch):
+def test_move_file_updates_parents(monkeypatch):
     class _Request:
         def __init__(self, response):
             self.headers = {}
@@ -1253,6 +1305,7 @@ def test_move_file_updates_parents_and_verifies_destination(monkeypatch):
                     {
                         "id": "file1",
                         "name": "deck",
+                        "webViewLink": "https://drive.google.com/file/d/file1/view",
                         "mimeType": "application/vnd.google-apps.presentation",
                         "parents": ["root"],
                         "trashed": False,
@@ -1264,14 +1317,6 @@ def test_move_file_updates_parents_and_verifies_destination(monkeypatch):
                         "name": "Testing Files",
                         "mimeType": "application/vnd.google-apps.folder",
                         "trashed": False,
-                    }
-                ),
-                _Request(
-                    {
-                        "id": "file1",
-                        "name": "deck",
-                        "mimeType": "application/vnd.google-apps.presentation",
-                        "parents": ["folder1"],
                     }
                 ),
             ]
@@ -1306,6 +1351,37 @@ def test_move_file_updates_parents_and_verifies_destination(monkeypatch):
     assert files.update_request.kwargs["addParents"] == "folder1"
     assert files.update_request.kwargs["removeParents"] == "root"
     assert files.update_request.kwargs["supportsAllDrives"] is True
+    assert files.get_requests == []
+    assert "webViewLink" in files.update_request.kwargs["fields"]
+
+
+@pytest.mark.parametrize("invalid_parents", [None, "root", ["root", 1]])
+def test_move_file_rejects_invalid_source_parents(monkeypatch, invalid_parents):
+    service = _mock_drive_service(monkeypatch)
+    source_request = service.files.return_value.get.return_value
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": invalid_parents,
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "folder1",
+        "name": "Testing Files",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "folder1"))
+
+    assert result["status"] == "error"
+    assert "parents" in result["message"]
+    service.files.return_value.update.assert_not_called()
 
 
 def test_move_file_is_idempotent_when_already_in_destination(monkeypatch):
@@ -1377,7 +1453,10 @@ def test_list_permissions_returns_permissions(monkeypatch):
     assert result["status"] == "success"
     assert result["permissions"][0]["id"] == "perm1"
     assert result["truncated"] is False
-    assert service.permissions.return_value.list.call_args.kwargs["supportsAllDrives"] is True
+    assert (
+        service.permissions.return_value.list.call_args.kwargs["supportsAllDrives"]
+        is True
+    )
 
 
 def test_list_permissions_requests_permission_details_field(monkeypatch):
@@ -1387,7 +1466,9 @@ def test_list_permissions_requests_permission_details_field(monkeypatch):
     Drive item, but the field must always be requested to expose it when
     it's there."""
     service = _mock_drive_service(monkeypatch)
-    service.permissions.return_value.list.return_value.execute.return_value = {"permissions": []}
+    service.permissions.return_value.list.return_value.execute.return_value = {
+        "permissions": []
+    }
 
     google_drive.google_drive_list_permissions("fid")
 
@@ -1404,7 +1485,10 @@ def test_list_permissions_accepts_a_caller_supplied_page_token(monkeypatch):
 
     google_drive.google_drive_list_permissions("fid", page_token="resume-here")
 
-    assert service.permissions.return_value.list.call_args.kwargs["pageToken"] == "resume-here"
+    assert (
+        service.permissions.return_value.list.call_args.kwargs["pageToken"]
+        == "resume-here"
+    )
 
 
 def test_list_permissions_returns_next_page_token_when_stopped_early(monkeypatch):
@@ -1661,8 +1745,8 @@ def test_list_permissions_defaults_missing_key(monkeypatch):
 
 def test_list_permissions_returns_error_payload_on_failure(monkeypatch):
     service = _mock_drive_service(monkeypatch)
-    service.permissions.return_value.list.return_value.execute.side_effect = RuntimeError(
-        "not found"
+    service.permissions.return_value.list.return_value.execute.side_effect = (
+        RuntimeError("not found")
     )
 
     result = json.loads(google_drive.google_drive_list_permissions("fid"))
@@ -1724,11 +1808,15 @@ def test_share_file_grants_role_to_group(monkeypatch):
 
 
 @pytest.mark.parametrize("bad_entity_type", ["domain", "anyone", ""])
-def test_share_file_rejects_entity_type_outside_user_or_group(monkeypatch, bad_entity_type):
+def test_share_file_rejects_entity_type_outside_user_or_group(
+    monkeypatch, bad_entity_type
+):
     service = _mock_drive_service(monkeypatch)
 
     result = json.loads(
-        google_drive.google_drive_share_file("fid", "a@x.com", entity_type=bad_entity_type)
+        google_drive.google_drive_share_file(
+            "fid", "a@x.com", entity_type=bad_entity_type
+        )
     )
 
     assert result["status"] == "error"
@@ -1792,7 +1880,9 @@ def test_share_file_rejects_role_outside_the_share_roles(monkeypatch, bad_role):
     model's behalf."""
     service = _mock_drive_service(monkeypatch)
 
-    result = json.loads(google_drive.google_drive_share_file("fid", "a@x.com", role=bad_role))
+    result = json.loads(
+        google_drive.google_drive_share_file("fid", "a@x.com", role=bad_role)
+    )
 
     assert result["status"] == "error"
     assert "role" in result["message"]
@@ -1817,8 +1907,8 @@ def test_share_file_rejects_invalid_email(monkeypatch, bad_email):
 
 def test_share_file_returns_error_payload_on_failure(monkeypatch):
     service = _mock_drive_service(monkeypatch)
-    service.permissions.return_value.create.return_value.execute.side_effect = RuntimeError(
-        "insufficientFilePermissions"
+    service.permissions.return_value.create.return_value.execute.side_effect = (
+        RuntimeError("insufficientFilePermissions")
     )
 
     result = json.loads(google_drive.google_drive_share_file("fid", "a@x.com"))
@@ -1834,7 +1924,9 @@ def test_update_permission_changes_role(monkeypatch):
         "role": "writer",
     }
 
-    result = json.loads(google_drive.google_drive_update_permission("fid", "perm1", "writer"))
+    result = json.loads(
+        google_drive.google_drive_update_permission("fid", "perm1", "writer")
+    )
 
     assert result["status"] == "success"
     kwargs = service.permissions.return_value.update.call_args.kwargs
@@ -1856,7 +1948,9 @@ def test_update_permission_attaches_resource_key_header(monkeypatch):
 
 
 @pytest.mark.parametrize("bad_permission_id", ["..", "../other", "perm/../file"])
-def test_update_permission_rejects_dot_segment_permission_id(monkeypatch, bad_permission_id):
+def test_update_permission_rejects_dot_segment_permission_id(
+    monkeypatch, bad_permission_id
+):
     """permission_id never goes through URL resolution, but googleapiclient
     does not percent-encode "." before interpolating it into the request
     path -- an unvalidated dot-segment id can be collapsed by normalization
@@ -1875,10 +1969,14 @@ def test_update_permission_rejects_dot_segment_permission_id(monkeypatch, bad_pe
 
 
 @pytest.mark.parametrize("bad_permission_id", ["..", "../other", "perm/../file"])
-def test_remove_permission_rejects_dot_segment_permission_id(monkeypatch, bad_permission_id):
+def test_remove_permission_rejects_dot_segment_permission_id(
+    monkeypatch, bad_permission_id
+):
     service = _mock_drive_service(monkeypatch)
 
-    result = json.loads(google_drive.google_drive_remove_permission("fid", bad_permission_id))
+    result = json.loads(
+        google_drive.google_drive_remove_permission("fid", bad_permission_id)
+    )
 
     assert result["status"] == "error"
     assert "permission_id" in result["message"]
@@ -1889,7 +1987,9 @@ def test_remove_permission_rejects_dot_segment_permission_id(monkeypatch, bad_pe
 def test_update_permission_rejects_role_outside_the_share_roles(monkeypatch, bad_role):
     service = _mock_drive_service(monkeypatch)
 
-    result = json.loads(google_drive.google_drive_update_permission("fid", "perm1", bad_role))
+    result = json.loads(
+        google_drive.google_drive_update_permission("fid", "perm1", bad_role)
+    )
 
     assert result["status"] == "error"
     assert "role" in result["message"]
@@ -1898,11 +1998,13 @@ def test_update_permission_rejects_role_outside_the_share_roles(monkeypatch, bad
 
 def test_update_permission_returns_error_payload_on_failure(monkeypatch):
     service = _mock_drive_service(monkeypatch)
-    service.permissions.return_value.update.return_value.execute.side_effect = RuntimeError(
-        "permission not found"
+    service.permissions.return_value.update.return_value.execute.side_effect = (
+        RuntimeError("permission not found")
     )
 
-    result = json.loads(google_drive.google_drive_update_permission("fid", "perm1", "reader"))
+    result = json.loads(
+        google_drive.google_drive_update_permission("fid", "perm1", "reader")
+    )
 
     assert result["status"] == "error"
     assert "permission not found" in result["message"]
@@ -1933,8 +2035,8 @@ def test_remove_permission_attaches_resource_key_header(monkeypatch):
 
 def test_remove_permission_returns_error_payload_on_failure(monkeypatch):
     service = _mock_drive_service(monkeypatch)
-    service.permissions.return_value.delete.return_value.execute.side_effect = RuntimeError(
-        "permission not found"
+    service.permissions.return_value.delete.return_value.execute.side_effect = (
+        RuntimeError("permission not found")
     )
 
     result = json.loads(google_drive.google_drive_remove_permission("fid", "perm1"))
@@ -2034,7 +2136,9 @@ class TestExecuteIgnoring204SslEof:
         "404" (plausible in a proxy's wrapped error message) would make a
         genuine failure-to-delete look like a success."""
         execute = Mock(
-            side_effect=Exception("UNEXPECTED_EOF_WHILE_READING: upstream returned 404 not found")
+            side_effect=Exception(
+                "UNEXPECTED_EOF_WHILE_READING: upstream returned 404 not found"
+            )
         )
         verify_done = Mock(return_value=None)  # object is still there
 
@@ -2050,7 +2154,9 @@ def test_delete_file_tolerates_ssl_eof_on_204_response(monkeypatch):
     service.files.return_value.delete.return_value.execute.side_effect = Exception(
         "UNEXPECTED_EOF_WHILE_READING"
     )
-    service.files.return_value.get.return_value.execute.side_effect = Exception("404: not found")
+    service.files.return_value.get.return_value.execute.side_effect = Exception(
+        "404: not found"
+    )
 
     result = json.loads(google_drive.google_drive_delete_file("fid"))
 
@@ -2085,8 +2191,8 @@ def test_delete_file_attaches_resource_key_header(monkeypatch):
 
 def test_remove_permission_tolerates_ssl_eof_on_204_response(monkeypatch):
     service = _mock_drive_service(monkeypatch)
-    service.permissions.return_value.delete.return_value.execute.side_effect = Exception(
-        "UNEXPECTED_EOF_WHILE_READING"
+    service.permissions.return_value.delete.return_value.execute.side_effect = (
+        Exception("UNEXPECTED_EOF_WHILE_READING")
     )
     service.permissions.return_value.get.return_value.execute.side_effect = Exception(
         "404: not found"
@@ -2197,7 +2303,9 @@ def test_get_file_content_accepts_rtf(monkeypatch):
     _mock_drive_service_with_files(monkeypatch, files)
     _patch_downloader(monkeypatch, rb"{\rtf1 hello}")
 
-    result = json.loads(google_drive.google_drive_get_file_content("f1", "application/rtf"))
+    result = json.loads(
+        google_drive.google_drive_get_file_content("f1", "application/rtf")
+    )
 
     assert result["status"] == "success"
 
@@ -2257,7 +2365,9 @@ def test_download_file_writes_regular_binary_file(monkeypatch, tmp_path):
     files.export_media.assert_not_called()
 
 
-def test_download_file_google_apps_detection_requires_the_real_prefix(monkeypatch, tmp_path):
+def test_download_file_google_apps_detection_requires_the_real_prefix(
+    monkeypatch, tmp_path
+):
     """Regression guard: same class of bug as google_drive_create_file's
     own fix -- a crafted mimeType that merely *contains* the substring
     "application/vnd.google-apps" (e.g. from a file uploaded via
@@ -2280,7 +2390,9 @@ def test_download_file_google_apps_detection_requires_the_real_prefix(monkeypatc
     files.export_media.assert_not_called()
 
 
-def test_download_file_exports_workspace_doc_with_extension_appended(monkeypatch, tmp_path):
+def test_download_file_exports_workspace_doc_with_extension_appended(
+    monkeypatch, tmp_path
+):
     files = Mock()
     files.get.return_value.execute.return_value = {
         "id": "f1",
@@ -2290,7 +2402,9 @@ def test_download_file_exports_workspace_doc_with_extension_appended(monkeypatch
     _mock_drive_service_with_files(monkeypatch, files)
     _patch_downloader(monkeypatch, b"%PDF-1.4 fake pdf")
 
-    result = json.loads(google_drive.google_drive_download_file("f1", mime_type="application/pdf"))
+    result = json.loads(
+        google_drive.google_drive_download_file("f1", mime_type="application/pdf")
+    )
 
     assert result["status"] == "success"
     output_path = tmp_path / "output" / "Onboarding Deck.pdf"
@@ -2336,7 +2450,9 @@ def test_download_file_uses_explicit_filename(monkeypatch, tmp_path):
     assert result["path"] == str(tmp_path / "output" / "custom.pdf")
 
 
-def test_download_file_appends_extension_to_explicit_filename_missing_one(monkeypatch, tmp_path):
+def test_download_file_appends_extension_to_explicit_filename_missing_one(
+    monkeypatch, tmp_path
+):
     """Regression guard: an explicit filename with no extension must still
     get the export mime_type's extension appended, exactly like the
     default (Drive-name-derived) filename already does — the caller
@@ -2360,7 +2476,9 @@ def test_download_file_appends_extension_to_explicit_filename_missing_one(monkey
     assert result["path"] == str(tmp_path / "output" / "report.pdf")
 
 
-def test_download_file_does_not_double_extension_on_case_mismatch(monkeypatch, tmp_path):
+def test_download_file_does_not_double_extension_on_case_mismatch(
+    monkeypatch, tmp_path
+):
     """Regression guard: matching the target extension must be
     case-insensitive — a Drive name already ending in ".PDF" (any case)
     exported to "application/pdf" must not become "....PDF.pdf"."""
@@ -2373,7 +2491,9 @@ def test_download_file_does_not_double_extension_on_case_mismatch(monkeypatch, t
     _mock_drive_service_with_files(monkeypatch, files)
     _patch_downloader(monkeypatch, b"content")
 
-    result = json.loads(google_drive.google_drive_download_file("f1", mime_type="application/pdf"))
+    result = json.loads(
+        google_drive.google_drive_download_file("f1", mime_type="application/pdf")
+    )
 
     assert result["status"] == "success"
     assert result["path"] == str(tmp_path / "output" / "Report.PDF")
@@ -2421,7 +2541,9 @@ def test_download_file_sanitizes_unsafe_characters_in_filename(monkeypatch, tmp_
     assert output_path.name.endswith(".txt")
 
 
-def test_download_file_preserves_extension_for_degenerate_drive_name(monkeypatch, tmp_path):
+def test_download_file_preserves_extension_for_degenerate_drive_name(
+    monkeypatch, tmp_path
+):
     """Regression guard: sanitizing a degenerate name (all characters the
     allowlist/strip would remove) must happen *before* the export extension
     is appended — otherwise the trailing ".strip('._')" eats into the
@@ -2436,14 +2558,18 @@ def test_download_file_preserves_extension_for_degenerate_drive_name(monkeypatch
     _mock_drive_service_with_files(monkeypatch, files)
     _patch_downloader(monkeypatch, b"content")
 
-    result = json.loads(google_drive.google_drive_download_file("f1", mime_type="application/pdf"))
+    result = json.loads(
+        google_drive.google_drive_download_file("f1", mime_type="application/pdf")
+    )
 
     assert result["status"] == "success"
     output_path = Path(result["path"])
     assert output_path.name == "file.pdf"
 
 
-def test_download_file_preserves_extension_for_non_ascii_drive_name(monkeypatch, tmp_path):
+def test_download_file_preserves_extension_for_non_ascii_drive_name(
+    monkeypatch, tmp_path
+):
     """Regression guard: a name whose entire stem is non-ASCII (e.g. CJK)
     sanitizes down to nothing on its own, but the extension must survive —
     this is the regular-file (get_media) branch, which has no separate
@@ -2487,7 +2613,9 @@ def test_download_file_preserves_extension_only_drive_name(monkeypatch, tmp_path
     assert output_path.name == "file.pdf"
 
 
-def test_download_file_sanitizes_path_traversal_in_explicit_filename(monkeypatch, tmp_path):
+def test_download_file_sanitizes_path_traversal_in_explicit_filename(
+    monkeypatch, tmp_path
+):
     """Regression guard: only the Drive-reported name was tested for
     traversal/unsafe-character sanitization elsewhere — an explicit
     `filename` argument goes through the exact same _safe_output_filename
@@ -2501,7 +2629,9 @@ def test_download_file_sanitizes_path_traversal_in_explicit_filename(monkeypatch
     _mock_drive_service_with_files(monkeypatch, files)
     _patch_downloader(monkeypatch, b"content")
 
-    result = json.loads(google_drive.google_drive_download_file("f1", filename="../../etc/passwd"))
+    result = json.loads(
+        google_drive.google_drive_download_file("f1", filename="../../etc/passwd")
+    )
 
     assert result["status"] == "success"
     output_path = Path(result["path"])
@@ -2553,7 +2683,9 @@ def test_download_file_truncates_overlong_suffix_too(monkeypatch, tmp_path):
     assert len(output_path.name) <= 30
 
 
-def test_download_file_errors_when_no_task_workspace_is_configured(monkeypatch, tmp_path):
+def test_download_file_errors_when_no_task_workspace_is_configured(
+    monkeypatch, tmp_path
+):
     """Regression guard: an unset output-dir env var must fail loudly
     rather than silently writing into whatever directory the MCP
     subprocess happens to have as its cwd."""
@@ -2674,14 +2806,20 @@ def test_resolve_upload_file_path_does_not_leak_host_path_or_existence(
     assert str(tmp_path) not in str(exc_info.value)
 
 
-def test_resolve_upload_file_path_rejects_dot_dot_traversal(tmp_path, _upload_allowed_dirs_env):
+def test_resolve_upload_file_path_rejects_dot_dot_traversal(
+    tmp_path, _upload_allowed_dirs_env
+):
     (tmp_path / "secret.txt").write_text("secret")
 
     with pytest.raises(PermissionError, match="allowed directories"):
-        google_drive._resolve_upload_file_path(str(_upload_allowed_dirs_env / ".." / "secret.txt"))
+        google_drive._resolve_upload_file_path(
+            str(_upload_allowed_dirs_env / ".." / "secret.txt")
+        )
 
 
-def test_resolve_upload_file_path_rejects_prefix_confusable_sibling_dir(tmp_path, monkeypatch):
+def test_resolve_upload_file_path_rejects_prefix_confusable_sibling_dir(
+    tmp_path, monkeypatch
+):
     """Regression guard: an allowed dir "ws" must not accidentally admit a
     sibling "ws_evil" just because it starts with the same string —
     containment has to be a real path-relative check (is_relative_to), not
@@ -2736,7 +2874,9 @@ def test_resolve_upload_file_path_rejects_missing_file_inside_allowed_dir(
     _upload_allowed_dirs_env,
 ):
     with pytest.raises(FileNotFoundError, match="report.pdf"):
-        google_drive._resolve_upload_file_path(str(_upload_allowed_dirs_env / "report.pdf"))
+        google_drive._resolve_upload_file_path(
+            str(_upload_allowed_dirs_env / "report.pdf")
+        )
 
 
 def test_upload_file_tool_rejects_file_outside_allowlist_via_symlink(
@@ -2760,7 +2900,9 @@ def test_upload_file_tool_rejects_file_outside_allowlist_via_symlink(
     assert "allowed directories" in result["message"]
 
 
-def test_upload_file_tool_falls_back_to_cwd_when_allowlist_env_unset(monkeypatch, tmp_path):
+def test_upload_file_tool_falls_back_to_cwd_when_allowlist_env_unset(
+    monkeypatch, tmp_path
+):
     """Minor #6 regression guard: with XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS
     unset, the tool must still work for a file inside the process's own
     cwd (the documented fail-open default), rather than erroring."""
@@ -2819,7 +2961,9 @@ def test_upload_file_sends_real_binary_content(monkeypatch, _upload_allowed_dirs
     assert media.size() == len(b"%PDF-1.4 fake pdf bytes")
 
 
-def test_upload_file_accepts_explicit_name_and_mime_type(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_accepts_explicit_name_and_mime_type(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "data.bin"
     local_file.write_bytes(b"\x00\x01\x02")
 
@@ -2839,7 +2983,9 @@ def test_upload_file_accepts_explicit_name_and_mime_type(monkeypatch, _upload_al
     assert kwargs["body"]["mimeType"] == "application/octet-stream"
 
 
-def test_upload_file_defaults_mime_type_when_unguessable(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_defaults_mime_type_when_unguessable(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "mystery_file_no_extension"
     local_file.write_bytes(b"some bytes")
 
@@ -2884,7 +3030,9 @@ def test_upload_file_succeeds_with_real_bytes_even_when_mimetype_guess_is_wrong(
     assert local_file.read_bytes() == b"real docx bytes"
 
 
-def test_upload_file_includes_parent_id_when_given(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_includes_parent_id_when_given(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"content")
 
@@ -2914,7 +3062,9 @@ def test_upload_file_resolves_parent_id_url_and_supports_shared_drives(
     }
 
     result = json.loads(
-        google_drive.google_drive_upload_file(str(local_file), parent_id=_FOLDER_URL_WITH_ID)
+        google_drive.google_drive_upload_file(
+            str(local_file), parent_id=_FOLDER_URL_WITH_ID
+        )
     )
 
     assert result["status"] == "success"
@@ -2923,7 +3073,9 @@ def test_upload_file_resolves_parent_id_url_and_supports_shared_drives(
     assert kwargs["supportsAllDrives"] is True
 
 
-def test_upload_file_attaches_resource_key_header_for_parent(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_attaches_resource_key_header_for_parent(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"content")
 
@@ -2974,7 +3126,9 @@ def test_upload_file_rejects_missing_file(monkeypatch, _upload_allowed_dirs_env)
     hasattr(os, "geteuid") and os.geteuid() == 0,
     reason="root ignores file permission bits, so chmod 000 wouldn't block the read",
 )
-def test_upload_file_does_not_leak_host_path_on_open_failure(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_does_not_leak_host_path_on_open_failure(
+    monkeypatch, _upload_allowed_dirs_env
+):
     """Regression guard for the OSError path-leak: a permission error (or a
     TOCTOU race) from local_path.open() must not surface the absolute host
     path in the caller-facing message -- that would undermine the same
@@ -3004,7 +3158,9 @@ def test_upload_file_validates_parent_id_before_building_service(
     get_service = Mock()
     monkeypatch.setattr(google_drive, "get_drive_service", get_service)
 
-    result = json.loads(google_drive.google_drive_upload_file(str(local_file), parent_id=123))
+    result = json.loads(
+        google_drive.google_drive_upload_file(str(local_file), parent_id=123)
+    )
 
     assert result["status"] == "error"
     assert "parent_id must be a string" in result["message"]
@@ -3025,7 +3181,9 @@ def test_upload_file_rejects_empty_file(monkeypatch, _upload_allowed_dirs_env):
     files.create.assert_not_called()
 
 
-def test_upload_file_returns_error_payload_on_api_failure(monkeypatch, _upload_allowed_dirs_env):
+def test_upload_file_returns_error_payload_on_api_failure(
+    monkeypatch, _upload_allowed_dirs_env
+):
     local_file = _upload_allowed_dirs_env / "report.pdf"
     local_file.write_bytes(b"content")
 
@@ -3044,7 +3202,9 @@ def test_upload_file_returns_error_payload_on_api_failure(monkeypatch, _upload_a
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["report.pdf", "photo.PNG", "deck.pptx", "archive.zip"])
+@pytest.mark.parametrize(
+    "name", ["report.pdf", "photo.PNG", "deck.pptx", "archive.zip"]
+)
 def test_create_file_rejects_binary_looking_names(monkeypatch, name):
     """Regression guard for the actual production bug: google_drive_create_file
     can only write text (content is utf-8 encoded), so a caller naming the
@@ -3087,7 +3247,9 @@ def test_create_file_allows_plain_text_names(monkeypatch):
     files.create.return_value.execute.return_value = {"id": "f1"}
     _mock_drive_service_with_files(monkeypatch, files)
 
-    result = json.loads(google_drive.google_drive_create_file("notes.txt", "hello world"))
+    result = json.loads(
+        google_drive.google_drive_create_file("notes.txt", "hello world")
+    )
 
     assert result["status"] == "success"
     files.create.assert_called_once()
@@ -3147,7 +3309,9 @@ def test_create_file_allows_script_source_extensions(monkeypatch, name):
         "application/graphql",
     ],
 )
-def test_create_file_allows_unambiguous_text_application_mime_types(monkeypatch, mime_type):
+def test_create_file_allows_unambiguous_text_application_mime_types(
+    monkeypatch, mime_type
+):
     """These application/* mime types are unambiguous — no real binary
     format is ever declared with them — so an explicit mime_type of one of
     these must be accepted even for a name with no matching extension
@@ -3291,7 +3455,9 @@ def test_create_file_allows_text_safe_mime_types(monkeypatch, mime_type):
         "diagram.vsdx",
     ],
 )
-def test_create_file_rejects_binary_extensions_not_in_the_text_allowlist(monkeypatch, name):
+def test_create_file_rejects_binary_extensions_not_in_the_text_allowlist(
+    monkeypatch, name
+):
     """Regression guard: with a default-deny design (accept only
     recognized text extensions), every one of these -- including the
     second round of gaps a reviewer found in the original 18-entry
@@ -3373,7 +3539,9 @@ def test_create_file_allows_newly_recognized_text_extensions(monkeypatch, name):
 
 
 @pytest.mark.parametrize("name", ["www.example.com", "report-v1.2", "2024.01.15-notes"])
-def test_create_file_explicit_mime_type_overrides_binary_looking_name(monkeypatch, name):
+def test_create_file_explicit_mime_type_overrides_binary_looking_name(
+    monkeypatch, name
+):
     """Regression guard: a name that merely contains a dot not meant as
     an extension has no way to be rescued when mime_type is left unset --
     but an explicit mime_type (even "text/plain") is a deliberate
@@ -3392,7 +3560,9 @@ def test_create_file_explicit_mime_type_overrides_binary_looking_name(monkeypatc
 
 
 @pytest.mark.parametrize("name", ["www.example.com", "report-v1.2", "2024.01.15-notes"])
-def test_create_file_still_rejects_binary_looking_name_without_explicit_override(monkeypatch, name):
+def test_create_file_still_rejects_binary_looking_name_without_explicit_override(
+    monkeypatch, name
+):
     """Companion to the override test above: leaving mime_type unset must
     still reject these same names -- the name-based guard only yields to
     an *explicit* mime_type, not merely because the name happens to be a
@@ -3430,7 +3600,9 @@ def test_create_file_strips_name_before_checking_the_extension(monkeypatch):
     files = Mock()
     _mock_drive_service_with_files(monkeypatch, files)
 
-    result = json.loads(google_drive.google_drive_create_file("report.pdf ", "some text"))
+    result = json.loads(
+        google_drive.google_drive_create_file("report.pdf ", "some text")
+    )
 
     assert result["status"] == "error"
     assert "google_drive_upload_file" in result["message"]
@@ -3493,7 +3665,9 @@ def test_create_file_allows_broadened_and_normalized_mime_types(monkeypatch, mim
         ("  text/csv  ", "text/csv"),
     ],
 )
-def test_create_file_sends_the_normalized_mime_type_to_drive(monkeypatch, mime_type, normalized):
+def test_create_file_sends_the_normalized_mime_type_to_drive(
+    monkeypatch, mime_type, normalized
+):
     """Regression guard: the guard's text-safety check normalizes
     mime_type internally, but without also reassigning the normalized
     value, the raw (non-canonical) string would still be what actually
@@ -3525,7 +3699,9 @@ def test_create_file_strips_embedded_crlf_from_mime_type(monkeypatch):
     _mock_drive_service_with_files(monkeypatch, files)
 
     result = json.loads(
-        google_drive.google_drive_create_file("notes.txt", "hi", mime_type="text/pl\r\nain")
+        google_drive.google_drive_create_file(
+            "notes.txt", "hi", mime_type="text/pl\r\nain"
+        )
     )
 
     assert result["status"] == "success"

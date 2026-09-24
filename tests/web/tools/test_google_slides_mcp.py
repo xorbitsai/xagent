@@ -1,5 +1,6 @@
 import json
 import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -2046,6 +2047,18 @@ def test_import_pptx_rejects_path_outside_allowlist(monkeypatch, tmp_path):
 
     assert result["status"] == "error"
     assert "outside the allowed directories" in result["message"]
+
+
+def test_resolve_pptx_upload_path_skips_unresolvable_candidate(monkeypatch, tmp_path):
+    monkeypatch.setattr(google_slides, "allowed_dirs_from_env", lambda _: [tmp_path])
+
+    def _raise_symlink_loop(_path):
+        raise RuntimeError("symlink loop")
+
+    monkeypatch.setattr(Path, "resolve", _raise_symlink_loop)
+
+    with pytest.raises(PermissionError, match="outside the allowed directories"):
+        google_slides._resolve_pptx_upload_path(str(tmp_path / "loop.pptx"))
 
 
 def test_create_presentation_returns_error_payload_on_api_failure(monkeypatch):

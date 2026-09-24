@@ -339,7 +339,7 @@ def _resolve_pptx_upload_path(file_path: str) -> Path:
             resolved_candidate = candidate.resolve()
         except (OSError, RuntimeError) as exc:
             logger.warning("Could not resolve PPTX path %s: %s", candidate, exc)
-            raise ValueError("file path could not be resolved safely") from None
+            continue
         if not any(
             resolved_candidate.is_relative_to(directory) for directory in allowed_dirs
         ):
@@ -351,7 +351,10 @@ def _resolve_pptx_upload_path(file_path: str) -> Path:
 
     if local_path is None:
         if authorized_candidate is None:
-            rejected_path = candidates[0].resolve()
+            try:
+                rejected_path = candidates[0].resolve()
+            except (OSError, RuntimeError):
+                rejected_path = candidates[0]
             logger.warning(
                 "Rejected PPTX path %s outside allowed directories: %s",
                 rejected_path,

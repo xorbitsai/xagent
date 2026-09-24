@@ -150,21 +150,20 @@ async def test_infra_callback_failure_marks_ledger_terminal() -> None:
     tools = [FakeTool("s1", concurrency_safe=True)]
     pattern = make_react(parallel=True)
     call = make_tool_call("s1")
+    original_call = dict(call)
 
     with pytest.raises(RuntimeError, match="trace backend down"):
         await pattern._execute_tool_safely(call, tools, _BoomOnStart())
 
     assert pattern.tool_ledger[call["id"]].status == "failed"
+    assert pattern.tool_ledger[call["id"]].invocation_id
+    assert call == original_call
 
 
 async def test_concurrent_batch_assigns_ids_to_id_less_calls() -> None:
-    # A tool call without an id must get a stable one stamped on the *original*
-    # dict before _execute_tool_safely's _with_* transforms run. _record_tool_call
-    # only generates a fallback key internally; if it is not written back, the
-    # key drifts between the running/completed writes (len(tool_ledger) grows in
-    # between) and never matches the still-id-less dict that _backfill_result and
-    # _reorder_ledger_for_batch read, desyncing the ledger from the context
-    # (I2/I3).
+    # An id-less batch must receive distinct fallback and invocation identities
+    # before scheduling without mutating caller-owned input. The prepared
+    # objects then remain continuous through ledger writes and result backfill.
     tools = [
         FakeTool("s1", concurrency_safe=True),
         FakeTool("s2", concurrency_safe=True),
@@ -177,6 +176,7 @@ async def test_concurrent_batch_assigns_ids_to_id_less_calls() -> None:
     runtime.active_react_step_id = "step-x"
     context = RecordingContext()
     batch = [make_tool_call("s1", id=""), make_tool_call("s2", id="")]
+    original_batch = [dict(call) for call in batch]
 
     await pattern._run_concurrent_batch(batch, tools, runtime, context)
 
@@ -188,6 +188,13 @@ async def test_concurrent_batch_assigns_ids_to_id_less_calls() -> None:
     ctx_ids = [r["tool_call_id"] for r in context.tool_results]
     assert all(ctx_ids)
     assert ctx_ids == list(pattern.tool_ledger.keys())
+    ctx_invocation_ids = [r["invocation_id"] for r in context.tool_results]
+    assert all(ctx_invocation_ids)
+    assert len(set(ctx_invocation_ids)) == 2
+    assert ctx_invocation_ids == [
+        record.invocation_id for record in pattern.tool_ledger.values()
+    ]
+    assert batch == original_batch
 
 
 async def test_concurrent_batch_propagates_infra_callback_failure() -> None:
@@ -287,7 +294,11 @@ async def test_interrupt_filter_uses_batch_position_when_ids_repeat() -> None:
         await task
 
     assert [result["tool_name"] for result in context.tool_results] == ["done"]
-    assert pattern.pending_tool_calls == [batch[1]]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call["id"] == batch[1]["id"]
+    assert pending_call["name"] == batch[1]["name"]
+    assert pending_call["args"] == batch[1]["args"]
+    assert pending_call["invocation_id"]
 
 
 # --- Inc.4: tool_ledger ordering after a concurrent batch (I3) -------------

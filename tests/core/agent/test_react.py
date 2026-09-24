@@ -12959,13 +12959,10 @@ async def test_react_shared_lifecycle_preserves_tool_observers(
     assert len(context.get_messages_by_role("tool")) == 1
     ordinary_count = int(name == "calculator")
     assert started.call_count == ended.call_count == billed.call_count == ordinary_count
-    # Legacy pending objects are enriched in place so concurrent completion and
-    # control handlers keep comparing the same object identity.
-    assert call["id"] == "call-1"
-    assert call["name"] == name
-    assert call["args"] == args
-    assert call["invocation_id"]
-    assert pattern.tool_ledger["call-1"].invocation_id == call["invocation_id"]
+    # Execution preparation replaces the pending entry without mutating the
+    # caller-owned input retained for retries or diagnostics.
+    assert call == {"id": "call-1", "name": name, "args": args}
+    assert pattern.tool_ledger["call-1"].invocation_id
     if name in {"send_message", "ask_user_question"}:
         metadata = runtime.outbound_messages[0]["metadata"]
         assert metadata["tool_call_id"] == "call-1"
@@ -13015,7 +13012,7 @@ async def test_react_control_send_failure_settles_lifecycle_and_propagates(
     assert pending_call["name"] == call["name"]
     assert pending_call["args"] == call["args"]
     assert pending_call["invocation_id"]
-    assert call["invocation_id"] == pending_call["invocation_id"]
+    assert "invocation_id" not in call
     assert context.get_messages_by_role("tool") == []
 
 

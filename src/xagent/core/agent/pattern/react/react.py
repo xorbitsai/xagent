@@ -4648,6 +4648,18 @@ class ReActPattern(AgentPattern):
         ``return_exceptions=True`` is an infra-callback/unexpected failure and is
         re-raised to halt the turn exactly like the serial path (I5).
         """
+        # Prepare identity before scheduling so back-fill, ledger ordering, and
+        # pending reconciliation all observe the exact objects that execution
+        # records. Reserve generated ids across the whole batch before any task
+        # starts, including legacy id-less calls restored from checkpoints.
+        reserved_ids: set[str] = set()
+        batch = [
+            self._prepare_tool_call_identity(
+                tool_call,
+                reserved_ids=reserved_ids,
+            )
+            for tool_call in batch
+        ]
         semaphore = asyncio.Semaphore(self.tool_max_concurrency)
 
         async def _guarded(tool_call: dict[str, Any]) -> Any:
@@ -5638,6 +5650,47 @@ class ReActPattern(AgentPattern):
             )
         return None
 
+    def _prepare_tool_call_identity(
+        self,
+        tool_call: dict[str, Any],
+        *,
+        reserved_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return an identity-bearing call and replace its pending entry.
+
+        Provider ids may be absent or reused, while ``invocation_id`` is the
+        durable execution identity. Copy before enriching so a callback failure
+        cannot mutate caller-owned retry or diagnostic input. Concurrent batches
+        reserve fallback provider ids before scheduling to prevent collisions.
+        """
+        original_call = tool_call
+        if not tool_call.get("id"):
+            used_ids = {record.tool_call_id for record in self.tool_ledger.values()}
+            used_ids.update(
+                str(candidate.get("id"))
+                for candidate in self.pending_tool_calls
+                if candidate.get("id")
+            )
+            if reserved_ids is not None:
+                used_ids.update(reserved_ids)
+            fallback_index = len(self.tool_ledger)
+            while f"tool_call_{fallback_index}" in used_ids:
+                fallback_index += 1
+            tool_call = {
+                **tool_call,
+                "id": f"tool_call_{fallback_index}",
+            }
+        if reserved_ids is not None:
+            reserved_ids.add(str(tool_call["id"]))
+        if not tool_call.get("invocation_id"):
+            tool_call = {**tool_call, "invocation_id": uuid.uuid4().hex}
+        if tool_call is not original_call:
+            self.pending_tool_calls = [
+                tool_call if candidate is original_call else candidate
+                for candidate in self.pending_tool_calls
+            ]
+        return tool_call
+
     async def _execute_tool_safely(
         self,
         tool_call: dict[str, Any],
@@ -5652,19 +5705,7 @@ class ReActPattern(AgentPattern):
         Control handlers retain their scheduling results. Only ordinary tools
         use the existing tracing, metering and business-error conversion.
         """
-        # Stamp a stable id on the *original* dict before the _with_* transforms
-        # (which may return a copy). _record_tool_call only computes a fallback
-        # key locally; without writing it back, the key drifts between the
-        # running/completed writes as the ledger grows, and the still-id-less
-        # dict that _backfill_result / _reorder_ledger_for_batch read desyncs
-        # from the ledger (I2/I3). No await runs before the first record below,
-        # so concurrent batch members get distinct fallback ids.
-        if not tool_call.get("id"):
-            tool_call["id"] = f"tool_call_{len(self.tool_ledger)}"
-        # New LLM responses are stamped during normalization. This fallback is
-        # only for restored legacy pending calls that predate invocation IDs.
-        if not tool_call.get("invocation_id"):
-            tool_call["invocation_id"] = uuid.uuid4().hex
+        tool_call = self._prepare_tool_call_identity(tool_call)
         pending_call = tool_call
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)

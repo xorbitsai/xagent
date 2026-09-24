@@ -4,7 +4,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
@@ -221,6 +221,31 @@ async def list_google_drives(
 
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@cloud_router.get("/google-drive/picker-token")
+async def get_google_drive_picker_token(
+    response: Response,
+    account_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    """Return the selected account's short-lived token for Google Picker.
+
+    Picker runs in the user's browser and therefore needs the same access
+    token that the backend uses for Drive requests. The endpoint is scoped to
+    the authenticated user's ``google-drive`` account and refreshes an
+    expired token through ``get_google_credentials`` before returning it.
+    """
+    creds = get_google_credentials(cast(int, user.id), db, account_id)
+    token = getattr(creds, "token", None)
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Google Drive session expired. Please reconnect.",
+        )
+    response.headers["Cache-Control"] = "no-store"
+    return {"access_token": str(token)}
 
 
 @cloud_router.get("/google-drive/files")

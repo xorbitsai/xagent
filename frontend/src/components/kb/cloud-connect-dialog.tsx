@@ -21,6 +21,7 @@ import {
 import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
+import { openGoogleDrivePicker } from "@/lib/google-picker"
 
 export interface CloudFile {
   id: string
@@ -73,6 +74,7 @@ export function CloudConnectDialog({
   const [files, setFiles] = useState<CloudFile[]>([])
   const [searchQuery, setSearchQuery] = useState("")
   const [loading, setLoading] = useState(false)
+  const [pickerLoading, setPickerLoading] = useState(false)
   const [accountsLoading, setAccountsLoading] = useState(false)
   const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccount[]>([])
   const [driveOptions, setDriveOptions] = useState<{ value: string, label: string }[]>([])
@@ -116,6 +118,63 @@ export function CloudConnectDialog({
       `${provider?.name} Auth`,
       `width=${width},height=${height},left=${left},top=${top}`
     )
+  }
+
+  const handleOpenGooglePicker = async () => {
+    if (!provider || provider.id !== "google-drive" || !cloudUser) return
+
+    const selectedAccount = connectedAccounts.find(
+      acc => (acc.email || `Account ${acc.id}`) === cloudUser,
+    )
+    const apiKey = process.env.NEXT_PUBLIC_GOOGLE_PICKER_API_KEY
+    const appId = process.env.NEXT_PUBLIC_GOOGLE_PICKER_APP_ID
+    if (!selectedAccount || !apiKey || !appId) {
+      toast.error(t("kb.dialog.cloudConnect.picker.notConfigured"))
+      return
+    }
+
+    setPickerLoading(true)
+    try {
+      const tokenResponse = await apiRequest(
+        `${getApiUrl()}/api/cloud/google-drive/picker-token?account_id=${selectedAccount.id}`,
+      )
+      if (!tokenResponse.ok) {
+        throw new Error("Failed to obtain Google Drive access token")
+      }
+      const { access_token: accessToken } = await tokenResponse.json()
+      if (!accessToken) throw new Error("Google Drive access token is missing")
+
+      const documents = await openGoogleDrivePicker({
+        apiKey,
+        appId,
+        accessToken,
+      })
+      const availableSlots = MAX_CLOUD_INGEST_FILES - selectedFiles.length
+      const newDocuments = documents
+        .filter(document => document.id && document.mimeType !== "application/vnd.google-apps.folder")
+        .filter(document => !selectedFiles.some(file => file.id === document.id))
+      const pickedFiles = newDocuments.slice(0, Math.max(availableSlots, 0))
+        .map(document => ({
+          id: document.id,
+          name: document.name || document.id,
+          type: "file" as const,
+          size: document.sizeBytes,
+          updatedAt: document.modifiedDate,
+          resourceKey: document.resourceKey,
+        }))
+
+      if (newDocuments.length > pickedFiles.length) {
+        toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
+          count: MAX_CLOUD_INGEST_FILES,
+        }))
+      }
+      setSelectedFiles(prev => [...prev, ...pickedFiles])
+    } catch (error) {
+      console.error("Failed to open Google Picker", error)
+      toast.error(t("kb.dialog.cloudConnect.picker.failed"))
+    } finally {
+      setPickerLoading(false)
+    }
   }
 
   useEffect(() => {
@@ -360,6 +419,21 @@ export function CloudConnectDialog({
                 disabled={!cloudUser}
                 placeholder={t("kb.dialog.cloudConnect.select.drivePlaceholder")}
               />
+            </div>
+          )}
+
+          {provider?.id === "google-drive" && (
+            <div className="flex items-center justify-between rounded-md border bg-muted/20 p-3">
+              <div className="text-sm text-muted-foreground">
+                {t("kb.dialog.cloudConnect.picker.description")}
+              </div>
+              <Button
+                onClick={handleOpenGooglePicker}
+                disabled={!cloudUser || pickerLoading}
+              >
+                {pickerLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                {t("kb.dialog.cloudConnect.picker.chooseFiles")}
+              </Button>
             </div>
           )}
 

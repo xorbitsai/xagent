@@ -101,6 +101,8 @@ Real-time communication with the FastAPI backend for live updates.
 
 - `NEXT_PUBLIC_WS_URL`: WebSocket server URL
 - `NEXT_PUBLIC_API_URL`: HTTP API server URL
+- `NEXT_PUBLIC_GOOGLE_PICKER_API_KEY`: Browser-restricted API key for Google Picker
+- `NEXT_PUBLIC_GOOGLE_PICKER_APP_ID`: Google Cloud project number used by Picker
 
 ### Backend Integration
 

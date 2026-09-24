@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
+const openGoogleDrivePickerMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const translateMock = vi.hoisted(() => vi.fn((key: string) => key))
 
@@ -16,6 +17,10 @@ vi.mock("@/contexts/i18n-context", () => ({
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
+}))
+
+vi.mock("@/lib/google-picker", () => ({
+  openGoogleDrivePicker: openGoogleDrivePickerMock,
 }))
 
 vi.mock("@/lib/utils", () => ({
@@ -109,7 +114,10 @@ function jsonResponse(body: unknown) {
 describe("CloudConnectDialog", () => {
   beforeEach(() => {
     vi.stubGlobal("React", React)
+    vi.stubEnv("NEXT_PUBLIC_GOOGLE_PICKER_API_KEY", "picker-api-key")
+    vi.stubEnv("NEXT_PUBLIC_GOOGLE_PICKER_APP_ID", "picker-app-id")
     apiRequestMock.mockReset()
+    openGoogleDrivePickerMock.mockReset()
     toastErrorMock.mockReset()
     translateMock.mockClear()
     apiRequestMock.mockImplementation((url: string) => {
@@ -128,6 +136,9 @@ describe("CloudConnectDialog", () => {
           }))
         ))
       }
+      if (url === "http://api.local/api/cloud/google-drive/picker-token?account_id=1") {
+        return Promise.resolve(jsonResponse({ access_token: "picker-token" }))
+      }
       throw new Error(`Unhandled apiRequest: ${url}`)
     })
   })
@@ -135,6 +146,7 @@ describe("CloudConnectDialog", () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
   })
 
   it("preserves a Drive resource key through file selection", async () => {
@@ -167,6 +179,52 @@ describe("CloudConnectDialog", () => {
       }),
     ])
     expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+
+  it("imports files selected through Google Picker", async () => {
+    openGoogleDrivePickerMock.mockResolvedValue([
+      {
+        id: "picker-file-1",
+        name: "Selected from Drive.pdf",
+        mimeType: "application/pdf",
+        resourceKey: "picker-resource-key",
+      },
+    ])
+    const onConfirm = vi.fn()
+
+    render(
+      <CloudConnectDialog
+        open={true}
+        onOpenChange={vi.fn()}
+        provider={{
+          id: "google-drive",
+          name: "Google Drive",
+          hasDrives: false,
+          authPath: "google",
+          logo: "drive",
+        }}
+        onConfirm={onConfirm}
+      />
+    )
+
+    fireEvent.click(await screen.findByTestId("select-user@example.com"))
+    fireEvent.click(screen.getByText("kb.dialog.cloudConnect.picker.chooseFiles"))
+    await waitFor(() => {
+      expect(openGoogleDrivePickerMock).toHaveBeenCalledWith({
+        apiKey: expect.any(String),
+        appId: expect.any(String),
+        accessToken: "picker-token",
+      })
+    })
+    fireEvent.click(screen.getByText("kb.dialog.cloudConnect.select.confirm"))
+
+    expect(onConfirm).toHaveBeenCalledWith([
+      expect.objectContaining({
+        id: "picker-file-1",
+        name: "Selected from Drive.pdf",
+        resourceKey: "picker-resource-key",
+      }),
+    ])
   })
 
   it("prevents selecting more than five files", async () => {

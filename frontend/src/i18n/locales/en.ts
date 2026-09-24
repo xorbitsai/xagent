@@ -2316,6 +2316,12 @@ Build when you need.`,
         error: {
           fetchFailed: "Failed to load files",
         },
+        picker: {
+          description: "Choose files from Google Drive with Google's secure file picker.",
+          chooseFiles: "Choose Drive files",
+          notConfigured: "Google Picker is not configured for this environment.",
+          failed: "Failed to open Google Picker.",
+        },
         search: {
           placeholder: "Search",
         },

@@ -2311,6 +2311,12 @@ const zh = {
         error: {
           fetchFailed: "加载文件失败",
         },
+        picker: {
+          description: "使用 Google 的安全文件选择器从 Google Drive 选择文件。",
+          chooseFiles: "选择 Drive 文件",
+          notConfigured: "当前环境尚未配置 Google Picker。",
+          failed: "打开 Google Picker 失败。",
+        },
         search: {
           placeholder: "搜索",
         },

@@ -1022,7 +1022,7 @@ def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() ->
         "name": "Gmail",
         "transport": "oauth",
         "provider_name": "google",
-        "oauth_scopes": ["https://www.googleapis.com/auth/gmail.modify"],
+        "oauth_scopes": [],
         "launch_config": {
             "command": "python",
             "args": ["-m", "xagent.web.tools.mcp.gmail"],

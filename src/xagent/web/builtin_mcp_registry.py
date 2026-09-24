@@ -461,8 +461,12 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Communication",
-            "oauth_scopes": ["https://www.googleapis.com/auth/gmail.modify"],
-            "is_visible_in_connector": True,
+            # Temporarily unavailable while the restricted Gmail permission is
+            # outside this release's Google OAuth verification scope. Keep the
+            # app row (rather than deleting it) so existing installations and
+            # a later re-enable migration retain the connector's stable ID.
+            "oauth_scopes": [],
+            "is_visible_in_connector": False,
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.gmail"],
@@ -477,7 +481,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Support",
-            "oauth_scopes": ["https://www.googleapis.com/auth/drive"],
+            "oauth_scopes": ["https://www.googleapis.com/auth/drive.file"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",

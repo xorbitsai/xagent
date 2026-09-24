@@ -215,7 +215,7 @@ def test_builtin_runtime_view_overlays_stale_execution_fields(catalog_db):
     assert app["name"] == "Gmail"
     assert app["transport"] == "oauth"
     assert app["provider"] == "google"
-    assert app["oauth_scopes"] == ["https://www.googleapis.com/auth/gmail.modify"]
+    assert app["oauth_scopes"] == []
     assert app["launch_config"] == {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.gmail"],

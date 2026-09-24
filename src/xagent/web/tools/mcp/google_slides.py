@@ -3,14 +3,17 @@ import logging
 import os
 import re
 import uuid
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
-from mcp.server.fastmcp import FastMCP
+from googleapiclient.http import MediaIoBaseUpload  # type: ignore[import-not-found]
 from pydantic import BeforeValidator
 
-from .utils import resolve_id_from_url, setup_proxy_env
+from mcp.server.fastmcp import FastMCP
+
+from .utils import allowed_dirs_from_env, resolve_id_from_url, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-slides-mcp")
@@ -21,6 +24,11 @@ setup_proxy_env()
 mcp = FastMCP("google-slides-mcp")
 
 _PRESENTATION_URL_ID_PATTERN = re.compile(r"/presentation/d/([a-zA-Z0-9_-]+)")
+_PPTX_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+)
+_GOOGLE_SLIDES_MIME_TYPE = "application/vnd.google-apps.presentation"
+_PPTX_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
 
 
 def _normalize_layout(value: object) -> object:
@@ -264,7 +272,7 @@ def _find_placeholders(
     return found
 
 
-def get_slides_service() -> Any:
+def _get_google_credentials() -> Credentials:
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
     client_id = os.environ.get("GOOGLE_CLIENT_ID")
@@ -285,7 +293,49 @@ def get_slides_service() -> Any:
         )
 
     credentials = Credentials(**creds_kwargs)
+    return credentials
+
+
+def get_slides_service() -> Any:
+    credentials = _get_google_credentials()
     return build("slides", "v1", credentials=credentials)
+
+
+def get_drive_service() -> Any:
+    credentials = _get_google_credentials()
+    return build("drive", "v3", credentials=credentials)
+
+
+def _resolve_pptx_upload_path(file_path: str) -> Path:
+    """Resolve a generated PPTX and keep uploads inside approved roots."""
+    local_path = Path(file_path).expanduser()
+    if not local_path.is_absolute():
+        local_path = Path.cwd() / local_path
+    local_path = local_path.resolve()
+
+    try:
+        allowed_dirs = allowed_dirs_from_env(_PPTX_UPLOAD_ALLOWED_DIRS_ENV_VAR)
+    except ValueError:
+        logger.warning("Invalid PPTX upload directory configuration")
+        raise ValueError("Upload directory configuration is invalid") from None
+
+    if not any(local_path.is_relative_to(directory) for directory in allowed_dirs):
+        logger.warning(
+            "Rejected PPTX path %s outside allowed directories: %s",
+            local_path,
+            ", ".join(str(directory) for directory in allowed_dirs),
+        )
+        raise PermissionError(
+            "file path is outside the allowed directories; provide a PPTX "
+            "inside the task workspace"
+        )
+    if not local_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    if local_path.suffix.lower() != ".pptx":
+        raise ValueError("file_path must point to a .pptx file")
+    if local_path.stat().st_size == 0:
+        raise ValueError("PPTX file is empty")
+    return local_path
 
 
 def _resolve_presentation_id(presentation_id: str) -> str:
@@ -349,25 +399,176 @@ def google_slides_get_presentation(presentation_id: str) -> str:
 @mcp.tool()
 def google_slides_create_presentation(title: str) -> str:
     """
-    Create a new, empty Google Slides presentation with the given title.
-    Use google_slides_add_slide to add content slides afterwards.
+    Create a new Google Slides presentation with the given title.
+
+    This is a plain text/layout primitive. For a new deck that needs visual
+    design, create a styled PPTX first and call google_slides_import_pptx;
+    do not build the deck by repeatedly calling google_slides_add_slide.
+
+    Google creates a default, empty slide as part of this operation. Remove
+    that implementation detail before returning so callers can append exactly
+    the slides they requested with google_slides_add_slide. The response is
+    verified after cleanup and reports the resulting slide count.
     """
     try:
         service = get_slides_service()
         presentation = service.presentations().create(body={"title": title}).execute()
         pres_id = presentation.get("presentationId")
+        if not pres_id:
+            raise ValueError("Google Slides did not return a presentation_id")
+
+        # The create response normally includes the initial page, but Google
+        # does not document that shape as a stable part of the create
+        # response. Fall back to a read when it is omitted so the cleanup is
+        # safe across client/API versions.
+        slides = presentation.get("slides")
+        if slides is None:
+            created = (
+                service.presentations().get(presentationId=pres_id).execute()
+            )
+            slides = created.get("slides", [])
+
+        removed_default_slide = False
+        if len(slides) == 1 and not _slide_summary(slides[0], 0)["text"]:
+            default_slide_id = slides[0].get("objectId")
+            if not default_slide_id:
+                raise ValueError(
+                    "Google Slides returned an empty initial slide without an object_id"
+                )
+
+            service.presentations().batchUpdate(
+                presentationId=pres_id,
+                body={"requests": [{"deleteObject": {"objectId": default_slide_id}}]},
+            ).execute()
+            removed_default_slide = True
+
+        # Confirm the postcondition rather than assuming deleteObject removed
+        # the page. This keeps the tool from handing the agent a link that
+        # still contains the blank first slide.
+        final_presentation = (
+            service.presentations().get(presentationId=pres_id).execute()
+        )
+        final_slides = final_presentation.get("slides", [])
+        if removed_default_slide and any(
+            slide.get("objectId") == default_slide_id for slide in final_slides
+        ):
+            raise RuntimeError("Google Slides default blank slide was not removed")
 
         return json.dumps(
             {
                 "status": "success",
                 "presentation_id": pres_id,
-                "title": presentation.get("title"),
+                "title": final_presentation.get("title") or presentation.get("title"),
                 "link": f"https://docs.google.com/presentation/d/{pres_id}/edit",
+                "slide_count": len(final_slides),
+                "default_slide_removed": removed_default_slide,
             },
             ensure_ascii=False,
         )
     except Exception as e:
         logger.error(f"Error creating presentation: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def google_slides_import_pptx(file_path: str, title: str = "") -> str:
+    """Import a designed local PPTX as a native Google Slides presentation.
+
+    Use this for requests that ask for a beautiful, polished, or visually
+    designed deck. The existing PPTX generator owns layout and styling; Drive
+    converts its bytes to a native Google Slides file, preserving editable
+    slides instead of falling back to raw title/body placeholders.
+
+    ``file_path`` must point to a non-empty ``.pptx`` inside the current task
+    workspace (or another configured Google Drive upload directory). The
+    conversion is read back through the Slides API before this tool reports
+    success, and an unexpected blank slide is returned as
+    ``validation_failed`` rather than being presented as a finished deck.
+    """
+    try:
+        local_path = _resolve_pptx_upload_path(file_path)
+        resolved_title = title.strip() or local_path.stem
+        if not resolved_title:
+            return _error("title cannot be empty")
+
+        drive_service = get_drive_service()
+        with local_path.open("rb") as file_handle:
+            media = MediaIoBaseUpload(
+                file_handle, mimetype=_PPTX_MIME_TYPE, resumable=True
+            )
+            imported_file = (
+                drive_service.files()
+                .create(
+                    body={
+                        "name": resolved_title,
+                        "mimeType": _GOOGLE_SLIDES_MIME_TYPE,
+                    },
+                    media_body=media,
+                    supportsAllDrives=True,
+                    fields="id,name,mimeType,webViewLink",
+                )
+                .execute()
+            )
+
+        presentation_id = imported_file.get("id")
+        if not presentation_id:
+            raise ValueError("Google Drive did not return the imported file id")
+
+        presentation = (
+            get_slides_service()
+            .presentations()
+            .get(presentationId=presentation_id)
+            .execute()
+        )
+        link = imported_file.get("webViewLink") or (
+            f"https://docs.google.com/presentation/d/{presentation_id}/edit"
+        )
+        slides = presentation.get("slides", [])
+        if not slides:
+            return json.dumps(
+                {
+                    "status": "validation_failed",
+                    "message": "Imported presentation contains no slides",
+                    "presentation_id": presentation_id,
+                    "title": presentation.get("title") or resolved_title,
+                    "link": link,
+                    "slide_count": 0,
+                    "empty_slide_numbers": [],
+                },
+                ensure_ascii=False,
+            )
+        empty_slide_numbers = [
+            summary["slide_number"]
+            for index, slide in enumerate(slides)
+            if not (summary := _slide_summary(slide, index))["text"]
+        ]
+        if empty_slide_numbers:
+            return json.dumps(
+                {
+                    "status": "validation_failed",
+                    "message": "Imported presentation contains empty slides",
+                    "presentation_id": presentation_id,
+                    "title": presentation.get("title") or resolved_title,
+                    "link": link,
+                    "slide_count": len(slides),
+                    "empty_slide_numbers": empty_slide_numbers,
+                },
+                ensure_ascii=False,
+            )
+
+        return json.dumps(
+            {
+                "status": "success",
+                "presentation_id": presentation_id,
+                "title": presentation.get("title") or resolved_title,
+                "link": link,
+                "slide_count": len(slides),
+                "empty_slide_numbers": [],
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        logger.error(f"Error importing PPTX into Google Slides: {e}")
         return _error(str(e))
 
 
@@ -380,6 +581,9 @@ def google_slides_add_slide(
 ) -> str:
     """
     Append a slide with a title and body text to a Google Slides presentation.
+    This is a text/layout primitive and does not create visual styling. For a
+    polished or designed deck, generate a local PPTX with the presentation
+    generator and call google_slides_import_pptx instead.
     The body supports plain text; use newlines to separate bullet lines — each
     line is rendered as its own bulleted paragraph (don't type literal "•"/"-"
     markers, Slides adds the bullet glyph itself — only "•"/"-"/"*" are

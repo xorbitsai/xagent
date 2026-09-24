@@ -1611,18 +1611,32 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
 
 
 @pytest.mark.parametrize("user_interaction_enabled", [True, False])
+@pytest.mark.parametrize(
+    "user_request",
+    [
+        "Analyze the available evidence",
+        "Analyze the available evidence. Ask me PDF or DOCX first.",
+    ],
+)
 def test_react_defaults_presentation_without_guessing_required_information(
     user_interaction_enabled: bool,
+    user_request: str,
 ) -> None:
     pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
     context = ExecutionContext(system_prompt="You are helpful.")
-    context.add_user_message("Analyze the available evidence")
+    context.add_user_message(user_request)
 
-    prompt = pattern._messages_for_llm(context, has_tools=True)[0]["content"]
+    messages = pattern._messages_for_llm(context, has_tools=True)
+    prompt = messages[0]["content"]
 
-    assert "Clarify only when missing user information prevents correct" in prompt
+    assert messages[-1]["content"] == user_request
+    assert "Request clarification only when user interaction is enabled" in prompt
+    assert "or the user explicitly asked to be consulted" in prompt
     assert "including an unspecified output format" in prompt
-    assert "deliver the supported work without pausing" in prompt
+    assert (
+        "deliver the supported work without pausing unless "
+        "the user explicitly asked to choose" in prompt
+    )
     assert "does not permit guessing facts, action targets, or authorization" in prompt
     # Presentation defaults must not weaken the existing missing-fact policy.
     assert "fact-carrying argument value" in prompt

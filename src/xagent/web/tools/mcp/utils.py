@@ -262,6 +262,50 @@ def halve_dict_or_mark(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     return _truncation_marker_or_empty(value), True
 
 
+_TRUNCATION_SUFFIX = "...[truncated]"
+
+
+def _fit_critical_fields(critical: dict[str, Any], max_output_length: int) -> str:
+    """Build ``{"status": "success", **critical}``, shortening ``critical``'s
+    own string values (longest first) until the serialized result fits
+    ``max_output_length`` -- the guaranteed-fits counterpart to
+    ``success_with_capped_dict``'s last-resort call site, which needs
+    critical_fields present but must never hand back something this
+    function can't promise is within budget (see that call site for why).
+
+    Non-string values are left alone (nothing currently passes one, and
+    there's no generic, lossless way to shorten an arbitrary value the way
+    a string can be cut with an ellipsis); if a fit still can't be reached
+    once every string is cut to just the truncation marker, this returns
+    whatever that leaves rather than looping forever.
+    """
+    working = dict(critical)
+    response = json.dumps({"status": "success", **working}, ensure_ascii=False)
+    while len(response) > max_output_length:
+        string_keys = [
+            key
+            for key, value in working.items()
+            if isinstance(value, str) and value and value != _TRUNCATION_SUFFIX
+        ]
+        if not string_keys:
+            break
+        target_key = max(string_keys, key=lambda key: len(working[key]))
+        current = working[target_key]
+        excess = len(response) - max_output_length
+        # Cut at least the excess plus the marker's own length, with a
+        # small safety margin for JSON-escaping growth (e.g. a quote or
+        # backslash newly exposed at the cut point costs an extra
+        # backslash once re-escaped) -- an exact-excess cut could
+        # otherwise still overshoot by a byte or two and force another
+        # round trip.
+        cut_to = max(0, len(current) - excess - len(_TRUNCATION_SUFFIX) - 8)
+        working[target_key] = (
+            current[:cut_to] + _TRUNCATION_SUFFIX if cut_to > 0 else _TRUNCATION_SUFFIX
+        )
+        response = json.dumps({"status": "success", **working}, ensure_ascii=False)
+    return response
+
+
 def success_with_capped_dict(
     field_name: str,
     data: Any,
@@ -324,8 +368,16 @@ def success_with_capped_dict(
     fallback, including every rung of the ladder described below: a signal
     like "this create's record could not be confirmed" matters more than
     the record data it's attached to, and silently dropping it under size
-    pressure would defeat the reason it exists. Reserved envelope keys
-    cannot be overridden by either, and the two must not share a key.
+    pressure would defeat the reason it exists. If the record data has
+    already been dropped entirely and critical_fields alone still don't
+    fit, their own string values get shortened (see ``_fit_critical_fields``)
+    rather than ever handing back a response wider than max_output_length --
+    that width is a real contract with the parent MCP process for a stdio
+    connector (see ``_apply_stdio_output_limit_env``), whose own blind,
+    JSON-unaware slice would otherwise cut an oversized response anywhere,
+    up to and including mid-string. Reserved envelope keys cannot be
+    overridden by either extra_fields or critical_fields, and the two must
+    not share a key.
 
     If the payload is still too large once ``data`` itself is fully
     truncated, the last resort walks a ladder from most to least
@@ -560,8 +612,19 @@ def success_with_capped_dict(
         # them here would mean the one guarantee this parameter exists to
         # make ("this signal is never silently lost to truncation") holds
         # everywhere except the single case it matters most: when nothing
-        # else fit at all.
-        return json.dumps({"status": "success", **critical}, ensure_ascii=False)
+        # else fit at all. But the result must still fit max_output_length,
+        # not just be non-empty: a stdio MCP child's own budget is mirrored
+        # into a *separate*, JSON-unaware truncation the parent process
+        # applies to this exact string (OutputFilteredToolWrapper via
+        # _apply_stdio_output_limit_env's mirrored env var) -- an oversized
+        # response here would be blindly sliced mid-structure by that
+        # parent-side filter, producing invalid JSON instead of a
+        # valid-but-abbreviated one, right on the path meant to carry an
+        # "unconfirmed" safety signal. So once nothing else is left to
+        # drop, shorten critical_fields' own string values (longest first)
+        # until the envelope fits, rather than emitting something this
+        # function can't guarantee is parseable downstream.
+        return _fit_critical_fields(critical, max_output_length)
     return response
 
 

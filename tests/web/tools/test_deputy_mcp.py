@@ -1407,6 +1407,35 @@ def test_success_with_capped_dict_critical_fields_survive_absolute_fallback(
     assert result["warning"] == "unconfirmed"
 
 
+def test_success_with_capped_dict_shortens_an_oversized_critical_field(monkeypatch):
+    """When critical_fields' own content is bigger than max_output_length,
+    the response must still fit within budget -- a stdio MCP child's own
+    budget is mirrored into a *separate*, JSON-unaware truncation the
+    parent process applies to this exact string; an oversized response
+    here would be blindly sliced mid-structure by that parent-side filter,
+    producing invalid JSON instead of a valid-but-abbreviated one, right
+    on the path meant to carry an "unconfirmed" safety signal (rogercloud
+    review round, PR #2592)."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 64)
+    warning = (
+        "Deputy reported this Roster create as successful (Id 1), but "
+        "reading it back returned no record. Treat this as unconfirmed -- "
+        "verify in Deputy directly before relying on it."
+    )
+    assert len(warning) > 64  # the scenario only arises when it doesn't fit whole
+
+    raw = mcp_utils.success_with_capped_dict(
+        "record",
+        {"Id": 1, "Notes": "x" * 5000},
+        critical_fields={"warning": warning},
+    )
+
+    assert len(raw) <= 64
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    assert result["warning"].endswith("...[truncated]")
+
+
 def test_success_with_capped_dict_rejects_overlapping_extra_and_critical_fields():
     with pytest.raises(ValueError, match="must not share a key"):
         mcp_utils.success_with_capped_dict(

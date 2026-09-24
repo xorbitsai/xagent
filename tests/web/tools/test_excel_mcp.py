@@ -728,6 +728,108 @@ def test_bounded_range_omits_all_aligned_matrices_together(monkeypatch):
     assert "matrices were omitted" in result["message"]
 
 
+def test_count_values_scans_the_complete_used_range(monkeypatch):
+    rows = [["Open"] if index in {0, 2222} else ["Closed"] for index in range(2223)]
+    responses = [
+        MockResponse(
+            {
+                "address": "Sheet1!H1:H2223",
+                "rowCount": 2223,
+                "columnCount": 1,
+            }
+        )
+    ]
+    responses.extend(
+        MockResponse({"values": rows[offset : offset + 100]})
+        for offset in range(0, len(rows), 100)
+    )
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_count_values("book.xlsx", "Sheet1", "H", "open"))
+
+    assert result == {
+        "status": "success",
+        "column": "H",
+        "value": "open",
+        "count": 2,
+        "scanned_range": "H1:H2223",
+        "complete": True,
+    }
+    assert mock_request.call_count == 1 + 23
+    assert mock_request.call_args_list[0].kwargs["params"] == {
+        "$select": "address,rowCount,columnCount"
+    }
+
+
+def test_scan_reduces_chunk_after_oversized_response(monkeypatch):
+    oversized = MockResponse({"values": [["x" * 1_000] for _ in range(100)]})
+    mock_request = Mock(
+        side_effect=[
+            MockResponse({"address": "Sheet1!H1:H100"}),
+            oversized,
+            MockResponse({"values": [["Open"] for _ in range(50)]}),
+            MockResponse({"values": [["Closed"] for _ in range(50)]}),
+        ]
+    )
+    monkeypatch.setattr(excel, "get_tool_max_output_length", lambda: 1_000)
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(excel.excel_count_values("book.xlsx", "Sheet1", "H", "Open"))
+
+    assert result["status"] == "success"
+    assert result["count"] == 50
+    assert mock_request.call_count == 4
+
+
+def test_find_rows_returns_exact_match_count_and_row_number(monkeypatch):
+    rows = [["Closed", "unrelated"] for _ in range(2223)]
+    rows[2199] = ["Open", "Facebook & Instagram connector"]
+    responses = [MockResponse({"address": "Sheet1!A1:H2223"})]
+    responses.extend(
+        MockResponse({"values": rows[offset : offset + 100]})
+        for offset in range(0, len(rows), 100)
+    )
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_find_rows("book.xlsx", "Sheet1", "facebook", max_matches=1)
+    )
+
+    assert result["status"] == "success"
+    assert result["matched_count"] == 1
+    assert result["rows"][0]["row_number"] == 2200
+    assert result["complete"] is True
+    assert result["scanned_range"] == "A1:H2223"
+
+
+@pytest.mark.parametrize(
+    ("tool_call", "message"),
+    [
+        (
+            lambda: excel.excel_count_values("book.xlsx", "Sheet1", "1", "Open"),
+            "column must be an Excel column label",
+        ),
+        (
+            lambda: excel.excel_find_rows("book.xlsx", "Sheet1", "", max_matches=1),
+            "query is required",
+        ),
+        (
+            lambda: excel.excel_find_rows(
+                "book.xlsx", "Sheet1", "Open", max_matches=101
+            ),
+            "max_matches must be between",
+        ),
+    ],
+)
+def test_query_tools_validate_arguments(tool_call, message):
+    result = json.loads(tool_call())
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+
+
 # ---------------------------------------------------------------------------
 # tables
 # ---------------------------------------------------------------------------

@@ -131,10 +131,15 @@ def _verify_created_record(
         # return the staler of the two.
         return _record_response(resource, readback, field_name=field_name)
     reason = f"failed: {detail}" if detail else "returned no record"
+    # The actionable instruction comes first and the (potentially long,
+    # up to MAX_ERROR_RESPONSE_TEXT_CHARS) diagnostic detail comes last:
+    # success_with_capped_dict's last-resort fallback cuts an oversized
+    # critical field from the end, so if this ever needs shortening, it
+    # must eat into "reason" -- not into the one instruction a caller
+    # actually needs to act on.
     warning = (
-        f"Deputy reported this {resource} create as successful (Id "
-        f"{record_id}), but reading it back {reason}. Treat this as "
-        "unconfirmed -- verify in Deputy directly before relying on it."
+        f"Unconfirmed Deputy {resource} create (Id {record_id}) -- verify "
+        f"directly in Deputy before relying on it. Reading it back {reason}."
     )
     # critical_fields, not extra_fields: this warning is the entire point
     # of this function, so it must survive even success_with_capped_dict's

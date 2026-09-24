@@ -262,47 +262,111 @@ def halve_dict_or_mark(value: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     return _truncation_marker_or_empty(value), True
 
 
-_TRUNCATION_SUFFIX = "...[truncated]"
+# Matches the spelling already used for the same "content was cut" signal
+# elsewhere in this connector (deputy.py's Deputy-error-detail truncation,
+# graphql_errors.py's truncate_error_text) rather than introducing a
+# second, differently-spelled marker for the same concept.
+_TRUNCATION_SUFFIX = "... [truncated]"
+
+
+def _envelope_with_critical(critical: dict[str, Any]) -> str:
+    return json.dumps(
+        {"status": "success", **critical, "truncated": True}, ensure_ascii=False
+    )
 
 
 def _fit_critical_fields(critical: dict[str, Any], max_output_length: int) -> str:
-    """Build ``{"status": "success", **critical}``, shortening ``critical``'s
-    own string values (longest first) until the serialized result fits
-    ``max_output_length`` -- the guaranteed-fits counterpart to
-    ``success_with_capped_dict``'s last-resort call site, which needs
-    critical_fields present but must never hand back something this
-    function can't promise is within budget (see that call site for why).
+    """Build the ``{"status": "success", **critical, "truncated": true}``
+    envelope, shortening or dropping ``critical`` as needed until the
+    serialized result actually fits ``max_output_length`` -- the
+    guaranteed-fits counterpart to ``success_with_capped_dict``'s
+    last-resort call site, which needs critical_fields present but must
+    never hand back something this function can't promise is within
+    budget (see that call site for why).
 
-    Non-string values are left alone (nothing currently passes one, and
-    there's no generic, lossless way to shorten an arbitrary value the way
-    a string can be cut with an ellipsis); if a fit still can't be reached
-    once every string is cut to just the truncation marker, this returns
-    whatever that leaves rather than looping forever.
+    Two passes, each mirroring an existing pattern in this module rather
+    than inventing a new one:
+
+    1. Shrink the largest string value (by its own serialized size, same
+       comparison ``halve_dict_or_mark``'s siblings use) down toward
+       ``_TRUNCATION_SUFFIX``, but size-gated the same way
+       ``_truncation_marker_or_empty`` gates its own marker: only replace
+       a value with the marker if that's no bigger than the value already
+       is. Without this gate, a value shorter than the marker would get
+       *replaced by something bigger* -- inflating the response instead of
+       shrinking it, and then, once marked, being permanently excluded
+       from further shrinking with no way back. A field the gate rejects
+       is tracked in ``floored`` (an explicit set, not a fragile
+       equality-against-the-marker-string check -- the same reason phase 1
+       tracks ``floored_keys`` explicitly rather than re-detecting a
+       marker by value) and is skipped from then on, since nothing further
+       can be done to it here.
+    2. If every string is floored (or ``critical`` has no string to shrink
+       at all -- nothing currently passes a non-string critical field, but
+       the type is ``dict[str, Any]``, not ``dict[str, str]``, so nothing
+       stops a future caller from doing that) and the envelope is still
+       oversized, drop whole fields outright (largest serialized cost
+       first) until it fits. Losing a critical field entirely is a worse
+       outcome than shrinking it, but a response this function still can't
+       guarantee fits is worse still: a stdio MCP child's own budget is
+       mirrored into a *separate*, JSON-unaware truncation the parent
+       applies to this exact string (see ``success_with_capped_dict``),
+       and that blind slice corrupts an oversized response into invalid
+       JSON rather than merely truncating it.
     """
     working = dict(critical)
-    response = json.dumps({"status": "success", **working}, ensure_ascii=False)
+    floored: set[str] = set()
+    response = _envelope_with_critical(working)
+
     while len(response) > max_output_length:
-        string_keys = [
-            key
+        shrinkable = {
+            key: value
             for key, value in working.items()
-            if isinstance(value, str) and value and value != _TRUNCATION_SUFFIX
-        ]
-        if not string_keys:
+            if key not in floored and isinstance(value, str) and value
+        }
+        if not shrinkable:
             break
-        target_key = max(string_keys, key=lambda key: len(working[key]))
-        current = working[target_key]
+        target_key = max(shrinkable, key=lambda key: len(shrinkable[key]))
+        current = shrinkable[target_key]
         excess = len(response) - max_output_length
-        # Cut at least the excess plus the marker's own length, with a
-        # small safety margin for JSON-escaping growth (e.g. a quote or
-        # backslash newly exposed at the cut point costs an extra
-        # backslash once re-escaped) -- an exact-excess cut could
-        # otherwise still overshoot by a byte or two and force another
-        # round trip.
-        cut_to = max(0, len(current) - excess - len(_TRUNCATION_SUFFIX) - 8)
-        working[target_key] = (
-            current[:cut_to] + _TRUNCATION_SUFFIX if cut_to > 0 else _TRUNCATION_SUFFIX
+        # How much shorter this value's raw content needs to be for the
+        # whole envelope to fit, with a small safety margin for
+        # JSON-escaping growth (e.g. a quote or backslash newly exposed at
+        # the cut point costs an extra backslash once re-escaped) -- an
+        # exact-excess target could otherwise still overshoot by a byte or
+        # two and force another round trip.
+        target_len = max(0, len(current) - excess - 8)
+        if target_len >= len(_TRUNCATION_SUFFIX):
+            # Room for some real content plus the marker.
+            candidate = (
+                current[: target_len - len(_TRUNCATION_SUFFIX)] + _TRUNCATION_SUFFIX
+            )
+        else:
+            # Not even enough room left for the marker text -- keep
+            # whatever raw content still fits, unmarked. The envelope's
+            # own top-level "truncated" flag still signals that
+            # something, somewhere, was cut.
+            candidate = current[:target_len]
+        if len(candidate) >= len(current):
+            # Shortening this field wouldn't actually shrink it (it's
+            # already this short or shorter) -- leave it untouched and
+            # stop selecting it, rather than replacing a short value with
+            # something bigger.
+            floored.add(target_key)
+            continue
+        working[target_key] = candidate
+        response = _envelope_with_critical(working)
+
+    remaining = list(working.keys())
+    while len(response) > max_output_length and remaining:
+        drop_key = max(
+            remaining, key=lambda key: len(json.dumps(working[key], ensure_ascii=False))
         )
-        response = json.dumps({"status": "success", **working}, ensure_ascii=False)
+        del working[drop_key]
+        remaining.remove(drop_key)
+        response = _envelope_with_critical(working)
+    if len(response) > max_output_length:
+        return json.dumps({"status": "success", "truncated": True}, ensure_ascii=False)
     return response
 
 

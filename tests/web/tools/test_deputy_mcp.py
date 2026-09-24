@@ -1364,14 +1364,16 @@ def test_success_with_capped_dict_last_resort_fallback_keeps_capitalized_id(
     assert result["record"] == {"Id": 123}
 
 
-def test_success_with_capped_dict_critical_fields_survive_last_resort_fallback(
+def test_success_with_capped_dict_critical_fields_survive_id_only_candidate(
     monkeypatch,
 ):
     """Unlike extra_fields (previous test), critical_fields must NOT be
-    dropped by the last-resort fallback -- this is what
-    _verify_created_record relies on so an unconfirmed-create warning is
-    never silently lost to truncation, which would reproduce the exact
-    "confident-looking success" failure this mechanism exists to catch."""
+    dropped once the ladder is down to its id-only candidate -- this is
+    what _verify_created_record relies on so an unconfirmed-create warning
+    is never silently lost to truncation, which would reproduce the exact
+    "confident-looking success" failure this mechanism exists to catch.
+    (At this budget the id-only candidate already fits, so this doesn't
+    reach _fit_critical_fields -- see the dedicated tests for that.)"""
     monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 140)
 
     raw = mcp_utils.success_with_capped_dict(
@@ -1387,35 +1389,42 @@ def test_success_with_capped_dict_critical_fields_survive_last_resort_fallback(
     assert result["warning"] == "y" * 60
 
 
-def test_success_with_capped_dict_critical_fields_survive_absolute_fallback(
+def test_success_with_capped_dict_critical_fields_survive_tiny_requested_budget(
     monkeypatch,
 ):
-    """Even when nothing else fits at all (the id-only candidate and the
-    bare-status candidate both still exceed the limit), critical_fields
-    must still come through -- silently dropping them here, of all
-    places, would be the worst possible time to lose the signal."""
+    """Even with an aggressively low requested budget (floored back up to
+    _MIN_OUTPUT_LENGTH=64), a critical value short enough to already fit
+    within that floor's own fixed envelope overhead must come through
+    completely untouched -- this is satisfied by the ladder's own
+    bare-status-plus-critical candidate at this size, not by
+    _fit_critical_fields itself (see the dedicated tests below for that
+    function's own guarantee, including for values too long to fit)."""
     monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 10)
 
     raw = mcp_utils.success_with_capped_dict(
         "record",
         {"Id": 123, "Notes": "x" * 5000},
-        critical_fields={"warning": "unconfirmed"},
+        critical_fields={"warning": "unconf"},
     )
     result = json.loads(raw)
 
     assert result["status"] == "success"
-    assert result["warning"] == "unconfirmed"
+    assert result["warning"] == "unconf"
 
 
-def test_success_with_capped_dict_shortens_an_oversized_critical_field(monkeypatch):
-    """When critical_fields' own content is bigger than max_output_length,
-    the response must still fit within budget -- a stdio MCP child's own
-    budget is mirrored into a *separate*, JSON-unaware truncation the
-    parent process applies to this exact string; an oversized response
-    here would be blindly sliced mid-structure by that parent-side filter,
-    producing invalid JSON instead of a valid-but-abbreviated one, right
-    on the path meant to carry an "unconfirmed" safety signal (rogercloud
-    review round, PR #2592)."""
+def test_success_with_capped_dict_fits_the_exact_reviewer_reported_budget(
+    monkeypatch,
+):
+    """Verified against rogercloud's own PR #2592 review numbers exactly:
+    XAGENT_TOOL_MAX_OUTPUT_LENGTH=64, an Id=1 "returned no record" warning.
+    At this budget there isn't even room left for the truncation marker
+    once the fixed envelope overhead is accounted for -- the response must
+    still fit, even if that means the surviving warning content is just a
+    character or two; a stdio MCP child's own budget is mirrored into a
+    *separate*, JSON-unaware truncation the parent process applies to this
+    exact string, and an oversized response here would be blindly sliced
+    mid-structure by that parent-side filter, producing invalid JSON
+    instead of a valid-but-abbreviated one."""
     monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 64)
     warning = (
         "Deputy reported this Roster create as successful (Id 1), but "
@@ -1433,7 +1442,120 @@ def test_success_with_capped_dict_shortens_an_oversized_critical_field(monkeypat
     assert len(raw) <= 64
     result = json.loads(raw)
     assert result["status"] == "success"
-    assert result["warning"].endswith("...[truncated]")
+    assert result["truncated"] is True
+
+
+def test_success_with_capped_dict_shortens_an_oversized_critical_field(monkeypatch):
+    """With a bit more room than the tightest possible budget, shortening
+    must keep a real prefix of the original content plus the truncation
+    marker, not just whatever survives is dropped down to nothing."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 100)
+    warning = (
+        "Deputy reported this Roster create as successful (Id 1), but "
+        "reading it back returned no record. Treat this as unconfirmed -- "
+        "verify in Deputy directly before relying on it."
+    )
+    assert len(warning) > 100
+
+    raw = mcp_utils.success_with_capped_dict(
+        "record",
+        {"Id": 1, "Notes": "x" * 5000},
+        critical_fields={"warning": warning},
+    )
+
+    assert len(raw) <= 100
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["warning"].endswith("... [truncated]")
+    assert warning.startswith(result["warning"].removesuffix("... [truncated]"))
+
+
+def test_success_with_capped_dict_never_inflates_a_critical_field_below_marker_size(
+    monkeypatch,
+):
+    """A critical field whose value is already SHORTER than the truncation
+    marker must be left alone, not replaced by something bigger -- without
+    a size gate matching _truncation_marker_or_empty's own ("only install
+    the marker if it's no bigger than what it replaces"), a long key name
+    paired with a short value could get "shortened" into a larger, still
+    oversized response with nothing left to shrink afterward."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 64)
+
+    raw = mcp_utils.success_with_capped_dict(
+        "record",
+        {"Id": 1, "Notes": "x" * 5000},
+        critical_fields={"a_very_long_critical_field_key_name_here": "x"},
+    )
+
+    assert len(raw) <= 64
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    # The field itself may have been dropped entirely (nothing left to
+    # shrink), but the response must never come back larger than what a
+    # short value would have produced on its own.
+    assert (
+        "a_very_long_critical_field_key_name_here" not in result
+        or result["a_very_long_critical_field_key_name_here"] == "x"
+    )
+
+
+def test_success_with_capped_dict_drops_a_critical_field_that_cannot_shrink(
+    monkeypatch,
+):
+    """A non-string critical value can't be shortened the way a string
+    can -- once every shrinkable string is exhausted and the envelope is
+    still oversized, the field must be dropped outright rather than the
+    function ever handing back something wider than max_output_length."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 64)
+
+    raw = mcp_utils.success_with_capped_dict(
+        "record",
+        {"Id": 1, "Notes": "x" * 5000},
+        critical_fields={"stats": {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6}},
+    )
+
+    assert len(raw) <= 64
+    result = json.loads(raw)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def test_create_resource_warning_survives_truncation_with_instruction_intact(
+    monkeypatch,
+):
+    """The instruction a caller actually needs to act on ("verify directly
+    in Deputy") must be at the front of the warning, not the end -- the
+    truncation marker cuts from the end, so if the fixed instruction were
+    last (as an earlier version of this message had it), truncation would
+    strip exactly the part of the message that matters most. 180 is sized
+    to fit the fixed instruction but not the full variable-length Deputy
+    error detail appended after it -- tight enough to force a real cut,
+    loose enough that the instruction itself isn't also a casualty."""
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 180)
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 1, "FirstName": "Peter"}),
+            MockResponse(
+                status_code=403,
+                json_data={
+                    "error": {
+                        "message": "Access to object denied because of an "
+                        "extremely long, detailed diagnostic explanation "
+                        "that goes on for quite a while about permissions"
+                    }
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert "verify directly in Deputy" in result["warning"]
+    assert "Unconfirmed Deputy Roster create" in result["warning"]
 
 
 def test_success_with_capped_dict_rejects_overlapping_extra_and_critical_fields():

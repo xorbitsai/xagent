@@ -5782,15 +5782,7 @@ class ReActPattern(AgentPattern):
                 # Never overwrite the matched genuine record with the
                 # envelope: on provider id reuse the genuine result must stay
                 # in the ledger so later duplicates still find it.
-                if (
-                    self._find_tool_record(
-                        tool_call_id=str(tool_call["id"]),
-                        invocation_id=self._normalized_invocation_id(
-                            tool_call.get("invocation_id")
-                        ),
-                    )
-                    is None
-                ):
+                if str(tool_call["id"]) not in self.tool_ledger:
                     self._record_tool_call(
                         tool_call, status="completed", result=suppressed
                     )

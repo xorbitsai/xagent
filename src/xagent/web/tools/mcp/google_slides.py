@@ -2,6 +2,7 @@
 # differently; keep this module's import grouping stable for both hooks.
 # isort: skip_file
 
+import errno
 import json
 import logging
 import os
@@ -337,14 +338,23 @@ def _resolve_pptx_upload_path(file_path: str) -> Path:
     for candidate in candidates:
         try:
             resolved_candidate = candidate.resolve()
-        except (OSError, RuntimeError) as exc:
+        except RuntimeError:
+            # Python 3.11/3.12 raises RuntimeError for symlink loops. Keep the
+            # original path so stat() can surface the expected ELOOP error.
+            resolved_candidate = candidate
+        except OSError as exc:
             logger.warning("Could not resolve PPTX path %s: %s", candidate, exc)
-            continue
+            raise ValueError("file path could not be resolved safely") from None
         if not any(
             resolved_candidate.is_relative_to(directory) for directory in allowed_dirs
         ):
             continue
         authorized_candidate = authorized_candidate or resolved_candidate
+        try:
+            resolved_candidate.stat()
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
         if resolved_candidate.is_file():
             local_path = resolved_candidate
             break

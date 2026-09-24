@@ -42,6 +42,32 @@ interface ConnectedAccount {
 // Keep in sync with CloudIngestRequest.files max_length in src/xagent/web/api/kb.py.
 const MAX_CLOUD_INGEST_FILES = 5
 
+interface SanitizedGooglePickerDocument {
+  id: string
+  name?: string
+  mimeType?: string
+  resourceKey?: string
+  sizeBytes?: string
+}
+
+function sanitizeGooglePickerDocuments(value: unknown): SanitizedGooglePickerDocument[] {
+  if (!Array.isArray(value)) return []
+
+  return value.flatMap(item => {
+    if (!item || typeof item !== "object") return []
+    const document = item as Record<string, unknown>
+    if (typeof document.id !== "string" || document.id.trim() === "") return []
+
+    return [{
+      id: document.id,
+      name: typeof document.name === "string" ? document.name : undefined,
+      mimeType: typeof document.mimeType === "string" ? document.mimeType : undefined,
+      resourceKey: typeof document.resourceKey === "string" ? document.resourceKey : undefined,
+      sizeBytes: typeof document.sizeBytes === "string" ? document.sizeBytes : undefined,
+    }]
+  })
+}
+
 let googlePickerScriptPromise: Promise<void> | null = null
 
 function loadGooglePicker(): Promise<void> {
@@ -200,8 +226,7 @@ export function CloudConnectDialog({
 
           const pickedFiles: CloudFile[] = []
           let pickedFolder: CloudFile | null = null
-          for (const document of data.docs || []) {
-            if (!document.id) continue
+          for (const document of sanitizeGooglePickerDocuments(data.docs)) {
             const isFolder = document.mimeType === "application/vnd.google-apps.folder"
             const file: CloudFile = {
               id: document.id,
@@ -222,12 +247,16 @@ export function CloudConnectDialog({
             setSearchQuery("")
           }
           if (pickedFiles.length > 0) {
-            setSelectedFiles(prev => {
-              const merged = [...prev, ...pickedFiles]
-              return merged.filter(
-                (file, index, all) => all.findIndex(item => item.id === file.id) === index,
-              ).slice(0, MAX_CLOUD_INGEST_FILES)
-            })
+            const merged = [...selectedFiles, ...pickedFiles]
+            const unique = merged.filter(
+              (file, index, all) => all.findIndex(item => item.id === file.id) === index,
+            )
+            if (unique.length > MAX_CLOUD_INGEST_FILES) {
+              toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
+                count: MAX_CLOUD_INGEST_FILES,
+              }))
+            }
+            setSelectedFiles(unique.slice(0, MAX_CLOUD_INGEST_FILES))
           }
           setRefreshTrigger(value => value + 1)
         })

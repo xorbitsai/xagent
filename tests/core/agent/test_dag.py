@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import ANY
 
 import pytest
 
@@ -56,6 +57,35 @@ from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
+
+
+def test_failed_step_evidence_keeps_pre_identity_provider_overwrite_semantics() -> None:
+    dag = DAGPattern(lambda **_: None)
+    react = ReActPattern()
+    [completed] = react._normalize_tool_calls(
+        [{"id": "provider-reused", "name": "calculator", "args": {}}]
+    )
+    [failed] = react._normalize_tool_calls(
+        [{"id": "provider-reused", "name": "calculator", "args": {}}]
+    )
+    react._record_tool_call(completed, status="completed", result={"value": 1})
+    react._record_tool_call(failed, status="failed", result={"error": "failed"})
+    context = ExecutionContext(execution_id="provider-compatible-evidence")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "provider-reused",
+                "type": "function",
+                "function": {"name": "calculator", "arguments": "{}"},
+            }
+        ],
+    )
+    context.add_tool_result("calculator", {"value": 1}, "provider-reused")
+
+    dag._retain_failed_step_evidence("step", context, react)
+
+    assert dag.failed_step_evidence["step"]["observations"] == []
 
 
 class FakeWorkspace:
@@ -6902,9 +6932,13 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     [pending_call] = checkpoint["pattern_state"]["active_step_pattern_states"]["calc"][
         "pending_tool_calls"
     ]
-    assert pending_call["id"] == "dag-call"
-    assert pending_call["name"] == "calculator"
-    assert pending_call["args"] == {"expression": "6*7"}
+    assert pending_call == {
+        "id": "dag-call",
+        "invocation_id": ANY,
+        "issued_at": ANY,
+        "name": "calculator",
+        "args": {"expression": "6*7"},
+    }
     checkpointed_invocation_id = pending_call["invocation_id"]
     assert checkpointed_invocation_id
 

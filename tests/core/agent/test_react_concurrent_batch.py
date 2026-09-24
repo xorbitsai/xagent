@@ -197,6 +197,62 @@ async def test_concurrent_batch_assigns_ids_to_id_less_calls() -> None:
     assert batch == original_batch
 
 
+async def test_pending_entry_prepares_legacy_concurrent_calls_once_for_all_consumers() -> (
+    None
+):
+    waiting_result = {
+        "success": False,
+        "status": "waiting_for_user",
+        "interaction_id": "needs-input",
+        "message": "Continue?",
+        "interactions": [],
+    }
+    tools = [
+        FakeTool("first", concurrency_safe=True, result=waiting_result),
+        FakeTool("second", concurrency_safe=True, result=waiting_result),
+    ]
+    pattern = make_react(parallel=True, max_concurrency=2)
+    original_calls = [
+        {"name": "first", "args": {}},
+        {"name": "second", "args": {}},
+    ]
+    pattern.pending_tool_calls = original_calls
+    context = RecordingContext()
+
+    result = await pattern._execute_pending_tool_calls(
+        context=context,
+        tools=tools,
+        llm=None,
+        runtime=FakeRuntime(),
+    )
+
+    assert result is not None and result["status"] == "waiting_for_user"
+    assert original_calls == [
+        {"name": "first", "args": {}},
+        {"name": "second", "args": {}},
+    ]
+    context_ids = [entry["tool_call_id"] for entry in context.tool_results]
+    request_ids = [
+        request["tool_call_id"]
+        for request in pattern.waiting_for_user_request["requests"]
+    ]
+    assert all(context_ids)
+    assert len(set(context_ids)) == 2
+    assert request_ids == context_ids
+    assert [
+        record.tool_call_id for record in pattern.tool_ledger.values()
+    ] == context_ids
+    assert [entry["invocation_id"] for entry in context.tool_results] == [None, None]
+    assert [
+        request["invocation_id"]
+        for request in pattern.waiting_for_user_request["requests"]
+    ] == [None, None]
+    assert [record.invocation_id for record in pattern.tool_ledger.values()] == [
+        None,
+        None,
+    ]
+
+
 async def test_concurrent_batch_propagates_infra_callback_failure() -> None:
     # An infra callback failure (on_tool_start) is a real exception, not a tool
     # failure. The serial path lets it propagate and halt the turn; the
@@ -295,10 +351,7 @@ async def test_interrupt_filter_uses_batch_position_when_ids_repeat() -> None:
 
     assert [result["tool_name"] for result in context.tool_results] == ["done"]
     [pending_call] = pattern.pending_tool_calls
-    assert pending_call["id"] == batch[1]["id"]
-    assert pending_call["name"] == batch[1]["name"]
-    assert pending_call["args"] == batch[1]["args"]
-    assert pending_call["invocation_id"]
+    assert pending_call == batch[1]
 
 
 # --- Inc.4: tool_ledger ordering after a concurrent batch (I3) -------------

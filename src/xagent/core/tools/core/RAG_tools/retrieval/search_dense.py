@@ -10,8 +10,8 @@ Phase 1A Option C: Provides both sync and async search functions.
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from ..core.exceptions import DocumentValidationError
 from ..core.schemas import DenseSearchResponse
+from ..utils.validation_utils import validate_search_common_inputs
 from ..vector_storage.vector_manager import validate_query_vector
 
 if TYPE_CHECKING:
@@ -36,12 +36,7 @@ def _validate_dense_inputs(
         DocumentValidationError: If collection/model_tag/top_k are invalid.
         VectorValidationError: If query-vector validation fails.
     """
-    if not collection or not isinstance(collection, str):
-        raise DocumentValidationError("Collection must be a non-empty string")
-    if not model_tag or not isinstance(model_tag, str):
-        raise DocumentValidationError("model_tag must be a non-empty string")
-    if top_k <= 0 or top_k > 1000:
-        raise DocumentValidationError("top_k must be between 1 and 1000")
+    validate_search_common_inputs(collection, model_tag, top_k)
     validate_query_vector(query_vector)
 
 

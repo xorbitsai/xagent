@@ -13,6 +13,7 @@ import os
 import re
 import weakref
 from collections.abc import Coroutine, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
@@ -29,6 +30,7 @@ from typing import (
     cast,
 )
 from urllib.parse import urlsplit, urlunsplit
+from uuid import UUID
 
 import httpx
 from mcp.types import CallToolResult
@@ -37,6 +39,7 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
+from ....file_ref import parse_file_id_ref
 from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
@@ -242,6 +245,50 @@ logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
 _SLACK_ACTOR_RUNTIME_REFRESH_KEY = "_slack_actor_runtime_refresh"
+
+# Durable-file materialization and staging are synchronous filesystem/database
+# operations. Keep them off the agent event loop and cap concurrent copies so
+# a burst of large uploads cannot create an unbounded executor workload.
+_UPLOAD_STAGING_MAX_WORKERS = 4
+_UPLOAD_STAGING_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_UPLOAD_STAGING_MAX_WORKERS,
+    thread_name_prefix="xagent-mcp-upload",
+)
+
+# These are host-owned contracts for connectors whose upload APIs require a
+# local path.  Do not infer this from arbitrary argument names: only these
+# built-in tools may turn a durable FileRef into a temporary local path.
+_DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("onedrive", "onedrive_upload_file"): ("local_file_path",),
+    ("sharepoint", "sharepoint_upload_file"): ("local_file_path",),
+    ("google_drive", "google_drive_upload_file"): ("file_path",),
+    ("slack", "slack_upload_file"): ("file_path",),
+}
+
+
+def _durable_upload_fields(server_name: str, tool_name: str) -> tuple[str, ...]:
+    from .selection_spec import normalize_mcp_server_name
+
+    return _DURABLE_UPLOAD_FIELDS.get(
+        (normalize_mcp_server_name(server_name), tool_name), ()
+    )
+
+
+def _file_ref_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    parsed = parse_file_id_ref(normalized)
+    if parsed:
+        return parsed
+    try:
+        UUID(normalized)
+    except (ValueError, AttributeError):
+        return None
+    return normalized
+
 # Hard ceiling on how many exception nodes either walk over a failed call
 # visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
 # Two consumers read it: _bounded_exception_nodes (the 401 resolver's
@@ -1229,6 +1276,8 @@ class MCPToolAdapter(AbstractBaseTool):
         visibility: Optional[ToolVisibility] = None,
         allow_users: Optional[List[str]] = None,
         source_server: Optional[str] = None,
+        workspace: Any | None = None,
+        durable_upload_fields: tuple[str, ...] = (),
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
         raw_annotations: Optional[Mapping[str, Any]] = None,
@@ -1245,6 +1294,10 @@ class MCPToolAdapter(AbstractBaseTool):
                 (``normalize_mcp_server_name``), surfaced on
                 ``metadata.source_server`` so server-scoped selection matches
                 by structured equality rather than re-parsing the tool name.
+            workspace: Current task workspace used to stage durable FileRefs
+                for local-path upload connectors.
+            durable_upload_fields: Host-owned scalar argument names that accept
+                a durable FileRef and need task-local staging.
             concurrency_safe: Whether the server operator guarantees these MCP
                 tools are both concurrency-safe and idempotent when retried
                 after interruption.
@@ -1265,6 +1318,8 @@ class MCPToolAdapter(AbstractBaseTool):
         self._visibility = visibility or ToolVisibility.PRIVATE
         self._allow_users = allow_users
         self.source_server = source_server
+        self._workspace = workspace
+        self._durable_upload_fields = tuple(durable_upload_fields)
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
             concurrency_safe=concurrency_safe,
@@ -1322,7 +1377,16 @@ class MCPToolAdapter(AbstractBaseTool):
     @property
     def description(self) -> str:
         """Get tool description from MCP tool."""
-        return self.mcp_tool.description or f"Execute MCP tool: {self.mcp_tool.name}"
+        description = self.mcp_tool.description or (
+            f"Execute MCP tool: {self.mcp_tool.name}"
+        )
+        if self._workspace is not None and self._durable_upload_fields:
+            description += (
+                " A registered file_id (or file:<id>) may be supplied for "
+                "the local upload argument; it will be staged in the current "
+                "task workspace before this connector runs."
+            )
+        return description
 
     @property
     def write_hint(self) -> "MCPWriteHint":
@@ -1502,8 +1566,7 @@ class MCPToolAdapter(AbstractBaseTool):
             structured_content: Any = Field(
                 default=None,
                 description=(
-                    "Structured JSON result of the tool call, if the server "
-                    "returned one."
+                    "Structured JSON result of the tool call, if the server returned one."
                 ),
             )
             is_error: bool = Field(
@@ -1779,6 +1842,92 @@ class MCPToolAdapter(AbstractBaseTool):
 
         return False
 
+    async def _run_upload_staging_operation(self, operation: Any, *args: Any) -> Any:
+        """Run one synchronous staging operation in the bounded executor.
+
+        If the caller is cancelled while staging, wait for the worker to
+        finish before returning cancellation. This is required because a
+        worker can finish creating a staged file after the awaiting coroutine
+        has been cancelled; abandoning it would leak an untracked file.
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(_UPLOAD_STAGING_EXECUTOR, operation, *args)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(future)
+            except BaseException:
+                pass
+            raise
+
+    async def _stage_external_upload_file(self, file_id: str) -> Any:
+        """Stage one file and clean it if cancellation races the worker."""
+        workspace = self._workspace
+        if workspace is None:
+            raise RuntimeError("upload staging requires a task workspace")
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            _UPLOAD_STAGING_EXECUTOR,
+            workspace.stage_file_for_external_upload,
+            file_id,
+        )
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            try:
+                staged_path = await asyncio.shield(future)
+            except BaseException:
+                pass
+            else:
+                try:
+                    await self._run_upload_staging_operation(
+                        workspace.discard_staged_external_upload,
+                        staged_path,
+                    )
+                except BaseException:
+                    logger.warning(
+                        "Failed to clean up cancelled MCP upload staging path for %s",
+                        self.mcp_tool.name,
+                    )
+            raise
+
+    async def _stage_external_upload_args(
+        self, tool_args: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], list[Any]]:
+        if self._workspace is None or not self._durable_upload_fields:
+            return dict(tool_args), []
+
+        staged: list[Any] = []
+        prepared = dict(tool_args)
+        try:
+            for field_name in self._durable_upload_fields:
+                file_id = _file_ref_value(prepared.get(field_name))
+                if file_id is None:
+                    continue
+                staged_path = await self._stage_external_upload_file(file_id)
+                prepared[field_name] = str(staged_path)
+                staged.append(staged_path)
+            return prepared, staged
+        except BaseException:
+            await self._discard_external_upload_args(staged)
+            raise
+
+    async def _discard_external_upload_args(self, staged: list[Any]) -> None:
+        workspace = self._workspace
+        if workspace is None:
+            return
+        for staged_path in staged:
+            try:
+                await self._run_upload_staging_operation(
+                    workspace.discard_staged_external_upload, staged_path
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to clean up MCP upload staging path for %s",
+                    self.mcp_tool.name,
+                )
+
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute MCP tool asynchronously with user validation and context."""
         try:
@@ -1797,8 +1946,7 @@ class MCPToolAdapter(AbstractBaseTool):
             for field_name in runtime_bound_args:
                 if field_name in normalized_args:
                     logger.warning(
-                        "Ignoring LLM-supplied runtime-bound MCP argument "
-                        "%s for tool %s",
+                        "Ignoring LLM-supplied runtime-bound MCP argument %s for tool %s",
                         field_name,
                         self.mcp_tool.name,
                     )
@@ -1808,6 +1956,9 @@ class MCPToolAdapter(AbstractBaseTool):
             tool_args = parsed_args.model_dump(exclude_none=True)
             tool_args.update(self._runtime_tool_arguments())
             tool_meta = self._runtime_mcp_meta()
+            tool_args, staged_uploads = await self._stage_external_upload_args(
+                tool_args
+            )
 
             logger.debug(
                 "Executing MCP tool %s with args keys: %s for user %s",
@@ -1822,29 +1973,32 @@ class MCPToolAdapter(AbstractBaseTool):
 
             user_context = UserContext(current_user_id)
 
-            with user_context.set_context():
-                (
-                    invocation_connection,
-                    was_refreshed,
-                ) = await self._invocation_connection()
-                if invocation_connection is None:
-                    return _delegated_authorization_failed_result()
-                try:
-                    return await self._execute_mcp_call(
-                        invocation_connection, tool_args, tool_meta
-                    )
-                except (BaseExceptionGroup, Exception) as exc:
-                    # A trusted Slack grant is freshly revalidated before every
-                    # invocation. Never retry its call with the stale connection
-                    # retained only for tool metadata/listing.
-                    if was_refreshed:
+            try:
+                with user_context.set_context():
+                    (
+                        invocation_connection,
+                        was_refreshed,
+                    ) = await self._invocation_connection()
+                    if invocation_connection is None:
+                        return _delegated_authorization_failed_result()
+                    try:
+                        return await self._execute_mcp_call(
+                            invocation_connection, tool_args, tool_meta
+                        )
+                    except (BaseExceptionGroup, Exception) as exc:
+                        # A trusted Slack grant is freshly revalidated before every
+                        # invocation. Never retry its call with the stale connection
+                        # retained only for tool metadata/listing.
+                        if was_refreshed:
+                            raise
+                        retry_result = await self._retry_after_authorization_failure(
+                            exc, tool_args, tool_meta
+                        )
+                        if retry_result is not None:
+                            return retry_result
                         raise
-                    retry_result = await self._retry_after_authorization_failure(
-                        exc, tool_args, tool_meta
-                    )
-                    if retry_result is not None:
-                        return retry_result
-                    raise
+            finally:
+                await self._discard_external_upload_args(staged_uploads)
 
         # The tool-loading handlers (_load_direct_mcp_tools,
         # load_mcp_tools_as_agent_tools) log only the class name above DEBUG
@@ -2339,6 +2493,7 @@ def _build_mcp_tool_adapter(
     name_prefix: str = "mcp_",
     visibility: Optional[ToolVisibility] = None,
     allow_users: Optional[List[str]] = None,
+    workspace: Any | None = None,
     concurrency_safe: bool = False,
     concurrent_tools: Optional[List[str]] = None,
 ) -> MCPToolAdapter:
@@ -2358,6 +2513,8 @@ def _build_mcp_tool_adapter(
         visibility=visibility,
         allow_users=allow_users,
         source_server=normalize_mcp_server_name(server_name),
+        workspace=workspace,
+        durable_upload_fields=_durable_upload_fields(server_name, mcp_tool.name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,
         # Read off the tool the loader produced -- both the direct and the
@@ -2464,6 +2621,7 @@ async def _load_direct_mcp_tools(
     name_prefix: str,
     visibility: Optional[ToolVisibility],
     allow_users: Optional[List[str]],
+    workspace: Any | None = None,
 ) -> MCPLoadResult:
     """Load MCP tools directly on the host."""
     agent_tools: list[AbstractBaseTool] = []
@@ -2490,8 +2648,7 @@ async def _load_direct_mcp_tools(
             error_type = type(e).__name__
             if attempt < max_attempts - 1:
                 logger.warning(
-                    "Attempt %d failed to load tools from MCP server %s during "
-                    "%s (%s); retrying",
+                    "Attempt %d failed to load tools from MCP server %s during %s (%s); retrying",
                     attempt + 1,
                     server_name,
                     current_phase.value,
@@ -2549,6 +2706,7 @@ async def _load_direct_mcp_tools(
                 name_prefix=name_prefix,
                 visibility=visibility,
                 allow_users=allow_users,
+                workspace=workspace,
                 concurrency_safe=concurrency_safe,
                 concurrent_tools=concurrent_tools,
             )
@@ -2740,6 +2898,7 @@ async def load_mcp_tools_as_agent_tools(
     visibility: Optional[ToolVisibility] = None,
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
+    workspace: Any | None = None,
 ) -> MCPLoadResult:
     """Load MCP tools from multiple servers and convert to Agent tools.
 
@@ -2753,6 +2912,7 @@ async def load_mcp_tools_as_agent_tools(
         allow_users: List of allowed user IDs
         sandbox: Optional sandbox instance. When provided, stdio connections
             using npx/uvx will be routed through the sandbox for isolation.
+        workspace: Current task workspace for durable FileRef upload staging.
 
     Returns:
         Structured MCP tools, loaded server names, and public-safe failures.
@@ -2788,6 +2948,7 @@ async def load_mcp_tools_as_agent_tools(
                         name_prefix=name_prefix,
                         visibility=visibility,
                         allow_users=allow_users,
+                        workspace=workspace,
                         concurrency_safe=_concurrency_safe,
                         concurrent_tools=_concurrent_tools,
                     )
@@ -2869,6 +3030,7 @@ async def load_mcp_tools_as_agent_tools(
                         name_prefix=name_prefix,
                         visibility=visibility,
                         allow_users=allow_users,
+                        workspace=workspace,
                     ),
                     timeout_seconds,
                 )

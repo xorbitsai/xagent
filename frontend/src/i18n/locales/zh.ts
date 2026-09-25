@@ -4078,6 +4078,7 @@ const zh = {
     runStatus: {
       pending: "等待中",
       running: "运行中",
+      paused: "已暂停",
       completed: "已完成",
       failed: "失败"
     },

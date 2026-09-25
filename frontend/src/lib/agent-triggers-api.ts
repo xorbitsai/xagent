@@ -4,7 +4,20 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 
 export type AgentTriggerType = "webhook" | "scheduled" | "gmail"
-export type AgentTriggerRunStatus = "pending" | "running" | "completed" | "failed"
+
+// Runtime list so every consumer that has to cover all statuses (labels, tests)
+// can iterate them; the union below is derived from it instead of duplicating
+// the values. "paused" is the non-terminal resting state: the run's task parked
+// at PAUSED / WAITING_FOR_USER. Both task states collapse onto it (#2177).
+export const AGENT_TRIGGER_RUN_STATUSES = [
+  "pending",
+  "running",
+  "paused",
+  "completed",
+  "failed",
+] as const
+
+export type AgentTriggerRunStatus = (typeof AGENT_TRIGGER_RUN_STATUSES)[number]
 
 // Triggers can be owned by an agent or a workforce (issue #950). Workforce
 // triggers live under /api/workforces/{id}/triggers and have agent_id null.

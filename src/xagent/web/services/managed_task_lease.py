@@ -62,7 +62,10 @@ def finalize_managed_task_lease_result(
         raise ValueError("Cannot finalize a managed lease with RUNNING status")
 
     from .chat_history_service import persist_assistant_message_no_commit
-    from .task_orchestrator import invalidate_task_cache_best_effort
+    from .task_orchestrator import (
+        invalidate_task_cache_best_effort,
+        sync_trigger_run_status,
+    )
 
     try:
         if not release_task_lease_no_commit(db, lease, status=status):
@@ -86,6 +89,9 @@ def finalize_managed_task_lease_result(
                 diagnostic_error or CLIENT_SAFE_TASK_FAILURE,
             )
         sync_workforce_run_status(db, task, status)
+        # Channels finalize with PAUSED when they park a conversation, so this
+        # path needs the same projection as the orchestrator's park tail.
+        sync_trigger_run_status(db, task, status)
         if task.user_id is not None and (
             (assistant_content is not None and assistant_content.strip())
             or interactions
@@ -341,7 +347,10 @@ def _claim_managed_task_lease_in_session(
     try:
         db.expire_all()
         task = db.query(Task).filter(Task.id == task_id).one()
+        from .task_orchestrator import sync_trigger_run_status
+
         sync_workforce_run_status(db, task, TaskStatus.RUNNING)
+        sync_trigger_run_status(db, task, TaskStatus.RUNNING)
         db.commit()
     except Exception:
         db.rollback()

@@ -142,21 +142,14 @@ def _verify_record_readable(
 
     ``is_create`` derives both the verb ("create" vs. "write") and
     whether the warning includes a "do not retry" instruction from one
-    flag, computed once and reused by every warning this function can
-    build -- deliberately not two independent parameters (an earlier,
-    briefly-shipped version took ``verb``/``retry_note`` separately):
-    that let a future call site pass one without the other, which is
-    exactly how a still-earlier version of this function regressed --
-    generalizing for deputy_update_resource silently dropped the "do not
-    retry" instruction for create callers too, then a first attempt at
-    reintroducing it only wired the instruction into one of this
-    function's two warning-emission branches (the readback-failed one),
-    leaving deputy_add_employee's "no Id in the response" branch
-    (Deputy's own OpenAPI spec documents POST /supervise/employee's
-    response as an undocumented, possibly-Id-less schema) still silently
-    missing it. A single derived flag, computed once and read by both
-    branches, can't drift between them the way two independently-passed
-    parameters already did twice.
+    flag, computed once at the top of this function and reused by both
+    of its warning-emission branches below -- deliberately not two
+    independent parameters a caller could pass out of sync with each
+    other, which is how this same guidance has gone silently missing
+    from part of a warning before (see deputy_add_employee's "no Id in
+    the response" case, reachable since Deputy's own OpenAPI spec
+    documents POST /supervise/employee's response as an undocumented,
+    possibly-Id-less schema).
 
     deputy_create_resource/deputy_add_employee pass ``is_create=True``:
     retrying after an unconfirmed readback there risks a genuine

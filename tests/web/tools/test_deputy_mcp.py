@@ -1156,6 +1156,7 @@ def test_update_resource_merges_data_into_the_fetched_record(monkeypatch):
 
     assert result["status"] == "success"
     assert result["record"] == {"Id": 123, "FirstName": "Ada", "Active": False}
+    assert "warning" not in result
     assert mock_request.call_count == 3
 
     get_call, post_call, verify_call = mock_request.call_args_list
@@ -1198,8 +1199,13 @@ def test_update_resource_ignores_caller_supplied_id(monkeypatch):
     )
     monkeypatch.setattr(deputy.requests, "request", mock_request)
 
-    deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+    )
 
+    assert result["status"] == "success"
+    assert "warning" not in result
+    assert mock_request.call_count == 3
     post_call = mock_request.call_args_list[1]
     assert post_call.kwargs["json"] == {"Id": 123, "Active": False}
 
@@ -1220,8 +1226,13 @@ def test_update_resource_ignores_caller_supplied_id_even_when_current_lacks_one(
     )
     monkeypatch.setattr(deputy.requests, "request", mock_request)
 
-    deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+    )
 
+    assert result["status"] == "success"
+    assert "warning" not in result
+    assert mock_request.call_count == 3
     post_call = mock_request.call_args_list[1]
     assert post_call.kwargs["json"] == {"Active": False}
 

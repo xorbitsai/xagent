@@ -1922,7 +1922,7 @@ def test_success_with_capped_dict_critical_fields_survive_id_only_candidate(
 ):
     """Unlike extra_fields (previous test), critical_fields must NOT be
     dropped once the ladder is down to its id-only candidate -- this is
-    what _verify_created_record relies on so an unconfirmed-create warning
+    what _verify_record_readable relies on so an unconfirmed-write warning
     is never silently lost to truncation, which would reproduce the exact
     "confident-looking success" failure this mechanism exists to catch.
     (At this budget the id-only candidate already fits, so this doesn't

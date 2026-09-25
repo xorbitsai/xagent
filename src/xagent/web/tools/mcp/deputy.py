@@ -85,8 +85,26 @@ def _empty_create_response(subject: str) -> str:
     )
 
 
+# Shared verbatim by deputy_create_resource/deputy_add_employee's calls
+# into _verify_record_readable below: a retry after an unconfirmed
+# *readback* risks a genuine duplicate record, since the POST already
+# returned an Id and most likely did create it -- this is the specific
+# guidance a caller needs to not reproduce the 2026-09-21 incident's Id
+# 5/Id 6 duplicate-orphan pattern (create, readback fails, retry anyway).
+# Not applicable to deputy_update_resource, whose retries are idempotent
+# by design -- it leaves _verify_record_readable's retry_note at its
+# default (no instruction) instead of passing this.
+_DO_NOT_RETRY_CREATE_NOTE = "do not retry the create, which likely already succeeded"
+
+
 def _verify_record_readable(
-    resource: str, safe_resource: str, result: Any, *, record_id: Any = None
+    resource: str,
+    safe_resource: str,
+    result: Any,
+    *,
+    record_id: Any = None,
+    verb: str = "write",
+    retry_note: str | None = None,
 ) -> str:
     """Confirm a just-written record is actually retrievable before
     reporting success, rather than trusting the create/update response at
@@ -127,6 +145,22 @@ def _verify_record_readable(
     behavior -- including the "no id to verify against" warning below,
     which a caller that always supplies its own ``record_id`` can never
     hit.
+
+    ``verb`` (e.g. "create") and ``retry_note`` let each caller's warning
+    describe what it actually did and whether retrying is safe -- this
+    matters, not just reads better: deputy_create_resource/
+    deputy_add_employee pass verb="create" and
+    ``_DO_NOT_RETRY_CREATE_NOTE`` because retrying after an unconfirmed
+    readback there risks a genuine duplicate; deputy_update_resource
+    leaves both at their defaults (a generic "write" with no retry
+    instruction) because its retries are idempotent by design and an
+    explicit "do not retry" would be actively wrong. An earlier version
+    of this function hard-coded "create" and the "do not retry" wording,
+    then briefly lost the retry instruction entirely for every caller
+    when generalized for deputy_update_resource -- silently regressing
+    exactly the guidance that closes the 2026-09-21 incident's duplicate-
+    orphan pattern (Id 5, then Id 6) for create callers too. Parameterize
+    rather than hard-code again so a future caller can't repeat that.
     """
     if not isinstance(result, dict):
         # A malformed response _record_response already errors on.
@@ -147,8 +181,8 @@ def _verify_record_readable(
         # from deputy_update_resource, which always supplies its own
         # ``record_id`` from the URL.
         warning = (
-            f"Unconfirmed Deputy {resource} write -- verify directly in "
-            "Deputy before relying on it. The write response had no Id "
+            f"Unconfirmed Deputy {resource} {verb} -- verify directly in "
+            f"Deputy before relying on it. The {verb} response had no Id "
             "to read back and confirm."
         )
         return success_with_capped_dict(
@@ -194,16 +228,14 @@ def _verify_record_readable(
     # success_with_capped_dict's last-resort fallback cuts an oversized
     # critical field from the end, so if this ever needs shortening, it
     # must eat into "reason" -- not into the one instruction a caller
-    # actually needs to act on. No blanket "do not retry" instruction
-    # here (unlike the old create-only wording this replaces): that's
-    # correct for create (a retry after an unconfirmed *readback* risks a
-    # genuine duplicate, since the POST already returned an Id), but
-    # wrong for deputy_update_resource, whose retries are idempotent by
-    # design -- each tool's own docstring covers its retry semantics.
-    warning = (
-        f"Unconfirmed Deputy {resource} write (Id {verify_id}) -- verify "
-        f"directly in Deputy before relying on it. Reading it back {reason}."
+    # actually needs to act on.
+    base = (
+        f"Unconfirmed Deputy {resource} {verb} (Id {verify_id}) -- verify "
+        "directly in Deputy before relying on it"
     )
+    warning = (
+        f"{base}; {retry_note}." if retry_note else f"{base}."
+    ) + f" Reading it back {reason}."
     # critical_fields, not extra_fields: this warning is the entire point
     # of this function, so it must survive even success_with_capped_dict's
     # last-resort truncation fallback, which otherwise drops ordinary
@@ -573,7 +605,13 @@ def deputy_create_resource(resource: str, data: dict[str, Any]) -> str:
         result = _request("POST", f"/resource/{safe_resource}", json_data=create_data)
         if isinstance(result, dict) and not result:
             return _empty_create_response(resource)
-        return _verify_record_readable(resource, safe_resource, result)
+        return _verify_record_readable(
+            resource,
+            safe_resource,
+            result,
+            verb="create",
+            retry_note=_DO_NOT_RETRY_CREATE_NOTE,
+        )
     except Exception as e:
         logger.error(f"Error creating Deputy {resource} record: {e}", exc_info=True)
         return _error(str(e))
@@ -691,7 +729,13 @@ def deputy_add_employee(
         result = _request("POST", "/supervise/employee", json_data=body)
         if isinstance(result, dict) and not result:
             return _empty_create_response("employee")
-        return _verify_record_readable("Employee", "Employee", result)
+        return _verify_record_readable(
+            "Employee",
+            "Employee",
+            result,
+            verb="create",
+            retry_note=_DO_NOT_RETRY_CREATE_NOTE,
+        )
     except Exception as e:
         logger.error(f"Error adding Deputy employee: {e}", exc_info=True)
         return _error(str(e))
@@ -716,18 +760,13 @@ def deputy_update_resource(
     deactivate an Employee. For "Employee", fields like "Company",
     "Contact", "Role", and "StressProfile" are ids referencing other
     records, not literal values -- look up a valid id first (e.g. via
-    deputy_list_resource) rather than guessing one. Reassigning an
-    Employee's "Company" carries the same risk as a bad create -- see the
-    note below.
+    deputy_list_resource) rather than guessing one.
     After Deputy reports success, this reads the record back before
     confirming -- if that fails, the result is still returned but with a
     "warning" field flagging it as unconfirmed; treat that the same as a
-    failure until you've verified it directly in Deputy. This guards
-    against the same failure mode as deputy_create_resource's Employee
-    rejection/deputy_add_employee: Deputy's permission model is scoped by
-    location, so a write that changes an Employee's Company can leave it
-    just as unreadable as a bad create, even though Deputy reports
-    success.
+    failure until you've verified it directly in Deputy (reassigning an
+    Employee's "Company" carries this same unreadable-after-success risk
+    as a bad create).
     """
     try:
         # "Id" is identified by resource_id/the URL, not data: the URL's
@@ -786,9 +825,9 @@ def deputy_update_resource(
         # guaranteed to echo "Id" back, and the record being written is
         # never in doubt here the way it is for a create's server-assigned
         # id. See _verify_record_readable's docstring for why an update
-        # needs this at all -- Employee's "Company" field is a regular,
-        # writable field on this same POST, so a caller-supplied Company
-        # change can orphan the record exactly like a bad create.
+        # needs this verification at all, and for why this leaves ``verb``/
+        # ``retry_note`` at their defaults (an update retry is idempotent,
+        # unlike a create's).
         return _verify_record_readable(
             resource, safe_resource, result, record_id=resource_id
         )

@@ -32,6 +32,10 @@ repos:
           - langchain-core
           - langchain-openai
           - langchain-community
+          # SQLAlchemy 2.0.47's typing regressions turn SQL expressions into
+          # bool/Any and make the full project mypy run fail. Keep the hook on
+          # the first release with the corrected typing surface.
+          - sqlalchemy==2.0.53
           - numexpr
           # Pin to the project's resolved numpy (uv.lock). Unpinned, the mypy
           # hook env pulls the latest numpy, whose newer stubs use PEP 695

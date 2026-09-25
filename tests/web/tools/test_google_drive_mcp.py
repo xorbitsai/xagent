@@ -1492,7 +1492,7 @@ def test_move_file_rejects_canonical_self_move_with_root_alias(monkeypatch):
     }
     service.files.return_value.get.side_effect = [source_request, destination_request]
 
-    result = json.loads(google_drive.google_drive_move_file("actual-root-id", "root"))
+    result = json.loads(google_drive.google_drive_move_file("root", "actual-root-id"))
 
     assert result["status"] == "error"
     assert "itself" in result["message"]

@@ -1663,6 +1663,9 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
         )
         _attach_resource_keys(source_get, [(resolved_file_id, source_resource_key)])
         source = source_get.execute()
+        source_id = source.get("id")
+        if isinstance(source_id, str) and source_id:
+            resolved_file_id = source_id
         if source.get("trashed"):
             raise ValueError("file_id refers to a trashed file or folder")
 

@@ -27,6 +27,10 @@ repos:
           - types-python-dateutil
           - httpx
           - fastapi
+          # Keep the mypy hook aligned with the project's uv.lock. SQLAlchemy
+          # 2.1 changes the ORM stubs enough to surface hundreds of unrelated
+          # errors across the existing codebase.
+          - sqlalchemy==2.0.47
           - uvicorn
           - langchain
           - langchain-core

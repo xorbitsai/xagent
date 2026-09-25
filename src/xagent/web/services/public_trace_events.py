@@ -10,6 +10,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
 from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from .memory_availability import caller_facing_trace_data
 from .trace_event_types import GENERAL_ERROR_EVENT_TYPES
 
 TOOL_EVENT_TYPES = frozenset(
@@ -120,6 +121,11 @@ def normalize_public_trace_event(
     still see a top-level workforce_delegation_* event with only safe summary
     fields.
     """
+    # Public trace surfaces include historical checkpoint rows. Older rows may
+    # contain a trusted host resolver's arbitrary diagnostic nested inside the
+    # snapshot, so fold it recursively before applying event-specific shaping.
+    data = caller_facing_trace_data(data)
+
     if event_type in TOOL_EVENT_TYPES:
         data = redact_runtime_sensitive_payload(data)
     elif event_type in GENERAL_ERROR_EVENT_TYPES:

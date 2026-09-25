@@ -19,7 +19,13 @@ from xagent.core.memory.vector_compatibility import (
 from xagent.core.model.embedding import BaseEmbedding
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from xagent.providers.vector_store.lancedb import clear_connection_cache
-from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
+from xagent.web import dynamic_memory_store
+from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager, _Publication
+from xagent.web.memory_lifecycle import (
+    AdmissionResult,
+    MemoryLifecycleState,
+    MemoryLifecycleStatus,
+)
 
 IDENTITY = EmbeddingIdentity(
     "openai", "text-embedding-3-small", "https://api.openai.com/v1/embeddings", 4, None
@@ -179,22 +185,34 @@ def test_recreation_propagates_real_io_errors(tmp_path, failure_point):
 
 
 def test_failed_manager_replacement_preserves_all_previous_state(monkeypatch):
+    """A failed re-admission never costs the manager the store it is serving."""
+    published = SimpleNamespace(name="already-admitted")
+    fingerprint = "vector-space-fingerprint"
     manager = DynamicMemoryStoreManager()
-    previous_store = manager._memory_store
-    manager._is_lancedb = True
-    manager._last_embedding_model_id = 1
-    manager._last_embedding_model_fingerprint = (1, "old")
-    model = SimpleNamespace(id=2, updated_at="new")
-    monkeypatch.setattr(manager, "_get_embedding_model_from_db", lambda: model)
+    manager._publication = _Publication(
+        store=published,
+        status=MemoryLifecycleStatus(MemoryLifecycleState.READY),
+        vector_space_fingerprint=fingerprint,
+    )
+    # Model a manager that is serving but still owes an admission attempt.
+    manager._status = MemoryLifecycleStatus(MemoryLifecycleState.RETRYABLE_UNAVAILABLE)
     monkeypatch.setattr(
-        manager,
-        "_create_lancedb_store",
-        lambda _model: (_ for _ in ()).throw(OSError("construction failed")),
+        dynamic_memory_store,
+        "_read_authority_snapshot",
+        lambda: SimpleNamespace(vector_space_fingerprint=lambda: fingerprint),
+    )
+    monkeypatch.setattr(
+        dynamic_memory_store,
+        "admit_authority_storage",
+        lambda *_args, **_kwargs: AdmissionResult(
+            MemoryLifecycleStatus(MemoryLifecycleState.RETRYABLE_UNAVAILABLE)
+        ),
     )
 
-    manager._check_and_update_store()
+    manager.admit()
 
-    assert manager._memory_store is previous_store
-    assert manager._is_lancedb is True
-    assert manager._last_embedding_model_id == 1
-    assert manager._last_embedding_model_fingerprint == (1, "old")
+    assert manager._publication is not None
+    assert manager._publication.store is published
+    assert manager._publication.vector_space_fingerprint == fingerprint
+    assert manager._status.state is MemoryLifecycleState.READY
+    assert manager.get_memory_store() is published

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -11,12 +12,38 @@ from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
 
 from ..auth_dependencies import get_current_user
-from ..dynamic_memory_store import get_memory_store_manager
+from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
+from ..memory_lifecycle import MemoryUnavailableError
 from ..models.user import User
+from ..services.db_runtime import run_db_io_cancellation_safe
 from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
 MEMORY_READ_UNAVAILABLE_DETAIL = "Memory storage is temporarily unavailable."
+
+
+@contextmanager
+def memory_operation() -> Iterator[None]:
+    """Answer a revocation that lands mid-operation with the same stable 503.
+
+    :attr:`MemoryManagementRouter.memory_store` maps only the *initial*
+    acquisition failure. The store it returns is a revocable proxy that
+    re-checks its publication generation on every call, so a concurrent
+    revalidation -- an administrator changing the authority's vector space,
+    another worker revoking the publication -- can raise
+    :class:`MemoryUnavailableError` from the delegated operation instead,
+    after the acquisition already succeeded.
+
+    Without this, each route's broad ``except Exception`` turned that into a
+    500 naming the internal failure. One shared boundary keeps every route on
+    the single public-safe detail, and keeps the seven of them from drifting
+    apart. ``store-info`` deliberately does not use it: it reports the
+    lifecycle rather than operating on the store, and answers 200 throughout.
+    """
+    try:
+        yield
+    except MemoryUnavailableError as error:
+        raise HTTPException(status_code=503, detail=error.status.detail) from None
 
 
 class MemoryListRequest(BaseModel):
@@ -72,28 +99,31 @@ class MemoryManagementRouter:
 
         Args:
             memory_store_provider: Optional function that returns a memory store.
-                                  If not provided, uses the static memory_store.
+                                  If not provided, uses the admitted store
+                                  published by the lifecycle manager.
         """
-        if memory_store_provider is not None:
-            self.get_memory_store = memory_store_provider
-            self._static_memory_store = None
-        else:
-            # Backward compatibility: use static memory store
-            self._static_memory_store = None
+        self.get_memory_store = (
+            memory_store_provider
+            if memory_store_provider is not None
+            else get_memory_store
+        )
 
         self.router = APIRouter(prefix="/api/memory", tags=["memory"])
         self._setup_routes()
 
     @property
     def memory_store(self) -> MemoryStore:
-        """Get the current memory store (supports dynamic switching)"""
-        if (
-            hasattr(self, "_static_memory_store")
-            and self._static_memory_store is not None
-        ):
-            return self._static_memory_store
-        else:
+        """Get the published memory store, or fail closed with a 503.
+
+        Every lifecycle condition the runtime can be in -- awaiting a retryable
+        admission, blocked on repair, missing a usable credential, or needing a
+        restart after meaningful drift -- reaches callers as the same stable,
+        public-safe 503. Only the operator log carries the detail.
+        """
+        try:
             return self.get_memory_store()
+        except MemoryUnavailableError as error:
+            raise HTTPException(status_code=503, detail=error.status.detail) from None
 
     def _setup_routes(self) -> None:
         @self.router.get("/list", response_model=MemoryListResponse)
@@ -144,15 +174,18 @@ class MemoryManagementRouter:
                         filters["date_to"] = date_to
 
                     try:
-                        if search:
-                            memories = self.memory_store.search(
-                                query=search,
-                                k=1000,
-                                filters=filters if filters else None,
-                                similarity_threshold=similarity_threshold,
-                            )
-                        else:
-                            memories = self.memory_store.list_all(filters)
+                        with memory_operation():
+                            if search:
+                                memories = self.memory_store.search(
+                                    query=search,
+                                    k=1000,
+                                    filters=filters if filters else None,
+                                    similarity_threshold=similarity_threshold,
+                                )
+                            else:
+                                memories = self.memory_store.list_all(filters)
+                    except HTTPException:
+                        raise
                     except Exception:
                         logger.exception("Memory list read failed")
                         raise HTTPException(
@@ -198,7 +231,7 @@ class MemoryManagementRouter:
         ) -> dict[str, Any]:
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     response = self.memory_store.delete(memory_id)
                     if response.success:
                         return {
@@ -224,7 +257,7 @@ class MemoryManagementRouter:
         ) -> dict[str, Any]:
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     # Get existing memory
                     get_response = self.memory_store.get(memory_id)
                     if not get_response.success:
@@ -287,9 +320,11 @@ class MemoryManagementRouter:
         ) -> MemoryStatsResponse:
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     stats = self.memory_store.get_stats()
                     return MemoryStatsResponse(**stats)
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to get memory stats: {str(e)}"
@@ -302,9 +337,13 @@ class MemoryManagementRouter:
             # Validate required fields
             if "content" not in memory_request:
                 raise HTTPException(status_code=422, detail="Content field is required")
+            # Resolved before the try block on purpose: the lifecycle 503 must
+            # reach the caller as itself, while the handler below keeps
+            # wrapping store failures the way it always has.
+            store = self.memory_store
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     # Create new memory note
                     memory_note = MemoryNote(
                         content=memory_request.get("content", ""),
@@ -314,7 +353,7 @@ class MemoryManagementRouter:
                         metadata=memory_request.get("metadata", {}),
                     )
 
-                    response = self.memory_store.add(memory_note)
+                    response = store.add(memory_note)
                     if response.success:
                         return {
                             "success": True,
@@ -327,10 +366,43 @@ class MemoryManagementRouter:
                             detail=response.error or "Failed to create memory",
                         )
 
+            except HTTPException:
+                # Needed for the 503 above to reach the caller at all: without
+                # it the broad handler re-wrapped every HTTPException raised
+                # inside the block, status code included, as a 500.
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to create memory: {str(e)}"
                 )
+
+        # Registered before the "/{memory_id}" catch-all, which would otherwise
+        # swallow this path and answer it as a lookup for a note called
+        # "store-info".
+        @self.router.get("/store-info")
+        async def get_store_info(user: User = Depends(get_current_user)) -> dict:
+            """Report the memory lifecycle state.
+
+            This stays available in every lifecycle state, including
+            BLOCKED_REPAIR, so an operator can see why memory is fenced off
+            while the rest of the deployment keeps serving.
+            """
+            try:
+                # Off the event loop, like every other caller of the manager:
+                # the report reaches the drift check, which checks out a
+                # synchronous authority Session. Running that inline would
+                # block the loop thread while ``get_current_user``'s
+                # request-scoped connection is still held, so on a
+                # single-slot pool the nested checkout would be waiting on
+                # the very thread that has to release it.
+                return await run_db_io_cancellation_safe(
+                    get_memory_store_manager().get_store_info
+                )
+            except Exception:
+                logger.exception("Failed to read memory store info")
+                raise HTTPException(
+                    status_code=500, detail="Failed to get store info."
+                ) from None
 
         @self.router.get("/{memory_id}")
         async def get_memory(
@@ -338,7 +410,7 @@ class MemoryManagementRouter:
         ) -> dict[str, Any]:
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     response = self.memory_store.get(memory_id)
                     if response.success and response.content:
                         memory = response.content
@@ -364,17 +436,6 @@ class MemoryManagementRouter:
             except Exception as e:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to get memory: {str(e)}"
-                )
-
-        @self.router.get("/store-info")
-        async def get_store_info(user: User = Depends(get_current_user)) -> dict:
-            """Get current memory store information for debugging"""
-            try:
-                manager = get_memory_store_manager()
-                return manager.get_store_info()
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500, detail=f"Failed to get store info: {str(e)}"
                 )
 
     def get_router(self) -> APIRouter:

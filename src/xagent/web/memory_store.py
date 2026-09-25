@@ -1,10 +1,39 @@
-"""User-isolated memory store factory for web application."""
+"""User-isolated memory store access for the web application.
 
-from .memory_utils import create_memory_store
-from .user_isolated_memory import UserIsolatedMemoryStore
+Importing this module must not build or publish a store. A store may only be
+published once storage admission has certified it, so the names below resolve
+through the lifecycle manager at attribute-access time (PEP 562) instead of at
+import time.
+"""
 
-# Create base memory store instance, then wrap as user-isolated memory store
-base_memory_store = create_memory_store()
-global_memory_store = UserIsolatedMemoryStore(base_memory_store)
+from __future__ import annotations
 
-__all__ = ["global_memory_store"]
+from typing import TYPE_CHECKING, Any
+
+from .dynamic_memory_store import get_memory_store
+
+if TYPE_CHECKING:
+    from .dynamic_memory_store import MemoryStoreType
+
+    # Declared for type checkers only; resolved at runtime by ``__getattr__``.
+    base_memory_store: MemoryStoreType
+    global_memory_store: MemoryStoreType
+
+__all__ = ["base_memory_store", "global_memory_store"]
+
+_LAZY_NAMES = frozenset(__all__)
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve the published store on access, failing closed when there is none.
+
+    Raises:
+        MemoryUnavailableError: when admission has not certified a store.
+    """
+    if name in _LAZY_NAMES:
+        return get_memory_store()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)

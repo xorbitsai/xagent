@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -62,11 +63,35 @@ def get_authority(
     return _state(GlobalMemoryEmbeddingAuthorityService(db).read_record())
 
 
-# Declared, not inferred: the route reads the body itself.
+# Declared, not inferred: the route reads the body itself, so FastAPI never
+# walks ``AuthorityConfiguration`` and none of its definitions reach the
+# document. Embedding the standalone schema left its nested ``$ref`` pointing
+# at a root ``$defs`` the assembled application document does not have, so
+# ``credential_source`` could not be dereferenced from ``/openapi.json``.
+#
+# Generate the schema with component-shaped refs, publish it and its nested
+# definitions through :data:`OPENAPI_COMPONENT_SCHEMAS` for the application to
+# register under ``components.schemas``, and reference the component here.
+_REQUEST_SCHEMA: dict[str, Any] = AuthorityConfiguration.model_json_schema(
+    ref_template="#/components/schemas/{model}"
+)
+_NESTED_SCHEMAS: dict[str, Any] = _REQUEST_SCHEMA.pop("$defs", {})
+
+#: Schemas the assembled application document has to carry for this router's
+#: declared request body to resolve. Registered by ``xagent.web.app``.
+OPENAPI_COMPONENT_SCHEMAS: dict[str, Any] = {
+    **_NESTED_SCHEMAS,
+    AuthorityConfiguration.__name__: _REQUEST_SCHEMA,
+}
+
 _REQUEST_BODY = {
     "required": True,
     "content": {
-        "application/json": {"schema": AuthorityConfiguration.model_json_schema()}
+        "application/json": {
+            "schema": {
+                "$ref": f"#/components/schemas/{AuthorityConfiguration.__name__}"
+            }
+        }
     },
 }
 

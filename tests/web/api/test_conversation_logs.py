@@ -966,6 +966,58 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
     assert all(entry.get("message_type") != "compaction" for entry in transcript)
 
 
+def test_detail_folds_raw_memory_reason_in_historical_checkpoint() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Checkpoint Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Checkpoint REST task",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    raw_reason = "host resolver secret shard eu-3"
+
+    db = _direct_db_session()
+    try:
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                event_id="checkpoint-1",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data={
+                    "checkpoint_type": "agent_execution_checkpoint",
+                    "snapshot": {
+                        "context": {
+                            "metadata": {
+                                "memory_available": False,
+                                "memory_availability_reason": raw_reason,
+                            }
+                        }
+                    },
+                },
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+
+    assert response.status_code == 200, response.text
+    events = response.json()["trace_events"]
+    assert len(events) == 1
+    assert raw_reason not in repr(events)
+    assert (
+        events[0]["data"]["snapshot"]["context"]["metadata"][
+            "memory_availability_reason"
+        ]
+        == "unavailable"
+    )
+
+
 def test_detail_includes_delegated_agent_traces_but_not_builder_traces() -> None:
     admin = _admin_headers()
     admin_id = _user_id("admin")

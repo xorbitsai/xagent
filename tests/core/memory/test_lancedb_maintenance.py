@@ -276,7 +276,8 @@ def test_late_metadata_writer_invalidates_marker_and_resumes(tmp_path, monkeypat
     _safe_close_table(table)
 
 
-def test_table_version_change_invalidates_fast_path(tmp_path, monkeypatch):
+def test_later_write_keeps_the_completion_fast_path(tmp_path, monkeypatch):
+    """Completion is migration state: an ordinary write does not undo it."""
     connection = _connection(tmp_path, count=1)
     assert (
         maintain_lancedb_memory_table(connection, "memories").status
@@ -284,20 +285,18 @@ def test_table_version_change_invalidates_fast_path(tmp_path, monkeypatch):
     )
     writer = _table(connection)
     writer.update("id = 'note-0'", values={"text": "new text"})
+    version = writer.version
     _safe_close_table(writer)
 
-    scanned = False
-    original = maintenance._read_rows
-
-    def record_scan(table):
-        nonlocal scanned
-        scanned = True
-        return original(table)
-
-    monkeypatch.setattr(maintenance, "_read_rows", record_scan)
+    monkeypatch.setattr(
+        maintenance, "_read_rows", lambda _table: pytest.fail("fast path scanned")
+    )
     result = maintain_lancedb_memory_table(connection, "memories")
-    assert result.status is MaintenanceStatus.COMPLETE
-    assert scanned
+    table = _table(connection)
+    assert result == maintenance.MaintenanceOutcome(MaintenanceStatus.COMPLETE)
+    assert table.version == version
+    assert table.to_arrow().to_pylist()[0]["text"] == "new text"
+    _safe_close_table(table)
 
 
 def test_strong_consistency_detects_version_change_during_final_read(

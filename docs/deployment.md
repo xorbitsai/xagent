@@ -2,11 +2,24 @@
 
 ## LanceDB memory compatibility
 
-The declared LanceDB dependency range is the one in `pyproject.toml`; this
-section does not restate it. CI exercises three representatives of that range:
-the declared minimum, the version pinned in `uv.lock`, and the newest minor
-tested so far. It does not claim that every intervening release is tested
-individually.
+The LanceDB dependency is bounded: `lancedb>=0.32.0,<0.38` in `pyproject.toml`.
+The bound is deliberate. Persistent memory reaches storage only through the
+admission primitives, and those depend on LanceDB table, metadata and commit
+semantics that no minor release is contracted to preserve, so an unbounded
+range would let an untested minor be installed under a runtime that fences
+memory off when it disagrees.
+
+CI exercises three representatives of that range:
+
+| Version | Why |
+| --- | --- |
+| `0.32.0` | The declared minimum. |
+| `0.33.0` | The version pinned in `uv.lock`, which is what a default install resolves to. |
+| `0.37.1` | The newest supported minor. |
+
+Those three are tested, not every intervening release. Raising the upper bound
+means testing the new minor against the admission matrix first and moving the
+`pyproject.toml` bound, the lock and this table together.
 
 ## 2026-08-11 — New public-task File Operation isolation
 
@@ -447,3 +460,228 @@ Bulk deletion pressures autovacuum and can extend replication lag. Watch `n_dead
 `XAGENT_RETENTION_ENABLED=false` followed by a restart stops the job without changing the configured periods; unsetting the periods does the same. Neither restores deleted rows — recovery from an over-broad period is a database restore, which is what makes the dry run the step worth not skipping.
 
 This change adds no migration and no index.
+
+## 2026-09-20 — Persistent memory lifecycle enablement
+
+### Deployment impact
+
+Persistent memory now admits its LanceDB storage once, at worker startup, and
+publishes a store only if that admission succeeds. Two behaviors change.
+
+The runtime reads its embedding identity from the global memory embedding
+authority alone. It no longer falls back to a user's default embedding model or
+to whichever embedding model happens to be configured in the model hub. A
+deployment with no authority configured runs persistent memory in an ephemeral
+in-process store: memory works within a worker's lifetime and is not persisted.
+
+Configuration no longer takes effect online. Changing the authority's provider,
+model, endpoint, dimension, or instruct changes the vector space; running
+workers stop serving memory and report that a restart is required. Rotating the
+credential or changing the retry budget does not change the vector space, so
+workers keep serving with their admitted credential until they restart.
+
+### Prerequisites and configuration
+
+The `global_memory_embedding_authority` table and its migration already ship.
+No new environment variable, dependency, or infrastructure requirement is
+introduced. `MEMORY_SIMILARITY_THRESHOLD` keeps its meaning.
+
+LanceDB support is unchanged: the runtime only reaches storage through the
+admission primitives, so the supported range is the one in `pyproject.toml`
+described under "LanceDB memory compatibility" above.
+
+### Deployment and migration steps
+
+1. Quiesce memory writers first. Stop every API, task-execution and chat
+   worker; do not leave a worker running against the memory LanceDB directory.
+2. Configure the global memory embedding authority if persistent memory is
+   wanted. The credential must be application- or organization-owned; a
+   personal credential is rejected at rest. Never create or change the
+   authority while any API or task worker is serving memory: a running agent
+   keeps the adapter it was built with until its next hand-off, so a live
+   change leaves a window in which the old adapter is still writing, and a
+   same-width change silently mixes two vector spaces in one table. These are
+   the same steps for a first rollout and for a later vector-space change.
+3. Deploy the same version to every API and task-execution worker and start
+   them together. Do not roll the fleet: a mixed fleet can have one worker
+   writing under a vector space another has not admitted.
+4. Confirm the state on each worker with `GET /api/memory/store-info`.
+
+Admission migrates a table at most once. The first admission of a legacy table
+(one without scope columns or without a current full-admission marker) scans
+every row and atomically overwrites the table with the validated result. That
+overwrite replaces whatever the table held when it commits, which is why the
+first upgrade, a release that bumps the validator generation, and any
+explicit repair must run with every writer quiesced.
+Once a table carries the marker, admission is read-only: every later worker
+start, respawn or retry only reads the schema and compares the stored vector
+identity with the authority, and it never stages, rewrites or overwrites the
+table. Ordinary memory writes do not remove the marker, so workers can restart
+while their siblings keep serving.
+
+### Verification and monitoring
+
+`GET /api/memory/store-info` reports `state`, `mode`, `supports_vector_search`
+and a caller-safe `detail`. The states are:
+
+| `state` | Meaning | Operator action |
+| --- | --- | --- |
+| `ready` | Admitted; memory is serving. `mode` is `vector`, or `text_only` when the stored vectors do not match the authority. | None when `mode` is `vector`. When `mode` is `text_only`, see "Serving in text_only mode" below: memory is writable but vector search is off, and restoring it is offline work. |
+| `not_configured` | No authority configured; an ephemeral store is in use. | Configure the authority, then restart every worker. |
+| `credential_unavailable` | The stored credential could not be decrypted or failed its verifier. | Re-set the authority, then restart every worker. |
+| `retryable_unavailable` | The admission lock was held, or the backend failed transiently. | Stop every API and task-execution memory writer and keep them all stopped until the retried admission has finished, then restart the fleet together. Ordinary memory writes take neither the admission nor the maintenance lock, and a table that was never fully migrated is rewritten by admission, so a retry that runs beside a live writer on such a table can overwrite a row that writer commits. Checking that no process is mid-maintenance is not enough. |
+| `restart_required` | The authority no longer describes the stored vector space, or maintenance was left incomplete. | Quiesce, re-embed offline if the existing vectors must be kept, restart every worker together. |
+| `blocked_repair` | Storage holds invalid legacy data or an incompatible schema and is fenced off. | Offline repair; see below. |
+
+Memory API routes answer `503` in every state except `ready` and
+`not_configured`, with one stable detail that does not distinguish the faults.
+`/api/memory/store-info` keeps answering `200` in every state, including when
+the database connection pool is exhausted: it then reports the last published
+state rather than failing.
+
+Tasks and chats continue to start while memory is fenced off; they run with
+memory disabled and an inert store, so nothing reads from or writes to the
+storage admission refused.
+
+Where the reason is recorded, and where it is not:
+
+* **Recorded.** The lifecycle state reaches the task's execution metadata
+  (`memory_available`, `memory_availability_reason`), which rides into the
+  tracing backend and into the execution checkpoint, and it is reported by the
+  internal `AgentService` status. That is what to read when asking why a
+  particular task ran without memory.
+* **Not recorded.** It is deliberately *not* written to the durable `Task` or
+  `TaskChatMessage` rows, and it does not appear in the `TaskInfo` or
+  task-completion payloads a caller receives. Do not query task records or
+  public task payloads for it; use the execution metadata above, or
+  `GET /api/memory/store-info` for the worker-wide state.
+
+The operator log carries the detail the API deliberately does not. Search for
+`Persistent memory` at `WARNING` and `ERROR`; each non-ready state logs the
+specific quiescence and repair steps for that state.
+
+### Serving in text_only mode
+
+`state` is `ready` and `mode` is `text_only` when admission found the stored
+vectors were written under a different embedding identity than the authority
+now describes. This is a degraded but stable serving state, not a fault, and it
+is not the same as "memory works normally":
+
+* Memory is **readable and writable**. Tasks and chats keep using it.
+* New notes are stored **without vectors**. They are reachable only by lexical
+  search, never by semantic similarity.
+* **Vector search is off** for the whole table. `supports_vector_search` is
+  `false`, and searches fall back to lexical matching over every row,
+  pre-existing and new alike.
+* Existing vectors are **left exactly as they are**. The runtime holds no
+  embedding adapter in this mode, so no write re-embeds a historical row and
+  no write changes the table's vector width. Nothing mixes two vector spaces.
+
+Restoring vector search is offline work, and it does not happen by itself:
+
+1. Decide which vector identity the table should be in. Either point the
+   authority back at the identity the stored vectors were written under, or
+   keep the current authority and re-embed the data to match it.
+2. If re-embedding: quiesce all writers, back up the memory LanceDB directory,
+   and re-embed every row offline under the current authority. Do not re-embed
+   in place, and do not start a worker to do it.
+3. Restart every worker together. Confirm `mode` is `vector` and
+   `supports_vector_search` is `true`.
+
+Leaving a deployment in `text_only` indefinitely is a supported choice, as long
+as it is a deliberate one: semantic recall stays off until the step above is
+done, and every note written in the meantime will need the same offline
+re-embed before it becomes semantically searchable.
+
+### Repairing BLOCKED_REPAIR
+
+`blocked_repair` means admission found invalid legacy data (a NULL, empty or
+duplicate note id, non-string metadata, or a `user_id` outside signed int64) or
+an incompatible schema, and refused to touch the table. Admission never mutates
+storage in this state, so the data on disk is exactly what it was.
+
+1. Stop every worker. Repair is offline work.
+2. Back up the memory LanceDB directory (`<storage root>/memory_store`, or the
+   project-local `memory_store/` when that legacy location is in use).
+3. Repair or remove the offending rows against the backup, not in place.
+4. Start every worker together and confirm `state` is `ready`.
+
+Do not start a single worker to "test" a repair: a worker that admits
+successfully begins writing, and the rest of the fleet has not admitted.
+
+### Rollback
+
+Rolling back is **not** symmetric with rolling forward, and quiescing writers
+is not sufficient on its own. The previous version does not read the authority.
+It picks its embedding model per user from the model hub, it has none of the
+admission checks this release added, and so it will happily open the memory
+table under an identity that has nothing to do with the vectors in it. Three
+things follow, and all three are silent:
+
+* **Online re-embedding.** If the identity the old code selects has a
+  different dimension than the stored vectors, the first ordinary write
+  rewrites the whole table to the new width and re-embeds every historical row
+  under the new model. This is irreversible and there is no prompt.
+* **Mixed vector spaces.** If the identity has the *same* dimension but a
+  different model or endpoint, nothing rewrites and nothing complains. New
+  vectors are simply written into a different space than the old ones, and
+  recall degrades in a way that no state field reports.
+* **Silent loss of durability.** On an unsupported provider configuration the
+  old manager falls back to an ephemeral in-memory store. Memory appears to
+  work and is discarded when the worker exits.
+
+So gate the rollback on the persisted identity, not just on the fleet version:
+
+1. **Quiesce every writer.** Stop all API and task-execution workers. Nothing
+   below is safe against a live writer.
+2. **Establish what the persisted vector identity is.** Read it from the
+   memory table's schema metadata (`xagent.memory.vector_space`), or from this
+   release's `GET /api/memory/store-info` before you stop the fleet — a `mode`
+   of `vector` means the stored vectors match the current authority.
+3. **Establish what identity the previous release would select** for the same
+   deployment: the per-user default embedding model, or the model hub's
+   configured embedding model, as that release resolved it.
+4. **Take a backup and verify it.** Copy the memory LanceDB directory
+   (`<storage root>/memory_store`, or the project-local `memory_store/` when
+   that legacy location is in use) while writers are still fenced, then verify
+   the copy opens and its row count and vector width match the original. An
+   unverified copy is not a backup.
+5. **Compare the two identities.**
+   * **They match** — this proves only that the identities agree, not that
+     the previous release will persist anything. Its memory manager resolves
+     the embedding model from the model hub (never from the authority) and,
+     when it cannot build a persistent store for that row — a failed lookup, a
+     provider it does not build a store for, a construction error — it logs
+     the error and serves the in-memory store instead. So before rolling back,
+     get positive evidence for every identity step 3 found:
+     * a model hub row the previous release will select (the user's default
+       embedding model, else the first active embedding model visible to the
+       user), active and carrying that identity; and
+     * a verified start of the previous version, with memory storage detached
+       (both memory directory locations moved aside) and no other worker
+       running, in which a memory request made as that user (for example
+       `GET /api/memory/list`) is followed by `GET /api/memory/store-info`
+       reporting `store_type` `LanceDBMemoryStore`, `is_lancedb` `true` and
+       the expected `embedding_model_id`. `InMemoryMemoryStore` or
+       `is_lancedb` `false` means the fallback, not a persistent store.
+
+     With both, stop that instance, discard whatever memory directory it
+     created, reattach the real one, and
+     redeploy the previous version to every worker at once. Leave the
+     authority row in place: the old code ignores it, and the new version
+     needs it on the next roll-forward. Without both, treat the case as
+     unprovable and follow the next branch.
+   * **They differ, or the persisted identity or the previous release's
+     persistence under it cannot be proven** — do **not**
+     start the previous version against this data. Keep memory fenced and pick
+     one: restore a verified backup that was written under the identity the
+     previous release will select, or re-embed the table offline into that
+     identity before rolling back. Only then redeploy.
+
+If you must roll the application back before either of those can be done, roll
+back with memory storage detached — move the memory directory aside so the old
+code starts against an empty one — and reattach it only once the identities
+agree. Unrelated functions are unaffected either way; persistent memory is the
+only thing at stake.
+
+Rolling back does not undo an offline repair, and does not need to.

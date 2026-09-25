@@ -26,6 +26,7 @@ from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from ..db.config import create_alembic_config
 from ..skills.utils import create_skill_manager
 from ..templates.utils import create_template_manager
+from .dynamic_memory_store import admit_memory_storage_at_startup
 from .models.database import configure_db, get_engine
 from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 from .services.chrome_mcp_runtime import shutdown_chrome_execution_session_pool
@@ -89,6 +90,16 @@ async def run_worker(
         initialize_langfuse()
         await create_skill_manager().initialize()
         await create_template_manager().initialize()
+        # Admit persistent memory before this worker starts accepting tasks.
+        #
+        # This process never runs the FastAPI startup sequence, so this is its
+        # only admission. Without it the worker would serve no persistent
+        # memory at all: acquisition is deliberately startup-only, because
+        # admission's repair path rewrites the memory table and a request-time
+        # claim of quiescence fences no other worker. Blocking database and
+        # LanceDB work, so it runs off the event loop; it never raises, because
+        # memory must not be able to abort a worker boot.
+        await asyncio.to_thread(admit_memory_storage_at_startup)
         sandbox = get_sandbox_manager()
         if sandbox is not None:
             await check_sandbox_static_readiness(sandbox)

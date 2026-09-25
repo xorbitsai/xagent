@@ -1286,6 +1286,36 @@ def test_merge_context_metadata_restored_keeps_identity_against_none(
     assert context.metadata["run_id"] == "run-original"
 
 
+def test_merge_context_metadata_replaces_legacy_raw_memory_reason(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-safe-memory-reason")
+    context.metadata.update(
+        {
+            "memory_available": False,
+            "memory_availability_reason": "host resolver secret shard eu-3",
+            "other": "checkpointed",
+        }
+    )
+
+    runner._merge_context_metadata(
+        context,
+        {
+            "memory_available": False,
+            "memory_availability_reason": "unavailable",
+        },
+        restored=True,
+    )
+
+    assert context.metadata["memory_available"] is False
+    assert context.metadata["memory_availability_reason"] == "unavailable"
+    assert context.metadata["other"] == "checkpointed"
+
+
 @pytest.mark.asyncio
 async def test_runner_empty_resume_metadata_preserves_non_modality_metadata(
     tmp_path: Path,

@@ -69,6 +69,11 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
         lambda: SimpleNamespace(initialize=AsyncMock()),
     )
     monkeypatch.setattr(worker, "get_sandbox_manager", lambda: None)
+    monkeypatch.setattr(
+        worker,
+        "admit_memory_storage_at_startup",
+        lambda: order.append("memory_admission"),
+    )
 
     from xagent.web.services import chrome_mcp_runtime
 
@@ -125,6 +130,11 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
             < order.index("accept")
             < order.index("dispatch")
         )
+        # Persistent memory is admitted before this worker will accept a task.
+        # The worker process never runs the FastAPI startup, so this is its
+        # only admission; without it the worker serves no persistent memory,
+        # because acquisition never admits lazily.
+        assert order.index("memory_admission") < order.index("accept")
     assert (
         order.index("stop_claims")
         < order.index("coordinator_drain")
@@ -137,3 +147,73 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
     pool.close_all.assert_awaited_once()
     assert chrome_mcp_runtime._chrome_pool is None
     assert chrome_mcp_runtime._chrome_pool_manager is None
+
+
+@pytest.mark.asyncio
+async def test_memory_admission_failure_never_aborts_the_worker_boot(monkeypatch):
+    """Memory is fenced off on its own; the worker still serves tasks."""
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "worker")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    order = []
+    for name in (
+        "configure_db",
+        "validate_worker_schema",
+        "validate_interaction_rollout_at_startup",
+        "register_local_browser_runtime",
+        "register_execution_scope_snapshot_loader",
+        "initialize_langfuse",
+        "shutdown_task_runtime_hook_executor",
+        "unregister_local_browser_runtime",
+        "flush_langfuse",
+        "start_task_command_dispatcher",
+    ):
+        monkeypatch.setattr(worker, name, Mock())
+    monkeypatch.setattr(
+        worker,
+        "background_task_manager",
+        SimpleNamespace(
+            start_accepting=lambda: order.append("accept"),
+            shutdown=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr(worker, "close_task_coordinators", AsyncMock())
+    monkeypatch.setattr(
+        worker, "create_skill_manager", lambda: SimpleNamespace(initialize=AsyncMock())
+    )
+    monkeypatch.setattr(
+        worker,
+        "create_template_manager",
+        lambda: SimpleNamespace(initialize=AsyncMock()),
+    )
+    monkeypatch.setattr(worker, "get_sandbox_manager", lambda: None)
+    monkeypatch.setattr(worker, "start_task_event_bridge", AsyncMock())
+    monkeypatch.setattr(worker, "stop_task_command_dispatcher", AsyncMock())
+    monkeypatch.setattr(worker, "stop_task_event_bridge", AsyncMock())
+    monkeypatch.setattr(worker, "wait_for_heartbeat_manager_idle", AsyncMock())
+    monkeypatch.setattr(worker, "run_task_lease_recovery_loop", AsyncMock())
+
+    # Break admission itself, not the startup helper: the helper's own
+    # exception isolation is what must keep the boot alive, so stubbing it out
+    # would test nothing.
+    from xagent.web import dynamic_memory_store
+
+    admissions = []
+
+    def exploding_admission():
+        admissions.append(1)
+        raise RuntimeError("memory directory is on fire")
+
+    monkeypatch.setattr(
+        dynamic_memory_store, "admit_memory_storage", exploding_admission
+    )
+
+    stop = asyncio.Event()
+    stop.set()
+    await worker.run_worker(stop=stop)
+
+    assert admissions == [1]
+    assert "accept" in order

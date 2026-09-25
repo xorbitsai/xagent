@@ -187,3 +187,70 @@ def test_scan_and_selection_residency_stay_bounded(store, observed):
     assert max(observed["scan_batch"]) <= 2
     assert sum(observed["scan_batch"]) == 5
     assert max(observed["retained"]) <= 2
+
+
+def _old_full_scan_search(store, query, k, filters=None):
+    """The full-table text fallback ``search()`` used before it streamed: every
+    row materialised in scan order, then case-insensitive substring match, the
+    full filters in Python, and the first ``k`` survivors."""
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    try:
+        rows = table.to_arrow().select(["id", "text", "metadata"]).to_pylist()
+    finally:
+        _safe_close_table(table)
+    other_filters = store._flat_other_filters(filters)
+    results = []
+    for row in rows:
+        if query and query.lower() not in row["text"].lower():
+            continue
+        note = store._dict_to_memory_note(row)
+        if filters and not store._matches_filters(note, filters, other_filters):
+            continue
+        results.append(note.id)
+        if len(results) >= k:
+            break
+    return results[:k]
+
+
+def _populate_two_principals(store):
+    for index in range(12):
+        _add(
+            store,
+            f"m{index:02d}",
+            "Alpha" if index % 4 == 0 else f"note alpha {index}",
+            user_id=7 if index % 3 else 8,
+            category="c1" if index % 2 else "c2",
+        )
+    _add(store, "other", "beta only", user_id=7)
+
+
+@pytest.mark.parametrize(
+    ("query", "k", "filters"),
+    [
+        ("alpha", 3, None),
+        ("ALPHA", 20, None),
+        ("", 4, None),
+        ("alpha", 2, {"metadata": {"user_id": 7}}),
+        ("alpha", 20, {"metadata": {"user_id": 8}}),
+        ("alpha", 3, {"category": "c1", "metadata": {"user_id": 7}}),
+        ("missing", 5, None),
+    ],
+)
+def test_text_only_search_matches_the_old_full_scan(store, query, k, filters):
+    _populate_two_principals(store)
+    expected = _old_full_scan_search(store, query, k, filters)
+    assert [note.id for note in store.search(query, k=k, filters=filters)] == expected
+
+
+def test_text_only_search_reads_bounded_batches_not_the_table(store, observed):
+    store._stream_batch_size = 2
+    for index in range(10):
+        _add(store, f"n{index}", "alpha")
+
+    assert [note.id for note in store.search("alpha", k=3)] == ["n0", "n1", "n2"]
+    # Read in batches of at most 2, stopped once k were retained, and never
+    # held more than k.
+    assert observed["scan_batch"]
+    assert max(observed["scan_batch"]) <= 2
+    assert sum(observed["scan_batch"]) < 10
+    assert max(observed["retained"]) <= 3

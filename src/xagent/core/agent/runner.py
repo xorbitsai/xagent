@@ -56,6 +56,16 @@ logger = logging.getLogger(__name__)
 # key reaches a context rebuilt from a checkpoint.
 RESERVED_ENGINE_METADATA_KEYS = frozenset({TOOL_EVIDENCE_REMOVED_METADATA_KEY})
 
+# Current execution policy is authoritative over checkpointed copies of these
+# two server-owned fields. Besides keeping a resumed run's status current, this
+# upgrades historical checkpoints that may contain an unvetted host diagnostic
+# to the caller-safe value supplied by the current web policy before the next
+# checkpoint is persisted.
+RESUME_AUTHORITATIVE_METADATA_KEYS = (
+    "memory_available",
+    "memory_availability_reason",
+)
+
 
 @dataclass
 class ExecutionControl:
@@ -963,6 +973,11 @@ class AgentRunner:
             for key in ("task_source", "run_id"):
                 if metadata.get(key) is not None:
                     context.metadata[key] = metadata[key]
+            for key in RESUME_AUTHORITATIVE_METADATA_KEYS:
+                if key in metadata:
+                    context.metadata[key] = metadata[key]
+                else:
+                    context.metadata.pop(key, None)
             return
 
         current_metadata = dict(metadata)

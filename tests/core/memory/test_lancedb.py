@@ -658,7 +658,11 @@ def test_text_fallback_skips_malformed_row(temp_db_dir, caplog):
         },
     )
 
-    with caplog.at_level(logging.WARNING, logger="xagent.core.memory.lancedb"):
+    # The text fallback streams through retrieval_compatibility, which owns
+    # the skip-and-log for a malformed row.
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.memory.retrieval_compatibility"
+    ):
         results = store.search("note", k=10)
 
     contents = {r.content for r in results}
@@ -667,7 +671,7 @@ def test_text_fallback_skips_malformed_row(temp_db_dir, caplog):
     assert any(
         "Skipping malformed memory row" in record.getMessage()
         and "malformed-ts" in record.getMessage()
-        and "text search" in record.getMessage()
+        and "streaming scan" in record.getMessage()
         for record in caplog.records
     )
 

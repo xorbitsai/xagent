@@ -71,6 +71,8 @@ class AgentService:
         compact_llm: BaseLLM | None = None,
         memory_similarity_threshold: float | None = None,
         memory_enabled: bool = True,
+        memory_available: bool = True,
+        memory_availability_reason: str | None = None,
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
@@ -101,6 +103,12 @@ class AgentService:
         self.preferred_input_modalities = self._base_preferred_input_modalities
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
+        # Why memory is off, when it is off for a reason the runtime chose
+        # rather than one the caller asked for. Caller-safe by construction:
+        # whoever builds this service is responsible for passing a value fit
+        # to publish (see the web layer's memory availability policy).
+        self.memory_available = memory_available
+        self.memory_availability_reason = memory_availability_reason
         self.react_max_iterations = max(1, int(react_max_iterations))
         self.enable_default_tools = enable_default_tools
         self.skills_enabled = skills_enabled
@@ -399,6 +407,42 @@ class AgentService:
             dict[str, Any] | None, self._execution_adapter.get_status(execution_id)
         )
 
+    def revoke_memory(
+        self,
+        *,
+        inert_store: MemoryStore,
+        availability_reason: str | None,
+        execution_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Take this service off persistent memory before its next turn.
+
+        Sets exactly the fields a service constructed with unavailable memory
+        already carries, so a reconciled turn is indistinguishable from a
+        freshly built one: the inert store replaces the published one, memory
+        is disabled -- which is what withholds the execution-scoped memory
+        tools, because the pattern builds them from the store the adapter is
+        handed -- and the reason reaches both the service status and the
+        execution metadata that rides into the trace and the checkpoint.
+
+        Applied to the adapter as well as to the service, so the change has
+        landed by the time this returns rather than at the start of the next
+        execution. That is what lets a caller treat the swap as atomic with
+        respect to the turn it is about to run.
+        """
+        self.memory = inert_store
+        # Keep the compatibility shim in step with a freshly built service.
+        self.agent.memory_store = inert_store
+        self.memory_enabled = False
+        self.memory_available = False
+        self.memory_availability_reason = availability_reason
+        if execution_metadata:
+            self.execution_metadata.update(execution_metadata)
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.memory_store = None
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
+            )
+
     def add_pattern(self, pattern: Any) -> None:
         self.patterns.append(pattern)
         self.agent.patterns = self.patterns
@@ -415,6 +459,9 @@ class AgentService:
             "patterns_count": 1 if self.llm else 0,
             "tools_count": len(self.tools),
             "memory_type": self.memory.__class__.__name__,
+            "memory_enabled": self.memory_enabled,
+            "memory_available": self.memory_available,
+            "memory_availability_reason": self.memory_availability_reason,
             "ready": self.llm is not None,
             "execution_type": self._execution_type(),
             "llm_configured": self.llm is not None,

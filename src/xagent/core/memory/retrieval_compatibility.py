@@ -1,10 +1,11 @@
-"""Bounded streaming retrieval for the dormant persistent-memory path (#2346).
+"""Bounded streaming retrieval for the persistent memory store (#2346).
 
-The live text fallback in ``LanceDBMemoryStore`` materialises the whole
-candidate population (``limit(None).to_pylist()``), pushes only the null-vector
-predicate into the backend, and sorts every candidate to pick ``k``. This module
-is the compatible replacement for that shape, kept dormant: it is reachable only
-from ``search_with_null_vector_fallback``, never from ``search``.
+``LanceDBMemoryStore`` used to answer a text search by materialising the whole
+table and filtering it in Python. This module is the bounded replacement. The
+ordinary ``search`` text path (no embedding, or no ANN result) goes through
+:func:`stream_lexical_top_k` in scan order (``ranked=False``); the ranked form
+is still reachable only from the dormant ``search_with_null_vector_fallback``
+admission primitive.
 
 Three properties hold on every scan here. **Bounded residency**: rows arrive
 through the backend's own batching (``to_batches(batch_size=...)``), projected to
@@ -26,7 +27,7 @@ from __future__ import annotations
 import heapq
 import logging
 from itertools import count
-from typing import Any, Callable, Iterable, Iterator, Optional, Union
+from typing import Any, Callable, Generator, Iterable, Iterator, Optional, Union
 
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .core import MemoryNote
@@ -76,7 +77,7 @@ def _stream_rows(
     scope_where: Optional[str],
     null_vectors_only: bool,
     batch_size: int,
-) -> Iterator[dict[str, Any]]:
+) -> Generator[dict[str, Any], None, None]:
     """Yield backend rows one bounded batch at a time. The ``vector IS NULL``
     term is added only when the table actually carries a vector column, so a
     legacy vectorless table streams instead of failing."""
@@ -116,7 +117,11 @@ def _accepted_note(
     try:
         note = row_to_note(row)
     except Exception as row_error:
-        logger.warning("Skipping malformed memory row in streaming scan: %s", row_error)
+        logger.warning(
+            "Skipping malformed memory row %r in streaming scan: %s",
+            row.get("id"),
+            row_error,
+        )
         return None
     if residual_filters and not matches(note):
         return None
@@ -134,6 +139,7 @@ def stream_lexical_top_k(
     exclude_ids: Iterable[str] = (),
     null_vectors_only: bool = True,
     batch_size: int = DEFAULT_STREAM_BATCH_SIZE,
+    ranked: bool = True,
 ) -> list[MemoryNote]:
     """The ``k`` best lexical matches for ``query``, streamed and bounded.
 
@@ -141,6 +147,11 @@ def stream_lexical_top_k(
     substring; more occurrences first; stable tie-break by id — but selected
     with a heap bounded at ``k`` across all batches instead of sorting every
     candidate.
+
+    ``ranked=False`` is the ordinary ``search()`` text path: the first ``k``
+    eligible rows in scan order, matched with ``str.lower`` exactly as the
+    full-table scan it replaces did. Because no later row can outrank an
+    earlier one, the scan stops as soon as ``k`` notes are retained.
 
     ``exclude_ids`` carries the ids ANN already returned. They are dropped on
     the raw row, before a note is built and before a heap slot is taken, so a
@@ -151,15 +162,36 @@ def stream_lexical_top_k(
     scope_where, residual_filters = build_scope_where(filters)
     matches = note_filter_factory(residual_filters)
     excluded = set(exclude_ids)
-    needle = query.casefold()
-    heap: list[tuple[_Descending, int, MemoryNote]] = []
-    tiebreak = count()
-    for row in _stream_rows(
+    rows = _stream_rows(
         resolve_handle(source),
         scope_where=scope_where,
         null_vectors_only=null_vectors_only,
         batch_size=batch_size,
-    ):
+    )
+    if not ranked:
+        needle = query.lower()
+        selected: list[MemoryNote] = []
+        try:
+            for row in rows:
+                if str(row.get("id", "")) in excluded:
+                    continue
+                if needle and needle not in (row.get("text") or "").lower():
+                    continue
+                note = _accepted_note(row, row_to_note, residual_filters, matches)
+                if note is None:
+                    continue
+                selected.append(note)
+                _checkpoint("retained", len(selected))
+                if len(selected) >= k:
+                    break
+        finally:
+            # Stopping early must still release the table the scan opened.
+            rows.close()
+        return selected
+    needle = query.casefold()
+    heap: list[tuple[_Descending, int, MemoryNote]] = []
+    tiebreak = count()
+    for row in rows:
         if str(row.get("id", "")) in excluded:
             continue
         folded = (row.get("text") or "").casefold()

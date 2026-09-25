@@ -55,7 +55,10 @@ dependencies = [
   "python-docx>=1.1.0",  # Built-in Word MCP connector runtime
   "pypinyin>=0.53.0",
   "cairosvg >= 2.7.1",
-  "lancedb>=0.32.0",
+  # Bounded: the memory admission primitives depend on LanceDB table, metadata
+  # and commit semantics that no major/minor bump is contracted to preserve.
+  # See "LanceDB memory compatibility" in docs/deployment.md.
+  "lancedb>=0.32.0,<0.38",
   # Dictionary for lance FTS jieba tokenizer; only the macOS wheel embeds one.
   "jieba>=0.42.1",
   "pyarrow>=16.1.0",

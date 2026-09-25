@@ -2506,6 +2506,8 @@ async def execute_resume_background(
     ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
     resume executes as (``UserContext``), not the acting principal.
     """
+    from .agent_service_manager import caller_facing_execution_metadata
+
     resume_owner_task = asyncio.current_task()
     if resume_owner_task is None:
         raise RuntimeError(f"Task {task_id} resume has no asyncio task")
@@ -3076,7 +3078,11 @@ async def execute_resume_background(
                 "error_details": result.get("error_details"),
                 **control_event_state,
                 "type": "task_completed",
-                "metadata": result.get("metadata", {}),
+                # The owner's socket, not the operator trace: fold the raw
+                # memory availability reason.
+                "metadata": caller_facing_execution_metadata(
+                    result.get("metadata", {})
+                ),
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
             task_id,

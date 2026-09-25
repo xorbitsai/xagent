@@ -14,7 +14,7 @@ import {
 interface ConnectedAccount {
   id: number
   provider: string
-  email?: string
+  email?: string | null
 }
 
 interface GoogleDrivePickerButtonProps {
@@ -49,7 +49,12 @@ export function GoogleDrivePickerButton({
         )
       }
       const accounts = await accountsResponse.json() as ConnectedAccount[]
-      const account = accounts.find(item => item.email === connectedAccount) ?? accounts[0]
+      const account = connectedAccount
+        ? accounts.find(item => item.email === connectedAccount)
+        : accounts.reduce<ConnectedAccount | undefined>(
+            (latest, item) => !latest || item.id > latest.id ? item : latest,
+            undefined,
+          )
       if (!account) throw new Error(t("kb.dialog.cloudConnect.auth.expired"))
 
       const configResponse = await apiRequest(

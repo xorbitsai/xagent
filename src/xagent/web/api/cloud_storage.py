@@ -28,6 +28,8 @@ cloud_router = APIRouter(prefix="/api/cloud", tags=["Cloud Storage"])
 
 # Google OAuth Constants
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+GOOGLE_DRIVE_SCOPE_PREFIX = "https://www.googleapis.com/auth/drive"
 
 
 def _google_credentials_expiry(value: datetime | None) -> datetime | None:
@@ -40,6 +42,15 @@ def _google_credentials_expiry(value: datetime | None) -> datetime | None:
     if value is None or value.tzinfo is None:
         return value
     return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _google_database_expiry(value: datetime | None) -> datetime | None:
+    """Return an aware UTC datetime for ``UserOAuth.expires_at``."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
@@ -107,13 +118,18 @@ def get_google_credentials(
     )
 
     # Check if token needs refresh
-    if creds.expired and creds.refresh_token:
+    if creds.expired:
+        if not creds.refresh_token:
+            raise HTTPException(
+                status_code=401,
+                detail="Google Drive session expired. Please reconnect.",
+            )
         try:
             creds.refresh(Request())
             # Update token in DB
             setattr(oauth_account, "access_token", creds.token)
             if creds.expiry:
-                oauth_account.expires_at = creds.expiry
+                oauth_account.expires_at = _google_database_expiry(creds.expiry)
             db.commit()
         except Exception as e:
             logger.error(f"Failed to refresh Google token: {e}")
@@ -174,9 +190,10 @@ async def get_google_drive_picker_config(
     response.headers["Cache-Control"] = "no-store"
     creds = get_google_credentials(cast(int, user.id), db, account_id)
     granted_scopes = set(creds.scopes or ())
-    if "https://www.googleapis.com/auth/drive" in granted_scopes or (
-        "https://www.googleapis.com/auth/drive.file" not in granted_scopes
-    ):
+    drive_scopes = {
+        scope for scope in granted_scopes if scope.startswith(GOOGLE_DRIVE_SCOPE_PREFIX)
+    }
+    if drive_scopes != {GOOGLE_DRIVE_FILE_SCOPE}:
         raise HTTPException(
             status_code=409,
             detail=(

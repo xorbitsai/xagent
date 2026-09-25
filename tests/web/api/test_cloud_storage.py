@@ -1,6 +1,6 @@
 """Tests for cloud-storage API metadata contracts."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +10,7 @@ from fastapi import Response
 
 from xagent.web.api.cloud_storage import (
     _google_credentials_expiry,
+    _google_database_expiry,
     get_google_credentials,
     get_google_drive_picker_config,
     list_google_drive_files,
@@ -134,6 +135,35 @@ async def test_google_drive_picker_config_rejects_legacy_full_drive_scope(
 
 
 @pytest.mark.asyncio
+async def test_google_drive_picker_config_rejects_additional_broad_drive_scope(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_PICKER_API_KEY", "picker-api-key")
+    monkeypatch.setenv("GOOGLE_PICKER_APP_ID", "1234567890")
+
+    with (
+        patch(
+            "xagent.web.api.cloud_storage.get_google_credentials",
+            return_value=SimpleNamespace(
+                token="access-token",
+                scopes={
+                    "https://www.googleapis.com/auth/drive.file",
+                    "https://www.googleapis.com/auth/drive.readonly",
+                },
+            ),
+        ),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        await get_google_drive_picker_config(
+            db=MagicMock(),
+            user=SimpleNamespace(id=1),
+            response=Response(),
+        )
+
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_google_drive_picker_config_does_not_fallback_to_server_api_key(
     monkeypatch,
 ) -> None:
@@ -169,6 +199,25 @@ def test_google_credentials_expiry_is_normalized_to_naive_utc() -> None:
     assert _google_credentials_expiry(aware) == aware.replace(tzinfo=None)
 
 
+def test_google_database_expiry_is_normalized_to_aware_utc() -> None:
+    naive = datetime(2026, 9, 24, 12, 34)
+    assert _google_database_expiry(naive) == naive.replace(tzinfo=timezone.utc)
+
+
+def test_google_database_expiry_converts_non_utc_aware_values() -> None:
+    aware = datetime(
+        2026,
+        9,
+        24,
+        14,
+        34,
+        tzinfo=timezone(timedelta(hours=2)),
+    )
+    assert _google_database_expiry(aware) == datetime(
+        2026, 9, 24, 12, 34, tzinfo=timezone.utc
+    )
+
+
 def test_get_google_credentials_passes_expiry_to_google_auth() -> None:
     expires_at = datetime(2026, 9, 24, 12, 34, tzinfo=timezone.utc)
     account = SimpleNamespace(
@@ -201,6 +250,79 @@ def test_get_google_credentials_passes_expiry_to_google_auth() -> None:
     assert credentials_class.call_args.kwargs["expiry"] == expires_at.replace(
         tzinfo=None
     )
+
+
+def test_get_google_credentials_rejects_expired_account_without_refresh_token() -> None:
+    account = SimpleNamespace(
+        access_token="expired-access-token",
+        refresh_token=None,
+        scope="https://www.googleapis.com/auth/drive.file",
+        expires_at=datetime(2026, 9, 24, 12, 34, tzinfo=timezone.utc),
+    )
+    query = MagicMock()
+    query.filter.return_value = query
+    query.first.return_value = account
+    fake_credentials = SimpleNamespace(expired=True, refresh_token=None)
+
+    with (
+        patch(
+            "xagent.web.api.cloud_storage.scoped_user_oauth_query",
+            return_value=query,
+        ),
+        patch(
+            "xagent.web.api.cloud_storage.get_google_oauth_config",
+            return_value=("client-id", "client-secret"),
+        ),
+        patch(
+            "xagent.web.api.cloud_storage.Credentials",
+            return_value=fake_credentials,
+        ),
+        pytest.raises(HTTPException) as exc_info,
+    ):
+        get_google_credentials(user_id=1, db=MagicMock())
+
+    assert exc_info.value.status_code == 401
+
+
+def test_get_google_credentials_persists_refreshed_expiry_as_aware_utc() -> None:
+    expires_at = datetime(2026, 9, 24, 12, 34, tzinfo=timezone.utc)
+    refreshed_expiry = datetime(2026, 9, 24, 13, 34)
+    account = SimpleNamespace(
+        access_token="expired-access-token",
+        refresh_token="refresh-token",
+        scope="https://www.googleapis.com/auth/drive.file",
+        expires_at=expires_at,
+    )
+    query = MagicMock()
+    query.filter.return_value = query
+    query.first.return_value = account
+    fake_credentials = MagicMock(
+        expired=True,
+        refresh_token="refresh-token",
+        token="refreshed-access-token",
+        expiry=refreshed_expiry,
+    )
+    db = MagicMock()
+
+    with (
+        patch(
+            "xagent.web.api.cloud_storage.scoped_user_oauth_query",
+            return_value=query,
+        ),
+        patch(
+            "xagent.web.api.cloud_storage.get_google_oauth_config",
+            return_value=("client-id", "client-secret"),
+        ),
+        patch(
+            "xagent.web.api.cloud_storage.Credentials",
+            return_value=fake_credentials,
+        ),
+    ):
+        get_google_credentials(user_id=1, db=db)
+
+    assert account.access_token == "refreshed-access-token"
+    assert account.expires_at == refreshed_expiry.replace(tzinfo=timezone.utc)
+    db.commit.assert_called_once_with()
 
 
 @pytest.mark.asyncio

@@ -133,3 +133,11 @@ def test_revision_metadata() -> None:
 
     assert migration.revision == "20260924_enable_google_drive_picker"
     assert migration.down_revision == "20260924_hide_google_drive_until_picker"
+
+
+def test_registry_is_visible_after_picker_migration() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    app = get_builtin_public_mcp_app("google-drive")
+    assert app is not None
+    assert app["is_visible_in_connector"] is True

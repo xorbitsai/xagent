@@ -289,6 +289,7 @@ def _file_ref_value(value: Any) -> str | None:
         return None
     return normalized
 
+
 # Hard ceiling on how many exception nodes either walk over a failed call
 # visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
 # Two consumers read it: _bounded_exception_nodes (the 401 resolver's

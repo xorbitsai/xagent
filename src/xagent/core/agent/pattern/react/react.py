@@ -1500,6 +1500,16 @@ class ReActPattern(AgentPattern):
                 "the user or attempt an unavailable interaction tool; finish with "
                 "outcome=blocked and explain what is missing. "
             )
+            clarification_instruction = (
+                "Request clarification only when missing information prevents "
+                "correct or authorized work or the user explicitly asked to be "
+                "consulted. "
+                if self.user_interaction_enabled
+                else "User interaction is disabled. If the user explicitly asked "
+                "to choose and that choice is still pending, do not select for "
+                "them; finish with outcome=blocked and explain that the required "
+                "user choice cannot be obtained in this run. "
+            )
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
                 "execute, inspect, read, write, or otherwise produce a concrete result "
@@ -1511,9 +1521,7 @@ class ReActPattern(AgentPattern):
                 "as any other tool call: run the work tools first, then answer on a "
                 "later turn from their results. Do not write assistant text in the "
                 "same response as a work tool call; call the tool directly. "
-                "Request clarification only when user interaction is enabled and "
-                "either missing information prevents correct or authorized work "
-                "or the user explicitly asked to be consulted. "
+                f"{clarification_instruction}"
                 "For nonessential presentation choices, "
                 "including an unspecified output format, choose a sensible "
                 "default and deliver the supported work without pausing unless "
@@ -3192,13 +3200,15 @@ class ReActPattern(AgentPattern):
                     "name": "ask_user_question",
                     "description": (
                         "Ask the user for structured input and pause execution until "
-                        "the user responds. Use this only when execution cannot "
+                        "the user responds. Use this when the user explicitly asks "
+                        "to be consulted, or when execution cannot "
                         "continue without missing user-provided information, such "
                         "as a required file, URL, account, target object, permission, "
                         "a fact-carrying value (one that asserts a real-world fact) "
                         "for a tool argument that the user has not provided, "
                         "or a choice between mutually exclusive actions with "
-                        "different side effects. Do not use it to confirm execution "
+                        "different side effects. Unless the user explicitly asks "
+                        "to be consulted, do not use it to confirm execution "
                         "strategy, whether to search, whether to use memory, whether "
                         "to apply formatting preferences, or whether to proceed with "
                         "a sufficiently specified task; decide those yourself. A task "

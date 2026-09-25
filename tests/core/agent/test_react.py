@@ -1611,27 +1611,21 @@ def test_react_grounding_rule_present_in_both_answer_paths() -> None:
 
 
 @pytest.mark.parametrize("user_interaction_enabled", [True, False])
-@pytest.mark.parametrize(
-    "user_request",
-    [
-        "Analyze the available evidence",
-        "Analyze the available evidence. Ask me PDF or DOCX first.",
-    ],
-)
 def test_react_defaults_presentation_without_guessing_required_information(
     user_interaction_enabled: bool,
-    user_request: str,
 ) -> None:
     pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
     context = ExecutionContext(system_prompt="You are helpful.")
+    user_request = "Analyze the available evidence. Ask me PDF or DOCX first."
     context.add_user_message(user_request)
 
-    messages = pattern._messages_for_llm(context, has_tools=True)
+    tool_names = [
+        schema["function"]["name"] for schema in pattern._builtin_tool_schemas()
+    ]
+    messages = pattern._messages_for_llm(context, has_tools=True, tool_names=tool_names)
     prompt = messages[0]["content"]
 
     assert messages[-1]["content"] == user_request
-    assert "Request clarification only when user interaction is enabled" in prompt
-    assert "or the user explicitly asked to be consulted" in prompt
     assert "including an unspecified output format" in prompt
     assert (
         "deliver the supported work without pausing unless "
@@ -1640,6 +1634,23 @@ def test_react_defaults_presentation_without_guessing_required_information(
     assert "does not permit guessing facts, action targets, or authorization" in prompt
     # Presentation defaults must not weaken the existing missing-fact policy.
     assert "fact-carrying argument value" in prompt
+    if user_interaction_enabled:
+        assert "ask_user_question" in tool_names
+        assert "Request clarification only when missing information" in prompt
+        assert "or the user explicitly asked to be consulted" in prompt
+        assert "call ask_user_question" in prompt
+        assert "user choice cannot be obtained in this run" not in prompt
+        assert "User interaction is disabled" not in prompt
+    else:
+        assert "ask_user_question" not in tool_names
+        assert "Request clarification only" not in prompt
+        assert "call ask_user_question" not in prompt
+        assert "User interaction is disabled" in prompt
+        assert (
+            "If the user explicitly asked to choose and that choice is still "
+            "pending, do not select for them; finish with outcome=blocked" in prompt
+        )
+        assert "user choice cannot be obtained in this run" in prompt
 
 
 def test_react_forced_final_answer_respects_prior_clarification_scope() -> None:
@@ -4295,7 +4306,14 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     assert "cannot continue without missing user-provided information" in (
         ask_user_description
     )
-    assert "Do not use it to confirm execution strategy" in ask_user_description
+    assert (
+        "Use this when the user explicitly asks to be consulted, or when "
+        "execution cannot continue" in ask_user_description
+    )
+    assert (
+        "Unless the user explicitly asks to be consulted, do not use it to "
+        "confirm execution strategy" in ask_user_description
+    )
     assert "whether to use memory" in ask_user_description
     assert (
         "a fact-carrying value (one that asserts a real-world fact) for a tool "

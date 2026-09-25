@@ -61,6 +61,10 @@ def test_grounding_rule_requires_source_content_for_inspection_claims(
 
     assert "A citation or search snippet is not evidence" in rule
     assert "attribute only claims supported by text actually available" in rule
+    assert (
+        "text actually available in the conversation, retrieved context, or "
+        "tool results" in rule
+    )
     if can_call_tools:
         assert "omitted. A citation" in rule
         assert "results. When the user asks" in rule

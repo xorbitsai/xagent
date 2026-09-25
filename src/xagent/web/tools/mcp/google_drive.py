@@ -1640,13 +1640,13 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
     """
     try:
         resolved_file_id = _resolve_file_id(file_id)
-        resolved_destination_id = _resolve_file_id(
+        requested_destination_id = _resolve_file_id(
             destination_folder_id, "destination_folder_id"
         )
         source_resource_key = _extract_resource_key(file_id)
         destination_resource_key = _extract_resource_key(destination_folder_id)
 
-        if resolved_file_id == resolved_destination_id:
+        if resolved_file_id == requested_destination_id:
             return json.dumps(
                 {
                     "status": "error",
@@ -1663,15 +1663,17 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
         )
         _attach_resource_keys(source_get, [(resolved_file_id, source_resource_key)])
         source = source_get.execute()
+        if source.get("trashed"):
+            raise ValueError("file_id refers to a trashed file or folder")
 
         destination_get = service.files().get(
-            fileId=resolved_destination_id,
+            fileId=requested_destination_id,
             supportsAllDrives=True,
             fields="id,name,mimeType,driveId,trashed",
         )
         _attach_resource_keys(
             destination_get,
-            [(resolved_destination_id, destination_resource_key)],
+            [(requested_destination_id, destination_resource_key)],
         )
         destination = destination_get.execute()
 
@@ -1679,8 +1681,17 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
             raise ValueError("destination_folder_id must refer to a Drive folder")
         if destination.get("trashed"):
             raise ValueError("destination_folder_id refers to a trashed folder")
-        if source.get("trashed"):
-            raise ValueError("file_id refers to a trashed file or folder")
+        resolved_destination_id = destination.get("id")
+        if not isinstance(resolved_destination_id, str) or not resolved_destination_id:
+            raise RuntimeError("Drive returned an invalid destination folder id")
+        if resolved_file_id == resolved_destination_id:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": "A file or folder cannot be moved into itself.",
+                },
+                ensure_ascii=False,
+            )
 
         current_parents = source.get("parents", [])
         if not isinstance(current_parents, list) or not all(
@@ -1703,7 +1714,7 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
             "body": {},
             "addParents": resolved_destination_id,
             "supportsAllDrives": True,
-            "fields": "id,name,mimeType,parents,driveId,webViewLink",
+            "fields": "id,name,mimeType,parents,driveId,webViewLink,trashed",
         }
         if current_parents:
             update_kwargs["removeParents"] = ",".join(current_parents)

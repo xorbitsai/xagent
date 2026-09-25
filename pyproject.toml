@@ -9,6 +9,7 @@ description = "a powerful agent os with great compatibility"
 license = { text = "Xagent Source License" }
 readme = "README.md"
 requires-python = ">=3.11"
+
 classifiers = [
   "Development Status :: 1 - Planning",
   "Operating System :: OS Independent",
@@ -107,6 +108,9 @@ dependencies = [
   "volcengine-python-sdk[ark]>=5.0.37",
   "byteplus-python-sdk-v2>=3.0.52",
 ]
+
+[tool.ruff]
+target-version = "py311"
 
 [project.optional-dependencies]
 command-path-guard = ["bashlex>=0.18"]

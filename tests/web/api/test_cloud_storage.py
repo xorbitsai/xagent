@@ -5,8 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
-from fastapi import Response
+from fastapi import HTTPException, Response
 
 from xagent.web.api.cloud_storage import (
     _google_credentials_expiry,

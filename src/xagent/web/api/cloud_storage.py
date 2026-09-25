@@ -129,7 +129,11 @@ def get_google_credentials(
             # Update token in DB
             setattr(oauth_account, "access_token", creds.token)
             if creds.expiry:
-                oauth_account.expires_at = _google_database_expiry(creds.expiry)
+                setattr(
+                    oauth_account,
+                    "expires_at",
+                    _google_database_expiry(creds.expiry),
+                )
             db.commit()
         except Exception as e:
             logger.error(f"Failed to refresh Google token: {e}")

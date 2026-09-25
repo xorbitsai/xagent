@@ -91,9 +91,10 @@ def _empty_create_response(subject: str) -> str:
 # returned an Id and most likely did create it -- this is the specific
 # guidance a caller needs to not reproduce the 2026-09-21 incident's Id
 # 5/Id 6 duplicate-orphan pattern (create, readback fails, retry anyway).
-# Not applicable to deputy_update_resource, whose retries are idempotent
-# by design -- it leaves _verify_record_readable's retry_note at its
-# default (no instruction) instead of passing this.
+# Not applicable to deputy_update_resource, whose retries repeat the
+# same write rather than creating a new record -- it leaves
+# _verify_record_readable's retry_note at its default (no instruction)
+# instead of passing this.
 _DO_NOT_RETRY_CREATE_NOTE = "do not retry the create, which likely already succeeded"
 
 
@@ -153,8 +154,11 @@ def _verify_record_readable(
     ``_DO_NOT_RETRY_CREATE_NOTE`` because retrying after an unconfirmed
     readback there risks a genuine duplicate; deputy_update_resource
     leaves both at their defaults (a generic "write" with no retry
-    instruction) because its retries are idempotent by design and an
-    explicit "do not retry" would be actively wrong. An earlier version
+    instruction) because a retry there repeats the same write rather
+    than creating a new record, so an explicit "do not retry" would be
+    actively wrong (this is weaker than true idempotence -- see
+    deputy_update_resource's own docstring on the lost-update race a
+    concurrent edit can still cause). An earlier version
     of this function hard-coded "create" and the "do not retry" wording,
     then briefly lost the retry instruction entirely for every caller
     when generalized for deputy_update_resource -- silently regressing
@@ -826,8 +830,8 @@ def deputy_update_resource(
         # never in doubt here the way it is for a create's server-assigned
         # id. See _verify_record_readable's docstring for why an update
         # needs this verification at all, and for why this leaves ``verb``/
-        # ``retry_note`` at their defaults (an update retry is idempotent,
-        # unlike a create's).
+        # ``retry_note`` at their defaults (a retry here repeats the same
+        # write rather than creating a new record, unlike a create's).
         return _verify_record_readable(
             resource, safe_resource, result, record_id=resource_id
         )

@@ -31,6 +31,12 @@ Do not build a new outlined deck with repeated `google_slides_create_presentatio
 and `google_slides_add_slide` calls. Those tools are for explicitly requested
 simple text/layout edits and do not preserve visual design.
 
+For simple Google Slides layout edits, pass the `default_slide_id` returned by
+`google_slides_create_presentation` to the first `google_slides_add_slide` call
+when calls may cross MCP processes. Without the id, the connector removes the
+first empty page as the default page; pass `preserve_blank_slide=true` when that
+page is intentional.
+
 ## ⚠️ CRITICAL REQUIREMENTS - READ FIRST
 
 **YOU MUST FOLLOW THESE RULES - NO EXCEPTIONS:**

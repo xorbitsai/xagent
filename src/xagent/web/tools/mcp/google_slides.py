@@ -419,16 +419,39 @@ def _shape_texts(shape: Any) -> list[str]:
     return texts
 
 
-def _extract_pptx_slide_text(file_path: Path) -> list[str]:
-    """Return normalized visible text for each local PPTX slide."""
+def _shape_has_meaningful_content(shape: Any) -> bool:
+    """Return whether a PPTX shape represents content beyond an empty placeholder."""
+    text = getattr(shape, "text", "")
+    if text and str(text).strip():
+        return True
+
+    grouped_shapes = getattr(shape, "shapes", None)
+    if grouped_shapes is not None:
+        return any(_shape_has_meaningful_content(child) for child in grouped_shapes)
+
+    return not bool(getattr(shape, "is_placeholder", False))
+
+
+def _extract_pptx_slide_content(file_path: Path) -> list[tuple[str, bool]]:
+    """Return normalized text and meaningful-content flags for each PPTX slide."""
     from pptx import Presentation
 
     presentation = Presentation(str(file_path))
-    slide_texts: list[str] = []
+    slide_content: list[tuple[str, bool]] = []
     for slide in presentation.slides:
         texts = [text for shape in slide.shapes for text in _shape_texts(shape)]
-        slide_texts.append(_normalize_comparison_text(" ".join(texts)))
-    return slide_texts
+        slide_content.append(
+            (
+                _normalize_comparison_text(" ".join(texts)),
+                any(_shape_has_meaningful_content(shape) for shape in slide.shapes),
+            )
+        )
+    return slide_content
+
+
+def _extract_pptx_slide_text(file_path: Path) -> list[str]:
+    """Return normalized visible text for each local PPTX slide."""
+    return [text for text, _has_content in _extract_pptx_slide_content(file_path)]
 
 
 def _record_created_default_slide(presentation_id: str, slide_id: str) -> None:
@@ -590,8 +613,9 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
     ``file_path`` must point to a non-empty ``.pptx`` inside the current task
     workspace (or another configured Google Drive upload directory). The
     conversion is read back through the Slides API before this tool reports
-    success, and an unexpected blank slide is returned as
-    ``validation_failed`` rather than being presented as a finished deck.
+    success, and an unexpected blank slide or dropped visual content is
+    returned as ``validation_failed`` rather than being presented as a
+    finished deck.
     """
     drive_service: Any | None = None
     presentation_id: str | None = None
@@ -601,7 +625,13 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
         if not resolved_title:
             return _error("title cannot be empty")
         try:
-            expected_slide_text = _extract_pptx_slide_text(local_path)
+            expected_slide_content = _extract_pptx_slide_content(local_path)
+            expected_slide_text = [
+                text for text, _has_content in expected_slide_content
+            ]
+            expected_slide_has_content = [
+                has_content for _text, has_content in expected_slide_content
+            ]
         except Exception as exc:  # noqa: BLE001
             logger.error("Could not inspect PPTX text before import: %s", exc)
             return _error("Could not inspect PPTX text before import")
@@ -674,7 +704,7 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
         empty_slide_numbers = [
             index + 1
             for index, slide in enumerate(slides)
-            if expected_slide_text[index] and _slide_is_empty(slide)
+            if expected_slide_has_content[index] and _slide_is_empty(slide)
         ]
         actual_slide_text = [
             _normalize_comparison_text(" ".join(_slide_summary(slide, index)["text"]))
@@ -783,10 +813,10 @@ def google_slides_add_slide(
 
     When the presentation was created with google_slides_create_presentation,
     pass its returned default_slide_id when this call may run in another MCP
-    process. If the presentation contains one empty slide and no id is
-    available, that slide is treated as Google's default page and removed
-    after the new slide is created. Set preserve_blank_slide=True when an
-    intentional blank page must be retained.
+    process. The known default page is removed even if other pages were added
+    before this call. Without an id, the first empty page is treated as
+    Google's default page and removed after the new slide is created. Set
+    preserve_blank_slide=True when an intentional blank page must be retained.
 
     To fix a slide this call already created (wrong/missing text), use
     google_slides_update_slide with its slide_id — do NOT call
@@ -859,32 +889,39 @@ def google_slides_add_slide(
         candidate_default_slide_id = (
             requested_default_slide_id or tracked_default_slide_id
         )
-        # A Slides API create call starts with one default blank page. Read
-        # the current pages before creating the first real page, then delete
-        # that default only after the new page has been created in this same
-        # atomic batch. The fallback for a new MCP process is stateless: a
-        # sole empty page is Google's default unless the caller explicitly
-        # asks to preserve it.
+        # A Slides API create call starts with a default blank page. Read the
+        # current pages before creating the next real page, then delete that
+        # default only after the new page has been created in this same atomic
+        # batch. A known id can identify the default even after other pages
+        # were added; without one, the first empty page is the stateless
+        # fallback unless the caller explicitly asks to preserve it.
         existing: dict[str, Any] = {"slides": []}
         if candidate_default_slide_id or not preserve_blank_slide:
             existing = service.presentations().get(presentationId=pres_id).execute()
         slide_to_remove = None
         existing_slides = existing.get("slides", [])
-        if len(existing_slides) == 1 and not preserve_blank_slide:
-            existing_slide = existing_slides[0]
-            existing_slide_id = existing_slide.get("objectId")
-            if _slide_is_empty(existing_slide) and (
-                not candidate_default_slide_id
-                or existing_slide_id == candidate_default_slide_id
-            ):
-                slide_to_remove = existing_slide_id
-            elif (
-                candidate_default_slide_id
-                and existing_slide_id == candidate_default_slide_id
-            ):
-                # The caller used the page before asking us to append a
-                # slide, so it is no longer the untouched default page.
-                _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
+        if not preserve_blank_slide:
+            if candidate_default_slide_id:
+                candidate_slide = next(
+                    (
+                        slide
+                        for slide in existing_slides
+                        if slide.get("objectId") == candidate_default_slide_id
+                    ),
+                    None,
+                )
+                if candidate_slide is not None:
+                    if _slide_is_empty(candidate_slide):
+                        slide_to_remove = candidate_default_slide_id
+                    else:
+                        # The caller used the page before asking us to append
+                        # a slide, so it is no longer the untouched default.
+                        _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
+            elif existing_slides and _slide_is_empty(existing_slides[0]):
+                # Google creates its default page at index 0. With no
+                # cross-process id available, only remove that first empty
+                # page; an empty page elsewhere is user content.
+                slide_to_remove = existing_slides[0].get("objectId")
 
         slide_id = f"slide_{uuid.uuid4().hex[:12]}"
         title_id = f"{slide_id}_title"

@@ -57,11 +57,17 @@ def _mock_presentation_get(presentations_mock, slide_id, elements):
     }
 
 
-def _mock_pptx_text(monkeypatch, *slide_texts):
+def _mock_pptx_text(monkeypatch, *slide_texts, has_content=None):
+    content_flags = (
+        list(has_content)
+        if has_content is not None
+        else [bool(text.strip()) for text in slide_texts]
+    )
+    assert len(content_flags) == len(slide_texts)
     monkeypatch.setattr(
         google_slides,
-        "_extract_pptx_slide_text",
-        lambda _file_path: list(slide_texts),
+        "_extract_pptx_slide_content",
+        lambda _file_path: list(zip(slide_texts, content_flags, strict=True)),
     )
 
 
@@ -1748,6 +1754,64 @@ def test_add_slide_removes_default_slide_across_mcp_processes(monkeypatch):
     }
 
 
+def test_add_slide_removes_known_default_slide_when_other_slides_exist(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [
+            {"objectId": "p", "pageElements": []},
+            {
+                "objectId": "existing-content",
+                "pageElements": [
+                    _placeholder_element("existing-title", "TITLE", "Existing")
+                ],
+            },
+        ]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="Title", body="Detail", default_slide_id="p"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is True
+    assert _batch_update_requests(presentations)[-1] == {
+        "deleteObject": {"objectId": "p"}
+    }
+
+
+def test_add_slide_removes_first_blank_slide_without_id_after_other_slide_added(
+    monkeypatch,
+):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [
+            {"objectId": "p", "pageElements": []},
+            {
+                "objectId": "existing-content",
+                "pageElements": [
+                    _placeholder_element("existing-title", "TITLE", "Existing")
+                ],
+            },
+        ]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="Title", body="Detail")
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is True
+    assert _batch_update_requests(presentations)[-1] == {
+        "deleteObject": {"objectId": "p"}
+    }
+
+
 def test_add_slide_keeps_untracked_intentional_blank_slide(monkeypatch):
     presentations = Mock()
     presentations.get.return_value.execute.return_value = {
@@ -2059,6 +2123,36 @@ def test_import_pptx_allows_image_only_slide_after_conversion(monkeypatch, tmp_p
 
     assert result["status"] == "success"
     assert result["empty_slide_numbers"] == []
+
+
+def test_import_pptx_rejects_dropped_visual_only_slide(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "visual-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "", has_content=[True])
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Visual Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Visual Deck",
+        "slides": [{"objectId": "slide1", "pageElements": []}],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_import_pptx(str(pptx_path)))
+
+    assert result["status"] == "validation_failed"
+    assert result["empty_slide_numbers"] == [1]
+    drive.files.return_value.delete.assert_called_once_with(
+        fileId="pres1", supportsAllDrives=True
+    )
 
 
 def test_import_pptx_rejects_conversion_with_no_slides(monkeypatch, tmp_path):

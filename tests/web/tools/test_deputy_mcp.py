@@ -869,6 +869,12 @@ def test_create_resource_warns_when_response_has_no_id(monkeypatch):
     assert result["status"] == "success"
     assert "warning" in result
     assert "no Id" in result["warning"]
+    # Regression guard: this branch and the readback-failed branch both
+    # build their warning from the same is_create-derived retry_note --
+    # a still-earlier version of this fix wired "do not retry" into only
+    # one of the two branches, leaving this one (which deputy_add_employee
+    # hits routinely, per its own docstring) silently without it.
+    assert "do not retry the create" in result["warning"]
     mock_request.assert_called_once()
 
 
@@ -1081,6 +1087,12 @@ def test_add_employee_warns_when_response_has_no_id(monkeypatch):
     assert result["status"] == "success"
     assert "warning" in result
     assert "no Id" in result["warning"]
+    # Regression guard: see the identical comment on
+    # test_create_resource_warns_when_response_has_no_id -- this is the
+    # branch deputy_add_employee actually hits routinely, since Deputy's
+    # own OpenAPI spec documents this endpoint's response as possibly
+    # Id-less.
+    assert "do not retry the create" in result["warning"]
 
 
 def test_add_employee_downgrades_to_warning_on_transport_exception(monkeypatch):
@@ -1714,11 +1726,11 @@ def test_add_employee_warning_still_tells_caller_not_to_retry(monkeypatch):
 
 
 def test_update_resource_warning_never_tells_caller_not_to_retry(monkeypatch):
-    """The inverse of the two regression guards above: deputy_update_resource's
-    retries are idempotent by design (see its idempotentHint=True
-    annotation), so its unconfirmed-write warning must not carry create's
-    "do not retry" instruction, which would be actively wrong advice
-    here."""
+    """The inverse of the two regression guards above: a retry against
+    deputy_update_resource repeats the same write rather than creating a
+    new record (see its idempotentHint=True annotation), so its
+    unconfirmed-write warning must not carry create's "do not retry"
+    instruction, which would be actively wrong advice here."""
     mock_request = Mock(
         side_effect=[
             MockResponse(json_data={"Id": 123, "Company": 1, "Active": True}),

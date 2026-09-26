@@ -155,8 +155,8 @@ async def test_infra_callback_failure_marks_ledger_terminal() -> None:
     with pytest.raises(RuntimeError, match="trace backend down"):
         await pattern._execute_tool_safely(call, tools, _BoomOnStart())
 
-    assert pattern.tool_ledger[call["id"]].status == "failed"
-    assert pattern.tool_ledger[call["id"]].invocation_id
+    assert pattern._record_for_tool_call_id(call["id"]).status == "failed"
+    assert pattern._record_for_tool_call_id(call["id"]).invocation_id
     assert call == original_call
 
 
@@ -183,11 +183,11 @@ async def test_concurrent_batch_assigns_ids_to_id_less_calls() -> None:
     # Exactly one terminal record per call (no orphan stuck at "running").
     assert len(pattern.tool_ledger) == 2
     assert all(record.status == "completed" for record in pattern.tool_ledger.values())
-    # Context tool_call_ids are non-empty and match the ledger keys in input
-    # order (I2 + I3).
+    # Context tool_call_ids are non-empty and match the provider-id index in
+    # input order (I2 + I3).
     ctx_ids = [r["tool_call_id"] for r in context.tool_results]
     assert all(ctx_ids)
-    assert ctx_ids == list(pattern.tool_ledger.keys())
+    assert ctx_ids == list(pattern.tool_call_id_index.keys())
     ctx_invocation_ids = [r["invocation_id"] for r in context.tool_results]
     assert all(ctx_invocation_ids)
     assert len(set(ctx_invocation_ids)) == 2
@@ -280,7 +280,7 @@ async def test_concurrent_batch_propagates_infra_callback_failure() -> None:
 
     assert [result["tool_name"] for result in context.tool_results] == ["s1", "s3"]
     # The failing call still reaches a terminal ledger state (I3 walk).
-    assert pattern.tool_ledger[batch[1]["id"]].status == "failed"
+    assert pattern._record_for_tool_call_id(batch[1]["id"]).status == "failed"
 
 
 async def test_mixed_infra_failure_and_interrupt_reconciles_batch_before_raise() -> (
@@ -319,9 +319,9 @@ async def test_mixed_infra_failure_and_interrupt_reconciles_batch_before_raise()
         "boom",
         "paused",
     ]
-    assert pattern.tool_ledger[batch[0]["id"]].status == "completed"
-    assert pattern.tool_ledger[batch[1]["id"]].status == "failed"
-    assert pattern.tool_ledger[batch[2]["id"]].status == "interrupted"
+    assert pattern._record_for_tool_call_id(batch[0]["id"]).status == "completed"
+    assert pattern._record_for_tool_call_id(batch[1]["id"]).status == "failed"
+    assert pattern._record_for_tool_call_id(batch[2]["id"]).status == "interrupted"
 
 
 async def test_interrupt_filter_uses_batch_position_when_ids_repeat() -> None:
@@ -354,6 +354,42 @@ async def test_interrupt_filter_uses_batch_position_when_ids_repeat() -> None:
     assert pending_call == batch[1]
 
 
+async def test_interrupt_keeps_only_unfinished_legacy_calls_pending() -> None:
+    # Calls restored from a pre-identity checkpoint carry no invocation id.
+    # Every preparation layer must hand back the same prepared object, or the
+    # batch's identity-based reconciliation cannot drop the completed call.
+    blocked = asyncio.Event()
+    tools = [
+        FakeTool("done", concurrency_safe=True),
+        FakeTool("paused", concurrency_safe=True, gate=blocked),
+    ]
+    pattern = make_react(parallel=True, max_concurrency=2)
+    context = RecordingContext()
+    pattern.pending_tool_calls = [
+        {"id": "legacy-done", "name": "done", "args": {}},
+        {"id": "legacy-paused", "name": "paused", "args": {}},
+    ]
+    runtime = PatternRuntime(execution_id="legacy-interrupt")
+
+    task = asyncio.create_task(
+        pattern._execute_pending_tool_calls(
+            context=context, tools=tools, llm=None, runtime=runtime
+        )
+    )
+    while not tools[0].calls or not tools[1].calls:
+        await asyncio.sleep(0)
+    runtime.request_interrupt("pause legacy batch")
+
+    with pytest.raises(ToolCallInterrupted, match="pause legacy batch"):
+        await task
+
+    assert [result["tool_name"] for result in context.tool_results] == ["done"]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call["id"] == "legacy-paused"
+    assert pending_call["invocation_id"] is None
+    assert pattern._prepare_tool_call_identity(pending_call) is pending_call
+
+
 # --- Inc.4: tool_ledger ordering after a concurrent batch (I3) -------------
 
 
@@ -373,11 +409,51 @@ def test_reorder_ledger_for_batch_restores_input_order() -> None:
         pattern._record_tool_call(
             tool_call, status="completed", result={"success": True}
         )
-    assert list(pattern.tool_ledger.keys()) == ["e0", "b3", "b1", "b2"]
+    assert list(pattern.tool_call_id_index.keys()) == ["e0", "b3", "b1", "b2"]
 
     pattern._reorder_ledger_for_batch(batch)
 
-    assert list(pattern.tool_ledger.keys()) == ["e0", "b1", "b2", "b3"]
+    assert list(pattern.tool_call_id_index.keys()) == ["e0", "b1", "b2", "b3"]
+    assert [record.tool_call_id for record in pattern.tool_ledger.values()] == [
+        "e0",
+        "b1",
+        "b2",
+        "b3",
+    ]
+
+
+def test_reorder_moves_ids_reused_from_an_earlier_step_to_the_tail() -> None:
+    # Providers without ids get tool_call_0..N synthesized per response, so a
+    # later concurrent batch reuses ids an earlier serial step already used.
+    pattern = make_react(parallel=True)
+    for index, status in enumerate(["completed", "completed", "failed"]):
+        pattern._record_tool_call(
+            make_tool_call("web_search", id=f"tool_call_{index}"),
+            status=status,
+            result={"success": status == "completed"},
+        )
+    batch = [
+        make_tool_call("web_search", id="tool_call_0"),
+        make_tool_call("web_search", id="tool_call_1"),
+    ]
+    for tool_call in reversed(batch):
+        pattern._record_tool_call(
+            tool_call, status="completed", result={"success": True}
+        )
+
+    pattern._reorder_ledger_for_batch(batch)
+
+    projected = pattern._provider_compatible_tool_records()
+    assert [record.tool_call_id for record in projected] == [
+        "tool_call_2",
+        "tool_call_0",
+        "tool_call_1",
+    ]
+    assert [record.invocation_id for record in projected[1:]] == [
+        tool_call["invocation_id"] for tool_call in batch
+    ]
+    group = pattern._tool_decision_group_for_name("web_search")
+    assert pattern._consecutive_successful_tool_group_count(group) == 2
 
 
 async def test_concurrent_batch_keeps_ledger_in_input_order() -> None:
@@ -403,7 +479,8 @@ async def test_concurrent_batch_keeps_ledger_in_input_order() -> None:
             await asyncio.sleep(0)
     await task
 
-    assert [tc["id"] for tc in batch] == list(pattern.tool_ledger.keys())
+    assert [tc["id"] for tc in batch] == list(pattern.tool_call_id_index.keys())
+    assert [tc["invocation_id"] for tc in batch] == list(pattern.tool_ledger.keys())
 
 
 async def test_concurrent_batch_updates_consecutive_group_count() -> None:

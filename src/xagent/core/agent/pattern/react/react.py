@@ -10,8 +10,9 @@ flag never changes observable results, only latency:
   original tool-call order, regardless of which tool finishes first.
 - I2 (one result per call): every ``tool_call_id`` gets exactly one result,
   including failures.
-- I3 (ledger order): ``tool_ledger`` insertion order matches input order after a
-  batch, because the consecutive-count walks read it in reverse insertion order.
+- I3 (ledger order): ``tool_ledger`` and ``tool_call_id_index`` insertion order
+  match input order after a batch, because the consecutive-count walks read the
+  index in reverse insertion order.
 - I4 (control segment): a control tool (final_answer / send_message /
   ask_user_question) owns its segment and never shares a concurrent batch.
   What happens to the rest of the batch depends on the control result:
@@ -702,7 +703,14 @@ class ReActPattern(AgentPattern):
         self.last_response: Any = None
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.pending_tool_call_content: dict[str, str] = {}
+        # One row per concrete invocation, keyed by ``_ledger_key``: the
+        # invocation id, or the provider tool-call id for a legacy row.
         self.tool_ledger: dict[str, ToolCallRecord] = {}
+        # Provider tool-call id -> ledger key of the row that id currently
+        # resolves to. Maintained with exactly the dict operations the
+        # pre-identity ledger (keyed by provider id) used, so its order and
+        # values reproduce that ledger for every provider-keyed consumer.
+        self.tool_call_id_index: dict[str, str] = {}
         self.force_final_answer_next = False
         # Forced-answer read state. The two counters are per run and never
         # reset, so a run makes at most FORCED_ANSWER_READ_BUDGET +
@@ -2547,6 +2555,9 @@ class ReActPattern(AgentPattern):
             "tool_ledger": {
                 key: record.to_dict() for key, record in self.tool_ledger.items()
             },
+            # Written through by ``_store_tool_record`` and
+            # ``_reorder_ledger_for_batch``, so it needs a snapshot.
+            "tool_call_id_index": dict(self.tool_call_id_index),
         }
 
     def load_state(self, state: dict[str, Any]) -> None:
@@ -2650,6 +2661,19 @@ class ReActPattern(AgentPattern):
             key: ToolCallRecord.from_dict(value)
             for key, value in state.get("tool_ledger", {}).items()
         }
+        stored_index = state.get("tool_call_id_index")
+        if isinstance(stored_index, dict):
+            self.tool_call_id_index = {
+                str(tool_call_id): str(key)
+                for tool_call_id, key in stored_index.items()
+                if str(key) in self.tool_ledger
+            }
+        else:
+            # A pre-identity checkpoint keys its ledger by provider id, so
+            # replaying it in stored order rebuilds the index it implies.
+            self.tool_call_id_index = {}
+            for key, record in self.tool_ledger.items():
+                self.tool_call_id_index[record.tool_call_id] = key
 
     async def _resume_waiting_for_user_if_needed(
         self,
@@ -2895,7 +2919,6 @@ class ReActPattern(AgentPattern):
             # turn, ReAct step) instead of inventing a new one.
             resume_call = {
                 "id": str(pending.get("tool_call_id") or ""),
-                "invocation_id": record.invocation_id,
                 "name": tool_name,
                 "turn_id": record.turn_id,
                 "step_id": record.step_id,
@@ -2956,7 +2979,7 @@ class ReActPattern(AgentPattern):
                     },
                 )
             except BaseException:
-                self.tool_ledger[record_before.tool_call_id] = record_before
+                self.tool_ledger[self._ledger_key(record_before)] = record_before
                 if messages_before is not None and isinstance(messages, list):
                     messages[:] = messages_before
                 self.force_final_answer_next = force_final_before
@@ -3003,7 +3026,7 @@ class ReActPattern(AgentPattern):
 
         tool_name = str(pending.get("tool_name") or "")
         tool_call_id = str(pending.get("tool_call_id") or "")
-        candidate = self.tool_ledger.get(tool_call_id)
+        candidate = self._record_for_tool_call_id(tool_call_id)
         # Only a record for this exact call AND this exact tool is ours.
         record = (
             candidate
@@ -3085,7 +3108,7 @@ class ReActPattern(AgentPattern):
                 },
             )
         except BaseException:
-            self.tool_ledger[record_before.tool_call_id] = record_before
+            self.tool_ledger[self._ledger_key(record_before)] = record_before
             self.force_final_answer_next = force_final_before
             self.settlement_final_answer_fence = settlement_fence_before
             self.settlement_fence_turn_id = settlement_fence_turn_before
@@ -3110,6 +3133,9 @@ class ReActPattern(AgentPattern):
 
         self.pending_tool_interaction_responses.pop(0)
         try:
+            # This skip runs before any ledger row is validated, so the queued
+            # request is the only identity source. The delivered and
+            # invalid-target checkpoints report the validated row instead.
             await runtime.checkpoint(
                 "tool_interaction_response_skipped",
                 context=context,
@@ -3245,7 +3271,7 @@ class ReActPattern(AgentPattern):
         """Validate every durable identity before a resume callback can run."""
 
         tool_call_id = str(pending.get("tool_call_id") or "")
-        record = self.tool_ledger.get(tool_call_id)
+        record = self._record_for_tool_call_id(tool_call_id)
         if record is None:
             raise RuntimeError(
                 "Cannot settle resumed tool interaction without its original "
@@ -4452,10 +4478,8 @@ class ReActPattern(AgentPattern):
             tool_name=tool_call["name"],
             result=result,
             tool_call_id=tool_call.get("id"),
-            invocation_id=(
-                str(tool_call["invocation_id"])
-                if tool_call.get("invocation_id")
-                else None
+            invocation_id=self._normalized_invocation_id(
+                tool_call.get("invocation_id")
             ),
         )
         self._forget_tool_call_content(tool_call)
@@ -4745,28 +4769,41 @@ class ReActPattern(AgentPattern):
 
         Concurrent execution can interleave ``_record_tool_call`` writes, so the
         batch's records may land out of order in the insertion-ordered ledger.
-        ``_consecutive_*_count`` walk the ledger in reverse insertion order, so
-        we pop this batch's records and re-insert them at the tail in the
-        original tool-call order. Records keep their latest (final) state; only
-        their relative position is restored.
+        ``_consecutive_*_count`` walk the provider-id index in reverse insertion
+        order, so we pop this batch's entries and re-insert them at the tail in
+        the original tool-call order. Records keep their latest (final) state;
+        only their relative position is restored.
+
+        The index replays the pre-identity pop/re-insert by provider id
+        verbatim, which also moves an id reused from an earlier step to the
+        tail. The exact rows are reordered by their own ledger keys.
         """
-        ordered: list[tuple[str, ToolCallRecord]] = []
+        tool_call_ids = [str(tool_call.get("id") or "") for tool_call in batch]
+        index_keys = {
+            tool_call_id: self.tool_call_id_index.pop(tool_call_id)
+            for tool_call_id in tool_call_ids
+            if tool_call_id in self.tool_call_id_index
+        }
+        for tool_call_id in tool_call_ids:
+            key = index_keys.get(tool_call_id)
+            if key is not None:
+                self.tool_call_id_index[tool_call_id] = key
+
+        ledger_keys: list[str] = []
         for tool_call in batch:
             record = self._find_tool_record(
                 tool_call_id=str(tool_call.get("id") or ""),
-                invocation_id=str(tool_call.get("invocation_id") or "") or None,
+                invocation_id=self._normalized_invocation_id(
+                    tool_call.get("invocation_id")
+                ),
             )
             if record is None:
                 continue
-            key = (
-                record.invocation_id
-                if record.invocation_id
-                and self.tool_ledger.get(record.invocation_id) is record
-                else record.tool_call_id
-            )
-            ordered.append((key, self.tool_ledger.pop(key)))
-        for key, record in ordered:
-            self.tool_ledger[key] = record
+            key = self._ledger_key(record)
+            if key not in ledger_keys:
+                ledger_keys.append(key)
+        records = {key: self.tool_ledger.pop(key) for key in ledger_keys}
+        self.tool_ledger.update(records)
 
     def _disabled_control_tool_index(
         self,
@@ -5703,7 +5740,7 @@ class ReActPattern(AgentPattern):
         """
         original_call = tool_call
         if not tool_call.get("id"):
-            used_ids = {record.tool_call_id for record in self.tool_ledger.values()}
+            used_ids = set(self.tool_call_id_index)
             used_ids.update(
                 str(candidate.get("id"))
                 for candidate in self.pending_tool_calls
@@ -5711,7 +5748,7 @@ class ReActPattern(AgentPattern):
             )
             if reserved_ids is not None:
                 used_ids.update(reserved_ids)
-            fallback_index = len(self.tool_ledger)
+            fallback_index = len(self.tool_call_id_index)
             while f"tool_call_{fallback_index}" in used_ids:
                 fallback_index += 1
             tool_call = {
@@ -5720,9 +5757,17 @@ class ReActPattern(AgentPattern):
             }
         if reserved_ids is not None:
             reserved_ids.add(str(tool_call["id"]))
+        # Fill only what is missing or not yet normalized, so preparing an
+        # already-prepared call returns the same object. Batch reconciliation
+        # tracks pending calls by object identity; re-copying a legacy call at
+        # every layer would detach the pending entry from the batch's copy.
         identity_updates: dict[str, Any] = {}
-        if not tool_call.get("invocation_id"):
-            identity_updates["invocation_id"] = None
+        invocation_id = self._normalized_invocation_id(tool_call.get("invocation_id"))
+        if (
+            "invocation_id" not in tool_call
+            or tool_call["invocation_id"] != invocation_id
+        ):
+            identity_updates["invocation_id"] = invocation_id
         if "issued_at" not in tool_call:
             identity_updates["issued_at"] = None
         if identity_updates:
@@ -5779,13 +5824,19 @@ class ReActPattern(AgentPattern):
             # distinct-fallback-id invariant for concurrent batch members.
             suppressed = self._suppressed_duplicate_write_result(tool_call, tools)
             if suppressed is not None:
-                # Never overwrite the matched genuine record with the
-                # envelope: on provider id reuse the genuine result must stay
-                # in the ledger so later duplicates still find it.
-                if str(tool_call["id"]) not in self.tool_ledger:
-                    self._record_tool_call(
-                        tool_call, status="completed", result=suppressed
-                    )
+                # Every surfaced invocation gets its exact row, but on
+                # provider id reuse the envelope must not take over the id in
+                # the index: the genuine result has to stay the provider-keyed
+                # evidence so later duplicates still find it, exactly as the
+                # pre-identity ledger skipped this write.
+                self._record_tool_call(
+                    tool_call,
+                    status="completed",
+                    result=suppressed,
+                    index_tool_call_id=(
+                        str(tool_call["id"]) not in self.tool_call_id_index
+                    ),
+                )
                 await runtime.on_tool_start(tool_call=tool_call)
                 await runtime.on_tool_end(tool_call=tool_call, result=suppressed)
                 return suppressed
@@ -6040,8 +6091,11 @@ class ReActPattern(AgentPattern):
         error: str | None = None,
         settlement_status: str | None = None,
         settlement_turn_id: str | None = None,
+        index_tool_call_id: bool = True,
     ) -> None:
-        tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
+        tool_call_id = str(
+            tool_call.get("id") or f"tool_call_{len(self.tool_call_id_index)}"
+        )
         invocation_id = self._normalized_invocation_id(tool_call.get("invocation_id"))
         args = self._tool_call_args_dict(tool_call)
         args_hash = self._args_hash(args)
@@ -6074,7 +6128,7 @@ class ReActPattern(AgentPattern):
             step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
             issued_at=issued_at,
         )
-        self._store_tool_record(record)
+        self._store_tool_record(record, index_tool_call_id=index_tool_call_id)
 
     @staticmethod
     def _normalized_invocation_id(value: Any) -> str | None:
@@ -6082,77 +6136,61 @@ class ReActPattern(AgentPattern):
 
         return str(value) if value else None
 
-    def _store_tool_record(self, record: ToolCallRecord) -> None:
-        """Store one exact row while keeping the provider key on the latest call.
+    @staticmethod
+    def _ledger_key(record: ToolCallRecord) -> str:
+        """Key one exact row: its invocation id, or its provider id if legacy."""
 
-        Before invocation identity existed, assigning a repeated provider id
-        replaced the value at that key. Keep that lookup contract in Slice A:
-        when an exact row currently occupies the provider key, move it under its
-        invocation id before installing the newer row. A legacy row has no exact
-        key, so replacement intentionally retains the old overwrite semantics.
+        return record.invocation_id or record.tool_call_id
+
+    def _store_tool_record(
+        self, record: ToolCallRecord, *, index_tool_call_id: bool = True
+    ) -> None:
+        """Store one exact row and point its provider id at it.
+
+        Rewriting the same invocation replaces its row in place. The index
+        assignment keeps a provider id's first insertion position, just as
+        assigning a repeated key in the pre-identity ledger did. A legacy row
+        is keyed by its provider id, so it keeps that overwrite behaviour in
+        the ledger itself as well.
         """
 
-        if record.invocation_id:
-            exact = self.tool_ledger.get(record.invocation_id)
-            if exact is not None and exact.invocation_id == record.invocation_id:
-                self.tool_ledger[record.invocation_id] = record
-                return
-
-        existing = self.tool_ledger.get(record.tool_call_id)
-        if existing is not None and existing.invocation_id != record.invocation_id:
-            if existing.invocation_id:
-                # Replace the storage key in place. Rebuilding preserves the
-                # old provider key's insertion position, which the compatibility
-                # projection below must retain even after later repetitions.
-                self.tool_ledger = {
-                    (
-                        existing.invocation_id if key == record.tool_call_id else key
-                    ): candidate
-                    for key, candidate in self.tool_ledger.items()
-                }
-            else:
-                # A legacy row has no exact identity to retain. Overwrite it at
-                # the provider key exactly as the pre-identity ledger did.
-                self.tool_ledger[record.tool_call_id] = record
-                return
-        self.tool_ledger[record.tool_call_id] = record
+        key = self._ledger_key(record)
+        self.tool_ledger[key] = record
+        if index_tool_call_id:
+            self.tool_call_id_index[record.tool_call_id] = key
 
     def _provider_compatible_tool_records(self) -> list[ToolCallRecord]:
-        """Project the full ledger to the pre-identity provider-key semantics.
+        """Return the rows the pre-identity ledger would hold, in its order.
 
-        Dict assignment historically replaced a repeated provider id without
-        moving its first insertion position. Building the projection in ledger
-        order and assigning by ``tool_call_id`` reproduces both properties while
-        keeping the per-invocation rows available for persistence only.
+        Provider-keyed consumers (repeated-tool counters, the duplicate-write
+        guard, DAG evidence) read this view so reused provider ids behave as
+        they did before invocation identity existed.
         """
 
-        projected: dict[str, ToolCallRecord] = {}
-        for record in self.tool_ledger.values():
-            projected[record.tool_call_id] = record
-        return list(projected.values())
+        return [self.tool_ledger[key] for key in self.tool_call_id_index.values()]
+
+    def _record_for_tool_call_id(self, tool_call_id: str) -> ToolCallRecord | None:
+        """Resolve a provider id the way the pre-identity ledger did."""
+
+        key = self.tool_call_id_index.get(tool_call_id)
+        return self.tool_ledger.get(key) if key is not None else None
 
     def _find_tool_record(
         self, *, tool_call_id: str, invocation_id: str | None
     ) -> ToolCallRecord | None:
-        if invocation_id:
-            direct = self.tool_ledger.get(invocation_id)
-            if direct is not None and direct.invocation_id == invocation_id:
-                return direct
-            provider_keyed = self.tool_ledger.get(tool_call_id)
-            if (
-                provider_keyed is not None
-                and provider_keyed.invocation_id == invocation_id
-            ):
-                return provider_keyed
+        """Return the exact row for one invocation, never a colliding one."""
+
+        record = self.tool_ledger.get(invocation_id or tool_call_id)
+        if record is None or record.invocation_id != invocation_id:
             return None
-        # A legacy row has no exact identity. Retain the old provider-id lookup
-        # and do not guess among newer colliding rows.
-        return self.tool_ledger.get(tool_call_id)
+        return record
 
     def _tool_record_for_call(self, tool_call: dict[str, Any]) -> ToolCallRecord:
         record = self._find_tool_record(
             tool_call_id=str(tool_call.get("id") or ""),
-            invocation_id=str(tool_call.get("invocation_id") or "") or None,
+            invocation_id=self._normalized_invocation_id(
+                tool_call.get("invocation_id")
+            ),
         )
         if record is None:
             raise KeyError(str(tool_call.get("id") or ""))

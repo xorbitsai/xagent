@@ -2315,13 +2315,15 @@ async def test_dag_step_checkpoint_survives_a_non_copyable_tool_result() -> None
     parent = PatternRuntime(tracer=JsonWriter(), execution_id="dag-root")
     child_context = ExecutionContext(execution_id="dag-root:a")
     react_pattern = ReActPattern()
-    react_pattern.tool_ledger["c1"] = ToolCallRecord(
-        tool_call_id="c1",
-        tool_name="t",
-        args={"a": 1},
-        args_hash="h",
-        status="completed",
-        result={"success": True, "client": threading.Lock()},
+    react_pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="c1",
+            tool_name="t",
+            args={"a": 1},
+            args_hash="h",
+            status="completed",
+            result={"success": True, "client": threading.Lock()},
+        )
     )
     runtime = _DAGStepRuntime(
         parent=parent,

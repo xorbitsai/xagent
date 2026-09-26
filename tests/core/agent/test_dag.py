@@ -6906,9 +6906,13 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     assert interrupted["status"] == "interrupted"
     assert checkpoint is not None
     assert checkpoint["label"] == "dag_interrupted"
-    assert checkpoint["pattern_state"]["active_step_pattern_states"]["calc"][
+    [pending_call] = checkpoint["pattern_state"]["active_step_pattern_states"]["calc"][
         "pending_tool_calls"
-    ] == [{"id": "dag-call", "name": "calculator", "args": {"expression": "6*7"}}]
+    ]
+    assert pending_call["id"] == "dag-call"
+    assert pending_call["name"] == "calculator"
+    assert pending_call["args"] == {"expression": "6*7"}
+    assert pending_call["invocation_id"]
 
     restored_pattern = DAGPattern(
         lambda **_: build_plan(PlanStep(id="calc", task="Calculate 6*7"))

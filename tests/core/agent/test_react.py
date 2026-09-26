@@ -1979,6 +1979,35 @@ async def test_react_pattern_does_not_stream_tool_call_preamble() -> None:
     assert tool_start_event["data"]["assistant_content"] == ("I will use a tool first.")
 
 
+def test_tool_call_preamble_cache_uses_exact_invocation_identity() -> None:
+    pattern = ReActPattern()
+    first = {
+        "id": "tool_call_0",
+        "invocation_id": "invocation-a",
+        "name": "calculator",
+    }
+    second = {
+        "id": "tool_call_0",
+        "invocation_id": "invocation-b",
+        "name": "calculator",
+    }
+
+    pattern._remember_tool_call_content([first], "first preamble")
+    pattern._remember_tool_call_content([second], "second preamble")
+
+    assert pattern._with_tool_call_content(first)["assistant_content"] == (
+        "first preamble"
+    )
+    assert pattern._with_tool_call_content(second)["assistant_content"] == (
+        "second preamble"
+    )
+    pattern._forget_tool_call_content(first)
+    assert "assistant_content" not in pattern._with_tool_call_content(first)
+    assert pattern._with_tool_call_content(second)["assistant_content"] == (
+        "second preamble"
+    )
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_streams_final_answer_control_tool() -> None:
     llm = StreamingFinalAnswerToolLLM()
@@ -6758,10 +6787,14 @@ async def test_react_pattern_emits_runtime_checkpoints() -> None:
         "final",
     ]
     after_llm = runtime.checkpoints[1]
-    assert after_llm["pattern_state"]["pending_tool_calls"] == [
-        {"id": "call_1", "name": "calculator", "args": {"expression": "3+3"}}
-    ]
-    assert after_llm["context"]["messages"][1]["tool_calls"][0]["id"] == "call_1"
+    [checkpointed_call] = after_llm["pattern_state"]["pending_tool_calls"]
+    assert checkpointed_call["id"] == "call_1"
+    assert checkpointed_call["name"] == "calculator"
+    assert checkpointed_call["args"] == {"expression": "3+3"}
+    assert checkpointed_call["invocation_id"]
+    context_call = after_llm["context"]["messages"][1]["tool_calls"][0]
+    assert context_call["id"] == "call_1"
+    assert "invocation_id" not in context_call
 
 
 @pytest.mark.asyncio
@@ -6907,9 +6940,11 @@ async def test_react_pattern_interrupts_at_tool_boundary() -> None:
     assert result["status"] == "interrupted"
     assert tool.calls == []
     assert runtime.last_checkpoint["label"] == "interrupted"
-    assert pattern.pending_tool_calls == [
-        {"id": "call_1", "name": "calculator", "args": {"expression": "4+4"}}
-    ]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call["id"] == "call_1"
+    assert pending_call["name"] == "calculator"
+    assert pending_call["args"] == {"expression": "4+4"}
+    assert pending_call["invocation_id"]
 
 
 @pytest.mark.asyncio
@@ -7036,6 +7071,7 @@ def test_tool_call_record_from_dict_handles_null_args() -> None:
     assert record.args == {}
     assert record.args_hash == ""
     assert record.status == "pending"
+    assert record.invocation_id is None
 
 
 def test_args_hash_is_stable_sha256_digest() -> None:
@@ -8251,6 +8287,128 @@ async def test_settlement_lifecycle_does_not_rebill_the_tool_call(mocker: Any) -
 
 
 @pytest.mark.asyncio
+async def test_same_step_reused_provider_id_settles_the_exact_invocation() -> None:
+    pattern = ReActPattern()
+    [first_call] = pattern._normalize_tool_calls(
+        [{"function": {"name": "approval_gate", "arguments": "{}"}}]
+    )
+    [second_call] = pattern._normalize_tool_calls(
+        [{"function": {"name": "approval_gate", "arguments": "{}"}}]
+    )
+    assert first_call["id"] == second_call["id"] == "tool_call_0"
+    assert first_call["invocation_id"] != second_call["invocation_id"]
+    first_call.update(step_id="react_same", turn_id="original-turn")
+    second_call.update(step_id="react_same", turn_id="original-turn")
+
+    pattern._record_tool_call(first_call, status="running")
+    pattern._record_tool_call(
+        first_call,
+        status="completed",
+        result={"success": True, "value": "earlier"},
+    )
+    pattern._record_tool_call(second_call, status="running")
+    pattern._record_tool_call(
+        second_call,
+        status="waiting_for_user",
+        result={"success": False, "status": "waiting_for_user"},
+    )
+    first_record = pattern._find_tool_record(
+        tool_call_id="tool_call_0",
+        invocation_id=first_call["invocation_id"],
+    )
+    second_record = pattern._find_tool_record(
+        tool_call_id="tool_call_0",
+        invocation_id=second_call["invocation_id"],
+    )
+    assert first_record is not None and second_record is not None
+    assert first_record.issued_at is not None
+    assert second_record.issued_at is not None
+    assert second_record.issued_at >= first_record.issued_at
+
+    context = ExecutionContext(execution_id="same-step-reuse")
+    context.add_tool_result(
+        "approval_gate",
+        first_record.result,
+        "tool_call_0",
+        invocation_id=first_record.invocation_id,
+    )
+    context.add_tool_result(
+        "approval_gate",
+        second_record.result,
+        "tool_call_0",
+        invocation_id=second_record.invocation_id,
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "tool_call_0",
+            "invocation_id": second_call["invocation_id"],
+            "interaction_id": "approval-2",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="same-step-reuse", tracer=tracer)
+    runtime.active_turn_id = "settlement-turn"
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded(
+                    {"success": True, "value": "settled"}
+                )
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+
+    first_after = pattern._find_tool_record(
+        tool_call_id="tool_call_0",
+        invocation_id=first_call["invocation_id"],
+    )
+    second_after = pattern._find_tool_record(
+        tool_call_id="tool_call_0",
+        invocation_id=second_call["invocation_id"],
+    )
+    assert first_after is not None and first_after.result["value"] == "earlier"
+    assert second_after is not None and second_after.result["value"] == "settled"
+    assert second_after.settlement_turn_id == "settlement-turn"
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("settlement_delivery") is True
+    ]
+    assert len(settlement_events) == 2
+    assert {event["data"]["invocation_id"] for event in settlement_events} == {
+        second_call["invocation_id"]
+    }
+    assert {event["data"]["original_started_at"] for event in settlement_events} == {
+        second_record.issued_at
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_replays_pending_settlement_traces_at_entry(mocker: Any) -> None:
+    pattern = ReActPattern(max_iterations=1)
+    replay = mocker.patch.object(
+        pattern,
+        "_replay_unemitted_settlement_traces",
+        new=mocker.AsyncMock(),
+    )
+    context = ExecutionContext(execution_id="run-replay-entry")
+    context.add_user_message("Finish")
+
+    await pattern.run(
+        context=context,
+        tools=[],
+        llm=FakeLLM([{"content": "Done", "done": True}]),
+        runtime=PatternRuntime(execution_id="run-replay-entry"),
+    )
+
+    replay.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds() -> (
     None
 ):
@@ -8358,7 +8516,10 @@ async def test_non_successful_settlement_fails_the_original_tool_call(
     assert record.result["success"] is False
     assert record.result["settlement_status"] == status
     guarded = status in {"rejected", "dispatch_unknown"}
-    assert pattern.force_final_answer_next is guarded
+    # Only the settlement-owned fence is raised. The shared
+    # force_final_answer_next is deliberately left alone: it outlives the turn
+    # and would lock the next unrelated request out of its tools.
+    assert pattern.force_final_answer_next is False
     assert pattern.settlement_final_answer_fence is guarded
     assert pattern.settlement_fence_turn_id == ("approval-turn" if guarded else None)
     assert pattern._consecutive_successful_tool_group_count("approval_gate") == 0
@@ -8562,9 +8723,9 @@ async def test_terminal_settlement_keeps_the_batch_final_answer_fence(
         context=context,
         runtime=runtime,
     )
-    assert pattern.force_final_answer_next is True
     assert pattern.settlement_final_answer_fence is True
     assert pattern.settlement_fence_turn_id == "approval-turn"
+    assert pattern.force_final_answer_next is False
 
     # The successful sibling still settled correctly on its own row and in the
     # transcript; the fence is turn-wide, not a per-row veto.
@@ -8831,15 +8992,18 @@ async def test_settlement_fence_does_not_outlive_its_turn(exit_kind: str) -> Non
             "requests": [],
             "interactions": [],
         }
-    # Whatever the exit route, the flag is still latched on the pattern.
+    # Whatever the exit route, the fence is still latched on the pattern, and
+    # no shared flag was co-latched with it. Nothing is reset by hand below:
+    # resetting force_final_answer_next here would mask the very production
+    # path this test exists to cover.
     assert pattern.settlement_final_answer_fence is True
+    assert pattern.force_final_answer_next is False
 
     # A brand-new user turn must get its tools back.
     next_context = ExecutionContext(execution_id=f"fence-exit-{exit_kind}-next")
     next_context.add_user_message("Now compute 2+2.", metadata={"turn_id": "next-turn"})
     pattern.status = "idle"
     pattern.waiting_for_user_request = None
-    pattern.force_final_answer_next = False
     pattern.max_iterations = 3
     next_tool = WorkTool()
     next_llm = FakeLLM(
@@ -8875,10 +9039,15 @@ async def test_settlement_fence_does_not_outlive_its_turn(exit_kind: str) -> Non
     result = await pattern.run(context=next_context, tools=[next_tool], llm=next_llm)
 
     assert result["success"] is True
-    assert next_tool.calls == 1
+    # The very first call of the new turn must already carry the work tools:
+    # a narrowed first schema would be the bug even if a later protocol-retry
+    # recovery handed them back.
     assert "calculator" in [
         schema["function"]["name"] for schema in next_llm.calls[0]["tools"]
     ]
+    # And the work actually ran, rather than the model being steered into a
+    # tool-free final answer.
+    assert next_tool.calls == 1
     assert pattern.settlement_final_answer_fence is False
     assert pattern.settlement_fence_turn_id is None
 
@@ -8915,6 +9084,7 @@ def test_settlement_fence_survives_a_state_round_trip() -> None:
 def test_settlement_ledger_fields_survive_a_record_round_trip() -> None:
     record = ToolCallRecord(
         tool_call_id="call-1",
+        invocation_id="invocation-1",
         tool_name="publish",
         args={"text": "hi"},
         args_hash="hash",
@@ -11286,7 +11456,12 @@ async def test_react_control_send_failure_settles_lifecycle_and_propagates(
         status,
     ]
     assert pattern.tool_ledger["send-1"].error == "send aborted"
-    assert pattern.pending_tool_calls == [call]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call["id"] == call["id"]
+    assert pending_call["name"] == call["name"]
+    assert pending_call["args"] == call["args"]
+    assert pending_call["invocation_id"]
+    assert "invocation_id" not in call
     assert context.get_messages_by_role("tool") == []
 
 
@@ -11517,3 +11692,360 @@ def test_react_get_state_is_unaffected_by_later_pop() -> None:
     assert [
         entry["interaction_id"] for entry in state["pending_tool_interaction_responses"]
     ] == ["i1", "i2"]
+
+
+@pytest.mark.asyncio
+async def test_a_cold_start_replays_only_records_that_still_owe_a_trace() -> None:
+    """The obligation is durable, so it survives a fresh ReActPattern.
+
+    A pattern is rebuilt per run and per DAG-step entry, so process-local
+    bookkeeping made every cold start, worker handoff and DAG re-entry re-emit
+    a pair for every settled row. Only ``settlement_trace_pending`` rows may
+    replay, and delivering one must clear the flag.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="cold-start")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+
+    async def cancel_in_the_gap(**_: Any) -> None:
+        raise asyncio.CancelledError("cancelled after checkpoint")
+
+    pattern._trace_tool_interaction_settlement = cancel_in_the_gap  # type: ignore[assignment]
+    settlement_runtime = PatternRuntime(execution_id="cold-start")
+    settlement_runtime.active_turn_id = "approval-turn"
+    with pytest.raises(asyncio.CancelledError):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[
+                SettlementApprovalTool(
+                    resume_result=ToolInteractionSettlement.succeeded({"success": True})
+                )
+            ],
+            context=context,
+            runtime=settlement_runtime,
+        )
+
+    lost_state = pattern.get_state()
+    assert lost_state["tool_ledger"]["call-1"]["settlement_trace_pending"] is True
+
+    # Cold start #1: the owed pair is delivered exactly once.
+    first = ReActPattern()
+    first.load_state(lost_state)
+    tracer = TraceEventRecorder()
+    replay_runtime = PatternRuntime(execution_id="cold-start", tracer=tracer)
+    replay_runtime.active_turn_id = "later-repair-turn"
+    await first._replay_unemitted_settlement_traces(runtime=replay_runtime)
+    assert _settlement_trace_events(tracer, "call-1") == [
+        "action_start_tool",
+        "action_end_tool",
+    ]
+    replayed_end = next(
+        event
+        for event in tracer.events
+        if event["data"].get("tool_call_id") == "call-1"
+        and event["event_type"] == "action_end_tool"
+    )
+    assert replayed_end["data"]["settlement_delivery"] is True
+    assert replayed_end["data"]["settlement_status"] == "succeeded"
+    assert replayed_end["data"]["turn_id"] == "approval-turn"
+    assert replayed_end["data"]["result"] == {"success": True}
+    assert first.tool_ledger["call-1"].settlement_trace_pending is False
+
+    # The cleared flag rides out on the next checkpoint; three further cold
+    # starts from that state must stay silent.
+    settled_state = first.get_state()
+    assert settled_state["tool_ledger"]["call-1"]["settlement_trace_pending"] is False
+    for index in range(3):
+        later = ReActPattern()
+        later.load_state(settled_state)
+        later_tracer = TraceEventRecorder()
+        later_runtime = PatternRuntime(execution_id="cold-start", tracer=later_tracer)
+        later_runtime.active_turn_id = f"later-turn-{index}"
+        await later._replay_unemitted_settlement_traces(runtime=later_runtime)
+        assert _settlement_trace_events(later_tracer, "call-1") == []
+
+
+@pytest.mark.asyncio
+async def test_a_normally_delivered_settlement_never_replays_on_a_cold_start() -> None:
+    """Delivery clears the obligation, so later processes emit nothing."""
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="no-replay")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="no-replay", tracer=tracer)
+    runtime.active_turn_id = "approval-turn"
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+    assert len(_settlement_trace_events(tracer, "call-1")) == 2
+    assert pattern.tool_ledger["call-1"].settlement_trace_pending is False
+
+    state = pattern.get_state()
+    for index in range(3):
+        restored = ReActPattern()
+        restored.load_state(state)
+        cold_tracer = TraceEventRecorder()
+        cold_runtime = PatternRuntime(execution_id="no-replay", tracer=cold_tracer)
+        cold_runtime.active_turn_id = f"later-turn-{index}"
+        await restored._replay_unemitted_settlement_traces(runtime=cold_runtime)
+        assert _settlement_trace_events(cold_tracer, "call-1") == []
+
+
+@pytest.mark.asyncio
+async def test_a_swallowed_trace_write_keeps_the_obligation() -> None:
+    """A half-written or failed pair must not discharge the obligation.
+
+    The writes are best-effort so a tracer fault cannot undo a durable
+    settlement, but clearing the flag anyway would drop the lifecycle for good.
+    """
+
+    class HalfBrokenTracer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> str:
+            self.calls += 1
+            if self.calls == 2:  # the END write fails
+                raise RuntimeError("tracer down")
+            return "ok"
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="half-written")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=PatternRuntime(execution_id="half-written", tracer=HalfBrokenTracer()),
+    )
+
+    # The settlement is durable, but its trace is not -- still owed.
+    assert pattern.tool_ledger["call-1"].settlement_status == "succeeded"
+    assert pattern.tool_ledger["call-1"].settlement_trace_pending is True
+
+    tracer = TraceEventRecorder()
+    await pattern._replay_unemitted_settlement_traces(
+        runtime=PatternRuntime(execution_id="half-written", tracer=tracer)
+    )
+    assert _settlement_trace_events(tracer, "call-1") == [
+        "action_start_tool",
+        "action_end_tool",
+    ]
+    assert pattern.tool_ledger["call-1"].settlement_trace_pending is False
+
+
+@pytest.mark.asyncio
+async def test_a_swallowed_production_style_db_failure_keeps_the_obligation() -> None:
+    """A database write failure that would normally be swallowed must not be.
+
+    ``Tracer.trace_event`` defaults to ``require_persisted=False``, and the
+    production ``DatabaseTraceHandler`` logs and returns normally on an
+    ordinary write failure in that mode -- it only raises when the caller
+    asks for persisted delivery. This fake mirrors exactly that contract
+    (unlike ``HalfBrokenTracer`` above, which raises unconditionally): it
+    only fails the END write when ``require_persisted`` is actually passed.
+    If settlement trace events did not request persistence, this write would
+    report success and durably clear the obligation on a pair that was never
+    actually written to the database.
+    """
+
+    class ProductionStyleTracer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> str:
+            self.calls += 1
+            if self.calls == 2 and kwargs.get("require_persisted"):
+                raise RuntimeError("db insert failed")
+            return "ok"
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="db-swallow")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=PatternRuntime(
+            execution_id="db-swallow", tracer=ProductionStyleTracer()
+        ),
+    )
+
+    # The END write's failure must not be swallowed into a false "success":
+    # the obligation must survive so the next run start replays the pair.
+    assert pattern.tool_ledger["call-1"].settlement_trace_pending is True
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_row_without_issued_at_stays_unknown_on_settlement() -> None:
+    """A checkpoint row that predates ``issued_at`` must not fabricate one.
+
+    ``_record_tool_call`` preserves ``issued_at`` across every rewrite of a
+    row -- but a row already ``waiting_for_user`` from a checkpoint written
+    BEFORE this field existed has ``issued_at=None`` on an EXISTING record,
+    not a first-ever registration. Stamping ``now()`` there (as if it were a
+    fresh call) fabricates a timestamp close to the SETTLEMENT time -- this
+    method runs immediately before the settlement trace is emitted -- and
+    that gets threaded downstream as ``original_started_at``, silently
+    reintroducing the SSE-lane started_at bug this field exists to fix.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="legacy-row")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    # Simulates a row restored via ToolCallRecord.from_dict() from a
+    # checkpoint written before ``issued_at`` existed: waiting_for_user, but
+    # issued_at is None on an EXISTING record -- not the "no record at all"
+    # case _record_tool_call must still stamp now() for.
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record(
+        "call-1", step_id="react_a", issued_at=None
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=PatternRuntime(execution_id="legacy-row", tracer=tracer),
+    )
+
+    assert pattern.tool_ledger["call-1"].issued_at is None
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("tool_call_id") == "call-1"
+    ]
+    assert settlement_events, "expected the settlement pair to be traced"
+    for event in settlement_events:
+        assert "original_started_at" not in event["data"]
+
+
+@pytest.mark.asyncio
+async def test_settlement_trace_is_emitted_under_the_original_step_id() -> None:
+    """The pair must land in the step that issued the call, not the resumed one.
+
+    Consumers bucket actions by step and only search the bucket an event
+    names, so emitting under the resumed run's fresh ``react_<uuid>`` puts the
+    update where the original card is not.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="step-routing")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record(
+        "call-1", step_id="react_original"
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="step-routing", tracer=tracer)
+    runtime.active_react_step_id = "react_resumed"
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("tool_call_id") == "call-1"
+    ]
+    assert len(settlement_events) == 2
+    assert {event["step_id"] for event in settlement_events} == {"react_original"}

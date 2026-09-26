@@ -778,6 +778,7 @@ class ExecutionContext:
         tool_call_id: str | None = None,
         *,
         context_refs: Any = (),
+        invocation_id: str | None = None,
     ) -> Message:
         public_result, supersedes_scope = split_tool_result_supersedes_scope(result)
         public_result, embedded_refs = split_tool_result_context_references(
@@ -820,6 +821,8 @@ class ExecutionContext:
             "cwd": self.cwd,
             "memory_session_id": self.memory_session_id,
         }
+        if invocation_id:
+            metadata["invocation_id"] = invocation_id
         if spill_records:
             metadata["spilled_results"] = list(spill_records)
         if supersedes_scope:

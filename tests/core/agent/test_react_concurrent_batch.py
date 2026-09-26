@@ -281,7 +281,11 @@ async def test_interrupt_filter_uses_batch_position_when_ids_repeat() -> None:
         await task
 
     assert [result["tool_name"] for result in context.tool_results] == ["done"]
-    assert pattern.pending_tool_calls == [batch[1]]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call["id"] == batch[1]["id"]
+    assert pending_call["name"] == batch[1]["name"]
+    assert pending_call["args"] == batch[1]["args"]
+    assert pending_call["invocation_id"]
 
 
 # --- Inc.4: tool_ledger ordering after a concurrent batch (I3) -------------

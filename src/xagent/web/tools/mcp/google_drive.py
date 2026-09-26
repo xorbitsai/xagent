@@ -385,6 +385,37 @@ def _extract_resource_key(file_id: str) -> str | None:
     return candidate
 
 
+def _attach_resource_keys(
+    request: Any, resource_keys: list[tuple[str, str | None]]
+) -> Any:
+    """Attach one or more Drive resource keys to an unexecuted request.
+
+    Most connector calls address one link-shared object, but a move request
+    addresses both the file being moved and its destination parent.  Drive
+    accepts the resource keys in one comma-separated header; keeping the
+    construction here prevents a move from silently dropping the parent's
+    key and turning a valid shared-link folder into a misleading 404.
+    """
+    header_values: list[str] = []
+    for file_id, resource_key in resource_keys:
+        if not resource_key:
+            continue
+        if "\r" in file_id or "\n" in file_id:
+            logger.error(
+                "_attach_resource_keys: file_id contains CR/LF, violating the caller invariant: %r",
+                file_id,
+            )
+            raise ValueError(
+                "internal error (bug in google_drive.py): file_id must not "
+                f"contain CR/LF, got {file_id!r}"
+            )
+        header_values.append(f"{file_id}/{resource_key}")
+
+    if header_values:
+        request.headers["X-Goog-Drive-Resource-Keys"] = ",".join(header_values)
+    return request
+
+
 def _attach_resource_key(request: Any, file_id: str, resource_key: str | None) -> Any:
     """Attach the X-Goog-Drive-Resource-Keys header to an unexecuted
     googleapiclient request when ``resource_key`` is present, mirroring
@@ -418,21 +449,7 @@ def _attach_resource_key(request: Any, file_id: str, resource_key: str | None) -
     the outer per-tool try/except still turns it into the same JSON error
     envelope as any other exception.
     """
-    if not resource_key:
-        return request
-    if "\r" in file_id or "\n" in file_id:
-        logger.error(
-            "_attach_resource_key: file_id contains CR/LF, violating the "
-            "caller invariant this function relies on -- this indicates a "
-            "bug in google_drive.py, not bad user input: %r",
-            file_id,
-        )
-        raise ValueError(
-            "internal error (bug in google_drive.py): file_id must not "
-            f"contain CR/LF, got {file_id!r}"
-        )
-    request.headers["X-Goog-Drive-Resource-Keys"] = f"{file_id}/{resource_key}"
-    return request
+    return _attach_resource_keys(request, [(file_id, resource_key)])
 
 
 def _apply_parent_id(
@@ -1603,6 +1620,141 @@ def google_drive_rename_file(file_id: str, new_name: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error renaming file: {e}")
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
+    """Move a Drive file or folder into another folder.
+
+    ``file_id`` and ``destination_folder_id`` may be bare IDs or trusted
+    Google Drive/Docs/Slides URLs.  The operation preserves the file's
+    presentation/document ID; it only changes its parent folder.  The source
+    and destination are read before the update so malformed inputs and
+    non-folder destinations fail without mutating anything, and the updated
+    parents are read back before reporting success.
+
+    This requires the connected account to have permission to move the item.
+    For ``drive.file`` accounts, the item and destination folder must first be
+    selected through Google's file picker or created by Xagent.
+    """
+    try:
+        resolved_file_id = _resolve_file_id(file_id)
+        requested_destination_id = _resolve_file_id(
+            destination_folder_id, "destination_folder_id"
+        )
+        source_resource_key = _extract_resource_key(file_id)
+        destination_resource_key = _extract_resource_key(destination_folder_id)
+
+        if resolved_file_id == requested_destination_id:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": "A file or folder cannot be moved into itself.",
+                },
+                ensure_ascii=False,
+            )
+
+        service = get_drive_service()
+        source_get = service.files().get(
+            fileId=resolved_file_id,
+            supportsAllDrives=True,
+            fields="id,name,webViewLink,mimeType,parents,driveId,trashed",
+        )
+        _attach_resource_keys(source_get, [(resolved_file_id, source_resource_key)])
+        source = source_get.execute()
+        source_id = source.get("id")
+        if isinstance(source_id, str) and source_id:
+            resolved_file_id = source_id
+        if source.get("trashed"):
+            raise ValueError("file_id refers to a trashed file or folder")
+
+        destination_get = service.files().get(
+            fileId=requested_destination_id,
+            supportsAllDrives=True,
+            fields="id,name,mimeType,driveId,trashed",
+        )
+        _attach_resource_keys(
+            destination_get,
+            [(requested_destination_id, destination_resource_key)],
+        )
+        destination = destination_get.execute()
+
+        if destination.get("mimeType") != "application/vnd.google-apps.folder":
+            raise ValueError("destination_folder_id must refer to a Drive folder")
+        if destination.get("trashed"):
+            raise ValueError("destination_folder_id refers to a trashed folder")
+        resolved_destination_id = destination.get("id")
+        if not isinstance(resolved_destination_id, str) or not resolved_destination_id:
+            raise RuntimeError("Drive returned an invalid destination folder id")
+        if resolved_file_id == resolved_destination_id:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": "A file or folder cannot be moved into itself.",
+                },
+                ensure_ascii=False,
+            )
+
+        current_parents = source.get("parents", [])
+        if not isinstance(current_parents, list) or not all(
+            isinstance(parent, str) for parent in current_parents
+        ):
+            raise ValueError("Drive returned an invalid parents list for file_id")
+        if resolved_destination_id in current_parents:
+            return json.dumps(
+                {
+                    "status": "success",
+                    "file": source,
+                    "destination_folder_id": resolved_destination_id,
+                    "already_in_destination": True,
+                },
+                ensure_ascii=False,
+            )
+
+        update_kwargs: dict[str, Any] = {
+            "fileId": resolved_file_id,
+            "body": {},
+            "addParents": resolved_destination_id,
+            "supportsAllDrives": True,
+            "fields": "id,name,mimeType,parents,driveId,webViewLink,trashed",
+        }
+        if current_parents:
+            update_kwargs["removeParents"] = ",".join(current_parents)
+
+        update_request = service.files().update(**update_kwargs)
+        _attach_resource_keys(
+            update_request,
+            [
+                (resolved_file_id, source_resource_key),
+                (resolved_destination_id, destination_resource_key),
+            ],
+        )
+        updated_file = update_request.execute()
+        if not isinstance(updated_file, dict):
+            raise RuntimeError("Drive move returned an invalid file response")
+        updated_parents = updated_file.get("parents", [])
+        if not isinstance(updated_parents, list) or not all(
+            isinstance(parent, str) for parent in updated_parents
+        ):
+            raise RuntimeError("Drive move returned an invalid parents list")
+        if resolved_destination_id not in updated_parents:
+            raise RuntimeError(
+                "Drive move returned successfully, but the destination folder "
+                "was not present in the response"
+            )
+
+        return json.dumps(
+            {
+                "status": "success",
+                "file": updated_file,
+                "destination_folder_id": resolved_destination_id,
+                "already_in_destination": False,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        logger.error(f"Error moving file: {e}")
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 

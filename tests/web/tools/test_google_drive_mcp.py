@@ -256,8 +256,7 @@ def test_resolve_file_id_rejects_malformed_path_segment_instead_of_truncating(ur
         # the whole string was rejected as untrusted -- even though this
         # is a perfectly legitimate Drive link.
         (
-            "docs.google.com/document/d/ABCID123/edit"
-            "?usp=sharing&continue=https://other.com/x",
+            "docs.google.com/document/d/ABCID123/edit?usp=sharing&continue=https://other.com/x",
             "ABCID123",
         ),
         # A harmless double-slash typo in the path must not defeat
@@ -1288,6 +1287,346 @@ def test_rename_file_attaches_resource_key_header(monkeypatch):
     google_drive.google_drive_rename_file(url, "renamed")
 
     assert update_request.headers == {"X-Goog-Drive-Resource-Keys": "abc123/0-Rkey123"}
+
+
+def test_move_file_updates_parents(monkeypatch):
+    class _Request:
+        def __init__(self, response):
+            self.headers = {}
+            self.response = response
+
+        def execute(self):
+            return self.response
+
+    class _Files:
+        def __init__(self):
+            self.get_requests = [
+                _Request(
+                    {
+                        "id": "file1",
+                        "name": "deck",
+                        "webViewLink": "https://drive.google.com/file/d/file1/view",
+                        "mimeType": "application/vnd.google-apps.presentation",
+                        "parents": ["root"],
+                        "trashed": False,
+                    }
+                ),
+                _Request(
+                    {
+                        "id": "folder1",
+                        "name": "Testing Files",
+                        "mimeType": "application/vnd.google-apps.folder",
+                        "trashed": False,
+                    }
+                ),
+            ]
+            self.update_request = _Request(
+                {
+                    "id": "file1",
+                    "name": "deck",
+                    "mimeType": "application/vnd.google-apps.presentation",
+                    "parents": ["folder1"],
+                    "trashed": False,
+                }
+            )
+
+        def get(self, **kwargs):
+            request = self.get_requests.pop(0)
+            request.kwargs = kwargs
+            return request
+
+        def update(self, **kwargs):
+            self.update_request.kwargs = kwargs
+            return self.update_request
+
+    files = _Files()
+    service = Mock()
+    service.files.return_value = files
+    monkeypatch.setattr(google_drive, "get_drive_service", lambda: service)
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "folder1"))
+
+    assert result["status"] == "success"
+    assert result["file"]["parents"] == ["folder1"]
+    assert result["already_in_destination"] is False
+    assert files.update_request.kwargs["addParents"] == "folder1"
+    assert files.update_request.kwargs["removeParents"] == "root"
+    assert files.update_request.kwargs["supportsAllDrives"] is True
+    assert files.get_requests == []
+    assert "webViewLink" in files.update_request.kwargs["fields"]
+    assert "trashed" in files.update_request.kwargs["fields"]
+
+
+def test_move_file_canonicalizes_root_alias(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = Mock()
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["folder1"],
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "actual-root-id",
+        "name": "My Drive",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": False,
+    }
+    update_request = Mock()
+    update_request.headers = {}
+    update_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["actual-root-id"],
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+    service.files.return_value.update.return_value = update_request
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "root"))
+
+    assert result["status"] == "success"
+    assert result["destination_folder_id"] == "actual-root-id"
+    assert service.files.return_value.get.call_args_list[1].kwargs["fileId"] == "root"
+    update_kwargs = service.files.return_value.update.call_args.kwargs
+    assert update_kwargs["addParents"] == "actual-root-id"
+    assert update_kwargs["removeParents"] == "folder1"
+
+
+def test_move_file_root_alias_is_idempotent(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = Mock()
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["actual-root-id"],
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "actual-root-id",
+        "name": "My Drive",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "root"))
+
+    assert result["status"] == "success"
+    assert result["already_in_destination"] is True
+    assert result["destination_folder_id"] == "actual-root-id"
+    service.files.return_value.update.assert_not_called()
+
+
+def test_move_file_rejects_trashed_source_before_destination_lookup(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = Mock()
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["folder1"],
+        "trashed": True,
+    }
+    service.files.return_value.get.return_value = source_request
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "folder1"))
+
+    assert result["status"] == "error"
+    assert "trashed" in result["message"]
+    assert service.files.return_value.get.call_count == 1
+    service.files.return_value.update.assert_not_called()
+
+
+def test_move_file_rejects_trashed_destination(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = Mock()
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["folder0"],
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "folder1",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": True,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "folder1"))
+
+    assert result["status"] == "error"
+    assert "trashed" in result["message"]
+    service.files.return_value.update.assert_not_called()
+
+
+def test_move_file_rejects_canonical_self_move_with_root_alias(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = Mock()
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "actual-root-id",
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [],
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "actual-root-id",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+
+    result = json.loads(google_drive.google_drive_move_file("root", "actual-root-id"))
+
+    assert result["status"] == "error"
+    assert "itself" in result["message"]
+    service.files.return_value.update.assert_not_called()
+
+
+def test_move_file_attaches_both_resource_keys_to_update(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = Mock()
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["folder0"],
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "folder1",
+        "name": "Testing Files",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": False,
+    }
+    update_request = Mock()
+    update_request.headers = {}
+    update_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["folder1"],
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+    service.files.return_value.update.return_value = update_request
+
+    source_url = "https://drive.google.com/file/d/file1/view?resourcekey=source-key"
+    destination_url = (
+        "https://drive.google.com/drive/folders/folder1?resourcekey=destination-key"
+    )
+    result = json.loads(
+        google_drive.google_drive_move_file(source_url, destination_url)
+    )
+
+    assert result["status"] == "success"
+    assert update_request.headers == {
+        "X-Goog-Drive-Resource-Keys": "file1/source-key,folder1/destination-key"
+    }
+
+
+@pytest.mark.parametrize("invalid_parents", [None, "root", ["root", 1]])
+def test_move_file_rejects_invalid_source_parents(monkeypatch, invalid_parents):
+    service = _mock_drive_service(monkeypatch)
+    source_request = service.files.return_value.get.return_value
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": invalid_parents,
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "folder1",
+        "name": "Testing Files",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "folder1"))
+
+    assert result["status"] == "error"
+    assert "parents" in result["message"]
+    service.files.return_value.update.assert_not_called()
+
+
+def test_move_file_is_idempotent_when_already_in_destination(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = service.files.return_value.get.return_value
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["folder1"],
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "folder1",
+        "name": "Testing Files",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "folder1"))
+
+    assert result["status"] == "success"
+    assert result["already_in_destination"] is True
+    service.files.return_value.update.assert_not_called()
+
+
+def test_move_file_rejects_non_folder_destination(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = service.files.return_value.get.return_value
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["root"],
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "file2",
+        "name": "another deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "file2"))
+
+    assert result["status"] == "error"
+    assert "destination_folder_id" in result["message"]
+    service.files.return_value.update.assert_not_called()
 
 
 def test_list_permissions_returns_permissions(monkeypatch):

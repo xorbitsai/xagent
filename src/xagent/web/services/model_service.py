@@ -13,7 +13,11 @@ from typing import Any, Dict, Iterator, Optional, cast
 from sqlalchemy import and_, case, or_
 from sqlalchemy.orm import Session
 
-from xagent.core.model.image.base import BaseImageModel, default_image_abilities
+from xagent.core.model.image.base import (
+    BaseImageModel,
+    default_image_abilities,
+    retry_image_call,
+)
 
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.image.dashscope import DashScopeImageModel
@@ -21,6 +25,7 @@ from ...core.model.image.gemini import GeminiImageModel
 from ...core.model.image.openai import OpenAIImageModel
 from ...core.model.image.xinference import XinferenceImageModel
 from ...core.model.video.base import BaseVideoModel
+from ...core.retry import create_retry_wrapper
 from ..models.model import Model as DBModel
 from .llm_utils import AutoModelUnavailableError
 
@@ -650,8 +655,25 @@ def get_vision_model(db: Session, user_id: Optional[int] = None) -> Optional[Bas
 def _add_image_model_with_id(
     models_dict: dict[str, Any], instance: Any, db_model: DBModel
 ) -> None:
+    # The id is stamped on the inner provider, which is what records image
+    # usage; the constructor argument at the call sites covers the same ground,
+    # but this keeps a provider built any other way from billing under its
+    # provider-facing name.
     setattr(instance, "model_id", str(db_model.model_id))
-    models_dict[str(db_model.model_id)] = instance
+    # Same retry policy as get_image_model_instance, so both construction paths
+    # agree on how often a call is attempted and never retry an already-billed
+    # invalid response. max_retries is the total attempt bound, clamped to at
+    # least 1: `or 3` only substitutes when the row's value is falsy (None or
+    # 0), so a negative row value passed straight through, and RetryWrapper's
+    # `range(max_retries)` is empty for anything <= 0 -- every call raised a
+    # bare RuntimeError without the target ever being invoked.
+    models_dict[str(db_model.model_id)] = create_retry_wrapper(
+        instance,
+        BaseImageModel,
+        retry_methods={"generate_image", "edit_image"},
+        max_retries=max(getattr(db_model, "max_retries", 3) or 3, 1),
+        retry_on=retry_image_call,
+    )
     logger.info(
         f"Added image model: model_id={db_model.model_id}, model_name={db_model.model_name}"
     )
@@ -713,6 +735,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=str(db_model.model_id),
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "gemini":
@@ -721,6 +744,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=str(db_model.model_id),
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "openai":
@@ -729,6 +753,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=str(db_model.model_id),
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
                 elif model_provider == "xinference":
@@ -737,6 +762,7 @@ def get_image_models(db: Session, user_id: Optional[int] = None) -> Dict[str, An
                         api_key=api_key,
                         base_url=base_url,
                         abilities=abilities,
+                        model_id=str(db_model.model_id),
                     )
                     _add_image_model_with_id(image_models, image_model, db_model)
             except Exception as e:

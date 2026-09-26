@@ -31,7 +31,11 @@ def get_image_model_instance(db_model: Any) -> BaseImageModel:
         db_model.abilities or default_image_abilities(provider, model_name)
     )
     timeout = getattr(db_model, "timeout", 300.0) or 300.0
-    max_retries = getattr(db_model, "max_retries", 3) or 3
+    # Clamped to at least 1: `or 3` only substitutes when the row's value is
+    # falsy (None or 0), so a negative row value passed straight through, and
+    # RetryWrapper's `range(max_retries)` is empty for anything <= 0 -- every
+    # call raised a bare RuntimeError without the target ever being invoked.
+    max_retries = max(getattr(db_model, "max_retries", 3) or 3, 1)
     # The row's own model_id, not a name+provider composite. `id` is what
     # create_image_model hands the provider as its billing identity, and the
     # aggregator groups on `model_id or model` -- a composite of the two

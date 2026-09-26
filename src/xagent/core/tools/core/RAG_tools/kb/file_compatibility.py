@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Unio
 from ..storage.contracts import DocumentRecord
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sqlalchemy.orm import Session
 
     from xagent.web.models.uploaded_file import UploadedFile
@@ -128,6 +130,7 @@ class KBFileCompatibilityFacade:
         file_id: str,
         user_id: Optional[int],
         remaining_file_ids: set[str],
+        after_commit: Optional[List[Callable[[], None]]] = None,
     ) -> bool:
         from xagent.web.services.kb_file_service import (
             _delete_uploaded_file_if_orphaned_impl,
@@ -138,6 +141,7 @@ class KBFileCompatibilityFacade:
             file_id=file_id,
             user_id=user_id,
             remaining_file_ids=remaining_file_ids,
+            after_commit=after_commit,
         )
 
     def list_collection_uploaded_file_owner_ids(
@@ -178,6 +182,7 @@ class KBFileCompatibilityFacade:
         collection_file_ids: Set[str],
         remaining_file_ids: Set[str],
         collection_dir: Optional[Path],
+        after_commit: List[Callable[[], None]],
     ) -> int:
         from xagent.web.services.kb_collection_service import (
             _delete_collection_uploaded_files_impl,
@@ -189,6 +194,7 @@ class KBFileCompatibilityFacade:
             collection_file_ids=collection_file_ids,
             remaining_file_ids=remaining_file_ids,
             collection_dir=collection_dir,
+            after_commit=after_commit,
         )
 
     def rename_collection_storage(

@@ -1392,6 +1392,19 @@ async def _cleanup_collection_metadata_after_failed_batch_api_ingest(
     )
 
 
+def _run_after_commit(actions: List[Callable[[], None]]) -> None:
+    """Run every queued byte delete, log each failure, then raise the first."""
+    first_error: Optional[Exception] = None
+    for action in actions:
+        try:
+            action()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to delete file bytes after commit", exc_info=True)
+            first_error = first_error or exc
+    if first_error is not None:
+        raise first_error
+
+
 async def _rollback_failed_ingestion(
     *,
     db: Session,
@@ -1423,6 +1436,7 @@ async def _rollback_failed_ingestion(
     def _compensate_file() -> None:
         if uploaded_file_existed_before:
             return
+        after_commit: List[Callable[[], None]] = []
         if register_created and doc_id:
             remaining_records = _list_document_records_for_file_ids(
                 [file_record_id],
@@ -1441,11 +1455,14 @@ async def _rollback_failed_ingestion(
                 file_id=file_record_id,
                 user_id=user_id,
                 remaining_file_ids=remaining_file_ids,
+                after_commit=after_commit,
             )
-            db.commit()
         else:
-            UploadedFileStore(db).delete(file_record, delete_local=False)
-            db.commit()
+            UploadedFileStore(db).delete(
+                file_record, delete_local=False, after_commit=after_commit
+            )
+        db.commit()
+        _run_after_commit(after_commit)
 
     try:
         collection_records = (
@@ -1503,15 +1520,17 @@ async def _rollback_failed_ingestion(
                 )
                 if file_id
             }
+            after_commit: List[Callable[[], None]] = []
             delete_collection_uploaded_files(
                 db,
                 user_id=user_id,
                 collection_file_ids=own_file_ids,
                 remaining_file_ids=remaining_file_ids,
                 collection_dir=None,
+                after_commit=after_commit,
             )
             if not uploaded_file_existed_before:
-                # The collection cleanup above may already delete+commit the UploadedFile
+                # The collection cleanup above may already delete the UploadedFile
                 # row, so reuse the stable file_id instead of touching a deleted ORM instance.
                 refreshed_file_record = (
                     db.query(UploadedFile)
@@ -1520,13 +1539,16 @@ async def _rollback_failed_ingestion(
                 )
                 if refreshed_file_record is not None:
                     UploadedFileStore(db).delete(
-                        refreshed_file_record, delete_local=False
+                        refreshed_file_record,
+                        delete_local=False,
+                        after_commit=after_commit,
                     )
+            db.commit()
+            _run_after_commit(after_commit)
             await _cleanup_failed_new_collection_metadata(
                 collection_name=collection_name,
                 user=user,
             )
-            db.commit()
 
         # Compare doc_ids, not file_ids (same-path ingests share a file_id); any
         # record but the document this run created counts as another's.
@@ -1637,12 +1659,17 @@ async def _rollback_failed_cloud_ingestion(
         }
 
         if file_record_id is not None:
+            after_commit: List[Callable[[], None]] = []
             _delete_uploaded_file_if_orphaned(
                 db,
                 file_id=file_record_id,
                 user_id=user_id,
                 remaining_file_ids=remaining_file_ids,
+                after_commit=after_commit,
             )
+            # Before COLLECTION awaits: /ingest-cloud siblings share this Session.
+            db.commit()
+            _run_after_commit(after_commit)
 
     async def _compensate_collection() -> None:
         collection_records = vector_store.list_document_records(
@@ -6591,6 +6618,7 @@ def _perform_kb_collection_delete(
             fallback_user_id=user_id,
         )
         deleted_uploaded_files = 0
+        after_commit: List[Callable[[], None]] = []
         for owner_id in sorted(mutation_scope.owner_user_ids):
             physical_cleanup = physical_cleanup_by_owner[owner_id]
             physical_cleanup_status = physical_cleanup.status
@@ -6606,6 +6634,7 @@ def _perform_kb_collection_delete(
                     ),
                     remaining_file_ids=remaining_file_ids_by_owner.get(owner_id, set()),
                     collection_dir=collection_dir,
+                    after_commit=after_commit,
                 )
             else:
                 logger.warning(
@@ -6616,11 +6645,19 @@ def _perform_kb_collection_delete(
                     physical_cleanup_status,
                 )
         if deleted_uploaded_files:
+            db.commit()
             logger.info(
                 "Deleted %s UploadedFile record(s) for collection %s",
                 deleted_uploaded_files,
                 safe_collection,
             )
+            try:
+                _run_after_commit(after_commit)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Left file bytes behind after deleting collection %s",
+                    safe_collection,
+                )
 
         cleanup_warnings = list(result.warnings) if result.warnings else []
         cleanup_info_messages: List[str] = []

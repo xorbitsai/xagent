@@ -6,7 +6,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Set
+from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from filelock import Timeout
 from sqlalchemy import or_
@@ -196,6 +196,7 @@ def _delete_collection_uploaded_files_impl(
     collection_file_ids: Set[str],
     remaining_file_ids: Set[str],
     collection_dir: Optional[Path],
+    after_commit: List[Callable[[], None]],
 ) -> int:
     """Delete orphan UploadedFile rows for a collection, with legacy path fallback."""
     deleted_uploaded_files = 0
@@ -207,6 +208,7 @@ def _delete_collection_uploaded_files_impl(
             file_id=current_file_id,
             user_id=user_id,
             remaining_file_ids=remaining_file_ids,
+            after_commit=after_commit,
         ):
             deleted_uploaded_files += 1
             deleted_file_ids.add(current_file_id)
@@ -226,11 +228,8 @@ def _delete_collection_uploaded_files_impl(
             query = query.filter(UploadedFile.file_id.notin_(deleted_file_ids))
         store = UploadedFileStore(db)
         for file_record in query.all():
-            store.delete(file_record, delete_local=False)
+            store.delete(file_record, delete_local=False, after_commit=after_commit)
             deleted_uploaded_files += 1
-
-    if deleted_uploaded_files:
-        db.commit()
 
     return deleted_uploaded_files
 
@@ -437,14 +436,19 @@ def delete_collection_uploaded_files(
     collection_file_ids: Set[str],
     remaining_file_ids: Set[str],
     collection_dir: Optional[Path],
+    after_commit: List[Callable[[], None]],
 ) -> int:
-    """Delete orphan UploadedFile rows for a collection, with legacy path fallback."""
+    """Delete orphan UploadedFile rows for a collection, with legacy path fallback.
+
+    Never commits; the caller commits, then runs ``after_commit``.
+    """
     return _get_file_compatibility_facade().delete_collection_uploaded_files(
         db,
         user_id=user_id,
         collection_file_ids=collection_file_ids,
         remaining_file_ids=remaining_file_ids,
         collection_dir=collection_dir,
+        after_commit=after_commit,
     )
 
 

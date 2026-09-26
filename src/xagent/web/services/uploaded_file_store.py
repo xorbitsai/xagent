@@ -1826,8 +1826,15 @@ class UploadedFileStore:
         *,
         delete_local: bool = True,
         local_root: Optional[Path] = None,
+        after_commit: Optional[list[Callable[[], None]]] = None,
     ) -> None:
-        ManagedFileRef(file_record).delete_durable()
+        ref = ManagedFileRef(file_record)
+        if after_commit is None:
+            ref.delete_durable()
+        elif ref.has_durable_object:
+            storage = get_user_file_storage(int(file_record.user_id))
+            key = ref.storage_key
+            after_commit.append(lambda: storage.delete(key))
         if delete_local:
             self._delete_local(file_record, local_root=local_root)
         # Remove any server-side PDF preview cache so derived content doesn't

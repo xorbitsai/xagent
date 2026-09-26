@@ -191,6 +191,7 @@ def test_collection_uploaded_file_cleanup_impl_uses_file_private_impl(
         file_id: str,
         user_id: int,
         remaining_file_ids: set[str],
+        after_commit: list[object],
     ) -> bool:
         calls.append(
             {
@@ -214,10 +215,11 @@ def test_collection_uploaded_file_cleanup_impl_uses_file_private_impl(
         collection_file_ids={"file-a", "file-b"},
         remaining_file_ids={"file-b"},
         collection_dir=None,
+        after_commit=[],
     )
 
     assert result == 1
-    assert commit_calls == [True]
+    assert commit_calls == []
     assert sorted(calls, key=lambda call: str(call["file_id"])) == [
         {
             "db": fake_db,

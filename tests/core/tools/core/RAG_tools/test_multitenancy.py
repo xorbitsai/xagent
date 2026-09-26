@@ -1079,6 +1079,7 @@ class TestAPIMultiTenancy:
                 collection_file_ids={"file-a"},
                 remaining_file_ids=set(),
                 collection_dir=owner_one_dir,
+                after_commit=ANY,
             ),
             call(
                 ANY,
@@ -1086,6 +1087,7 @@ class TestAPIMultiTenancy:
                 collection_file_ids={"file-b"},
                 remaining_file_ids=set(),
                 collection_dir=owner_two_dir,
+                after_commit=ANY,
             ),
         ]
         assert result.status == "success"
@@ -1332,6 +1334,7 @@ class TestAPIMultiTenancy:
             collection_file_ids=set(),
             remaining_file_ids=set(),
             collection_dir=owner_dir,
+            after_commit=ANY,
         )
         assert result.status == "success"
 
@@ -1403,6 +1406,7 @@ class TestAPIMultiTenancy:
             collection_file_ids=set(),
             remaining_file_ids=set(),
             collection_dir=owner_dir,
+            after_commit=ANY,
         )
         assert result.status == "success"
 

@@ -10,7 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Union
 
 from sqlalchemy.orm import Session
 
@@ -322,6 +322,7 @@ def _delete_uploaded_file_if_orphaned_impl(
     file_id: str,
     user_id: Optional[int],
     remaining_file_ids: set[str],
+    after_commit: Optional[List[Callable[[], None]]] = None,
 ) -> bool:
     """Delete uploaded file row and local file when no documents still reference it.
 
@@ -363,11 +364,20 @@ def _delete_uploaded_file_if_orphaned_impl(
             file_path,
         )
     else:
-        if resolved_path.exists() and resolved_path.is_file():
-            resolved_path.unlink()
-            logger.info("Deleted orphaned physical file: %s", resolved_path)
 
-    UploadedFileStore(db).delete(file_record, delete_local=False)
+        def _unlink() -> None:
+            if resolved_path.exists() and resolved_path.is_file():
+                resolved_path.unlink()
+                logger.info("Deleted orphaned physical file: %s", resolved_path)
+
+        if after_commit is None:
+            _unlink()
+        else:
+            after_commit.append(_unlink)
+
+    UploadedFileStore(db).delete(
+        file_record, delete_local=False, after_commit=after_commit
+    )
     # Invalidate cache for this user since file list changed
     _file_status_cache.invalidate_user(scope.user_id)
     return True
@@ -1056,6 +1066,7 @@ def delete_uploaded_file_if_orphaned(
     file_id: str,
     user_id: Optional[int],
     remaining_file_ids: set[str],
+    after_commit: Optional[List[Callable[[], None]]] = None,
 ) -> bool:
     """Delete uploaded file row and local file when no documents still reference it."""
     return _get_file_compatibility_facade().delete_uploaded_file_if_orphaned(
@@ -1063,6 +1074,7 @@ def delete_uploaded_file_if_orphaned(
         file_id=file_id,
         user_id=user_id,
         remaining_file_ids=remaining_file_ids,
+        after_commit=after_commit,
     )
 
 

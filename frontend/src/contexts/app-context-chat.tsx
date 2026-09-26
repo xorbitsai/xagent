@@ -1291,7 +1291,9 @@ type AppAction =
   | { type: "SET_HISTORY_LOADING"; payload: boolean }
   | { type: "SYNC_PROCESSING_STATUS" }
 
-const createInitialState = (): AppState => ({
+// Exported alongside projectAppState so a reducer unit test can build a real
+// starting state instead of hand-rolling every field.
+export const createInitialState = (): AppState => ({
   messages: [],
   currentTask: null,
   taskRuntimeExtensions: {},
@@ -1326,7 +1328,57 @@ const createInitialState = (): AppState => ({
   sessionConversation: { ...initialSessionConversationState },
 })
 
-function projectAppState(state: AppState, action: AppAction): AppState {
+// A settlement lifecycle (``settlement_delivery``) re-opens a tool call that
+// already completed, so its events belong in the message that holds that
+// call's original ``tool_execution_start`` -- not in the live buffer, which
+// feeds whichever result message is written next. Returns that message's
+// index, or -1 when no message owns the call (a first-ever delivery, or a
+// history window that does not reach back to the original start), in which
+// case the caller keeps the normal buffering behavior.
+function settlementTargetMessageIndex(
+  messages: Message[],
+  event: TraceEvent
+): number {
+  const data = (event?.data ?? {}) as Record<string, unknown>
+  if (data.settlement_delivery !== true) return -1
+  const toolCallId = data.tool_call_id
+  if (typeof toolCallId !== "string" || !toolCallId) return -1
+  // tool_call_id alone is not invocation-global: a provider that omits ids
+  // makes the backend's synthesized fallback (`tool_call_{index}`) collide
+  // across concurrent DAG steps, and a bare-id match could route this
+  // settlement into a DIFFERENT call's message. But a single call's OWN
+  // settlement can legitimately carry a step_id that differs from its
+  // pause's (a ledger row without a persisted original step_id falls back
+  // to the resumed run's fresh one -- see react.py's
+  // `_trace_tool_interaction_settlement`), so requiring an exact match
+  // unconditionally would misroute the common, unambiguous case. Only gate
+  // on it when more than one message's stored call actually shares this id.
+  const originStepId = event.step_id
+  const owningIndexes: number[] = []
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const owns = (messages[index].traceEvents || []).some(candidate => {
+      if (candidate?.event_type !== "tool_execution_start") return false
+      const candidateData = (candidate?.data ?? {}) as Record<string, unknown>
+      return candidateData.tool_call_id === toolCallId
+    })
+    if (owns) owningIndexes.push(index)
+  }
+  if (owningIndexes.length === 0) return -1
+  if (owningIndexes.length === 1) return owningIndexes[0]
+  const exact = owningIndexes.filter(index =>
+    (messages[index].traceEvents || []).some(candidate => {
+      if (candidate?.event_type !== "tool_execution_start") return false
+      const candidateData = (candidate?.data ?? {}) as Record<string, unknown>
+      return candidateData.tool_call_id === toolCallId && candidate.step_id === originStepId
+    })
+  )
+  return exact.length === 1 ? exact[0] : -1
+}
+
+// Pure reducer over (state, action). Exported for unit testing -- notably the
+// ADD_TRACE_EVENT routing that keeps a settlement lifecycle in the same
+// message window as the call it updates.
+export function projectAppState(state: AppState, action: AppAction): AppState {
   console.log('🔍 Reducer called with action:', action.type, action)
 
   switch (action.type) {
@@ -1791,7 +1843,27 @@ function projectAppState(state: AppState, action: AppAction): AppState {
     case "SET_STEPS":
       return { ...state, steps: action.payload }
 
-    case "ADD_TRACE_EVENT":
+    case "ADD_TRACE_EVENT": {
+      // A settlement lifecycle updates a tool call that was sealed into an
+      // EARLIER message. The pause pair ends up inside the waiting-question
+      // result message, and the user's reply is appended after it, so by the
+      // time the settlement arrives the tail is a user message and the
+      // default buffering below would file the update into the NEXT result
+      // message -- a different TraceEventRenderer window from the card it is
+      // meant to update, which is what made it render as a second card.
+      // Route it to whichever message already holds that tool_call_id.
+      const settlementTarget = settlementTargetMessageIndex(state.messages, action.payload)
+      if (settlementTarget >= 0) {
+        const target = state.messages[settlementTarget]
+        return {
+          ...state,
+          messages: state.messages.map((message, index) =>
+            index === settlementTarget
+              ? { ...target, traceEvents: [...(target.traceEvents || []), action.payload] }
+              : message
+          )
+        }
+      }
       // If the last message is a result message from assistant, append the trace event to that message directly.
       // This ensures that events arriving after the result message (like react_task_end) are correctly displayed.
       const lastMsg = state.messages.length > 0 ? state.messages[state.messages.length - 1] : null
@@ -1806,6 +1878,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         }
       }
       return { ...state, traceEvents: [...state.traceEvents, action.payload] }
+    }
 
     case "SET_TRACE_EVENTS":
       return { ...state, traceEvents: action.payload }

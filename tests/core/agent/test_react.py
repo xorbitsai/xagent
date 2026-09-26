@@ -1653,6 +1653,37 @@ def test_react_defaults_presentation_without_guessing_required_information(
         assert "user choice cannot be obtained in this run" in prompt
 
 
+@pytest.mark.parametrize("user_interaction_enabled", [True, False])
+def test_react_authorization_guidance_preserves_interaction_policy(
+    user_interaction_enabled: bool,
+) -> None:
+    pattern = ReActPattern(user_interaction_enabled=user_interaction_enabled)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.add_user_message("Summarize the records for my account.")
+    tool_names = [
+        schema["function"]["name"] for schema in pattern._builtin_tool_schemas()
+    ]
+    prompt = pattern._messages_for_llm(context, has_tools=True, tool_names=tool_names)[
+        0
+    ]["content"]
+
+    assert "generic HTTP tool does not restore access" in prompt
+    assert "retry only after a relevant authorization or configuration change" in prompt
+    assert "Never ask the user to paste passwords, API keys, or access tokens" in prompt
+    if user_interaction_enabled:
+        assert "call ask_user_question" in prompt
+    else:
+        assert "ask_user_question" not in tool_names
+        assert "call ask_user_question" not in prompt
+        assert "finish with outcome=blocked and explain what is missing" in prompt
+
+    forced_prompt = pattern._messages_for_llm(
+        context, has_tools=True, force_final_answer=True, tool_names=["final_answer"]
+    )[0]["content"]
+    assert "If a tool reports missing or expired authorization" not in forced_prompt
+    assert "retry only after" not in forced_prompt
+
+
 def test_react_forced_final_answer_respects_prior_clarification_scope() -> None:
     """A selected subset must stay the scope at the moment the model writes
     the user-visible answer, not just while it can still call tools.
@@ -4315,6 +4346,13 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
         "confirm execution strategy" in ask_user_description
     )
     assert "whether to use memory" in ask_user_description
+    assert (
+        "Do not request passwords, API keys, or access tokens" in ask_user_description
+    )
+    assert "offer uploaded or pasted data where suitable" in ask_user_description
+    assert "credentials belong in the application's connection settings" in (
+        ask_user_description
+    )
     assert (
         "a fact-carrying value (one that asserts a real-world fact) for a tool "
         "argument that the user has not provided" in ask_user_description

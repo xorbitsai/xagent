@@ -1528,6 +1528,13 @@ class ReActPattern(AgentPattern):
                 "the user explicitly asked to choose. This "
                 "does not permit guessing facts, action targets, or authorization. "
                 f"{missing_information_instruction}"
+                "If a tool reports missing or expired "
+                "authorization, changing unrelated query parameters or switching "
+                "to a generic HTTP tool does not restore access; retry only after "
+                "a relevant authorization or configuration change. Never ask the "
+                "user to paste passwords, API keys, or access tokens into chat or "
+                "a clarification form; direct credential setup to the application's "
+                "connection settings instead. "
                 "If the latest user "
                 "message explicitly asks you to call a named available tool, call "
                 "that tool instead of paraphrasing the request. If a tool "
@@ -3214,7 +3221,11 @@ class ReActPattern(AgentPattern):
                         "a sufficiently specified task; decide those yourself. A task "
                         "is not sufficiently specified if carrying it out would "
                         "require inventing a fact-carrying argument value the user "
-                        "has not provided. " + OPTIONS_REQUIRED_GUIDANCE
+                        "has not provided. Do not request passwords, API keys, or "
+                        "access tokens in these fields. For missing data access, "
+                        "offer uploaded or pasted data where suitable; credentials "
+                        "belong in the application's connection settings, not this "
+                        "form. " + OPTIONS_REQUIRED_GUIDANCE
                     ),
                     "parameters": {
                         "type": "object",

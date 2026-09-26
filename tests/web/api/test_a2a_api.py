@@ -715,6 +715,10 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     assert response.status_code == 200, response.text
     assert response.json()["task"]["contextId"] == "ctx-follow-up"
     assert response.json()["task"]["status"]["state"] == "TASK_STATE_WORKING"
+    assert (
+        agent_manager.get_agent_for_task.await_args.kwargs["connector_runtime_turn_id"]
+        == f"a2a:{task_id}:msg-follow-up"
+    )
     agent_service.post_user_message.assert_awaited_once_with(
         task_id,
         execution_message="follow up",

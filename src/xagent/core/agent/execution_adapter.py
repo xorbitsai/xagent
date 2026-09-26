@@ -185,6 +185,9 @@ class AgentExecutionAdapter:
                 metadata=self._execution_metadata(execution_type=execution_type),
             )
         else:
+            # AgentService may have rebuilt the tool objects after a connection
+            # or policy change. A paused runner still holds the previous list.
+            handle.runner.agent.tools = self.config.tools
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()
             )

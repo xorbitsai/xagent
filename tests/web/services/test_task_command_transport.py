@@ -1119,6 +1119,12 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
     assert command is not None
     assert command.status == COMMAND_COMPLETED
     assert task.run_id == "run-2"
+    assert (
+        runtime_manager.get_agent_for_task.await_args.kwargs[
+            "connector_runtime_turn_id"
+        ]
+        == "committed-turn"
+    )
     runtime_agent.post_user_message.assert_awaited_once()
     assert runtime_agent.post_user_message.await_args.kwargs["turn_id"] == (
         "committed-turn"

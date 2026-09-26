@@ -217,7 +217,7 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
     post_user_message = AsyncMock(return_value=UserMessageInjectionOutcome.POSTED_FRESH)
     agent_patch, agent_service = _patch_agent_service(post_user_message)
     with (
-        agent_patch,
+        agent_patch as get_agent_manager,
         patch(
             "xagent.web.services.task_resume._schedule_waiting_reply_resume",
             new=AsyncMock(),
@@ -242,6 +242,12 @@ def test_reply_happy_path_resumes_the_same_run(mock_start_task):
     assert call_kwargs["display_message"] == "yes, continue"
     assert call_kwargs["request_interrupt"] is False
     assert call_kwargs["turn_id"].startswith(f"v1:reply:{task_id}:")
+    assert (
+        get_agent_manager.return_value.get_agent_for_task.await_args.kwargs[
+            "connector_runtime_turn_id"
+        ]
+        == call_kwargs["turn_id"]
+    )
     schedule_resume.assert_called_once()
     scheduled_lease = schedule_resume.call_args.kwargs["task_lease"]
     assert scheduled_lease.run_id == "run-original"

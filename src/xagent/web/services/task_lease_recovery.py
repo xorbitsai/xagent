@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
-from ..models.task import Task, TaskStatus
+from ..models.chat_message import TaskChatMessage
+from ..models.task import Task, TaskStatus, task_status_predicate
+from .chat_history_service import DELIVERY_DISPATCHED, DELIVERY_PENDING
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
 from .ops_signals import CHECKPOINT_LEGACY_POINTER_AMBIGUOUS, clear_degradation
+from .task_execution_controller import TaskControlState
 from .task_lease_service import (
     CheckpointRecoveryVerdict,
     TaskLeaseRecoveryCandidate,
@@ -22,6 +27,7 @@ from .task_lease_service import (
     utc_now,
 )
 from .task_orchestrator import (
+    _APPENDABLE_STATUSES,
     invalidate_task_cache_best_effort,
     sync_trigger_run_status,
 )
@@ -46,6 +52,165 @@ class TaskLeaseRecoveryBatch:
     scanned: int
     recovered: int
     next_cursor: TaskLeaseRecoveryCursor | None
+
+
+def _orphaned_pending_delivery_predicates(
+    *,
+    now: datetime,
+    task_id: int | None,
+    created_before: datetime | None,
+) -> list[Any]:
+    """Predicates selecting pending user rows that no owner can still settle.
+
+    A row qualifies only while its task is quiescent -- appendable (never
+    PENDING or WAITING_FOR_USER), no pause/resume in flight, and no live
+    lease -- and the task has no unfinished command that could still redrive
+    or inject the turn. A same-id MESSAGE that failed is excluded as well:
+    its sender was told the message was not accepted, so the row must not
+    start reading as delivered.
+    """
+
+    from ..models.task_command import TaskExecutionCommand
+    from .task_command_transport import (
+        COMMAND_FAILED,
+        COMMAND_PENDING,
+        COMMAND_PROCESSING,
+    )
+
+    predicates: list[Any] = [
+        TaskChatMessage.role == "user",
+        TaskChatMessage.delivery_status == DELIVERY_PENDING,
+        TaskChatMessage.turn_id.is_not(None),
+        select(Task.id)
+        .where(
+            Task.id == TaskChatMessage.task_id,
+            task_status_predicate.in_(_APPENDABLE_STATUSES),
+            or_(
+                Task.control_state.is_(None),
+                Task.control_state.not_in(
+                    (
+                        TaskControlState.PAUSE_REQUESTED.value,
+                        TaskControlState.RESUME_REQUESTED.value,
+                    )
+                ),
+            ),
+            or_(
+                Task.runner_id.is_(None),
+                Task.lease_expires_at.is_(None),
+                Task.lease_expires_at < now,
+            ),
+        )
+        .exists(),
+        ~select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == TaskChatMessage.task_id,
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+        )
+        .exists(),
+        ~select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == TaskChatMessage.task_id,
+            TaskExecutionCommand.command_id == TaskChatMessage.turn_id,
+            TaskExecutionCommand.status == COMMAND_FAILED,
+        )
+        .exists(),
+    ]
+    if task_id is not None:
+        predicates.append(TaskChatMessage.task_id == task_id)
+    if created_before is not None:
+        predicates.append(TaskChatMessage.created_at < created_before)
+    return predicates
+
+
+def reconcile_orphaned_pending_deliveries_no_commit(
+    db: Session,
+    *,
+    now: datetime,
+    task_id: int | None = None,
+    created_before: datetime | None = None,
+) -> int:
+    """Advance orphaned ``pending`` user rows to ``dispatched``; no commit.
+
+    A row stays ``pending`` forever when the run that accepted it crashed
+    before settling it, or when its coroutine was not the authoritative
+    closer at finalize (see ``_reconcile_finalized_turn_delivery``). Nothing
+    will settle it later, and a ``pending`` row makes every same-id resend
+    wait on it. ``dispatched`` means "do not resend", not "applied": whether
+    the turn ran is unknown, and resending could run it twice. One guarded
+    UPDATE, so a row that a concurrent new turn claims, or whose task starts
+    running, is left alone.
+    """
+
+    result = db.execute(
+        update(TaskChatMessage)
+        .where(
+            *_orphaned_pending_delivery_predicates(
+                now=now,
+                task_id=task_id,
+                created_before=created_before,
+            )
+        )
+        .values(delivery_status=DELIVERY_DISPATCHED)
+        .execution_options(synchronize_session=False)
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def reconcile_orphaned_pending_deliveries_isolated(*, batch_size: int) -> int:
+    """Sweep a bounded page of tasks with orphaned pending delivery rows.
+
+    Rows younger than one lease TTL are left for their own run to settle.
+    Each task gets its own short transaction so one busy task cannot hold
+    locks for the whole page.
+    """
+
+    from ...config import get_task_lease_ttl_seconds
+    from ..models.database import get_session_local
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    now = utc_now()
+    created_before = now - timedelta(seconds=get_task_lease_ttl_seconds())
+    SessionLocal = get_session_local()
+    with SessionLocal() as scan_db:
+        task_ids = [
+            int(value)
+            for value in scan_db.execute(
+                select(TaskChatMessage.task_id)
+                .where(
+                    *_orphaned_pending_delivery_predicates(
+                        now=now,
+                        task_id=None,
+                        created_before=created_before,
+                    )
+                )
+                .distinct()
+                .order_by(TaskChatMessage.task_id)
+                .limit(batch_size)
+            ).scalars()
+        ]
+
+    reconciled = 0
+    for candidate_task_id in task_ids:
+        with SessionLocal() as db:
+            try:
+                reconciled += reconcile_orphaned_pending_deliveries_no_commit(
+                    db,
+                    now=utc_now(),
+                    task_id=candidate_task_id,
+                    created_before=created_before,
+                )
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                if is_database_pool_timeout(exc):
+                    raise
+                logger.exception(
+                    "Orphaned delivery reconciliation failed for task %s; "
+                    "retrying next tick",
+                    candidate_task_id,
+                )
+    return reconciled
 
 
 def recover_task_lease_candidate_no_commit(
@@ -80,6 +245,19 @@ def recover_task_lease_candidate_no_commit(
     if not recovered:
         return None
 
+    # Same transaction as the fenced status write: the expired run cannot
+    # settle its own delivery rows any more, so close them here.
+    reconciled = reconcile_orphaned_pending_deliveries_no_commit(
+        db,
+        now=recovered_at,
+        task_id=candidate.task_id,
+    )
+    if reconciled:
+        logger.info(
+            "Lease recovery of task %s reconciled %s pending delivery row(s)",
+            candidate.task_id,
+            reconciled,
+        )
     db.expire_all()
     task = db.query(Task).filter(Task.id == candidate.task_id).one()
     sync_workforce_run_status(db, task, next_status)
@@ -354,6 +532,30 @@ async def run_task_lease_recovery_loop(
                 )
             else:
                 logger.exception("Task lease recovery tick failed")
+
+        # Its own guard so a lease-recovery fault cannot starve it. The first
+        # tick runs before any sleep, which also backfills historical rows.
+        try:
+            reconciled = await run_db_io_cancellation_safe(
+                lambda: reconcile_orphaned_pending_deliveries_isolated(
+                    batch_size=batch_size
+                )
+            )
+            if reconciled:
+                logger.info(
+                    "Reconciled %s orphaned pending delivery row(s) to dispatched",
+                    reconciled,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if is_database_pool_timeout(exc):
+                logger.warning(
+                    "Orphaned delivery reconciliation skipped after database "
+                    "pool timeout"
+                )
+            else:
+                logger.exception("Orphaned delivery reconciliation tick failed")
 
         await asyncio.sleep(poll_interval_seconds)
 

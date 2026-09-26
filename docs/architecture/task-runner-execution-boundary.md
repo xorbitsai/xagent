@@ -140,6 +140,28 @@ that `turn_id` against the checkpoint it rebuilds from, so a turn that was
 written replays instead of being applied twice, and one that was not written is
 applied once.
 
+That replay needs a runtime that can reconcile the `turn_id`: the command's own
+run, or a run that is live in this process. When the task's run has changed
+since the command targeted it and no such runtime exists, an earlier attempt
+may have accepted the message as a new turn and started a run for it before
+crashing. That input is at-most-once: the retry does not run it again.
+It settles the command as accepted with an unknown outcome, advances the
+delivery row to `dispatched` ("do not resend", not "applied"), and leaves the
+task in its recovered state. The sender gets the `outcome_unknown` delivery
+frame; with no reachable origin connection the notice is also published
+task-wide. A same-id resend is answered from the command's stored result, so
+it reports the unknown outcome instead of success. A new-turn claim that finds
+the turn already in the transcript (`TaskTurnAlreadyAccepted`) settles the
+same way instead of failing on the unique index.
+
+Rows that no owner can settle any more are reconciled by lease recovery,
+which never redrives the turn. Recovering an expired lease advances that
+task's `pending` user rows to `dispatched` in the recovery transaction, and a
+periodic sweep does the same for rows older than one lease TTL. Both require
+a quiescent task: an appendable status (never PENDING or WAITING_FOR_USER), no
+pause or resume request in flight, no live lease, no pending or processing
+command on the task, and no failed command with the row's `turn_id`.
+
 While the fenced run is still live, input that arrives after an unknown write
 never queues behind it: the fenced context rejects it as not accepted, and the
 client resends it under a new id.

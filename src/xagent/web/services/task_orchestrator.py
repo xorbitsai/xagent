@@ -232,6 +232,20 @@ class TaskTurnError(Exception):
         self.reason = reason
 
 
+class TaskTurnAlreadyAccepted(TaskTurnError):
+    """The transcript already holds a user row for this turn id.
+
+    Raised before the insert, inside the claim transaction, so the claim's
+    status flip rolls back with it. Only a same-id redelivery of an accepted
+    turn reaches it: every other caller mints a fresh turn id. The WebSocket
+    adapter settles that turn as outcome unknown; as a ``TaskTurnError`` the
+    other adapters keep their generic busy mapping.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("turn_already_accepted")
+
+
 class TaskTurnNotFoundError(Exception):
     """Raised when the turn's atomic claim finds no row that both exists
     and is owned by ``task_owner_user_id``.
@@ -903,10 +917,13 @@ def _reconcile_finalized_turn_delivery(
     (returned ``False``), or the pre-execution SETTLEMENT_READY short-circuit
     fired. A hard process crash skips it too. Of those leftovers, only the
     paused-task resume path has an in-repo consumer that re-posts the same
-    ``turn_id``; ``task_lease_recovery`` terminalizes the *task* but never
-    redrives the turn or touches delivery rows, so the deferral/crash cases
-    remain a narrower instance of the stuck-``pending`` window, not a solved
-    one.
+    ``turn_id``. The rest are closed by ``task_lease_recovery``, which never
+    redrives the turn: when it recovers an expired lease it advances that
+    task's orphaned ``pending`` user rows to ``dispatched`` in the same
+    transaction, and its periodic sweep does the same for rows older than one
+    lease TTL on any quiescent task (appendable status, no pause/resume in
+    flight, no live lease, no unfinished command, no failed same-id command).
+    ``dispatched`` there means "do not resend", not "applied".
 
     Target selection is driven by what finalize actually knows, because the
     downstream contract is asymmetric: the session WS probe answers a
@@ -1008,7 +1025,27 @@ def _persist_accepted_turn_no_commit(
 ) -> _AcceptedTurn:
     """Persist the first message and snapshot one accepted turn."""
 
+    from ..models.chat_message import TaskChatMessage
     from .chat_history_service import persist_user_message_no_commit
+
+    if payload.turn_id is not None and (
+        payload.transcript_message.strip() or payload.attachments
+    ):
+        # Checked before the insert, after the caller's task-row claim (lock
+        # order: task row first). The unique (task_id, role, turn_id) index
+        # would otherwise surface as an IntegrityError that reads as a
+        # delivery failure, although an earlier attempt accepted this turn.
+        already_accepted = (
+            db.query(TaskChatMessage.id)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == payload.turn_id,
+            )
+            .first()
+        )
+        if already_accepted is not None:
+            raise TaskTurnAlreadyAccepted()
 
     persisted_message = persist_user_message_no_commit(
         db=db,
@@ -2439,15 +2476,18 @@ def _schedule_bg(
                     # (returned ``False``), settlement was deferred, or the
                     # pre-execution SETTLEMENT_READY short-circuit fired (the
                     # turn body never ran, so ``completed`` would be a lie).
-                    # KNOWN GAP: rows skipped here stay ``pending`` permanently —
-                    # lease TTL recovery terminalizes the *task* only and nothing
-                    # in this tree redrives delivery rows. The skip is still
-                    # correct (a non-authoritative close is worse). Note the
-                    # deferral triggers correlate with this bug's own trigger:
-                    # post-schedule dispatch, setup/run and settle all draw from
-                    # the same DB pool, so one exhaustion event can both orphan
-                    # the row and defer the settlement that would have closed it.
-                    # Tracked in xorbitsai/xagent-saas#409.
+                    # Rows skipped here are closed by task_lease_recovery instead:
+                    # lease recovery advances the task's orphaned ``pending`` rows
+                    # to ``dispatched`` ("do not resend", not "applied") in its
+                    # recovery transaction, and its periodic sweep does the same
+                    # once the task is quiescent and the row is older than one
+                    # lease TTL. The skip is still correct (a non-authoritative
+                    # close is worse). Note the deferral triggers correlate with
+                    # this bug's own trigger: post-schedule dispatch, setup/run
+                    # and settle all draw from the same DB pool, so one
+                    # exhaustion event can both orphan the row and defer the
+                    # settlement that would have closed it.
+                    # (xorbitsai/xagent-saas#409)
                     if lease_settled and not skip_delivery_reconciliation:
                         try:
                             await run_db_io_cancellation_safe(

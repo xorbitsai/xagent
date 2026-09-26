@@ -145,6 +145,7 @@ from .task_events import (
     CommandReply,
     DeliveryNotifier,
     command_reply,
+    discard_command_reply,
     finish_task_command_delivery,
     publish_task_event,
 )
@@ -880,6 +881,10 @@ class _TaskMessagePreparation:
     claimed_created_turn: "_PreparedTurn | None"
     existing_delivery: _UserMessageDeliverySnapshot | None
     recovered_delivery: _UserMessageDeliverySnapshot | None
+    # A recovered claim whose command targeted a different run than the task
+    # now has. Unless a live local runtime can reconcile the turn id, the
+    # earlier attempt's outcome is unknown and the turn must not run again.
+    recovered_run_changed: bool
     delivery_claimed: bool
     delivery_dispatched: bool
     uses_live_control: bool
@@ -1318,6 +1323,20 @@ def _prepare_task_message_sync(
             uses_live_control = False
         if recovered_delivery is not None and durable_target_run_id == routing.run_id:
             uses_live_control = True
+        # ``begin_turn`` always mints a new run, so a recovered pending row
+        # under the command's own run is a live-injection claim (redriven
+        # live above), while one under a different run may have been
+        # accepted as a new turn by an earlier attempt. The handler settles
+        # that as outcome unknown unless a live local runtime can reconcile
+        # the turn id. A command without a target run (the task had no run
+        # when it was accepted) proves neither; it keeps the status-based
+        # routing and a new-turn collision is caught by
+        # ``TaskTurnAlreadyAccepted``.
+        recovered_run_changed = (
+            recovered_delivery is not None
+            and durable_target_run_id is not None
+            and durable_target_run_id != routing.run_id
+        )
 
         return _TaskMessagePreparation(
             requested_task_id=requested_task_id,
@@ -1332,6 +1351,7 @@ def _prepare_task_message_sync(
             claimed_created_turn=claimed_created_turn,
             existing_delivery=existing_delivery_snapshot,
             recovered_delivery=recovered_delivery,
+            recovered_run_changed=recovered_run_changed,
             delivery_claimed=delivery_claimed,
             delivery_dispatched=delivery_dispatched,
             uses_live_control=uses_live_control,
@@ -1366,6 +1386,10 @@ async def handle_task_message(
     delivery_failure_persist_attempted = False
     delivery_failure_pool_timeout = False
     recovered_delivery: _UserMessageDeliverySnapshot | None = None
+    # Survives ``recovered_delivery`` being consumed by the live path: a prior
+    # attempt may already have applied this turn, so an unexpected failure
+    # can never prove it was not accepted.
+    delivery_recovered_claim = False
 
     async def finish_delivery(
         accepted: bool,
@@ -1551,6 +1575,49 @@ async def handle_task_message(
         else:
             await finish_delivery(True)
 
+    async def settle_accepted_outcome_unknown() -> None:
+        """Settle a turn an earlier attempt accepted but never settled.
+
+        The turn is at-most-once: it is not run again, and whether it was
+        applied is unknown. ``dispatched`` records "do not resend" (not
+        "applied"); the task keeps whatever state recovery left it in. The
+        durable command answers the sender from the marker, so this does not
+        call ``finish_delivery``.
+        """
+
+        nonlocal delivery_outcome_unknown, delivery_dispatched
+        # First, so any failure below reaches finish_delivery_failure as
+        # outcome unknown and can never persist the row as failed.
+        delivery_outcome_unknown = True
+        transition = await run_db_io_cancellation_safe(
+            lambda: mark_user_message_delivery_sync(
+                task_id,
+                turn_id,
+                DELIVERY_DISPATCHED,
+            )
+        )
+        if transition.status in {DELIVERY_DISPATCHED, None}:
+            delivery_dispatched = True
+            message_data["_recovered_delivery_outcome_unknown"] = turn_id
+            logger.warning(
+                "task %s turn %s was accepted by an earlier attempt that did "
+                "not settle it; recording its outcome as unknown instead of "
+                "running it again",
+                task_id,
+                turn_id,
+            )
+        # Otherwise another writer settled the row first (completed, failed,
+        # or outcome_unknown); the durable command answers from that state.
+        if not suppress_delivery_ack:
+            # Only durable commands own a row-based answer; a direct caller
+            # still needs its ack.
+            await finish_delivery(
+                False,
+                client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                rejection_outcome="outcome_unknown",
+            )
+
     try:
         user_message = message_data.get("message", "")
         raw_context = message_data.get("context", {})
@@ -1613,6 +1680,7 @@ async def handle_task_message(
         ]
         turn_payload = preparation.turn_payload
         recovered_delivery = preparation.recovered_delivery
+        delivery_recovered_claim = recovered_delivery is not None
         delivery_claimed = preparation.delivery_claimed
         delivery_dispatched = preparation.delivery_dispatched
 
@@ -1685,6 +1753,14 @@ async def handle_task_message(
                 if task_status == TaskStatus.RUNNING
                 else None
             )
+            if preparation.recovered_run_changed and live_task_lease is None:
+                # No live runtime here can reconcile the turn id against its
+                # checkpoint, so redriving would be a second execution of a
+                # turn an earlier attempt may already have started. A live
+                # local run keeps the live path: its injection replays a turn
+                # it already holds.
+                await settle_accepted_outcome_unknown()
+                return
             agent_service = None
             supports_live_control = False
             if task_uses_live_control:
@@ -2298,6 +2374,7 @@ async def handle_task_message(
                 # schedule -- so WS and /v1 SDK use one turn-
                 # lifecycle state machine.
                 from .task_orchestrator import (
+                    TaskTurnAlreadyAccepted,
                     TaskTurnCommitOutcomeUnknown,
                     TaskTurnError,
                     TaskTurnNotFoundError,
@@ -2418,6 +2495,11 @@ async def handle_task_message(
                         error_code=ClientErrorCode.TASK_UNAVAILABLE.value,
                         rejection_outcome="not_accepted",
                     )
+                except TaskTurnAlreadyAccepted:
+                    # The transcript already holds this turn: an earlier
+                    # attempt accepted it (and started a run for it) without
+                    # settling. The claim rolled back, so nothing new ran.
+                    await settle_accepted_outcome_unknown()
                 except TaskTurnError as busy_err:
                     # begin_turn's atomic transaction rolls back on
                     # bg_inflight / busy — neither the status flip
@@ -2568,6 +2650,10 @@ async def handle_task_message(
             # websocket_chat_endpoint and both public_chat_access.py endpoints
             # log without exc_info, so the record depends on who called.
             logger.error("Unexpected error in agent execution: %s", e, exc_info=True)
+            if delivery_recovered_claim:
+                # An earlier attempt may have applied this recovered turn; an
+                # unexpected fault here cannot prove it was not accepted.
+                delivery_outcome_unknown = True
             await finish_delivery_failure(client_safe_error_message(e))
             raise
 
@@ -2681,6 +2767,10 @@ async def handle_task_message(
         # Other errors, re-raise
         # Redacted below, so the traceback is the only record left.
         logger.error("Unexpected error handling chat message: %s", e, exc_info=True)
+        if delivery_recovered_claim:
+            # Same reasoning as the inner handler: a recovered turn may
+            # already have been applied.
+            delivery_outcome_unknown = True
         await finish_delivery_failure(client_safe_error_message(e))
         raise
 
@@ -3560,6 +3650,66 @@ def _load_command_actor(actor_user_id: int | None) -> _CommandActor:
         return _CommandActor(id=int(user_row[0]), is_admin=bool(user_row[1]))
 
 
+async def _answer_message_outcome_unknown(
+    reply: CommandReply,
+    command: ClaimedTaskCommand,
+) -> dict[str, Any]:
+    """Report a message whose delivery outcome is unknown and settle it.
+
+    The ingress ack only accepted the command into the inbox, so the terminal
+    delivery outcome is reported before its personal route is retired. When
+    no origin connection can receive it (the origin disconnected, or another
+    worker holds it), the notice is also published to every subscriber of the
+    task, so whoever is watching it -- the sender's other views included --
+    learns the message will not be retried automatically. It carries only
+    ids, the error code and the generic client-safe text, never the message
+    body.
+    """
+
+    message = client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN)
+    await send_message_delivery(
+        reply,
+        client_message_id=command.command_id,
+        turn_id=command.command_id,
+        accepted=False,
+        message=message,
+        error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+        rejection_outcome="outcome_unknown",
+    )
+    error_frame = {
+        "type": "error",
+        "task_id": command.task_id,
+        "client_message_id": command.command_id,
+        "turn_id": command.command_id,
+        "error_code": ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+        "message": message,
+    }
+    # Inbox acceptance has already resolved the browser's send promise. Its
+    # personal error channel still displays later delivery results.
+    await reply(error_frame)
+    if reply is discard_command_reply:
+        try:
+            await publish_task_event(
+                {**error_frame, "timestamp": datetime.now(timezone.utc).timestamp()},
+                command.task_id,
+            )
+        except Exception:
+            # Best effort: the durable result below still records the outcome
+            # and a same-id resend is answered from it.
+            logger.warning(
+                "task %s outcome-unknown notice for message %s was not published",
+                command.task_id,
+                command.command_id,
+                exc_info=True,
+            )
+    return {
+        "task_id": command.task_id,
+        "command_id": command.command_id,
+        "kind": command.kind.value,
+        "delivery_outcome": DELIVERY_OUTCOME_UNKNOWN,
+    }
+
+
 async def _execute_durable_task_command(
     command: ClaimedTaskCommand,
 ) -> dict[str, Any] | None | SettledTaskCommand:
@@ -3661,6 +3811,11 @@ async def _execute_durable_task_command(
             raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} has an unknown commit outcome"
             )
+        if (
+            message_data.get("_recovered_delivery_outcome_unknown")
+            == command.command_id
+        ):
+            return await _answer_message_outcome_unknown(reply, command)
         if message_data.get("_registered_turn_handoff") == command.command_id:
             return {
                 "task_id": command.task_id,
@@ -3678,37 +3833,7 @@ async def _execute_durable_task_command(
                 f"Message {command.command_id} is waiting for runtime injection"
             )
         if delivery_status == DELIVERY_OUTCOME_UNKNOWN:
-            # The ingress ack only accepted the command into the inbox. Report
-            # the terminal delivery outcome before its personal route is retired.
-            await send_message_delivery(
-                reply,
-                client_message_id=command.command_id,
-                turn_id=command.command_id,
-                accepted=False,
-                message=client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
-                error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
-                rejection_outcome="outcome_unknown",
-            )
-            # Inbox acceptance has already resolved the browser's send promise.
-            # Its personal error channel still displays later delivery results.
-            await reply(
-                {
-                    "type": "error",
-                    "task_id": command.task_id,
-                    "client_message_id": command.command_id,
-                    "turn_id": command.command_id,
-                    "error_code": ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
-                    "message": client_error_message(
-                        ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
-                    ),
-                }
-            )
-            return {
-                "task_id": command.task_id,
-                "command_id": command.command_id,
-                "kind": command.kind.value,
-                "delivery_outcome": DELIVERY_OUTCOME_UNKNOWN,
-            }
+            return await _answer_message_outcome_unknown(reply, command)
         if delivery_status == DELIVERY_FAILED:
             raise TaskCommandRejected(
                 f"Message {command.command_id} could not be applied"

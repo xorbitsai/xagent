@@ -248,8 +248,10 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # Cancellation during live injection now persists and sends an unknown
     # acknowledgement through finish_delivery_failure's safe message builder.
     # A fenced-run rejection adds one live and one deferred delivery-failed ack.
-    assert result.producers == 39, (
-        f"expected exactly 39 producers, matched {result.producers}; "
+    # Settling a recovered turn as outcome unknown adds one ack for callers
+    # that are not answered from the durable command row.
+    assert result.producers == 40, (
+        f"expected exactly 40 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``
@@ -261,8 +263,10 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # identity rule for the live frame too, bringing the census to 51.
     # The host event and command reply adapters add two forwarding sinks
     # to the original 51. Unknown delivery adds a personal coded notice.
-    assert result.error_payloads == 54, (
-        f"expected exactly 54 error payloads, matched {result.error_payloads}; "
+    # Its task-wide copy, published when no origin can receive the personal
+    # one, brings the census to 55.
+    assert result.error_payloads == 55, (
+        f"expected exactly 55 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry

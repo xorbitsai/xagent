@@ -481,11 +481,16 @@ def _tool_call_violation(
         return None
     schema = schemas.get(name)
     if schema is None:
+        # tool_name is the one structured record of which call was refused;
+        # message is prose and callers must not parse it.
         return ToolProtocolViolation(
             provider=_PROVIDER,
             code="unavailable_tool_call",
             message=f"DeepSeek returned unavailable tool call {name!r}.",
-            details=argument_details,
+            details={
+                **(argument_details or {}),
+                "tool_name": name[:_ARGUMENTS_PREVIEW_LIMIT],
+            },
         )
 
     parameters = schema.get("parameters")

@@ -201,14 +201,26 @@ class PublicStepProjector:
         nothing reads. :meth:`materialized_steps` raises in this mode
         rather than returning a silently partial timeline.
 
+    A consumer that needs both in sequence -- the whole timeline once,
+    and then a projector that keeps folding live events without
+    retaining any of them -- cannot express that as a construction-time
+    flag, because each mode breaks one half of it. :meth:`take_materialized_steps`
+    is that transition: it returns the timeline and drops retention in
+    the same call, leaving an instance indistinguishable from one built
+    with ``retain_finished=False``. It exists so the pre-warm caller
+    never has to reach into the projector's own list to do it.
+
     ``feed``'s return value is identical in both modes; the mode only
     decides whether the projector also keeps the step afterwards. The
     pending table is kept either way -- the pairing rules need it.
 
     :meth:`materialized_steps` never sorts by ``started_at``. That global
-    resort is a batch-only concern (see ``map_trace_events_to_public_steps``):
-    a live consumer wants steps in the order they actually resolved, not
-    resorted on every event.
+    resort is left to the two callers that need public, ``started_at``-
+    ordered output: ``map_trace_events_to_public_steps`` (the batch
+    driver behind ``GET .../steps``) and ``_events_stream.py``'s
+    ``_build_warm_up_frames`` (the attach-time replay), each sorting the
+    snapshot it takes for its own purpose. A live consumer wants steps in
+    the order they actually resolved, not resorted on every event.
 
     Preconditions for the incremental path: one instance per task, fed
     in event order, from one thread/task at a time. ``feed`` mutates
@@ -263,14 +275,26 @@ class PublicStepProjector:
             projector.feed(event)
         return projector
 
+    @property
+    def retains_finished(self) -> bool:
+        """Whether this projector still keeps finished steps.
+
+        The retention mode as a readable fact rather than an inference
+        from whether :meth:`materialized_steps` happens to raise, so a
+        consumer whose correctness depends on being handed a
+        *non*-retaining projector can check for it directly.
+        """
+        return self._finished is not None
+
     def materialized_steps(self) -> List[Dict[str, Any]]:
         """Return every step currently known, finished or still running.
 
         Order: finished steps in the order they resolved, then any
         still-``pending`` (``running``) steps in the order they started.
-        Callers that need the public started_at-sorted order (currently
-        only the ``map_trace_events_to_public_steps`` batch driver) sort
-        this themselves.
+        Callers that need the public started_at-sorted order --
+        ``map_trace_events_to_public_steps`` (the batch driver) and
+        ``_events_stream.py``'s ``_build_warm_up_frames`` (the attach-time
+        replay) -- sort this themselves.
 
         The list itself is a fresh snapshot, but the step dicts inside
         it are the projector's live objects: a still-``running`` step
@@ -278,17 +302,49 @@ class PublicStepProjector:
         :meth:`feed`). Treat them as read-only views -- a caller that
         needs a stable picture must copy before storing.
 
-        Raises ``RuntimeError`` on a projector built with
-        ``retain_finished=False``: the finished steps it would need were
-        never kept, so there is no partial answer worth returning.
+        Raises ``RuntimeError`` on a projector that is not retaining --
+        one built with ``retain_finished=False``, or one that has since
+        released retention through :meth:`take_materialized_steps`. The
+        finished steps it would need were never kept (or are already
+        gone), so there is no partial answer worth returning.
         """
         if self._finished is None:
             raise RuntimeError(
                 "materialized_steps() needs the finished-step history; this "
-                "projector was built with retain_finished=False"
+                "projector is not retaining finished steps"
             )
         steps = list(self._finished)
         steps.extend(self._pending.values())
+        return steps
+
+    def take_materialized_steps(self) -> List[Dict[str, Any]]:
+        """Return every step known so far, then stop retaining finished ones.
+
+        The pre-warm exit. A caller that replays a task's history to
+        build pairing state, reads that history out exactly once, and
+        then keeps feeding the same instance live events needs both
+        halves of the retention question answered differently over time:
+        retention on while the history is being folded and read, off
+        afterwards. The v1 SSE warm-up replay is that caller -- it hands
+        the projector to a sink that serializes each ``feed`` result
+        immediately and never asks for the timeline again, over a
+        connection that can live an hour.
+
+        Returns exactly what :meth:`materialized_steps` would have
+        returned, with the same live-object caveat. Afterwards this
+        instance behaves as if it had been built with
+        ``retain_finished=False``: :meth:`feed` still returns every step
+        it changes, :meth:`materialized_steps` raises, and nothing
+        accumulates. Releasing retention here rather than letting the
+        caller clear the projector's own list is what keeps that
+        invariant checkable in one place.
+
+        Raises ``RuntimeError`` on a projector that is already not
+        retaining, for the same reason :meth:`materialized_steps` does:
+        there is no timeline to hand back.
+        """
+        steps = self.materialized_steps()
+        self._finished = None
         return steps
 
     def feed(self, event: Any) -> List[Dict[str, Any]]:
@@ -311,7 +367,6 @@ class PublicStepProjector:
         event_type = _safe_get(event, "event_type")
         if not event_type:
             return []
-
         # ===== messages: one event per message, no pairing =====
         if event_type == "user_message":
             step = _build_message_step(event, role="user")

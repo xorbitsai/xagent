@@ -125,6 +125,7 @@ from ..models.task import (
     TraceMessageBlob,
 )
 from ..models.task_interaction import TaskInteractionRequest
+from .expired_tasks import record_task_expiry_no_commit
 from .task_cleanup_obligations import (
     CleanupObligation,
     captured_workspace_obligation,
@@ -376,7 +377,7 @@ def _rowcount(result: object) -> int:
     return int(getattr(result, "rowcount", 0) or 0)
 
 
-def _purge_trace_rows(db: Session, task_id: int) -> int:
+def _purge_trace_rows(db: Session, task_id: int, *, now: datetime) -> int:
     """Delete one task's trace, keeping the task and its conversation.
 
     Returns the number of rows it actually changed, so the caller can tell a
@@ -404,12 +405,17 @@ def _purge_trace_rows(db: Session, task_id: int) -> int:
     Expiring a trace is maintenance, not execution activity, and #2557's
     side-effect review names maintenance writes that advance ``updated_at`` as
     a hazard in their own right.
+
+    The same UPDATE stamps ``traces_expired_at`` (#2565), so a steps read can
+    say its history was removed rather than presenting an empty or partial
+    list as complete. It is re-stamped on every real expiry: a trace-expired
+    task can take new turns, whose trace can expire in turn.
     """
     removed = 0
-    # Only when a pointer is actually set. An unconditional UPDATE matches the
-    # row every time, and PostgreSQL does not elide a no-op update -- it writes
-    # a new tuple and leaves a dead one. That is what made a re-purged task
-    # cost a dead tuple per sweep.
+    # Only when there is something to remove. An unconditional UPDATE matches
+    # the row every time, and PostgreSQL does not elide a no-op update -- it
+    # writes a new tuple and leaves a dead one. That is what made a re-purged
+    # task cost a dead tuple per sweep.
     pointers_set = db.execute(
         select(Task.id).where(
             Task.id == task_id,
@@ -419,19 +425,31 @@ def _purge_trace_rows(db: Session, task_id: int) -> int:
             ),
         )
     ).scalar_one_or_none()
-    if pointers_set is not None:
-        removed += _rowcount(
-            db.execute(
-                update(Task)
-                .where(Task.id == task_id)
-                .values(
-                    last_checkpoint_event_id=None,
-                    last_checkpoint_trace_event_id=None,
-                    updated_at=Task.updated_at,
+    trace_rows_exist = db.execute(
+        select(
+            or_(
+                *(
+                    exists(select(1).where(model.task_id == task_id))
+                    for model in (TraceCheckpointBlob, TraceMessageBlob, TraceEvent)
                 )
-                .execution_options(synchronize_session=False)
             )
         )
+    ).scalar_one()
+    if pointers_set is None and not trace_rows_exist:
+        return 0
+    removed += _rowcount(
+        db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                last_checkpoint_event_id=None,
+                last_checkpoint_trace_event_id=None,
+                traces_expired_at=now,
+                updated_at=Task.updated_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+    )
     for model in (TraceCheckpointBlob, TraceMessageBlob, TraceEvent):
         removed += _rowcount(
             db.execute(
@@ -569,8 +587,11 @@ def _purge_task(
         if action is RetentionPurgeAction.PURGED_CONVERSATION:
             owed = _conversation_cleanup_owed(db, task_id)
             record_cleanup_obligations_no_commit(db, owed, now=now)
+            # Before the delete: the tombstone is read from the row, and the
+            # runs are found by the ``task_id`` the delete SETs NULL.
+            record_task_expiry_no_commit(db, task_id, now=now)
             purge_task_rows(db, task_id=task_id)
-        elif _purge_trace_rows(db, task_id) == 0:
+        elif _purge_trace_rows(db, task_id, now=now) == 0:
             # Either the rows went between the scan and the lock, or the scan
             # admitted a drifted task whose trace an earlier sweep removed
             # (see ``NOTHING_TO_PURGE``). Committing an empty transaction is

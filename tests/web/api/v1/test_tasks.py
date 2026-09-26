@@ -3820,6 +3820,10 @@ def _run_trace_expiry_steps_case(task_id, agent_id, full_key, base) -> None:
     body = resp.json()
     assert body["task_id"] == task_id
     assert body["steps"] == []
+    # #2565: the empty list is told apart from "never had steps".
+    assert body["steps_expired"] is True
+    expired_at = datetime.fromisoformat(body["steps_expired_at"])
+    assert expired_at.replace(tzinfo=expired_at.tzinfo or UTC) == now
 
 
 def test_get_steps_task_not_found_returns_404(mock_start_task):

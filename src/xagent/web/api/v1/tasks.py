@@ -196,6 +196,19 @@ def _raise_start_rejection(exc: task_start_service.TaskStartRejected) -> NoRetur
             500,
             message=_CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE,
         ) from exc
+    if exc.reason == "task_expired":
+        # 410, not 404: an unaware client still handles it as the 4xx it
+        # already gets for a missing task, and one that knows the code can
+        # stop polling an id that will never answer again.
+        assert exc.task_id is not None and exc.expired_at is not None
+        raise V1ApiError(
+            V1ErrorCode.TASK_EXPIRED,
+            410,
+            details={
+                "task_id": exc.task_id,
+                "expired_at": exc.expired_at.isoformat(),
+            },
+        ) from exc
     code, status = {
         "agent_not_found": (V1ErrorCode.AGENT_NOT_FOUND, 404),
         "workforce_not_found": (V1ErrorCode.WORKFORCE_NOT_FOUND, 404),
@@ -382,11 +395,20 @@ class _TaskInfoSnapshot:
 
 @dataclass(frozen=True)
 class _TaskStepsVersionSnapshot:
-    """Authorized task identity and the trace version used for cache lookup."""
+    """Authorized task identity and the trace version used for cache lookup.
+
+    The version is the pair (``max_event_id``, ``traces_expired_at``).
+    A trace purge does not always move ``max_event_id``: rows outside
+    this read (build-scoped events, checkpoint blobs) can be all it
+    removed, and a dialect that reuses ids can put a later turn back on
+    the same maximum. An entry cached before the purge must not be served
+    without the ``steps_expired`` flag it now owes.
+    """
 
     task_id: int
     agent_id: int
     max_event_id: int
+    traces_expired_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -408,7 +430,24 @@ class _TaskStepsSnapshot:
     task_id: int
     agent_id: int
     max_event_id: int
+    traces_expired_at: datetime | None
     events: tuple[_TraceEventSnapshot, ...]
+
+
+def _read_traces_expired_at(task_id: int, db: Session) -> datetime | None:
+    """``tasks.traces_expired_at``, read *after* the trace rows it qualifies.
+
+    The trace purge deletes the rows and stamps this column in one
+    transaction, but a steps read sees each statement's own committed
+    snapshot. Reading the column first could pair a pre-purge "never
+    expired" with the post-purge empty list -- a truncated history
+    presented as complete. Reading it last errs the other way: at worst
+    full steps flagged as possibly incomplete.
+    """
+    return cast(
+        datetime | None,
+        db.query(Task.traces_expired_at).filter(Task.id == task_id).scalar(),
+    )
 
 
 def _resolve_task_or_404(task_id: int, principal: ApiKeyPrincipal, db: Session) -> Task:
@@ -474,6 +513,7 @@ def _load_task_steps_version_snapshot(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
             max_event_id=int(max_event_id),
+            traces_expired_at=_read_traces_expired_at(task_id, db),
         )
 
 
@@ -510,6 +550,7 @@ def _load_task_steps_snapshot(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
             max_event_id=int(rows[-1].id) if rows else 0,
+            traces_expired_at=_read_traces_expired_at(task_id, db),
             events=events,
         )
 
@@ -605,7 +646,15 @@ def _get_chat_task_steps_sync(
     version = _load_task_steps_version_snapshot(task_id, principal)
     cache_key = task_steps_key(task_id)
     cached = cache_get(cache_key)
-    if isinstance(cached, dict) and cached.get("max_event_id") == version.max_event_id:
+    # An entry written before ``traces_expired_at`` existed has no such key
+    # and reads as ``None``, which matches exactly the tasks retention never
+    # touched -- the ones whose cached body is still right without the flag.
+    if (
+        isinstance(cached, dict)
+        and cached.get("max_event_id") == version.max_event_id
+        and cached.get("traces_expired_at")
+        == cache_version_token(version.traces_expired_at)
+    ):
         return StepsResponse.model_validate(cached["response"])
 
     snapshot = _load_task_steps_snapshot(task_id, principal)
@@ -614,11 +663,14 @@ def _get_chat_task_steps_sync(
         task_id=snapshot.task_id,
         agent_id=snapshot.agent_id,
         steps=[PublicStep(**step) for step in public_steps_data],
+        steps_expired=snapshot.traces_expired_at is not None,
+        steps_expired_at=snapshot.traces_expired_at,
     )
     cache_set(
         cache_key,
         {
             "max_event_id": snapshot.max_event_id,
+            "traces_expired_at": cache_version_token(snapshot.traces_expired_at),
             "response": response.model_dump(mode="json"),
         },
         ttl_seconds=task_cache_ttl_seconds(),
@@ -680,6 +732,9 @@ async def append_message_to_task(
         V1ApiError 404: task not found OR not owned by the key OR
             body.agent_id / body.workforce_id doesn't match the bound
             owner.
+        V1ApiError 410: ``task_expired`` -- the retention policy expired
+            a task this key could have seen; ``details`` carries
+            ``task_id`` and ``expired_at``.
         V1ApiError 409: ``task_busy`` (retryable), a workforce rejection
             code (not retryable), or ``interaction_response_required``
             (use ``reply`` instead).
@@ -781,6 +836,9 @@ async def get_chat_task(
     Raises:
         V1ApiError 401: missing / invalid / revoked key.
         V1ApiError 404: task missing or not owned by the calling key.
+        V1ApiError 410: ``task_expired`` -- the retention policy expired
+            a task this key could have seen; ``details`` carries
+            ``task_id`` and ``expired_at``.
     """
     return await run_db_io_cancellation_safe(
         lambda: _get_chat_task_sync(task_id, principal)
@@ -822,10 +880,17 @@ async def get_chat_task_steps(
         steps array in ``started_at`` ascending order. In-flight steps
         appear with ``status='running'`` and ``completed_at=null`` so
         SDK clients can poll this endpoint and observe progress.
+        ``steps_expired`` / ``steps_expired_at`` report that the
+        retention policy removed the task's historical steps, so the
+        array may be incomplete -- it can still hold steps from turns
+        taken after that removal.
 
     Raises:
         V1ApiError 401: missing / invalid / revoked key.
         V1ApiError 404: task missing or not owned by the calling key.
+        V1ApiError 410: ``task_expired`` -- the retention policy expired
+            the whole task (not just its steps); ``details`` carries
+            ``task_id`` and ``expired_at``.
     """
     return await run_db_io_cancellation_safe(
         lambda: _get_chat_task_steps_sync(task_id, principal)
@@ -1029,8 +1094,8 @@ async def stream_chat_task_events(
         not silent in the same way -- the
         close frame that follows a queue-drain is often itself a
         ``stream.error`` (``resync_required``/``unauthorized``/
-        ``task_deleted``/``stream_expired``) -- but that close frame
-        carries no record of what it drained on its way out, so its
+        ``task_deleted``/``task_expired``/``stream_expired``) -- but that
+        close frame carries no record of what it drained on its way out, so its
         presence or absence proves nothing about whether a content frame
         was lost this way: a ``stream.error`` does not mean content was
         dropped, and its absence does not mean nothing was. Only
@@ -1057,9 +1122,10 @@ async def stream_chat_task_events(
         below) still sends its conclusion frame -- ``task.completed``
         here, ``task.input_required`` there -- before closing with a
         ``stream.error`` frame naming why -- ``task_deleted`` when the
-        row is gone by the time the steps are read, ``resync_required``
-        otherwise: a step-read failure on either fast path never
-        costs the client the lifecycle conclusion it already had in
+        row is gone by the time the steps are read (``task_expired``
+        when the retention policy is what removed it),
+        ``resync_required`` otherwise: a step-read failure on either
+        fast path never costs the client the lifecycle conclusion it already had in
         hand from the snapshot that picked this path. Step content goes
         out at all only once the task row has been read once more and
         confirmed to still be the same run/state generation as the
@@ -1092,8 +1158,9 @@ async def stream_chat_task_events(
         ``task.status``, the task's steps, then ``task.input_required``);
         with ``stream.error`` if the API key is revoked/paused, the task
         row disappears (within one watchdog cycle, 30s in production, of
-        the delete), the client can't keep up (``resync_required``), or
-        the stream has been open for the 1-hour maximum
+        the delete: ``task_expired`` when the retention policy expired
+        it, ``task_deleted`` for any other removal), the client can't
+        keep up (``resync_required``), or the stream has been open for the 1-hour maximum
         (``stream_expired``, emitted before the connection closes so
         it's distinguishable from a clean end). After any
         ``stream.error``, re-attaching is the supported recovery path
@@ -1119,6 +1186,9 @@ async def stream_chat_task_events(
             the stream never opens).
         V1ApiError 404: task missing or not owned by the calling key
             (plain JSON; the stream never opens).
+        V1ApiError 410 ``task_expired``: the retention policy expired a
+            task this key could have seen (plain JSON with ``details``
+            ``task_id`` / ``expired_at``; the stream never opens).
         V1ApiError 429 ``rate_limited``: 2 or more concurrent streams
             already open on this task, or 32 or more already open for
             this key across all tasks (the per-key cap). Both caps are

@@ -311,15 +311,18 @@ def _stream_close_reason(status: TaskStatus, control_state: str | None) -> str |
 # object (duck-typed: ``.status`` / ``.control_state`` / ``.output`` /
 # ``.error`` / ``.pending_question``), raising
 # ``V1ApiError(TASK_NOT_FOUND, 404)`` when the task is missing or not
-# owned. Always run through ``run_db_io_cancellation_safe`` by this module
-# -- never called directly.
+# owned, or ``V1ApiError(TASK_EXPIRED, 410)`` when retention expired a
+# task the key could have seen (see ``_task_gone_error_frame``); the two
+# steps readers below raise the same pair. Always run through
+# ``run_db_io_cancellation_safe`` by this module -- never called directly.
 TaskSnapshotReader = Callable[[int, "ApiKeyPrincipal"], Any]
 
 # A sync callable: (task_id, principal) -> ``StepsResponse``-shaped
 # object (duck-typed: ``.steps``, a list of already-validated
 # ``PublicStep``), backed by the *same cache* the polling
-# ``GET .../steps`` endpoint uses (keyed by ``max_event_id`` -- see
-# ``tasks.py``'s ``_get_chat_task_steps_sync``). Used only by the two
+# ``GET .../steps`` endpoint uses (versioned by ``max_event_id`` and
+# ``traces_expired_at`` -- see ``tasks.py``'s
+# ``_get_chat_task_steps_sync``). Used only by the two
 # attach-time fast paths (already-terminal / already-waiting-for-user):
 # they're one-shot and need no live pairing state, so a cache hit there
 # collapses a burst of fast-path attaches on the same task into the read
@@ -434,6 +437,7 @@ _ERROR_MESSAGES = {
     ),
     "unauthorized": "The API key used to open this stream has been revoked or paused.",
     "task_deleted": "The task no longer exists.",
+    "task_expired": "The task's conversation was removed under the retention policy.",
     "stream_expired": "This stream reached its maximum allowed duration.",
 }
 
@@ -459,6 +463,36 @@ def error_frame(code: str, *, message: str | None = None) -> str:
         "stream.error",
         {"code": code, "message": message if message is not None else default_message},
     )
+
+
+def _task_gone_error_frame(exc: BaseException) -> str | None:
+    """The close frame for a reader that found the task gone, else ``None``.
+
+    Every reader this module calls re-resolves the task through
+    ``resolve_sdk_task``, which already tells the two ways it can be gone
+    apart -- in the reader's own session, off the event loop, and with the
+    same access predicate the attach passed -- so no path here reads the
+    tombstone itself:
+
+      - ``TASK_EXPIRED``: the retention purge expired it -> ``task_expired``.
+      - ``TASK_NOT_FOUND``: anything else (its owner deleted it) ->
+        ``task_deleted``, as before expiry existed.
+
+    Both are terminal. Neither may fall through to ``resync_required``:
+    re-attaching cannot bring the task back. A client that does not know
+    ``task_expired`` still sees a terminal ``stream.error`` and a closed
+    stream -- the outcome it already handles for ``task_deleted``.
+
+    Shared by the watchdog and both fast-path error builders so the
+    classification cannot drift between them. ``None`` means the caller
+    keeps its own handling for every other failure.
+    """
+    if isinstance(exc, V1ApiError):
+        if exc.code is V1ErrorCode.TASK_EXPIRED:
+            return error_frame("task_expired")
+        if exc.code is V1ErrorCode.TASK_NOT_FOUND:
+            return error_frame("task_deleted")
+    return None
 
 
 # -- Content projection: step.* / message.* --------------------------------
@@ -1391,8 +1425,9 @@ async def watchdog_check_once(
             lambda: read_task_snapshot(task_id, principal)
         )
     except V1ApiError as exc:
-        if exc.code is V1ErrorCode.TASK_NOT_FOUND:
-            return sink.enqueue_close(error_frame("task_deleted"))
+        gone_frame = _task_gone_error_frame(exc)
+        if gone_frame is not None:
+            return sink.enqueue_close(gone_frame)
         raise
 
     status = snapshot.status
@@ -1606,14 +1641,17 @@ def _fast_path_steps_read_error_frame(
     in projection) keeps the existing ``resync_required`` handling and
     is logged -- ``task_deleted`` isn't logged here for the same reason
     the watchdog path doesn't log it: a deleted task racing the attach
-    isn't a bug in this stream.
+    isn't a bug in this stream. A task the retention purge expired in
+    that gap surfaces as ``V1ApiError(TASK_EXPIRED)`` instead and gets
+    ``task_expired`` by the same reasoning (``_task_gone_error_frame``).
 
     Must be called from inside the ``except`` block it serves -- the
     ``logger.exception`` call below relies on the caller's still-active
     exception context to attach a traceback.
     """
-    if isinstance(exc, V1ApiError) and exc.code is V1ErrorCode.TASK_NOT_FOUND:
-        return error_frame("task_deleted")
+    gone_frame = _task_gone_error_frame(exc)
+    if gone_frame is not None:
+        return gone_frame
     logger.exception(
         "v1 SSE %s fast-path step snapshot preparation failed for task "
         "%s; closing for resync instead of leaving the client with a "
@@ -1756,8 +1794,8 @@ def _fast_path_generation_reread_error_frame(
     Classifies the same way ``_fast_path_steps_read_error_frame`` does:
     a task deleted in the gap between the steps read and this reread
     surfaces the same ``V1ApiError(TASK_NOT_FOUND)`` and gets the same
-    ``task_deleted`` frame; everything else gets ``resync_required``,
-    logged.
+    ``task_deleted`` frame (``task_expired`` for ``TASK_EXPIRED``);
+    everything else gets ``resync_required``, logged.
 
     Kept separate from ``_fast_path_steps_read_error_frame`` rather than
     reused outright because the two failures warrant different
@@ -1766,8 +1804,9 @@ def _fast_path_generation_reread_error_frame(
     failed to confirm one of them, so the default steps-read wording
     would describe a cause this failure didn't have.
     """
-    if isinstance(exc, V1ApiError) and exc.code is V1ErrorCode.TASK_NOT_FOUND:
-        return error_frame("task_deleted")
+    gone_frame = _task_gone_error_frame(exc)
+    if gone_frame is not None:
+        return gone_frame
     logger.exception(
         "v1 SSE %s fast-path staleness recheck failed for task %s; "
         "closing for resync instead of leaving the client with a bare "

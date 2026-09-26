@@ -83,6 +83,15 @@ class V1ErrorCode(str, Enum):
     # Also 404 for the same leak-prevention reason.
     TASK_NOT_FOUND = "task_not_found"
 
+    # The task_id named a task the retention policy expired, and the key
+    # could have seen that task while it existed. 410 Gone, not retryable:
+    # the conversation was removed and will not come back. ``details``
+    # carries ``task_id`` and ``expired_at``. A key that could not have
+    # seen the task gets ``task_not_found`` instead, and so does a task its
+    # owner deleted -- only the retention purge leaves the record this
+    # code is answered from.
+    TASK_EXPIRED = "task_expired"
+
     # Template id is unknown or unavailable to the caller.
     TEMPLATE_NOT_FOUND = "template_not_found"
 
@@ -174,6 +183,9 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     ),
     V1ErrorCode.FILE_NOT_FOUND: "One or more file ids are not accessible.",
     V1ErrorCode.TASK_NOT_FOUND: "Task not found or not accessible with this key.",
+    V1ErrorCode.TASK_EXPIRED: (
+        "This task's conversation was removed under the retention policy."
+    ),
     V1ErrorCode.TEMPLATE_NOT_FOUND: "Template not found.",
     V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",
     V1ErrorCode.INVALID_INPUT: "Request body failed validation.",

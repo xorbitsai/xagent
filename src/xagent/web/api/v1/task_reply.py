@@ -85,6 +85,8 @@ async def reply_to_task(
         V1ApiError 404: task not found, not owned by the key, or
             body.agent_id / body.workforce_id doesn't match the bound
             owner.
+        V1ApiError 410: ``task_expired`` -- the retention policy expired
+            a task this key could have seen.
         V1ApiError 422: body.message.files is non-empty, or
             body.agent_id is missing for an agent-bound key.
         V1ApiError 409: ``task_busy`` (task is RUNNING, or the resume

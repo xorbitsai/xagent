@@ -5690,3 +5690,249 @@ async def test_dag_execute_end_closes_the_planning_step_as_failed():
     assert step_via_live["started_at"] == polled["started_at"]
     assert step_via_live["completed_at"] == polled["completed_at"]
     assert sink.queue.empty()  # no further frame after the close
+
+
+# ===== retention expiry vs deletion (#2565) =====
+#
+# Every reader this module calls re-resolves through ``resolve_sdk_task``,
+# which raises ``TASK_EXPIRED`` for an owned tombstone and ``TASK_NOT_FOUND``
+# for everything else. These pin that each post-headers path maps the two to
+# distinct terminal frames, and never to ``resync_required``.
+
+
+def _expire_task_row(task_id: int, *, agent_id: int) -> None:
+    """Delete the task and leave the tombstone the retention purge would."""
+    from xagent.web.models.expired_task import ExpiredTaskTombstone
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        user_id = int(task.user_id)
+        db.query(Task).filter(Task.id == task_id).delete()
+        db.add(
+            ExpiredTaskTombstone(
+                task_id=task_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                workforce_id=None,
+                source="sdk",
+                is_visible=False,
+                is_channel_plumbing=False,
+                task_created_at=None,
+                expired_at=datetime(2026, 9, 1, tzinfo=UTC),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_error_frame_task_expired_has_its_own_default_message():
+    frame = es.error_frame("task_expired")
+    data = json.loads(frame.split("data: ", 1)[1])
+    assert data == {
+        "code": "task_expired",
+        "message": "The task's conversation was removed under the retention policy.",
+    }
+
+
+def test_attach_to_an_expired_task_is_a_plain_410_before_the_stream_opens():
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _expire_task_row(task_id, agent_id=agent_id)
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/events", headers=_bearer(full_key))
+
+    assert resp.status_code == 410, resp.text
+    assert resp.headers["content-type"].startswith("application/json")
+    assert resp.json()["error"]["code"] == "task_expired"
+    assert resp.json()["error"]["details"]["task_id"] == task_id
+
+
+async def test_watchdog_expired_task_closes_with_task_expired():
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    _expire_task_row(task_id, agent_id=agent_id)
+
+    sink = es.V1EventStreamSink(
+        task_id=task_id, principal_key_prefix=key_prefix, initial_status="running"
+    )
+    closed = await es.watchdog_check_once(
+        sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
+    )
+    assert closed is True
+    assert sink.queue.get_nowait() == (es.error_frame("task_expired"), True)
+
+
+async def test_watchdog_tombstone_outside_the_key_scope_still_reads_task_deleted():
+    """A tombstone the key could not have seen is not disclosed mid-stream
+    either; the stream reports the plain deletion it always did."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    key_prefix = _key_prefix_for_agent(agent_id)
+    from xagent.web.models.agent import Agent
+
+    db = _direct_db_session()
+    try:
+        owner_id = db.query(Task.user_id).filter(Task.id == task_id).scalar()
+        other_agent = Agent(user_id=owner_id, name="another agent, same owner")
+        db.add(other_agent)
+        db.commit()
+        other_agent_id = int(other_agent.id)
+    finally:
+        db.close()
+    _expire_task_row(task_id, agent_id=other_agent_id)
+
+    sink = es.V1EventStreamSink(
+        task_id=task_id, principal_key_prefix=key_prefix, initial_status="running"
+    )
+    closed = await es.watchdog_check_once(
+        sink, task_id, principal, read_task_snapshot=v1_tasks._load_task_info_snapshot
+    )
+    assert closed is True
+    assert sink.queue.get_nowait() == (es.error_frame("task_deleted"), True)
+
+
+async def test_live_stream_closes_with_task_expired_when_retention_expires_it():
+    """End to end through the real readers: the stream is already open (200
+    and headers sent) when the task expires, so the only way to say so is
+    the terminal frame."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    principal = _principal_for(full_key)
+    snapshot = v1_tasks._load_task_info_snapshot(task_id, principal)
+
+    resp = await es.build_event_stream_response(
+        task_id=task_id,
+        principal=principal,
+        initial_snapshot=snapshot,
+        read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+        read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+        **_long_intervals(watchdog_interval_seconds=0.01),
+    )
+    first = await asyncio.wait_for(resp.body_iterator.__anext__(), timeout=2)
+    assert "event: task.status" in first
+
+    _expire_task_row(task_id, agent_id=agent_id)
+
+    frames = []
+
+    async def _drain() -> None:
+        async for frame in resp.body_iterator:
+            frames.append(frame)
+
+    await asyncio.wait_for(_drain(), timeout=2)
+    assert _parse_error_frame(frames[-1])["code"] == "task_expired"
+    assert es.count_task_sinks(task_id) == 0
+
+
+_FAST_PATHS = [
+    pytest.param(
+        "_terminal_snapshot_stream",
+        TaskStatus.COMPLETED,
+        "task.completed",
+        {"output": "done", "error": None},
+        id="terminal",
+    ),
+    pytest.param(
+        "_input_required_snapshot_stream",
+        TaskStatus.WAITING_FOR_USER,
+        "task.input_required",
+        {"pending_question": "what next?"},
+        id="waiting-for-user",
+    ),
+]
+
+
+def _expired_reader(*_args):
+    raise V1ApiError(V1ErrorCode.TASK_EXPIRED, 410)
+
+
+def _steps_version_reader(*_args):
+    return SimpleNamespace(max_event_id=1)
+
+
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"), _FAST_PATHS
+)
+async def test_fast_path_steps_read_on_an_expired_task_closes_with_task_expired(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
+    """The task expired between the attach's snapshot and its steps read.
+    The conclusion already in hand still goes out, then ``task_expired``."""
+
+    def _unused_reread(*_args):
+        raise AssertionError("the reread must not run after a failed steps read")
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=None,
+            read_task_steps_response=_expired_reader,
+            read_task_snapshot=_unused_reread,
+            read_task_steps_version=_steps_version_reader,
+        )
+    ]
+    body = "".join(frames)
+    assert _parse_error_frame(body)["code"] == "task_expired"
+    assert "resync_required" not in body
+    assert body.count(f"event: {conclusion_event}") == 1
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")
+
+
+@pytest.mark.parametrize(
+    ("stream_fn", "status", "conclusion_event", "extra_snapshot"), _FAST_PATHS
+)
+async def test_fast_path_generation_reread_on_an_expired_task_closes_with_task_expired(
+    stream_fn, status, conclusion_event, extra_snapshot
+):
+    """The task expired after its steps were read, before the fence reread."""
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    step = es.PublicStep(
+        id="tool_call:call-1",
+        type="tool_call",
+        status="completed",
+        started_at=base,
+        completed_at=base,
+        data={"name": "search", "result": "ok"},
+    )
+
+    def _read_task_steps_response(*_args):
+        return SimpleNamespace(steps=[step])
+
+    snapshot = SimpleNamespace(
+        task_id=1,
+        agent_id=1,
+        status=status,
+        run_id="run-1",
+        state_version=1,
+        **extra_snapshot,
+    )
+    frames = [
+        chunk
+        async for chunk in getattr(es, stream_fn)(
+            snapshot,
+            principal=_FENCE_PRINCIPAL,
+            read_task_steps_response=_read_task_steps_response,
+            read_task_snapshot=_expired_reader,
+            read_task_steps_version=_steps_version_reader,
+        )
+    ]
+    body = "".join(frames)
+    assert _parse_error_frame(body)["code"] == "task_expired"
+    assert "event: step.completed" not in body
+    assert "resync_required" not in body
+    assert body.index(f"event: {conclusion_event}") < body.index("event: stream.error")

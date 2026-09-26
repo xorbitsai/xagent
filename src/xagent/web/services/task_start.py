@@ -36,6 +36,7 @@ from .connector_runtime import (
     store_ephemeral_runtime_values,
 )
 from .db_runtime import drain_async_task_cancellation_safe, run_db_io_cancellation_safe
+from .expired_tasks import find_expired_task
 from .file_turn import (
     append_uploaded_files_context,
     build_uploaded_files_context,
@@ -78,15 +79,25 @@ class SdkCreateTurnRejected(TaskTurnError):
 
 
 class TaskStartRejected(Exception):
-    """A domain rejection for the API to translate to its protocol."""
+    """A domain rejection for the API to translate to its protocol.
+
+    ``expired_at`` is set only on a ``task_expired`` rejection (see
+    :func:`resolve_sdk_task`), together with ``task_id``.
+    """
 
     def __init__(
-        self, reason: str, *, task_id: int | None = None, context_id: str | None = None
+        self,
+        reason: str,
+        *,
+        task_id: int | None = None,
+        context_id: str | None = None,
+        expired_at: datetime | None = None,
     ):
         super().__init__(reason)
         self.reason = reason
         self.task_id = task_id
         self.context_id = context_id
+        self.expired_at = expired_at
 
 
 @dataclass(frozen=True)
@@ -497,14 +508,23 @@ def resolve_sdk_task(task_id: int, scope: SdkTaskScope, db: Session) -> Task:
     /v1/chat/tasks`` and ``POST /v1/workforces/{id}/runs`` both write
     ``source="sdk"`` so this is well-defined.
 
+    A task the retention purge expired raises ``task_expired`` instead,
+    but only when its tombstone passes this same predicate (see
+    :func:`_raise_if_expired_for_scope`). Every v1 route addressed by a
+    task id resolves through here, so each one tells "expired" apart
+    from "not found" identically, including the SSE readers that run
+    after the stream's headers are sent.
+
     Args:
         task_id: Path parameter from the route.
         scope: Detached owner IDs resolved by API-key authentication.
         db: SQLAlchemy session.
 
     Raises:
-        TaskStartRejected: task missing, not owned by
-            the calling key, or not created by the SDK.
+        TaskStartRejected: ``task_not_found`` when the task is missing,
+            not owned by the calling key, or not created by the SDK;
+            ``task_expired`` (with ``task_id`` and ``expired_at``) when
+            retention expired a task the calling key could have seen.
     """
     query = db.query(Task).filter(
         Task.id == task_id,
@@ -519,8 +539,43 @@ def resolve_sdk_task(task_id: int, scope: SdkTaskScope, db: Session) -> Task:
         )
     task = query.first()
     if task is None:
+        _raise_if_expired_for_scope(task_id, scope, db)
         raise TaskStartRejected("task_not_found")
     return task
+
+
+def _raise_if_expired_for_scope(task_id: int, scope: SdkTaskScope, db: Session) -> None:
+    """Raise ``task_expired`` if retention expired a task ``scope`` could see.
+
+    The tombstone is held to :func:`resolve_sdk_task`'s own predicate,
+    column for column: ``source == "sdk"``, and the key's agent or
+    workforce. The workforce is read from the tombstone rather than
+    through ``WorkforceRun``: the purge SETs ``WorkforceRun.task_id``
+    NULL, so the join the live lookup uses can no longer prove the
+    binding, and the tombstone recorded it before the delete for exactly
+    this read. A tombstone that fails the predicate returns silently, so
+    the caller answers the same ``task_not_found`` a missing task gets
+    and an id's existence is not disclosed to a key that could not have
+    seen it live.
+
+    Only the retention purge writes tombstones, so a task its owner
+    deleted still falls through to ``task_not_found``. A live task always
+    wins: :func:`find_expired_task` returns nothing while one holds the
+    id, including a live task the key simply does not own.
+    """
+    tombstone = find_expired_task(db, task_id)
+    if tombstone is None or tombstone.source != "sdk":
+        return
+    if scope.agent_id is not None:
+        if tombstone.agent_id != scope.agent_id:
+            return
+    elif tombstone.workforce_id != scope.workforce_id:
+        return
+    raise TaskStartRejected(
+        "task_expired",
+        task_id=int(tombstone.task_id),
+        expired_at=tombstone.expired_at,
+    )
 
 
 async def create_sdk_task(

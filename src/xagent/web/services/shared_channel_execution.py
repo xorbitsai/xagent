@@ -656,6 +656,7 @@ async def execute_channel_background(
         user=snapshot.runtime_user,
         task_setup_snapshot=snapshot,
         task_owner_user_id=snapshot.task.user_id,
+        connector_runtime_turn_id=command.command_id,
     )
     service.set_conversation_history(
         [dict(message) for message in snapshot.conversation_history],

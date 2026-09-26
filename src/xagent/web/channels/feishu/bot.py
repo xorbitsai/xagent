@@ -862,12 +862,14 @@ class FeishuBotInstance(BatchChannelControl[str]):
             # approval registration, so it is read from the task row and
             # never from the inbound chat event.
             task_row_source = setup_snapshot.task.source
+            message_turn_id = str(uuid4())
             agent_manager = get_agent_manager()
             agent_service = await agent_manager.get_agent_for_task(
                 task_id,
                 user=setup_snapshot.runtime_user,
                 task_setup_snapshot=setup_snapshot,
                 task_owner_user_id=owner_user_id,
+                connector_runtime_turn_id=message_turn_id,
             )
             agent_service.set_conversation_history(
                 [dict(message) for message in setup_snapshot.conversation_history],
@@ -885,7 +887,6 @@ class FeishuBotInstance(BatchChannelControl[str]):
 
             if await interrupted():
                 return
-            message_turn_id = str(uuid4())
             context: dict = {"turn_id": message_turn_id}
             bind_channel_turn_identity(
                 context, task_source=task_row_source, managed_lease=managed_lease

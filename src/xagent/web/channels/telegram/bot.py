@@ -2259,12 +2259,14 @@ class TelegramBotInstance(BatchChannelControl[int]):
             # never from the inbound chat event.
             task_row_source = setup_snapshot.task.source
 
+            message_turn_id = str(uuid4())
             agent_manager = get_agent_manager()
             agent_service = await agent_manager.get_agent_for_task(
                 task_id,
                 user=setup_snapshot.runtime_user,
                 task_setup_snapshot=setup_snapshot,
                 task_owner_user_id=owner_user_id,
+                connector_runtime_turn_id=message_turn_id,
             )
             agent_service.set_conversation_history(
                 [dict(message) for message in setup_snapshot.conversation_history],
@@ -2280,7 +2282,6 @@ class TelegramBotInstance(BatchChannelControl[int]):
                 recovery_state.get("skill_context")
             )
 
-            message_turn_id = str(uuid4())
             context: dict = {"turn_id": message_turn_id}
             bind_channel_turn_identity(
                 context, task_source=task_row_source, managed_lease=managed_lease

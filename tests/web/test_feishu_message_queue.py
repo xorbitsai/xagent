@@ -321,6 +321,9 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     bot._save_active_tasks = lambda: True
     events: list[str] = []
     finalized: list[dict] = []
+    connector_turn_ids: list[str | None] = []
+    execution_turn_ids: list[str] = []
+    persisted_turn_ids: list[str] = []
 
     lease = TaskLease(task_id=45, runner_id="runner-a", run_id="shared-run")
 
@@ -358,9 +361,11 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
 
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            connector_turn_ids.append(_kwargs.get("connector_runtime_turn_id"))
             return agent_service
 
         async def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
+            execution_turn_ids.append(_kwargs["context"]["turn_id"])
             events.append("execute")
             return execution_result
 
@@ -378,6 +383,7 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
         assert kwargs["task_id"] == 45
         assert kwargs["user_id"] == 5
         assert kwargs["content"] == "hello"
+        persisted_turn_ids.append(kwargs["turn_id"])
         events.append("user-message")
 
     async def send_text(_chat_id: str, _text: str) -> str:
@@ -427,6 +433,9 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     await bot._process_messages_batch("open-id", [message])
 
     assert events == ["user-message", "execute", "assistant-settlement"]
+    assert connector_turn_ids == execution_turn_ids == persisted_turn_ids
+    assert len(connector_turn_ids) == 1
+    assert connector_turn_ids[0]
     assert finalized == [
         {
             "status": expected_status,

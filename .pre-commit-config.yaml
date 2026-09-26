@@ -67,6 +67,11 @@ repos:
           - exa-py
           - slack-sdk==3.43.0
           - limits
+          # Pin limits' `deprecated` dependency to the project's resolved
+          # version (uv.lock). Unpinned, the mypy hook env pulls deprecated
+          # 3.0.0, which uses PEP 695 `type` syntax that fails under
+          # python_version = 3.11 and aborts the whole mypy run.
+          - deprecated==1.3.1
           - google-genai==1.66.0
           - elevenlabs==2.56.0
           # Pin google-auth/google-api-core to versions that ship py.typed;

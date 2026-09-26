@@ -3817,3 +3817,141 @@ describe("stays quiet when mounted with no provider", () => {
     warn.mockRestore()
   })
 })
+
+describe("keeps the rejection on screen when the refresh after it is superseded", () => {
+  it("keeps the rejection on screen when the refresh after it is superseded", async () => {
+    // A rejected save that asks for a re-read holds the save buttons closed
+    // until that re-read settles. When a retarget supersedes the re-read,
+    // the rejection the server really made stays on screen, nothing is
+    // announced (nothing was written), and the dialog stops being busy.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "malformed" })
+    let resolveRefresh: (v: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveRefresh = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("connectorRuntime.errors.contactAdmin")).toBeInTheDocument()
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeDisabled()
+
+    await act(async () => {
+      resolveRefresh(ok(report(true, [])))
+    })
+
+    expect(toastMock).not.toHaveBeenCalled()
+    expect(screen.getByText("connectorRuntime.errors.contactAdmin")).toBeInTheDocument()
+    // The superseded refresh installed nothing: the rows are still the
+    // retarget's own fillable report, and saving is open again.
+    expect(screen.getByLabelText("token")).toHaveValue("x")
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+  })
+})
+
+describe("says the refreshed report still needs input before a retry resend", () => {
+  it("says the refreshed report still needs input before a retry resend", async () => {
+    // The panel stays up across a same-task re-read that installs a report
+    // still missing a value. A retry pressed on it cannot go out -- the
+    // backend would refuse the turn on the same gate -- so the panel goes
+    // and the reason is said once, leaving the rows to fill.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "other", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+    sendMessageMock.mockClear()
+    toastMock.mockClear()
+
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentIncomplete"]])
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.getByLabelText("other")).toBeInTheDocument()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+})
+
+describe("closes as resent when a retry lands after a settlement took its panel away", () => {
+  it("closes as resent when a retry lands after a settlement took its panel away", async () => {
+    // A settlement frame takes the panel's snapshot away while its retry is
+    // on the wire. The panel goes in that frame, but the retry is still in
+    // flight, so the dialog stays busy; when the retry lands it closes the
+    // dialog as resent, the same as it would have with the panel still up.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    let resolveRetry: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveRetry = res }))
+    toastMock.mockClear()
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeDisabled()
+
+    await act(async () => { resolveRetry() })
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(latestState.request).toBeNull()
+    expect(toastMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("keeps the save gate closed across two same-task retargets in a row", () => {
+  it("keeps the save gate closed across two same-task retargets in a row", async () => {
+    // Two retargets land before either re-read answers. The first read is
+    // stale by the time it answers: it must neither install its report nor
+    // count as the current read having settled, or saving would open over a
+    // report the current request never produced.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    let resolveFirst: (v: unknown) => void = () => {}
+    let resolveSecond: (v: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveFirst = res }))
+    await openForTask()
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveSecond = res }))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+
+    await act(async () => {
+      resolveFirst(ok(report(false, [
+        connector(REF_A, "A", [input({ section: "context", key: "stale", type: "string", required: true })]),
+      ])))
+    })
+    expect(screen.queryByLabelText("stale")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.refreshing")).toBeInTheDocument()
+    const saveOnly = screen.getByText("connectorRuntime.actions.saveOnly")
+    expect(saveOnly).toBeDisabled()
+    fireEvent.click(saveOnly)
+    expect(submitMock).not.toHaveBeenCalled()
+
+    await act(async () => {
+      resolveSecond(ok(report(false, [
+        connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+      ])))
+    })
+    expect(screen.queryByText("connectorRuntime.refreshing")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+  })
+})

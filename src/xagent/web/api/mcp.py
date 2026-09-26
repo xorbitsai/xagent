@@ -13,6 +13,7 @@ import json
 import logging
 import secrets
 import shlex
+import weakref
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -40,7 +41,12 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...config import get_app_base_url, get_public_api_base_url, get_session_secret
+from ...config import (
+    get_app_base_url,
+    get_mcp_tool_init_timeout_seconds,
+    get_public_api_base_url,
+    get_session_secret,
+)
 from ...core.tools.adapters.vibe.connector_runtime import (
     validate_runtime_config_declaration,
 )
@@ -292,6 +298,132 @@ def _project_mcp_tool_load_result(load_result: Any) -> _MCPToolLoadAPIProjection
             for failure in failures
         ),
     )
+
+
+# The connection-test endpoint loads tools for a connection that is not saved.
+# It carries its own concurrency cap: at most this many test loads run at once
+# per event loop. The value matches the per-server cap the MCP loader applies
+# to the single server name every test load uses.
+_MCP_CONNECTION_TEST_MAX_INFLIGHT = 4
+
+# Name the unsaved connection is loaded under. The timeout result built below
+# uses the same name, so a timeout reads the same whichever side hit it.
+_MCP_CONNECTION_TEST_SERVER_NAME = "test"
+
+# Semaphores bind to the event loop they first wait on: key them by loop,
+# weakly, so a finished loop (e.g. one per test) does not pin its semaphore.
+_mcp_connection_test_gates: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+# Loads that currently hold a slot. The done-callback that gives a slot back
+# is registered on the task; this set keeps the task referenced until then.
+_mcp_connection_test_loads: "set[asyncio.Task[Any]]" = set()
+
+
+def _mcp_connection_test_gate() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    gate = _mcp_connection_test_gates.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(_MCP_CONNECTION_TEST_MAX_INFLIGHT)
+        _mcp_connection_test_gates[loop] = gate
+    return gate
+
+
+def _mcp_connection_test_timeout_result() -> Any:
+    """The result the MCP loader returns when this connection times out."""
+    from ...core.tools.adapters.vibe.mcp_adapter import (
+        MCPFailurePhase,
+        MCPLoadResult,
+        MCPServerLoadFailure,
+    )
+
+    return MCPLoadResult(
+        tools=(),
+        loaded_servers=(),
+        failures=(
+            MCPServerLoadFailure(
+                server_name=_MCP_CONNECTION_TEST_SERVER_NAME,
+                phase=MCPFailurePhase.INITIALIZE,
+                error_type="TimeoutError",
+            ),
+        ),
+    )
+
+
+async def _load_mcp_connection_test_tools(connection: dict[str, Any]) -> Any:
+    """Load tools for one unsaved connection under this endpoint's own cap.
+
+    * At most ``_MCP_CONNECTION_TEST_MAX_INFLIGHT`` loads run per event loop.
+    * Waiting for a slot and the load share one deadline, the MCP
+      initialization timeout, so the request returns within it.
+    * When the request reaches that deadline, or is cancelled, the load is
+      cancelled too; its slot is given back once the cancelled load has
+      returned, which the loader makes prompt.
+    * At the deadline the request gets the loader's own timeout result.
+    * A timeout of 0 disables the deadline: wait for a slot as long as it
+      takes, await the load directly, and let cancellation reach it.
+    """
+    from ...core.tools.adapters.vibe.mcp_adapter import (
+        load_mcp_tools_as_agent_tools,
+    )
+
+    # No ``connector_refs``: this connection is not persisted yet, so there is
+    # no connector identity to carry. The tools built here are only projected
+    # to names/descriptions and never dispatched, so the approval gate is never
+    # consulted for them.
+    connections: dict[str, Any] = {_MCP_CONNECTION_TEST_SERVER_NAME: connection}
+    timeout_seconds = get_mcp_tool_init_timeout_seconds()
+    gate = _mcp_connection_test_gate()
+
+    if timeout_seconds <= 0:
+        await gate.acquire()
+        try:
+            return await load_mcp_tools_as_agent_tools(connections, name_prefix="test_")
+        finally:
+            gate.release()
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    try:
+        await asyncio.wait_for(gate.acquire(), timeout_seconds)
+    except TimeoutError:
+        logger.error(
+            "MCP connection test got no slot within %ss; reporting a timeout",
+            timeout_seconds,
+        )
+        return _mcp_connection_test_timeout_result()
+
+    load = asyncio.ensure_future(
+        load_mcp_tools_as_agent_tools(connections, name_prefix="test_")
+    )
+    _mcp_connection_test_loads.add(load)
+
+    def _give_back(task: "asyncio.Task[Any]") -> None:
+        _mcp_connection_test_loads.discard(task)
+        gate.release()
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.debug(
+                "MCP connection-test load finished with %s", type(exc).__name__
+            )
+
+    load.add_done_callback(_give_back)
+    try:
+        done, _pending = await asyncio.wait(
+            {load}, timeout=max(0.0, deadline - loop.time())
+        )
+    except asyncio.CancelledError:
+        load.cancel()
+        raise
+    if load in done:
+        return load.result()
+    load.cancel()
+    logger.error(
+        "MCP connection test did not finish within %ss; reporting a timeout",
+        timeout_seconds,
+    )
+    return _mcp_connection_test_timeout_result()
 
 
 class MCPOAuthDiscoverRequest(BaseModel):
@@ -5397,10 +5529,6 @@ async def test_mcp_connection(
 ) -> MCPConnectionTestResponse:
     """Test MCP server connection without saving."""
     try:
-        from ...core.tools.adapters.vibe.mcp_adapter import (
-            load_mcp_tools_as_agent_tools,
-        )
-
         connection: dict[str, Any] = {
             "name": test_data.name,
             "transport": test_data.transport,
@@ -5409,14 +5537,7 @@ async def test_mcp_connection(
         connection.update(**test_data.config)
 
         try:
-            # No ``connector_refs``: this connection is not persisted yet, so
-            # there is no connector identity to carry. The tools built here
-            # are only projected to names/descriptions and never dispatched,
-            # so the approval gate is never consulted for them.
-            connections_dict: Dict[str, Any] = {"test": connection}
-            load_result = await load_mcp_tools_as_agent_tools(
-                connections_dict, name_prefix="test_"
-            )
+            load_result = await _load_mcp_connection_test_tools(connection)
 
             projection = _project_mcp_tool_load_result(load_result)
             details: dict[str, Any] = {"tool_count": len(projection.tools)}

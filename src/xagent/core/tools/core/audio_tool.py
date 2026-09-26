@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from ...file_ref import build_workspace_file_ref
 from ...model.asr.base import ASRResult, BaseASR
+from ...model.asr.usage import record_asr_seconds, resolve_asr_seconds
+from ...model.chat.token_context import MediaCallType
 from ...model.tts.base import BaseTTS, TTSResult
 from ...workspace import TaskWorkspace
 from .audio_tool_descriptions import (
@@ -27,6 +29,7 @@ from .audio_tool_descriptions import (
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION,
     TRANSCRIBE_AUDIO_DESCRIPTION,
 )
+from .media_usage import record_media_usage, resolve_billing_model
 
 logger = logging.getLogger(__name__)
 
@@ -572,6 +575,33 @@ class AudioToolCore:
                 return model_id
         return "default"
 
+    @staticmethod
+    def _resolve_billing_model(
+        models: Dict[str, Any], model: Any, model_id: Optional[str]
+    ) -> str:
+        """Identify the model that actually served a call, for usage records.
+
+        Resolves by configured key, then by object identity (the batch path
+        hands back a different instance than the registry dict holds), then
+        delegates to the shared :func:`resolve_billing_model` for the
+        provider-attribute fallback and the placeholder filter — so the
+        Xinference default model, which exposes no ``model_name``, is never
+        billed under the literal string ``"default"``.
+        """
+        if model_id and model_id in models:
+            return model_id
+        if model is not None:
+            for configured_id, configured_model in models.items():
+                if configured_model is model:
+                    return configured_id
+        # The provider class name is the last identity that still attributes
+        # cost to something real. The shared helper's own fallback is the
+        # literal "default", which the metering invariants forbid as a billing
+        # identity — the Xinference default model reaches exactly that case,
+        # exposing no model_name and never matching by identity above.
+        fallback = type(model).__name__ if model is not None else "default"
+        return resolve_billing_model(None, model, fallback=fallback)
+
     def _get_provider_tts_model(
         self,
         *,
@@ -713,14 +743,15 @@ class AudioToolCore:
             )
 
             # Determine the actual model used
-            actual_model_id = (
-                model_id if model_id and model_id in self._asr_models else "default"
+            actual_model_id = self._resolve_billing_model(
+                self._asr_models, asr_model, model_id
             )
 
             # Handle different result types
             text = None
             raw_segments = None
             language_detected = None
+            raw_response: dict[str, Any] = {}
 
             if isinstance(result, str):
                 text = result
@@ -741,6 +772,35 @@ class AudioToolCore:
                     else None
                 )
                 language_detected = result.language
+                if isinstance(result.raw_response, dict):
+                    raw_response = result.raw_response
+
+            # Shared with /speech/transcribe and the Telegram channel so the
+            # duration rule (provider's own total first, segment timings only
+            # as a fallback) has exactly one implementation.
+            audio_seconds = resolve_asr_seconds(raw_response, raw_segments)
+
+            # Recorded here, before _aggregate_segments and the rest of the
+            # post-processing below. Those steps can raise (a segment missing
+            # start/end raises ValueError), and the broad handler at the bottom
+            # turns any raise into success:False -- so recording afterwards
+            # meant a provider call that succeeded and was billed went
+            # unmetered. That is the bug class this metering exists to remove,
+            # and TTS in this same file already records before unpacking.
+            # Routed through the shared ASR recorder so every entry point
+            # meters identically.
+            record_asr_seconds(
+                audio_seconds,
+                # model_id is deliberately left unset. This tool is handed
+                # name-keyed registries (model_service keys _asr_models by
+                # model_name), so the only identity in scope here is a name —
+                # writing a name into model_id would persist it under an id
+                # field. The aggregator groups on `model_id or model`, so
+                # leaving it empty lets these rows key on the name
+                # consistently instead of inventing a third identity that can
+                # never be reconciled.
+                model_name=str(actual_model_id),
+            )
 
             segment_view = "raw" if verbose else "processed"
             segments = raw_segments
@@ -916,8 +976,19 @@ class AudioToolCore:
             )
 
             # Determine the actual model used
-            actual_model_id = (
-                model_id if model_id and model_id in self._tts_models else "default"
+            actual_model_id = self._resolve_billing_model(
+                self._tts_models, tts_model, model_id
+            )
+
+            # Meter TTS by input characters (how providers like ElevenLabs
+            # bill). Recorded before the result is unpacked below: the provider
+            # call already happened and is billable regardless of what fails
+            # afterwards. model_id stays unset — see synthesize/ASR above, the
+            # registries here are name-keyed so only a name is ever in scope.
+            record_media_usage(
+                MediaCallType.TTS,
+                len(text or ""),
+                model=str(actual_model_id),
             )
 
             audio_data: Optional[bytes] = None
@@ -1871,6 +1942,20 @@ class AudioToolCore:
                 voice=voice,
                 language=language,
                 **kwargs,
+            )
+
+            # Meter TTS by input characters, matching synthesize_speech so batch
+            # synthesis is metered the same way as single-shot synthesis.
+            # _resolve_billing_model rather than _get_tts_model_id: the latter
+            # bottoms out at the literal "default" with no model_name fallback,
+            # so an implicitly-resolved model would bill a phantom name here.
+            batch_model_id = self._resolve_billing_model(
+                self._tts_models, tts_model, None
+            )
+            record_media_usage(
+                MediaCallType.TTS,
+                len(text or ""),
+                model=batch_model_id,
             )
 
             # Handle result

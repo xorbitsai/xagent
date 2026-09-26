@@ -155,6 +155,10 @@ class WorkforceRun(Base):  # type: ignore[no-any-unimported]
     snapshot = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # Set when the retention purge expired this run's task (#2565), in the
+    # same transaction that deletes it; ``task_id`` is then SET NULL. Kept
+    # apart from ``status`` because the run's outcome is unchanged by it.
+    task_expired_at = Column(DateTime(timezone=True), nullable=True)
     # Bumped on every sync_workforce_run_status call (workforce_runtime.py)
     # that actually changes this row, i.e. once per turn of an active
     # conversation. created_at alone can't tell a genuinely-abandoned preview
@@ -170,7 +174,9 @@ class WorkforceRun(Base):  # type: ignore[no-any-unimported]
     # this row, transition or not. That only lines up with the comment above
     # today because sync_workforce_run_status is the only code path that
     # updates WorkforceRun rows; it would stop lining up the moment another
-    # write path is added without the same guard.
+    # write path is added without the same guard. The retention purge's
+    # ``task_expired_at`` write (services/expired_tasks.py) is such a path
+    # and pins this column in its SET clause for exactly that reason.
     last_activity_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

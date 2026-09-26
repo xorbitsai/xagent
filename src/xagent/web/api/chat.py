@@ -56,6 +56,7 @@ from ..services.connector_runtime import (
     build_task_runtime_requirements,
     resolve_agent_runtime_requirements,
 )
+from ..services.expired_tasks import find_expired_task
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -98,6 +99,7 @@ from ..services.task_workspace_cleanup import (
 )
 from ..services.workforce_runtime import resolve_workforce_task_runtime
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
+from .expired_task_errors import task_expired_http_error
 
 logger = logging.getLogger(__name__)
 
@@ -1050,6 +1052,17 @@ async def get_task(
                     .first()
                 )
             if not task:
+                # A task the retention purge expired answers 410 to the same
+                # callers the query above would have served it to: an admin,
+                # or its owner (#2565). Anyone else keeps the plain 404, so
+                # the answer cannot be used to probe for other users' ids.
+                tombstone = find_expired_task(db, task_id)
+                if tombstone is not None and (
+                    bool(user.is_admin) or int(tombstone.user_id) == int(user.id)
+                ):
+                    raise task_expired_http_error(
+                        tombstone, message="Task expired under the retention policy"
+                    )
                 raise HTTPException(status_code=404, detail="Task not found")
 
             cache_key = web_task_detail_key(task_id)

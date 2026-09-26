@@ -4539,3 +4539,70 @@ def test_finish_turn_syncs_trigger_run_status() -> None:
         assert run.error_message is None
     finally:
         db.close()
+
+
+def test_trigger_run_history_tells_an_expired_conversation_from_a_deleted_one() -> None:
+    """#2565: a run keeps its outcome and says why its task is gone.
+
+    The rows are what the retention purge leaves (``task_id`` SET NULL,
+    ``task_expired_at`` stamped, ``status`` untouched) next to what any other
+    deletion leaves (``task_id`` NULL and nothing else). The list and the
+    single-run read serialize through the same function.
+    """
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Expiry webhook", "config": {}},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+    expired_at = datetime(2026, 9, 1, 8, 30, tzinfo=timezone.utc)
+
+    db = _direct_db_session()
+    try:
+        expired_run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=None,
+            status=TriggerRunStatus.COMPLETED.value,
+            idempotency_key="expiry:expired",
+            task_expired_at=expired_at,
+        )
+        deleted_run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=None,
+            status=TriggerRunStatus.FAILED.value,
+            idempotency_key="expiry:deleted",
+        )
+        db.add_all([expired_run, deleted_run])
+        db.commit()
+        expired_run_id = int(expired_run.id)
+        deleted_run_id = int(deleted_run.id)
+    finally:
+        db.close()
+
+    listed = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs", headers=headers
+    )
+    assert listed.status_code == 200, listed.text
+    runs = {run["id"]: run for run in listed.json()}
+
+    expired = runs[expired_run_id]
+    assert expired["task_id"] is None
+    assert expired["status"] == "completed"
+    assert (
+        datetime.fromisoformat(expired["task_expired_at"]).replace(tzinfo=timezone.utc)
+        == expired_at
+    )
+    assert runs[deleted_run_id]["task_id"] is None
+    assert runs[deleted_run_id]["status"] == "failed"
+    assert runs[deleted_run_id]["task_expired_at"] is None
+
+    detail = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{expired_run_id}",
+        headers=headers,
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["status"] == "completed"
+    assert detail.json()["task_expired_at"] == expired["task_expired_at"]

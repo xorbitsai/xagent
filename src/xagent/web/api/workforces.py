@@ -292,6 +292,7 @@ def _serialize_workforce_list_item(
                 "id": last_run.id,
                 "task_id": last_run.task_id,
                 "status": last_run.status,
+                "task_expired_at": _serialize_datetime(last_run.task_expired_at),
                 "created_at": _serialize_datetime(last_run.created_at),
             }
             if last_run
@@ -1453,7 +1454,12 @@ def _serialize_run_list_item(run: WorkforceRun) -> dict[str, Any]:
     return {
         "id": run.id,
         "task_id": run.task_id,
+        # The run's own outcome, unchanged when retention expires its task.
         "status": run.status,
+        # When the retention purge expired this run's conversation (#2565);
+        # ``task_id`` is null from then on. A null ``task_id`` without it is
+        # a task deleted some other way.
+        "task_expired_at": _serialize_datetime(run.task_expired_at),
         "is_preview": bool(run.is_preview),
         "source": task.source if task is not None else None,
         "task_title": task.title if task is not None else None,

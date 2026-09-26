@@ -14,6 +14,7 @@ from sqlalchemy.types import Boolean
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import get_engine
+from xagent.web.models.expired_task import ExpiredTaskTombstone
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
@@ -908,6 +909,7 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
     # Both rows are in the timeline before the purge; the compact one is also
     # read separately into the transcript, which is why it is seeded here.
     assert len(warm.json()["trace_events"]) == 2
+    assert warm.json()["trace_events_expired_at"] is None
     assert any(
         entry.get("message_type") == "compaction" for entry in warm.json()["transcript"]
     ), (
@@ -952,6 +954,8 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["trace_events"] == []
+    # Empty because retention removed it, not because there never was one.
+    assert body["trace_events_expired_at"] is not None
     assert body["log"]["task_id"] == task_id
     # The conversation itself is what the shorter trace period exists to keep.
     transcript = body["transcript"]
@@ -1779,3 +1783,250 @@ def test_mcp_actor_tasks_stay_out_of_conversation_logs() -> None:
 
     detail = client.get(f"/api/conversation-logs/{actor_task_id}", headers=headers)
     assert detail.status_code == 404, detail.text
+
+
+# --- Expired conversation logs (#2565) ---------------------------------------
+#
+# The purge refuses SQLite as a job, so most of these insert the tombstone the
+# purge would have left; the first runs ``purge_task`` itself to pin the whole
+# chain. Tombstone-only ids are far above anything a test creates, so no live
+# task can hold them by accident.
+
+_EXPIRED_AT = datetime(2026, 9, 1, 8, 30, 0, tzinfo=timezone.utc)
+_UNUSED_TASK_ID = 900_000
+
+
+def _insert_tombstone(
+    *,
+    task_id: int,
+    user_id: int,
+    source: str | None = "sdk",
+    is_visible: bool = False,
+    is_channel_plumbing: bool = False,
+    agent_id: int | None = None,
+) -> None:
+    db = _direct_db_session()
+    try:
+        db.add(
+            ExpiredTaskTombstone(
+                task_id=task_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                source=source,
+                is_visible=is_visible,
+                is_channel_plumbing=is_channel_plumbing,
+                task_created_at=_EXPIRED_AT,
+                expired_at=_EXPIRED_AT,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _assert_expired(response: Any, task_id: int) -> None:
+    assert response.status_code == 410, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "task_expired"
+    assert detail["task_id"] == task_id
+    assert datetime.fromisoformat(detail["expired_at"]) == _EXPIRED_AT
+    assert detail["message"]
+
+
+def _assert_not_found(response: Any) -> None:
+    # Exactly the answer for an id that never existed, so the response cannot
+    # be used to probe which ids retention expired.
+    assert response.status_code == 404, response.text
+    assert response.json() == {"detail": "Conversation log not found"}
+
+
+def test_purged_conversation_log_detail_is_expired_and_absent_from_the_list() -> None:
+    from datetime import timedelta
+
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services.task_retention_purge import (
+        RetentionPurgeAction,
+        purge_task,
+    )
+
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Expiring Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Conversation retention expires",
+        source="widget",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    listed = client.get("/api/conversation-logs", headers=admin)
+    assert listed.status_code == 200, listed.text
+    assert [log["task_id"] for log in listed.json()["logs"]] == [task_id]
+
+    base = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    now = base + timedelta(days=400)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.last_activity_at = base
+        task.lease_expires_at = None
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).delete(synchronize_session=False)
+        db.commit()
+        assert (
+            purge_task(db, task_id, now=now, conversation_days=365, trace_days=90)
+            is RetentionPurgeAction.PURGED_CONVERSATION
+        )
+    finally:
+        db.close()
+
+    detail = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+    assert detail.status_code == 410, detail.text
+    assert detail.json()["detail"]["code"] == "task_expired"
+    assert detail.json()["detail"]["task_id"] == task_id
+    assert datetime.fromisoformat(detail.json()["detail"]["expired_at"]) == now
+
+    # Lists are deliberately unchanged: an expired task is simply gone from
+    # them, counts and agent filter options included.
+    listed = client.get("/api/conversation-logs", headers=admin)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["logs"] == []
+    assert listed.json()["source_counts"]["all"] == 0
+    assert listed.json()["agents"] == []
+
+
+def test_expired_log_detail_is_disclosed_to_the_owner_and_admins_only() -> None:
+    admin = _admin_headers()
+    owner = _register_second_user(username="expiredowner")
+    stranger = _register_second_user(username="expiredstranger")
+    task_id = _UNUSED_TASK_ID + 1
+    _insert_tombstone(task_id=task_id, user_id=_user_id("expiredowner"))
+
+    _assert_expired(
+        client.get(f"/api/conversation-logs/{task_id}", headers=owner), task_id
+    )
+    # Admins read hidden external logs across users live, so they are told
+    # about an expired one across users too.
+    _assert_expired(
+        client.get(f"/api/conversation-logs/{task_id}", headers=admin), task_id
+    )
+    _assert_not_found(client.get(f"/api/conversation-logs/{task_id}", headers=stranger))
+
+
+@pytest.mark.parametrize(
+    ("tombstone", "reason"),
+    [
+        (
+            {"source": "external", "is_channel_plumbing": True},
+            "MCP actor/OAuth turns are channel plumbing, never a conversation log",
+        ),
+        (
+            {"source": "sdk", "is_visible": True},
+            "visible tasks are not hidden external conversation logs",
+        ),
+        (
+            {"source": "internal"},
+            "internal tasks are outside the external-source scope",
+        ),
+        (
+            {"source": None},
+            "a task without a source is outside the external-source scope",
+        ),
+        (
+            {"source": "trigger"},
+            "the tombstone cannot prove a trigger task was a webhook log",
+        ),
+    ],
+)
+def test_expired_task_outside_the_log_scope_is_not_found(
+    tombstone: dict[str, Any], reason: str
+) -> None:
+    admin = _admin_headers()
+    task_id = _UNUSED_TASK_ID + 2
+    _insert_tombstone(task_id=task_id, user_id=_user_id("admin"), **tombstone)
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+
+    assert response.status_code == 404, reason
+    _assert_not_found(response)
+
+
+def test_expired_direct_and_external_sources_are_in_scope() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    for offset, source in enumerate(("sdk", "widget", "shared_link", "external")):
+        task_id = _UNUSED_TASK_ID + 10 + offset
+        _insert_tombstone(task_id=task_id, user_id=admin_id, source=source)
+        _assert_expired(
+            client.get(f"/api/conversation-logs/{task_id}", headers=admin), task_id
+        )
+
+
+def test_live_log_wins_over_a_tombstone_with_the_same_id() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Reused Id Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Live conversation",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    # SQLite hands a deleted id to the next insert, so a tombstone and a live
+    # task can share one; the live task is what the id means now.
+    _insert_tombstone(task_id=task_id, user_id=admin_id)
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["log"]["title"] == "Live conversation"
+
+
+def test_live_task_outside_the_log_scope_stays_not_found_despite_a_tombstone() -> None:
+    """A live task the page does not serve is not an expired one.
+
+    ``find_expired_task`` yields nothing while a live row holds the id, so a
+    visible task that shares an id with a tombstone stays a plain 404.
+    """
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    task_id = _create_task_row(
+        user_id=admin_id, title="Visible task", source="sdk", is_visible=True
+    )
+    _insert_tombstone(task_id=task_id, user_id=admin_id)
+
+    _assert_not_found(client.get(f"/api/conversation-logs/{task_id}", headers=admin))
+
+
+def test_tombstones_never_appear_in_the_list_or_its_counts() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Listed Agent")
+    live_id = _create_task_row(
+        user_id=admin_id,
+        title="Still here",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    _insert_tombstone(task_id=_UNUSED_TASK_ID + 20, user_id=admin_id, agent_id=agent_id)
+    _insert_tombstone(
+        task_id=_UNUSED_TASK_ID + 21,
+        user_id=admin_id,
+        source="widget",
+        agent_id=agent_id,
+    )
+
+    for source in ("all", "rest_api", "widget"):
+        response = client.get(
+            "/api/conversation-logs", params={"source": source}, headers=admin
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        expected = [live_id] if source in ("all", "rest_api") else []
+        assert [log["task_id"] for log in body["logs"]] == expected
+        assert body["source_counts"]["all"] == 1
+        assert body["source_counts"]["rest_api"] == 1
+        assert body["source_counts"]["widget"] == 0

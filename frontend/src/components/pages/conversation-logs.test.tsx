@@ -334,4 +334,78 @@ describe("ConversationLogsPage", () => {
     expect(screen.getByText("Handle webhook event")).toBeInTheDocument()
     expect(screen.queryByText("Qualify this lead")).not.toBeInTheDocument()
   })
+
+  function mockDetailResponse(detail: () => Response) {
+    apiRequestMock.mockImplementation((url: string) => {
+      const parsed = new URL(url)
+      if (parsed.pathname === "/api/conversation-logs/101") {
+        return Promise.resolve(detail())
+      }
+      if (parsed.pathname === "/api/conversation-logs") {
+        return Promise.resolve(
+          new Response(JSON.stringify(listPayload), { status: 200 })
+        )
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+  }
+
+  it("says a log expired when retention removed it after it was listed", async () => {
+    mockDetailResponse(
+      () =>
+        new Response(
+          JSON.stringify({
+            detail: {
+              code: "task_expired",
+              message: "Conversation log expired under the retention policy",
+              task_id: 101,
+              expired_at: "2026-09-01T08:30:00+00:00",
+            },
+          }),
+          { status: 410 }
+        )
+    )
+
+    render(<ConversationLogsPage />)
+
+    expect(await screen.findByText("conversationLogs.expired.detail")).toBeInTheDocument()
+    expect(screen.queryByText("Failed to load conversation detail")).not.toBeInTheDocument()
+  })
+
+  it("treats a 410 without the task_expired code as an ordinary failure", async () => {
+    mockDetailResponse(
+      () => new Response(JSON.stringify({ detail: "Gone" }), { status: 410 })
+    )
+
+    render(<ConversationLogsPage />)
+
+    expect(await screen.findByText("Failed to load conversation detail")).toBeInTheDocument()
+    expect(screen.queryByText("conversationLogs.expired.detail")).not.toBeInTheDocument()
+  })
+
+  it("notes when retention removed earlier execution steps", async () => {
+    mockDetailResponse(
+      () =>
+        new Response(
+          JSON.stringify({
+            ...detailPayload,
+            trace_events: [],
+            trace_events_expired_at: "2026-09-01T08:30:00+00:00",
+          }),
+          { status: 200 }
+        )
+    )
+
+    render(<ConversationLogsPage />)
+
+    expect(await screen.findByText("Qualify this lead")).toBeInTheDocument()
+    expect(screen.getByText("conversationLogs.expired.traceEvents")).toBeInTheDocument()
+  })
+
+  it("shows no retention note for a complete trace", async () => {
+    render(<ConversationLogsPage />)
+
+    expect(await screen.findByText("Qualify this lead")).toBeInTheDocument()
+    expect(screen.queryByText("conversationLogs.expired.traceEvents")).not.toBeInTheDocument()
+  })
 })

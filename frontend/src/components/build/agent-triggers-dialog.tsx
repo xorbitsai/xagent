@@ -57,6 +57,7 @@ import {
   updateOwnerTrigger,
 } from "@/lib/agent-triggers-api"
 import { copyToClipboard } from "@/lib/clipboard"
+import { formatTime } from "@/lib/time-utils"
 import { cn, getApiUrl } from "@/lib/utils"
 import {
   RECURRENCE_TYPES,
@@ -2208,6 +2209,12 @@ export function AgentTriggersDialog({
                       >
                         #{run.task_id}
                       </Button>
+                    ) : run.task_expired_at ? (
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {t("triggers.runs.taskExpired", {
+                          date: formatTime(run.task_expired_at, "date"),
+                        })}
+                      </span>
                     ) : (
                       <span className="text-xs text-muted-foreground">-</span>
                     )}

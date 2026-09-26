@@ -113,6 +113,11 @@ class TriggerRunResponse(BaseModel):
     error_message: str | None
     started_at: str | None
     finished_at: str | None
+    # When the retention purge expired this run's conversation (#2565);
+    # ``task_id`` is null from then on. ``status`` is untouched by it: a run
+    # that completed still completed. A null ``task_id`` without this
+    # timestamp is a task deleted some other way.
+    task_expired_at: str | None
     created_at: str | None
     updated_at: str | None
 
@@ -177,6 +182,7 @@ def _serialize_run(
         error_message=run.error_message,
         started_at=_dt(getattr(run, "started_at", None)),
         finished_at=_dt(getattr(run, "finished_at", None)),
+        task_expired_at=_dt(getattr(run, "task_expired_at", None)),
         created_at=_dt(getattr(run, "created_at", None)),
         updated_at=_dt(getattr(run, "updated_at", None)),
     )

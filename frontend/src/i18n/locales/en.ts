@@ -149,6 +149,10 @@ const en = {
       detail: "Select a conversation log to inspect its transcript.",
       transcript: "No transcript has been captured for this conversation.",
     },
+    expired: {
+      detail: "This conversation expired on {date} under the data retention policy.",
+      traceEvents: "Execution steps from before {date} were removed under the data retention policy.",
+    },
   },
   home: {
     hero: {
@@ -4219,7 +4223,8 @@ Build when you need.`,
       source: "Source",
       task: "Task",
       created: "Created",
-      empty: "No runs yet"
+      empty: "No runs yet",
+      taskExpired: "Conversation expired on {date}"
     },
     validation: {
       name: "Trigger name is required",
@@ -4604,6 +4609,7 @@ Build when you need.`,
       untitled: "Run #{id}",
       previewBadge: "Preview",
       taskDeleted: "Conversation unavailable",
+      taskExpired: "Conversation expired on {date}",
       status: {
         pending: "Pending",
         running: "Running",

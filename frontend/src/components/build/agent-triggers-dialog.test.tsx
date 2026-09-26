@@ -459,6 +459,65 @@ describe("AgentTriggersDialog", () => {
     expect(headerSwitch).toHaveAttribute("aria-checked", "false")
   })
 
+  it("tells a run whose conversation expired apart from one whose task was deleted", async () => {
+    const run = {
+      trigger_id: 9,
+      background_job_id: null,
+      source_event_id: null,
+      payload_snapshot: null,
+      error_message: null,
+      started_at: null,
+      finished_at: null,
+      created_at: null,
+      updated_at: null,
+    }
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(
+          jsonResponse([
+            // Retention expired the conversation: the run still completed.
+            {
+              ...run,
+              id: 1,
+              task_id: null,
+              status: "completed",
+              idempotency_key: "evt-expired",
+              task_expired_at: "2026-09-01T08:30:00+00:00",
+            },
+            // Deleted some other way: no expiry timestamp.
+            { ...run, id: 2, task_id: null, status: "failed", idempotency_key: "evt-deleted" },
+          ]),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+
+    const expiredRow = (await screen.findByText("evt-expired")).parentElement as HTMLElement
+    expect(within(expiredRow).getByText("triggers.runStatus.completed")).toBeInTheDocument()
+    expect(within(expiredRow).getByText("triggers.runs.taskExpired")).toBeInTheDocument()
+
+    const deletedRow = screen.getByText("evt-deleted").parentElement as HTMLElement
+    expect(within(deletedRow).getByText("triggers.runStatus.failed")).toBeInTheDocument()
+    expect(within(deletedRow).getByText("-")).toBeInTheDocument()
+    expect(within(deletedRow).queryByText("triggers.runs.taskExpired")).not.toBeInTheDocument()
+  })
+
   it("reconciles a card switch from the PATCH response, not just the requested value", async () => {
     apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
       if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))

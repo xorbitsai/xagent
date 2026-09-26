@@ -49,6 +49,10 @@ export interface AgentTriggerRun {
   error_message: string | null
   started_at: string | null
   finished_at: string | null
+  // Set when the retention policy expired this run's conversation; task_id is
+  // null from then on. `status` is still the run's own outcome. Optional so an
+  // older backend that does not send it reads as "not expired".
+  task_expired_at?: string | null
   created_at: string | null
   updated_at: string | null
 }

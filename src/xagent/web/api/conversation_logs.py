@@ -17,6 +17,7 @@ from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
+from ..models.expired_task import ExpiredTaskTombstone
 from ..models.task import Task, TraceEvent
 from ..models.trigger import AgentTrigger, TriggerRun
 from ..models.uploaded_file import UploadedFile
@@ -26,6 +27,7 @@ from ..services.conversation_log_sources import (
     get_external_task_public_context,
     get_external_task_source_branches,
 )
+from ..services.expired_tasks import find_expired_task
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -37,6 +39,7 @@ from ..services.public_trace_events import (
 )
 from ..services.task_runtime import MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY
 from ..utils.db_timezone import format_datetime_for_api
+from .expired_task_errors import task_expired_http_error
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +344,66 @@ def _apply_external_task_scope(query: Any, user: User) -> Any:
     if not bool(user.is_admin):
         query = query.filter(Task.user_id == int(user.id))
     return query
+
+
+def _tombstone_in_external_task_scope(
+    tombstone: ExpiredTaskTombstone, user: User
+) -> bool:
+    """``_apply_external_task_scope``, applied to an expired task's tombstone.
+
+    The tombstone stores exactly the inputs that filter reads, so this is the
+    same predicate term for term: hidden, an external source, not MCP channel
+    plumbing, and the caller's own unless the caller is an admin. Keep the two
+    in step -- a term added there and not here would let an expired task be
+    disclosed to a caller who could never have seen it live.
+    """
+    if tombstone.is_visible:
+        return False
+    if tombstone.source not in EXTERNAL_TASK_SOURCES:
+        return False
+    if tombstone.is_channel_plumbing:
+        return False
+    return bool(user.is_admin) or int(tombstone.user_id) == int(user.id)
+
+
+def _tombstone_has_ui_source(tombstone: ExpiredTaskTombstone) -> bool:
+    """The detail route's second gate, ``_ui_source_for_task``, on a tombstone.
+
+    Direct sources map to a UI source unconditionally, and ``external`` rows
+    fall back to the REST API default when no deployment branch matches, so
+    both always pass. ``trigger`` rows pass only for a webhook trigger, and
+    the trigger type lived in ``agent_config`` and on the ``TriggerRun`` whose
+    ``task_id`` the purge nulled -- the tombstone does not record it. Without
+    it a scheduled or Gmail trigger task, which this page never showed, cannot
+    be told apart from a webhook one, so every trigger tombstone answers
+    not-found: failing to say "expired" is the safe side of that trade,
+    saying it for a task the page never served is not.
+    """
+    source = str(tombstone.source or "")
+    return source in DIRECT_SOURCE_TO_UI_SOURCE or source == EXTERNAL_TASK_SOURCE
+
+
+def _missing_conversation_log_error(
+    db: Session, user: User, task_id: int
+) -> HTTPException:
+    """The error for a detail request whose task is not served live.
+
+    ``410 task_expired`` when retention expired the task and the tombstone
+    passes the same gates the live task would have (see
+    ``expired_task_errors``); otherwise this route's ordinary 404, so the
+    answer never reveals that an id the caller could not see ever existed.
+    """
+    tombstone = find_expired_task(db, task_id)
+    if (
+        tombstone is not None
+        and _tombstone_in_external_task_scope(tombstone, user)
+        and _tombstone_has_ui_source(tombstone)
+    ):
+        return task_expired_http_error(
+            tombstone,
+            message="Conversation log expired under the retention policy",
+        )
+    return HTTPException(status_code=404, detail="Conversation log not found")
 
 
 def _apply_task_filters(
@@ -788,12 +851,14 @@ async def get_conversation_log_detail(
     """Return one hidden external conversation log.
 
     Admin users can inspect hidden external conversation logs across all users.
-    Non-admin users are limited to their own logs.
+    Non-admin users are limited to their own logs. A log the retention purge
+    expired answers ``410 task_expired`` to exactly those callers and 404 to
+    everyone else; the list never includes it.
     """
     query = _base_task_query(db, user).filter(Task.id == task_id)
     task = query.first()
     if task is None:
-        raise HTTPException(status_code=404, detail="Conversation log not found")
+        raise _missing_conversation_log_error(db, user, task_id)
 
     ui_source = _ui_source_for_task(db, task)
     if ui_source is None:
@@ -814,6 +879,11 @@ async def get_conversation_log_detail(
             file_reference_records,
         ),
         "trace_events": _serialize_trace_events(db, int(task.id)),
+        # When retention last removed this task's trace (#2565). Later turns
+        # write new trace rows, so a non-null value does not mean
+        # ``trace_events`` is empty: it means the events from before this
+        # moment are gone and the timeline may be incomplete.
+        "trace_events_expired_at": format_datetime_for_api(task.traces_expired_at),
         "metadata": {
             "task": {
                 "task_id": int(task.id),

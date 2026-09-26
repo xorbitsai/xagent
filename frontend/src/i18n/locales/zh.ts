@@ -149,6 +149,10 @@ const zh = {
       detail: "选择一条会话日志查看对话记录。",
       transcript: "这条会话还没有记录到对话内容。",
     },
+    expired: {
+      detail: "根据数据保留策略，这条会话已于 {date} 过期。",
+      traceEvents: "根据数据保留策略，{date} 之前的执行步骤已被移除。",
+    },
   },
   home: {
     hero: {
@@ -4214,7 +4218,8 @@ const zh = {
       source: "来源",
       task: "任务",
       created: "创建时间",
-      empty: "还没有运行记录"
+      empty: "还没有运行记录",
+      taskExpired: "会话已于 {date} 过期"
     },
     validation: {
       name: "Trigger 名称不能为空",
@@ -4599,6 +4604,7 @@ const zh = {
       untitled: "运行 #{id}",
       previewBadge: "预览",
       taskDeleted: "会话不可用",
+      taskExpired: "会话已于 {date} 过期",
       status: {
         pending: "等待中",
         running: "运行中",

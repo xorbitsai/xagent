@@ -16,9 +16,11 @@ import {
   type ConversationLogListResponse,
   type ConversationLogSource,
   type ConversationLogSummary,
+  ConversationLogExpiredError,
   fetchConversationLogDetail,
   fetchConversationLogs,
 } from "@/lib/conversation-logs-api"
+import { formatTime } from "@/lib/time-utils"
 import { cn } from "@/lib/utils"
 
 const SOURCE_TABS: Array<{
@@ -83,6 +85,7 @@ export function ConversationLogsPage() {
   const [isDetailLoading, setIsDetailLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [detailError, setDetailError] = useState<string | null>(null)
+  const [detailExpired, setDetailExpired] = useState<ConversationLogExpiredError | null>(null)
   const unknownErrorRef = useRef("Unknown error")
 
   useEffect(() => {
@@ -92,6 +95,7 @@ export function ConversationLogsPage() {
   const loadDetail = useCallback(async (taskId: number) => {
     setIsDetailLoading(true)
     setDetailError(null)
+    setDetailExpired(null)
     try {
       const data = await fetchConversationLogDetail(taskId)
       if (taskId === selectedTaskIdRef.current) {
@@ -100,7 +104,11 @@ export function ConversationLogsPage() {
     } catch (err) {
       if (taskId === selectedTaskIdRef.current) {
         setDetail(null)
-        setDetailError(err instanceof Error ? err.message : unknownErrorRef.current)
+        if (err instanceof ConversationLogExpiredError) {
+          setDetailExpired(err)
+        } else {
+          setDetailError(err instanceof Error ? err.message : unknownErrorRef.current)
+        }
       }
     } finally {
       if (taskId === selectedTaskIdRef.current) {
@@ -144,6 +152,7 @@ export function ConversationLogsPage() {
         } else {
           setDetail(null)
           setDetailError(null)
+          setDetailExpired(null)
           setIsDetailLoading(false)
         }
       } catch (err) {
@@ -359,6 +368,12 @@ export function ConversationLogsPage() {
             </div>
           ) : isDetailLoading && !detail ? (
             <div className="px-6 py-6 text-sm text-slate-500">{t("common.loading")}</div>
+          ) : detailExpired ? (
+            <div className="px-6 py-6 text-sm text-slate-500">
+              {t("conversationLogs.expired.detail", {
+                date: formatTime(detailExpired.expiredAt, "date"),
+              })}
+            </div>
           ) : detailError ? (
             <div className="px-6 py-6 text-sm text-rose-600">{detailError}</div>
           ) : detail ? (
@@ -453,9 +468,19 @@ function ConversationLogDetail({ detail }: { detail: ConversationLogDetailRespon
             ))}
           </div>
         )}
-        {detail.trace_events && detail.trace_events.length > 0 ? (
+        {detail.trace_events_expired_at ||
+        (detail.trace_events && detail.trace_events.length > 0) ? (
           <div className="mt-6 border-t border-slate-200 pt-4">
-            <TraceEventRenderer events={detail.trace_events as any} taskStatus={log.status} />
+            {detail.trace_events_expired_at ? (
+              <p className="mb-3 text-xs text-slate-500">
+                {t("conversationLogs.expired.traceEvents", {
+                  date: formatTime(detail.trace_events_expired_at, "date"),
+                })}
+              </p>
+            ) : null}
+            {detail.trace_events && detail.trace_events.length > 0 ? (
+              <TraceEventRenderer events={detail.trace_events as any} taskStatus={log.status} />
+            ) : null}
           </div>
         ) : null}
       </section>

@@ -134,6 +134,7 @@ def _create_workforce_run(
     is_preview: bool = False,
     task_id: int | None = None,
     completed_at: datetime | None = None,
+    task_expired_at: datetime | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
@@ -146,6 +147,7 @@ def _create_workforce_run(
             snapshot={"workforce": {"id": workforce_id}},
             created_at=created_at,
             completed_at=completed_at,
+            task_expired_at=task_expired_at,
         )
         db.add(run)
         db.commit()
@@ -2340,6 +2342,72 @@ def test_list_workforce_runs_orders_paginates_and_excludes_previews() -> None:
     )
     assert list_response.status_code == 200
     assert list_response.json()["items"][0]["last_run"]["id"] == latest_run_id
+
+
+def test_workforce_run_history_tells_an_expired_conversation_from_a_deleted_one() -> (
+    None
+):
+    """#2565: run history keeps the run's outcome and says why its task is gone.
+
+    The rows are what the retention purge leaves (``task_id`` SET NULL,
+    ``task_expired_at`` stamped, ``status`` untouched) next to what any other
+    deletion leaves (``task_id`` NULL and nothing else).
+    """
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Expired Runs Workforce")
+    workforce_id = int(workforce["id"])
+    now = datetime.now(timezone.utc)
+    expired_at = now - timedelta(days=1)
+
+    deleted_run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="failed",
+        created_at=now - timedelta(minutes=10),
+    )
+    expired_run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=now,
+        completed_at=now + timedelta(minutes=1),
+        task_expired_at=expired_at,
+    )
+
+    response = client.get(f"/api/workforces/{workforce_id}/runs", headers=headers)
+    assert response.status_code == 200, response.text
+    items = {item["id"]: item for item in response.json()["items"]}
+
+    expired = items[expired_run_id]
+    assert expired["task_id"] is None
+    assert expired["status"] == "completed"
+    assert datetime.fromisoformat(expired["task_expired_at"]).replace(
+        tzinfo=timezone.utc
+    ) == expired_at.replace(tzinfo=timezone.utc)
+
+    deleted = items[deleted_run_id]
+    assert deleted["task_id"] is None
+    assert deleted["status"] == "failed"
+    assert deleted["task_expired_at"] is None
+
+    detail = client.get(
+        f"/api/workforces/{workforce_id}/runs/{expired_run_id}", headers=headers
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["status"] == "completed"
+    assert detail.json()["task_expired_at"] == expired["task_expired_at"]
+
+    listed = client.get(
+        "/api/workforces",
+        headers=headers,
+        params={"search": "Expired Runs Workforce"},
+    )
+    assert listed.status_code == 200, listed.text
+    last_run = listed.json()["items"][0]["last_run"]
+    assert last_run["id"] == expired_run_id
+    assert last_run["status"] == "completed"
+    assert last_run["task_expired_at"] == expired["task_expired_at"]
 
 
 def test_workforce_run_detail_and_access_control() -> None:

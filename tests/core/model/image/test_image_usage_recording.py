@@ -1141,6 +1141,225 @@ async def test_gemini_edit_records_one_image_through_the_real_context(
     assert entry["model_id"] == "gem-cfg"
 
 
+async def _record_gemini_call(monkeypatch, method: str, usage_metadata: dict):
+    """Run one Gemini generate/edit call and return its persisted media row."""
+    from xagent.core.model.image import gemini as gemini_mod
+
+    payload = {
+        "candidates": [
+            {
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [{"text": "![Image](https://example.com/out.png)"}]
+                },
+            }
+        ],
+        "usageMetadata": usage_metadata,
+    }
+    monkeypatch.setattr(
+        gemini_mod.httpx, "AsyncClient", _gemini_client_factory(payload, {"n": 0})
+    )
+    model = gemini_mod.GeminiImageModel(
+        model_name="gemini-3-pro-image-preview-2k",
+        api_key="k",
+        abilities=["generate", "edit"],
+        model_id="gem-modalities",
+    )
+
+    with TokenContextManager() as manager:
+        if method == "generate":
+            await model.generate_image(prompt="draw")
+        else:
+            await model.edit_image(
+                image_url="data:image/png;base64,iVBORw0KGgo=", prompt="edit"
+            )
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 1
+    return usage.details[0]
+
+
+@pytest.mark.parametrize(
+    ("method", "details", "text_tokens", "image_tokens"),
+    [
+        # A text-only prompt lists no IMAGE entry: that is an explicit zero,
+        # not an unknown image count.
+        ("generate", [{"modality": "TEXT", "tokenCount": 12}], 12, 0),
+        (
+            "edit",
+            [
+                {"modality": "TEXT", "tokenCount": 9},
+                {"modality": "IMAGE", "tokenCount": 1290},
+            ],
+            9,
+            1290,
+        ),
+        # A zero-token entry in another modality carries no charge.
+        (
+            "generate",
+            [
+                {"modality": "TEXT", "tokenCount": 12},
+                {"modality": "AUDIO", "tokenCount": 0},
+            ],
+            12,
+            0,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_gemini_paths_record_provider_input_modalities(
+    monkeypatch, method: str, details: list, text_tokens: int, image_tokens: int
+) -> None:
+    prompt_tokens = text_tokens + image_tokens
+    entry = await _record_gemini_call(
+        monkeypatch,
+        method,
+        {
+            "promptTokenCount": prompt_tokens,
+            "candidatesTokenCount": 1290,
+            "promptTokensDetails": details,
+        },
+    )
+
+    assert entry["call_type"] == f"{method}_image"
+    assert entry["provider_input_tokens"] == prompt_tokens
+    assert entry["provider_text_input_tokens"] == text_tokens
+    assert entry["provider_image_input_tokens"] == image_tokens
+    [group] = aggregate_media_usage_by_model([entry])
+    assert group["provider_text_input_tokens"] == text_tokens
+    assert group["provider_image_input_tokens"] == image_tokens
+
+
+@pytest.mark.parametrize(
+    "usage_metadata",
+    [
+        pytest.param({"promptTokenCount": 12}, id="details-absent"),
+        pytest.param(
+            {"promptTokenCount": 12, "promptTokensDetails": []}, id="details-empty"
+        ),
+        pytest.param(
+            {"promptTokenCount": 12, "promptTokensDetails": {"TEXT": 12}},
+            id="details-not-a-list",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 10}],
+            },
+            id="split-below-total",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "IMAGE", "tokenCount": 5},
+                ],
+            },
+            id="split-above-total",
+        ),
+        pytest.param(
+            {"promptTokensDetails": [{"modality": "TEXT", "tokenCount": 12}]},
+            id="total-absent",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": "not-a-count",
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 12}],
+            },
+            id="total-malformed",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 30,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "AUDIO", "tokenCount": 18},
+                ],
+            },
+            id="other-modality",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 30,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "HOLOGRAM", "tokenCount": 18},
+                ],
+            },
+            id="unknown-modality",
+        ),
+        # Tokens outside text and image void the split even when the provider's
+        # total leaves them out.
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "VIDEO", "tokenCount": 18},
+                ],
+            },
+            id="other-modality-outside-total",
+        ),
+        # A missing count is unknown, not zero, even when the rest would
+        # balance.
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "IMAGE"},
+                ],
+            },
+            id="count-absent",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 1,
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": True}],
+            },
+            id="count-boolean",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 13},
+                    {"modality": "IMAGE", "tokenCount": -1},
+                ],
+            },
+            id="count-negative",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 11.5},
+                    {"modality": "IMAGE", "tokenCount": 0.5},
+                ],
+            },
+            id="count-fractional",
+        ),
+        pytest.param(
+            {"promptTokenCount": 12, "promptTokensDetails": ["TEXT"]},
+            id="entry-not-a-dict",
+        ),
+    ],
+)
+@pytest.mark.parametrize("method", ["generate", "edit"])
+@pytest.mark.asyncio
+async def test_gemini_untrustworthy_input_modality_split_is_omitted(
+    monkeypatch, method: str, usage_metadata: dict
+) -> None:
+    entry = await _record_gemini_call(monkeypatch, method, usage_metadata)
+
+    # The row still records the call and its aggregate tokens; only the split
+    # is left out, so billing reports unpriced input instead of guessing.
+    assert entry["quantity"] == 1.0
+    assert "provider_text_input_tokens" not in entry
+    assert "provider_image_input_tokens" not in entry
+
+
 @pytest.mark.asyncio
 async def test_dashscope_edit_records_through_the_real_context(monkeypatch) -> None:
     """Companion to the kwargs-level DashScope edit seam test above."""

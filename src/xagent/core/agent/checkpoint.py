@@ -60,6 +60,10 @@ class CheckpointPersistenceError(RuntimeError):
     """Raised when a checkpoint cannot be durably persisted."""
 
 
+class ExecutionEventPersistenceError(CheckpointPersistenceError):
+    """An execution fact failed to commit; apply the checkpoint abort policy."""
+
+
 class CheckpointReadError(RuntimeError):
     """Base for checkpoint read failures that must not collapse to absence.
 
@@ -177,6 +181,10 @@ class TraceCheckpointStore:
 
     tracer: Any
     require_persisted: bool = True
+
+    @property
+    def records_execution_events(self) -> bool:
+        return getattr(self.tracer, "records_execution_events", False) is True
 
     async def checkpoint(self, **payload: Any) -> str | None:
         return await self.save(payload)

@@ -64,6 +64,7 @@ from dataclasses import dataclass, replace
 from datetime import timezone
 from enum import Enum
 from typing import Any, Callable, cast
+from uuid import uuid4
 
 from ....context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
 from ....file_ref import (
@@ -91,7 +92,7 @@ from ....tools.user_interaction import (
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
-from ...checkpoint import CheckpointPersistenceError
+from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...clarification import draft_from_waiting_request
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
@@ -1149,6 +1150,11 @@ class ReActPattern(AgentPattern):
 
             assistant_content = normalized.get("content")
             tool_calls = normalized.get("tool_calls", [])
+            if getattr(runtime.tracer, "records_execution_events", False) is True:
+                batch_id = str(uuid4())
+                for tool_call in tool_calls:
+                    tool_call["assistant_message_id"] = batch_id
+                    tool_call["tool_attempt_id"] = str(uuid4())
             if assistant_content is not None or normalized.get("tool_calls"):
                 # A tool-protocol error response never carries tool_calls (see
                 # tool_protocol_error_response), so this guard never mistakes
@@ -2698,7 +2704,7 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
         data: dict[str, Any],
     ) -> None:
-        """Write one settlement trace event, matching runtime's best-effort rule."""
+        """Persist settlement facts strictly and deliver observers best-effort."""
 
         execution_id = getattr(runtime, "execution_id", None)
         step_id = getattr(runtime, "active_react_step_id", None)
@@ -2711,6 +2717,8 @@ class ReActPattern(AgentPattern):
             )
             if inspect.isawaitable(emitted):
                 await emitted
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
             # UI trace events are best-effort, exactly as in
             # PatternRuntime._emit_trace_event; a tracer fault must not undo a
@@ -5064,6 +5072,8 @@ class ReActPattern(AgentPattern):
                     error=str(exc),
                 )
                 recorded_terminal = True
+                raise
+            except ExecutionEventPersistenceError:
                 raise
             except Exception as exc:  # noqa: BLE001
                 error_result = {

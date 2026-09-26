@@ -37,6 +37,11 @@ def test_execution_services_and_tracer_load_without_api_routes() -> None:
                 with patch.object(task_execution, "create_terminal_task_error_event", return_value=event):
                     asyncio.run(_broadcast_external_cancel_terminal_event(1))
                 sink.assert_awaited_once_with(event, 1)
+                from xagent.web.models.database import configure_db, get_engine, Base
+                import tempfile
+                database_directory = tempfile.TemporaryDirectory()
+                configure_db(f"sqlite:///{database_directory.name}/tasks.db")
+                Base.metadata.create_all(get_engine())
                 from xagent.web.tracing import create_task_tracer
                 create_task_tracer(1, user_id=1)
                 """

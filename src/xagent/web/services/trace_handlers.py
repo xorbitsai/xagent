@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -213,6 +213,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
         super().__init__()
         self.task_id = task_id
         self.build_id = build_id
+        self.authoritative = False
 
     async def _handle_task_event(self, event: CoreTraceEvent) -> None:
         """Handle task-level events for database storage."""
@@ -1013,6 +1014,9 @@ class DatabaseTraceHandler(BaseTraceHandler):
         from .task_event_trace_handler import get_event_type_mapping
         from .trace_event_staging import prepare_trace_payload
 
+        if self.authoritative:
+            return lambda db: self._save_trace_event(db, event)
+
         event_type = get_event_type_mapping(event)
         with observe_duration("xagent.trace.database.serialization.duration"):
             data = self._serialize_data_for_json(event.data or {})
@@ -1044,11 +1048,112 @@ class DatabaseTraceHandler(BaseTraceHandler):
             timestamp = _convert_float_to_datetime(event.timestamp)
 
             # Serialize data to ensure JSON compatibility
-            if prepared is not None:
+            if self.authoritative:
+                data = event.data or {}
+            elif prepared is not None:
                 data = prepared.data
             else:
                 with observe_duration("xagent.trace.database.serialization.duration"):
                     data = self._serialize_data_for_json(event.data or {})
+            if self.authoritative:
+                from .task_execution_event_store import (
+                    lock_task_execution_events_no_commit,
+                )
+                from .task_execution_event_writer import append_fact_no_commit
+
+                lock_task_execution_events_no_commit(db, self.task_id)
+                lease = current_task_lease()
+                if lease is not None:
+                    if lease.task_id != self.task_id:
+                        raise RuntimeError("Execution event task lease mismatch")
+                    owned = (
+                        db.query(Task.id)
+                        .filter(
+                            Task.id == self.task_id,
+                            Task.runner_id == lease.runner_id,
+                            task_lease_attempt_predicate(lease),
+                            Task.run_id == lease.run_id,
+                            Task.status == TaskStatus.RUNNING,
+                        )
+                        .first()
+                    )
+                    if owned is None:
+                        raise RuntimeError(
+                            "Execution event producer lost its task lease"
+                        )
+                is_state = data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES
+                attempt = data.get("tool_attempt_id")
+                if attempt:
+                    from uuid import NAMESPACE_URL, uuid5
+
+                    from ..models.task_execution_event import TaskExecutionEvent
+
+                    event.id = str(
+                        uuid5(
+                            NAMESPACE_URL,
+                            f"task:{self.task_id}:{self.build_id or 'root'}:{attempt}:{event_type_str}",
+                        )
+                    )
+                    if (
+                        event_type_str == "tool_execution_start"
+                        and db.query(TaskExecutionEvent.id)
+                        .filter(
+                            TaskExecutionEvent.task_id == self.task_id,
+                            TaskExecutionEvent.scope_id == (self.build_id or "root"),
+                            TaskExecutionEvent.tool_attempt_id == attempt,
+                        )
+                        .first()
+                        is not None
+                    ):
+                        # Until event-based recovery reconciles the attempt, do
+                        # not re-execute a possibly completed external effect.
+                        raise RuntimeError(
+                            "Tool attempt already started; result reconciliation required"
+                        )
+                key = (
+                    f"tool:{attempt}:{event_type_str}"
+                    if attempt
+                    else f"runtime:{event.id}"
+                )
+                fact = append_fact_no_commit(
+                    db,
+                    task_id=self.task_id,
+                    scope_id=self.build_id or "root",
+                    run_id=lease.run_id if lease is not None else None,
+                    turn_id=data.get("turn_id"),
+                    assistant_message_id=data.get("assistant_message_id"),
+                    tool_attempt_id=attempt,
+                    key=key,
+                    kind="recovery_state" if is_state else event_type_str,
+                    payload={
+                        "data": data,
+                        "step_id": event.step_id,
+                        "protocol_event_id": str(event.id),
+                        "event_type": event_type_str,
+                        "parent_event_id": str(event.parent_id)
+                        if event.parent_id
+                        else None,
+                    },
+                    occurred_at=timestamp,
+                )
+                data = cast(dict[str, Any], fact.payload["data"])
+                if is_state:
+                    from .task_execution_event_writer import (
+                        stage_applied_inputs_no_commit,
+                    )
+
+                    stage_applied_inputs_no_commit(db, fact)
+                if (
+                    db.query(DatabaseTraceEvent.id)
+                    .filter(
+                        DatabaseTraceEvent.task_id == self.task_id,
+                        DatabaseTraceEvent.event_id == str(event.id),
+                    )
+                    .first()
+                    is not None
+                ):
+                    db.commit()
+                    return
             lease = current_task_lease() if self.build_id is None else None
             is_legacy_checkpoint = (
                 event_type_str == "system_update_general"
@@ -1080,6 +1185,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     data.get("turn_id") if isinstance(data, dict) else None,
                     self.task_id,
                 )
+                if self.authoritative:
+                    db.commit()
                 return
             if (
                 event_type_str == "system_update_general"

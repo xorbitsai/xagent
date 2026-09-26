@@ -1713,7 +1713,13 @@ async def handle_task_message(
                 )
                 if hasattr(agent_service, "set_outbound_message_handler"):
                     agent_service.set_outbound_message_handler(
-                        task_execution_service.make_agent_outbound_handler(task_id)
+                        task_execution_service.make_agent_outbound_handler(
+                            task_id,
+                            authoritative=getattr(
+                                agent_service.tracer, "records_execution_events", False
+                            )
+                            is True,
+                        )
                     )
                 supports_live_control = getattr(
                     agent_service, "supports_live_control", lambda: False

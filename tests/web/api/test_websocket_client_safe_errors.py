@@ -3269,6 +3269,28 @@ def test_registry_is_bounded_by_lru_eviction(_clean_origins: None) -> None:
         assert origins.resolve("cmd-0", 7) is None  # evicted -> safe discard
 
 
+@pytest.mark.parametrize(
+    ("types", "reassignment", "blocked"),
+    [
+        ('"final_answer_start", "final_answer_error"', "", False),
+        ('"final_answer_start", "error"', "", True),
+        ('"final_answer_start"', 'kind = "error"', True),
+    ],
+)
+def test_assigned_final_answer_envelope_type_narrowing(types, reassignment, blocked):
+    source = f"""
+def create_final_answer_stream_event(event_type, task_id, data):
+    return {{"type": event_type, **data}}
+
+async def send(kind, raw):
+    if kind in {{{types}}}:
+        {reassignment or "pass"}
+        envelope = create_final_answer_stream_event(kind, 1, {{"message": str(raw)}})
+        await manager.broadcast_to_task(envelope, 1)
+"""
+    assert bool(_guard_offenders(source)) is blocked
+
+
 def test_ast_guard_rejects_raw_errors_in_command_replies() -> None:
     result = _scan(
         ast.parse("""

@@ -1725,6 +1725,11 @@ def settle_task_lease_isolated(
                             content=client_error_message,
                             message_type=client_message_type,
                         )
+                    from .task_execution_event_writer import stage_result_fact_no_commit
+
+                    stage_result_fact_no_commit(
+                        settle_db, task, {"error": error_message}
+                    )
                     if get_shared_task_execution_enabled():
                         from .task_runtime_secrets import (
                             delete_runtime_values_no_commit,

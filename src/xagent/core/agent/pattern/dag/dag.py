@@ -13,7 +13,7 @@ from ....task_runtime import (
     normalize_input_modalities,
 )
 from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME
-from ...checkpoint import CheckpointPersistenceError
+from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
@@ -1676,6 +1676,8 @@ class DAGPattern(AgentPattern):
             )
             if interrupted is not None:
                 return interrupted
+            raise
+        except ExecutionEventPersistenceError:
             raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(

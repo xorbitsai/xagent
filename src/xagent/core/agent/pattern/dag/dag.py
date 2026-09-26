@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 from dataclasses import dataclass, replace
@@ -53,6 +54,17 @@ from .plan_generator import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The DAG step whose staged active-step entry is in scope for the checkpoint
+# payload currently being built, or ``None`` outside a step checkpoint.
+#
+# A ``ContextVar`` rather than an attribute because DAG steps run as
+# concurrent asyncio tasks: each task gets its own copy, so a sibling
+# building a payload at the same time sees ``None`` here and therefore only
+# committed state, which is the whole point of the staged/committed split.
+_STAGED_STEP_IN_SCOPE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "dag_staged_step_in_scope", default=None
+)
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 DAG_FAILURE_DELIVERY_TIMEOUT_SECONDS = 30.0
@@ -182,126 +194,60 @@ class _DAGStepRuntime:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        # Snapshot only this step's own entries. Steps run concurrently
-        # (``max_concurrency`` defaults to 4) and the ``await`` below is a
-        # suspension point, so restoring the whole mapping would discard a
-        # sibling step's in-flight progress on failure.
+        # Stage this step's entry, checkpoint, then commit it only once the
+        # write is durable. Steps run concurrently (``max_concurrency``
+        # defaults to 4) and the ``await`` below is a suspension point, so a
+        # sibling can build its own payload while this one is in flight. A
+        # staged entry is visible only to the step that staged it, so the
+        # sibling's durable payload cannot capture state whose checkpoint has
+        # not been accepted yet -- and if this write fails, dropping the
+        # staged entry is a complete rollback.
         #
-        # No deep copy is needed here, which keeps the hot path (~23
-        # checkpoint call sites per step) free of copying cost. That rests on
-        # two properties, both of which are pinned by tests:
-        #
-        # 1. ``_set_active_step_context`` / ``_set_active_step_pattern_state``
-        #    *replace* the dict entry rather than mutating it in place, so the
-        #    previous object survives the write untouched.
-        # 2. ``context.to_dict()`` and ``pattern.get_state()`` snapshot every
-        #    container that some code path mutates in place, so nothing that
-        #    happens after the entry was stored can reach into it. What they
-        #    still hand out by reference is write-once (replaced wholesale,
-        #    never written through) -- both methods document each exemption,
-        #    and the tests in ``test_context.py`` / ``test_react.py`` fail if
-        #    a new shared container appears.
-        #
-        # Together they make holding the previous reference and reassigning it
-        # a complete rollback. If a future change starts mutating one of those
-        # values in place, snapshot it there -- deep-copying the whole entry
-        # here would hide the problem and put the cost on every checkpoint.
+        # Nothing is copied here, which keeps the hot path (~23 checkpoint
+        # call sites per step) free of copying cost: ``context.to_dict()`` and
+        # ``pattern.get_state()`` already snapshot every container that any
+        # code path mutates in place, and what they hand out by reference is
+        # write-once. Both methods document each exemption, and the tests in
+        # ``test_context.py`` / ``test_react.py`` fail if a new shared
+        # container appears.
         was_active = self.step_id in self.dag_pattern.active_step_ids
-        had_context = self.step_id in self.dag_pattern.active_step_contexts
-        context_before = self.dag_pattern.active_step_contexts.get(self.step_id)
-        had_state = self.step_id in self.dag_pattern.active_step_pattern_states
-        state_before = self.dag_pattern.active_step_pattern_states.get(self.step_id)
         step_metadata = {
             "active_step_id": self.step_id,
             "child_label": label,
         }
         if metadata:
             step_metadata.update(metadata)
+        token = _STAGED_STEP_IN_SCOPE.set(self.step_id)
         try:
-            self.dag_pattern._set_active_step_context(self.step_id, context.to_dict())
+            self.dag_pattern._stage_active_step_context(self.step_id, context.to_dict())
             get_state = getattr(pattern, "get_state", None)
             if callable(get_state):
-                self.dag_pattern._set_active_step_pattern_state(
+                self.dag_pattern._stage_active_step_pattern_state(
                     self.step_id,
                     get_state(),
                 )
-            return await self.parent.checkpoint(
+            result = await self.parent.checkpoint(
                 label=f"dag_{label}",
                 context=self.root_context,
                 pattern=self.dag_pattern,
                 status=status,
                 metadata=step_metadata,
             )
-        except BaseException as exc:
-            unrestorable = self._restore_step_snapshot(
-                was_active=was_active,
-                had_context=had_context,
-                context_before=context_before,
-                had_state=had_state,
-                state_before=state_before,
-            )
-            if unrestorable and isinstance(exc, Exception):
-                # The rollback could not fully reinstate the previous entry,
-                # so report a durability failure rather than let the caller
-                # believe the pre-checkpoint state survived. Only ordinary
-                # exceptions are replaced: cancellation, ``SystemExit`` and
-                # ``KeyboardInterrupt`` carry control-flow meaning and must
-                # reach the caller unchanged.
-                raise CheckpointPersistenceError(
-                    "Cannot roll back the DAG step checkpoint for step "
-                    f"{self.step_id!r}: {unrestorable}."
-                ) from exc
+        except BaseException:
+            # The write never landed, so the staged entry must not become
+            # visible to anyone. Only this step's own staging is touched, so a
+            # sibling keeps whatever it committed while this coroutine was
+            # suspended.
+            self.dag_pattern._discard_staged_step(self.step_id)
+            if not was_active:
+                # Nothing in the ``try`` removes a step id, so it can only
+                # have been added by the staging calls above.
+                self.dag_pattern._unmark_step_active(self.step_id)
             raise
-
-    def _restore_step_snapshot(
-        self,
-        *,
-        was_active: bool,
-        had_context: bool,
-        context_before: dict[str, Any] | None,
-        had_state: bool,
-        state_before: dict[str, Any] | None,
-    ) -> str | None:
-        """Undo this step's own active-step writes after a failed checkpoint.
-
-        Only entries keyed by ``self.step_id`` are touched, so a concurrently
-        running step keeps whatever it wrote while this coroutine was
-        suspended on the checkpoint ``await``.
-
-        This never raises, so a problem with one entry cannot leave the others
-        half-restored. It returns ``None`` when the rollback was complete, and
-        otherwise a description of what could not be reinstated, which the
-        caller turns into a durability failure.
-        """
-        unrestorable: list[str] = []
-        if not was_active:
-            # Nothing in the ``try`` removes a step id, so the id can only
-            # have been *added* by the setters. Drop it again.
-            self.dag_pattern.active_step_ids = [
-                step_id
-                for step_id in self.dag_pattern.active_step_ids
-                if step_id != self.step_id
-            ]
-        # A recorded-but-``None`` entry can only come from restored or legacy
-        # persisted state. It must not surface as an ``AssertionError``:
-        # DAGPattern's generic ``except Exception`` would swallow that into a
-        # permanent ``step.status="failed"`` instead of a retryable durability
-        # failure. Drop the key rather than write ``None`` back, so the
-        # mapping keeps its declared ``dict[str, dict[str, Any]]`` shape.
-        if had_context and context_before is not None:
-            self.dag_pattern.active_step_contexts[self.step_id] = context_before
-        else:
-            self.dag_pattern.active_step_contexts.pop(self.step_id, None)
-            if had_context:
-                unrestorable.append("the previous context is missing")
-        if had_state and state_before is not None:
-            self.dag_pattern.active_step_pattern_states[self.step_id] = state_before
-        else:
-            self.dag_pattern.active_step_pattern_states.pop(self.step_id, None)
-            if had_state:
-                unrestorable.append("the previous pattern state is missing")
-        self.dag_pattern._sync_legacy_active_step()
-        return " and ".join(unrestorable) if unrestorable else None
+        finally:
+            _STAGED_STEP_IN_SCOPE.reset(token)
+        self.dag_pattern._commit_staged_step(self.step_id)
+        return result
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         await self.parent.on_tool_start(tool_call=self._with_step(tool_call))
@@ -494,6 +440,12 @@ class DAGPattern(AgentPattern):
         self.active_step_ids: list[str] = []
         self.active_step_pattern_states: dict[str, dict[str, Any]] = {}
         self.active_step_contexts: dict[str, dict[str, Any]] = {}
+        # Uncommitted writes from a step checkpoint that is still in flight.
+        # Never serialized: a staged entry has, by definition, no durable
+        # checkpoint behind it, so it must not reach a payload other than the
+        # one being written for the step that staged it.
+        self._staged_step_pattern_states: dict[str, dict[str, Any]] = {}
+        self._staged_step_contexts: dict[str, dict[str, Any]] = {}
         self.step_results: dict[str, Any] = {}
         # Failed-step observations are evidence only, never dependency results.
         self.failed_step_evidence: dict[str, Any] = {}
@@ -1291,15 +1243,29 @@ class DAGPattern(AgentPattern):
         return None
 
     def get_state(self) -> dict[str, Any]:
+        # The three legacy scalars are resolved here rather than shipped from
+        # the pre-computed attributes. Those attributes are refreshed on every
+        # active-step write, including a staging write, and they keep that
+        # value across the checkpoint ``await``. A root-level payload built
+        # while a sibling step is mid-write would otherwise carry that
+        # sibling's uncommitted state even though the maps beside it are
+        # clean -- and ``load_state`` feeds these scalars back into the
+        # committed maps via ``setdefault``, which would make a rejected
+        # checkpoint durable on resume.
+        contexts = self._payload_step_contexts()
+        states = self._payload_step_pattern_states()
+        head = self.active_step_ids[0] if self.active_step_ids else None
         return {
             "status": self.status,
             "plan": self.plan.to_dict() if self.plan is not None else None,
-            "active_step_id": self.active_step_id,
-            "active_step_pattern_state": self.active_step_pattern_state,
-            "active_step_context": self.active_step_context,
+            "active_step_id": head,
+            "active_step_pattern_state": (
+                states.get(head) if head is not None else None
+            ),
+            "active_step_context": contexts.get(head) if head is not None else None,
             "active_step_ids": list(self.active_step_ids),
-            "active_step_pattern_states": dict(self.active_step_pattern_states),
-            "active_step_contexts": dict(self.active_step_contexts),
+            "active_step_pattern_states": states,
+            "active_step_contexts": contexts,
             "step_results": dict(self.step_results),
             "failed_step_evidence": dict(self.failed_step_evidence),
             "failure_delivery_attempted": self.failure_delivery_attempted,
@@ -1366,6 +1332,11 @@ class DAGPattern(AgentPattern):
         ).to_dict()
 
     def load_state(self, state: dict[str, Any]) -> None:
+        # Staged entries are per-run and never serialized, so a restored
+        # pattern starts from committed state only. Resetting here also keeps
+        # a reused instance from carrying a previous run's staging.
+        self._staged_step_contexts = {}
+        self._staged_step_pattern_states = {}
         self.status = str(state.get("status", "idle"))
         plan_payload = state.get("plan")
         self.plan = (
@@ -2599,6 +2570,46 @@ class DAGPattern(AgentPattern):
         self._mark_step_active(step_id)
         self._sync_legacy_active_step()
 
+    def _stage_active_step_context(
+        self,
+        step_id: str,
+        context: dict[str, Any],
+    ) -> None:
+        self._staged_step_contexts[step_id] = context
+        self._mark_step_active(step_id)
+
+    def _stage_active_step_pattern_state(
+        self,
+        step_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        self._staged_step_pattern_states[step_id] = state
+        self._mark_step_active(step_id)
+
+    def _commit_staged_step(self, step_id: str) -> None:
+        """Promote a step's staged entry after its checkpoint was accepted."""
+        if step_id in self._staged_step_contexts:
+            self.active_step_contexts[step_id] = self._staged_step_contexts.pop(step_id)
+        if step_id in self._staged_step_pattern_states:
+            self.active_step_pattern_states[step_id] = (
+                self._staged_step_pattern_states.pop(step_id)
+            )
+        self._sync_legacy_active_step()
+
+    def _discard_staged_step(self, step_id: str) -> None:
+        """Drop a step's staged entry after its checkpoint failed."""
+        self._staged_step_contexts.pop(step_id, None)
+        self._staged_step_pattern_states.pop(step_id, None)
+        self._sync_legacy_active_step()
+
+    def _unmark_step_active(self, step_id: str) -> None:
+        self.active_step_ids = [
+            active_step_id
+            for active_step_id in self.active_step_ids
+            if active_step_id != step_id
+        ]
+        self._sync_legacy_active_step()
+
     def _clear_active_step(self, step_id: str) -> None:
         self.active_step_ids = [
             active_step_id
@@ -2607,13 +2618,40 @@ class DAGPattern(AgentPattern):
         ]
         self.active_step_contexts.pop(step_id, None)
         self.active_step_pattern_states.pop(step_id, None)
+        self._staged_step_contexts.pop(step_id, None)
+        self._staged_step_pattern_states.pop(step_id, None)
         self._sync_legacy_active_step()
 
     def _clear_all_active_steps(self) -> None:
         self.active_step_ids = []
         self.active_step_contexts = {}
         self.active_step_pattern_states = {}
+        self._staged_step_contexts = {}
+        self._staged_step_pattern_states = {}
         self._sync_legacy_active_step()
+
+    def _payload_step_contexts(self) -> dict[str, dict[str, Any]]:
+        """Active-step contexts as they may be written to a checkpoint.
+
+        Committed entries, plus the staged entry of the step this checkpoint
+        is being written for (if any). A sibling step building its own
+        payload at the same time has no step in scope and therefore sees only
+        committed state, so it cannot durably capture an entry whose own
+        checkpoint has not been accepted.
+        """
+        payload = dict(self.active_step_contexts)
+        step_id = _STAGED_STEP_IN_SCOPE.get()
+        if step_id is not None and step_id in self._staged_step_contexts:
+            payload[step_id] = self._staged_step_contexts[step_id]
+        return payload
+
+    def _payload_step_pattern_states(self) -> dict[str, dict[str, Any]]:
+        """Pattern states as they may be written; see ``_payload_step_contexts``."""
+        payload = dict(self.active_step_pattern_states)
+        step_id = _STAGED_STEP_IN_SCOPE.get()
+        if step_id is not None and step_id in self._staged_step_pattern_states:
+            payload[step_id] = self._staged_step_pattern_states[step_id]
+        return payload
 
     def _sync_legacy_active_step(self) -> None:
         self.active_step_id = self.active_step_ids[0] if self.active_step_ids else None
@@ -2621,10 +2659,27 @@ class DAGPattern(AgentPattern):
             self.active_step_context = None
             self.active_step_pattern_state = None
             return
-        self.active_step_context = self.active_step_contexts.get(self.active_step_id)
-        self.active_step_pattern_state = self.active_step_pattern_states.get(
-            self.active_step_id
-        )
+        # Mirrors the payload view: the staged entry is visible only to the
+        # step that staged it, so these legacy scalars never expose another
+        # step's uncommitted state. Resolved with direct lookups rather than
+        # via the payload helpers -- this runs on every active-step write, and
+        # building the merged maps here would allocate two dicts each time.
+        staged_step_id = _STAGED_STEP_IN_SCOPE.get()
+        in_scope = staged_step_id is not None and staged_step_id == self.active_step_id
+        if in_scope and self.active_step_id in self._staged_step_contexts:
+            self.active_step_context = self._staged_step_contexts[self.active_step_id]
+        else:
+            self.active_step_context = self.active_step_contexts.get(
+                self.active_step_id
+            )
+        if in_scope and self.active_step_id in self._staged_step_pattern_states:
+            self.active_step_pattern_state = self._staged_step_pattern_states[
+                self.active_step_id
+            ]
+        else:
+            self.active_step_pattern_state = self.active_step_pattern_states.get(
+                self.active_step_id
+            )
 
     def _child_frame_id(self, root_execution_id: str, step_id: str | None) -> str:
         return f"{root_execution_id}:dag_step:{step_id or 'unknown'}"

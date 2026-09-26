@@ -212,6 +212,8 @@ def _store_runtime_secret_for_turn(turn_id: str) -> None:
     [
         (TaskStatus.WAITING_FOR_USER, True),
         (TaskStatus.PAUSED, True),
+        (TaskStatus.RUNNING, True),
+        (TaskStatus.PENDING, False),
         (TaskStatus.COMPLETED, False),
         (TaskStatus.FAILED, False),
     ],
@@ -278,6 +280,40 @@ def test_local_runtime_inputs_keep_owner_and_original_expiry(
     monkeypatch.setattr(runtime, "monotonic", lambda: 110.0)
     assert runtime._get_ephemeral_run_values(task) is None
     assert runtime._EPHEMERAL_RUN_VALUES == {}
+
+
+def test_local_runtime_input_bind_purges_previous_run(monkeypatch) -> None:
+    from xagent.web.services import connector_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_EPHEMERAL_RUN_VALUES", {})
+    for run_id in ("old-run", "new-run"):
+        _store_runtime_secret_for_turn(run_id)
+        runtime.bind_ephemeral_runtime_values_to_run(
+            task_id=1, run_id=run_id, user_id=2, turn_id=run_id
+        )
+        pop_ephemeral_runtime_values(run_id)
+
+    assert set(runtime._EPHEMERAL_RUN_VALUES) == {(1, "new-run")}
+
+
+def test_local_runtime_cleanup_sweeps_other_expired_entries(monkeypatch) -> None:
+    from xagent.web.services import connector_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_EPHEMERAL_RUN_VALUES", {})
+    monkeypatch.setenv("XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS", "10")
+    for task_id, now in ((1, 100.0), (2, 105.0)):
+        monkeypatch.setattr(runtime, "monotonic", lambda: now)
+        _store_runtime_secret_for_turn("sweep-inputs")
+        runtime.bind_ephemeral_runtime_values_to_run(
+            task_id=task_id, run_id="run", user_id=3, turn_id="sweep-inputs"
+        )
+        pop_ephemeral_runtime_values("sweep-inputs")
+
+    monkeypatch.setattr(runtime, "monotonic", lambda: 110.0)
+    # Even cleanup for a task with no retained inputs sweeps other expired
+    # records, including entries whose task was deleted while waiting.
+    runtime.clean_ephemeral_runtime_values_for_run(task_id=99, run_id="other")
+    assert set(runtime._EPHEMERAL_RUN_VALUES) == {(2, "run")}
 
 
 @pytest.mark.asyncio
@@ -3930,6 +3966,35 @@ def _spawn_finalize_runner(task, user, payload, **schedule_kwargs):
         context=None,
         **schedule_kwargs,
     )
+
+
+@pytest.mark.asyncio
+async def test_shared_scheduler_skips_local_runtime_input_store(
+    db_session, monkeypatch
+) -> None:
+    user, task, payload, lease = _finalize_turn_fixture(
+        db_session, turn_id="shared-runtime-inputs"
+    )
+    monkeypatch.setattr(
+        task_orchestrator_module, "get_shared_task_execution_enabled", lambda: True
+    )
+    with (
+        _finalize_runner_patches(lease, settle=MagicMock(return_value=True)),
+        patch(
+            "xagent.web.services.connector_runtime.bind_ephemeral_runtime_values_to_run"
+        ) as bind,
+        patch(
+            "xagent.web.services.connector_runtime.clean_ephemeral_runtime_values_for_run"
+        ) as clean,
+        patch(
+            "xagent.web.services.task_runtime_secrets.clean_finished_runtime_values"
+        ) as shared_clean,
+    ):
+        await _spawn_finalize_runner(task, user, payload, run_id=lease.run_id)
+
+    bind.assert_not_called()
+    clean.assert_not_called()
+    shared_clean.assert_called_once_with(task_id=int(task.id), run_id=lease.run_id)
 
 
 @pytest.mark.asyncio

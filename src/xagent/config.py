@@ -835,13 +835,14 @@ def get_channel_ingress_enabled() -> bool:
 
 
 def validate_task_execution_host_config() -> None:
-    """Reject incomplete shared deployments before accepting tasks."""
+    """Reject invalid execution configuration before accepting tasks."""
     role = get_task_execution_role()
     if not get_shared_task_execution_enabled():
         if role != "combined":
             raise ValueError(
                 f"{TASK_EXECUTION_ROLE}={role} requires {SHARED_TASK_EXECUTION_ENABLED}"
             )
+        get_task_runtime_secrets_ttl_seconds()
         return
     if not get_redis_url():
         raise ValueError(f"{SHARED_TASK_EXECUTION_ENABLED} requires {REDIS_URL}")

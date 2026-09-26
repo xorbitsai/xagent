@@ -1667,6 +1667,7 @@ def test_react_authorization_guidance_preserves_interaction_policy(
         0
     ]["content"]
 
+    assert "If a tool reports missing or expired authorization" in prompt
     assert "generic HTTP tool does not restore access" in prompt
     assert "retry only after a relevant authorization or configuration change" in prompt
     assert "Never ask the user to paste passwords, API keys, or access tokens" in prompt

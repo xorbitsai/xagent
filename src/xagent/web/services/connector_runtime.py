@@ -150,6 +150,9 @@ class _ConnectorRuntimeResolverRegistration:
 # when the create/append request and the worker that consumes the turn run in
 # the same process. Multi-worker deployments should provide ephemeral secrets
 # through the resolver hook or a deployment-owned distributed secret store.
+# Accepted raw inputs are retained per task/run across replies, until terminal
+# or replaced. TTL expiry is checked lazily on bind, read, and cleanup; resolved
+# connector views and resolver results are not retained in this store.
 _EPHEMERAL_RUNTIME_VALUES: dict[str, dict[str, Any]] = {}
 _EPHEMERAL_RUNTIME_MANIFESTS: dict[str, dict[str, dict[str, set[str]]]] = {}
 _EPHEMERAL_RUNTIME_VALUES_LOCK = RLock()
@@ -188,11 +191,15 @@ def bind_ephemeral_runtime_values_to_run(
 
 
 def clean_ephemeral_runtime_values_for_run(*, task_id: int, run_id: str) -> None:
-    """Drop terminal/replaced runs; waiting and paused runs retain their inputs."""
+    """Drop terminal/replaced runs and sweep expired local inputs."""
     from ..models.database import get_session_local
 
     key = (task_id, run_id)
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        now = monotonic()
+        for expired_key, candidate in list(_EPHEMERAL_RUN_VALUES.items()):
+            if candidate.expires_at <= now:
+                del _EPHEMERAL_RUN_VALUES[expired_key]
         if key not in _EPHEMERAL_RUN_VALUES:
             return
     with get_session_local()() as db:
@@ -200,7 +207,11 @@ def clean_ephemeral_runtime_values_for_run(*, task_id: int, run_id: str) -> None
         retain = (
             task is not None
             and task.run_id == run_id
-            and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            # Settlement releases the lease before this cleanup. A reply may
+            # already have reclaimed the same run, so RUNNING must retain its
+            # inputs too; a run id cannot distinguish those acquisitions.
+            and task.status
+            in (TaskStatus.RUNNING, TaskStatus.WAITING_FOR_USER, TaskStatus.PAUSED)
         )
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
         entry = _EPHEMERAL_RUN_VALUES.get(key)

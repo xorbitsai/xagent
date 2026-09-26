@@ -3027,6 +3027,15 @@ def test_default_task_execution_host_configuration_is_self_contained(monkeypatch
     config.validate_task_execution_host_config()
 
 
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_local_host_rejects_invalid_runtime_secret_ttl_at_startup(monkeypatch, value):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "false")
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, "combined")
+    monkeypatch.setenv(config.TASK_RUNTIME_SECRETS_TTL_SECONDS, value)
+    with pytest.raises(ValueError):
+        config.validate_task_execution_host_config()
+
+
 @pytest.mark.parametrize("value", ["", " ", "deployment/channel"])
 def test_task_event_channel_prefix_rejects_invalid_namespace(monkeypatch, value):
     monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, value)

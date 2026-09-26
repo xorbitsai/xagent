@@ -1,5 +1,7 @@
+import errno
 import json
 import time
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -14,11 +16,14 @@ def _credentials(monkeypatch):
     # building — this just guards against a stray, unmocked call blowing up
     # with a confusing "missing env var" error instead of the actual assertion.
     monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "access-token")
+    monkeypatch.setattr(google_slides, "_CREATED_DEFAULT_SLIDES", {})
 
 
 def _mock_slides_service(monkeypatch, presentations_mock):
     service = Mock()
     service.presentations.return_value = presentations_mock
+    if not isinstance(presentations_mock.get.return_value.execute.return_value, dict):
+        presentations_mock.get.return_value.execute.return_value = {"slides": []}
     monkeypatch.setattr(google_slides, "get_slides_service", lambda: service)
     return service
 
@@ -50,6 +55,20 @@ def _mock_presentation_get(presentations_mock, slide_id, elements):
     presentations_mock.get.return_value.execute.return_value = {
         "slides": [{"objectId": slide_id, "pageElements": elements}]
     }
+
+
+def _mock_pptx_text(monkeypatch, *slide_texts, has_content=None):
+    content_flags = (
+        list(has_content)
+        if has_content is not None
+        else [bool(text.strip()) for text in slide_texts]
+    )
+    assert len(content_flags) == len(slide_texts)
+    monkeypatch.setattr(
+        google_slides,
+        "_extract_pptx_slide_content",
+        lambda _file_path: list(zip(slide_texts, content_flags, strict=True)),
+    )
 
 
 def test_add_slide_default_layout_creates_title_and_body_with_bullets(monkeypatch):
@@ -1628,6 +1647,7 @@ def test_create_presentation_returns_link_and_id(monkeypatch):
     presentations.create.return_value.execute.return_value = {
         "presentationId": "pres1",
         "title": "New Deck",
+        "slides": [{"objectId": "p", "pageElements": []}],
     }
     _mock_slides_service(monkeypatch, presentations)
 
@@ -1636,6 +1656,557 @@ def test_create_presentation_returns_link_and_id(monkeypatch):
     assert result["status"] == "success"
     assert result["presentation_id"] == "pres1"
     assert result["link"] == "https://docs.google.com/presentation/d/pres1/edit"
+    assert result["slide_count"] == 1
+    assert result["default_slide_id"] == "p"
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_create_presentation_reads_initial_slide_when_create_omits_slides(monkeypatch):
+    presentations = Mock()
+    presentations.create.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "New Deck",
+    }
+    _mock_slides_service(monkeypatch, presentations)
+    presentations.get.return_value.execute.return_value = {
+        "slides": [{"objectId": "p", "pageElements": []}]
+    }
+
+    result = json.loads(google_slides.google_slides_create_presentation("New Deck"))
+
+    assert result["status"] == "success"
+    assert result["slide_count"] == 1
+    assert result["default_slide_id"] == "p"
+    assert presentations.get.call_count == 1
+
+
+def test_create_presentation_does_not_delete_nonempty_initial_slide(monkeypatch):
+    presentations = Mock()
+    presentations.create.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "New Deck",
+        "slides": [
+            {
+                "objectId": "p",
+                "pageElements": [
+                    _placeholder_element("p_title", "CENTERED_TITLE", "Existing")
+                ],
+            }
+        ],
+    }
+    presentations.get.return_value.execute.return_value = {
+        "slides": presentations.create.return_value.execute.return_value["slides"]
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_create_presentation("New Deck"))
+
+    assert result["status"] == "success"
+    assert result["slide_count"] == 1
+    presentations.batchUpdate.assert_not_called()
+
+
+def test_add_slide_removes_default_blank_slide_in_same_batch(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [{"objectId": "p", "pageElements": []}]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="Title", body="Detail", default_slide_id="p"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is True
+    requests = _batch_update_requests(presentations)
+    assert "createSlide" in requests[0]
+    assert requests[-1] == {"deleteObject": {"objectId": "p"}}
+
+
+def test_add_slide_removes_default_slide_across_mcp_processes(monkeypatch):
+    presentations = Mock()
+    presentations.create.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "New Deck",
+        "slides": [{"objectId": "p", "pageElements": []}],
+    }
+    presentations.get.return_value.execute.return_value = {
+        "slides": [{"objectId": "p", "pageElements": []}]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    created = json.loads(google_slides.google_slides_create_presentation("New Deck"))
+    google_slides._CREATED_DEFAULT_SLIDES.clear()
+    added = json.loads(
+        google_slides.google_slides_add_slide(
+            created["presentation_id"], title="Title", body="Detail"
+        )
+    )
+
+    assert added["default_slide_removed"] is True
+    assert _batch_update_requests(presentations)[-1] == {
+        "deleteObject": {"objectId": "p"}
+    }
+
+
+def test_add_slide_removes_known_default_slide_when_other_slides_exist(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [
+            {"objectId": "p", "pageElements": []},
+            {
+                "objectId": "existing-content",
+                "pageElements": [
+                    _placeholder_element("existing-title", "TITLE", "Existing")
+                ],
+            },
+        ]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="Title", body="Detail", default_slide_id="p"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is True
+    assert _batch_update_requests(presentations)[-1] == {
+        "deleteObject": {"objectId": "p"}
+    }
+
+
+def test_add_slide_removes_first_blank_slide_without_id_after_other_slide_added(
+    monkeypatch,
+):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [
+            {"objectId": "p", "pageElements": []},
+            {
+                "objectId": "existing-content",
+                "pageElements": [
+                    _placeholder_element("existing-title", "TITLE", "Existing")
+                ],
+            },
+        ]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="Title", body="Detail")
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is True
+    assert _batch_update_requests(presentations)[-1] == {
+        "deleteObject": {"objectId": "p"}
+    }
+
+
+def test_add_slide_keeps_untracked_intentional_blank_slide(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [{"objectId": "intentional-blank", "pageElements": []}]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1",
+            title="Title",
+            body="Detail",
+            preserve_blank_slide=True,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is False
+    requests = _batch_update_requests(presentations)
+    assert not any("deleteObject" in request for request in requests)
+
+
+def test_add_slide_keeps_image_only_existing_slide(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [
+            {
+                "objectId": "image-slide",
+                "pageElements": [
+                    {"image": {"contentUrl": "https://example.com/a.png"}}
+                ],
+            }
+        ]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="Title", body="Detail")
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is False
+    requests = _batch_update_requests(presentations)
+    assert not any("deleteObject" in request for request in requests)
+
+
+def test_import_pptx_converts_and_verifies_native_google_slides(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "designed-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "Title")
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Designed Deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "webViewLink": "https://docs.google.com/presentation/d/pres1/edit",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Designed Deck",
+        "slides": [
+            {
+                "objectId": "slide1",
+                "pageElements": [
+                    {
+                        "shape": {
+                            "text": {
+                                "textElements": [{"textRun": {"content": "Title\n"}}]
+                            }
+                        }
+                    }
+                ],
+            }
+        ],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_import_pptx(str(pptx_path), title="Designed Deck")
+    )
+
+    assert result["status"] == "success"
+    assert result["presentation_id"] == "pres1"
+    assert result["slide_count"] == 1
+    request = drive.files.return_value.create.call_args.kwargs
+    assert request["body"]["mimeType"] == "application/vnd.google-apps.presentation"
+    assert request["media_body"]._mimetype == (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    )
+
+
+def test_extract_pptx_slide_text_reads_title_and_body(tmp_path):
+    from pptx import Presentation
+
+    pptx_path = tmp_path / "designed-deck.pptx"
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+    slide.shapes.title.text = "Title"
+    slide.placeholders[1].text = "Detail one\nDetail two"
+    presentation.save(pptx_path)
+
+    assert google_slides._extract_pptx_slide_text(pptx_path) == [
+        "Title Detail one Detail two"
+    ]
+
+
+def test_import_pptx_resolves_relative_generated_file_from_allowed_root(
+    monkeypatch, tmp_path
+):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    pptx_path = output_dir / "designed-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "Title")
+    unrelated_dir = tmp_path / "unrelated"
+    unrelated_dir.mkdir()
+    monkeypatch.chdir(unrelated_dir)
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Designed Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Designed Deck",
+        "slides": [
+            {
+                "objectId": "slide1",
+                "pageElements": [
+                    {
+                        "shape": {
+                            "text": {
+                                "textElements": [{"textRun": {"content": "Title\n"}}]
+                            }
+                        }
+                    }
+                ],
+            }
+        ],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_import_pptx("output/designed-deck.pptx")
+    )
+
+    assert result["status"] == "success"
+    assert drive.files.return_value.create.call_args.kwargs[
+        "media_body"
+    ]._fd.name == str(pptx_path)
+
+
+def test_import_pptx_rejects_missing_text_after_conversion(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "designed-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "Title Detail")
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Designed Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Designed Deck",
+        "slides": [
+            {
+                "objectId": "slide1",
+                "pageElements": [
+                    {
+                        "shape": {
+                            "text": {
+                                "textElements": [{"textRun": {"content": "Title\n"}}]
+                            }
+                        }
+                    }
+                ],
+            }
+        ],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_import_pptx(str(pptx_path)))
+
+    assert result["status"] == "validation_failed"
+    assert result["empty_slide_numbers"] == []
+    assert result["missing_text_slide_numbers"] == [1]
+
+
+def test_import_pptx_rejects_empty_slide_after_conversion(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "designed-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "Title")
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Designed Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Designed Deck",
+        "slides": [{"objectId": "slide1", "pageElements": []}],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_import_pptx(str(pptx_path)))
+
+    assert result["status"] == "validation_failed"
+    assert result["empty_slide_numbers"] == [1]
+    drive.files.return_value.delete.assert_called_once_with(
+        fileId="pres1", supportsAllDrives=True
+    )
+
+
+def test_element_text_reads_grouped_shapes():
+    element = {
+        "elementGroup": {
+            "children": [
+                {
+                    "shape": {
+                        "text": {
+                            "textElements": [{"textRun": {"content": "Grouped text"}}]
+                        }
+                    }
+                }
+            ]
+        }
+    }
+
+    assert google_slides._element_text(element) == "Grouped text"
+
+
+def test_import_pptx_allows_intentional_blank_source_slide(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "blank-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "")
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Blank Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Blank Deck",
+        "slides": [{"objectId": "slide1", "pageElements": []}],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_import_pptx(str(pptx_path)))
+
+    assert result["status"] == "success"
+
+
+def test_import_pptx_allows_image_only_slide_after_conversion(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "designed-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "")
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Designed Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Designed Deck",
+        "slides": [
+            {
+                "objectId": "slide1",
+                "pageElements": [
+                    {"image": {"contentUrl": "https://example.com/a.png"}}
+                ],
+            }
+        ],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_import_pptx(str(pptx_path)))
+
+    assert result["status"] == "success"
+    assert result["empty_slide_numbers"] == []
+
+
+def test_import_pptx_rejects_dropped_visual_only_slide(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "visual-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "", has_content=[True])
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Visual Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Visual Deck",
+        "slides": [{"objectId": "slide1", "pageElements": []}],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_import_pptx(str(pptx_path)))
+
+    assert result["status"] == "validation_failed"
+    assert result["empty_slide_numbers"] == [1]
+    drive.files.return_value.delete.assert_called_once_with(
+        fileId="pres1", supportsAllDrives=True
+    )
+
+
+def test_import_pptx_rejects_conversion_with_no_slides(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "designed-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch)
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Designed Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Designed Deck",
+        "slides": [],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_import_pptx(str(pptx_path)))
+
+    assert result["status"] == "validation_failed"
+    assert result["slide_count"] == 0
+    assert result["empty_slide_numbers"] == []
+
+
+def test_import_pptx_rejects_path_outside_allowlist(monkeypatch, tmp_path):
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    result = json.loads(
+        google_slides.google_slides_import_pptx("/private/tmp/not-allowed.pptx")
+    )
+
+    assert result["status"] == "error"
+    assert "outside the allowed directories" in result["message"]
+
+
+def test_resolve_pptx_upload_path_surfaces_symlink_loop(monkeypatch, tmp_path):
+    monkeypatch.setattr(google_slides, "allowed_dirs_from_env", lambda _: [tmp_path])
+    loop_path = tmp_path / "loop.pptx"
+    loop_path.symlink_to(loop_path)
+
+    def _raise_symlink_loop(_path):
+        raise RuntimeError("symlink loop")
+
+    monkeypatch.setattr(Path, "resolve", _raise_symlink_loop)
+
+    with pytest.raises(OSError) as exc_info:
+        google_slides._resolve_pptx_upload_path(str(loop_path))
+    assert exc_info.value.errno == errno.ELOOP
 
 
 def test_create_presentation_returns_error_payload_on_api_failure(monkeypatch):

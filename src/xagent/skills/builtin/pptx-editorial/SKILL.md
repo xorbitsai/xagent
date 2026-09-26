@@ -5,7 +5,7 @@ description: |
   "投资人路演 PPT", "美观 PPT", board review, product launch. Named palettes,
   fixed typography, 10 numbered layouts.
 when_to_use: |
-  A polished .pptx that must open in PowerPoint / Keynote / Google Slides.
+  A polished .pptx or Google Slides deck that must preserve visual design.
   Prefer over presentation-generator when visual quality matters; use
   html-deck-editorial when the user wants HTML output.
 tags:
@@ -22,6 +22,12 @@ You will generate one `.pptx` file by writing a JavaScript program that uses
 **pptxgenjs** and runs it via the `execute_javascript_code` tool. Save the file
 to the workspace (use the output dir the tool returns), then report the path
 and a 1-line layout summary.
+
+When the requested deliverable is Google Slides, import the validated PPTX with
+`google_slides_import_pptx` and then verify it with
+`google_slides_get_presentation`. If the import returns `validation_failed`,
+repair the PPTX instead of delivering the link. Do not use the native Google Slides
+title/body placeholder tools to create a new designed deck.
 
 ## ⚠️ Hard rules — NO exceptions
 

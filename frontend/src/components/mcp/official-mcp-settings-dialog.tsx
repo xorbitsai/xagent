@@ -9,6 +9,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 
 import type { AppIntegration } from "./types"
+import { GoogleDrivePickerButton } from "./google-drive-picker-button"
 
 export type { AppIntegration }
 
@@ -251,6 +252,15 @@ export function OfficialMcpSettingsDialog({
           </p>
 
           <div className="flex flex-col items-center justify-center gap-3 w-full">
+            {isGloballyConnected && app.id === "google-drive" && (
+              <GoogleDrivePickerButton
+                connectedAccount={app.connected_account}
+                // Radix's modal focus trap/pointer lock can interfere with
+                // Picker's iframe, which is mounted outside DialogContent.
+                // Close this settings dialog before the browser Picker opens.
+                onBeforeOpen={() => onOpenChange(false)}
+              />
+            )}
             {!isGloballyConnected && (
               <Button
                 className="w-full max-w-[200px] rounded-full h-11 font-medium bg-blue-600 text-white hover:bg-blue-700"

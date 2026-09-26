@@ -2,9 +2,10 @@
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
@@ -27,6 +28,29 @@ cloud_router = APIRouter(prefix="/api/cloud", tags=["Cloud Storage"])
 
 # Google OAuth Constants
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+GOOGLE_DRIVE_SCOPE_PREFIX = "https://www.googleapis.com/auth/drive"
+
+
+def _google_credentials_expiry(value: datetime | None) -> datetime | None:
+    """Return the naive UTC datetime required by google-auth.
+
+    ``UserOAuth.expires_at`` is timezone-aware on PostgreSQL but google-auth
+    compares ``Credentials.expiry`` with a naive UTC value.  Normalize here so
+    expired Drive tokens refresh before they are handed to the API or Picker.
+    """
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _google_database_expiry(value: datetime | None) -> datetime | None:
+    """Return an aware UTC datetime for ``UserOAuth.expires_at``."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
@@ -88,16 +112,28 @@ def get_google_credentials(
         client_id=client_id,
         client_secret=client_secret,
         scopes=oauth_account.scope.split(" ") if oauth_account.scope else None,
+        expiry=_google_credentials_expiry(
+            cast("datetime | None", oauth_account.expires_at)
+        ),
     )
 
     # Check if token needs refresh
-    if creds.expired and creds.refresh_token:
+    if creds.expired:
+        if not creds.refresh_token:
+            raise HTTPException(
+                status_code=401,
+                detail="Google Drive session expired. Please reconnect.",
+            )
         try:
             creds.refresh(Request())
             # Update token in DB
             setattr(oauth_account, "access_token", creds.token)
             if creds.expiry:
-                oauth_account.expires_at = creds.expiry
+                setattr(
+                    oauth_account,
+                    "expires_at",
+                    _google_database_expiry(creds.expiry),
+                )
             db.commit()
         except Exception as e:
             logger.error(f"Failed to refresh Google token: {e}")
@@ -138,6 +174,68 @@ async def list_connected_accounts(
         }
         for acc in accounts
     ]
+
+
+@cloud_router.get("/google-drive/picker-config")
+async def get_google_drive_picker_config(
+    response: Response,
+    account_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, str]:
+    """Return the short-lived credentials needed by Google's file picker.
+
+    ``drive.file`` deliberately exposes only files selected in Picker (or
+    created by the app).  The browser therefore needs a Picker access token
+    before the Drive browser can operate on an existing file or folder.  The
+    refresh token and client secret never leave the server; the returned access
+    token is scoped to the authenticated user and expires normally.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    creds = get_google_credentials(cast(int, user.id), db, account_id)
+    granted_scopes = set(creds.scopes or ())
+    drive_scopes = {
+        scope for scope in granted_scopes if scope.startswith(GOOGLE_DRIVE_SCOPE_PREFIX)
+    }
+    if drive_scopes != {GOOGLE_DRIVE_FILE_SCOPE}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Google Drive connection uses an outdated permission. "
+                "Reconnect it before opening Google Drive Picker."
+            ),
+        )
+    client_id, _ = get_google_oauth_config(db)
+    client_id = client_id or os.environ.get("GOOGLE_CLIENT_ID")
+
+    # Picker keys are browser-facing and must be a dedicated, referrer-
+    # restricted key.  GOOGLE_API_KEY is also used for server-side Gemini and
+    # Custom Search calls, so returning it here would expose a billable
+    # operator credential to every authenticated Drive user.
+    developer_key = os.environ.get("GOOGLE_PICKER_API_KEY", "").strip()
+    picker_app_id = os.environ.get("GOOGLE_PICKER_APP_ID", "").strip()
+    if not picker_app_id and client_id:
+        # Google OAuth client IDs start with the numeric Cloud project number.
+        # Keep this as a fallback for existing deployments; an explicit
+        # GOOGLE_PICKER_APP_ID remains preferred because it is unambiguous.
+        candidate = client_id.split("-", 1)[0]
+        if candidate.isdigit():
+            picker_app_id = candidate
+
+    if not developer_key or not picker_app_id:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Google Drive Picker is not configured. Set "
+                "GOOGLE_PICKER_API_KEY and GOOGLE_PICKER_APP_ID."
+            ),
+        )
+
+    return {
+        "access_token": str(creds.token),
+        "developer_key": developer_key,
+        "app_id": picker_app_id,
+    }
 
 
 @cloud_router.delete("/accounts/{account_id}")
@@ -252,8 +350,7 @@ async def list_google_drive_files(
                 q=query,
                 pageSize=100,
                 fields=(
-                    "nextPageToken, "
-                    "files(id, name, mimeType, size, modifiedTime, resourceKey)"
+                    "nextPageToken, files(id, name, mimeType, size, modifiedTime, resourceKey)"
                 ),
                 orderBy="folder,name",
                 supportsAllDrives=supports_all_drives,

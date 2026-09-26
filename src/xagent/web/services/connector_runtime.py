@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Collection
+from copy import deepcopy
 from dataclasses import dataclass
 from threading import RLock
+from time import monotonic
 from typing import Any, Iterable, cast
 
 from sqlalchemy import Text
@@ -22,7 +24,10 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...config import get_shared_task_execution_enabled
+from ...config import (
+    get_shared_task_execution_enabled,
+    get_task_runtime_secrets_ttl_seconds,
+)
 from ...core.tools.adapters.vibe.connector_runtime import (
     CONNECTOR_TYPE_CUSTOM_API,
     CONNECTOR_TYPE_MCP,
@@ -51,7 +56,7 @@ from ...core.tools.adapters.vibe.selection_spec import (
 from ..models.agent import Agent
 from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.mcp import MCPServer, UserMCPServer
-from ..models.task import Task, TaskConnectorRuntimeContext
+from ..models.task import Task, TaskConnectorRuntimeContext, TaskStatus
 from ..schemas.connector_runtime import (
     ConnectorRuntimeConnectorModel,
     ConnectorRuntimeInputModel,
@@ -141,7 +146,7 @@ class _ConnectorRuntimeResolverRegistration:
     task_sources: frozenset[str] | None
 
 
-# The default OSS store is process-local and single-turn: it is only reliable
+# The default OSS store is process-local: it is only reliable
 # when the create/append request and the worker that consumes the turn run in
 # the same process. Multi-worker deployments should provide ephemeral secrets
 # through the resolver hook or a deployment-owned distributed secret store.
@@ -149,6 +154,72 @@ _EPHEMERAL_RUNTIME_VALUES: dict[str, dict[str, Any]] = {}
 _EPHEMERAL_RUNTIME_MANIFESTS: dict[str, dict[str, dict[str, set[str]]]] = {}
 _EPHEMERAL_RUNTIME_VALUES_LOCK = RLock()
 _RUNTIME_RESOLVER_REGISTRATION: _ConnectorRuntimeResolverRegistration | None = None
+
+
+@dataclass(repr=False)
+class _EphemeralRunValues:
+    user_id: int
+    expires_at: float
+    values: dict[str, Any]
+    manifest: dict[str, dict[str, set[str]]]
+
+
+_EPHEMERAL_RUN_VALUES: dict[tuple[int, str], _EphemeralRunValues] = {}
+
+
+def bind_ephemeral_runtime_values_to_run(
+    *, task_id: int, run_id: str, user_id: int, turn_id: str
+) -> None:
+    """Retain accepted local inputs for replies within this exact run only."""
+    with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        now = monotonic()
+        for key, entry in list(_EPHEMERAL_RUN_VALUES.items()):
+            if entry.expires_at <= now or (key[0] == task_id and key[1] != run_id):
+                del _EPHEMERAL_RUN_VALUES[key]
+        key = (task_id, run_id)
+        values = _EPHEMERAL_RUNTIME_VALUES.get(turn_id)
+        if values is not None and key not in _EPHEMERAL_RUN_VALUES:
+            _EPHEMERAL_RUN_VALUES[key] = _EphemeralRunValues(
+                user_id=user_id,
+                expires_at=now + get_task_runtime_secrets_ttl_seconds(),
+                values=deepcopy(values),
+                manifest=deepcopy(_EPHEMERAL_RUNTIME_MANIFESTS.get(turn_id, {})),
+            )
+
+
+def clean_ephemeral_runtime_values_for_run(*, task_id: int, run_id: str) -> None:
+    """Drop terminal/replaced runs; waiting and paused runs retain their inputs."""
+    from ..models.database import get_session_local
+
+    key = (task_id, run_id)
+    with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        if key not in _EPHEMERAL_RUN_VALUES:
+            return
+    with get_session_local()() as db:
+        task = db.get(Task, task_id)
+        retain = (
+            task is not None
+            and task.run_id == run_id
+            and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+        )
+    with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        entry = _EPHEMERAL_RUN_VALUES.get(key)
+        if entry is not None and (not retain or entry.expires_at <= monotonic()):
+            del _EPHEMERAL_RUN_VALUES[key]
+
+
+def _get_ephemeral_run_values(task: Task) -> _EphemeralRunValues | None:
+    if task.run_id is None:
+        return None
+    with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        key = (int(task.id), str(task.run_id))
+        entry = _EPHEMERAL_RUN_VALUES.get(key)
+        if entry is not None:
+            if entry.expires_at <= monotonic():
+                del _EPHEMERAL_RUN_VALUES[key]
+            elif entry.user_id == task.user_id:
+                return deepcopy(entry)
+    return None
 
 
 def set_connector_runtime_resolver(
@@ -315,6 +386,14 @@ def load_connector_runtime_view(
             if ephemeral_by_ref is not None
             else None
         )
+    elif ephemeral_by_ref is None:
+        # Reply IDs identify transcript turns, not new credential submissions.
+        # Only raw accepted inputs survive; visibility and resolver output are
+        # still recomputed below for the current reply.
+        run_values = _get_ephemeral_run_values(task)
+        if run_values is not None:
+            ephemeral_by_ref = run_values.values
+            ephemeral_manifest = run_values.manifest
     visible = _load_visible_runtime_connectors(
         db, user_id=task_owner_user_id, agent_team_id=agent_team_id
     )

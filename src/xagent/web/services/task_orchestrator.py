@@ -2124,6 +2124,17 @@ def _schedule_bg(
                         return
 
                 async def execute_owned_run() -> None:
+                    if not get_shared_task_execution_enabled() and lease.run_id:
+                        from .connector_runtime import (
+                            bind_ephemeral_runtime_values_to_run,
+                        )
+
+                        bind_ephemeral_runtime_values_to_run(
+                            task_id=task_id,
+                            run_id=lease.run_id,
+                            user_id=task_owner_user_id,
+                            turn_id=payload.turn_id,
+                        )
                     # Snapshot and scope resolution each own a short Session in a
                     # worker. Drain either worker if cancellation arrives so final
                     # settlement never races an abandoned pool checkout.
@@ -2447,6 +2458,17 @@ def _schedule_bg(
 
                 if turn_id is not None:
                     pop_ephemeral_runtime_values(turn_id)
+                if not get_shared_task_execution_enabled() and lease and lease.run_id:
+                    from .connector_runtime import (
+                        clean_ephemeral_runtime_values_for_run,
+                    )
+
+                    cleanup_run_id = lease.run_id
+                    await run_db_io_cancellation_safe(
+                        lambda: clean_ephemeral_runtime_values_for_run(
+                            task_id=task_id, run_id=cleanup_run_id
+                        )
+                    )
                 if get_shared_task_execution_enabled():
                     from .task_runtime_secrets import clean_finished_runtime_values
 

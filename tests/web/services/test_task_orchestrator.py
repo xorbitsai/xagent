@@ -207,6 +207,268 @@ def _store_runtime_secret_for_turn(turn_id: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("status", "retain"),
+    [
+        (TaskStatus.WAITING_FOR_USER, True),
+        (TaskStatus.PAUSED, True),
+        (TaskStatus.COMPLETED, False),
+        (TaskStatus.FAILED, False),
+    ],
+)
+def test_local_runtime_inputs_follow_run_lifecycle(
+    db_session, monkeypatch, status, retain
+) -> None:
+    from xagent.web.services import connector_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_EPHEMERAL_RUN_VALUES", {})
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=status)
+    task.run_id = "accepted-run"
+    db_session.commit()
+    turn_id = "lifecycle-inputs"
+    _store_runtime_secret_for_turn(turn_id)
+    runtime.bind_ephemeral_runtime_values_to_run(
+        task_id=int(task.id), run_id=task.run_id, user_id=int(user.id), turn_id=turn_id
+    )
+    pop_ephemeral_runtime_values(turn_id)
+
+    runtime.clean_ephemeral_runtime_values_for_run(
+        task_id=int(task.id), run_id=task.run_id
+    )
+
+    assert (runtime._get_ephemeral_run_values(task) is not None) is retain
+    # A replacement run must not see the old inputs, even before its cleanup.
+    task.run_id = "replacement-run"
+    db_session.commit()
+    assert runtime._get_ephemeral_run_values(task) is None
+    runtime.clean_ephemeral_runtime_values_for_run(
+        task_id=int(task.id), run_id="accepted-run"
+    )
+    assert runtime._EPHEMERAL_RUN_VALUES == {}
+
+
+def test_local_runtime_inputs_keep_owner_and_original_expiry(
+    db_session, monkeypatch
+) -> None:
+    from xagent.web.services import connector_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_EPHEMERAL_RUN_VALUES", {})
+    monkeypatch.setattr(runtime, "monotonic", lambda: 100.0)
+    monkeypatch.setenv("XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS", "10")
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id), status=TaskStatus.WAITING_FOR_USER)
+    task.run_id = "accepted-run"
+    db_session.commit()
+    turn_id = "expiry-inputs"
+    _store_runtime_secret_for_turn(turn_id)
+    runtime.bind_ephemeral_runtime_values_to_run(
+        task_id=int(task.id), run_id=task.run_id, user_id=int(user.id), turn_id=turn_id
+    )
+    pop_ephemeral_runtime_values(turn_id)
+    assert runtime._get_ephemeral_run_values(task) is not None
+    task.user_id = int(user.id) + 1
+    assert runtime._get_ephemeral_run_values(task) is None
+    task.user_id = int(user.id)
+    monkeypatch.setattr(runtime, "monotonic", lambda: 109.0)
+    runtime.bind_ephemeral_runtime_values_to_run(
+        task_id=int(task.id), run_id=task.run_id, user_id=int(user.id), turn_id="reply"
+    )
+    assert runtime._get_ephemeral_run_values(task) is not None
+    monkeypatch.setattr(runtime, "monotonic", lambda: 110.0)
+    assert runtime._get_ephemeral_run_values(task) is None
+    assert runtime._EPHEMERAL_RUN_VALUES == {}
+
+
+@pytest.mark.asyncio
+async def test_waiting_reply_refreshes_cached_runner_with_required_runtime_inputs(
+    db_session, monkeypatch, tmp_path
+) -> None:
+    from tests.core.agent.test_execution_adapter import (
+        FakeLLM,
+        FakeTool,
+        TracerCheckpointStore,
+    )
+    from xagent.core.agent.service import AgentService
+    from xagent.web.models.custom_api import CustomApi, UserCustomApi
+    from xagent.web.services import connector_runtime
+    from xagent.web.services.agent_service_manager import AgentServiceManager
+    from xagent.web.services.task_execution import background_task_manager
+    from xagent.web.tools.config import WebToolConfig
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    monkeypatch.setattr(connector_runtime, "_EPHEMERAL_RUN_VALUES", {})
+    user = _create_user(db_session)
+    task = _create_task(db_session, int(user.id))
+    task_id, user_id = int(task.id), int(user.id)
+    api = CustomApi(
+        name="runtime-input-test",
+        url="https://example.com/old",
+        method="GET",
+        runtime_input_schema={
+            "secrets": {"token": {"type": "string", "required": True}},
+            "auth_selector": {"account": {"type": "string", "required": True}},
+        },
+    )
+    db_session.add(api)
+    db_session.flush()
+    db_session.add(
+        UserCustomApi(
+            user_id=user_id, custom_api_id=api.id, is_owner=True, is_active=True
+        )
+    )
+    task.connector_runtime_selected_refs = [
+        {"connector_type": "custom_api", "connector_id": int(api.id)}
+    ]
+    db_session.commit()
+    api_id = int(api.id)
+    payload = TaskTurnPayload("Read the selected account")
+    accepted_inputs = {
+        "secrets": {"token": "test-only-token"},
+        "auth_selector": {"account": "account-a"},
+    }
+    store_ephemeral_runtime_values(
+        payload.turn_id, {ConnectorRef("custom_api", api_id): accepted_inputs}
+    )
+    claimed = _begin_turn_atomic_sync(
+        task_id, user_id, payload=payload, kind=TurnKind.CREATE
+    )
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        db_factory=database_module.get_session_local(),
+        user_id=user_id,
+        task_id=str(task_id),
+        connector_runtime_turn_id=payload.turn_id,
+        workspace_base_dir=str(tmp_path),
+    )
+    built_tools = []
+    built_configs = []
+
+    async def build_tools(config):
+        await config.prepare_factory_runtime()
+        built_configs.append(config.get_custom_api_configs())
+        tool = FakeTool()
+        built_tools.append(tool)
+        config.handoff_factory_runtime()
+        return [tool]
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        build_tools,
+    )
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "ask",
+                        "name": "ask_user_question",
+                        "args": {"message": "Which period?"},
+                    }
+                ]
+            }
+        ]
+    )
+    service = AgentService(
+        name="resume-input-test",
+        id=str(task_id),
+        llm=llm,
+        pattern="react",
+        tool_config=cfg,
+        enable_workspace=False,
+        memory_enabled=False,
+        skills_enabled=False,
+    )
+    service._execution_adapter = service._build_execution_adapter()
+    service._execution_adapter.config.tracer = TracerCheckpointStore()
+    manager = AgentServiceManager()
+    manager._agents[task_id] = service
+    manager._agent_owner_ids[task_id] = user_id
+    manager._agent_scope_fingerprints[task_id] = None
+    results = []
+
+    async def execute(**kwargs):
+        if not results:
+            result = await service.execute_task(
+                "Read account data", task_id=str(task_id)
+            )
+        else:
+            result = await service.resume_execution_by_id(str(task_id))
+        results.append(result)
+        with database_module.get_session_local()() as db:
+            row = db.get(Task, task_id)
+            row.status = TaskStatus(result["status"])
+            db.commit()
+
+    with (
+        patch("xagent.web.services.task_execution.execute_task_background", execute),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            return_value=MagicMock(),
+        ),
+        patch.object(background_task_manager, "register_task"),
+    ):
+        await _schedule_bg(
+            task_id=task_id,
+            task_owner_user_id=user_id,
+            task_source="sdk",
+            run_id=claimed.run_id,
+            task_lease=claimed.task_lease,
+            payload=payload,
+            force_fresh=False,
+            context=None,
+        )
+        assert results[0]["status"] == "waiting_for_user"
+        assert get_ephemeral_runtime_values(payload.turn_id) is None
+        db_session.expire_all()
+        api = db_session.get(CustomApi, api_id)
+        api.url = "https://example.com/new"
+        db_session.commit()
+
+        reply = TaskTurnPayload("Last month", turn_id="reply-runtime-input-test")
+        cached = await manager.get_agent_for_task(
+            task_id,
+            task_owner_user_id=user_id,
+            connector_runtime_turn_id=reply.turn_id,
+            resolved_execution_scope=None,
+        )
+        assert cached is service
+        await cached.post_user_message(
+            str(task_id),
+            reply.transcript_message,
+            turn_id=reply.turn_id,
+            request_interrupt=False,
+        )
+        llm.responses.extend(
+            [{"tool_calls": [{"id": "read", "name": "noop", "args": {}}]}, "done"]
+        )
+        await _schedule_bg(
+            task_id=task_id,
+            task_owner_user_id=user_id,
+            task_source="sdk",
+            run_id=claimed.run_id,
+            payload=reply,
+            force_fresh=False,
+            context=None,
+        )
+
+    assert results[1]["status"] == "completed"
+    assert len(built_tools) == 2
+    assert built_tools[0].calls == []
+    assert built_tools[1].calls == [{}]
+    assert built_configs[0][0]["url"] == "https://example.com/old"
+    assert built_configs[1][0]["url"] == "https://example.com/new"
+    for config in built_configs:
+        assert config[0]["connector_runtime"]["secrets"] == accepted_inputs["secrets"]
+        assert (
+            config[0]["connector_runtime"]["auth_selector"]
+            == accepted_inputs["auth_selector"]
+        )
+    assert (task_id, claimed.run_id) not in connector_runtime._EPHEMERAL_RUN_VALUES
+    cfg.close()
+
+
 def test_channel_and_web_claims_are_cross_process_exclusive(db_session) -> None:
     user = _create_user(db_session)
     task = _create_task(db_session, int(user.id))

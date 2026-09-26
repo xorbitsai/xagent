@@ -351,6 +351,12 @@ class Task(Base):  # type: ignore
     # migration transaction. Whoever adds the scan adds the index, with the
     # deployment procedure that goes with it.
     last_activity_at = Column(DateTime(timezone=True), nullable=True)
+    # When the retention purge last removed this task's execution trace
+    # (#2565). The conversation survives trace expiry and can take new turns,
+    # which write new trace rows, so this does not mean "has no steps": it
+    # means the steps from before this moment were removed and a steps read
+    # may be incomplete. NULL when retention never touched the trace.
+    traces_expired_at = Column(DateTime(timezone=True), nullable=True)
     runner_id = Column(String(255), nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)

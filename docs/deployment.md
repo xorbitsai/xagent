@@ -483,3 +483,19 @@ A runtime-extension obligation whose provider is not registered in this process 
 
 Rolling back the application leaves the table in place and unread. Downgrading the migration drops it, and with it the record of every cleanup still owed. Export `xagent retention cleanup-pending --all` first.
 
+## 2026-09-26 — Expired-task records
+
+When the retention purge expires a conversation it now leaves a record, so that later readers can report "expired under the retention policy" instead of the not-found a deleted task gets. Nothing reads these records yet; the v1 API and internal surfaces follow separately (#2565). Only the purge writes them, and no deployment configures a retention period yet, so this change is inert on its own.
+
+### Deployment impact
+
+- Migration `20260926_expired_task_tombstones` adds the `expired_task_tombstones` table and three nullable columns: `tasks.traces_expired_at`, `trigger_runs.task_expired_at` and `workforce_runs.task_expired_at`. The columns have no server default, so on PostgreSQL each `ADD COLUMN` is catalog-only: no table rewrite and no backfill on `tasks`.
+- Conversation expiry writes one tombstone per expired task, in the purge's own transaction. It holds no conversation content — only the owner, agent, workforce, source, visibility and MCP channel-plumbing marker that the read surfaces' access checks need, plus the task's creation and expiry times. Expect roughly 150–200 bytes per expired task including indexes.
+- The same transaction sets `task_expired_at` on every trigger and workforce run that pointed at the task, without changing the run's status and without advancing `trigger_runs.updated_at` or `workforce_runs.last_activity_at`.
+- Trace expiry stamps `tasks.traces_expired_at` each time it removes a trace.
+- User-initiated task deletion is unchanged and writes no record.
+- Tombstones are removed with their owner's account. Deleting an agent or workforce clears the tombstone's reference to it, as agent deletion already does for live tasks. How long tombstones are otherwise kept is an open policy decision (#2567); today they are kept indefinitely.
+
+### Rollback
+
+Rolling back the application leaves the table and columns in place and unwritten. Downgrading the migration drops them, which loses the record of which tasks retention expired; readers then fall back to not-found for those ids.

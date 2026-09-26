@@ -346,6 +346,67 @@ class TaskWorkspace:
             self.resolve_path(file_path, default_dir), file_path
         )
 
+    def stage_file_for_external_upload(self, file_id: str) -> Path:
+        """Materialize a durable file into this task's upload-safe temp area.
+
+        Connectors intentionally accept only paths under the current task
+        workspace.  A durable ``FileRef`` may resolve to the shared
+        materialization cache instead, so copy it into the workspace before
+        handing it to an external upload connector.  The staging directory is
+        internal scratch and is removed with the task workspace; it is never
+        registered as a user-visible file.
+        """
+
+        source = self.resolve_file_id_detached(file_id)
+        if source is None:
+            raise FileNotFoundError(f"File not found: {file_id}")
+        try:
+            source = Path(source).resolve(strict=True)
+        except RuntimeError:
+            # Python 3.11/3.12 raise RuntimeError for symlink loops. Keep the
+            # unresolved path so the normal filesystem check can fail closed.
+            source = Path(source)
+        if not source.is_file():
+            raise FileNotFoundError(f"File not found: {file_id}")
+
+        staging_root = (self.internal_temp_dir / "mcp-upload").resolve()
+        staging_dir = staging_root / uuid4().hex
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        target = staging_dir / source.name
+        try:
+            shutil.copy2(source, target)
+            os.chmod(target, 0o600)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        return target
+
+    def discard_staged_external_upload(self, file_path: str | Path) -> None:
+        """Remove a file previously returned by staging.
+
+        Cleanup is deliberately confined to the per-task internal staging
+        root, so a connector cannot cause arbitrary workspace deletion.
+        """
+
+        try:
+            candidate = Path(file_path).resolve()
+        except RuntimeError:
+            # A symlink loop must not escape cleanup's confined-path check.
+            candidate = Path(file_path)
+        staging_root = (self.internal_temp_dir / "mcp-upload").resolve()
+        if not candidate.is_relative_to(staging_root) or candidate == staging_root:
+            raise ValueError("staged upload path is outside the task staging area")
+        try:
+            candidate.unlink(missing_ok=True)
+        finally:
+            parent = candidate.parent
+            while parent != staging_root and parent.is_relative_to(staging_root):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
     def register_internal_file(
         self,
         file_path: str,
@@ -663,8 +724,7 @@ class TaskWorkspace:
                     existing_path = path_by_requested_file_id.get(requested_file_id)
                     if existing_path is not None and existing_path != path_key:
                         raise ValueError(
-                            "One file id cannot identify multiple workspace paths "
-                            "in the same batch"
+                            "One file id cannot identify multiple workspace paths in the same batch"
                         )
                     path_by_requested_file_id[requested_file_id] = path_key
                 result_indexes.append(existing_index)
@@ -674,8 +734,7 @@ class TaskWorkspace:
                 existing_path = path_by_requested_file_id.get(requested_file_id)
                 if existing_path is not None and existing_path != path_key:
                     raise ValueError(
-                        "One file id cannot identify multiple workspace paths "
-                        "in the same batch"
+                        "One file id cannot identify multiple workspace paths in the same batch"
                     )
                 path_by_requested_file_id[requested_file_id] = path_key
 
@@ -810,8 +869,7 @@ class TaskWorkspace:
             record_user_id = int(existing_record.user_id)
             if record_user_id != task_user_id:
                 raise PermissionError(
-                    "Cannot register a workspace file over metadata owned by "
-                    "another user"
+                    "Cannot register a workspace file over metadata owned by another user"
                 )
             existing = WorkspaceUploadedFileSnapshot(
                 version=snapshot_uploaded_file_version(existing_record),
@@ -1584,8 +1642,7 @@ class TaskWorkspace:
             # Preserve File Operation's public not-found shape while failing
             # closed on malformed policy state or database infrastructure.
             logger.warning(
-                "File Operation selector policy validation failed for "
-                "workspace %s and task %s",
+                "File Operation selector policy validation failed for workspace %s and task %s",
                 self.id,
                 self.db_task_id,
                 exc_info=True,
@@ -1967,8 +2024,7 @@ class TaskWorkspace:
                 match = self._find_existing_candidate(search_dirs, normalized_clean)
                 if match is not None:
                     logger.info(
-                        f"File '{file_path}' matched via normalized name: "
-                        f"'{normalized_name}'"
+                        f"File '{file_path}' matched via normalized name: '{normalized_name}'"
                     )
                     return match
 
@@ -2008,8 +2064,7 @@ class TaskWorkspace:
                         except ValueError:
                             continue
                         logger.info(
-                            f"File '{file_path}' fuzzy matched to: "
-                            f"'{existing_file.name}'"
+                            f"File '{file_path}' fuzzy matched to: '{existing_file.name}'"
                         )
                         return resolved
 

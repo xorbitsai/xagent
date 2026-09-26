@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Event, Lock, local
 from uuid import UUID
 
@@ -1555,3 +1556,25 @@ def test_list_all_user_files_includes_durable_only_uploads(tmp_path, mock_worksp
 @pytest.fixture
 def mock_workspace_db():
     yield
+
+
+def test_stage_and_discard_external_upload_file(tmp_path, monkeypatch):
+    workspace = TaskWorkspace(id="task_stage", base_dir=str(tmp_path / "workspaces"))
+    source = tmp_path / "materialized" / "report.xlsx"
+    source.parent.mkdir()
+    source.write_bytes(b"workbook")
+    monkeypatch.setattr(workspace, "resolve_file_id_detached", lambda _: source)
+
+    staged = workspace.stage_file_for_external_upload("file-id")
+
+    assert staged.is_file()
+    assert staged.read_bytes() == b"workbook"
+    assert staged.is_relative_to(workspace.temp_dir / ".xagent-internal" / "mcp-upload")
+    assert str(staged) not in workspace.get_allowed_dirs()
+    assert any(
+        staged.is_relative_to(Path(directory))
+        for directory in workspace.get_allowed_dirs()
+    )
+
+    workspace.discard_staged_external_upload(staged)
+    assert not staged.exists()

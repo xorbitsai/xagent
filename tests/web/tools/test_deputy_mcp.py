@@ -624,7 +624,7 @@ def test_create_resource_sends_data_and_returns_record(monkeypatch):
     assert create_call.kwargs["method"] == "POST"
     assert create_call.kwargs["json"] == {"FirstName": "Peter"}
     # The successful create is read back to confirm it's really there
-    # before reporting success (see _verify_created_record).
+    # before reporting success (see _verify_record_readable).
     verify_call = mock_request.call_args_list[1]
     assert verify_call.kwargs["url"] == (
         "https://acme.au.deputy.com/api/v1/resource/Roster/123"
@@ -869,6 +869,12 @@ def test_create_resource_warns_when_response_has_no_id(monkeypatch):
     assert result["status"] == "success"
     assert "warning" in result
     assert "no Id" in result["warning"]
+    # Regression guard: this branch and the readback-failed branch both
+    # build their warning from the same is_create-derived retry_note --
+    # a still-earlier version of this fix wired "do not retry" into only
+    # one of the two branches, leaving this one (which deputy_add_employee
+    # hits routinely, per its own docstring) silently without it.
+    assert "do not retry the create" in result["warning"]
     mock_request.assert_called_once()
 
 
@@ -899,7 +905,7 @@ def test_add_employee_sends_required_fields_and_returns_record(monkeypatch):
         "blnSendInvite": 0,
     }
     # The successful create is read back to confirm it's really there
-    # before reporting success (see _verify_created_record) -- this is
+    # before reporting success (see _verify_record_readable) -- this is
     # exactly the check that was missing during the 2026-09-21 incident.
     verify_call = mock_request.call_args_list[1]
     assert verify_call.kwargs["url"] == (
@@ -1047,7 +1053,7 @@ def test_add_employee_downgrades_to_warning_when_readback_fails(monkeypatch):
 def test_add_employee_downgrades_to_warning_when_readback_returns_empty(monkeypatch):
     """A readback that succeeds but comes back empty is just as
     unconfirmed as one that errors outright -- mirrors
-    deputy_create_resource's identical case, which _verify_created_record
+    deputy_create_resource's identical case, which _verify_record_readable
     handles the same way for both callers."""
     mock_request = Mock(
         side_effect=[
@@ -1081,6 +1087,12 @@ def test_add_employee_warns_when_response_has_no_id(monkeypatch):
     assert result["status"] == "success"
     assert "warning" in result
     assert "no Id" in result["warning"]
+    # Regression guard: see the identical comment on
+    # test_create_resource_warns_when_response_has_no_id -- this is the
+    # branch deputy_add_employee actually hits routinely, since Deputy's
+    # own OpenAPI spec documents this endpoint's response as possibly
+    # Id-less.
+    assert "do not retry the create" in result["warning"]
 
 
 def test_add_employee_downgrades_to_warning_on_transport_exception(monkeypatch):
@@ -1133,6 +1145,7 @@ def test_update_resource_merges_data_into_the_fetched_record(monkeypatch):
         side_effect=[
             MockResponse(json_data={"Id": 123, "FirstName": "Ada", "Active": True}),
             MockResponse(json_data={"Id": 123, "FirstName": "Ada", "Active": False}),
+            MockResponse(json_data={"Id": 123, "FirstName": "Ada", "Active": False}),
         ]
     )
     monkeypatch.setattr(deputy.requests, "request", mock_request)
@@ -1143,9 +1156,10 @@ def test_update_resource_merges_data_into_the_fetched_record(monkeypatch):
 
     assert result["status"] == "success"
     assert result["record"] == {"Id": 123, "FirstName": "Ada", "Active": False}
-    assert mock_request.call_count == 2
+    assert "warning" not in result
+    assert mock_request.call_count == 3
 
-    get_call, post_call = mock_request.call_args_list
+    get_call, post_call, verify_call = mock_request.call_args_list
     assert get_call.kwargs["method"] == "GET"
     assert get_call.kwargs["url"] == (
         "https://acme.au.deputy.com/api/v1/resource/Employee/123"
@@ -1161,6 +1175,15 @@ def test_update_resource_merges_data_into_the_fetched_record(monkeypatch):
         "FirstName": "Ada",
         "Active": False,
     }
+    # The write is read back to confirm it's really there before
+    # reporting success (see _verify_record_readable) -- same protection
+    # as deputy_create_resource/deputy_add_employee, since changing a
+    # location/permission-scoping field (e.g. Employee's "Company") on
+    # update can orphan a record the same way a bad create can.
+    assert verify_call.kwargs["method"] == "GET"
+    assert verify_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee/123"
+    )
 
 
 def test_update_resource_ignores_caller_supplied_id(monkeypatch):
@@ -1171,12 +1194,18 @@ def test_update_resource_ignores_caller_supplied_id(monkeypatch):
         side_effect=[
             MockResponse(json_data={"Id": 123, "Active": True}),
             MockResponse(json_data={"Id": 123, "Active": False}),
+            MockResponse(json_data={"Id": 123, "Active": False}),
         ]
     )
     monkeypatch.setattr(deputy.requests, "request", mock_request)
 
-    deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+    )
 
+    assert result["status"] == "success"
+    assert "warning" not in result
+    assert mock_request.call_count == 3
     post_call = mock_request.call_args_list[1]
     assert post_call.kwargs["json"] == {"Id": 123, "Active": False}
 
@@ -1192,12 +1221,18 @@ def test_update_resource_ignores_caller_supplied_id_even_when_current_lacks_one(
         side_effect=[
             MockResponse(json_data={"Active": True}),
             MockResponse(json_data={"Active": False}),
+            MockResponse(json_data={"Active": False}),
         ]
     )
     monkeypatch.setattr(deputy.requests, "request", mock_request)
 
-    deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Id": 999, "Active": False})
+    )
 
+    assert result["status"] == "success"
+    assert "warning" not in result
+    assert mock_request.call_count == 3
     post_call = mock_request.call_args_list[1]
     assert post_call.kwargs["json"] == {"Active": False}
 
@@ -1304,6 +1339,195 @@ def test_update_resource_rejects_non_dict_write_response(monkeypatch):
     )
 
     assert result["status"] == "error"
+
+
+def test_update_resource_downgrades_to_warning_when_readback_fails(monkeypatch):
+    """Same protection as deputy_create_resource/deputy_add_employee: a
+    write that changes an Employee's "Company" (the location/permission-
+    scoping field the 2026-09-21 incident traced the orphaning to) can
+    report success while leaving the record unreadable, even though this
+    is an update, not a create. The write result must still come back
+    (nothing here says the write itself failed), but flagged as
+    unconfirmed rather than a plain success."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Company": 1, "Active": True}),
+            MockResponse(json_data={"Id": 123, "Company": 2, "Active": True}),
+            MockResponse(
+                status_code=403,
+                json_data={"error": {"message": "Access to object denied"}},
+            ),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Company": 2})
+    )
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "Company": 2, "Active": True}
+    assert "warning" in result
+    assert "123" in result["warning"]
+    assert mock_request.call_count == 3
+
+
+def test_update_resource_downgrades_to_warning_when_readback_returns_empty(
+    monkeypatch,
+):
+    """A readback that succeeds but comes back empty (Deputy's own {}
+    normalization for a 204/empty body) is just as unconfirmed as one
+    that errors outright -- must not be silently treated as verified."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(json_data={"Id": 123, "Active": False}),
+            MockResponse(status_code=204),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "returned no record" in result["warning"]
+
+
+def test_update_resource_returns_the_freshly_read_record_when_verified(monkeypatch):
+    """Matches deputy_create_resource's identical behavior: a verified
+    update returns what the readback GET actually found, not the stale
+    POST response, since a full GET is already being paid for to verify
+    existence."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(json_data={"Id": 123, "Active": False}),
+            MockResponse(json_data={"Id": 123, "Active": False, "Modified": "later"}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "Active": False, "Modified": "later"}
+    assert "warning" not in result
+
+
+def test_update_resource_verifies_against_url_resource_id_not_response_body(
+    monkeypatch,
+):
+    """Unlike a create, deputy_update_resource already knows the record's
+    id from the URL -- verification must use that id directly rather than
+    depending on the write response echoing back an "Id" field, which
+    Deputy's update response is not guaranteed to do."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            # The write response omits "Id" entirely.
+            MockResponse(json_data={"Active": False}),
+            MockResponse(json_data={"Id": 123, "Active": False}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "success"
+    assert "warning" not in result
+    verify_call = mock_request.call_args_list[2]
+    assert verify_call.kwargs["method"] == "GET"
+    assert verify_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee/123"
+    )
+
+
+def test_update_resource_warning_distinguishes_unexpected_shape_from_empty(
+    monkeypatch,
+):
+    """Mirrors
+    test_create_resource_warning_distinguishes_unexpected_shape_from_empty:
+    a readback that succeeds and returns *something* -- just not a record
+    (e.g. a list) -- is a different, more informative diagnostic than a
+    plain empty response, and the update path must distinguish them the
+    same way create does."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(json_data={"Id": 123, "Active": False}),
+            MockResponse(json_data=["unexpected", "list"]),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "success"
+    assert "unexpected response shape" in result["warning"]
+    assert "no record" not in result["warning"]
+
+
+def test_update_resource_downgrades_to_warning_on_transport_exception(monkeypatch):
+    """Mirrors test_add_employee_downgrades_to_warning_on_transport_exception:
+    a readback that fails before ever getting a response (a timeout or
+    connection error, not a 4xx/5xx Deputy responded with) must be caught
+    the same way as any other unconfirmed readback on the update path
+    too, not just create's."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(json_data={"Id": 123, "Active": False}),
+            requests.exceptions.ConnectionError("Connection refused"),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "success"
+    assert "warning" in result
+    assert "failed: Connection refused" in result["warning"]
+
+
+def test_update_resource_verifies_even_when_write_response_is_empty(monkeypatch):
+    """Unlike create (which short-circuits to _empty_create_response before
+    ever calling _verify_record_readable when the POST returns {}),
+    deputy_update_resource has no such early return -- an empty write
+    response still goes through verification, since the record's id is
+    already known from the URL regardless of what the POST echoed back."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Active": True}),
+            MockResponse(status_code=204),
+            MockResponse(json_data={"Id": 123, "Active": False}),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Active": False})
+    )
+
+    assert result["status"] == "success"
+    assert result["record"] == {"Id": 123, "Active": False}
+    assert "warning" not in result
+    assert mock_request.call_count == 3
+    verify_call = mock_request.call_args_list[2]
+    assert verify_call.kwargs["method"] == "GET"
+    assert verify_call.kwargs["url"] == (
+        "https://acme.au.deputy.com/api/v1/resource/Employee/123"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1462,3 +1686,77 @@ def test_create_resource_warning_survives_truncation_with_instruction_intact(
     assert result["status"] == "success"
     assert "verify directly in Deputy" in result["warning"]
     assert "Unconfirmed Deputy Roster create" in result["warning"]
+
+
+def test_create_resource_warning_still_tells_caller_not_to_retry(monkeypatch):
+    """Regression guard: an earlier version of _verify_record_readable's
+    generalization for deputy_update_resource accidentally dropped "do
+    not retry the create, which likely already succeeded" from every
+    caller's warning, not just deputy_update_resource's -- silently
+    reopening the exact duplicate-orphan pattern (Id 5, then Id 6) the
+    2026-09-21 incident hit: create succeeds with an Id, readback fails,
+    caller retries anyway. Only the previous test asserted this warning's
+    wording, and it was updated alongside the regression instead of
+    catching it, so this asserts the retry instruction on its own."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 1, "FirstName": "Peter"}),
+            MockResponse(
+                status_code=403,
+                json_data={"error": {"message": "Access to object denied"}},
+            ),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_create_resource("Roster", {"FirstName": "Peter"}))
+
+    assert result["status"] == "success"
+    assert "do not retry the create" in result["warning"]
+
+
+def test_add_employee_warning_still_tells_caller_not_to_retry(monkeypatch):
+    """Same regression guard as
+    test_create_resource_warning_still_tells_caller_not_to_retry, for
+    deputy_add_employee's own call into _verify_record_readable."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 5, "DisplayName": "Peter Parker"}),
+            MockResponse(
+                status_code=403,
+                json_data={"error": {"message": "Access to object denied"}},
+            ),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(deputy.deputy_add_employee("Peter", "Parker", 1))
+
+    assert result["status"] == "success"
+    assert "do not retry the create" in result["warning"]
+
+
+def test_update_resource_warning_never_tells_caller_not_to_retry(monkeypatch):
+    """The inverse of the two regression guards above: a retry against
+    deputy_update_resource repeats the same write rather than creating a
+    new record (see its idempotentHint=True annotation), so its
+    unconfirmed-write warning must not carry create's "do not retry"
+    instruction, which would be actively wrong advice here."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Id": 123, "Company": 1, "Active": True}),
+            MockResponse(json_data={"Id": 123, "Company": 2, "Active": True}),
+            MockResponse(
+                status_code=403,
+                json_data={"error": {"message": "Access to object denied"}},
+            ),
+        ]
+    )
+    monkeypatch.setattr(deputy.requests, "request", mock_request)
+
+    result = json.loads(
+        deputy.deputy_update_resource("Employee", "123", {"Company": 2})
+    )
+
+    assert result["status"] == "success"
+    assert "do not retry" not in result["warning"]

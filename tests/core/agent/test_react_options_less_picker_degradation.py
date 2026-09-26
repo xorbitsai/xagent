@@ -159,7 +159,7 @@ async def test_the_tool_result_names_the_degraded_fields() -> None:
 
     _, pattern, _, context = await _ask(PRODUCTION_FORM)
 
-    tool_result = pattern.tool_ledger["call_1"].result
+    tool_result = pattern._record_for_tool_call_id("call_1").result
     assert tool_result["degraded_fields"] == ["client_id", "staff_ids"]
     assert tool_result["interactions"][0]["type"] == "text_input"
 
@@ -189,7 +189,7 @@ async def test_a_clean_form_is_published_verbatim_and_unremarked() -> None:
     _, pattern, runtime, context = await _ask(form)
 
     assert _published_interactions(runtime) == form
-    assert "degraded_fields" not in pattern.tool_ledger["call_1"].result
+    assert "degraded_fields" not in pattern._record_for_tool_call_id("call_1").result
     assert "degraded_fields" not in _tool_result_text(context)
 
 
@@ -203,7 +203,7 @@ async def test_a_text_input_with_an_empty_options_list_is_not_a_picker() -> None
     _, pattern, runtime, _ = await _ask(form)
 
     assert _published_interactions(runtime) == form
-    assert "degraded_fields" not in pattern.tool_ledger["call_1"].result
+    assert "degraded_fields" not in pattern._record_for_tool_call_id("call_1").result
 
 
 @pytest.mark.asyncio
@@ -247,7 +247,7 @@ async def test_degradation_reports_the_deduplicated_field_names() -> None:
         ]
     )
 
-    assert pattern.tool_ledger["call_1"].result["degraded_fields"] == [
+    assert pattern._record_for_tool_call_id("call_1").result["degraded_fields"] == [
         "choice",
         "choice_2",
     ]

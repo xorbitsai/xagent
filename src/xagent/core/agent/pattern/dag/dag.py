@@ -1476,7 +1476,7 @@ class DAGPattern(AgentPattern):
         # visible result when a provider reuses an inherited tool-call id.
         tool_call_ids = {
             record.tool_call_id
-            for record in pattern.tool_ledger.values()
+            for record in pattern._provider_compatible_tool_records()
             if record.status == "completed"
         }
         observations = {

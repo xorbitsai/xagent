@@ -192,7 +192,9 @@ async def test_send_message_records_the_field_without_echoing_it_to_the_model() 
     context.add_user_message("Do the thing")
     await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
 
-    assert pattern.tool_ledger["call_1"].result["interactions"] == [DEFAULT_FIELD]
+    assert pattern._record_for_tool_call_id("call_1").result["interactions"] == [
+        DEFAULT_FIELD
+    ]
     tool_messages = [
         message.content
         for message in context.messages
@@ -266,7 +268,7 @@ async def test_a_non_waiting_send_message_records_no_interactions() -> None:
         runtime=PatternRuntime(execution_id="exec-plain-send"),
     )
 
-    assert "interactions" not in pattern.tool_ledger["call_1"].result
+    assert "interactions" not in pattern._record_for_tool_call_id("call_1").result
 
 
 @pytest.mark.asyncio

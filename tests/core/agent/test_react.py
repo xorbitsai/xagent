@@ -10,6 +10,7 @@ import unicodedata
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import ANY
 
 import pytest
 from langchain_core.tools import tool as langchain_tool
@@ -2142,7 +2143,7 @@ async def test_react_strips_final_answer_bundled_after_work_tool(
         message.tool_call_id for message in context.get_messages_by_role("tool")
     }
     assert "call_final" not in tool_result_ids
-    assert "call_final" not in pattern.tool_ledger
+    assert "call_final" not in pattern.tool_call_id_index
 
     # Regression-only guard, not a mutation-effective assertion on its own:
     # no orphaned tool_call may ever appear in history.
@@ -2830,9 +2831,9 @@ async def test_react_pauses_for_user_after_stripping_bundled_final_answer() -> N
 
     assert result["status"] == "waiting_for_user"
     assert tool.calls == []
-    assert "call_final" not in pattern.tool_ledger
-    assert pattern.tool_ledger["call_calc"].status == "cancelled"
-    assert pattern.tool_ledger["call_ask"].status == "completed"
+    assert "call_final" not in pattern.tool_call_id_index
+    assert pattern._record_for_tool_call_id("call_calc").status == "cancelled"
+    assert pattern._record_for_tool_call_id("call_ask").status == "completed"
 
     assistant_messages = context.get_messages_by_role("assistant")
     assistant_tool_call_ids = {
@@ -2944,8 +2945,10 @@ async def test_react_interrupt_cancels_in_flight_tool() -> None:
     with pytest.raises(ToolCallInterrupted, match="paused by websocket"):
         await task
     assert tool.cancelled.is_set()
-    assert pattern.tool_ledger["call-vision"].status == "interrupted"
-    assert pattern.tool_ledger["call-vision"].error == "paused by websocket"
+    assert pattern._record_for_tool_call_id("call-vision").status == "interrupted"
+    assert (
+        pattern._record_for_tool_call_id("call-vision").error == "paused by websocket"
+    )
 
 
 @pytest.mark.asyncio
@@ -3038,7 +3041,7 @@ async def test_react_sanitizes_tool_args_before_trace_and_execution() -> None:
     assert result["success"] is True
     assert runtime.started_args == {"params": {"q": "client"}}
     assert tool.calls == [{"params": {"q": "client"}}]
-    record = pattern.tool_ledger["call-custom-api"]
+    record = pattern._record_for_tool_call_id("call-custom-api")
     assert record.args == {"params": {"q": "client"}}
     assert "caller-token" not in repr(record.to_dict())
 
@@ -3099,7 +3102,7 @@ async def test_react_rejects_non_mapping_tool_args_without_crashing_ledger(
     assert result["success"] is False
     assert result["error"] == "Tool call args must be a JSON object."
     assert tool.calls == []
-    record = pattern.tool_ledger["call-custom-api"]
+    record = pattern._record_for_tool_call_id("call-custom-api")
     assert record.status == "failed"
     assert record.args == {}
     assert record.error == "Tool call args must be a JSON object."
@@ -5170,7 +5173,7 @@ async def test_react_pattern_send_message_without_response_continues() -> None:
     assert all(
         message.get("content") != "Still working" for message in next_call_messages
     )
-    assert pattern.tool_ledger["call_message"].status == "completed"
+    assert pattern._record_for_tool_call_id("call_message").status == "completed"
 
 
 @pytest.mark.asyncio
@@ -5262,7 +5265,7 @@ async def test_react_pattern_ask_user_question_pauses_with_structured_payload() 
             "options": [{"label": "A", "value": "a"}],
         }
     ]
-    assert pattern.tool_ledger["call_question_form"].status == "completed"
+    assert pattern._record_for_tool_call_id("call_question_form").status == "completed"
     tool_messages = context.get_messages_by_role("tool")
     assert tool_messages[0].tool_call_id == "call_question_form"
     assert tool_messages[0].metadata["raw_result"]["status"] == "waiting_for_user"
@@ -5944,7 +5947,7 @@ async def test_react_pattern_replans_after_waiting_control_tool() -> None:
 
     assert first["status"] == "waiting_for_user"
     assert pattern.pending_tool_calls == []
-    assert pattern.tool_ledger["call_calc"].status == "cancelled"
+    assert pattern._record_for_tool_call_id("call_calc").status == "cancelled"
     assert tool.calls == []
 
     context.add_user_message("B")
@@ -6281,7 +6284,9 @@ async def test_react_resume_waiting_cancels_stale_pending_from_legacy_checkpoint
     assert len(resumed_llm.calls) == 1
     assert tool.calls == []
     for stale_pending in stale_pendings:
-        assert pattern.tool_ledger[stale_pending["id"]].status == "cancelled"
+        assert (
+            pattern._record_for_tool_call_id(stale_pending["id"]).status == "cancelled"
+        )
     resume_checkpoints = [
         checkpoint
         for checkpoint in runtime.checkpoints
@@ -6391,7 +6396,7 @@ async def test_react_pattern_tool_errors_are_written_as_observations() -> None:
     assert "Tool missing returned" in tool_message.content
     assert tool_message.metadata["raw_result"]["success"] is False
     assert "Tool not found" in tool_message.metadata["raw_result"]["error"]
-    assert pattern.tool_ledger["call_missing"].status == "failed"
+    assert pattern._record_for_tool_call_id("call_missing").status == "failed"
 
 
 @pytest.mark.asyncio
@@ -6424,7 +6429,7 @@ async def test_react_pattern_tool_exception_is_written_as_observation() -> None:
     tool_message = context.get_messages_by_role("tool")[0]
     assert tool_message.metadata["raw_result"]["success"] is False
     assert "broken with" in tool_message.metadata["raw_result"]["error"]
-    assert pattern.tool_ledger["call_broken"].status == "failed"
+    assert pattern._record_for_tool_call_id("call_broken").status == "failed"
 
 
 @pytest.mark.asyncio
@@ -6462,7 +6467,7 @@ async def test_react_pattern_failed_tool_result_emits_tool_error_trace() -> None
     assert result["success"] is True
     tool_message = context.get_messages_by_role("tool")[0]
     assert tool_message.metadata["raw_result"]["success"] is False
-    assert pattern.tool_ledger["call_failed_result"].status == "failed"
+    assert pattern._record_for_tool_call_id("call_failed_result").status == "failed"
     event_types = {event["event_type"] for event in tracer.events}
     assert "action_error_tool" in event_types
     assert "task_start_react" in event_types
@@ -6513,7 +6518,9 @@ async def test_react_pattern_status_error_tool_result_is_failed() -> None:
     assert result["success"] is True
     tool_message = context.get_messages_by_role("tool")[0]
     assert tool_message.metadata["raw_result"]["status"] == "error"
-    assert pattern.tool_ledger["call_status_error_result"].status == "failed"
+    assert (
+        pattern._record_for_tool_call_id("call_status_error_result").status == "failed"
+    )
     event_types = {event["event_type"] for event in tracer.events}
     assert "action_error_tool" in event_types
 
@@ -6555,7 +6562,7 @@ async def test_react_pattern_mcp_is_error_result_is_failed_without_failure_code(
     assert result["success"] is True
     tool_message = context.get_messages_by_role("tool")[0]
     assert tool_message.metadata["raw_result"]["is_error"] is True
-    assert pattern.tool_ledger["call_is_error_result"].status == "failed"
+    assert pattern._record_for_tool_call_id("call_is_error_result").status == "failed"
     assert llm.calls[1]["tools"] is not None
     failure_events = [
         event for event in tracer.events if event["event_type"] == "action_error_tool"
@@ -6605,9 +6612,9 @@ async def test_react_pattern_classified_failure_preserves_failure_code() -> None
     )
 
     assert result["success"] is True
-    assert pattern.tool_ledger["call_classified"].status == "failed"
+    assert pattern._record_for_tool_call_id("call_classified").status == "failed"
     assert (
-        pattern.tool_ledger["call_classified"].result["failure_code"]
+        pattern._record_for_tool_call_id("call_classified").result["failure_code"]
         == "unsupported_nested_interaction"
     )
 
@@ -6797,10 +6804,18 @@ async def test_react_pattern_emits_runtime_checkpoints() -> None:
         "final",
     ]
     after_llm = runtime.checkpoints[1]
-    assert after_llm["pattern_state"]["pending_tool_calls"] == [
-        {"id": "call_1", "name": "calculator", "args": {"expression": "3+3"}}
-    ]
-    assert after_llm["context"]["messages"][1]["tool_calls"][0]["id"] == "call_1"
+    [checkpointed_call] = after_llm["pattern_state"]["pending_tool_calls"]
+    assert checkpointed_call == {
+        "id": "call_1",
+        "invocation_id": ANY,
+        "issued_at": ANY,
+        "name": "calculator",
+        "args": {"expression": "3+3"},
+    }
+    context_call = after_llm["context"]["messages"][1]["tool_calls"][0]
+    assert context_call["id"] == "call_1"
+    assert "invocation_id" not in context_call
+    assert "issued_at" not in context_call
 
 
 @pytest.mark.asyncio
@@ -6946,9 +6961,14 @@ async def test_react_pattern_interrupts_at_tool_boundary() -> None:
     assert result["status"] == "interrupted"
     assert tool.calls == []
     assert runtime.last_checkpoint["label"] == "interrupted"
-    assert pattern.pending_tool_calls == [
-        {"id": "call_1", "name": "calculator", "args": {"expression": "4+4"}}
-    ]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call == {
+        "id": "call_1",
+        "invocation_id": ANY,
+        "issued_at": ANY,
+        "name": "calculator",
+        "args": {"expression": "4+4"},
+    }
 
 
 @pytest.mark.asyncio
@@ -7037,7 +7057,7 @@ def test_react_pattern_state_roundtrip() -> None:
     assert restored.task_text == "Original task"
     assert restored.memory_input_text == "Clean original task"
     assert restored.reasoning_mode == ReActReasoningMode.TOOL_CALLING
-    assert restored.tool_ledger["call_1"].result == {"result": 2}
+    assert restored._record_for_tool_call_id("call_1").result == {"result": 2}
 
 
 def test_react_pattern_loads_legacy_state_without_overwriting_memory_input() -> None:
@@ -7496,8 +7516,8 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
 
     assert waiting["status"] == "waiting_for_user"
     assert waiting["message"] == "Should the action continue?"
-    assert pattern.tool_ledger["wait-call"].status == "waiting_for_user"
-    assert pattern.tool_ledger["stale-mutation"].status == "cancelled"
+    assert pattern._record_for_tool_call_id("wait-call").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("stale-mutation").status == "cancelled"
     assert pattern.pending_tool_calls == []
     assert first_mutation.calls == []
     assert runtime.outbound_messages[0]["expect_response"] is True
@@ -7556,7 +7576,7 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
         {"interaction_id": "interaction-1", "response": "Continue"}
     ]
     assert resumed_tool.resume_context.react_step_id == (
-        pattern.tool_ledger["wait-call"].step_id
+        pattern._record_for_tool_call_id("wait-call").step_id
     )
     assert resumed_mutation.calls == []
     assert resumed_pattern.pending_tool_interaction_responses == []
@@ -7744,9 +7764,9 @@ async def test_ungated_mcp_tool_pause_and_resume_takes_the_legacy_path() -> None
         )
         assert waiting["status"] == "waiting_for_user"
         # The gate did not stamp this id: the tool, not the gate, issued it.
-        assert pattern.tool_ledger["wait-call"].result["interaction_id"] == (
-            "host-owned-interaction"
-        )
+        assert pattern._record_for_tool_call_id("wait-call").result[
+            "interaction_id"
+        ] == ("host-owned-interaction")
 
         context.add_user_message("The roadmap page")
         resumed_pattern = ReActPattern(max_iterations=2)
@@ -7781,7 +7801,7 @@ async def test_ungated_mcp_tool_pause_and_resume_takes_the_legacy_path() -> None
     assert resumed_pattern.pending_tool_interaction_responses == []
     # Legacy path: no settlement was projected onto the original row, and the
     # gate never re-dispatched the call.
-    record = resumed_pattern.tool_ledger["wait-call"]
+    record = resumed_pattern._record_for_tool_call_id("wait-call")
     assert record.status == "waiting_for_user"
     assert record.settlement_status is None
     assert target.calls == [{"expression": "roadmap"}]
@@ -7851,7 +7871,7 @@ async def test_gated_call_survives_a_real_checkpoint_rebuild_and_resumes() -> No
 
         assert waiting["status"] == "waiting_for_user"
         assert target.calls == []
-        paused_record = first_pattern.tool_ledger["gated-call-1"]
+        paused_record = first_pattern._record_for_tool_call_id("gated-call-1")
         stamped_id = paused_record.result["interaction_id"]
         # The gate stamped its own source into the id the host will see back.
         assert _gated_interaction_source(stamped_id) == ("slack", "host-1")
@@ -7869,7 +7889,7 @@ async def test_gated_call_survives_a_real_checkpoint_rebuild_and_resumes() -> No
         restored_pattern.load_state(checkpoint["pattern_state"])
 
         # The stamped id and the issuing step survived serialization by value.
-        restored_record = restored_pattern.tool_ledger["gated-call-1"]
+        restored_record = restored_pattern._record_for_tool_call_id("gated-call-1")
         assert restored_record.result["interaction_id"] == stamped_id
         assert restored_record.step_id == paused_record.step_id
 
@@ -7903,7 +7923,7 @@ async def test_gated_call_survives_a_real_checkpoint_rebuild_and_resumes() -> No
     assert resumed["success"] is True
     # The approved write ran exactly once, on the rebuilt runtime.
     assert target.calls == [{"expression": "2+2"}]
-    settled = restored_pattern.tool_ledger["gated-call-1"]
+    settled = restored_pattern._record_for_tool_call_id("gated-call-1")
     assert settled.status == "completed"
     assert settled.settlement_status == "succeeded"
     assert restored_pattern.pending_tool_interaction_responses == []
@@ -7947,12 +7967,14 @@ async def test_pending_interaction_delivery_is_exact_and_retryable() -> None:
     pattern = ReActPattern()
     pattern.pending_tool_interaction_responses = list(pending)
     for index in (1, 2):
-        pattern.tool_ledger[f"call-{index}"] = ToolCallRecord(
-            tool_call_id=f"call-{index}",
-            tool_name="approval_gate",
-            args={},
-            args_hash="stored-hash",
-            status="waiting_for_user",
+        pattern._store_tool_record(
+            ToolCallRecord(
+                tool_call_id=f"call-{index}",
+                tool_name="approval_gate",
+                args={},
+                args_hash="stored-hash",
+                status="waiting_for_user",
+            )
         )
     tool = ResumableTool()
     context = ExecutionContext(execution_id="interaction-delivery")
@@ -8169,13 +8191,16 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
     assert resumed_tool.resume_calls == [
         {"interaction_id": "publish-interaction-1", "response": "Approve"}
     ]
-    record = restored_pattern.tool_ledger["original-publish-call"]
+    record = restored_pattern._record_for_tool_call_id("original-publish-call")
     assert record.status == "completed"
     assert record.settlement_status == "succeeded"
     # The issuing ReAct step survives the checkpoint round-trip BY VALUE, so a
     # resumed gated call rebuilds the exact execution identity it paused with.
     # A truthy-only assertion here would pass on any regenerated step id.
-    assert record.step_id == first_pattern.tool_ledger["original-publish-call"].step_id
+    assert (
+        record.step_id
+        == first_pattern._record_for_tool_call_id("original-publish-call").step_id
+    )
     assert record.result == {"success": True, "post_urn": "urn:li:share:123"}
     assert (
         restored_pattern._consecutive_successful_tool_group_count("approval_gate") == 1
@@ -8309,10 +8334,12 @@ async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds()
     }
     pattern = ReActPattern()
     pattern.pending_tool_interaction_responses = [pending]
-    pattern.tool_ledger["call-1"] = _waiting_ledger_record(
-        "call-1",
-        args={"expression": "publish"},
-        result={"status": "waiting_for_user"},
+    pattern._store_tool_record(
+        _waiting_ledger_record(
+            "call-1",
+            args={"expression": "publish"},
+            result={"status": "waiting_for_user"},
+        )
     )
     context = ExecutionContext(execution_id="interaction-retry")
     context.add_tool_result(
@@ -8333,8 +8360,8 @@ async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds()
         )
     assert "checkpoint unavailable" in str(raised.value.__cause__)
     assert pattern.pending_tool_interaction_responses == [pending]
-    assert pattern.tool_ledger["call-1"].status == "waiting_for_user"
-    assert pattern.tool_ledger["call-1"].settlement_status is None
+    assert pattern._record_for_tool_call_id("call-1").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("call-1").settlement_status is None
     assert context.messages[0].metadata["raw_result"]["status"] == "waiting_for_user"
     assert (
         len(
@@ -8354,7 +8381,7 @@ async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds()
     )
     assert len(tool.resume_calls) == 2
     assert pattern.pending_tool_interaction_responses == []
-    assert pattern.tool_ledger["call-1"].result == settlement.result
+    assert pattern._record_for_tool_call_id("call-1").result == settlement.result
 
 
 @pytest.mark.asyncio
@@ -8371,7 +8398,7 @@ async def test_non_successful_settlement_fails_the_original_tool_call(
             "response": "Reject",
         }
     ]
-    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern._store_tool_record(_waiting_ledger_record("call-1"))
     context = ExecutionContext(execution_id="terminal-interaction")
     context.add_tool_result(
         "approval_gate",
@@ -8390,7 +8417,7 @@ async def test_non_successful_settlement_fails_the_original_tool_call(
         context=context,
         runtime=runtime,
     )
-    record = pattern.tool_ledger["call-1"]
+    record = pattern._record_for_tool_call_id("call-1")
     assert record.status == "failed"
     assert record.settlement_status == status
     assert record.settlement_turn_id == "approval-turn"
@@ -8431,11 +8458,13 @@ async def test_invalid_resume_target_is_skipped_before_callback(
     }
     pattern.pending_tool_interaction_responses = [pending]
     if case != "missing_ledger":
-        pattern.tool_ledger["call-1"] = _waiting_ledger_record(
-            "call-1",
-            tool_name="different_tool" if case == "wrong_tool" else "approval_gate",
-            status="completed" if case == "not_waiting" else "waiting_for_user",
-            result={"success": True} if case == "not_waiting" else None,
+        pattern._store_tool_record(
+            _waiting_ledger_record(
+                "call-1",
+                tool_name="different_tool" if case == "wrong_tool" else "approval_gate",
+                status="completed" if case == "not_waiting" else "waiting_for_user",
+                result={"success": True} if case == "not_waiting" else None,
+            )
         )
     context = ExecutionContext(execution_id="invalid-resume-target")
     if case != "missing_result":
@@ -8469,7 +8498,7 @@ async def test_invalid_resume_target_is_skipped_before_callback(
     # failed to validate.
     assert context.messages == messages_before
 
-    record = pattern.tool_ledger.get("call-1")
+    record = pattern._record_for_tool_call_id("call-1")
     if case == "missing_ledger":
         # Nothing to settle and nothing to guard; the entry is simply dropped.
         assert record is None
@@ -8528,7 +8557,7 @@ async def test_invalid_resume_callback_result_fails_closed() -> None:
             "response": "Approve",
         }
     ]
-    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern._store_tool_record(_waiting_ledger_record("call-1"))
     context = ExecutionContext(execution_id="invalid-resume-return")
     context.add_tool_result(
         "approval_gate",
@@ -8545,7 +8574,10 @@ async def test_invalid_resume_callback_result_fails_closed() -> None:
     )
 
     assert pattern.pending_tool_interaction_responses == []
-    assert pattern.tool_ledger["call-1"].settlement_status == "dispatch_unknown"
+    assert (
+        pattern._record_for_tool_call_id("call-1").settlement_status
+        == "dispatch_unknown"
+    )
     assert pattern.settlement_final_answer_fence is True
     assert pattern.settlement_fence_turn_id == "approval-turn"
 
@@ -8580,7 +8612,7 @@ async def test_terminal_settlement_keeps_the_batch_final_answer_fence(
                 "response": "Approve",
             }
         )
-        pattern.tool_ledger[call_id] = _waiting_ledger_record(call_id)
+        pattern._store_tool_record(_waiting_ledger_record(call_id))
         context.add_tool_result(
             "approval_gate",
             {"success": False, "status": "waiting_for_user"},
@@ -8608,7 +8640,7 @@ async def test_terminal_settlement_keeps_the_batch_final_answer_fence(
     # The successful sibling still settled correctly on its own row and in the
     # transcript; the fence is turn-wide, not a per-row veto.
     success_id = call_ids["succeeded"]
-    success_record = pattern.tool_ledger[success_id]
+    success_record = pattern._record_for_tool_call_id(success_id)
     assert success_record.status == "completed"
     assert success_record.settlement_status == "succeeded"
     assert success_record.result == {"success": True, "post_urn": "urn:li:share:9"}
@@ -8620,7 +8652,7 @@ async def test_terminal_settlement_keeps_the_batch_final_answer_fence(
     assert len(projected) == 1
     assert projected[0].metadata["raw_result"] == success_record.result
 
-    terminal_record = pattern.tool_ledger[call_ids["terminal"]]
+    terminal_record = pattern._record_for_tool_call_id(call_ids["terminal"])
     assert terminal_record.status == "failed"
     assert terminal_record.settlement_status == terminal_status
 
@@ -8972,16 +9004,18 @@ def test_settlement_ledger_fields_survive_a_record_round_trip() -> None:
 def test_resumed_success_guards_only_its_settlement_turn() -> None:
     pattern = ReActPattern()
     args = {"text": "approved"}
-    pattern.tool_ledger["original-call"] = ToolCallRecord(
-        tool_call_id="original-call",
-        tool_name="publish",
-        args=args,
-        args_hash=pattern._args_hash(args),
-        status="completed",
-        result={"success": True},
-        settlement_status="succeeded",
-        turn_id="original-turn",
-        settlement_turn_id="approval-turn",
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="original-call",
+            tool_name="publish",
+            args=args,
+            args_hash=pattern._args_hash(args),
+            status="completed",
+            result={"success": True},
+            settlement_status="succeeded",
+            turn_id="original-turn",
+            settlement_turn_id="approval-turn",
+        )
     )
     tool = SimpleNamespace(
         non_idempotent=True,
@@ -9013,15 +9047,17 @@ def test_denied_settlement_suppresses_the_same_write_in_its_turn(
 ) -> None:
     pattern = ReActPattern()
     args = {"text": "denied"}
-    pattern.tool_ledger["original-call"] = ToolCallRecord(
-        tool_call_id="original-call",
-        tool_name="publish",
-        args=args,
-        args_hash=pattern._args_hash(args),
-        status="failed",
-        result={"success": False, "settlement_status": settlement_status},
-        settlement_status=settlement_status,
-        settlement_turn_id="approval-turn",
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="original-call",
+            tool_name="publish",
+            args=args,
+            args_hash=pattern._args_hash(args),
+            status="failed",
+            result={"success": False, "settlement_status": settlement_status},
+            settlement_status=settlement_status,
+            settlement_turn_id="approval-turn",
+        )
     )
     tool = SimpleNamespace(
         non_idempotent=True,
@@ -9048,15 +9084,17 @@ def test_plain_failed_settlement_is_not_duplicate_write_guarded() -> None:
 
     pattern = ReActPattern()
     args = {"text": "not sent"}
-    pattern.tool_ledger["original-call"] = ToolCallRecord(
-        tool_call_id="original-call",
-        tool_name="publish",
-        args=args,
-        args_hash=pattern._args_hash(args),
-        status="failed",
-        result={"success": False, "settlement_status": "failed"},
-        settlement_status="failed",
-        settlement_turn_id="approval-turn",
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="original-call",
+            tool_name="publish",
+            args=args,
+            args_hash=pattern._args_hash(args),
+            status="failed",
+            result={"success": False, "settlement_status": "failed"},
+            settlement_status="failed",
+            settlement_turn_id="approval-turn",
+        )
     )
     tool = SimpleNamespace(
         non_idempotent=True,
@@ -9135,12 +9173,14 @@ async def test_one_reply_reaches_every_resumable_interaction_in_the_batch() -> N
         {
             "tool_name": "publish_a",
             "tool_call_id": "call-a",
+            "invocation_id": None,
             "interaction_id": "approval-a",
             "response": "Approve the first one only",
         },
         {
             "tool_name": "publish_b",
             "tool_call_id": "call-b",
+            "invocation_id": None,
             "interaction_id": "approval-b",
             "response": "Approve the first one only",
         },
@@ -9360,9 +9400,9 @@ async def test_concurrent_tool_interactions_pause_in_one_deterministic_message()
         for request in pattern.waiting_for_user_request["requests"]
     ] == ["decision", "decision_2"]
     assert len(runtime.outbound_messages) == 1
-    assert pattern.tool_ledger["first-call"].status == "waiting_for_user"
-    assert pattern.tool_ledger["second-call"].status == "waiting_for_user"
-    assert pattern.tool_ledger["stale-mutation"].status == "cancelled"
+    assert pattern._record_for_tool_call_id("first-call").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("second-call").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("stale-mutation").status == "cancelled"
     assert pattern.pending_tool_calls == []
     assert mutation_tool.calls == []
 
@@ -9554,7 +9594,7 @@ async def test_react_strips_empty_final_answer_with_trailing_work_call() -> None
         message.tool_call_id for message in context.messages if message.role == "tool"
     }
     assert "call_final_0" not in assistant_tool_call_ids
-    assert "call_final_0" not in pattern.tool_ledger
+    assert "call_final_0" not in pattern.tool_call_id_index
     assert assistant_tool_call_ids <= tool_result_ids
 
 
@@ -9677,7 +9717,7 @@ async def test_react_re_requests_final_answer_for_resumed_empty_pending_call(
 
     assert result["success"] is True
     assert result["response"] == "The result is 4."
-    assert pattern.tool_ledger["call_resumed"].status == "failed"
+    assert pattern._record_for_tool_call_id("call_resumed").status == "failed"
     assert pattern.pending_tool_calls == []
     # The next turn is forced back to final_answer only.
     assert [
@@ -9791,8 +9831,8 @@ async def test_react_discards_rest_of_resumed_batch_after_empty_final_answer() -
     # The side-effecting tool never ran.
     assert tool.calls == []
     # I2: the abandoned call still got exactly one result.
-    assert pattern.tool_ledger["call_work"].status == "cancelled"
-    assert pattern.tool_ledger["call_resumed"].status == "failed"
+    assert pattern._record_for_tool_call_id("call_work").status == "cancelled"
+    assert pattern._record_for_tool_call_id("call_resumed").status == "failed"
     assert pattern.pending_tool_calls == []
 
 
@@ -9914,7 +9954,7 @@ async def test_react_resumed_empty_final_answer_survives_a_state_roundtrip() -> 
     carried = ReActPattern()
     carried.load_state(resumed.get_state())
     assert carried.force_final_answer_next is False  # cleared once answered
-    assert carried.tool_ledger["call_resumed"].status == "failed"
+    assert carried._record_for_tool_call_id("call_resumed").status == "failed"
 
 
 @pytest.mark.asyncio
@@ -9981,8 +10021,8 @@ async def test_react_resumed_reverse_batch_order_cannot_undo_an_executed_tool() 
     assert result["success"] is True
     # The work tool ran: the rejection cannot reach back past it.
     assert tool.calls == [{"expression": "2+2"}]
-    assert pattern.tool_ledger["call_work"].status == "completed"
-    assert pattern.tool_ledger["call_resumed"].status == "failed"
+    assert pattern._record_for_tool_call_id("call_work").status == "completed"
+    assert pattern._record_for_tool_call_id("call_resumed").status == "failed"
 
 
 def test_rejected_empty_final_answer_is_recorded_as_a_failure() -> None:
@@ -9996,7 +10036,7 @@ def test_rejected_empty_final_answer_is_recorded_as_a_failure() -> None:
 
     pattern._reject_empty_final_answer(tool_call, context)
 
-    recorded = pattern.tool_ledger["call_1"]
+    recorded = pattern._record_for_tool_call_id("call_1")
     assert recorded.status == "failed"
     # The recorded result carries the keys ``tool_result_succeeded`` reads, so a
     # consumer cannot read this failure back as a success.
@@ -11255,7 +11295,10 @@ async def test_react_shared_lifecycle_preserves_tool_observers(
     name: str, args: dict[str, Any], mocker: Any
 ) -> None:
     pattern = ReActPattern()
-    call = {"id": "call-1", "name": name, "args": args}
+    [call] = pattern._normalize_tool_calls(
+        [{"id": "call-1", "name": name, "args": args}]
+    )
+    original_call = dict(call)
     pattern.pending_tool_calls = [call]
     runtime = PatternRuntime()
     runtime.active_react_step_id = "step-1"
@@ -11274,13 +11317,17 @@ async def test_react_shared_lifecycle_preserves_tool_observers(
         "running",
         "completed",
     ]
-    assert pattern.tool_ledger["call-1"].status == "completed"
+    assert pattern._record_for_tool_call_id("call-1").status == "completed"
     assert len(context.get_messages_by_role("tool")) == 1
     ordinary_count = int(name == "calculator")
     assert started.call_count == ended.call_count == billed.call_count == ordinary_count
-    # Preparing execution context must not mutate an existing checkpoint's
-    # pending object or interfere with control handlers' identity comparisons.
-    assert call == {"id": "call-1", "name": name, "args": args}
+    # Execution preparation replaces the pending entry without mutating the
+    # caller-owned input retained for retries or diagnostics.
+    assert call == original_call
+    assert (
+        pattern._record_for_tool_call_id("call-1").invocation_id
+        == call["invocation_id"]
+    )
     if name in {"send_message", "ask_user_question"}:
         metadata = runtime.outbound_messages[0]["metadata"]
         assert metadata["tool_call_id"] == "call-1"
@@ -11303,12 +11350,21 @@ async def test_react_control_send_failure_settles_lifecycle_and_propagates(
     failure_type: type[BaseException], status: str, mocker: Any
 ) -> None:
     pattern = ReActPattern()
-    call = {"id": "send-1", "name": "send_message", "args": {"message": "Hi"}}
+    [call] = pattern._normalize_tool_calls(
+        [
+            {
+                "id": "send-1",
+                "name": "send_message",
+                "args": {"message": "Hi"},
+            }
+        ]
+    )
+    original_call = dict(call)
     pattern.pending_tool_calls = [call]
     failure = failure_type("send aborted")
 
     async def send(payload: dict[str, Any]) -> None:
-        assert pattern.tool_ledger["send-1"].status == "running"
+        assert pattern._record_for_tool_call_id("send-1").status == "running"
         assert payload["metadata"]["tool_call_id"] == "send-1"
         raise failure
 
@@ -11324,8 +11380,10 @@ async def test_react_control_send_failure_settles_lifecycle_and_propagates(
         "running",
         status,
     ]
-    assert pattern.tool_ledger["send-1"].error == "send aborted"
-    assert pattern.pending_tool_calls == [call]
+    assert pattern._record_for_tool_call_id("send-1").error == "send aborted"
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call == original_call
+    assert call == original_call
     assert context.get_messages_by_role("tool") == []
 
 
@@ -11389,8 +11447,8 @@ async def test_react_final_checkpoint_failure_preserves_completed_call(
         "running",
         "completed",
     ]
-    assert pattern.tool_ledger["final-1"].status == "completed"
-    assert pattern.tool_ledger["final-1"].error is None
+    assert pattern._record_for_tool_call_id("final-1").status == "completed"
+    assert pattern._record_for_tool_call_id("final-1").error is None
     assert len(context.get_messages_by_role("tool")) == 1
 
 
@@ -11461,13 +11519,15 @@ def test_react_get_state_snapshots_in_place_mutated_containers() -> None:
     pattern.repeated_tool_decision = {"d": {"deep": 1}}
     pattern.waiting_for_user_request = {"w": {"deep": 1}}
     pattern.last_response = {"r": {"deep": 1}}
-    pattern.tool_ledger["c1"] = ToolCallRecord(
-        tool_call_id="c1",
-        tool_name="t",
-        args={"nested": {"deep": [1]}},
-        args_hash="h",
-        status="completed",
-        result={"out": ["v"]},
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="c1",
+            tool_name="t",
+            args={"nested": {"deep": [1]}},
+            args_hash="h",
+            status="completed",
+            result={"out": ["v"]},
+        )
     )
 
     state = pattern.get_state()
@@ -11508,13 +11568,15 @@ def test_react_get_state_survives_a_non_copyable_tool_result() -> None:
     """
 
     pattern = ReActPattern()
-    pattern.tool_ledger["c1"] = ToolCallRecord(
-        tool_call_id="c1",
-        tool_name="t",
-        args={"a": 1},
-        args_hash="h",
-        status="completed",
-        result={"success": True, "handle": threading.Lock()},
+    pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="c1",
+            tool_name="t",
+            args={"a": 1},
+            args_hash="h",
+            status="completed",
+            result={"success": True, "handle": threading.Lock()},
+        )
     )
 
     state = pattern.get_state()
@@ -11556,3 +11618,616 @@ def test_react_get_state_is_unaffected_by_later_pop() -> None:
     assert [
         entry["interaction_id"] for entry in state["pending_tool_interaction_responses"]
     ] == ["i1", "i2"]
+
+
+def test_invocation_identity_is_fresh_per_normalized_provider_call() -> None:
+    pattern = ReActPattern()
+
+    [same_step_first] = pattern._normalize_tool_calls(
+        [{"function": {"name": "calculator", "arguments": "{}"}}]
+    )
+    [same_step_second] = pattern._normalize_tool_calls(
+        [{"function": {"name": "calculator", "arguments": "{}"}}]
+    )
+
+    assert same_step_first["id"] == same_step_second["id"] == "tool_call_0"
+    assert same_step_first["invocation_id"] != same_step_second["invocation_id"]
+    assert pattern._tool_call_for_context(same_step_first) == {
+        "id": "tool_call_0",
+        "type": "function",
+        "function": {"name": "calculator", "arguments": "{}"},
+    }
+
+
+def test_reused_provider_id_keeps_distinct_records_and_start_times() -> None:
+    pattern = ReActPattern()
+    [first] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "calculator", "args": {"value": 1}}]
+    )
+    [second] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "calculator", "args": {"value": 2}}]
+    )
+    first["step_id"] = "react_same"
+    second["step_id"] = "react_other"
+    first["issued_at"] = 100.0
+    second["issued_at"] = 200.0
+
+    pattern._record_tool_call(first, status="running")
+    pattern._record_tool_call(first, status="completed", result={"value": 1})
+    pattern._record_tool_call(second, status="running")
+
+    first_record = pattern._tool_record_for_call(first)
+    second_record = pattern._tool_record_for_call(second)
+    assert first_record is not second_record
+    assert first_record.step_id == "react_same"
+    assert second_record.step_id == "react_other"
+    assert first_record.issued_at == 100.0
+    assert second_record.issued_at == 200.0
+    assert len(pattern.tool_ledger) == 2
+
+
+def test_issued_at_is_stamped_at_normalization_and_survives_pre_execution_restore() -> (
+    None
+):
+    pattern = ReActPattern()
+    calls = pattern._normalize_tool_calls(
+        [
+            {"id": "first", "name": "calculator", "args": {}},
+            {"id": "second", "name": "calculator", "args": {}},
+        ]
+    )
+    assert calls[0]["issued_at"] == calls[1]["issued_at"]
+    assert calls[0]["issued_at"] is not None
+    pattern.pending_tool_calls = calls
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+    restored_call = restored.pending_tool_calls[0]
+    restored._record_tool_call(restored_call, status="running")
+
+    assert restored_call["issued_at"] == calls[0]["issued_at"]
+    assert restored._record_for_tool_call_id("first").issued_at == calls[0]["issued_at"]
+
+
+def test_invocation_identity_survives_checkpoint_and_legacy_rows_stay_unknown() -> None:
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "calculator", "args": {}}]
+    )
+    pattern._record_tool_call(call, status="running")
+    pattern.pending_tool_calls = [call]
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "calculator",
+            "tool_call_id": "provider-1",
+            "invocation_id": call["invocation_id"],
+            "interaction_id": "interaction-1",
+            "response": "continue",
+        }
+    ]
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+    restored_call = restored.pending_tool_calls[0]
+    restored_record = restored._tool_record_for_call(restored_call)
+    issued_at = restored_record.issued_at
+    restored._record_tool_call(
+        restored_call, status="completed", result={"success": True}
+    )
+
+    assert (
+        restored._tool_record_for_call(restored_call).invocation_id
+        == (call["invocation_id"])
+    )
+    assert restored._tool_record_for_call(restored_call).issued_at == issued_at
+    assert (
+        restored.pending_tool_interaction_responses[0]["invocation_id"]
+        == (call["invocation_id"])
+    )
+
+    legacy = ToolCallRecord.from_dict(
+        {
+            "tool_call_id": "legacy-provider-id",
+            "tool_name": "calculator",
+            "args": {},
+            "status": "completed",
+        }
+    )
+    assert legacy.invocation_id is None
+    assert legacy.issued_at is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_serial_pause_delivers_reply_without_fabricated_identity() -> (
+    None
+):
+    pattern = ReActPattern()
+    caller_owned = {
+        "id": "legacy-provider-id",
+        "name": "approval_gate",
+        "args": {"expression": "1+1"},
+    }
+    pattern.pending_tool_calls = [caller_owned]
+    context = ExecutionContext(execution_id="legacy-serial-resume")
+    runtime = PatternRuntime(execution_id="legacy-serial-resume")
+    tool = SettlementApprovalTool(
+        resume_result=ToolInteractionSettlement.succeeded(
+            {"success": True, "value": "approved"}
+        )
+    )
+
+    waiting = await pattern._execute_pending_tool_calls(
+        context=context,
+        tools=[tool],
+        llm=None,
+        runtime=runtime,
+    )
+
+    assert waiting is not None and waiting["status"] == "waiting_for_user"
+    assert caller_owned == {
+        "id": "legacy-provider-id",
+        "name": "approval_gate",
+        "args": {"expression": "1+1"},
+    }
+    record = pattern._record_for_tool_call_id("legacy-provider-id")
+    assert record.invocation_id is None
+    assert record.issued_at is None
+    tool_message = next(
+        message for message in context.messages if message.role == "tool"
+    )
+    assert "invocation_id" not in tool_message.metadata
+    request = pattern.waiting_for_user_request["requests"][0]
+    assert request["invocation_id"] is None
+
+    pattern._queue_tool_interaction_responses(
+        waiting_request=pattern.waiting_for_user_request,
+        response="Approve",
+        tools=[tool],
+    )
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert tool.resume_calls == [
+        {
+            "interaction_id": "publish-interaction-1",
+            "response": "Approve",
+        }
+    ]
+    assert pattern.pending_tool_interaction_responses == []
+    assert pattern._record_for_tool_call_id("legacy-provider-id").result == {
+        "success": True,
+        "value": "approved",
+    }
+
+
+def test_provider_compatible_projection_matches_pre_identity_dict_semantics() -> None:
+    pattern = ReActPattern()
+    calls: list[dict[str, Any]] = []
+    for provider_id, name, success in (
+        ("provider-a", "alpha", True),
+        ("provider-b", "beta", True),
+        ("provider-a", "alpha-new", False),
+        ("provider-c", "final_answer", True),
+        ("provider-b", "beta-new", True),
+    ):
+        [call] = pattern._normalize_tool_calls(
+            [{"id": provider_id, "name": name, "args": {}}]
+        )
+        calls.append(call)
+        pattern._record_tool_call(
+            call,
+            status="completed" if success else "failed",
+            result={"success": success},
+        )
+
+    expected: dict[str, ToolCallRecord] = {}
+    for call in calls:
+        expected[str(call["id"])] = pattern._tool_record_for_call(call)
+
+    projected = pattern._provider_compatible_tool_records()
+    assert [record.tool_call_id for record in projected] == list(expected)
+    assert projected == list(expected.values())
+    assert (
+        pattern._record_for_tool_call_id("provider-a").invocation_id
+        == calls[2]["invocation_id"]
+    )
+    assert (
+        pattern._record_for_tool_call_id("provider-b").invocation_id
+        == calls[4]["invocation_id"]
+    )
+    assert pattern._tool_record_for_call(calls[0]).tool_name == "alpha"
+    assert pattern._tool_record_for_call(calls[1]).tool_name == "beta"
+
+    restored = ReActPattern()
+    restored.load_state(pattern.get_state())
+    assert [
+        (record.tool_call_id, record.tool_name, record.status)
+        for record in restored._provider_compatible_tool_records()
+    ] == [
+        (record.tool_call_id, record.tool_name, record.status) for record in projected
+    ]
+    assert (
+        restored._find_tool_record(
+            tool_call_id="provider-a",
+            invocation_id=str(calls[0]["invocation_id"]),
+        ).tool_name
+        == "alpha"
+    )
+
+
+def test_provider_compatible_consumers_ignore_overwritten_invocations() -> None:
+    pattern = ReActPattern()
+    tool = SettlementApprovalTool()
+    calls: list[dict[str, Any]] = []
+    for expression in ("first", "second"):
+        [call] = pattern._normalize_tool_calls(
+            [
+                {
+                    "id": "provider-reused",
+                    "name": "approval_gate",
+                    "args": {"expression": expression},
+                }
+            ]
+        )
+        call["turn_id"] = "same-turn"
+        calls.append(call)
+        pattern._record_tool_call(
+            call,
+            status="completed",
+            result={"success": True, "value": expression},
+        )
+
+    [retry_of_overwritten] = pattern._normalize_tool_calls(
+        [
+            {
+                "id": "provider-reused",
+                "name": "approval_gate",
+                "args": {"expression": "first"},
+            }
+        ]
+    )
+    retry_of_overwritten["turn_id"] = "same-turn"
+
+    assert pattern._consecutive_work_tool_call_count() == 1
+    assert (
+        pattern._suppressed_duplicate_write_result(
+            retry_of_overwritten,
+            [tool],
+        )
+        is None
+    )
+
+
+def test_empty_invocation_id_restores_as_legacy_none() -> None:
+    record = ToolCallRecord.from_dict(
+        {
+            "tool_call_id": "legacy",
+            "tool_name": "calculator",
+            "args": {},
+            "status": "running",
+            "invocation_id": "",
+        }
+    )
+
+    assert record.invocation_id is None
+
+
+def test_record_tool_call_does_not_enrich_caller_owned_legacy_dict() -> None:
+    pattern = ReActPattern()
+    call = {"id": "legacy", "name": "calculator", "args": {}}
+
+    pattern._record_tool_call(call, status="running")
+
+    assert call == {"id": "legacy", "name": "calculator", "args": {}}
+    assert pattern._record_for_tool_call_id("legacy").invocation_id is None
+
+
+def test_cancelled_calls_keep_identity_in_message_and_ledger_without_mutation() -> None:
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [{"id": "cancelled", "name": "calculator", "args": {}}]
+    )
+    original = dict(call)
+    context = ExecutionContext(execution_id="cancelled-identity")
+
+    pattern._cancel_tool_calls([call], context, reason="cancelled by test")
+
+    [message] = context.get_messages_by_role("tool")
+    assert message.metadata["invocation_id"] == call["invocation_id"]
+    assert pattern._tool_record_for_call(call).invocation_id == call["invocation_id"]
+    assert call == original
+
+
+@pytest.mark.asyncio
+async def test_control_tool_result_keeps_additive_invocation_metadata() -> None:
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [
+            {
+                "id": "final",
+                "name": "final_answer",
+                "args": {"answer": "Done", "outcome": "completed"},
+            }
+        ]
+    )
+    pattern.pending_tool_calls = [call]
+    context = ExecutionContext(execution_id="control-identity")
+
+    result = await pattern._execute_pending_tool_calls(
+        context=context,
+        tools=[],
+        llm=None,
+        runtime=PatternRuntime(execution_id="control-identity"),
+    )
+
+    assert result is not None and result["status"] == "completed"
+    [message] = context.get_messages_by_role("tool")
+    assert message.metadata["invocation_id"] == call["invocation_id"]
+    assert pattern._tool_record_for_call(call).invocation_id == call["invocation_id"]
+
+
+def test_slice_a_settlement_consumer_remains_provider_compatible() -> None:
+    pattern = ReActPattern()
+    [first] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "approval_gate", "args": {}}]
+    )
+    [second] = pattern._normalize_tool_calls(
+        [{"id": "provider-1", "name": "approval_gate", "args": {}}]
+    )
+    for call in (first, second):
+        call.update(step_id="react_same", turn_id="original-turn")
+    pattern._record_tool_call(first, status="completed", result={"value": "first"})
+    pattern._record_tool_call(
+        second,
+        status="waiting_for_user",
+        result={"success": False, "status": "waiting_for_user"},
+    )
+
+    context = ExecutionContext(execution_id="exact-resume")
+    context.add_tool_result(
+        "approval_gate",
+        {"value": "first"},
+        "provider-1",
+        invocation_id=first["invocation_id"],
+    )
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "provider-1",
+        invocation_id=second["invocation_id"],
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "provider-1",
+            "invocation_id": second["invocation_id"],
+            "interaction_id": "interaction-2",
+            "response": "Approve",
+        }
+    ]
+    # Slice A carries identity as metadata but deliberately does not switch the
+    # settlement consumer. Two provider-identical observations therefore remain
+    # ambiguous until Slice B enables exact projection/replay.
+    with pytest.raises(RuntimeError, match="found 2"):
+        pattern._validate_tool_interaction_settlement_target(
+            pending=pattern.pending_tool_interaction_responses[0],
+            context=context,
+        )
+
+
+@pytest.mark.asyncio
+async def test_every_runtime_tool_lifecycle_event_carries_invocation_identity() -> None:
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="trace-identity", tracer=tracer)
+    cases = [
+        ("success", {"success": True}),
+        ("waiting", {"success": False, "status": "waiting_for_user"}),
+        ("error", {"success": False, "error": "failed"}),
+        ("cancelled", None),
+    ]
+
+    for label, result in cases:
+        tool_call = {
+            "id": "provider-reused",
+            "invocation_id": f"invocation-{label}",
+            "name": "calculator",
+            "args": {},
+            "step_id": "public-step",
+        }
+        await runtime.on_tool_start(tool_call=tool_call)
+        if label == "error":
+            await runtime.on_tool_error(
+                tool_call=tool_call,
+                error=RuntimeError("failed"),
+                result=result,
+            )
+        elif label == "cancelled":
+            await runtime.on_tool_cancelled(tool_call=tool_call, reason="stop")
+        else:
+            await runtime.on_tool_end(tool_call=tool_call, result=result)
+
+    tool_events = [event for event in tracer.events if "tool" in event["event_type"]]
+    assert len(tool_events) == 8
+    for (label, _), start, terminal in zip(cases, tool_events[::2], tool_events[1::2]):
+        assert start["data"]["invocation_id"] == f"invocation-{label}"
+        assert terminal["data"]["invocation_id"] == f"invocation-{label}"
+        assert start["step_id"] == terminal["step_id"] == "public-step"
+
+
+def test_find_tool_record_separates_legacy_and_identity_rows_sharing_provider_id() -> (
+    None
+):
+    pattern = ReActPattern()
+    # A pre-identity checkpoint: provider-keyed rows and no stored index.
+    pattern.load_state(
+        {
+            "tool_ledger": {
+                "shared": {
+                    "tool_call_id": "shared",
+                    "tool_name": "legacy_tool",
+                    "args": {},
+                    "status": "completed",
+                    "result": {"success": True},
+                },
+                "other": {
+                    "tool_call_id": "other",
+                    "tool_name": "other_tool",
+                    "args": {},
+                    "status": "completed",
+                    "result": {"success": True},
+                },
+            }
+        }
+    )
+    [call] = pattern._normalize_tool_calls(
+        [{"id": "shared", "name": "new_tool", "args": {}}]
+    )
+    pattern._record_tool_call(call, status="failed", result={"success": False})
+
+    legacy = pattern._find_tool_record(tool_call_id="shared", invocation_id=None)
+    exact = pattern._find_tool_record(
+        tool_call_id="shared", invocation_id=call["invocation_id"]
+    )
+    assert legacy is not None and legacy.tool_name == "legacy_tool"
+    assert exact is not None and exact.tool_name == "new_tool"
+    assert (
+        pattern._find_tool_record(tool_call_id="shared", invocation_id="unknown")
+        is None
+    )
+    assert list(pattern.tool_ledger) == ["shared", "other", call["invocation_id"]]
+    # The provider view replaces the reused id in place, as the pre-identity
+    # ledger did, so the newer row keeps the legacy row's position.
+    assert pattern._record_for_tool_call_id("shared") is exact
+    assert [
+        record.tool_name for record in pattern._provider_compatible_tool_records()
+    ] == ["new_tool", "other_tool"]
+
+
+def test_provider_index_order_survives_checkpoint_restore() -> None:
+    # A concurrent batch reusing ids from an earlier step moves them to the
+    # tail of the provider index but not of the exact ledger, so the restored
+    # order must come from the persisted index rather than the ledger order.
+    pattern = ReActPattern()
+    for provider_id in ("tool_call_0", "tool_call_1", "tool_call_2"):
+        [call] = pattern._normalize_tool_calls(
+            [{"id": provider_id, "name": "web_search", "args": {}}]
+        )
+        pattern._record_tool_call(call, status="completed", result={"success": True})
+    batch = pattern._normalize_tool_calls(
+        [
+            {"id": "tool_call_0", "name": "web_search", "args": {}},
+            {"id": "tool_call_1", "name": "web_search", "args": {}},
+        ]
+    )
+    for call in batch:
+        pattern._record_tool_call(call, status="completed", result={"success": True})
+    pattern._reorder_ledger_for_batch(batch)
+
+    restored = ReActPattern()
+    restored.load_state(json.loads(json.dumps(pattern.get_state())))
+
+    expected = ["tool_call_2", "tool_call_0", "tool_call_1"]
+    assert list(pattern.tool_call_id_index) == expected
+    assert list(restored.tool_call_id_index) == expected
+    assert restored.tool_call_id_index == pattern.tool_call_id_index
+
+
+class _CheckpointRecorder(TraceEventRecorder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.checkpoints: list[dict[str, Any]] = []
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.checkpoints.append(payload)
+
+
+def _checkpoint_metadata(tracer: _CheckpointRecorder, label: str) -> dict[str, Any]:
+    [metadata] = [
+        payload["metadata"]
+        for payload in tracer.checkpoints
+        if payload.get("label") == label
+    ]
+    return metadata
+
+
+@pytest.mark.asyncio
+async def test_delivered_and_invalid_target_checkpoints_report_the_row_identity() -> (
+    None
+):
+    pattern = ReActPattern()
+    [waiting, stale] = pattern._normalize_tool_calls(
+        [
+            {"id": "wait-call", "name": "approval_gate", "args": {}},
+            {"id": "stale-call", "name": "approval_gate", "args": {}},
+        ]
+    )
+    context = ExecutionContext(execution_id="settlement-identity")
+    for call in (waiting, stale):
+        pattern._record_tool_call(
+            call, status="waiting_for_user", result={"status": "waiting_for_user"}
+        )
+    # Only the first row has its single tool result; the second fails
+    # validation and is closed as an invalid settlement target.
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "wait-call",
+        invocation_id=waiting["invocation_id"],
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": call["id"],
+            "invocation_id": call["invocation_id"],
+            "interaction_id": "publish-interaction-1",
+            "response": "Approve",
+        }
+        for call in (waiting, stale)
+    ]
+    tracer = _CheckpointRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    runtime.active_turn_id = "approval-turn"
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+
+    delivered = _checkpoint_metadata(tracer, "tool_interaction_response_delivered")
+    skipped = _checkpoint_metadata(tracer, "tool_interaction_response_skipped")
+    assert delivered["invocation_id"] == waiting["invocation_id"]
+    assert skipped["reason"] == "invalid_settlement_target"
+    assert skipped["invocation_id"] == stale["invocation_id"]
+
+
+@pytest.mark.asyncio
+async def test_skipped_checkpoint_reports_the_queued_request_identity() -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "removed_tool",
+            "tool_call_id": "removed-call",
+            "invocation_id": "queued-invocation",
+            "interaction_id": "interaction-1",
+            "response": "Approve",
+        }
+    ]
+    tracer = _CheckpointRecorder()
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[],
+        context=ExecutionContext(execution_id="skipped-identity"),
+        runtime=PatternRuntime(tracer=tracer),
+    )
+
+    skipped = _checkpoint_metadata(tracer, "tool_interaction_response_skipped")
+    assert skipped["reason"] == "resume_callback_unavailable"
+    assert skipped["invocation_id"] == "queued-invocation"

@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from xagent.core.agent import ExecutionContext, ReActPattern
+from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
 from xagent.core.agent.pattern.react.duplicate_write_guard import (
     DUPLICATE_WRITE_SUPPRESSED_KEY,
     build_suppression_envelope,
@@ -348,6 +348,63 @@ async def test_provider_id_reuse_does_not_defeat_the_guard() -> None:
 
 
 @pytest.mark.asyncio
+async def test_suppressed_reuse_has_an_exact_row_outside_the_provider_view() -> None:
+    # Every invocation the model and the trace see must have its own ledger
+    # row, but the envelope must not displace the genuine execution as the
+    # provider-keyed evidence for the reused id.
+    class StartEndRecorder:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, Any]] = []
+
+        async def trace_event(
+            self, event_type: Any, *, data: dict[str, Any] | None = None, **_: Any
+        ) -> str:
+            data = data or {}
+            if data.get("tool_call_id") == "call_1":
+                name = getattr(event_type, "value", str(event_type))
+                self.events.append((name, data.get("invocation_id")))
+            return "event"
+
+    args = {"title": "invoice"}
+    llm = FakeLLM(
+        responses=[
+            _tool_call_response("create_record", args, "call_1"),
+            _tool_call_response("create_record", dict(args), "call_1"),
+            {"content": "Done.", "done": True},
+        ]
+    )
+    tracer = StartEndRecorder()
+    pattern = _pattern()
+    context = _turn_context()
+
+    await pattern.run(
+        context=context,
+        tools=[FakeWriteTool()],
+        llm=llm,
+        runtime=PatternRuntime(tracer=tracer),
+    )
+
+    genuine_id, suppressed_id = [
+        message.metadata["invocation_id"]
+        for message in context.messages
+        if message.role == "tool"
+    ]
+    assert genuine_id != suppressed_id
+    envelope_row = pattern.tool_ledger[suppressed_id]
+    assert envelope_row.result[DUPLICATE_WRITE_SUPPRESSED_KEY] is True
+    assert pattern.tool_ledger[genuine_id].result == {
+        "success": True,
+        "record_id": "rec-1",
+    }
+    assert pattern._record_for_tool_call_id("call_1") is pattern.tool_ledger[genuine_id]
+    assert envelope_row not in pattern._provider_compatible_tool_records()
+    suppressed_events = [
+        name for name, value in tracer.events if value == suppressed_id
+    ]
+    assert len(suppressed_events) == 2
+
+
+@pytest.mark.asyncio
 async def test_third_call_attaches_the_original_result() -> None:
     args = {"title": "invoice"}
     llm = FakeLLM(
@@ -570,10 +627,12 @@ async def test_envelope_first_ledger_order_still_attaches_the_genuine_result() -
         context=_turn_context(), tools=[FakeWriteTool()], llm=seed_llm
     )
     state = json.loads(json.dumps(seed_pattern.get_state()))
-    real_hash = state["tool_ledger"]["call_1"]["args_hash"]
+    [real_hash] = [record["args_hash"] for record in state["tool_ledger"].values()]
     envelope_record["args_hash"] = real_hash
     genuine_record["args_hash"] = real_hash
+    # A pre-identity checkpoint: provider-keyed rows and no stored index.
     state["tool_ledger"] = {"call_2": envelope_record, "call_1": genuine_record}
+    del state["tool_call_id_index"]
 
     pattern = _pattern()
     pattern.load_state(state)

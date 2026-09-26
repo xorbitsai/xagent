@@ -200,46 +200,27 @@ def _list_documents_for_user_impl(
         _safe_close_table(table)
 
 
-def _list_document_records_for_file_ids_impl(
-    file_ids: Iterable[str],
-    *,
-    user_id: Optional[int],
-    is_admin: bool,
-) -> List[DocumentRecord]:
-    """Uncapped: documents in the user's scope that reference any of ``file_ids``."""
+def _find_referenced_file_ids_impl(file_ids: Iterable[str]) -> set[str]:
+    """Uncapped: which of ``file_ids`` any document references, whatever its owner."""
     normalized_file_ids = sorted({file_id for file_id in file_ids if file_id})
     conn = get_connection_from_env()
     ensure_documents_table(conn)
-    scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
-    user_filter = UserPermissions.get_user_filter(
-        scope.user_id, is_admin=scope.is_admin
-    )
-    records: List[DocumentRecord] = []
+    referenced: set[str] = set()
     table = None
     try:
         table = conn.open_table("documents")
         for offset in range(0, len(normalized_file_ids), _ORPHAN_LOOKUP_BATCH_SIZE):
             batch = normalized_file_ids[offset : offset + _ORPHAN_LOOKUP_BATCH_SIZE]
-            combined_filter = _combine_lancedb_filters(
-                _build_file_id_in_filter(batch), user_filter
-            )
             rows = query_to_list(
                 table.search()
-                .where(combined_filter)
-                .select(["doc_id", "file_id", "user_id"])
+                .where(_build_file_id_in_filter(batch))
+                .select(["file_id"])
                 .limit(-1)
             )
-            records.extend(
-                DocumentRecord(
-                    doc_id=str(row.get("doc_id") or ""),
-                    file_id=str(row["file_id"]),
-                    user_id=None if row.get("user_id") is None else int(row["user_id"]),
-                )
-                for row in rows
-            )
+            referenced.update(str(row["file_id"]) for row in rows)
     finally:
         _safe_close_table(table)
-    return records
+    return referenced
 
 
 def _build_uploaded_filename_map_impl(
@@ -1008,18 +989,9 @@ def list_documents_for_user(
     )
 
 
-def list_document_records_for_file_ids(
-    file_ids: Iterable[str],
-    *,
-    user_id: Optional[int],
-    is_admin: bool,
-) -> List[DocumentRecord]:
-    """Uncapped: documents in the user's scope that reference any of ``file_ids``."""
-    return _get_file_compatibility_facade().list_document_records_for_file_ids(
-        file_ids,
-        user_id=user_id,
-        is_admin=is_admin,
-    )
+def find_referenced_file_ids(file_ids: Iterable[str]) -> set[str]:
+    """Uncapped: which of ``file_ids`` any document references, whatever its owner."""
+    return _get_file_compatibility_facade().find_referenced_file_ids(file_ids)
 
 
 def build_uploaded_filename_map(

@@ -4810,12 +4810,8 @@ def test_delete_document_keeps_uploaded_file_when_other_docs_still_reference_it(
         },
     ]
 
-    def _fake_referencing_records(file_ids, *, user_id, is_admin):
-        return [
-            DocumentRecord(doc_id=record["doc_id"], file_id=record["file_id"])
-            for record in document_state
-            if record["file_id"] in set(file_ids)
-        ]
+    def _fake_referenced_file_ids(file_ids):
+        return {record["file_id"] for record in document_state} & set(file_ids)
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
         document_state[:] = [
@@ -4826,8 +4822,8 @@ def test_delete_document_keeps_uploaded_file_when_other_docs_still_reference_it(
     with (
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch(
-            "xagent.web.api.kb._list_document_records_for_file_ids",
-            side_effect=_fake_referencing_records,
+            "xagent.web.api.kb._find_referenced_file_ids",
+            side_effect=_fake_referenced_file_ids,
         ),
         patch(
             "xagent.web.api.kb.delete_document",
@@ -4896,7 +4892,7 @@ def test_delete_document_skips_orphan_cleanup_when_remaining_doc_refresh_fails(
         },
     ]
 
-    def _failing_referencing_records(file_ids, *, user_id, is_admin):
+    def _failing_referenced_file_ids(file_ids):
         raise RuntimeError("refresh failed")
 
     def _fake_delete_document(collection_name, doc_id, user_id, is_admin):
@@ -4908,8 +4904,8 @@ def test_delete_document_skips_orphan_cleanup_when_remaining_doc_refresh_fails(
     with (
         patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock),
         patch(
-            "xagent.web.api.kb._list_document_records_for_file_ids",
-            side_effect=_failing_referencing_records,
+            "xagent.web.api.kb._find_referenced_file_ids",
+            side_effect=_failing_referenced_file_ids,
         ),
         patch(
             "xagent.web.api.kb.delete_document",

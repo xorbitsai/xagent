@@ -118,6 +118,7 @@ def _install_leaves(
         db, *, user_id, collection_file_ids, remaining_file_ids, collection_dir
     ):
         seen["collection_file_ids"] = collection_file_ids
+        seen["remaining_file_ids"] = remaining_file_ids
         seen["collection_dir"] = collection_dir
         _hit("del_coll_files")
 
@@ -138,9 +139,10 @@ def _install_leaves(
     def _orphan(db, *, file_id, user_id, remaining_file_ids):
         _hit("orphan")
 
-    def _refs(file_ids, *, user_id, is_admin):
+    def _refs(file_ids):
         _hit(f"refs:{sorted(file_ids)}")
-        return []
+        seen["refs_answer"] = set(file_ids)
+        return seen["refs_answer"]
 
     def _clear_status(collection, doc_id, *, user_id, is_admin):
         _hit("clear_status")
@@ -158,7 +160,7 @@ def _install_leaves(
         "_cleanup_failed_new_collection_metadata": _metadata,
         "delete_document": _delete_document,
         "_delete_uploaded_file_if_orphaned": _orphan,
-        "_list_document_records_for_file_ids": _refs,
+        "_find_referenced_file_ids": _refs,
         "clear_ingestion_status": _clear_status,
         "_restore_ingest_file_backup": _restore,
         "_delete_web_rag_side_effects_for_file_id": lambda **_kw: _hit("web_cleanup"),
@@ -344,6 +346,7 @@ async def test_whole_collection_offers_only_a_row_this_run_created(
     await _rollback(db, uploaded_file_existed_before=existed)
 
     assert seen["collection_file_ids"] == offered
+    assert seen["remaining_file_ids"] is seen["refs_answer"]
     assert seen["collection_dir"] is None
     assert f"refs:{sorted(offered)}" in calls
 

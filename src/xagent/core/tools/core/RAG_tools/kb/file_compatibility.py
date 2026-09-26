@@ -70,22 +70,10 @@ class KBFileCompatibilityFacade:
             collection_name=collection_name,
         )
 
-    def list_document_records_for_file_ids(
-        self,
-        file_ids: Iterable[str],
-        *,
-        user_id: Optional[int],
-        is_admin: bool,
-    ) -> List[DocumentRecord]:
-        from xagent.web.services.kb_file_service import (
-            _list_document_records_for_file_ids_impl,
-        )
+    def find_referenced_file_ids(self, file_ids: Iterable[str]) -> set[str]:
+        from xagent.web.services.kb_file_service import _find_referenced_file_ids_impl
 
-        return _list_document_records_for_file_ids_impl(
-            file_ids,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
+        return _find_referenced_file_ids_impl(file_ids)
 
     def build_uploaded_filename_map(
         self, db: Session, *, user_id: Optional[int], file_ids: List[str]

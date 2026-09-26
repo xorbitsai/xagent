@@ -136,10 +136,10 @@ from ..services.kb_file_service import (
     delete_uploaded_file_if_orphaned as _delete_uploaded_file_if_orphaned,
 )
 from ..services.kb_file_service import (
-    get_document_record_file_id as _get_document_record_file_id,
+    find_referenced_file_ids as _find_referenced_file_ids,
 )
 from ..services.kb_file_service import (
-    list_document_records_for_file_ids as _list_document_records_for_file_ids,
+    get_document_record_file_id as _get_document_record_file_id,
 )
 from ..services.kb_file_service import (
     list_documents_for_user as _list_documents_for_user,
@@ -1424,23 +1424,11 @@ async def _rollback_failed_ingestion(
         if uploaded_file_existed_before:
             return
         if register_created and doc_id:
-            remaining_records = _list_document_records_for_file_ids(
-                [file_record_id],
-                user_id=user_id,
-                is_admin=bool(user.is_admin),
-            )
-            remaining_file_ids = {
-                current_file_id
-                for current_file_id in (
-                    _get_document_record_file_id(record) for record in remaining_records
-                )
-                if current_file_id
-            }
             _delete_uploaded_file_if_orphaned(
                 db,
                 file_id=file_record_id,
                 user_id=user_id,
-                remaining_file_ids=remaining_file_ids,
+                remaining_file_ids=_find_referenced_file_ids([file_record_id]),
             )
             db.commit()
         else:
@@ -1491,23 +1479,11 @@ async def _rollback_failed_ingestion(
             own_file_ids = (
                 set() if uploaded_file_existed_before else collection_file_ids
             )
-            remaining_records = _list_document_records_for_file_ids(
-                own_file_ids,
-                user_id=user_id,
-                is_admin=bool(user.is_admin),
-            )
-            remaining_file_ids = {
-                file_id
-                for file_id in (
-                    _get_document_record_file_id(record) for record in remaining_records
-                )
-                if file_id
-            }
             delete_collection_uploaded_files(
                 db,
                 user_id=user_id,
                 collection_file_ids=own_file_ids,
-                remaining_file_ids=remaining_file_ids,
+                remaining_file_ids=_find_referenced_file_ids(own_file_ids),
                 collection_dir=None,
             )
             if not uploaded_file_existed_before:
@@ -1623,18 +1599,9 @@ async def _rollback_failed_cloud_ingestion(
     def _compensate_file() -> None:
         if uploaded_file_existed_before:
             return
-        remaining_records = _list_document_records_for_file_ids(
-            [file_record_id] if file_record_id is not None else [],
-            user_id=user_id,
-            is_admin=bool(user.is_admin),
+        remaining_file_ids = _find_referenced_file_ids(
+            [file_record_id] if file_record_id is not None else []
         )
-        remaining_file_ids = {
-            current_file_id
-            for current_file_id in (
-                _get_document_record_file_id(record) for record in remaining_records
-            )
-            if current_file_id
-        }
 
         if file_record_id is not None:
             _delete_uploaded_file_if_orphaned(
@@ -6581,14 +6548,8 @@ def _perform_kb_collection_delete(
                 deleted_counts=result.deleted_counts,
             )
 
-        remaining_records = _list_document_records_for_file_ids(
-            set().union(*mutation_scope.file_ids_by_owner.values()),
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        remaining_file_ids_by_owner = _group_document_file_ids_by_owner(
-            remaining_records,
-            fallback_user_id=user_id,
+        remaining_file_ids = _find_referenced_file_ids(
+            set().union(*mutation_scope.file_ids_by_owner.values())
         )
         deleted_uploaded_files = 0
         for owner_id in sorted(mutation_scope.owner_user_ids):
@@ -6604,7 +6565,7 @@ def _perform_kb_collection_delete(
                     collection_file_ids=mutation_scope.file_ids_by_owner.get(
                         owner_id, set()
                     ),
-                    remaining_file_ids=remaining_file_ids_by_owner.get(owner_id, set()),
+                    remaining_file_ids=remaining_file_ids,
                     collection_dir=collection_dir,
                 )
             else:
@@ -7523,18 +7484,7 @@ async def delete_document_api(
 
     if cleanup_candidate_file_ids:
         try:
-            remaining_records = _list_document_records_for_file_ids(
-                cleanup_candidate_file_ids,
-                user_id=user_id_int,
-                is_admin=bool(_user.is_admin),
-            )
-            remaining_file_ids = {
-                current_file_id
-                for current_file_id in (
-                    _get_document_record_file_id(record) for record in remaining_records
-                )
-                if current_file_id
-            }
+            remaining_file_ids = _find_referenced_file_ids(cleanup_candidate_file_ids)
         except Exception as exc:
             logger.warning(
                 "Failed to refresh remaining docs for orphan cleanup; skipping orphan cleanup for %s file(s): %s",

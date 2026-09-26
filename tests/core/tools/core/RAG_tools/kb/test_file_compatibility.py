@@ -25,10 +25,7 @@ def test_kb_file_compatibility_methods_match_public_helper_signatures() -> None:
             kb_file_service.upsert_uploaded_file_record,
         ),
         (facade.list_documents_for_user, kb_file_service.list_documents_for_user),
-        (
-            facade.list_document_records_for_file_ids,
-            kb_file_service.list_document_records_for_file_ids,
-        ),
+        (facade.find_referenced_file_ids, kb_file_service.find_referenced_file_ids),
         (
             facade.build_uploaded_filename_map,
             kb_file_service.build_uploaded_filename_map,

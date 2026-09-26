@@ -90,11 +90,11 @@ def _install_leaves(
     def _orphan(db, *, file_id, user_id, remaining_file_ids):
         calls.append("orphan")
 
-    def _refs(file_ids, *, user_id, is_admin):
+    def _refs(file_ids):
         calls.append(f"refs:{sorted(file_ids)}")
         if refs_error is not None:
             raise refs_error
-        return []
+        return set()
 
     async def _may_delete(**_kwargs):
         calls.append("may_delete")
@@ -119,7 +119,7 @@ def _install_leaves(
         "delete_document": _delete_document,
         "clear_ingestion_status": _clear_status,
         "_delete_uploaded_file_if_orphaned": _orphan,
-        "_list_document_records_for_file_ids": _refs,
+        "_find_referenced_file_ids": _refs,
         "_rollback_may_delete_collection": _may_delete,
         "delete_collection": _delete_collection,
         "_cleanup_failed_new_collection_metadata": _metadata_cleanup,

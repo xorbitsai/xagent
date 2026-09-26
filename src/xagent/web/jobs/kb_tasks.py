@@ -239,9 +239,11 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             context="background staged document superseded exception",
         )
         return _superseded_staged_document_result(payload)
-    except Exception:
+    except Exception as exc:
         if int(job.attempts or 0) >= int(job.max_attempts or 1):
-            _cleanup_staged_document_input(payload)
+            # Last attempt only: a retry re-registers the same doc_id and reuses
+            # its parse, chunk and embedding rows.
+            _rollback_raised_staged_document_ingestion(db, payload, exc)
         _cleanup_failed_staged_job_collection_metadata_if_current(
             db,
             payload,
@@ -695,6 +697,40 @@ def _rollback_failed_staged_document_ingestion_if_current(
         result,
         api_result=api_result,
     )
+
+
+def _rollback_raised_staged_document_ingestion(
+    db: Session,
+    payload: dict[str, Any],
+    exc: Exception,
+) -> None:
+    from ..api.kb import _raised_ingestion_rollback_result
+
+    file_id = payload.get("file_id")
+    try:
+        if not file_id or not _is_staged_document_generation_latest(db, payload):
+            return
+        result = asyncio.run(
+            _raised_ingestion_rollback_result(
+                collection_name=str(payload["collection"]),
+                file_id=str(file_id),
+                # Stamped at submit; a job queued before the stamp keeps the document.
+                document_existed_before=bool(
+                    payload.get("document_existed_before", True)
+                ),
+                message=str(exc),
+            )
+        ).model_copy(update={"file_id": str(file_id)})
+        _rollback_failed_staged_document_ingestion(
+            db, payload, result, api_result=KBApiOperationResult(result=result)
+        )
+    except BackgroundJobHandlerError:
+        raise
+    except Exception:
+        # Only the rollback's own verdict may replace the ingest error.
+        raise exc
+    finally:
+        _cleanup_staged_document_input(payload)
 
 
 def _publish_staged_document_ingestion(

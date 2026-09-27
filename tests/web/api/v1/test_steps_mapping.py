@@ -1842,3 +1842,61 @@ def test_two_full_rounds_interrupted_then_failed_close_independently():
     assert round_one_step["completed_at"] is None
     assert round_two_step["status"] == "failed"
     assert round_two_step["completed_at"] is not None
+
+
+def test_take_materialized_steps_returns_the_timeline_and_stops_retaining():
+    """The pre-warm exit, pinned in both halves.
+
+    A caller that replays history to build pairing state reads the
+    resulting timeline out exactly once and then keeps feeding the same
+    instance live events -- so it needs retention on for the read and
+    off forever after. This asserts the read returns the full timeline,
+    and that the same instance is afterwards indistinguishable from one
+    built with ``retain_finished=False``: ``materialized_steps()``
+    raises, ``feed()`` still returns what it changed, and nothing
+    accumulates.
+
+    Without the release, this projector would hold every finished
+    step's untruncated ``data`` for as long as its consumer lives.
+    """
+    projector = PublicStepProjector.from_history(
+        [
+            _ev("react_action_start", step_id="s1"),
+            _ev("react_action_end", step_id="s1", data={"success": True}),
+        ]
+    )
+    assert projector.retains_finished is True
+
+    taken = projector.take_materialized_steps()
+
+    assert [step["status"] for step in taken] == ["completed"]
+    assert projector.retains_finished is False
+    with pytest.raises(RuntimeError):
+        projector.materialized_steps()
+
+    # Still a working projector: it folds and reports, it just keeps
+    # nothing. Both halves matter -- an implementation that released
+    # retention by breaking ``feed`` would pass the assertions above.
+    changed = projector.feed(_ev("react_action_start", step_id="s2"))
+    assert len(changed) == 1
+    assert changed[0]["status"] == "running"
+    resolved = projector.feed(
+        _ev("react_action_end", step_id="s2", data={"success": True})
+    )
+    assert len(resolved) == 1
+    assert resolved[0]["status"] == "completed"
+    with pytest.raises(RuntimeError):
+        projector.materialized_steps()
+
+
+def test_take_materialized_steps_raises_on_an_already_released_projector():
+    """Calling it twice is a caller bug, not a silent empty answer: the
+    timeline it would return is gone, exactly the case
+    ``materialized_steps()`` already refuses to answer partially."""
+    projector = PublicStepProjector.from_history(
+        [_ev("react_action_start", step_id="s1")]
+    )
+    projector.take_materialized_steps()
+
+    with pytest.raises(RuntimeError):
+        projector.take_materialized_steps()

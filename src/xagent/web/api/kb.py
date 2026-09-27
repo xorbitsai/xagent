@@ -1748,46 +1748,8 @@ def _atomic_replace_file(source_path: Path, target_path: Path) -> None:
 def _mark_uploaded_file_for_reindex(file_id: str) -> bool:
     """Clear ingestion run markers so changed file can be re-indexed."""
     try:
-        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-            _safe_close_table,
-            ensure_documents_table,
-            ensure_ingestion_runs_table,
-        )
-        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
-        from ...core.tools.core.RAG_tools.utils.string_utils import (
-            escape_lancedb_string,
-        )
-        from ...providers.vector_store.lancedb import get_connection_from_env
-
-        conn = get_connection_from_env()
-        ensure_documents_table(conn)
-        ensure_ingestion_runs_table(conn)
-        documents_table = None
-        ingestion_runs_table = None
-        try:
-            documents_table = conn.open_table("documents")
-            ingestion_runs_table = conn.open_table("ingestion_runs")
-
-            safe_file_id = escape_lancedb_string(file_id)
-            rows = query_to_list(
-                documents_table.search()
-                .where(f"file_id = '{safe_file_id}'")
-                .select(["collection", "doc_id"])
-                .limit(-1)
-            )
-            for row in rows:
-                collection = str(row.get("collection") or "").strip()
-                doc_id = str(row.get("doc_id") or "").strip()
-                if not collection or not doc_id:
-                    continue
-                safe_collection = escape_lancedb_string(collection)
-                safe_doc_id = escape_lancedb_string(doc_id)
-                ingestion_runs_table.delete(
-                    f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
-                )
-        finally:
-            _safe_close_table(documents_table)
-            _safe_close_table(ingestion_runs_table)
+        for collection, doc_id in _list_document_refs_for_uploaded_file(file_id):
+            clear_ingestion_status(collection, doc_id, is_admin=True)
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -1797,18 +1759,6 @@ def _mark_uploaded_file_for_reindex(file_id: str) -> bool:
             exc_info=True,
         )
         return False
-
-
-_INGESTION_RUN_COLUMNS = (
-    "collection",
-    "doc_id",
-    "status",
-    "message",
-    "parse_hash",
-    "created_at",
-    "updated_at",
-    "user_id",
-)
 
 
 @dataclass
@@ -1821,18 +1771,6 @@ class _IngestionRunsSnapshot:
 class _RagDocumentSnapshot:
     doc_refs: List[tuple[str, str]]
     collections: List[KBDocumentRowsSnapshot]
-
-
-def _ingestion_run_filter(collection: str, doc_id: str) -> str:
-    from ...core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
-
-    safe_collection = escape_lancedb_string(collection)
-    safe_doc_id = escape_lancedb_string(doc_id)
-    return f"collection = '{safe_collection}' and doc_id = '{safe_doc_id}'"
-
-
-def _combine_lancedb_filters(filters: List[str]) -> str:
-    return " or ".join(f"({filter_expr})" for filter_expr in filters)
 
 
 def _snapshot_rag_documents_for_uploaded_file(
@@ -1899,37 +1837,9 @@ def _snapshot_ingestion_runs_for_uploaded_file(
 ) -> Optional[_IngestionRunsSnapshot]:
     """Snapshot current ingestion status rows before refreshing an existing file."""
     try:
-        from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-            _safe_close_table,
-            ensure_ingestion_runs_table,
-        )
-        from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import query_to_list
-        from ...providers.vector_store.lancedb import get_connection_from_env
-
         doc_refs = _list_document_refs_for_uploaded_file(file_id)
-        conn = get_connection_from_env()
-        ensure_ingestion_runs_table(conn)
-        ingestion_runs_table = None
-        try:
-            ingestion_runs_table = conn.open_table("ingestion_runs")
-            if doc_refs:
-                combined_filter = _combine_lancedb_filters(
-                    [
-                        _ingestion_run_filter(collection, doc_id)
-                        for collection, doc_id in doc_refs
-                    ]
-                )
-                rows = query_to_list(
-                    ingestion_runs_table.search()
-                    .where(combined_filter)
-                    .select(list(_INGESTION_RUN_COLUMNS))
-                    .limit(-1)
-                )
-            else:
-                rows = []
-            return _IngestionRunsSnapshot(doc_refs=doc_refs, rows=rows)
-        finally:
-            _safe_close_table(ingestion_runs_table)
+        rows = _get_api_compatibility_facade().load_ingestion_status_rows(doc_refs)
+        return _IngestionRunsSnapshot(doc_refs=doc_refs, rows=rows)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Failed to snapshot ingestion runs before web file refresh: file_id=%s, error=%s",
@@ -1942,29 +1852,9 @@ def _snapshot_ingestion_runs_for_uploaded_file(
 
 def _restore_ingestion_runs_snapshot(snapshot: _IngestionRunsSnapshot) -> None:
     """Restore ingestion status rows after a failed existing-file refresh."""
-    from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-        _safe_close_table,
-        ensure_ingestion_runs_table,
+    _get_api_compatibility_facade().replace_ingestion_status_rows(
+        snapshot.doc_refs, snapshot.rows
     )
-    from ...providers.vector_store.lancedb import get_connection_from_env
-
-    conn = get_connection_from_env()
-    ensure_ingestion_runs_table(conn)
-    ingestion_runs_table = None
-    try:
-        ingestion_runs_table = conn.open_table("ingestion_runs")
-        if snapshot.doc_refs:
-            combined_filter = _combine_lancedb_filters(
-                [
-                    _ingestion_run_filter(collection, doc_id)
-                    for collection, doc_id in snapshot.doc_refs
-                ]
-            )
-            ingestion_runs_table.delete(combined_filter)
-        if snapshot.rows:
-            ingestion_runs_table.add(snapshot.rows)
-    finally:
-        _safe_close_table(ingestion_runs_table)
 
 
 _UPLOADED_FILE_ROLLBACK_FIELDS = (

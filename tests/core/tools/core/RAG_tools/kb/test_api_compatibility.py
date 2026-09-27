@@ -534,10 +534,18 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
     class StatusStore:
         def __init__(self) -> None:
             self.renamed: list[dict[str, object]] = []
+            self.row_calls: list[tuple[object, ...]] = []
 
         def rename_collection_status(self, **kwargs: object) -> list[str]:
             self.renamed.append(kwargs)
             return ["status warning"]
+
+        def load_ingestion_status_rows(self, doc_refs: object) -> list[str]:
+            self.row_calls.append(("load", doc_refs))
+            return ["status row"]
+
+        def replace_ingestion_status_rows(self, doc_refs: object, rows: object) -> None:
+            self.row_calls.append(("replace", doc_refs, rows))
 
     outer_metadata = MetadataStore()
     outer_vector = VectorStore()
@@ -556,6 +564,8 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
             is_admin=False,
         ) == ["record"]
         assert facade.list_document_records_by_file_ids(["f"]) == ["by-file"]
+        assert facade.load_ingestion_status_rows([("old", "d")]) == ["status row"]
+        facade.replace_ingestion_status_rows([("old", "d")], ["status row"])
         await facade.save_collection_config(
             collection="old",
             config_json="{}",
@@ -604,6 +614,7 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
     assert outer_metadata.deleted_metadata == []
     assert outer_metadata.renamed == []
     assert outer_status.renamed == []
+    assert outer_status.row_calls == []
 
     assert inner_vector.list_calls == [
         {"collection_name": "old", "user_id": 7, "is_admin": False}
@@ -633,6 +644,10 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
     ]
     assert inner_status.renamed == [
         {"old_name": "old", "new_name": "new", "user_id": 7, "is_admin": False}
+    ]
+    assert inner_status.row_calls == [
+        ("load", [("old", "d")]),
+        ("replace", [("old", "d")], ["status row"]),
     ]
 
 

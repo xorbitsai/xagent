@@ -1613,6 +1613,28 @@ class IngestionStatusStore(ABC):
         """
 
     @abstractmethod
+    def load_ingestion_status_rows(
+        self, doc_refs: Sequence[Tuple[str, str]]
+    ) -> List[Dict[str, Any]]:
+        """Every status row of ``doc_refs`` (``(collection, doc_id)`` pairs).
+
+        Uncapped and whatever the owner. Rows carry the eight status columns
+        as stored, timestamps included, for :meth:`replace_ingestion_status_rows`.
+        """
+
+    @abstractmethod
+    def replace_ingestion_status_rows(
+        self,
+        doc_refs: Sequence[Tuple[str, str]],
+        rows: Sequence[Dict[str, Any]],
+    ) -> None:
+        """Delete every status row of ``doc_refs``, whatever its owner, then add ``rows``.
+
+        Unlike :meth:`write_ingestion_status`, ``rows`` are written as given,
+        timestamps included.
+        """
+
+    @abstractmethod
     def rename_collection_status(
         self,
         old_name: str,

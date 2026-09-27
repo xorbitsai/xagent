@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import (
@@ -816,6 +816,24 @@ class KBApiCompatibilityFacade:
             from ..storage.factory import get_vector_index_store
 
             return get_vector_index_store().list_document_records_by_file_ids(file_ids)
+
+    def load_ingestion_status_rows(
+        self, doc_refs: Sequence[tuple[str, str]]
+    ) -> list[dict[str, Any]]:
+        with self._storage_context():
+            from ..storage.factory import get_ingestion_status_store
+
+            return get_ingestion_status_store().load_ingestion_status_rows(doc_refs)
+
+    def replace_ingestion_status_rows(
+        self,
+        doc_refs: Sequence[tuple[str, str]],
+        rows: Sequence[dict[str, Any]],
+    ) -> None:
+        with self._storage_context():
+            from ..storage.factory import get_ingestion_status_store
+
+            get_ingestion_status_store().replace_ingestion_status_rows(doc_refs, rows)
 
     def delete_document(
         self,

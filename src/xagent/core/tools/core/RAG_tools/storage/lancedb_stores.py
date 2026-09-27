@@ -62,6 +62,16 @@ from .logging_utils import log_audit, log_performance
 logger = logging.getLogger(__name__)
 
 _FILE_ID_LOOKUP_BATCH_SIZE = 200
+_INGESTION_STATUS_COLUMNS = (
+    "collection",
+    "doc_id",
+    "status",
+    "message",
+    "parse_hash",
+    "created_at",
+    "updated_at",
+    "user_id",
+)
 
 
 def _fragment_count(table: Any) -> int:
@@ -3957,6 +3967,46 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         finally:
             _safe_close_table(table)
 
+    def load_ingestion_status_rows(
+        self, doc_refs: Sequence[Tuple[str, str]]
+    ) -> List[Dict[str, Any]]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_sync_connection()
+        self._ensure_ingestion_runs_table(conn)
+        table = None
+        try:
+            table = conn.open_table("ingestion_runs")
+            if not doc_refs:
+                return []
+            return query_to_list(
+                table.search()
+                .where(self._build_doc_refs_filter(doc_refs))
+                .select(list(_INGESTION_STATUS_COLUMNS))
+                .limit(-1)
+            )
+        finally:
+            _safe_close_table(table)
+
+    def replace_ingestion_status_rows(
+        self,
+        doc_refs: Sequence[Tuple[str, str]],
+        rows: Sequence[Dict[str, Any]],
+    ) -> None:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_sync_connection()
+        self._ensure_ingestion_runs_table(conn)
+        table = None
+        try:
+            table = conn.open_table("ingestion_runs")
+            if doc_refs:
+                table.delete(self._build_doc_refs_filter(doc_refs))
+            if rows:
+                table.add(list(rows))
+        finally:
+            _safe_close_table(table)
+
     # Deprecated: use KBCollectionHandle.rename_collection_status instead. Remove in #514.
     def rename_collection_status(
         self,
@@ -4080,6 +4130,12 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         safe_collection = escape_lancedb_string(collection)
         safe_doc_id = escape_lancedb_string(doc_id)
         return f"collection == '{safe_collection}' AND doc_id == '{safe_doc_id}'"
+
+    def _build_doc_refs_filter(self, doc_refs: Sequence[Tuple[str, str]]) -> str:
+        return " or ".join(
+            f"({self._build_base_filter(collection, doc_id)})"
+            for collection, doc_id in doc_refs
+        )
 
     def _build_load_filter(
         self,

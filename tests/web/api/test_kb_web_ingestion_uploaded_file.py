@@ -32,6 +32,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.file_storage.factory import get_unscoped_file_storage
+from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+    ensure_documents_table,
+    ensure_ingestion_runs_table,
+)
+from xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.web.api.kb import (
     _WEB_FILE_LOCKS,
     _atomic_replace_file,
@@ -2098,54 +2103,37 @@ class TestWebFileRefreshHelpers:
 
         assert processed_urls["hash-key"] == "new-file-id"
 
-    def test_mark_uploaded_file_for_reindex_clears_ingestion_runs(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        deleted_filters: list[str] = []
-
-        class _FakeTable:
-            def search(self):
-                return self
-
-            def where(self, _expr: str):
-                return self
-
-            def select(self, _fields: list[str]):
-                return self
-
-            def limit(self, _value: int):
-                return self
-
-            def delete(self, expr: str) -> None:
-                deleted_filters.append(expr)
-
-        class _FakeConn:
-            def open_table(self, _name: str):
-                return _FakeTable()
-
-        monkeypatch.setattr(
-            "xagent.providers.vector_store.lancedb.get_connection_from_env",
-            lambda: _FakeConn(),
+    def test_mark_uploaded_file_for_reindex_clears_ingestion_runs(self) -> None:
+        conn = get_connection_from_env()
+        ensure_documents_table(conn)
+        conn.open_table("documents").add(
+            [
+                {"collection": "kb", "doc_id": "doc-1", "file_id": "file-123"},
+                {"collection": "kb2", "doc_id": "doc-2", "file_id": "file-123"},
+            ]
         )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_documents_table",
-            lambda _conn: None,
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_ingestion_runs_table",
-            lambda _conn: None,
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.query_to_list",
-            lambda _query: [{"collection": "kb", "doc_id": "doc-1"}],
+        ensure_ingestion_runs_table(conn)
+        conn.open_table("ingestion_runs").add(
+            [
+                {"collection": c, "doc_id": d, "status": "success", "user_id": u}
+                for c, d, u in [
+                    ("kb", "doc-1", 1),
+                    ("kb", "doc-1", None),
+                    ("kb2", "doc-2", 2),
+                    ("kb", "doc-2", 1),
+                    ("kb2", "doc-1", 2),
+                ]
+            ]
         )
 
         marked = _mark_uploaded_file_for_reindex("file-123")
 
         assert marked is True
-        assert len(deleted_filters) == 1
-        assert "collection = 'kb'" in deleted_filters[0]
-        assert "doc_id = 'doc-1'" in deleted_filters[0]
+        left = conn.open_table("ingestion_runs").search().limit(-1).to_list()
+        assert sorted((r["collection"], r["doc_id"]) for r in left) == [
+            ("kb", "doc-2"),
+            ("kb2", "doc-1"),
+        ]
 
     def test_refresh_fails_when_ingestion_run_snapshot_fails(
         self,

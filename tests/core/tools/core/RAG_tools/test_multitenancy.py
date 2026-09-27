@@ -1069,8 +1069,8 @@ class TestAPIMultiTenancy:
 
         mock_delete_collection.assert_called_once_with("team", 999, True)
         assert mock_delete_collection_physical_dir.call_args_list == [
-            call(user_id=101, collection_name="team"),
-            call(user_id=202, collection_name="team"),
+            call(ANY, user_id=101, collection_name="team"),
+            call(ANY, user_id=202, collection_name="team"),
         ]
         assert mock_delete_collection_uploaded_files.call_args_list == [
             call(
@@ -1325,6 +1325,7 @@ class TestAPIMultiTenancy:
             )
 
         mock_delete_collection_physical_dir.assert_called_once_with(
+            ANY,
             user_id=101,
             collection_name="team",
         )
@@ -1397,6 +1398,7 @@ class TestAPIMultiTenancy:
             )
 
         mock_delete_collection_physical_dir.assert_called_once_with(
+            ANY,
             user_id=101,
             collection_name="team",
         )

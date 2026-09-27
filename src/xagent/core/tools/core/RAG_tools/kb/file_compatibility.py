@@ -149,6 +149,7 @@ class KBFileCompatibilityFacade:
 
     def delete_collection_physical_dir(
         self,
+        db: Session,
         *,
         user_id: int,
         collection_name: str,
@@ -158,6 +159,7 @@ class KBFileCompatibilityFacade:
         )
 
         return _delete_collection_physical_dir_impl(
+            db,
             user_id=user_id,
             collection_name=collection_name,
         )

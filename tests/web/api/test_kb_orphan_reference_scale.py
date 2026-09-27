@@ -430,26 +430,44 @@ def test_deleting_own_document_never_deletes_another_owners_file(
     assert path.exists()
 
 
-def test_collection_delete_still_removes_referenced_file_in_its_directory(
-    test_env, temp_uploads
+@pytest.mark.parametrize(
+    "other_owner",
+    ["self", OTHER_TENANT, None],
+    ids=["same-owner", "other-tenant", "unowned"],
+)
+def test_collection_delete_keeps_referenced_file_in_its_directory(
+    test_env, temp_uploads, other_owner
 ):
     app, headers, user, sessions = test_env
     # Resolved: the directory pass compares against the resolved collection path.
-    path = temp_uploads.resolve() / f"user_{user.id}" / "team" / "shared.txt"
+    collection_dir = temp_uploads.resolve() / f"user_{user.id}" / "team"
+    path = collection_dir / "shared.txt"
     file_id = _uploaded(sessions, user.id, path)
     _documents().add(
         [
             _doc("team", "doc-team", file_id, user.id),
-            _doc("theirs", "doc-theirs", file_id, OTHER_TENANT),
+            _doc(
+                "theirs",
+                "doc-theirs",
+                file_id,
+                user.id if other_owner == "self" else other_owner,
+            ),
         ]
     )
 
     response = _delete_via_api(app, headers, "/api/kb/collections/team")
 
     assert response.status_code == 200, response.text
-    # Current behavior, not desired: #2662 item 7.
-    assert not _row_exists(sessions, file_id)
-    assert not path.exists()
+    session = sessions()
+    try:
+        kept = Path(
+            session.query(UploadedFile).filter_by(file_id=file_id).one().storage_path
+        )
+    finally:
+        session.close()
+    assert not collection_dir.exists()
+    assert collection_dir not in kept.parents
+    assert kept.read_text() == "content"
 
 
 def test_reference_lookup_returns_referenced_candidates_of_any_owner(

@@ -111,7 +111,7 @@ def _install_leaves(
         _hit("delete_collection")
         return SimpleNamespace(status=collection_status, message="boom")
 
-    def _physdir(*, user_id, collection_name):
+    def _physdir(_db, *, user_id, collection_name):
         _hit("physdir")
         return SimpleNamespace(
             status=physdir[0], error=physdir[1], collection_dir=Path("/uploads/coll")

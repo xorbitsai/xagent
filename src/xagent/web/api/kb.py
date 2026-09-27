@@ -1491,6 +1491,7 @@ async def _rollback_failed_ingestion(
             )
 
             physical_cleanup = delete_collection_physical_dir(
+                db,
                 user_id=user_id,
                 collection_name=collection_name,
             )
@@ -6550,11 +6551,14 @@ def _perform_kb_collection_delete(
         result = delete_collection(safe_collection, user_id, is_admin)
 
         physical_cleanup_by_owner = {}
-        for owner_id in sorted(mutation_scope.owner_user_ids):
-            physical_cleanup_by_owner[owner_id] = delete_collection_physical_dir(
-                user_id=owner_id,
-                collection_name=safe_collection,
-            )
+        # An error result deleted no document, so nothing under the directory moves.
+        if result.status != "error":
+            for owner_id in sorted(mutation_scope.owner_user_ids):
+                physical_cleanup_by_owner[owner_id] = delete_collection_physical_dir(
+                    db,
+                    user_id=owner_id,
+                    collection_name=safe_collection,
+                )
 
         if result.status == "error":
             cleanup_warnings = list(result.warnings) if result.warnings else []

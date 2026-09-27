@@ -66,6 +66,155 @@ async def test_authentication_failure_survives_output_filtering():
     assert tool_result_requires_authentication(result)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args,final_url,classified",
+    [
+        ({}, None, True),
+        ({"url": "https://TEST.invalid:443/other"}, None, True),
+        ({"url": "https://other.invalid"}, None, False),
+        ({"url": "http://test.invalid"}, None, False),
+        ({"url": "https://test.invalid:8443"}, None, False),
+        ({}, "https://other.invalid/login", False),
+        ({}, "https://test.invalid/login", True),
+        ({"headers": {"Authorization": "Bearer caller"}}, None, False),
+        ({"headers": {"authorization": "Bearer caller"}}, None, False),
+        ({"headers": {"Authorization": ""}}, None, False),
+        ({"headers": {"X-API-Key": "caller"}}, None, False),
+        ({"headers": {"Accept": "application/json"}}, None, True),
+        ({"headers": {"Authorization": "Bearer configured"}}, None, True),
+        ({"params": {"api_key": "caller"}}, None, False),
+        ({"url": "https://caller:password@test.invalid"}, None, False),
+        ({"url": "https://test.invalid?token=caller"}, None, False),
+    ],
+)
+async def test_401_classification_requires_the_configured_connection(
+    args, final_url, classified
+):
+    tool = CustomApiTool(
+        name="test",
+        description="test",
+        env={},
+        url="https://test.invalid",
+        headers={"Authorization": "Bearer configured"},
+    )
+    original = {
+        "success": False,
+        "status_code": 401,
+        "headers": {},
+        "body": {"detail": "denied"},
+        "error": "HTTP 401",
+    }
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api",
+        return_value={**original, "final_url": final_url},
+    ) as request:
+        result = await tool.run_json_async(args)
+
+    request.assert_awaited_once()
+    assert {key: result[key] for key in original} == original
+    assert tool_result_requires_authentication(result) is classified
+    if not classified:
+        assert result == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [None, "https://test.invalid:invalid"])
+async def test_401_without_a_usable_configured_endpoint_is_not_a_connection_failure(
+    url,
+):
+    tool = CustomApiTool(name="test", description="test", env={}, url=url)
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api",
+        return_value={"success": False, "status_code": 401, "error": "HTTP 401"},
+    ):
+        result = await tool.run_json_async({"url": "https://test.invalid"})
+
+    assert result["status_code"] == 401
+    assert not tool_result_requires_authentication(result)
+
+
+@pytest.mark.asyncio
+async def test_401_after_transport_strips_credentials_is_not_a_connection_failure():
+    tool = CustomApiTool(
+        name="test",
+        description="test",
+        env={},
+        url="https://test.invalid",
+        headers={"Authorization": "Bearer configured"},
+    )
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api",
+        return_value={
+            "success": False,
+            "status_code": 401,
+            "error": "HTTP 401",
+            "final_url": "https://test.invalid/login",
+            "final_request_has_credential": False,
+        },
+    ):
+        result = await tool.run_json_async({})
+
+    assert result["status_code"] == 401
+    assert not tool_result_requires_authentication(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args,classified",
+    [
+        ({"params": {"store": "A"}}, True),
+        ({"params": {"api_key": "configured"}}, True),
+        ({"params": {"api_key": "caller"}}, False),
+        ({"params": {"api_key": ""}}, False),
+        ({"url": "https://test.invalid/other"}, False),
+    ],
+)
+async def test_401_preserves_configured_query_credentials(args, classified):
+    tool = CustomApiTool(
+        name="test",
+        description="test",
+        env={"TOKEN": "configured"},
+        url="https://test.invalid?api_key=$TOKEN",
+    )
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api",
+        return_value={"success": False, "status_code": 401, "error": "HTTP 401"},
+    ):
+        result = await tool.run_json_async(args)
+
+    assert result["status_code"] == 401
+    assert tool_result_requires_authentication(result) is classified
+
+
+@pytest.mark.asyncio
+async def test_401_with_runtime_authorization_uses_the_effective_header():
+    tool = CustomApiTool(
+        name="test",
+        description="test",
+        env={},
+        url="https://test.invalid",
+        runtime_bindings=[
+            {
+                "source": {"input_type": "secrets", "key": "authorization"},
+                "target": {"target_type": "headers", "key": "Authorization"},
+            }
+        ],
+        connector_runtime={"secrets": {"authorization": "Bearer runtime"}},
+        allow_delegated_authorization=True,
+    )
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api",
+        return_value={"success": False, "status_code": 401, "error": "HTTP 401"},
+    ) as request:
+        result = await tool.run_json_async(
+            {"headers": {"Authorization": "Bearer caller"}}
+        )
+
+    assert request.call_args.kwargs["headers"] == {"Authorization": "Bearer runtime"}
+    assert tool_result_requires_authentication(result)
+
+
 def test_custom_api_tool_init():
     tool = CustomApiTool(
         name="my-test api",

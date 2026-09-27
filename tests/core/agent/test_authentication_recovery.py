@@ -1,9 +1,12 @@
 """Configured API authentication failures pause once and resume by replanning."""
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import BaseModel
 
 from xagent.core.agent import (
     DAGPattern,
@@ -52,10 +55,9 @@ def http_result(status: int) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("resume_action", ["reauthorize", "change_scope", "use_export"])
 async def test_401_pauses_cancels_fallback_and_replans_after_checkpoint(
-    monkeypatch, parallel, resume_action
+    monkeypatch, resume_action
 ):
     request = AsyncMock(return_value=http_result(401))
     monkeypatch.setattr(
@@ -76,7 +78,7 @@ async def test_401_pauses_cancels_fallback_and_replans_after_checkpoint(
             }
         ]
     )
-    pattern = ReActPattern(max_iterations=6, tool_parallel_enabled=parallel)
+    pattern = ReActPattern(max_iterations=6)
     runtime = PatternRuntime()
     context = ExecutionContext()
     context.add_user_message("Read store A's records.")
@@ -136,6 +138,78 @@ async def test_401_pauses_cancels_fallback_and_replans_after_checkpoint(
         assert request.call_args.kwargs["headers"] == {"Authorization": "updated"}
     fallback_request.assert_not_awaited()
     assert "Read store A's records." in str(resumed_llm.calls[0]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_concurrent_authentication_pause_keeps_sibling_and_cancels_fallback(
+    monkeypatch,
+):
+    sibling_started = asyncio.Event()
+
+    class EmptyArgs(BaseModel):
+        pass
+
+    class SafeTool:
+        def __init__(self, name):
+            self.metadata = SimpleNamespace(
+                name=name, description=name, concurrency_safe=True
+            )
+
+        def args_type(self):
+            return EmptyArgs
+
+        async def run_json_async(self, args):
+            if self.metadata.name == "auth_read":
+                # Neither call can finish this batch if dispatch is serial.
+                await sibling_started.wait()
+                return {
+                    "success": False,
+                    "is_error": True,
+                    "failure_code": "authentication_required",
+                    "error": "HTTP 401",
+                }
+            sibling_started.set()
+            return {"success": True, "records": [1]}
+
+    fallback = APITool()
+    request = AsyncMock()
+    monkeypatch.setattr(fallback._client, "call_api", request)
+    llm = ScriptedLLM(
+        [
+            {
+                "tool_calls": [
+                    tool_call("auth_read", "auth"),
+                    tool_call("other_read", "sibling"),
+                    tool_call(fallback.name, "fallback", url="https://records.invalid"),
+                ]
+            }
+        ]
+    )
+    pattern = ReActPattern(max_iterations=4, tool_parallel_enabled=True)
+    runtime = PatternRuntime()
+    context = ExecutionContext()
+    context.add_user_message("Read both sources.")
+
+    result = await asyncio.wait_for(
+        pattern.run(
+            context=context,
+            tools=[SafeTool("auth_read"), SafeTool("other_read"), fallback],
+            llm=llm,
+            runtime=runtime,
+        ),
+        timeout=5,
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert len(llm.calls) == 1
+    assert any(c["label"] == "before_tool_batch" for c in runtime.checkpoints)
+    assert pattern.tool_ledger["auth"].status == "waiting_for_user"
+    assert pattern.tool_ledger["sibling"].status == "completed"
+    assert pattern.tool_ledger["sibling"].result["records"] == [1]
+    assert pattern.tool_ledger["fallback"].status == "cancelled"
+    assert runtime.checkpoints[-1]["pattern_state"]["pending_tool_calls"] == []
+    assert len(runtime.outbound_messages) == 1
+    request.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import os
 import tempfile
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import create_engine
@@ -16,6 +17,7 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
     _CHILD_NO_ANSWER_MESSAGE,
     AgentTool,
 )
+from xagent.core.tools.adapters.vibe.api_tool_adapter import CustomApiTool
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
@@ -1214,15 +1216,78 @@ def _real_delegated_agent_tool(
 
 
 @pytest.mark.asyncio
-async def test_agent_tool_real_pausing_child_fails_closed(monkeypatch, tmp_path):
-    """A real ReAct child that asks the user a question fails closed end to end.
+async def test_agent_tool_real_child_reports_auth_failure_without_nested_pause(
+    monkeypatch, tmp_path
+):
+    import xagent.core.tools.adapters.vibe.factory as factory_module
 
-    The classifier must work against the actual shape
-    ``AgentExecutionAdapter._normalize_result`` produces from a real pattern
-    run, not just against hand-built dicts.
-    """
+    api = CustomApiTool(
+        name="records",
+        description="Read records",
+        env={},
+        url="https://records.invalid",
+        headers={"Authorization": "Bearer expired"},
+    )
+    request = AsyncMock(
+        return_value={"success": False, "status_code": 401, "error": "HTTP 401"}
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api", request
+    )
 
-    llm = _StubSingleCallLLM(
+    class AuthReportingLLM:
+        model_name = "stub-model"
+        calls = 0
+
+        async def chat(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "tool_calls": [{"id": "read", "name": api.name, "arguments": {}}]
+                }
+            assert "authentication_required" in str(kwargs["messages"])
+            assert api.name in str(kwargs["messages"])
+            return {
+                "tool_calls": [
+                    {
+                        "id": "answer",
+                        "name": "final_answer",
+                        "arguments": {
+                            "answer": "Records unavailable: authorization failed."
+                        },
+                    }
+                ]
+            }
+
+    llm = AuthReportingLLM()
+    tool = _real_delegated_agent_tool(monkeypatch, tmp_path, llm)
+
+    async def connector_tools(*_args, **_kwargs):
+        return [api]
+
+    monkeypatch.setattr(factory_module.ToolFactory, "create_all_tools", connector_tools)
+    result = await tool.run_json_async({"task": "Read records or report the blocker."})
+
+    request.assert_awaited_once()
+    assert llm.calls == 2
+    assert "authorization failed" in result["response"]
+    assert result.get("failure_code") != "unsupported_nested_interaction"
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_real_child_cannot_request_user_interaction(
+    monkeypatch, tmp_path
+):
+    """A delegated child cannot expose or park on interaction controls."""
+
+    class NonInteractiveLLM(_StubSingleCallLLM):
+        async def chat(self, **kwargs):
+            names = {schema["function"]["name"] for schema in kwargs["tools"]}
+            assert "ask_user_question" not in names
+            assert "send_message" not in names
+            return await super().chat(**kwargs)
+
+    llm = NonInteractiveLLM(
         {
             "content": "",
             "tool_calls": [
@@ -1239,13 +1304,15 @@ async def test_agent_tool_real_pausing_child_fails_closed(monkeypatch, tmp_path)
             "done": False,
         }
     )
-    tool = _real_delegated_agent_tool(monkeypatch, tmp_path, llm)
+    tool = _real_delegated_agent_tool(
+        monkeypatch, tmp_path, llm, execution_mode="flash"
+    )
 
     result = await tool.run_json_async({"task": "run"})
 
-    assert result["failure_code"] == "unsupported_nested_interaction"
     assert result["status"] == "error"
     assert result["success"] is False
+    assert llm.calls > 0
 
 
 @pytest.mark.asyncio

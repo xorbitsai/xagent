@@ -2578,6 +2578,10 @@ class AgentTool(AbstractBaseTool):
                     vision_llm=vision_llm,
                     compact_llm=compact_llm,
                     memory_enabled=False,
+                    # One-shot delegated calls cannot forward or resume a
+                    # user interaction. Keep failures available to the child
+                    # for reporting instead of parking an unreachable run.
+                    user_interaction_enabled=False,
                     tool_config=tool_config,
                     pattern=get_agent_pattern_for_execution_mode(agent_execution_mode),
                     id=execution_task_id,

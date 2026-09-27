@@ -7,10 +7,11 @@ import logging
 import re
 from typing import Any, Dict, List, Literal, Mapping, Optional, Type
 
+import httpx
 from pydantic import BaseModel, Field, model_validator
 
 from ....utils.encryption import decrypt_value
-from ...core.api_tool import call_api
+from ...core.api_tool import call_api, has_auth_credentials
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .connector_runtime import (
     MISSING_RUNTIME_VALUE,
@@ -350,10 +351,17 @@ class CustomApiTool(AbstractBaseTool):
                 body=result.get("body"),
                 error=result.get("error"),
             )
-            # Only the real transport status classifies the failure. A 403 may
-            # be a resource-specific policy denial; response text is not an
-            # authentication signal. The runtime decides whether to pause.
-            if response.status_code == 401:
+            # Only attribute a real 401 to this connection when the caller
+            # has not changed its origin or credentials. A 403 or response
+            # text alone is not an authentication signal.
+            if response.status_code == 401 and self._used_configured_connection(
+                url=url,
+                params=params,
+                headers=headers,
+                runtime_headers=runtime_headers,
+                response_url=result.get("final_url") or url,
+                response_has_credential=result.get("final_request_has_credential"),
+            ):
                 response.success = False
                 response.is_error = True
                 response.failure_code = "authentication_required"
@@ -372,6 +380,76 @@ class CustomApiTool(AbstractBaseTool):
                 body=None,
                 error="Error executing Custom API.",
             ).model_dump(exclude_unset=True)
+
+    def _used_configured_connection(
+        self,
+        *,
+        url: str,
+        params: Dict[str, Any],
+        headers: Dict[str, str],
+        runtime_headers: Dict[str, str],
+        response_url: str,
+        response_has_credential: bool | None,
+    ) -> bool:
+        """Attribute authentication only; never restrict the outgoing request."""
+        if not self._default_url:
+            return False
+        try:
+            configured = httpx.URL(self._replace_secrets(self._default_url))
+            requested = httpx.URL(url).copy_merge_params(params)
+            responded = httpx.URL(response_url)
+        except httpx.InvalidURL:
+            return False
+        origin = (configured.scheme, configured.host, configured.port)
+        if any(
+            (target.scheme, target.host, target.port) != origin
+            for target in (requested, responded)
+        ):
+            return False
+        # A redirect chain can strip credentials even if it ends back on the
+        # configured origin. The transport records what actually arrived.
+        if response_has_credential is False and has_auth_credentials(
+            str(requested), headers
+        ):
+            return False
+        if requested.userinfo != configured.userinfo:
+            return False
+        auth_query_names = {
+            key
+            for key in set(configured.params) | set(requested.params)
+            if has_auth_credentials(
+                str(
+                    requested.copy_with(userinfo=b"", query=None).copy_add_param(
+                        key, "value"
+                    )
+                ),
+                None,
+            )
+        }
+        if any(
+            requested.params.get_list(key) != configured.params.get_list(key)
+            for key in auth_query_names
+        ):
+            return False
+
+        configured_headers = {
+            key.lower(): self._replace_secrets(value)
+            for key, value in {**self._default_headers, **runtime_headers}.items()
+        }
+        # Check each spelling separately: HTTP header names are case-insensitive,
+        # and differently cased duplicates must not hide a caller override.
+        if any(
+            key.lower() in configured_headers
+            and value != configured_headers[key.lower()]
+            for key, value in headers.items()
+        ):
+            return False
+        added_headers = {
+            key: value
+            for key, value in headers.items()
+            if key.lower() not in configured_headers
+        }
+        return not has_auth_credentials("", added_headers)
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         try:

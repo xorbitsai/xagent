@@ -2343,7 +2343,7 @@ class ReActPattern(AgentPattern):
         interrupted mid-run has already been counted. Resuming replays that
         same call, recognized by its id, name and arguments.
         """
-        record = self.tool_ledger.get(str(tool_call.get("id")))
+        record = self._record_for_tool_call_id(str(tool_call.get("id")))
         return (
             record is not None
             and record.status == "interrupted"

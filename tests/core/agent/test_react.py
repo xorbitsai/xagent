@@ -6087,7 +6087,11 @@ async def test_a_refused_read_is_closed_like_a_cancelled_call() -> None:
     )
 
     assert result["success"] is True
-    pattern_ledger = runtime.checkpoints[-1]["pattern_state"]["tool_ledger"]
+    pattern_state = runtime.checkpoints[-1]["pattern_state"]
+    pattern_ledger = {
+        tool_call_id: pattern_state["tool_ledger"][key]
+        for tool_call_id, key in pattern_state["tool_call_id_index"].items()
+    }
     refused = pattern_ledger["call_bad"]
     assert refused["status"] == "refused"
     assert refused["result"] == _refused(FORCED_ANSWER_READ_UNLISTED_PATH_TEXT)

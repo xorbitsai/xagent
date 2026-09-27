@@ -3,13 +3,67 @@ from unittest.mock import patch
 
 import pytest
 
+from xagent.core.agent.result import tool_result_requires_authentication
 from xagent.core.tools.adapters.vibe.api_tool_adapter import (
     CustomApiTool,
     create_custom_api_tools,
 )
+from xagent.core.tools.adapters.vibe.output_filter_wrapper import (
+    OutputFilteredToolWrapper,
+)
 from xagent.core.tools.adapters.vibe.tool_naming_limits import (
     MAX_AGENT_TOOL_NAME_LENGTH,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [200, 401, 403, 404, 422, 429, 500])
+async def test_only_transport_401_is_classified_as_authentication_required(status_code):
+    original = {
+        "success": status_code == 200,
+        "status_code": status_code,
+        "headers": {},
+        # Body-level errors must not trigger runtime control flow.
+        "body": {"status_code": 401, "error": "authentication_required"},
+        "error": None if status_code == 200 else "HTTP error",
+    }
+    tool = CustomApiTool(
+        name="test", description="test", env={}, url="https://test.invalid"
+    )
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api",
+        return_value=original,
+    ):
+        result = await tool.run_json_async({})
+
+    assert {key: result[key] for key in original} == original
+    assert tool_result_requires_authentication(result) is (status_code == 401)
+    if status_code != 401:
+        assert result == original
+
+
+@pytest.mark.asyncio
+async def test_authentication_failure_survives_output_filtering():
+    tool = OutputFilteredToolWrapper(
+        CustomApiTool(
+            name="test", description="test", env={}, url="https://test.invalid"
+        ),
+        max_chars=20,
+        max_fields=1,
+        max_recursion=1,
+    )
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api",
+        return_value={
+            "success": False,
+            "status_code": 401,
+            "body": {"error": "Long server response " * 100},
+            "error": "HTTP 401",
+        },
+    ):
+        result = await tool.run_json_async({})
+
+    assert tool_result_requires_authentication(result)
 
 
 def test_custom_api_tool_init():

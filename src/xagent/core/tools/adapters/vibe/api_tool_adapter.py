@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any, Dict, List, Mapping, Optional, Type
+from typing import Any, Dict, List, Literal, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -110,6 +110,8 @@ class CustomApiToolResult(BaseModel):
         default=None, description="Response body (JSON or text)"
     )
     error: Optional[str] = Field(default=None, description="Error message if any")
+    is_error: bool = False
+    failure_code: Literal["authentication_required"] | None = None
 
 
 class CustomApiTool(AbstractBaseTool):
@@ -298,7 +300,7 @@ class CustomApiTool(AbstractBaseTool):
                     headers={},
                     body=None,
                     error="URL is required because this Custom API has no configured endpoint.",
-                ).model_dump()
+                ).model_dump(exclude_unset=True)
 
             merged_headers = dict(self._default_headers)
             if parsed_args.headers:
@@ -341,13 +343,21 @@ class CustomApiTool(AbstractBaseTool):
             if not result.get("success"):
                 logger.warning(f"Custom API {self._name} failed: {result.get('error')}")
 
-            return CustomApiToolResult(
+            response = CustomApiToolResult(
                 success=result.get("success", False),
                 status_code=result.get("status_code", 0),
                 headers=result.get("headers", {}),
                 body=result.get("body"),
                 error=result.get("error"),
-            ).model_dump()
+            )
+            # Only the real transport status classifies the failure. A 403 may
+            # be a resource-specific policy denial; response text is not an
+            # authentication signal. The runtime decides whether to pause.
+            if response.status_code == 401:
+                response.success = False
+                response.is_error = True
+                response.failure_code = "authentication_required"
+            return response.model_dump(exclude_unset=True)
 
         except Exception as e:
             logger.error(
@@ -361,7 +371,7 @@ class CustomApiTool(AbstractBaseTool):
                 headers={},
                 body=None,
                 error="Error executing Custom API.",
-            ).model_dump()
+            ).model_dump(exclude_unset=True)
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         try:

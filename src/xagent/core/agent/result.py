@@ -6,6 +6,7 @@ from typing import Any
 
 TOOL_FAILURE_CODES = frozenset(
     {
+        "authentication_required",
         "oauth_token_required",
         "unsupported_nested_interaction",
         "missing_delegated_output",
@@ -43,6 +44,18 @@ def is_oauth_token_required_code(value: Any) -> bool:
     A str subclass is a trust-boundary input, not an allowlisted code.
     """
     return type(value) is str and value == "oauth_token_required"
+
+
+def tool_result_requires_authentication(result: Any) -> bool:
+    """Recognize an adapter-classified authentication failure, not HTTP payloads."""
+
+    return (
+        isinstance(result, dict)
+        and result.get("success") is False
+        and result.get("is_error") is True
+        and normalize_tool_failure_code(result.get("failure_code"))
+        == "authentication_required"
+    )
 
 
 @dataclass(frozen=True)

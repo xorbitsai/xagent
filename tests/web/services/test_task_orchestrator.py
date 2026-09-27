@@ -61,6 +61,7 @@ from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services.assistant_history_safety import (
+    ASSISTANT_RESPONSE_MESSAGE_TYPE,
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
     TASK_FAILURE_MESSAGE_TYPE,
 )
@@ -72,6 +73,7 @@ from xagent.web.services.chat_history_service import (
     claim_user_message_delivery,
     inspect_user_message_delivery,
     mark_user_message_delivery,
+    persist_assistant_message,
 )
 from xagent.web.services.client_error_messages import (
     CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
@@ -831,6 +833,84 @@ async def test_begin_turn_append_clears_stale_error_message(
     assert task.input == "second"
     assert task.error_message is None
     assert task.output is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "followup",
+    [
+        "The connection is restored. Continue the requested report.",
+        "The connection is restored. Use site B instead; keep the other filters.",
+    ],
+)
+async def test_append_snapshot_retains_original_request_after_blocked_answer(
+    db_session,
+    mock_schedule_bg,
+    followup: str,
+) -> None:
+    """A fresh turn needs the user's request, not just the blocked answer."""
+    from xagent.web.services.task_setup_snapshot import load_task_setup_snapshot_sync
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id)
+    original = (
+        "Read site A records for 2026-09-24, exclude cancellations, and total cost."
+    )
+    await TaskTurnOrchestrator.begin_turn(
+        task_id=int(task.id),
+        task_owner_user_id=int(user.id),
+        payload=TaskTurnPayload(original),
+        kind=TurnKind.CREATE,
+    )
+    db_session.refresh(task)
+    # A blocked final_answer ends the run but does not repeat the request's
+    # parameters. None can be recovered from this reply or Task.description.
+    blocked = "Access expired. Reconnect the service to continue."
+    persist_assistant_message(
+        db_session,
+        int(task.id),
+        int(user.id),
+        blocked,
+        message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    )
+    task.status = TaskStatus.COMPLETED
+    db_session.commit()
+    assert finish_turn(db_session, int(task.id))
+
+    payload = TaskTurnPayload(followup)
+    await TaskTurnOrchestrator.begin_turn(
+        task_id=int(task.id),
+        task_owner_user_id=int(user.id),
+        payload=payload,
+        kind=TurnKind.APPEND,
+    )
+    scheduled = mock_schedule_bg.call_args.kwargs
+    current_row = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.turn_id == payload.turn_id)
+        .one()
+    )
+    assert scheduled["before_message_id"] == int(current_row.id)
+    snapshot = load_task_setup_snapshot_sync(
+        int(task.id),
+        int(user.id),
+        before_message_id=scheduled["before_message_id"],
+    )
+    assert snapshot is not None
+    assert list(snapshot.conversation_history) == [
+        {"role": "user", "content": original},
+        {"role": "assistant", "content": blocked},
+    ]
+    # The current request is sent separately, not duplicated in history or
+    # replaced with the original task. This also preserves user corrections.
+    assert scheduled["payload"].for_agent == followup
+    assert [
+        row.content
+        for row in db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == task.id, TaskChatMessage.role == "user")
+        .order_by(TaskChatMessage.id)
+        .all()
+    ] == [original, followup]
 
 
 @pytest.mark.asyncio

@@ -93,6 +93,7 @@ from ....tools.tool_result_spill import (
     render_spill_notice,
 )
 from ....tools.user_interaction import (
+    WAITING_FOR_USER_STATUS,
     ToolInteractionSettlement,
     tool_result_waits_for_user,
     user_interaction_resume_callable,
@@ -117,6 +118,7 @@ from ...grounding import evidence_facts, grounding_rule
 from ...language import final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
+    tool_result_requires_authentication,
     tool_result_succeeded,
     unwrap_final_answer_content,
 )
@@ -135,6 +137,7 @@ from ...runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
+from ...tool_access import connector_tool_sources, tool_access_context
 from ...trace import TraceAction, TraceCategory, TraceEventType, TraceScope
 from ..base import (
     AgentPattern,
@@ -647,6 +650,7 @@ class ReActPattern(AgentPattern):
         self.memory_input_text: str | None = None
         self._memory_store: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
+        self._connector_tool_sources: dict[str, str] = {}
 
     async def run(
         self,
@@ -814,6 +818,7 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         self.status = "thinking"
         self._tool_decision_groups_by_name = self._tool_decision_groups_for_tools(tools)
+        self._connector_tool_sources = connector_tool_sources(tools)
         # Read by get_system_context to contradict skill text naming edit_image.
         context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] = (
             "generate_image" in self._tool_decision_groups_by_name
@@ -1740,6 +1745,11 @@ class ReActPattern(AgentPattern):
                 f"\n\nAvailable tool names for this LLM call are exactly: {available_tools}. "
                 "Never call a tool name that is not in this list."
             )
+            access_context = tool_access_context(
+                self._connector_tool_sources, active_tool_names
+            )
+            if access_context:
+                instruction = f"{instruction}\n\n{access_context}"
         else:
             # Reachable only with tool_choice="none", which no production
             # construction site sets. If that ever changes, this branch needs
@@ -5543,6 +5553,24 @@ class ReActPattern(AgentPattern):
                 )
                 recorded_terminal = True
                 return error_result
+
+            if self.user_interaction_enabled and tool_result_requires_authentication(
+                result
+            ):
+                # Reuse the checkpoint/replan path instead of letting the model
+                # retry unchanged credentials or execute its queued fallback.
+                # Headless runs retain the ordinary classified failure result.
+                result = {
+                    **result,
+                    "status": WAITING_FOR_USER_STATUS,
+                    "message": (
+                        f"The connection used by {tool_call['name']} requires "
+                        "authentication. Please check or update its authorization "
+                        "in the connection settings, then reply to continue. "
+                        "Do not paste credentials into this conversation. You can "
+                        "also provide an exported file or choose another source."
+                    ),
+                }
 
             if tool_result_waits_for_user(result):
                 self._record_tool_call(

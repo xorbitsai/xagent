@@ -49,6 +49,7 @@ _FILE_STATUS_BATCH_SIZE = 200
 _ORPHAN_LOOKUP_BATCH_SIZE = 200
 _STALE_FILE_STATUSES = {"FAILED", "UNKNOWN", "RUNNING"}
 _DEFAULT_DELETABLE_STALE_STATUSES = {"FAILED"}
+KB_RETAINED_DIR = ".kb-retained"
 
 
 def _get_file_compatibility_facade() -> "KBFileCompatibilityFacade":
@@ -313,7 +314,8 @@ def _delete_uploaded_file_if_orphaned_impl(
     Args:
         db: Database session.
         file_id: The ID of the file to check.
-        user_id: User ID for scoping.
+        user_id: Requester; only their rows are freed, except rows collection
+            delete retained under ``.kb-retained``, which go whoever owns them.
         remaining_file_ids: file_id values still referenced by other documents; must include every candidate that still is.
 
     Returns:
@@ -326,15 +328,14 @@ def _delete_uploaded_file_if_orphaned_impl(
     if not file_id or file_id in remaining_file_ids:
         return False
 
-    file_record = (
-        db.query(UploadedFile)
-        .filter(
-            UploadedFile.user_id == scope.user_id,
-            UploadedFile.file_id == file_id,
-        )
-        .first()
-    )
+    file_record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
     if file_record is None:
+        return False
+    retained_dir = Path(str(file_record.storage_path)).parent
+    # Retained rows exist only for surviving references; any requester's last one frees them.
+    if int(file_record.user_id) != scope.user_id and not (
+        retained_dir.name == file_id and retained_dir.parent.name == KB_RETAINED_DIR
+    ):
         return False
 
     uploads_root = get_uploads_dir().resolve()
@@ -363,7 +364,7 @@ def _delete_uploaded_file_if_orphaned_impl(
         file_record, delete_local=False, after_commit=after_commit
     )
     # Invalidate cache for this user since file list changed
-    _file_status_cache.invalidate_user(scope.user_id)
+    _file_status_cache.invalidate_user(int(file_record.user_id))
     return True
 
 

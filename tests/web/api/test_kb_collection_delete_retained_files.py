@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import errno
+import io
+import logging
+import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,10 +13,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
 from tests.web.api import test_kb_orphan_reference_scale as scale
 from xagent.core.file_storage import get_unscoped_file_storage
 from xagent.core.tools.core.RAG_tools.core.schemas import CollectionOperationResult
+from xagent.web.api import files as files_module
 from xagent.web.api import kb as kb_module
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -78,6 +84,70 @@ def _add_user(sessions, user_id: int) -> None:
         session.commit()
     finally:
         session.close()
+
+
+def _refuse_link(*_args, **_kwargs):
+    raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+
+def _patch_link_and_copy(monkeypatch, *, link, copy) -> None:
+    monkeypatch.setattr(
+        kb_collection_service, "os", SimpleNamespace(sep=os.sep, link=link)
+    )
+    monkeypatch.setattr(kb_collection_service, "shutil", SimpleNamespace(copy2=copy))
+
+
+@pytest.mark.parametrize("linkable", [True, False], ids=["hard-link", "copy-fallback"])
+def test_retained_file_is_linked_or_copied(
+    test_env, temp_uploads, monkeypatch, linkable
+):
+    app, headers, user, sessions = test_env
+    team = _dir(temp_uploads, user.id)
+    file_id = _upload(sessions, user.id, team / "a.txt")
+    scale._documents().add([scale._doc("other", "doc-other", file_id, user.id)])
+    if not linkable:
+        _patch_link_and_copy(monkeypatch, link=_refuse_link, copy=shutil.copy2)
+
+    response = scale._delete_via_api(app, headers, "/api/kb/collections/team")
+
+    assert response.json()["status"] == "success"
+    kept = Path(_row(sessions, file_id).storage_path)
+    assert team not in kept.parents
+    assert kept.read_text() == "a.txt"
+    assert kept.stat().st_nlink == 1
+    # A linked file's old name is dropped before the move; a copy's original moves.
+    assert bool(list((temp_uploads / ".trash").rglob("a.txt"))) is not linkable
+
+
+def test_failed_move_after_the_commit_cannot_write_into_the_retained_file(
+    test_env, temp_uploads, monkeypatch
+):
+    _app, _headers, user, sessions = test_env
+    team = _dir(temp_uploads, user.id)
+    file_id = _upload(sessions, user.id, team / "a.txt")
+    scale._documents().add([scale._doc("other", "doc-other", file_id, user.id)])
+
+    def _refuse_move(*_args, **_kwargs):
+        raise OSError("rename refused")
+
+    monkeypatch.setattr(
+        kb_collection_service, "move_collection_dir_to_trash", _refuse_move
+    )
+    db = sessions()
+    try:
+        result = kb_collection_service.delete_collection_physical_dir(
+            db, user_id=user.id, collection_name="team"
+        )
+    finally:
+        db.close()
+    kept = Path(_row(sessions, file_id).storage_path)
+    kb_module._copy_upload_file_to_path(
+        SimpleNamespace(file=io.BytesIO(b"NEW")), team / "a.txt"
+    )
+
+    assert result.status == "failed"
+    assert team not in kept.parents
+    assert kept.read_text() == "a.txt"
 
 
 def test_retained_file_keeps_its_durable_object(test_env, temp_uploads):
@@ -162,10 +232,14 @@ def test_admin_delete_keeps_each_owners_referenced_file(test_env, temp_uploads):
     response = scale._delete_via_api(app, headers, "/api/kb/collections/team")
 
     assert response.status_code == 200, response.text
-    for owner, file_id in ((user.id, mine), (OTHER, theirs)):
+    for owner, file_id, name in (
+        (user.id, mine, "mine.txt"),
+        (OTHER, theirs, "theirs.txt"),
+    ):
         kept = Path(_row(sessions, file_id).storage_path)
         assert not _dir(temp_uploads, owner).exists()
-        assert kept.exists()
+        assert _dir(temp_uploads, owner).parent in kept.resolve().parents
+        assert kept.read_text() == name
 
 
 def test_another_owners_row_in_the_directory_moves_under_its_owner(
@@ -185,7 +259,7 @@ def test_another_owners_row_in_the_directory_moves_under_its_owner(
 
 
 def test_reference_lookup_failure_keeps_the_directory(
-    test_env, temp_uploads, monkeypatch
+    test_env, temp_uploads, monkeypatch, caplog
 ):
     app, headers, user, sessions = test_env
     team = _dir(temp_uploads, user.id)
@@ -198,18 +272,27 @@ def test_reference_lookup_failure_keeps_the_directory(
 
     monkeypatch.setattr(kb_collection_service, "find_referenced_file_ids", _raise)
 
-    response = scale._delete_via_api(app, headers, "/api/kb/collections/team")
+    with caplog.at_level(logging.WARNING, logger=kb_collection_service.__name__):
+        response = scale._delete_via_api(app, headers, "/api/kb/collections/team")
 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "partial_success"
-    assert "refs down" in response.json()["message"]
+    assert "Could not check which files" in response.json()["message"]
+    assert "The directory was kept." in response.json()["message"]
+    assert ".." not in response.json()["message"]
+    assert "refs down" not in response.json()["message"]
+    assert any(
+        record.exc_info and "refs down" in str(record.exc_info[1].__cause__)
+        for record in caplog.records
+    )
     assert (team / "kept.txt").exists()
     assert _row(sessions, kept).storage_path == str(team / "kept.txt")
     assert _row(sessions, loose) is not None
 
 
+@pytest.mark.parametrize("linkable", [True, False], ids=["linked", "copied"])
 def test_copy_failure_keeps_the_directory_and_paths(
-    test_env, temp_uploads, monkeypatch
+    test_env, temp_uploads, monkeypatch, linkable
 ):
     app, headers, user, sessions = test_env
     team = _dir(temp_uploads, user.id)
@@ -221,27 +304,32 @@ def test_copy_failure_keeps_the_directory_and_paths(
             scale._doc("other", "doc-2", second, user.id),
         ]
     )
-    real_copy = shutil.copy2
-    copied = []
+    attempts = []
+
+    def _link(src, dst):
+        attempts.append(src)
+        if linkable and len(attempts) == 1:
+            return os.link(src, dst)
+        return _refuse_link()
 
     def _copy(src, dst, *args, **kwargs):
-        copied.append(src)
-        if len(copied) == 2:
+        if len(attempts) == 2:
             Path(dst).write_text("par")
             raise OSError("disk full")
-        return real_copy(src, dst, *args, **kwargs)
+        return shutil.copy2(src, dst, *args, **kwargs)
 
-    monkeypatch.setattr(kb_collection_service, "shutil", SimpleNamespace(copy2=_copy))
+    _patch_link_and_copy(monkeypatch, link=_link, copy=_copy)
 
     response = scale._delete_via_api(app, headers, "/api/kb/collections/team")
 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "partial_success"
-    assert _row(sessions, first).storage_path == str(team / "first.txt")
-    assert _row(sessions, second).storage_path == str(team / "second.txt")
-    assert (team / "first.txt").exists()
-    assert (team / "second.txt").exists()
-    assert not list(temp_uploads.rglob(".kb-retained/*/*"))
+    assert "Could not copy out files" in response.json()["message"]
+    assert "disk full" not in response.json()["message"]
+    for file_id, name in ((first, "first.txt"), (second, "second.txt")):
+        assert _row(sessions, file_id).storage_path == str(team / name)
+        assert (team / name).read_text() == name
+    assert not list(temp_uploads.rglob(".kb-retained/*"))
 
 
 def test_commit_failure_keeps_the_directory_and_paths(test_env, temp_uploads):
@@ -257,9 +345,20 @@ def test_commit_failure_keeps_the_directory_and_paths(test_env, temp_uploads):
 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "partial_success"
-    assert "Could not keep files" in response.json()["message"]
+    assert "Could not commit before moving" in response.json()["message"]
+    assert "UNIQUE" not in response.json()["message"]
     assert _row(sessions, file_id).storage_path == str(team / "a.txt")
     assert (team / "a.txt").exists()
+    assert retained.read_text() == "a.txt"
+
+    session = sessions()
+    session.query(UploadedFile).filter_by(storage_path=str(retained)).delete()
+    session.commit()
+    session.close()
+    retry = scale._delete_via_api(app, headers, "/api/kb/collections/team")
+
+    assert retry.json()["status"] == "success"
+    assert _row(sessions, file_id).storage_path == str(retained)
     assert retained.read_text() == "a.txt"
 
 
@@ -290,7 +389,7 @@ def test_failed_copy_keeps_the_callers_pending_writes(
     def _fail(*_args, **_kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(kb_collection_service, "shutil", SimpleNamespace(copy2=_fail))
+    _patch_link_and_copy(monkeypatch, link=_refuse_link, copy=_fail)
 
     result, still_pending = _delete_team_dir_with_pending_delete(
         sessions, user.id, pending
@@ -361,7 +460,6 @@ def test_retained_path_survives_a_later_failure(
     record = _row(sessions, file_id)
     assert team not in Path(record.storage_path).parents
     assert UploadedFileStore.ensure_local(record).read_text() == "a.txt"
-    assert not team.exists()
 
 
 def test_failed_collection_delete_leaves_directory_rows_and_hook_writes(
@@ -397,6 +495,92 @@ def test_failed_collection_delete_leaves_directory_rows_and_hook_writes(
         assert _row(sessions, file_id).storage_path == str(team / f"f{i}.txt")
         assert (team / f"f{i}.txt").exists()
     assert _row(sessions, link) is not None
+
+
+def test_last_reference_frees_another_owners_retained_file(test_env, temp_uploads):
+    app, headers, user, sessions = test_env
+    _add_user(sessions, OTHER)
+    file_id = _upload(
+        sessions, OTHER, _dir(temp_uploads, OTHER) / "a.txt", durable=True
+    )
+    key = str(_row(sessions, file_id).storage_key)
+    scale._documents().add([scale._doc("mine", "doc-mine", file_id, user.id)])
+    db = sessions()
+    try:
+        kb_collection_service.delete_collection_physical_dir(
+            db, user_id=OTHER, collection_name="team"
+        )
+    finally:
+        db.close()
+    kept = Path(_row(sessions, file_id).storage_path)
+    assert kept.read_text() == "a.txt"
+
+    response = scale._delete_via_api(
+        app, headers, f"/api/kb/collections/mine/documents/a.txt?file_id={file_id}"
+    )
+
+    assert response.json()["deleted_doc_ids"] == ["doc-mine"]
+    assert _row(sessions, file_id) is None
+    assert not get_unscoped_file_storage().exists(key)
+    assert not kept.exists()
+
+
+@pytest.mark.parametrize(
+    "layout", ["file-id-dir-outside-kb-retained", "kb-retained-other-id"]
+)
+def test_another_owners_lookalike_row_is_not_freed(test_env, temp_uploads, layout):
+    app, headers, user, sessions = test_env
+    _add_user(sessions, OTHER)
+    root = temp_uploads / f"user_{OTHER}"
+    file_id = _upload(sessions, OTHER, root / "tmp" / "x.txt")
+    parent = (
+        root / "uploads" / file_id
+        if layout == "file-id-dir-outside-kb-retained"
+        else root / ".kb-retained" / f"not-{file_id}"
+    )
+    path = parent / "x.txt"
+    path.parent.mkdir(parents=True)
+    path.write_text("theirs")
+    session = sessions()
+    session.query(UploadedFile).filter_by(file_id=file_id).update(
+        {"storage_path": str(path)}
+    )
+    session.commit()
+    session.close()
+    scale._documents().add([scale._doc("mine", "doc-mine", file_id, user.id)])
+
+    response = scale._delete_via_api(
+        app, headers, f"/api/kb/collections/mine/documents/x.txt?file_id={file_id}"
+    )
+
+    assert response.json()["deleted_doc_ids"] == ["doc-mine"]
+    assert _row(sessions, file_id) is not None
+    assert path.read_text() == "theirs"
+
+
+def test_backfill_mints_no_row_for_retained_copies(test_env, temp_uploads, monkeypatch):
+    _app, _headers, user, sessions = test_env
+    monkeypatch.setattr(files_module, "get_uploads_dir", lambda: temp_uploads)
+    root = temp_uploads / f"user_{user.id}"
+    leftover = root / ".kb-retained" / "f-1" / "a.txt"
+    leftover.parent.mkdir(parents=True)
+    leftover.write_text("a")
+    retained = _upload(sessions, user.id, root / ".kb-retained" / "f-2" / "b.txt")
+    visible = [root / ".notes.pdf", root / "task_2" / "f" / ".draft.docx"]
+    for path in visible:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(path.name)
+
+    db = sessions()
+    try:
+        files_module._backfill_uploaded_file_records(db, db.get(User, user.id))
+        paths = {row.storage_path for row in db.query(UploadedFile)}
+    finally:
+        db.close()
+
+    assert str(leftover) not in paths
+    assert {str(path) for path in visible} <= paths
+    assert _row(sessions, retained).storage_key is not None
 
 
 async def test_whole_collection_rollback_keeps_referenced_file(
@@ -456,23 +640,34 @@ def test_files_stored_under_either_spelling_are_kept(test_env, temp_uploads, tmp
 def test_only_rows_inside_the_directory_are_retained(test_env, temp_uploads):
     _app, _headers, user, sessions = test_env
     inside = _upload(sessions, user.id, _dir(temp_uploads, user.id, "my_kb") / "a.txt")
-    sibling_path = _dir(temp_uploads, user.id, "my-kb") / "b.txt"
-    sibling = _upload(sessions, user.id, sibling_path)
+    siblings = {
+        _upload(sessions, user.id, path): path
+        for path in (
+            _dir(temp_uploads, user.id, "my-kb") / "b.txt",
+            _dir(temp_uploads, user.id, "MY_KB") / "c.txt",
+        )
+    }
     scale._documents().add(
-        [
-            scale._doc("other", "doc-a", inside, user.id),
-            scale._doc("my-kb", "doc-b", sibling, user.id),
-        ]
+        [scale._doc("other", "doc-a", inside, user.id)]
+        + [scale._doc("sib", f"doc-{f}", f, user.id) for f in siblings]
     )
+    statements: list[str] = []
+
+    def _record(_conn, _cursor, statement, *_args):
+        statements.append(statement)
 
     db = sessions()
+    event.listen(db.get_bind(), "before_cursor_execute", _record)
     try:
         result = kb_collection_service.delete_collection_physical_dir(
             db, user_id=user.id, collection_name="my_kb"
         )
     finally:
+        event.remove(db.get_bind(), "before_cursor_execute", _record)
         db.close()
 
     assert result.status == "success"
-    assert _row(sessions, sibling).storage_path == str(sibling_path)
+    for file_id, path in siblings.items():
+        assert _row(sessions, file_id).storage_path == str(path)
     assert Path(_row(sessions, inside).storage_path).read_text() == "a.txt"
+    assert sum(s.count("ESCAPE") for s in statements if "uploaded_files" in s) == 2

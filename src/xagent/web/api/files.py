@@ -70,7 +70,10 @@ from ..services.db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
-from ..services.kb_file_service import aggregate_uploaded_file_statuses
+from ..services.kb_file_service import (
+    KB_RETAINED_DIR,
+    aggregate_uploaded_file_statuses,
+)
 from ..services.managed_file_ref import (
     FILE_INTEGRITY_REUPLOAD_MESSAGE,
     NAMESPACE_AUTHORITY_ERRORS,
@@ -973,6 +976,9 @@ def _backfill_uploaded_file_records(db: Session, user: User) -> None:
                             True,
                         )
                         created += 1
+                continue
+            # A stray retained copy must not get a row that owns its retained path.
+            if candidate.relative_to(user_root).parts[0] == KB_RETAINED_DIR:
                 continue
 
             file_id = str(uuid4())

@@ -1059,18 +1059,17 @@ class TestAPIMultiTenancy:
             deleted_counts={},
         )
 
+        db = MagicMock()
         with patch(
             "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store",
             return_value=mock_get_vector_store.return_value,
         ):
-            result = await delete_collection_api(
-                "team", _user=mock_user, db=MagicMock()
-            )
+            result = await delete_collection_api("team", _user=mock_user, db=db)
 
         mock_delete_collection.assert_called_once_with("team", 999, True)
         assert mock_delete_collection_physical_dir.call_args_list == [
-            call(ANY, user_id=101, collection_name="team"),
-            call(ANY, user_id=202, collection_name="team"),
+            call(db, user_id=101, collection_name="team"),
+            call(db, user_id=202, collection_name="team"),
         ]
         assert mock_delete_collection_uploaded_files.call_args_list == [
             call(
@@ -1316,16 +1315,15 @@ class TestAPIMultiTenancy:
             deleted_counts={},
         )
 
+        db = MagicMock()
         with patch(
             "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store",
             return_value=mock_get_vector_store.return_value,
         ):
-            result = await delete_collection_api(
-                "team", _user=mock_user, db=MagicMock()
-            )
+            result = await delete_collection_api("team", _user=mock_user, db=db)
 
         mock_delete_collection_physical_dir.assert_called_once_with(
-            ANY,
+            db,
             user_id=101,
             collection_name="team",
         )
@@ -1389,16 +1387,15 @@ class TestAPIMultiTenancy:
             deleted_counts={},
         )
 
+        db = MagicMock()
         with patch(
             "xagent.core.tools.core.RAG_tools.storage.factory.get_vector_index_store",
             return_value=mock_get_vector_store.return_value,
         ):
-            result = await delete_collection_api(
-                "team", _user=mock_user, db=MagicMock()
-            )
+            result = await delete_collection_api("team", _user=mock_user, db=db)
 
         mock_delete_collection_physical_dir.assert_called_once_with(
-            ANY,
+            db,
             user_id=101,
             collection_name="team",
         )

@@ -371,6 +371,9 @@ describe("AgentBuilder preview", () => {
       await screen.findByDisplayValue("Existing SSH agent")
       fireEvent.click(screen.getByText("send-preview-message"))
       await waitFor(() => expect(sendMessageMock).toHaveBeenCalled())
+      previewState.taskId = 123
+      rerender(<AgentBuilder agentId="42" />)
+      expectPreviewComplete(false)
       previewState = { messages: [{ role: "user" }], currentTask: { id: "999", status: "completed" }, taskId: 999, isProcessing: false }
       rerender(<AgentBuilder agentId="42" />)
       expectPreviewComplete(false)

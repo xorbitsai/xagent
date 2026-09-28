@@ -1897,7 +1897,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const previewStepCompleted = previewCompletionTaskId !== null
     && state.taskId === previewCompletionTaskId
     && state.currentTask?.id === String(previewCompletionTaskId)
-    && state.currentTask.status === "completed"
+    && state.currentTask?.status === "completed"
     && !state.isProcessing
   const shouldHighlightConfigStep = !configStepCompleted
   const shouldHighlightKbSection = useTemplateSpecificHighlights ? templateMissingKb : shouldHighlightConfigStep

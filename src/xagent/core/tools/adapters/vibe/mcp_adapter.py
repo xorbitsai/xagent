@@ -70,6 +70,8 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
 )
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
+_DESCRIPTION_BOUND_ARGS_MAX_CHARS = 4096
+
 
 class MCPFailurePhase(str, Enum):
     """Public-safe phase where an MCP server failed to load."""
@@ -1340,7 +1342,7 @@ class MCPToolAdapter(AbstractBaseTool):
         # redaction at both source and target keys as other runtime payloads.
         # Do not expand large context objects into every tool's LLM schema.
         values = json.dumps(bound_args, ensure_ascii=False, separators=(",", ":"))
-        if len(values) > 4096:
+        if len(values) > _DESCRIPTION_BOUND_ARGS_MAX_CHARS:
             values = "[bound values omitted because they exceed the description limit]"
         return (
             f"{description}\n\nRuntime-bound arguments for this task: {values}\n"

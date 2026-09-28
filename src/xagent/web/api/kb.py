@@ -124,6 +124,7 @@ from ..services.background_jobs import (
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.google_drive_download import download_google_workspace_file
 from ..services.kb_collection_service import (
+    classify_collection_physical_cleanup,
     delete_collection_physical_dir,
     delete_collection_uploaded_files,
     list_collection_uploaded_file_owner_ids,
@@ -6131,38 +6132,18 @@ def _perform_kb_collection_delete(
                 )
 
         if result.status == "error":
-            cleanup_warnings = list(result.warnings) if result.warnings else []
-            for owner_id, physical_cleanup in physical_cleanup_by_owner.items():
-                collection_dir = physical_cleanup.collection_dir or get_upload_path(
-                    "", user_id=owner_id, collection=safe_collection
-                )
-                physical_cleanup_status = physical_cleanup.status
-                if physical_cleanup_status == "success":
-                    cleanup_warnings.append(
-                        f"Physical directory moved to trash for user_{owner_id}: "
-                        f"{collection_dir} "
-                        "(trash cleanup requires external scheduler/cron)"
-                    )
-                elif physical_cleanup_status == "not_found":
-                    cleanup_warnings.append(
-                        f"Physical directory cleanup for user_{owner_id}: "
-                        "No physical directory found (collection had no files)"
-                    )
-                elif physical_cleanup.error:
-                    cleanup_warnings.append(
-                        f"Physical directory cleanup for user_{owner_id}: "
-                        f"{physical_cleanup.status} - {physical_cleanup.error}"
-                    )
-
             return CollectionOperationResult(
                 status="error",
                 collection=safe_collection,
                 message=result.message,
-                warnings=cleanup_warnings,
+                warnings=list(result.warnings),
                 affected_documents=result.affected_documents,
                 deleted_counts=result.deleted_counts,
             )
 
+        report = classify_collection_physical_cleanup(
+            result, physical_cleanup_by_owner, collection_name=safe_collection
+        )
         remaining_file_ids = _find_referenced_file_ids(
             set().union(*mutation_scope.file_ids_by_owner.values())
         )
@@ -6174,7 +6155,7 @@ def _perform_kb_collection_delete(
             collection_dir = physical_cleanup.collection_dir or get_upload_path(
                 "", user_id=owner_id, collection=safe_collection
             )
-            if physical_cleanup_status in {"success", "not_found"}:
+            if owner_id in report.rows_deletable_owner_ids:
                 deleted_uploaded_files += delete_collection_uploaded_files(
                     db,
                     user_id=owner_id,
@@ -6208,74 +6189,14 @@ def _perform_kb_collection_delete(
                     safe_collection,
                 )
 
-        cleanup_warnings = list(result.warnings) if result.warnings else []
-        cleanup_info_messages: List[str] = []
-        has_physical_cleanup_issue = False
-
-        for owner_id, physical_cleanup in physical_cleanup_by_owner.items():
-            physical_cleanup_status = physical_cleanup.status
-            physical_cleanup_error = physical_cleanup.error
-            collection_dir = physical_cleanup.collection_dir or get_upload_path(
-                "", user_id=owner_id, collection=safe_collection
-            )
-
-            if physical_cleanup_status == "success":
-                cleanup_info = (
-                    f"Physical directory moved to trash for user_{owner_id}: "
-                    f"{collection_dir} "
-                    "(trash cleanup requires external scheduler/cron)"
-                )
-                cleanup_warnings.append(cleanup_info)
-                cleanup_info_messages.append(cleanup_info)
-            elif physical_cleanup_status == "not_found":
-                cleanup_info = (
-                    f"Physical directory cleanup for user_{owner_id}: "
-                    "No physical directory found (collection had no files)"
-                )
-                cleanup_warnings.append(cleanup_info)
-                cleanup_info_messages.append(cleanup_info)
-            elif physical_cleanup_status == "error" and physical_cleanup_error:
-                has_physical_cleanup_issue = True
-                cleanup_info = (
-                    f"Physical directory cleanup for user_{owner_id}: Warning - "
-                    f"{physical_cleanup_error}. Database deletion proceeded, but "
-                    "physical file cleanup status is uncertain."
-                )
-                cleanup_warnings.append(cleanup_info)
-                cleanup_info_messages.append(cleanup_info)
-            elif physical_cleanup_status == "failed" and physical_cleanup_error:
-                has_physical_cleanup_issue = True
-                cleanup_info = (
-                    f"Physical directory cleanup for user_{owner_id}: Failed - "
-                    f"{physical_cleanup_error}"
-                )
-                cleanup_warnings.append(cleanup_info)
-                cleanup_info_messages.append(cleanup_info)
-
-        cleanup_info_message = ""
-        if cleanup_info_messages:
-            cleanup_info_message = f" {'; '.join(cleanup_info_messages)}."
-
-        final_status = result.status
-        if result.status == "success" and has_physical_cleanup_issue:
-            final_status = "partial_success"
-            if not cleanup_info_message:
-                cleanup_info_message = " Database deletion succeeded, but physical file cleanup encountered issues."
-
-        updated_message = result.message
-        if cleanup_info_message:
-            updated_message = f"{result.message}{cleanup_info_message}"
-
-        updated_result = CollectionOperationResult(
-            status=final_status,
+        return CollectionOperationResult(
+            status=report.status,
             collection=safe_collection,
-            message=updated_message,
-            warnings=cleanup_warnings,
+            message=report.message,
+            warnings=report.warnings,
             affected_documents=result.affected_documents,
             deleted_counts=result.deleted_counts,
         )
-
-        return updated_result
 
     except HTTPException:
         raise

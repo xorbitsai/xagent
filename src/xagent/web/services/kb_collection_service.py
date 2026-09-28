@@ -8,7 +8,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, List, Optional, Set
+from typing import TYPE_CHECKING, Callable, List, Mapping, Optional, Set
 
 from filelock import Timeout
 from sqlalchemy import or_
@@ -26,6 +26,7 @@ from .kb_file_service import (
 from .uploaded_file_store import UploadedFileStore
 
 if TYPE_CHECKING:
+    from ...core.tools.core.RAG_tools.core.schemas import CollectionOperationResult
     from ...core.tools.core.RAG_tools.kb import KBFileCompatibilityFacade
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,19 @@ class CollectionPhysicalRenameResult:
     error: Optional[str] = None
     old_collection_dir: Optional[Path] = None
     new_collection_dir: Optional[Path] = None
+
+
+@dataclass(frozen=True)
+class CollectionCleanupReport:
+    """What a collection delete reports once each owner's directory is handled.
+
+    Only owners in ``rows_deletable_owner_ids`` may lose their UploadedFile rows.
+    """
+
+    status: str
+    message: str
+    warnings: List[str]
+    rows_deletable_owner_ids: frozenset[int]
 
 
 def _path_belongs_to_collection_dir(
@@ -570,6 +584,64 @@ def delete_collection_uploaded_files(
         remaining_file_ids=remaining_file_ids,
         collection_dir=collection_dir,
         after_commit=after_commit,
+    )
+
+
+def classify_collection_physical_cleanup(
+    result: CollectionOperationResult,
+    physical_cleanup_by_owner: Mapping[int, CollectionPhysicalDeleteResult],
+    *,
+    collection_name: str,
+) -> CollectionCleanupReport:
+    """Report a collection delete after each owner's directory cleanup.
+
+    The caller returns an ``error`` result itself and must not pass one here.
+    Notes follow ``physical_cleanup_by_owner`` order. A ``success`` result
+    becomes ``partial_success`` when an ``error`` or ``failed`` cleanup has an
+    error. Only owners whose cleanup is ``success``/``not_found`` may lose rows.
+    """
+    notes: List[str] = []
+    rows_deletable_owner_ids: Set[int] = set()
+    has_issue = False
+    for owner_id, cleanup in physical_cleanup_by_owner.items():
+        if cleanup.status == "success":
+            rows_deletable_owner_ids.add(owner_id)
+            collection_dir = cleanup.collection_dir or get_upload_path(
+                "", user_id=owner_id, collection=collection_name
+            )
+            notes.append(
+                f"Physical directory moved to trash for user_{owner_id}: "
+                f"{collection_dir} "
+                "(trash cleanup requires external scheduler/cron)"
+            )
+        elif cleanup.status == "not_found":
+            rows_deletable_owner_ids.add(owner_id)
+            notes.append(
+                f"Physical directory cleanup for user_{owner_id}: "
+                "No physical directory found (collection had no files)"
+            )
+        elif cleanup.status == "error" and cleanup.error:
+            has_issue = True
+            notes.append(
+                f"Physical directory cleanup for user_{owner_id}: Warning - "
+                f"{cleanup.error}. Database deletion proceeded, but "
+                "physical file cleanup status is uncertain."
+            )
+        elif cleanup.status == "failed" and cleanup.error:
+            has_issue = True
+            notes.append(
+                f"Physical directory cleanup for user_{owner_id}: Failed - "
+                f"{cleanup.error}"
+            )
+
+    status = result.status
+    if status == "success" and has_issue:
+        status = "partial_success"
+    return CollectionCleanupReport(
+        status=status,
+        message=f"{result.message} {'; '.join(notes)}." if notes else result.message,
+        warnings=[*result.warnings, *notes],
+        rows_deletable_owner_ids=frozenset(rows_deletable_owner_ids),
     )
 
 

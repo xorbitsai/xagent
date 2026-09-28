@@ -4,6 +4,7 @@ import pytest
 
 from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.tools.user_interaction import (
+    ResumableUserInteractionTool,
     ToolInteractionSettlement,
     tool_result_waits_for_user,
     user_interaction_resume_callable,
@@ -131,3 +132,30 @@ def test_failed_settlement_preserves_a_tool_specific_status() -> None:
 def test_settlement_rejects_an_unknown_status() -> None:
     with pytest.raises(ValueError, match="Invalid tool interaction settlement"):
         ToolInteractionSettlement(status="unknown")  # type: ignore[arg-type]
+
+
+def test_the_protocol_accepts_sync_and_async_resume_implementations() -> None:
+    """Both callback shapes must satisfy the advertised public Protocol.
+
+    The pattern awaits an awaitable resume result, so an ``async def``
+    implementation is fully supported at runtime. When the Protocol promised
+    only ``Settlement | None`` it still passed ``isinstance`` (which checks
+    method presence, not signatures) while failing a static structural check,
+    so this pins the runtime half here and ``tests/typing/`` pins mypy.
+    """
+
+    class SyncTool:
+        def resume_user_interaction(
+            self, *, interaction_id: str, response: str
+        ) -> ToolInteractionSettlement | None:
+            return ToolInteractionSettlement.rejected(error="no")
+
+    class AsyncTool:
+        async def resume_user_interaction(
+            self, *, interaction_id: str, response: str
+        ) -> ToolInteractionSettlement | None:
+            return ToolInteractionSettlement.rejected(error="no")
+
+    for tool in (SyncTool(), AsyncTool()):
+        assert isinstance(tool, ResumableUserInteractionTool)
+        assert callable(user_interaction_resume_callable(tool))

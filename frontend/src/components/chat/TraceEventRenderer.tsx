@@ -156,6 +156,7 @@ interface StepAction {
     error?: any;
     tool_calls?: any;
     tool_call_id?: string;
+    invocation_id?: string;
     sandboxed?: boolean;
     inline?: boolean;
     workforceSummary?: boolean;
@@ -377,19 +378,90 @@ export function processTraceEvents(
     // by "last running tool" mis-attributes results; the id makes it exact.
     // Returns null when the id is absent so callers can fall back to
     // findLastRunningAction (legacy / single-tool events).
-    const findRunningToolByCallId = (step: ProcessedStep, toolCallId?: string) => {
+    const findRunningToolByCallId = (
+      step: ProcessedStep,
+      toolCallId?: string,
+      invocationId?: string,
+    ) => {
       if (!toolCallId) return null;
       for (let i = step.actions.length - 1; i >= 0; i--) {
         const action = step.actions[i];
         if (
           action.type === 'tool' &&
           action.status === 'running' &&
-          action.data?.tool_call_id === toolCallId
+          action.data?.tool_call_id === toolCallId &&
+          (!invocationId || action.data?.invocation_id === invocationId)
         ) {
           return action;
         }
       }
       return null;
+    };
+
+    // A settlement lifecycle (`settlement_delivery`) re-opens a tool call that
+    // already emitted a complete pause pair, to project the resumed outcome
+    // onto it. Two things make it unlike an ordinary pair: the original action
+    // is no longer 'running' (the pause END closed it), and the resumed run
+    // mints a fresh step id, so the original lives in a DIFFERENT step bucket.
+    // Both finders above are step-local and running-only, so neither can see
+    // it. This one searches every bucket for the call, whatever its status.
+    //
+    // `tool_call_id` alone is not invocation-global: a provider that omits
+    // ids makes the backend's synthesized fallback (`tool_call_{index}`)
+    // collide across concurrent DAG steps, each running its own ReAct loop.
+    // A bare-id search could then resolve a settlement to a DIFFERENT step's
+    // action and overwrite its result. But a single call's OWN settlement can
+    // legitimately carry a step_id that differs from its pause's (a ledger
+    // row without a persisted original step_id falls back to the resumed
+    // run's fresh one -- see react.py's `_trace_tool_interaction_settlement`),
+    // so requiring an exact `originStepId` match unconditionally would refuse
+    // the common, unambiguous case. The check only needs to fire when there
+    // is genuine ambiguity: more than one action, in DIFFERENT steps, sharing
+    // this id.
+    const findToolActionByCallIdAcrossSteps = (
+      toolCallId?: string,
+      invocationId?: string,
+      originStepId?: string,
+    ) => {
+      if (!toolCallId) return null;
+      const matches: { stepId: string; action: StepAction }[] = [];
+      for (const candidateStep of stepsMap.values()) {
+        for (const action of candidateStep.actions) {
+          if (
+            action.type === 'tool' &&
+            action.data?.tool_call_id === toolCallId &&
+            (!invocationId || action.data?.invocation_id === invocationId)
+          ) {
+            matches.push({ stepId: candidateStep.stepId, action });
+          }
+        }
+      }
+      if (matches.length === 0) return null;
+      if (matches.length === 1) return matches[0].action;
+      const exact = matches.filter(m => m.stepId === originStepId);
+      return exact.length === 1 ? exact[0].action : null;
+    };
+
+    // Targets registered by a settlement START, consumed by its END/ERROR.
+    // New traces use the invocation id. The provider-id/step key is retained
+    // only for historical traces that predate invocation metadata.
+    const settlementTargets = new Map<string, StepAction>();
+    const settlementTargetCacheKey = (
+      toolCallId: string,
+      invocationId?: string,
+      originStepId?: string,
+    ) => invocationId || `${toolCallId}::${originStepId ?? ''}`;
+    const isSettlementEvent = (event: TraceEvent) =>
+      event.data?.settlement_delivery === true;
+    const resolveSettlementTarget = (
+      toolCallId?: string,
+      invocationId?: string,
+      originStepId?: string,
+    ) => {
+      if (!toolCallId) return null;
+      const cacheKey = settlementTargetCacheKey(toolCallId, invocationId, originStepId);
+      return settlementTargets.get(cacheKey)
+        || findToolActionByCallIdAcrossSteps(toolCallId, invocationId, originStepId);
     };
 
     orderedEvents.forEach(({ event, index, timestamp }) => {
@@ -450,6 +522,12 @@ export function processTraceEvents(
 
       const step = stepsMap.get(stepId)!;
       const eventId = event.event_id || `event-${index}`;
+      if (isSettlementEvent(event) && !step.stepName) {
+        // The original react_task_start may be outside a truncated history
+        // window. Keep the terminal settlement visible in a named fallback
+        // bucket instead of dropping it in the final step filter.
+        step.stepName = t('traceEventRenderer.taskExecution');
+      }
 
       if ((isWorkforceDelegation || isDelegatedChildEvent) && workerTaskId) {
         const previousExecution = step.agentExecution;
@@ -651,6 +729,7 @@ export function processTraceEvents(
         const toolName = rawToolName || t('traceEventRenderer.unknownTool');
         const toolDisplayName = rawToolName ? getFriendlyToolName(rawToolName, tDynamic) : toolName;
         const toolCallId = event.data?.tool_call_id as string | undefined;
+        const invocationId = event.data?.invocation_id as string | undefined;
         const assistantContent = event.data?.response?.assistant_content || event.data?.assistant_content;
 
         if (typeof assistantContent === 'string' && assistantContent.trim()) {
@@ -667,27 +746,61 @@ export function processTraceEvents(
           });
         }
 
-        if (toolName) {
+        // A settlement START never opens a new card: it re-opens the original
+        // call's action so the resumed outcome lands on the one card the user
+        // already saw. Appending here is what rendered a resumed approval as a
+        // second, duplicate tool execution. When the original card is absent
+        // (its START fell outside a truncated replay window) the target is
+        // null and we append below, so the outcome is still visible.
+        //
+        // Resolved BEFORE step.tools is touched: when the call folds into
+        // another step's bucket, this step never ran that tool and must not
+        // advertise it.
+        const settlementStartTarget = isSettlementEvent(event)
+          ? resolveSettlementTarget(toolCallId, invocationId, event.step_id ?? undefined)
+          : null;
+
+        if (toolName && !settlementStartTarget) {
           // Merge with existing tools instead of replacing
           if (!step.tools.some(tItem => tItem.function.name === toolName)) {
             step.tools.push({ function: { name: toolName } });
           }
         }
 
-        step.actions.push({
-          id: eventId,
-          type: 'tool',
-          title: t('traceEventRenderer.executeTool', { tool: toolDisplayName }),
-          status: 'running',
-          timestamp,
-          data: {
-            tool: toolName,
-            args: toolArgs,
-            code: step.code,
-            tool_call_id: toolCallId,
-            sandboxed: !!event.data?.sandboxed
+        if (settlementStartTarget) {
+          if (toolCallId) {
+            settlementTargets.set(
+              settlementTargetCacheKey(toolCallId, invocationId, event.step_id ?? undefined),
+              settlementStartTarget
+            );
           }
-        });
+          // Deliberately NOT flipping status back to 'running': if the
+          // settlement END is lost, a card stuck at 'running' reads worse than
+          // one still showing its (accurate) pause result.
+        } else {
+          const newAction: StepAction = {
+            id: eventId,
+            type: 'tool',
+            title: t('traceEventRenderer.executeTool', { tool: toolDisplayName }),
+            status: 'running',
+            timestamp,
+            data: {
+              tool: toolName,
+              args: toolArgs,
+              code: step.code,
+              tool_call_id: toolCallId,
+              invocation_id: invocationId,
+              sandboxed: !!event.data?.sandboxed
+            }
+          };
+          step.actions.push(newAction);
+          if (isSettlementEvent(event) && toolCallId) {
+            settlementTargets.set(
+              settlementTargetCacheKey(toolCallId, invocationId, event.step_id ?? undefined),
+              newAction,
+            );
+          }
+        }
       }
 
       if (event.event_type === 'tool_execution_end') {
@@ -742,9 +855,16 @@ export function processTraceEvents(
             : undefined;
 
         const endToolCallId = event.data?.tool_call_id as string | undefined;
-        const action =
-          findRunningToolByCallId(step, endToolCallId) ||
-          findLastRunningAction(step, 'tool');
+        const endInvocationId = event.data?.invocation_id as string | undefined;
+        // A settlement END resolves ONLY to its own call. The
+        // findLastRunningAction fallback must never apply to it: the resumed
+        // step can legitimately have other tools in flight, and closing one of
+        // those with this settlement's result would silently attribute an
+        // approval to an unrelated tool.
+        const action = isSettlementEvent(event)
+          ? resolveSettlementTarget(endToolCallId, endInvocationId, event.step_id ?? undefined)
+          : findRunningToolByCallId(step, endToolCallId, endInvocationId) ||
+            findLastRunningAction(step, 'tool');
         if (action) {
           action.status = 'completed';
           action.data.output = output;
@@ -860,10 +980,37 @@ export function processTraceEvents(
 
         // If no running action found, or type mismatch, try to find the last action of corresponding type
         if (event.event_type === 'tool_execution_failed') {
-          const lastTool =
-            findRunningToolByCallId(step, errorData.tool_call_id as string | undefined) ||
-            findLastRunningAction(step, 'tool');
-          if (lastTool) runningAction = lastTool;
+          // Same rule as the settlement END above: resolve to the settled call
+          // only, never to whichever tool happens to be running.
+          const settlementErrorTarget = isSettlementEvent(event)
+            ? resolveSettlementTarget(
+              errorData.tool_call_id as string | undefined,
+              errorData.invocation_id as string | undefined,
+              event.step_id ?? undefined,
+            )
+            : null;
+          if (isSettlementEvent(event)) {
+            runningAction = settlementErrorTarget ?? undefined;
+            if (settlementErrorTarget) {
+              settlementErrorTarget.data.rawResult = event.data?.result;
+              // The action being re-closed here already carries the pause's
+              // own output (e.g. "Publish this exact post?") from its ORIGINAL
+              // end event. A failed settlement doesn't produce a new output --
+              // only an error -- so without this the stale pause prompt would
+              // keep rendering (ToolOutputDisplay shows `data.output`
+              // regardless of status) right alongside the new error message.
+              delete settlementErrorTarget.data.output;
+            }
+          } else {
+            const lastTool =
+              findRunningToolByCallId(
+                step,
+                errorData.tool_call_id as string | undefined,
+                errorData.invocation_id as string | undefined,
+              ) ||
+              findLastRunningAction(step, 'tool');
+            if (lastTool) runningAction = lastTool;
+          }
         } else if (event.event_type === 'llm_call_failed') {
           const lastLlm = findLastRunningAction(step, 'llm');
           if (lastLlm) runningAction = lastLlm;

@@ -641,3 +641,427 @@ describe("every toolNames entry resolves through getFriendlyToolName", () => {
     expect(source).toContain(boundary)
   })
 })
+
+/**
+ * Settlement delivery (#2256): a resumed user-interaction tool projects its
+ * terminal outcome onto the ORIGINAL call, which already emitted a complete
+ * pause pair. The settlement pair carries `settlement_delivery: true` and
+ * reuses the original `tool_call_id`, but arrives under a fresh step id.
+ * Without update semantics the reducer appended it as a second tool card.
+ */
+describe("processTraceEvents settlement delivery", () => {
+  const resumedStepStart = {
+    event_type: "react_task_start",
+    step_id: "step-2",
+    data: { step_name: "Resumed" },
+  }
+  const inStep2 = (event_type: string, data: Record<string, unknown>) => ({
+    event_type,
+    step_id: "step-2",
+    data,
+  })
+
+  const pausePair = [
+    stepStart,
+    ev("tool_execution_start", {
+      tool_name: "approval_gate",
+      tool_call_id: "call-1",
+      tool_args: { text: "publish" },
+    }),
+    ev("tool_execution_end", {
+      tool_name: "approval_gate",
+      tool_call_id: "call-1",
+      status: "waiting_for_user",
+      result: { output: "Publish this exact post?" },
+    }),
+  ]
+
+  const allToolActions = (steps: ReturnType<typeof processTraceEvents>) =>
+    steps.flatMap((step) => step.actions.filter((a) => a.type === "tool"))
+
+  it("updates the original action in place instead of adding a second card", () => {
+    const events = [
+      ...pausePair,
+      resumedStepStart,
+      inStep2("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+      }),
+      inStep2("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "urn:li:share:123" },
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+
+    // Exactly one card for the call, carrying the SETTLED result.
+    expect(toolActions).toHaveLength(1)
+    expect(toolActions[0].data.tool_call_id).toBe("call-1")
+    expect(toolActions[0].status).toBe("completed")
+    expect(toolActions[0].data.output).toBe("urn:li:share:123")
+    // The resumed step never ran the tool, so it must not advertise it.
+    const resumedStep = steps.find((step) => step.stepId === "step-2")
+    expect(resumedStep?.tools ?? []).toHaveLength(0)
+  })
+
+  it("marks a denied settlement as failed on the original action", () => {
+    const events = [
+      ...pausePair,
+      resumedStepStart,
+      inStep2("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+      }),
+      inStep2("tool_execution_failed", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+        settlement_status: "rejected",
+        error: "The user rejected the tool call.",
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+
+    expect(toolActions).toHaveLength(1)
+    expect(toolActions[0].status).toBe("failed")
+    expect(toolActions[0].data.error).toBe("The user rejected the tool call.")
+  })
+
+  it("is idempotent when the backend replays the settlement pair", () => {
+    // The run-start replay re-emits the pair to repair a lifecycle lost to a
+    // crash; a second delivery must not produce a second card.
+    const settlement = [
+      inStep2("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+      }),
+      inStep2("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "urn:li:share:123" },
+      }),
+    ]
+    const events = [...pausePair, resumedStepStart, ...settlement, ...settlement]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+
+    expect(toolActions).toHaveLength(1)
+    expect(toolActions[0].data.output).toBe("urn:li:share:123")
+  })
+
+  it("appends a card only when no message window holds the original", () => {
+    // Truncated history -- the original start is genuinely absent, so the
+    // settlement must still be visible rather than silently dropped. In
+    // production this is the rare case, not the norm: the backend emits the
+    // pair under the original call's step id and the chat reducer routes it
+    // to the message that already holds that tool_call_id.
+    const events = [
+      {
+        event_type: "tool_execution_start",
+        step_id: "original-step-outside-window",
+        data: {
+        tool_name: "approval_gate",
+        tool_call_id: "orphan-call",
+        invocation_id: "orphan-invocation",
+        settlement_delivery: true,
+        },
+      },
+      {
+        event_type: "tool_execution_end",
+        step_id: "original-step-outside-window",
+        data: {
+        tool_name: "approval_gate",
+        tool_call_id: "orphan-call",
+        invocation_id: "orphan-invocation",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "done" },
+        },
+      },
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+
+    expect(toolActions).toHaveLength(1)
+    expect(toolActions[0].status).toBe("completed")
+    expect(toolActions[0].data.output).toBe("done")
+  })
+
+  it("uses invocation identity when one step reuses the same provider id", () => {
+    const inSameStep = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-1",
+      data,
+    })
+    const events = [
+      stepStart,
+      inSameStep("tool_execution_start", {
+        tool_name: "search",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-a",
+      }),
+      inSameStep("tool_execution_end", {
+        tool_name: "search",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-a",
+        result: { output: "earlier" },
+      }),
+      inSameStep("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-b",
+      }),
+      inSameStep("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-b",
+        result: { output: "Publish?" },
+      }),
+      inSameStep("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-b",
+        settlement_delivery: true,
+      }),
+      inSameStep("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-b",
+        settlement_delivery: true,
+        result: { output: "settled" },
+      }),
+    ]
+
+    const toolActions = allToolActions(processTraceEvents(events as never, t))
+    expect(toolActions).toHaveLength(2)
+    expect(toolActions.find((action) => action.data.invocation_id === "invocation-a")?.data.output).toBe("earlier")
+    expect(toolActions.find((action) => action.data.invocation_id === "invocation-b")?.data.output).toBe("settled")
+  })
+
+  it("never closes an unrelated running tool with a settlement result", () => {
+    // The resumed step legitimately has another tool in flight. The old
+    // findLastRunningAction fallback would have attributed the approval to it.
+    const events = [
+      ...pausePair,
+      resumedStepStart,
+      inStep2("tool_execution_start", {
+        tool_name: "search",
+        tool_call_id: "other-call",
+        tool_args: { q: "weather" },
+      }),
+      inStep2("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "urn:li:share:123" },
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+    const other = toolActions.find((a) => a.data.tool_call_id === "other-call")
+    const settled = toolActions.find((a) => a.data.tool_call_id === "call-1")
+
+    // The unrelated tool is untouched and still running.
+    expect(other?.status).toBe("running")
+    expect(other?.data.output).toBeUndefined()
+    // The settlement landed on its own call.
+    expect(settled?.status).toBe("completed")
+    expect(settled?.data.output).toBe("urn:li:share:123")
+  })
+
+  it("does not reopen a DIFFERENT step's action sharing the same tool_call_id", () => {
+    // tool_call_id is only unique in principle: a provider that omits ids
+    // makes the backend's fallback ("tool_call_{index}") collide across
+    // concurrent DAG steps, each running its own ReAct loop. Step A pauses
+    // and settles later; step B is a completely different, unrelated call
+    // that happens to synthesize the SAME id and finishes first. The
+    // settlement carries its OWN original step_id (step-a), which is what
+    // must disambiguate it from step-b's unrelated result.
+    const inStepA = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-a",
+      data,
+    })
+    const inStepB = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-b",
+      data,
+    })
+    const stepAStart = { event_type: "react_task_start", step_id: "step-a", data: { step_name: "A" } }
+    const stepBStart = { event_type: "react_task_start", step_id: "step-b", data: { step_name: "B" } }
+
+    const events = [
+      stepAStart,
+      inStepA("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+      }),
+      inStepA("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        status: "waiting_for_user",
+        result: { output: "Publish?" },
+      }),
+      stepBStart,
+      inStepB("tool_execution_start", {
+        tool_name: "search",
+        tool_call_id: "tool_call_0",
+      }),
+      inStepB("tool_execution_end", {
+        tool_name: "search",
+        tool_call_id: "tool_call_0",
+        result: { output: "3 hits" },
+      }),
+      // The settlement for A's call, carrying A's OWN original step_id.
+      inStepA("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+      }),
+      inStepA("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "urn:li:share:123" },
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+    const search = toolActions.find((a) => a.data.tool === "search")
+    const approval = toolActions.find((a) => a.data.tool === "approval_gate")
+
+    // B's unrelated result is untouched.
+    expect(search?.data.output).toBe("3 hits")
+    // A's own action reopened and carries the settled result, not a third,
+    // ambiguous card.
+    expect(approval?.data.output).toBe("urn:li:share:123")
+    expect(toolActions).toHaveLength(2)
+  })
+
+  it("does not let a colliding call's settlement overwrite another's via the resolver cache", () => {
+    // The cache lookup used to be keyed on the BARE
+    // call id and returned before the origin-aware cross-step search ever
+    // ran. Two DIFFERENT colliding calls (a provider-omitted-id collision
+    // across concurrent DAG steps) each settling within the SAME processing
+    // pass -- e.g. a run-start replay redelivering both -- would have A's
+    // settlement START populate the cache under "tool_call_0", and B's
+    // settlement START/END would then silently read back (and overwrite)
+    // A's cached action instead of resolving to its own.
+    const inStepA = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-a",
+      data,
+    })
+    const inStepB = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-b",
+      data,
+    })
+    const stepAStart = { event_type: "react_task_start", step_id: "step-a", data: { step_name: "A" } }
+    const stepBStart = { event_type: "react_task_start", step_id: "step-b", data: { step_name: "B" } }
+
+    const events = [
+      stepAStart,
+      inStepA("tool_execution_start", { tool_name: "approval_gate", tool_call_id: "tool_call_0" }),
+      inStepA("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        status: "waiting_for_user",
+        result: { output: "Publish A?" },
+      }),
+      stepBStart,
+      inStepB("tool_execution_start", { tool_name: "approval_gate", tool_call_id: "tool_call_0" }),
+      inStepB("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        status: "waiting_for_user",
+        result: { output: "Publish B?" },
+      }),
+      // Both settlements redelivered together, A's pair fully processed
+      // before B's starts -- exactly what populates and then would leak
+      // the bare-id cache entry.
+      inStepA("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+      }),
+      inStepA("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "A-approved" },
+      }),
+      inStepB("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+      }),
+      inStepB("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "B-approved" },
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+
+    expect(toolActions).toHaveLength(2)
+    // A's settled result must survive B's later, differently-originated
+    // settlement -- not get silently overwritten via a shared cache entry.
+    expect(toolActions.find((a) => a.data.output === "A-approved")).toBeTruthy()
+    expect(toolActions.find((a) => a.data.output === "B-approved")).toBeTruthy()
+  })
+
+  it("clears the stale pause output when a settlement fails", () => {
+    // A rejected/errored settlement produces no new output -- only an error.
+    // Without clearing it, ToolOutputDisplay would keep rendering the
+    // original pause prompt ("Publish this exact post?") alongside the new
+    // error message.
+    const events = [
+      ...pausePair,
+      resumedStepStart,
+      inStep2("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+      }),
+      inStep2("tool_execution_failed", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+        settlement_status: "rejected",
+        error: "The user rejected the tool call.",
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+
+    expect(toolActions).toHaveLength(1)
+    expect(toolActions[0].status).toBe("failed")
+    expect(toolActions[0].data.error).toBe("The user rejected the tool call.")
+    expect(toolActions[0].data.output).toBeUndefined()
+  })
+})

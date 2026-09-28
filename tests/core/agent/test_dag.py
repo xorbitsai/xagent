@@ -7,6 +7,7 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import ANY
 
 import pytest
 
@@ -56,6 +57,35 @@ from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
+
+
+def test_failed_step_evidence_keeps_pre_identity_provider_overwrite_semantics() -> None:
+    dag = DAGPattern(lambda **_: None)
+    react = ReActPattern()
+    [completed] = react._normalize_tool_calls(
+        [{"id": "provider-reused", "name": "calculator", "args": {}}]
+    )
+    [failed] = react._normalize_tool_calls(
+        [{"id": "provider-reused", "name": "calculator", "args": {}}]
+    )
+    react._record_tool_call(completed, status="completed", result={"value": 1})
+    react._record_tool_call(failed, status="failed", result={"error": "failed"})
+    context = ExecutionContext(execution_id="provider-compatible-evidence")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "provider-reused",
+                "type": "function",
+                "function": {"name": "calculator", "arguments": "{}"},
+            }
+        ],
+    )
+    context.add_tool_result("calculator", {"value": 1}, "provider-reused")
+
+    dag._retain_failed_step_evidence("step", context, react)
+
+    assert dag.failed_step_evidence["step"]["observations"] == []
 
 
 class FakeWorkspace:
@@ -2285,13 +2315,15 @@ async def test_dag_step_checkpoint_survives_a_non_copyable_tool_result() -> None
     parent = PatternRuntime(tracer=JsonWriter(), execution_id="dag-root")
     child_context = ExecutionContext(execution_id="dag-root:a")
     react_pattern = ReActPattern()
-    react_pattern.tool_ledger["c1"] = ToolCallRecord(
-        tool_call_id="c1",
-        tool_name="t",
-        args={"a": 1},
-        args_hash="h",
-        status="completed",
-        result={"success": True, "client": threading.Lock()},
+    react_pattern._store_tool_record(
+        ToolCallRecord(
+            tool_call_id="c1",
+            tool_name="t",
+            args={"a": 1},
+            args_hash="h",
+            status="completed",
+            result={"success": True, "client": threading.Lock()},
+        )
     )
     runtime = _DAGStepRuntime(
         parent=parent,
@@ -6898,14 +6930,27 @@ async def test_dag_pattern_resume_executes_pending_tool_call_from_checkpoint() -
     assert interrupted["status"] == "interrupted"
     assert checkpoint is not None
     assert checkpoint["label"] == "dag_interrupted"
-    assert checkpoint["pattern_state"]["active_step_pattern_states"]["calc"][
+    [pending_call] = checkpoint["pattern_state"]["active_step_pattern_states"]["calc"][
         "pending_tool_calls"
-    ] == [{"id": "dag-call", "name": "calculator", "args": {"expression": "6*7"}}]
+    ]
+    assert pending_call == {
+        "id": "dag-call",
+        "invocation_id": ANY,
+        "issued_at": ANY,
+        "name": "calculator",
+        "args": {"expression": "6*7"},
+    }
+    checkpointed_invocation_id = pending_call["invocation_id"]
+    assert checkpointed_invocation_id
 
     restored_pattern = DAGPattern(
         lambda **_: build_plan(PlanStep(id="calc", task="Calculate 6*7"))
     )
     restored_pattern.load_state(checkpoint["pattern_state"])
+    [restored_pending_call] = restored_pattern.active_step_pattern_states["calc"][
+        "pending_tool_calls"
+    ]
+    assert restored_pending_call["invocation_id"] == checkpointed_invocation_id
     restored_context = ExecutionContext.from_dict(checkpoint["context"])
     restored_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["audio"]
     restored_tool = FakeTool()

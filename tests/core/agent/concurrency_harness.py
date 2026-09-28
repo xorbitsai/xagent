@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import itertools
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from xagent.core.agent import ReActPattern
@@ -170,15 +172,25 @@ class RecordingContext:
         tool_name: str,
         result: Any,
         tool_call_id: str | None = None,
+        *,
+        invocation_id: str | None = None,
     ) -> _RecordedMessage:
         self.tool_results.append(
             {
                 "tool_name": tool_name,
                 "result": result,
                 "tool_call_id": tool_call_id,
+                "invocation_id": invocation_id,
             }
         )
-        message = _RecordedMessage("tool", result, tool_call_id=tool_call_id)
+        message = _RecordedMessage(
+            "tool",
+            result,
+            tool_call_id=tool_call_id,
+            metadata=(
+                {"invocation_id": invocation_id} if invocation_id is not None else {}
+            ),
+        )
         self.messages.append(message)
         return message
 
@@ -321,6 +333,8 @@ def make_tool_call(
         "name": name,
         "args": dict(args or {}),
         "id": id if id is not None else f"call_{next(_tool_call_ids)}",
+        "invocation_id": uuid.uuid4().hex,
+        "issued_at": datetime.now(timezone.utc).timestamp(),
     }
 
 

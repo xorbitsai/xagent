@@ -178,8 +178,8 @@ async def test_interrupt_during_batch_preserves_completed_results() -> None:
         )
     )
     while (
-        pattern.tool_ledger.get(calls[0]["id"]) is None
-        or pattern.tool_ledger[calls[0]["id"]].status != "completed"
+        pattern._record_for_tool_call_id(calls[0]["id"]) is None
+        or pattern._record_for_tool_call_id(calls[0]["id"]).status != "completed"
         or not tools[1].calls
     ):
         await asyncio.sleep(0)
@@ -190,8 +190,8 @@ async def test_interrupt_during_batch_preserves_completed_results() -> None:
 
     assert [result["tool_name"] for result in context.tool_results] == ["s1"]
     assert [call["name"] for call in pattern.pending_tool_calls] == ["s2"]
-    assert pattern.tool_ledger[calls[0]["id"]].status == "completed"
-    assert pattern.tool_ledger[calls[1]["id"]].status == "interrupted"
+    assert pattern._record_for_tool_call_id(calls[0]["id"]).status == "completed"
+    assert pattern._record_for_tool_call_id(calls[1]["id"]).status == "interrupted"
 
 
 async def test_concurrent_batch_then_unsafe_serial_preserves_order() -> None:
@@ -432,9 +432,9 @@ async def test_forced_turn_policy_applies_within_one_batch(cell: str) -> None:
     ]
     read_ids = [call["id"] for call in calls if call["name"] == SPILL_READ_TOOL_NAME]
     assert refused == read_ids[3:]
-    assert [pattern.tool_ledger[call_id].status for call_id in read_ids[3:]] == [
-        "refused"
-    ] * 5
+    assert [
+        pattern._record_for_tool_call_id(call_id).status for call_id in read_ids[3:]
+    ] == ["refused"] * 5
     assert _forced_read_counts(pattern) == (3, 0, 3)
 
 

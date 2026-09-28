@@ -3972,13 +3972,13 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
     ) -> List[Dict[str, Any]]:
         from ..LanceDB.schema_manager import _safe_close_table
 
-        if not doc_refs:
-            return []
         table = None
         try:
             conn = self._get_sync_connection()
             self._ensure_ingestion_runs_table(conn)
             table = conn.open_table("ingestion_runs")
+            if not doc_refs:
+                return []
             return query_to_list(
                 table.search()
                 .where(self._build_doc_refs_filter(doc_refs))
@@ -4002,14 +4002,13 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         stray -= set(doc_refs)
         if stray:
             raise ValueError(f"Status rows outside doc_refs: {stray}")
-        if not doc_refs:
-            return
         table = None
         try:
             conn = self._get_sync_connection()
             self._ensure_ingestion_runs_table(conn)
             table = conn.open_table("ingestion_runs")
-            table.delete(self._build_doc_refs_filter(doc_refs))
+            if doc_refs:
+                table.delete(self._build_doc_refs_filter(doc_refs))
             if rows:
                 table.add(list(rows))
         except Exception as e:
@@ -4143,7 +4142,7 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         return f"collection == '{safe_collection}' AND doc_id == '{safe_doc_id}'"
 
     def _build_doc_refs_filter(self, doc_refs: Sequence[Tuple[str, str]]) -> str:
-        """Needs non-empty ``doc_refs``: no refs yields ``""``, which is no filter."""
+        """Callers skip empty ``doc_refs``: they yield ``""``, which is no filter."""
         return " or ".join(
             f"({self._build_base_filter(collection, doc_id)})"
             for collection, doc_id in doc_refs

@@ -97,13 +97,13 @@ def test_replace_rejects_rows_outside_the_refs_before_touching_the_table():
     assert sorted(_all_rows(), key=_key) == sorted(TARGETS + BYSTANDERS, key=_key)
 
 
-def test_empty_refs_never_open_the_table(monkeypatch):
+def test_empty_refs_read_and_change_nothing():
     store = LanceDBIngestionStatusStore()
-    monkeypatch.setattr(
-        store, "_get_sync_connection", lambda: pytest.fail("opened ingestion_runs")
-    )
+    _table().add(TARGETS + BYSTANDERS)
 
     assert store.load_ingestion_status_rows([]) == []
     store.replace_ingestion_status_rows([], [])
     with pytest.raises(ValueError, match="outside doc_refs"):
         store.replace_ingestion_status_rows([], TARGETS)
+
+    assert sorted(_all_rows(), key=_key) == sorted(TARGETS + BYSTANDERS, key=_key)

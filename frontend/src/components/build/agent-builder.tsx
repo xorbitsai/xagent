@@ -717,10 +717,14 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const previewGenerationRef = useRef(0)
   // Bumped by invalidatePreviewTask on config changes; a mismatch still sends the in-flight message but won't cache its task.
   const previewConfigGenerationRef = useRef(0)
+  // Only an accepted send for the current configuration can complete the guide.
+  // Keep this reactive: invalidating the cached task must also remove its checkmark.
+  const [previewCompletionTaskId, setPreviewCompletionTaskId] = useState<number | null>(null)
 
   const resetPreviewSession = useCallback(() => {
     previewGenerationRef.current += 1
     previewTaskIdRef.current = null
+    setPreviewCompletionTaskId(null)
     closeFilePreview()
     dispatch({ type: "CLEAR_MESSAGES" })
     dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
@@ -734,6 +738,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const invalidatePreviewTask = useCallback(() => {
     previewConfigGenerationRef.current += 1
     previewTaskIdRef.current = null
+    setPreviewCompletionTaskId(null)
   }, [])
 
   useEffect(() => {
@@ -1177,6 +1182,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const handlePreviewSendMessage = async (content: string, _config?: any, files?: File[]) => {
     const generationAtStart = previewGenerationRef.current
+    const configGenerationAtStart = previewConfigGenerationRef.current
+    setPreviewCompletionTaskId(null)
     try {
       // Check if general model is selected
       if (!modelConfig.general) {
@@ -1209,7 +1216,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       const finalToolCategories = buildToolCategories()
 
       if (!previewTaskId) {
-        const configGenerationAtStart = previewConfigGenerationRef.current
         const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1281,6 +1287,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       }
 
       await sendMessage(backendMessage, { force: true, targetTaskId: previewTaskId }, files)
+      if (
+        previewGenerationRef.current === generationAtStart
+        && previewConfigGenerationRef.current === configGenerationAtStart
+      ) {
+        setPreviewCompletionTaskId(previewTaskId)
+      }
     } catch (error) {
       console.error("Preview failed:", error)
       if (previewGenerationRef.current !== generationAtStart) return
@@ -1882,7 +1894,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         selectedToolCategories.length > 0 ||
         selectedMcpServers.length > 0
       )
-  const previewStepCompleted = state.messages.some((message) => message.role === "user")
+  const previewStepCompleted = previewCompletionTaskId !== null
+    && state.taskId === previewCompletionTaskId
+    && state.currentTask?.id === String(previewCompletionTaskId)
+    && state.currentTask.status === "completed"
+    && !state.isProcessing
   const shouldHighlightConfigStep = !configStepCompleted
   const shouldHighlightKbSection = useTemplateSpecificHighlights ? templateMissingKb : shouldHighlightConfigStep
   const shouldHighlightSkillsSection = useTemplateSpecificHighlights ? templateMissingSkills : shouldHighlightConfigStep

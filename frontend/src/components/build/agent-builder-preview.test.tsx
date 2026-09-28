@@ -1,6 +1,7 @@
 import React from "react"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { Task } from "@/contexts/app-context-chat"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const setTaskIdMock = vi.hoisted(() => vi.fn())
@@ -34,15 +35,12 @@ vi.mock("@/lib/utils", async () => {
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
     state: {
-      messages: [],
       traceEvents: [],
-      currentTask: null,
-      isProcessing: false,
       isHistoryLoading: false,
-      taskId: null,
       filePreview: { isOpen: false },
       dagExecution: null,
       steps: [],
+      ...previewState,
     },
     setTaskId: setTaskIdMock,
     sendMessage: sendMessageMock,
@@ -177,6 +175,12 @@ import { AgentBuilder } from "./agent-builder"
 let storedToolCategories: string[] = ["ssh"]
 let putBody: { tool_categories?: string[] } | undefined
 let availableTools: unknown[] = []
+let previewState: {
+  messages: Array<{ role: string }>
+  currentTask: Pick<Task, "id" | "status"> | null
+  taskId: number | null
+  isProcessing: boolean
+}
 
 describe("AgentBuilder preview", () => {
   const originalWebSocket = globalThis.WebSocket
@@ -185,6 +189,7 @@ describe("AgentBuilder preview", () => {
     storedToolCategories = ["ssh"]
     putBody = undefined
     availableTools = []
+    previewState = { messages: [], currentTask: null, taskId: null, isProcessing: false }
     apiRequestMock.mockReset()
     setTaskIdMock.mockReset()
     sendMessageMock.mockReset()
@@ -339,6 +344,105 @@ describe("AgentBuilder preview", () => {
       preview_agent_id: 42,
       is_preview: true,
       tool_categories: ["ssh"],
+    })
+  })
+
+  describe("preview completion", () => {
+    const expectPreviewComplete = (complete: boolean) => {
+      const step = screen.getByRole("button", { name: /builds.editor.stepGuide.preview/ })
+      expect(step.querySelector("svg") !== null).toBe(complete)
+    }
+
+    it.each(["pending", "running", "failed", "paused", "waiting_for_user"] as const)(
+      "does not count a user message on a %s task as a completed preview",
+      async (status) => {
+        const { rerender } = render(<AgentBuilder agentId="42" />)
+        await screen.findByDisplayValue("Existing SSH agent")
+        fireEvent.click(screen.getByText("send-preview-message"))
+        await waitFor(() => expect(sendMessageMock).toHaveBeenCalled())
+        previewState = { messages: [{ role: "user" }], currentTask: { id: "123", status }, taskId: 123, isProcessing: status === "running" }
+        rerender(<AgentBuilder agentId="42" />)
+        expectPreviewComplete(false)
+      },
+    )
+
+    it("requires this configuration's completed task and invalidates it on config edits or Clear", async () => {
+      const { rerender } = render(<AgentBuilder agentId="42" />)
+      await screen.findByDisplayValue("Existing SSH agent")
+      fireEvent.click(screen.getByText("send-preview-message"))
+      await waitFor(() => expect(sendMessageMock).toHaveBeenCalled())
+      previewState = { messages: [{ role: "user" }], currentTask: { id: "999", status: "completed" }, taskId: 999, isProcessing: false }
+      rerender(<AgentBuilder agentId="42" />)
+      expectPreviewComplete(false)
+      previewState = { ...previewState, currentTask: { id: "123", status: "completed" }, taskId: 123 }
+      rerender(<AgentBuilder agentId="42" />)
+      expectPreviewComplete(true)
+
+      fireEvent.change(screen.getByDisplayValue("Existing SSH agent"), { target: { value: "Renamed" } })
+      expectPreviewComplete(true)
+      fireEvent.click(screen.getByText("builds.configForm.executionMode.think.title"))
+      expectPreviewComplete(false)
+      const baseImpl = apiRequestMock.getMockImplementation()!
+      apiRequestMock.mockImplementation((url: string, init?: RequestInit) =>
+        url.endsWith("/api/chat/task/create")
+          ? Promise.resolve(new Response(JSON.stringify({ task_id: 456, status: "pending" })))
+          : baseImpl(url, init),
+      )
+      fireEvent.click(screen.getByText("send-preview-message"))
+      await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+      expectPreviewComplete(false)
+      previewState = { ...previewState, taskId: 456, currentTask: { id: "456", status: "completed" } }
+      rerender(<AgentBuilder agentId="42" />)
+      expectPreviewComplete(true)
+      fireEvent.click(screen.getByTitle("common.clear"))
+      expectPreviewComplete(false)
+    })
+
+    it("only completes after a waiting or running preview finishes", async () => {
+      const { rerender } = render(<AgentBuilder agentId="42" />)
+      await screen.findByDisplayValue("Existing SSH agent")
+      fireEvent.click(screen.getByText("send-preview-message"))
+      await waitFor(() => expect(sendMessageMock).toHaveBeenCalled())
+      for (const status of ["waiting_for_user", "running", "completed"] as const) {
+        previewState = { messages: [{ role: "user" }], currentTask: { id: "123", status }, taskId: 123, isProcessing: status === "running" }
+        rerender(<AgentBuilder agentId="42" />)
+        expectPreviewComplete(status === "completed")
+      }
+      previewState.isProcessing = true
+      rerender(<AgentBuilder agentId="42" />)
+      expectPreviewComplete(false)
+    })
+
+    it.each(["config", "clear"])("does not restore completion after %s changes before the send is acknowledged", async (change) => {
+      let acknowledgeSend!: () => void
+      sendMessageMock.mockReturnValueOnce(new Promise<void>((resolve) => { acknowledgeSend = resolve }))
+      const { rerender } = render(<AgentBuilder agentId="42" />)
+      await screen.findByDisplayValue("Existing SSH agent")
+      fireEvent.click(screen.getByText("send-preview-message"))
+      await waitFor(() => expect(sendMessageMock).toHaveBeenCalled())
+      fireEvent.click(change === "config"
+        ? screen.getByText("builds.configForm.executionMode.think.title")
+        : screen.getByTitle("common.clear"))
+      previewState = { messages: [{ role: "user" }], currentTask: { id: "123", status: "completed" }, taskId: 123, isProcessing: false }
+      await act(async () => acknowledgeSend())
+      rerender(<AgentBuilder agentId="42" />)
+      expectPreviewComplete(false)
+    })
+
+    it("withdraws completion while a follow-up is being sent and after delivery fails", async () => {
+      const { rerender } = render(<AgentBuilder agentId="42" />)
+      await screen.findByDisplayValue("Existing SSH agent")
+      fireEvent.click(screen.getByText("send-preview-message"))
+      await waitFor(() => expect(sendMessageMock).toHaveBeenCalled())
+      previewState = { messages: [{ role: "user" }], currentTask: { id: "123", status: "completed" }, taskId: 123, isProcessing: false }
+      rerender(<AgentBuilder agentId="42" />)
+      expectPreviewComplete(true)
+      let rejectSend!: (error: Error) => void
+      sendMessageMock.mockReturnValueOnce(new Promise((_, reject) => { rejectSend = reject }))
+      fireEvent.click(screen.getByText("send-preview-message"))
+      expectPreviewComplete(false)
+      await act(async () => rejectSend(new Error("not delivered")))
+      expectPreviewComplete(false)
     })
   })
 

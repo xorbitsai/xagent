@@ -4719,6 +4719,8 @@ class LanceDBMainPointerStore(MainPointerStore):
         try:
             normalized_tag = self._normalize_model_tag(model_tag)
             now = datetime.now(timezone.utc).replace(tzinfo=None)
+            # main_pointers is timestamp[ms]; merge_insert rejects sub-ms values.
+            now = now.replace(microsecond=now.microsecond // 1000 * 1000)
 
             # Check if pointer already exists to preserve created_at
             existing = self.get_main_pointer(collection, doc_id, step_type, model_tag)

@@ -1,6 +1,7 @@
 """Tests for LanceDB-backed storage implementations."""
 
 import asyncio
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
@@ -1406,6 +1407,31 @@ def test_main_pointer_store_delete_not_found(mock_get_connection: Mock) -> None:
     result = store.delete_main_pointer("test_collection", "test_doc", "parse")
     assert result is False
     mock_table.delete.assert_not_called()
+
+
+def test_main_pointer_store_set_twice_upserts_one_row_on_real_table() -> None:
+    from xagent.providers.vector_store.lancedb import get_connection_from_env
+
+    store = LanceDBMainPointerStore()
+    store.set_main_pointer("kb", "d1", "embed", "s1", "t1", "m1", operator="first")
+    first = store.get_main_pointer("kb", "d1", "embed", "m1")
+    assert first is not None
+    assert (first["semantic_id"], first["technical_id"]) == ("s1", "t1")
+
+    time.sleep(0.002)
+    store.set_main_pointer("kb", "d1", "embed", "s2", "t2", "m1", operator="second")
+
+    rows = get_connection_from_env().open_table("main_pointers").to_arrow().to_pylist()
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["semantic_id"], row["technical_id"], row["operator"]) == (
+        "s2",
+        "t2",
+        "second",
+    )
+    assert row["model_tag"] == "m1"
+    assert row["created_at"] == first["created_at"]
+    assert row["updated_at"] > first["updated_at"]
 
 
 # =============================================================================

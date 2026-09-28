@@ -188,7 +188,7 @@ def test_kb_file_service_opens_no_lancedb() -> None:
     )
 
 
-def test_kb_router_opens_no_lancedb() -> None:
+def test_kb_api_opens_no_lancedb() -> None:
     source = Path(kb_api_module.__file__).read_text()
     offenders = _lancedb_access_offenders(source, kb_api_module.__package__)
     assert offenders == [], (

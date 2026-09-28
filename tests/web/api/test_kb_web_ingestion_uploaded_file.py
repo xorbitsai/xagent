@@ -2110,6 +2110,7 @@ class TestWebFileRefreshHelpers:
             [
                 {"collection": "kb", "doc_id": "doc-1", "file_id": "file-123"},
                 {"collection": "kb2", "doc_id": "doc-2", "file_id": "file-123"},
+                {"collection": "kb", "doc_id": "doc-2", "file_id": "other-file"},
             ]
         )
         ensure_ingestion_runs_table(conn)

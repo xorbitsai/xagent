@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
@@ -60,17 +61,17 @@ def _bind(monkeypatch: pytest.MonkeyPatch, status_store: _StatusStore) -> None:
 
 
 REFS = [("kb-a", "d-1"), ("kb-b", "d-2")]
+_FAILING_AMBIENT = SimpleNamespace(
+    get_ingestion_status_store=lambda: _StatusStore(fail=True),
+    get_vector_index_store=_VectorStore,
+)
 
 
 def test_snapshot_and_restore_use_the_coordinators_status_store(monkeypatch):
     status_store = _StatusStore()
     _bind(monkeypatch, status_store)
-    ambient = SimpleNamespace(
-        get_ingestion_status_store=lambda: _StatusStore(fail=True),
-        get_vector_index_store=_VectorStore,
-    )
 
-    with bind_storage_shim_for_current_context(ambient):
+    with bind_storage_shim_for_current_context(_FAILING_AMBIENT):
         snapshot = kb_module._snapshot_ingestion_runs_for_uploaded_file("f")
         assert snapshot is not None
         kb_module._restore_ingestion_runs_snapshot(snapshot)
@@ -86,7 +87,8 @@ def test_reindex_marker_clears_each_ref_for_every_owner(monkeypatch):
     status_store = _StatusStore()
     _bind(monkeypatch, status_store)
 
-    assert kb_module._mark_uploaded_file_for_reindex("f") is True
+    with bind_storage_shim_for_current_context(_FAILING_AMBIENT):
+        assert kb_module._mark_uploaded_file_for_reindex("f") is True
 
     assert status_store.calls == [
         ("clear", {"collection": c, "doc_id": d, "user_id": None, "is_admin": True})
@@ -94,11 +96,14 @@ def test_reindex_marker_clears_each_ref_for_every_owner(monkeypatch):
     ]
 
 
-def test_status_store_failures_keep_each_callers_contract(monkeypatch):
+def test_status_store_failures_keep_each_callers_contract(monkeypatch, caplog):
     _bind(monkeypatch, _StatusStore(fail=True))
 
-    assert kb_module._snapshot_ingestion_runs_for_uploaded_file("f") is None
-    assert kb_module._mark_uploaded_file_for_reindex("f") is False
+    with caplog.at_level(logging.WARNING, logger=kb_module.logger.name):
+        assert kb_module._snapshot_ingestion_runs_for_uploaded_file("f") is None
+        assert kb_module._mark_uploaded_file_for_reindex("f") is False
+    swallowed = [r.exc_info[1] for r in caplog.records if r.exc_info]
+    assert [str(exc) for exc in swallowed] == ["status store down"] * 2
     with pytest.raises(RuntimeError, match="status store down"):
         kb_module._restore_ingestion_runs_snapshot(
             kb_module._IngestionRunsSnapshot(doc_refs=REFS, rows=[])

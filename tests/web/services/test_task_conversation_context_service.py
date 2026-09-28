@@ -2421,3 +2421,204 @@ def test_same_prose_separated_by_a_prose_less_exchange_is_kept():
         assert assistant_contents == [repeated_prose, "", repeated_prose]
     finally:
         db_session.close()
+
+
+def test_settlement_delivery_supersedes_the_pause_observation(caplog):
+    """A resumed settlement replaces its call's result, not adds a second call.
+
+    The settlement pair reuses the original ``tool_call_id`` but is emitted
+    under the resumed run's own ``step_id``, so the step-scoped pairing key
+    would have paired it as an independent exchange and replayed one tool call
+    to the planner twice -- once waiting for the user, once settled.
+    """
+
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="publish the post",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(0),
+            step_id="react_a",
+            turn_id="turn-1",
+            data={
+                "tool_name": "publish_post",
+                "tool_params": {"text": "hello"},
+                "tool_call_id": "call-1",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(1),
+            step_id="react_a",
+            turn_id="turn-1",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "call-1",
+                "success": False,
+                "status": "waiting_for_user",
+                "result": {"status": "waiting_for_user", "message": "Publish?"},
+            },
+        )
+        # The user approves; the resumed run settles the SAME call under a new
+        # step id.
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="yes, publish it",
+            created_at=_ts(2),
+            turn_id="turn-2",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(3),
+            step_id="react_b",
+            turn_id="turn-2",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(4),
+            step_id="react_b",
+            turn_id="turn-2",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "success": True,
+                "result": {"success": True, "post_urn": "urn:li:share:123"},
+            },
+        )
+
+        logger_name = "xagent.web.services.task_conversation_context_service"
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            messages = load_task_conversation_context_sync(db_session, int(task.id))
+
+        publish_results = [
+            message
+            for message in messages
+            if message["role"] == "tool" and message["tool_name"] == "publish_post"
+        ]
+        # Exactly one exchange for the call, carrying the settled outcome.
+        assert len(publish_results) == 1
+        assert publish_results[0]["raw_result"] == {
+            "success": True,
+            "post_urn": "urn:li:share:123",
+        }
+        # The settlement end is start-less by design (its start is skipped),
+        # so it must not register as a reconstruction drop.
+        summary = next(
+            record.getMessage()
+            for record in caplog.records
+            if "task_conversation_context_reconstructed" in record.getMessage()
+        )
+        assert "tool_ends_without_start=0" in summary
+
+        # And only one assistant tool_call announces it.
+        announced = [
+            call
+            for message in messages
+            if message["role"] == "assistant" and message.get("tool_calls")
+            for call in message["tool_calls"]
+            if call["id"] == "call-1"
+        ]
+        assert len(announced) == 1
+    finally:
+        db_session.close()
+
+
+def test_settlement_start_is_not_counted_as_a_dangling_start(caplog):
+    """The settlement start is skipped, not parked in the pending table.
+
+    The two settlement events are independent best-effort trace writes, so the
+    start can land while the end is lost. Parking that start would leave a
+    pending entry nothing can ever pair, inflating the dangling-start health
+    metric -- a signal that exists to reveal real reconstruction drops.
+    """
+
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="publish the post",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(0),
+            step_id="react_a",
+            turn_id="turn-1",
+            data={
+                "tool_name": "publish_post",
+                "tool_params": {"text": "hello"},
+                "tool_call_id": "call-1",
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(1),
+            step_id="react_a",
+            turn_id="turn-1",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "call-1",
+                "success": False,
+                "result": {"status": "waiting_for_user"},
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(2),
+            step_id="react_b",
+            turn_id="turn-2",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        )
+        # No settlement end: its best-effort trace write was lost.
+
+        logger_name = "xagent.web.services.task_conversation_context_service"
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            load_task_conversation_context_sync(db_session, int(task.id))
+
+        summary = next(
+            record.getMessage()
+            for record in caplog.records
+            if "task_conversation_context_reconstructed" in record.getMessage()
+        )
+        assert "dangling_tool_starts=0" in summary
+    finally:
+        db_session.close()

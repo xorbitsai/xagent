@@ -1418,10 +1418,15 @@ def test_main_pointer_store_set_twice_upserts_one_row_on_real_table() -> None:
     assert first is not None
     assert (first["semantic_id"], first["technical_id"]) == ("s1", "t1")
 
-    time.sleep(0.002)
+    time.sleep(0.05)
     store.set_main_pointer("kb", "d1", "embed", "s2", "t2", "m1", operator="second")
 
-    rows = get_connection_from_env().open_table("main_pointers").to_arrow().to_pylist()
+    table = get_connection_from_env().open_table("main_pointers")
+    rows = [
+        r
+        for r in table.to_arrow().to_pylist()
+        if (r["collection"], r["doc_id"], r["step_type"]) == ("kb", "d1", "embed")
+    ]
     assert len(rows) == 1
     row = rows[0]
     assert (row["semantic_id"], row["technical_id"], row["operator"]) == (

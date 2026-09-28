@@ -19,6 +19,9 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services.kb_collection_service import (
     CollectionPhysicalDeleteResult as Cleanup,
 )
+from xagent.web.services.kb_collection_service import (
+    classify_collection_physical_cleanup,
+)
 
 test_env = kb_dir.test_env
 temp_uploads = kb_dir.temp_uploads
@@ -274,3 +277,10 @@ def test_failed_db_delete_skips_directory_cleanup_and_keeps_rows(
     physical.assert_not_called()
     assert result == _expected(db_result, "error", db_result.message, ["db"])
     assert kept == {owner}
+
+
+def test_classifier_rejects_a_failed_db_delete():
+    with pytest.raises(ValueError):
+        classify_collection_physical_cleanup(
+            _db_result(status="error"), {1: Cleanup("success")}, collection_name="demo"
+        )

@@ -8,7 +8,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, List, Mapping, Optional, Set
+from typing import TYPE_CHECKING, Callable, List, Mapping, Optional, Set, Tuple
 
 from filelock import Timeout
 from sqlalchemy import or_
@@ -66,7 +66,7 @@ class CollectionCleanupReport:
 
     status: str
     message: str
-    warnings: List[str]
+    warnings: Tuple[str, ...]
     rows_deletable_owner_ids: frozenset[int]
 
 
@@ -595,11 +595,13 @@ def classify_collection_physical_cleanup(
 ) -> CollectionCleanupReport:
     """Report a collection delete after each owner's directory cleanup.
 
-    The caller returns an ``error`` result itself and must not pass one here.
+    The caller returns ``error`` results itself; passing one raises ``ValueError``.
     Notes follow ``physical_cleanup_by_owner`` order. A ``success`` result
     becomes ``partial_success`` when an ``error`` or ``failed`` cleanup has an
     error. Only owners whose cleanup is ``success``/``not_found`` may lose rows.
     """
+    if result.status == "error":
+        raise ValueError("error results are returned by the caller, not classified")
     notes: List[str] = []
     rows_deletable_owner_ids: Set[int] = set()
     has_issue = False
@@ -640,7 +642,7 @@ def classify_collection_physical_cleanup(
     return CollectionCleanupReport(
         status=status,
         message=f"{result.message} {'; '.join(notes)}." if notes else result.message,
-        warnings=[*result.warnings, *notes],
+        warnings=(*result.warnings, *notes),
         rows_deletable_owner_ids=frozenset(rows_deletable_owner_ids),
     )
 

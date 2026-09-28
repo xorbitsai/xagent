@@ -6193,7 +6193,7 @@ def _perform_kb_collection_delete(
             status=report.status,
             collection=safe_collection,
             message=report.message,
-            warnings=report.warnings,
+            warnings=list(report.warnings),
             affected_documents=result.affected_documents,
             deleted_counts=result.deleted_counts,
         )

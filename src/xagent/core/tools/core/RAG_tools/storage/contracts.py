@@ -1632,6 +1632,13 @@ class IngestionStatusStore(ABC):
 
         Unlike :meth:`write_ingestion_status`, ``rows`` are written as given,
         timestamps included.
+
+        Every row's ``(collection, doc_id)`` must be in ``doc_refs``: a row
+        outside them would sit next to rows the delete never touched.
+
+        Raises:
+            ValueError: If a row's ``(collection, doc_id)`` is not in
+                ``doc_refs``, before anything is deleted or added.
         """
 
     @abstractmethod

@@ -3972,19 +3972,22 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
     ) -> List[Dict[str, Any]]:
         from ..LanceDB.schema_manager import _safe_close_table
 
-        conn = self._get_sync_connection()
-        self._ensure_ingestion_runs_table(conn)
+        if not doc_refs:
+            return []
         table = None
         try:
+            conn = self._get_sync_connection()
+            self._ensure_ingestion_runs_table(conn)
             table = conn.open_table("ingestion_runs")
-            if not doc_refs:
-                return []
             return query_to_list(
                 table.search()
                 .where(self._build_doc_refs_filter(doc_refs))
                 .select(list(_INGESTION_STATUS_COLUMNS))
                 .limit(-1)
             )
+        except Exception as e:
+            logger.error("Failed to load ingestion status rows: %s", e)
+            raise
         finally:
             _safe_close_table(table)
 
@@ -3995,15 +3998,23 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
     ) -> None:
         from ..LanceDB.schema_manager import _safe_close_table
 
-        conn = self._get_sync_connection()
-        self._ensure_ingestion_runs_table(conn)
+        stray = {(row.get("collection"), row.get("doc_id")) for row in rows}
+        stray -= set(doc_refs)
+        if stray:
+            raise ValueError(f"Status rows outside doc_refs: {stray}")
+        if not doc_refs:
+            return
         table = None
         try:
+            conn = self._get_sync_connection()
+            self._ensure_ingestion_runs_table(conn)
             table = conn.open_table("ingestion_runs")
-            if doc_refs:
-                table.delete(self._build_doc_refs_filter(doc_refs))
+            table.delete(self._build_doc_refs_filter(doc_refs))
             if rows:
                 table.add(list(rows))
+        except Exception as e:
+            logger.error("Failed to replace ingestion status rows: %s", e)
+            raise
         finally:
             _safe_close_table(table)
 
@@ -4132,6 +4143,7 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         return f"collection == '{safe_collection}' AND doc_id == '{safe_doc_id}'"
 
     def _build_doc_refs_filter(self, doc_refs: Sequence[Tuple[str, str]]) -> str:
+        """Needs non-empty ``doc_refs``: no refs yields ``""``, which is no filter."""
         return " or ".join(
             f"({self._build_base_filter(collection, doc_id)})"
             for collection, doc_id in doc_refs

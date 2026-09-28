@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+import pytest
+
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
     ensure_ingestion_runs_table,
 )
@@ -82,3 +84,26 @@ def test_replace_with_no_rows_only_deletes():
     LanceDBIngestionStatusStore().replace_ingestion_status_rows(REFS, [])
 
     assert sorted(_all_rows(), key=_key) == sorted(BYSTANDERS, key=_key)
+
+
+def test_replace_rejects_rows_outside_the_refs_before_touching_the_table():
+    _table().add(TARGETS + BYSTANDERS)
+
+    with pytest.raises(ValueError, match="outside doc_refs"):
+        LanceDBIngestionStatusStore().replace_ingestion_status_rows(
+            REFS, TARGETS + BYSTANDERS[:1]
+        )
+
+    assert sorted(_all_rows(), key=_key) == sorted(TARGETS + BYSTANDERS, key=_key)
+
+
+def test_empty_refs_never_open_the_table(monkeypatch):
+    store = LanceDBIngestionStatusStore()
+    monkeypatch.setattr(
+        store, "_get_sync_connection", lambda: pytest.fail("opened ingestion_runs")
+    )
+
+    assert store.load_ingestion_status_rows([]) == []
+    store.replace_ingestion_status_rows([], [])
+    with pytest.raises(ValueError, match="outside doc_refs"):
+        store.replace_ingestion_status_rows([], TARGETS)

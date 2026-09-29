@@ -47,7 +47,9 @@ class StreamChunk:
         delta: Incremental content (new content added by current chunk)
         tool_calls: Tool call list (only for TOOL_CALL type)
         usage: Token usage statistics (only for USAGE type)
-        finish_reason: Finish reason (only for END type)
+        finish_reason: Provider finish reason, set on the chunk that ends the
+            generation (END, or the final TOKEN / TOOL_CALL chunk when the
+            provider reports it alongside the last delta)
         raw: Original response object
     """
 

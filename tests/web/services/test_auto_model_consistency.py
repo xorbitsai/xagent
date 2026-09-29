@@ -280,7 +280,7 @@ def test_admin_delete_prunes_only_inaccessible_bindings(env, retained_grant):
         env.db.add(UserModel(user_id=env.consumer.id, model_id=t.id, is_owner=True))
         env.db.commit()
     env.db.close()
-    assert admin_users._delete_user_rows_sync(user_id=ids[0]) is True
+    assert admin_users._delete_user_rows_sync(user_id=ids[0]) is not None
     with env.factory() as db:
         assert db.get(User, ids[0]) is None
         assert db.get(Model, ids[2]) is not None

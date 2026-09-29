@@ -27,6 +27,7 @@ from ..config import (
     get_orphan_upload_sweep_interval_seconds,
     get_session_secret,
     get_shared_task_execution_enabled,
+    get_task_cleanup_retry_interval_seconds,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
     get_taskless_upload_ttl_seconds,
@@ -56,6 +57,9 @@ from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
 from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
 from .api.admin_mcp import admin_mcp_router
+from .api.admin_memory_embedding_authority import (
+    OPENAPI_COMPONENT_SCHEMAS as ADMIN_MEMORY_AUTHORITY_SCHEMAS,
+)
 from .api.admin_memory_embedding_authority import (
     router as admin_memory_embedding_authority_router,
 )
@@ -676,6 +680,80 @@ async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
         except Exception as exc:
             logger.error(
                 "Orphan upload GC loop stopped after failure",
+                exc_info=exc,
+            )
+
+
+def start_task_cleanup_retry_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the retry driver for cleanup task deletions still owe (#2587).
+
+    Unlike the retention purge this runs in every deployment: on-demand task
+    and account deletion record obligations on any store, and a directory left
+    by a failed removal is owed whether or not retention is configured. Several
+    replicas running it is safe -- its claim is a compare-and-set.
+
+    Guarded under pytest like the sibling loops; a test that means to exercise
+    the starter opts in through ``task_cleanup_retry_allowed_in_tests``.
+    """
+
+    from .models.database import get_session_local
+    from .services.task_cleanup_obligations import run_cleanup_obligation_loop
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "task_cleanup_retry_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error("Previous task cleanup retry loop failed", exc_info=failure)
+        app_instance.state.task_cleanup_retry_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST") and not getattr(
+        app_instance.state, "task_cleanup_retry_allowed_in_tests", False
+    ):
+        logger.info("Skipping task cleanup retry loop (test environment)")
+        return None
+
+    poll_interval_seconds = get_task_cleanup_retry_interval_seconds()
+    task = asyncio.create_task(
+        run_cleanup_obligation_loop(
+            get_session_local(), poll_interval_seconds=poll_interval_seconds
+        )
+    )
+    app_instance.state.task_cleanup_retry_task = task
+    logger.info("Started task cleanup retry loop (interval=%ss)", poll_interval_seconds)
+    return task
+
+
+async def stop_task_cleanup_retry_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's task cleanup retry loop.
+
+    Cancelling is enough here, unlike the purge: an interrupted release keeps
+    its claim until the lease lapses and is then retried, and the release is
+    idempotent.
+    """
+
+    task = getattr(app_instance.state, "task_cleanup_retry_task", None)
+    app_instance.state.task_cleanup_retry_task = None
+    if task is not None and not task.done():
+        logger.info("Cancelling task cleanup retry loop...")
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Task cleanup retry loop stopped after failure",
                 exc_info=exc,
             )
 
@@ -1377,6 +1455,38 @@ app.include_router(share_router)
 app.include_router(v1_router)
 
 
+#: Schemas no route signature declares, so the framework never walks them.
+#: A route that reads its own body declares its ``requestBody`` by hand and
+#: references a component; without registering that component here, the served
+#: document would carry a ``$ref`` that resolves to nothing.
+DECLARED_OPENAPI_COMPONENT_SCHEMAS: dict[str, Any] = {
+    **ADMIN_MEMORY_AUTHORITY_SCHEMAS,
+}
+
+_assembled_openapi = app.openapi
+
+
+def openapi_with_declared_components() -> dict[str, Any]:
+    """The assembled document, plus the schemas it cannot infer.
+
+    Merged rather than overwritten: where the framework already inferred a
+    definition from a response model, that one stays authoritative and only
+    the genuinely missing definitions are added.
+    """
+    schema = _assembled_openapi()
+    components = schema.setdefault("components", {}).setdefault("schemas", {})
+    for name, definition in DECLARED_OPENAPI_COMPONENT_SCHEMAS.items():
+        components.setdefault(name, definition)
+    # ``app.openapi`` caches and returns that same dict, so the merge above
+    # has already landed in the cache; this only covers the first call, which
+    # populates it.
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = openapi_with_declared_components  # type: ignore[method-assign]
+
+
 def start_runtime_performance_monitor(app_instance: FastAPI) -> None:
     """Start one event-loop lag sampler for the current app lifespan."""
 
@@ -1460,6 +1570,7 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     start_uploaded_file_recovery_task(app_instance)
     start_orphan_upload_gc_task(app_instance)
     start_retention_purge_task(app_instance)
+    start_task_cleanup_retry_task(app_instance)
 
 
 async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
@@ -1579,21 +1690,15 @@ async def startup_event() -> None:
         f"Template manager initialized with {len(await template_manager.list_templates())} templates"
     )
 
-    # Log memory store type (using dynamic manager)
-    from .dynamic_memory_store import get_memory_store_manager
+    # Admit persistent memory storage before anything is allowed to use it.
+    # Startup is the only moment at which this process is guaranteed to have no
+    # memory writers, and no store is published unless admission succeeds.
+    # Quiescing the rest of the fleet is the operator's job: the supported
+    # procedure is an all-worker restart, never a rolling one.
+    from .dynamic_memory_store import admit_memory_storage_at_startup
 
-    manager = get_memory_store_manager()
-    store_info = manager.get_store_info()
-
-    if store_info["is_lancedb"]:
-        logger.info("Using LanceDB memory store with vector search capabilities")
-        logger.info(f"Embedding model ID: {store_info['embedding_model_id']}")
-    else:
-        logger.info("Using in-memory store (no vector search capabilities)")
-
-    logger.info(
-        f"Memory store similarity threshold: {store_info['similarity_threshold']}"
-    )
+    with _startup_phase("memory storage admission"):
+        admit_memory_storage_at_startup()
 
     # Auto-migrate LanceDB tables if needed (for multi-tenancy support)
     # Controlled by LANCEDB_AUTO_MIGRATE environment variable (default: true)
@@ -2067,6 +2172,7 @@ async def shutdown_event() -> None:
 
     await stop_orphan_upload_gc_task(app)
     await stop_retention_purge_task(app)
+    await stop_task_cleanup_retry_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_lease_recovery_task(app)
 

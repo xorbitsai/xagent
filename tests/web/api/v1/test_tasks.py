@@ -3767,6 +3767,7 @@ def test_get_steps_on_a_trace_expired_task_is_empty_not_an_error(mock_start_task
 def _run_trace_expiry_steps_case(task_id, agent_id, full_key, base) -> None:
     from datetime import timedelta
 
+    from xagent.web.models.chat_message import TaskChatMessage
     from xagent.web.models.task_command import TaskExecutionCommand
     from xagent.web.services.task_retention_purge import (
         RetentionPurgeAction,
@@ -3786,6 +3787,12 @@ def _run_trace_expiry_steps_case(task_id, agent_id, full_key, base) -> None:
         task.status = TaskStatus.COMPLETED
         task.last_activity_at = base
         task.lease_expires_at = None
+        # The transcript was written at wall-clock time, and the assessment
+        # measures from the newest message as well as the stored anchor
+        # (#2580), so it has to be as old as the anchor it stands beside.
+        db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).update(
+            {TaskChatMessage.created_at: base}, synchronize_session=False
+        )
         db.commit()
         # Task creation stages a start command; the predicate counts a pending
         # command as work still owed, which is the point of that leg. Clear it
@@ -3813,6 +3820,10 @@ def _run_trace_expiry_steps_case(task_id, agent_id, full_key, base) -> None:
     body = resp.json()
     assert body["task_id"] == task_id
     assert body["steps"] == []
+    # #2565: the empty list is told apart from "never had steps".
+    assert body["steps_expired"] is True
+    expired_at = datetime.fromisoformat(body["steps_expired_at"])
+    assert expired_at.replace(tzinfo=expired_at.tzinfo or UTC) == now
 
 
 def test_get_steps_task_not_found_returns_404(mock_start_task):

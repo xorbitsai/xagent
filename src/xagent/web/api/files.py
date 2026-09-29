@@ -70,7 +70,10 @@ from ..services.db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
-from ..services.kb_file_service import aggregate_uploaded_file_statuses
+from ..services.kb_file_service import (
+    KB_RETAINED_DIR,
+    aggregate_uploaded_file_statuses,
+)
 from ..services.managed_file_ref import (
     FILE_INTEGRITY_REUPLOAD_MESSAGE,
     NAMESPACE_AUTHORITY_ERRORS,
@@ -776,6 +779,11 @@ def _validate_public_task_file_access(
     public preview and download URLs. Share and widget tasks additionally bind
     file access to a signed guest token, which must resolve to the same task.
     """
+    if (
+        file_record.detached_reason is not None
+        or file_record.storage_status == "compensating"
+    ):
+        raise HTTPException(status_code=403, detail="Access denied")
     if not file_record.task_id:
         return
 
@@ -973,6 +981,9 @@ def _backfill_uploaded_file_records(db: Session, user: User) -> None:
                             True,
                         )
                         created += 1
+                continue
+            # A stray retained copy must not get a row that owns its retained path.
+            if candidate.relative_to(user_root).parts[0] == KB_RETAINED_DIR:
                 continue
 
             file_id = str(uuid4())
@@ -1279,7 +1290,10 @@ async def list_files(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    query = db.query(UploadedFile)
+    query = db.query(UploadedFile).filter(
+        UploadedFile.detached_reason.is_(None),
+        UploadedFile.storage_status != "compensating",
+    )
     if not _is_admin_user(user):
         query = query.filter(UploadedFile.user_id == _user_id_value(user))
 

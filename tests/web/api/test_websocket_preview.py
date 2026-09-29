@@ -5,11 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import QueuePool
 
-from tests.web.pool_contention_shared import assert_pool_checkout_off_loop
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.web import dynamic_memory_store as dynamic_memory_store_module
 from xagent.web.api import websocket as websocket_api
@@ -19,6 +16,7 @@ from xagent.web.api.websocket import (
     handle_build_preview_execution,
 )
 from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
+from xagent.web.memory_lifecycle import MemoryLifecycleState
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
@@ -322,30 +320,30 @@ def test_inline_preview_agent_config_uses_in_memory_disabled_policy():
 
 
 @pytest.mark.asyncio
-async def test_memory_policy_pool_timeout_does_not_block_loop_or_fallback(
-    tmp_path,
+async def test_memory_policy_without_a_publication_never_opens_a_session(
     monkeypatch,
 ) -> None:
-    """A real QueuePool wait must run off-loop and remain a visible failure."""
+    """An unpublished manager resolves the policy without any database work.
 
-    engine = create_engine(
-        f"sqlite:///{tmp_path / 'memory-policy-timeout.db'}",
-        connect_args={"check_same_thread": False},
-        poolclass=QueuePool,
-        pool_size=1,
-        max_overflow=0,
-        pool_timeout=0.05,
-    )
-    session_factory = sessionmaker(bind=engine)
+    The request path re-reads the authority for one reason only: to check a
+    *published* store for vector-space drift. A worker that never admitted has
+    nothing published and therefore nothing to check, so resolution must
+    short-circuit to a memory-disabled policy instead of opening a session the
+    request path has no business opening.
 
-    def get_test_db():
-        db = session_factory()
-        try:
-            yield db
-        finally:
-            db.close()
+    The off-loop pool-timeout contract this test used to carry lives in
+    ``tests/web/test_memory_lifecycle.py``, on the drift check that still
+    performs the read.
+    """
 
-    monkeypatch.setattr(dynamic_memory_store_module, "get_db", get_test_db)
+    sessions_opened = 0
+
+    def unexpected_get_db():
+        nonlocal sessions_opened
+        sessions_opened += 1
+        raise AssertionError("memory policy resolution opened a database session")
+
+    monkeypatch.setattr(dynamic_memory_store_module, "get_db", unexpected_get_db)
     memory_manager = DynamicMemoryStoreManager()
     monkeypatch.setattr(
         agent_runtime_service,
@@ -353,16 +351,21 @@ async def test_memory_policy_pool_timeout_does_not_block_loop_or_fallback(
         memory_manager.get_memory_store,
     )
 
-    held_connection = engine.connect()
-    try:
-        with assert_pool_checkout_off_loop(engine):
-            with pytest.raises(SQLAlchemyTimeoutError):
-                await agent_runtime_service.resolve_agent_service_memory_policy_async(
-                    agent_config={},
-                )
-    finally:
-        held_connection.close()
-        engine.dispose()
+    policy = await agent_runtime_service.resolve_agent_service_memory_policy_async(
+        agent_config={},
+    )
+
+    # Counted rather than left to the raise: ``_read_authority_snapshot`` folds
+    # an unexpected failure into ``AuthorityUnreadable``, so a session opened
+    # here would otherwise be swallowed and the test would still pass.
+    assert sessions_opened == 0
+    assert isinstance(policy.memory, InMemoryMemoryStore)
+    assert policy.memory_enabled is False
+    assert policy.memory_available is False
+    assert (
+        policy.memory_availability_reason
+        == MemoryLifecycleState.RETRYABLE_UNAVAILABLE.value
+    )
 
 
 def test_historical_file_projection_never_writes_unregistered_output(

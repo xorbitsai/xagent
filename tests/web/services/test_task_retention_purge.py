@@ -162,6 +162,10 @@ def _seed_full_task(
                 role="user",
                 content="hello",
                 message_type="text",
+                # The message that produced ``anchor``. Left to its server
+                # default it would be "now", and the assessment measures from
+                # the newest message as well as the stored anchor (#2580).
+                created_at=anchor,
             ),
         ]
     )
@@ -364,6 +368,46 @@ def test_trace_expiry_does_not_move_the_retention_anchor(sessions) -> None:
     assert _as_utc(anchor) == _age(100)
 
 
+def test_trace_expiry_clears_a_dangling_pointer_without_trace_rows(sessions) -> None:
+    """A checkpoint pointer can go dangling with no trace row behind it.
+
+    The stored pointer can lag what still exists (#2580), or a run set it for
+    a row an earlier sweep already removed. Either way the purge must still
+    clear the pointer, but with nothing actually removed it must not claim a
+    trace history was expired.
+    """
+    with sessions() as db:
+        user_id = _make_user(db, "t4")
+        task_id = _make_task(db, user_id=user_id, anchor=_age(100))
+        db.execute(
+            sa.update(Task)
+            .where(Task.id == task_id)
+            .values(last_checkpoint_event_id="evt-dangling")
+        )
+        db.commit()
+        before = db.execute(
+            sa.select(Task.updated_at).where(Task.id == task_id)
+        ).scalar_one()
+
+    assert _purge(sessions, task_id) is RetentionPurgeAction.PURGED_TRACES
+
+    with sessions() as db:
+        row = db.execute(
+            sa.select(
+                Task.last_checkpoint_event_id,
+                Task.last_checkpoint_trace_event_id,
+                Task.traces_expired_at,
+                Task.updated_at,
+            ).where(Task.id == task_id)
+        ).one()
+    assert (row.last_checkpoint_event_id, row.last_checkpoint_trace_event_id) == (
+        None,
+        None,
+    )
+    assert row.traces_expired_at is None
+    assert row.updated_at == before
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     """SQLite returns ``DateTime(timezone=True)`` naive; PostgreSQL aware."""
     if value is None or value.tzinfo is not None:
@@ -477,7 +521,7 @@ def test_a_task_younger_than_both_periods_is_not_purged(sessions) -> None:
     with sessions() as db:
         task_id = _seed_full_task(db, username="y1", anchor=_age(10))
 
-    assert _purge(sessions, task_id) is RetentionPurgeAction.SKIPPED_BUSY
+    assert _purge(sessions, task_id) is RetentionPurgeAction.SKIPPED_NOT_DUE
 
     with sessions() as db:
         assert _counts(db, task_id)["trace_events"] == 1
@@ -489,7 +533,7 @@ def test_unlimited_retention_purges_nothing(sessions) -> None:
 
     action = _purge(sessions, task_id, conversation_days=None, trace_days=None)
 
-    assert action is RetentionPurgeAction.SKIPPED_BUSY
+    assert action is RetentionPurgeAction.SKIPPED_NOT_DUE
     with sessions() as db:
         assert _counts(db, task_id)["tasks"] == 1
 
@@ -751,14 +795,14 @@ def test_a_failing_task_is_counted_and_the_batch_carries_on(
         doomed = _seed_full_task(db, username="doomed", anchor=_age(400))
         last = _seed_full_task(db, username="ok-after", anchor=_age(400))
 
-    real = purge_module.purge_task
+    real = purge_module.purge_task_rows
 
-    def failing(db, task_id, **kwargs):
+    def failing(db, *, task_id, detached_reason):
         if task_id == doomed:
             raise RuntimeError("deterministic per-task failure")
-        return real(db, task_id, **kwargs)
+        return real(db, task_id=task_id, detached_reason=detached_reason)
 
-    monkeypatch.setattr(purge_module, "purge_task", failing)
+    monkeypatch.setattr(purge_module, "purge_task_rows", failing)
 
     report = _run_batch(sessions, limit=10)
 
@@ -989,6 +1033,8 @@ def test_every_action_increments_exactly_one_counter() -> None:
                 "purged_conversations",
                 "purged_traces",
                 "skipped_busy",
+                "skipped_not_due",
+                "skipped_override_unresolved",
                 "skipped_active_interaction",
                 "nothing_to_purge",
                 "failed",

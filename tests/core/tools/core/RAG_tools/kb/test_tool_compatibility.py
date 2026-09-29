@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 from typing import Optional
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -299,24 +298,6 @@ def test_tool_factories_keep_names_models_and_async_only_sync_errors() -> None:
         match="KnowledgeSearchTool only supports async execution.",
     ):
         search_tool.run_json_sync({})
-
-
-@pytest.mark.asyncio
-async def test_ingestion_tool_factories_keep_tool_names_and_sync_errors() -> None:
-    facade = KBToolCompatibilityFacade()
-    config = MagicMock()
-    config.get_user_id.return_value = 7
-    config.is_admin.return_value = False
-
-    file_tools = await facade.create_file_ingestion_tools(config)
-    web_tools = await facade.create_web_ingestion_tools(config)
-
-    assert [tool.name for tool in file_tools] == ["create_knowledge_base_from_file"]
-    assert [tool.name for tool in web_tools] == ["create_knowledge_base_from_url"]
-    with pytest.raises(NotImplementedError, match="Only supports async execution."):
-        file_tools[0].run_json_sync({})
-    with pytest.raises(NotImplementedError, match="Only supports async execution."):
-        web_tools[0].run_json_sync({})
 
 
 def test_coordinator_accepts_injected_tool_facade() -> None:

@@ -152,8 +152,7 @@ def test_gmail_push_runs_to_completion(shared_app, owner):
             "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT": "push@example.com",
         }
     )
-    app.start("web")
-    app.start("worker")
+    app.start_all("web", "worker")
     now = int(time.time())
     token = jwt.encode(
         {

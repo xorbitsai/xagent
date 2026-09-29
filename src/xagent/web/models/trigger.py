@@ -184,6 +184,11 @@ class TriggerRun(Base):  # type: ignore
 
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
+    # Set when the retention purge expired this run's task (#2565), in the
+    # same transaction that deletes it; ``task_id`` is then SET NULL. Kept
+    # apart from ``status`` because the two are independent facts: a run
+    # that completed still completed after its conversation expired.
+    task_expired_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

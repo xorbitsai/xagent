@@ -428,14 +428,24 @@ class ReplyRequest(BaseModel):
     )
 
 
+ReplyStatus = Literal["running", "queued"]
+REPLY_STATUS_RUNNING: ReplyStatus = "running"
+REPLY_STATUS_QUEUED: ReplyStatus = "queued"
+"""``ReplyResponse.status`` while a durable reply waits for execution capacity."""
+
+
 class ReplyResponse(BaseModel):
     """``POST /v1/chat/tasks/{task_id}/reply`` -> 202 Accepted response.
 
     Same fields and semantics as :class:`AppendMessageResponse`, except:
-    ``status`` is always ``'running'`` (a reply always resumes
-    execution), and ``run_id`` is the *same* run the task was waiting
+    ``status`` is ``'running'`` (the reply resumed execution) or
+    ``'queued'`` (shared execution accepted the reply durably, but it is
+    still waiting for execution capacity and has not been validated or
+    resumed yet), and ``run_id`` is the *same* run the task was waiting
     on -- the reply resumes the paused execution rather than starting a
-    new one.
+    new one. A ``'queued'`` reply keeps the task ``waiting_for_user``
+    until a worker resumes it; repeat the same ``command_id`` with the
+    identical body to observe its outcome without injecting the answer again.
     """
 
     command_id: str | None = Field(
@@ -456,8 +466,12 @@ class ReplyResponse(BaseModel):
             "null for agent-bound keys."
         ),
     )
-    status: str = Field(
-        ..., description="Always 'running': a reply always resumes execution."
+    status: ReplyStatus = Field(
+        ...,
+        description=(
+            "'running' once the reply resumed execution; 'queued' while the "
+            "durable reply still waits for execution capacity."
+        ),
     )
     accepted_at: datetime = Field(
         ...,
@@ -765,6 +779,13 @@ class StepsResponse(BaseModel):
     is a polling primitive: each call returns the full known history
     so far (including any still-running steps as ``status='running'``)
     so SDK clients can resume after a network blip without state.
+
+    "Full known history" stops at the retention policy: once it removes a
+    task's execution trace, ``steps_expired`` is true and the steps from
+    before ``steps_expired_at`` are gone for good. The task itself
+    survives and can take new turns, so the flag coexists with steps
+    those later turns produced -- it means "this list may be incomplete",
+    not "this list is empty".
     """
 
     task_id: int = Field(..., description="The task these steps belong to.")
@@ -772,4 +793,19 @@ class StepsResponse(BaseModel):
     steps: List[PublicStep] = Field(
         default_factory=list,
         description="Public-timeline steps in started_at ascending order.",
+    )
+    steps_expired: bool = Field(
+        False,
+        description=(
+            "True when the retention policy removed this task's historical "
+            "steps, so this response may be incomplete. Steps from turns "
+            "after the removal can still be present."
+        ),
+    )
+    steps_expired_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "When the retention policy last removed this task's steps. "
+            "Null when steps_expired is false."
+        ),
     )

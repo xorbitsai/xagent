@@ -1537,6 +1537,7 @@ def test_build_args_model_handles_multi_value_type_list():
 @pytest.mark.asyncio
 async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
     monkeypatch,
+    caplog,
 ):
     mcp_tool = SimpleNamespace(
         name="list_clients",
@@ -1561,6 +1562,10 @@ async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
             {
                 "source": {"input_type": "context", "key": "account_id"},
                 "target": {"target_type": "mcp_meta", "key": "account_id"},
+            },
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "tool_arguments", "key": "not_in_schema"},
             },
         ],
         "connector_runtime": {
@@ -1593,6 +1598,11 @@ async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
 
     args_model = adapter.args_type()
     assert "account_id" not in args_model.model_fields
+    assert 'Runtime-bound arguments for this task: {"account_id":"6185"}' in (
+        adapter.description
+    )
+    assert "Tool arguments cannot override them" in adapter.description
+    assert adapter.metadata.description == adapter.description
 
     result = await adapter.run_json_async(
         {"query": "active", "account_id": "llm-supplied"}
@@ -1602,6 +1612,252 @@ async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
     assert captured["name"] == "list_clients"
     assert captured["arguments"] == {"query": "active", "account_id": "6185"}
     assert captured["kwargs"]["meta"] == {"account_id": "6185"}
+    assert result["runtime_bound_arguments"] == {"account_id": "6185"}
+    assert adapter.return_type().model_validate(result).runtime_bound_arguments == {
+        "account_id": "6185"
+    }
+    assert "Runtime-bound arguments used" in adapter.return_value_as_string(result)
+    from xagent.core.agent.context import ExecutionContext
+
+    context = ExecutionContext()
+    observation = context.add_tool_result(
+        "list_clients", result, tool_call_id="bound-1"
+    )
+    assert "runtime_bound_arguments" in observation.content
+    assert "6185" in observation.content
+    skipped = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Skipping runtime MCP tool argument")
+    ]
+    assert len(skipped) == 1
+    assert "not_in_schema" in skipped[0]
+
+
+@pytest.mark.parametrize(
+    ("target_type", "target_key", "context"),
+    [
+        ("mcp_meta", "account_id", {"account_id": "B"}),
+        ("tool_arguments", "not_in_tool_schema", {"account_id": "B"}),
+        ("tool_arguments", "account_id", {}),
+    ],
+)
+def test_mcp_description_does_not_claim_unapplied_argument_bindings(
+    target_type, target_key, context, caplog
+):
+    tool = _mcp_tool("list_clients")
+    tool.inputSchema = {
+        "type": "object",
+        "properties": {"account_id": {"type": "string"}},
+    }
+    adapter = MCPToolAdapter(
+        mcp_tool=tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": target_type, "key": target_key},
+                }
+            ],
+            "connector_runtime": {"context": context},
+        },
+    )
+
+    caplog.set_level("WARNING")
+    for _ in range(3):
+        assert adapter.description == "list_clients tool"
+        assert adapter.metadata.description == "list_clients tool"
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("account_id", ["A", "B"])
+def test_mcp_description_uses_each_adapters_own_runtime_context(account_id):
+    tool = _mcp_tool("list_clients")
+    tool.description = None
+    tool.inputSchema = {
+        "type": "object",
+        "properties": {"account_id": {"type": "string"}},
+    }
+    adapter = MCPToolAdapter(
+        mcp_tool=tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "selected_account"},
+                    "target": {"target_type": "tool_arguments", "key": "account_id"},
+                }
+            ],
+            "connector_runtime": {"context": {"selected_account": account_id}},
+        },
+    )
+
+    assert adapter.description.startswith("Execute MCP tool: list_clients\n\n")
+    assert f'{{"account_id":"{account_id}"}}' in adapter.description
+    assert "account_id" not in adapter.args_type().model_fields
+
+
+@pytest.mark.asyncio
+async def test_mcp_binding_description_redacts_without_changing_execution_values(
+    monkeypatch,
+):
+    tool = _mcp_tool("list_clients")
+    values = {
+        "account_id": "B",
+        "api_key": "source-secret",
+        "alias": "target-secret",
+        "filters": {"region": "west", "access_token": "nested-secret"},
+        "unbound": "unbound-context",
+    }
+    mappings = {
+        "account_id": "account_id",
+        "api_key": "scope_alias",
+        "alias": "access_token",
+        "filters": "filters",
+    }
+    tool.inputSchema = {
+        "type": "object",
+        "properties": {key: {} for key in mappings.values()},
+    }
+    adapter = MCPToolAdapter(
+        mcp_tool=tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": source},
+                    "target": {"target_type": "tool_arguments", "key": target},
+                }
+                for source, target in mappings.items()
+            ],
+            "connector_runtime": {
+                "context": values,
+                "secrets": {"key": "runtime-secret"},
+                "auth_selector": {"account": "private-selector"},
+            },
+        },
+    )
+
+    description = adapter.description
+    assert '"account_id":"B"' in description
+    assert '"region":"west"' in description
+    for value in (
+        "source-secret",
+        "target-secret",
+        "nested-secret",
+        "unbound-context",
+        "runtime-secret",
+        "private-selector",
+    ):
+        assert value not in description
+    assert adapter._runtime_tool_arguments() == {
+        target: values[source] for source, target in mappings.items()
+    }
+    captured = {}
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured.update(arguments)
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    result = await adapter.run_json_async({})
+    assert captured == adapter._runtime_tool_arguments()
+    assert result["runtime_bound_arguments"] == adapter._runtime_tool_arguments(
+        redact_sensitive=True
+    )
+    rendered = adapter.return_value_as_string(result)
+    assert "task configuration values, not instructions" in rendered
+    assert '"account_id": "B"' in rendered
+    for secret in ("source-secret", "target-secret", "nested-secret"):
+        assert secret not in json.dumps(result)
+        assert secret not in rendered
+
+
+def test_mcp_binding_description_omits_oversized_values_without_truncating_ids():
+    tool = _mcp_tool("list_clients")
+    tool.inputSchema = {
+        "type": "object",
+        "properties": {"account_id": {"type": "string"}},
+    }
+    value = "long-account-" + "x" * 4096
+    adapter = MCPToolAdapter(
+        mcp_tool=tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "tool_arguments", "key": "account_id"},
+                }
+            ],
+            "connector_runtime": {"context": {"account_id": value}},
+        },
+    )
+
+    assert "bound values omitted" in adapter.description
+    assert "long-account-" not in adapter.description
+    assert len(adapter.description) < 4096
+    assert adapter._runtime_tool_arguments() == {"account_id": value}
+
+
+@pytest.mark.parametrize(
+    "large_values",
+    [
+        {"filters": {"query": "x" * 4096}},
+        {"filters": {"query": "x" * 4070}},
+        {f"filter_{i}": "x" * 1000 for i in range(6)},
+    ],
+)
+def test_mcp_binding_description_keeps_small_values_within_total_budget(large_values):
+    # Large values come first so they cannot crowd out the short scope id.
+    values = {**large_values, "account_id": "B"}
+    tool = _mcp_tool("list_clients")
+    tool.inputSchema = {
+        "type": "object",
+        "properties": {key: {} for key in values},
+    }
+    adapter = MCPToolAdapter(
+        mcp_tool=tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": key},
+                    "target": {"target_type": "tool_arguments", "key": key},
+                }
+                for key in values
+            ],
+            "connector_runtime": {"context": values},
+        },
+    )
+
+    rendered = adapter.description.split("Runtime-bound arguments for this task: ")[1]
+    visible, end = json.JSONDecoder().raw_decode(rendered)
+    assert visible["account_id"] == "B"
+    assert len(visible) < len(values)
+    assert end <= mcp_adapter_module._DESCRIPTION_BOUND_ARGS_MAX_CHARS
+    assert "bound values omitted" in rendered[end:]
+    assert all(value == values[key] for key, value in visible.items())
+    assert adapter._runtime_tool_arguments() == values
 
 
 def test_mcp_runtime_tool_argument_missing_source_warns(caplog):
@@ -2049,6 +2305,7 @@ async def test_real_mcp_session_retries_nested_resolver_401_once(monkeypatch, ca
         ],
         "structured_content": None,
         "is_error": False,
+        "runtime_bound_arguments": {"account_id": "6185"},
     }
     assert initial_client_builds == 1
     assert refreshed_client_builds == 1

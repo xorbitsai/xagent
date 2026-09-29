@@ -134,6 +134,8 @@ def _orphan_candidates(
     query = db.query(UploadedFile).filter(
         UploadedFile.upload_source == TASKLESS_SHARE_UPLOAD_SOURCE,
         UploadedFile.task_id.is_(None),
+        UploadedFile.detached_reason.is_(None),
+        UploadedFile.detached_at.is_(None),
         UploadedFile.created_at < cutoff,
         UploadedFile.storage_status == "available",
         UploadedFile.storage_key.isnot(None),
@@ -196,6 +198,8 @@ def _claim_orphan(db: Session, candidate: _OrphanUploadCandidate) -> datetime | 
             UploadedFile.storage_key == candidate.storage_key,
             UploadedFile.storage_status == "available",
             UploadedFile.task_id.is_(None),
+            UploadedFile.detached_reason.is_(None),
+            UploadedFile.detached_at.is_(None),
         )
         .update(
             {

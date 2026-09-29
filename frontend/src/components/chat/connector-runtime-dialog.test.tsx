@@ -1813,7 +1813,7 @@ describe("ignores a resend result superseded by a new request", () => {
     // turn a second time.
     await act(async () => { resolveRetry() })
     expect(screen.getByRole("dialog")).toBeInTheDocument()
-    expect(closeSpy).not.toHaveBeenCalledWith("resent")
+    expect(closeSpy.mock.calls.map(([outcome]) => outcome)).not.toContain("resent")
     expect(toastMock.mock.calls).toEqual([["connectorRuntime.resendSupersededSent"]])
   })
 
@@ -2494,7 +2494,7 @@ describe("does not open off the host routes", () => {
     pathnameRef.current = "/settings"
     first.rerender(providerTree())
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
-    expect(closeSpy).toHaveBeenCalledWith("left-host")
+    expect(closeSpy).toHaveBeenCalledWith("left-host", 1)
     expect(latestState.request).toBeNull()
     expect((latestState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("z")
     cleanup()
@@ -3348,6 +3348,190 @@ describe("keeps a message's delivery verdict from falling back once its panel is
   })
 })
 
+describe("words a settlement that takes the snapshot mid save-and-resend off the message's verdict", () => {
+  function fillableReport() {
+    return report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])
+  }
+
+  /** One save-and-resend of `orig-1` whose resend fails with `disposition`. */
+  async function firstResendOfOrig1EndsIn(disposition: "outcome_unknown" | "not_sent") {
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    const view = renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure(disposition))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeInTheDocument())
+    return view
+  }
+
+  /**
+   * That failed resend, then its panel taken down by a retry the re-read
+   * report turns down, leaving the rows and `orig-1` still in the snapshot.
+   */
+  async function panelDownAfter(disposition: "outcome_unknown" | "not_sent") {
+    const view = await firstResendOfOrig1EndsIn(disposition)
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    await openForTask() // a same-task terminal frame; the snapshot stays
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.resend")).toBeEnabled())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    toastMock.mockClear()
+    return view
+  }
+
+  /**
+   * A save-and-resend of whatever the snapshot holds now, whose save is
+   * still in flight when a settlement frame for this task takes the snapshot
+   * away. The save then lands, and there is nothing left to resend.
+   * `alsoMidSave` runs after the settlement frame, while the save is still
+   * in flight.
+   */
+  async function snapshotTakenMidSave(alsoMidSave?: () => Promise<void>) {
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
+    let resolveSave: (value: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSave = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await act(async () => { latestActions.forgetDelivery(1) })
+    await alsoMidSave?.()
+    await act(async () => { resolveSave(ok(report(true, []))) })
+  }
+
+  async function snapshotTakenMidSaveAfter(disposition: "outcome_unknown" | "not_sent") {
+    await panelDownAfter(disposition)
+    await snapshotTakenMidSave()
+  }
+
+  it("does not say \"not sent\" when an earlier attempt's outcome was unknown", async () => {
+    // Nothing went out this time, but the first attempt may still be
+    // running: the only toast this exit raises must keep saying so.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await snapshotTakenMidSaveAfter("outcome_unknown")
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendOutcomeUnknown"]])
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("still says \"not sent\" when every earlier attempt definitely did not go out", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await snapshotTakenMidSaveAfter("not_sent")
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  // The two ways the view can go away under that same save. Either one ends
+  // the flow when the save lands, before the resend step runs, so the only
+  // toast says this press did not resend -- which leaves the earlier "may
+  // have been sent" standing -- rather than saying the message was not sent.
+  it("does not say \"not sent\" when the dialog unmounts mid save after an unknown outcome", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const view = await panelDownAfter("outcome_unknown")
+    await snapshotTakenMidSave(async () => {
+      view.rerender(<ConnectorRuntimeDialogProvider><Probe mounted={false} /></ConnectorRuntimeDialogProvider>)
+    })
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentUnmounted"]])
+    expect(warn).not.toHaveBeenCalledWith("[connector-runtime] resend attempted with no snapshot to send")
+  })
+
+  it("does not say \"not sent\" when a same-task frame retargets the dialog mid save after an unknown outcome", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    await panelDownAfter("outcome_unknown")
+    await snapshotTakenMidSave(async () => {
+      fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+      await openForTask() // a same-task terminal frame retargets this dialog
+    })
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentSuperseded"]])
+    expect(warn).not.toHaveBeenCalledWith("[connector-runtime] resend attempted with no snapshot to send")
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("does not say \"not sent\" when the footer retry repeats a save-and-resend after the snapshot went", async () => {
+    // The save-and-resend press promised to resend `orig-1`, and its save
+    // was refused with a retryable error. A settlement then took the
+    // snapshot, so "Save and resend" is gone but the retry button that
+    // repeats that press is still there. Pressing it saves, finds nothing
+    // to send, and must still say the first attempt may have gone out.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await panelDownAfter("outcome_unknown")
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "y" } })
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.retry")).toBeInTheDocument())
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.retry")).toBeEnabled()
+
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.retry"))
+    await waitFor(() => expect(toastMock).toHaveBeenCalled())
+
+    expect(submitMock).toHaveBeenCalledTimes(3)
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendOutcomeUnknown"]])
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("reads the verdict of the message the flow set out to resend, not another message's", async () => {
+    // `orig-1` may have gone out; `orig-2`, a newer turn that replaced it in
+    // the snapshot, was never attempted. A save-and-resend of `orig-2` that
+    // loses its snapshot mid-save sent nothing and nothing before it did
+    // either, so it must say "not sent" whatever `orig-1`'s verdict is.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await firstResendOfOrig1EndsIn("outcome_unknown")
+
+    await stageThenRecord({ taskId: 1, clientMessageId: "orig-2", text: "a later message" })
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    await openForTask()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeEnabled())
+    expect(latestState.request).toMatchObject({ resendPayload: { clientMessageId: "orig-2" } })
+    expect(screen.queryByText("connectorRuntime.actions.resend")).not.toBeInTheDocument()
+    toastMock.mockClear()
+
+    await snapshotTakenMidSave()
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1)
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.sendFailed"]])
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+
+  it("does not resend when the footer retry repeats a save-only press", async () => {
+    // The recorded-message field is written by every save press, including
+    // a save-only one -- as null, because a save-only press never sets out
+    // to resend anything. If it wrote the snapshot's id instead, repeating
+    // that press through the footer Retry would resend a message the user
+    // only ever asked to save.
+    fetchMock.mockResolvedValueOnce(ok(fillableReport()))
+    renderHarness()
+    await recordThenOpen({ taskId: 1, clientMessageId: "orig-1", text: "hi" })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.retry")).toBeInTheDocument())
+    expect(submitMock).toHaveBeenCalledTimes(1)
+
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.retry"))
+    await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(2))
+
+    expect(sendMessageMock).not.toHaveBeenCalled()
+  })
+})
+
 describe("drops the send-failed panel once the snapshot it is about is replaced", () => {
   it("drops the send-failed panel once the snapshot it is about is replaced", async () => {
     // The panel names the message whose send failed, and its retry button
@@ -3815,5 +3999,671 @@ describe("stays quiet when mounted with no provider", () => {
     unmount()
     expect(warn).not.toHaveBeenCalled()
     warn.mockRestore()
+  })
+})
+
+describe("keeps the rejection on screen when the refresh after it is superseded", () => {
+  it("keeps the rejection on screen when the refresh after it is superseded", async () => {
+    // A rejected save that asks for a re-read holds the save buttons closed
+    // until that re-read settles. When a retarget supersedes the re-read,
+    // the rejection the server really made stays on screen, nothing is
+    // announced (nothing was written), and the dialog stops being busy.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "malformed" })
+    let resolveRefresh: (v: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveRefresh = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("connectorRuntime.errors.contactAdmin")).toBeInTheDocument()
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeDisabled()
+
+    await act(async () => {
+      resolveRefresh(ok(report(true, [])))
+    })
+
+    expect(toastMock).not.toHaveBeenCalled()
+    expect(screen.getByText("connectorRuntime.errors.contactAdmin")).toBeInTheDocument()
+    // The superseded refresh installed nothing: the rows are still the
+    // retarget's own fillable report, and saving is open again.
+    expect(screen.getByLabelText("token")).toHaveValue("x")
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+  })
+})
+
+describe("says the refreshed report still needs input before a retry resend", () => {
+  it("says the refreshed report still needs input before a retry resend", async () => {
+    // The panel stays up across a same-task re-read that installs a report
+    // still missing a value. A retry pressed on it cannot go out -- the
+    // backend would refuse the turn on the same gate -- so the panel goes
+    // and the reason is said once, leaving the rows to fill.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "other", type: "string", required: true })]),
+    ])))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument()
+    sendMessageMock.mockClear()
+    toastMock.mockClear()
+
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+
+    expect(sendMessageMock).not.toHaveBeenCalled()
+    expect(toastMock.mock.calls).toEqual([["connectorRuntime.savedNotResentIncomplete"]])
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.getByLabelText("other")).toBeInTheDocument()
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+  })
+})
+
+describe("closes as resent when a retry lands after a settlement took its panel away", () => {
+  it("closes as resent when a retry lands after a settlement took its panel away", async () => {
+    // A settlement frame takes the panel's snapshot away while its retry is
+    // on the wire. The panel goes in that frame, but the retry is still in
+    // flight, so the dialog stays busy; when the retry lands it closes the
+    // dialog as resent, the same as it would have with the panel still up.
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    sendMessageMock.mockRejectedValueOnce(deliveryFailure("not_sent"))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndResend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.sendFailed")).toBeInTheDocument())
+
+    let resolveRetry: () => void = () => {}
+    sendMessageMock.mockReturnValueOnce(new Promise((res) => { resolveRetry = res }))
+    toastMock.mockClear()
+    fireEvent.click(screen.getByText("connectorRuntime.actions.resend"))
+
+    await act(async () => { latestActions.forgetDelivery(1) })
+    expect(screen.queryByText("connectorRuntime.sendFailed")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeDisabled()
+
+    await act(async () => { resolveRetry() })
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(latestState.request).toBeNull()
+    expect(toastMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("keeps the save gate closed across two same-task retargets in a row", () => {
+  it("keeps the save gate closed across two same-task retargets in a row", async () => {
+    // Two retargets land before either re-read answers. The first read is
+    // stale by the time it answers: it must neither install its report nor
+    // count as the current read having settled, or saving would open over a
+    // report the current request never produced.
+    await openSimpleDialog()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+
+    let resolveFirst: (v: unknown) => void = () => {}
+    let resolveSecond: (v: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveFirst = res }))
+    await openForTask()
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveSecond = res }))
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+
+    await act(async () => {
+      resolveFirst(ok(report(false, [
+        connector(REF_A, "A", [input({ section: "context", key: "stale", type: "string", required: true })]),
+      ])))
+    })
+    expect(screen.queryByLabelText("stale")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.refreshing")).toBeInTheDocument()
+    const saveOnly = screen.getByText("connectorRuntime.actions.saveOnly")
+    expect(saveOnly).toBeDisabled()
+    fireEvent.click(saveOnly)
+    expect(submitMock).not.toHaveBeenCalled()
+
+    await act(async () => {
+      resolveSecond(ok(report(false, [
+        connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+      ])))
+    })
+    expect(screen.queryByText("connectorRuntime.refreshing")).not.toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeEnabled()
+  })
+})
+
+// A session check: the task page asks whether the task it shows is missing
+// anything, with no failed turn behind the question.
+describe("a session check shows only what the user can fill", () => {
+  const fillable = () => ok(report(false, [
+    connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+  ]))
+  async function openSessionCheck(taskId = 1) {
+    await act(async () => { latestActions.openSessionCheck(taskId, "opened") })
+  }
+
+  it("shows a fillable report with save only, under the session-check line", async () => {
+    fetchMock.mockResolvedValueOnce(fillable())
+    renderHarness()
+    await openSessionCheck()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.sessionOpenDescription")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.acknowledge")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.description")).not.toBeInTheDocument()
+  })
+
+  it("switches to the met line when a shown check re-reads a met report", async () => {
+    fetchMock.mockResolvedValueOnce(fillable())
+    renderHarness()
+    await openSessionCheck()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    // A rejected save that asks for a refresh, and the refresh reads met.
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 409, code: "runtime_context_immutable",
+      reason: "conflict.context.token", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.metNothingLeft")).toBeInTheDocument())
+    expect(screen.queryByText("connectorRuntime.sessionOpenDescription")).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ["unsupported_only", () => ok(report(false, [
+      connector(REF_A, "A", [input({ section: "secrets", key: "api_key", type: "string", required: true })]),
+    ]))],
+    ["nothing_fillable", () => ok(report(false, []))],
+  ] as const)("stops asking the user to fill it in when a shown check re-reads %s", async (_name, result) => {
+    fetchMock.mockResolvedValueOnce(fillable())
+    renderHarness()
+    await openSessionCheck()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 409, code: "runtime_context_immutable",
+      reason: "conflict.context.token", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(result())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.acknowledge")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.sessionOpenNotFillable")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.sessionOpenDescription")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.description")).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ["met", () => ok(report(true, []))],
+    ["unsupported_only", () => ok(report(false, [
+      connector(REF_A, "A", [input({ section: "secrets", key: "api_key", type: "string", required: true })]),
+    ]))],
+    ["nothing_fillable", () => ok(report(false, []))],
+    ["a failed read", () => ({ ok: false, kind: "http", status: 500 })],
+  ] as const)("stays hidden and closes as not-shown on %s", async (_name, result) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    fetchMock.mockResolvedValueOnce(result())
+    renderHarness()
+    const closeSpy = vi.spyOn(latestActions, "close")
+    await openSessionCheck()
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+  })
+})
+
+describe("a failure frame upgrades an open session check", () => {
+  it("keeps the dialog and the draft, and offers the claimed resend", async () => {
+    fetchMock.mockResolvedValue(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "draft" } })
+    await act(async () => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "turn-1", text: "hi" })
+    })
+    await openForTask()
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndResend")).toBeInTheDocument())
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByLabelText("token")).toHaveValue("draft")
+    expect(screen.getByText("connectorRuntime.actions.saveOnly")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.description")).toBeInTheDocument()
+    expect(latestState.request).toMatchObject({
+      taskId: 1, trigger: "turn_failure", resendPayload: { clientMessageId: "turn-1" },
+    })
+  })
+})
+
+describe("closing a session check keeps the stash", () => {
+  async function visibleCheckWithStash() {
+    fetchMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ])))
+    renderHarness()
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    // A turn for this task delivered while the check is on screen.
+    await stageThenRecord({ taskId: 1, clientMessageId: "sent-1", text: "hi" })
+  }
+
+  it("keeps it when the user closes the dialog", async () => {
+    await visibleCheckWithStash()
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect((latestState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("sent-1")
+  })
+
+  it("keeps it when save only lands met and closes the dialog", async () => {
+    await visibleCheckWithStash()
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveOnly"))
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect((latestState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("sent-1")
+  })
+})
+
+describe("a session check keeps to the three host pages", () => {
+  const fillable = () => ok(report(false, [
+    connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+  ]))
+
+  it("reads nothing when it mounts off the host pages, even on the new-conversation page", async () => {
+    for (const path of ["/settings", "/task"]) {
+      pathnameRef.current = path
+      fetchMock.mockReset()
+      renderHarness()
+      const closeSpy = vi.spyOn(latestActions, "close")
+      await act(async () => { latestActions.openSessionCheck(1, "opened") })
+      await waitFor(() => expect(latestState.request).toBeNull())
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+      cleanup()
+    }
+  })
+
+  it("closes as not-shown when the path leaves while the read is in flight", async () => {
+    let resolveRead: (value: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveRead = res }))
+    const view = render(providerTree())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    pathnameRef.current = "/settings"
+    view.rerender(providerTree())
+    await act(async () => { resolveRead(fillable()) })
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+  })
+
+  it("closes as left-host when the path leaves after it was shown", async () => {
+    fetchMock.mockResolvedValueOnce(fillable())
+    const view = render(providerTree())
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    pathnameRef.current = "/settings"
+    view.rerender(providerTree())
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect(closeSpy.mock.calls).toEqual([["left-host", 1]])
+  })
+})
+
+// A first gate: a new conversation's first message is held by the create
+// path until this dialog lets it go. The dialog only reads, collects and
+// closes; how the held message ends is what the provider hands the create
+// path, read here from the promise openFirstGate returns.
+const gateFillable = () => ok(report(false, [
+  connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+]))
+const gateSecretsOnly = () => ok(report(false, [
+  connector(REF_A, "A", [input({ section: "secrets", key: "api_key", type: "string", required: true })]),
+]))
+// Still fillable by resolveDialogOutcome, but the server rejects any value
+// saved under this name, so a first gate has nothing it can save.
+const gateBadNameOnly = () => ok(report(false, [
+  connector(REF_A, "A", [input({ section: "context", key: "bad key", type: "string", required: true })]),
+]))
+async function holdFirstMessage(taskId = 1): Promise<string[]> {
+  const seen: string[] = []
+  await act(async () => { void latestActions.openFirstGate(taskId)?.then(d => { seen.push(d) }) })
+  return seen
+}
+
+describe("a first gate shows only while something can be filled, and only where it may", () => {
+  it("shows a fillable report with save and send only, under the first-gate line", async () => {
+    pathnameRef.current = "/task"
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    expect(screen.getByText("connectorRuntime.firstGateDescription")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument()
+    for (const other of ["saveOnly", "saveAndResend", "acknowledge", "sendHeld"]) {
+      expect(screen.queryByText(`connectorRuntime.actions.${other}`)).not.toBeInTheDocument()
+    }
+    expect(screen.getByLabelText("token")).toBeInstanceOf(HTMLInputElement)
+    expect(seen).toEqual([])
+  })
+
+  it.each(["/task", "/agent/1", "/task/1"])("reads and shows on %s", async (path) => {
+    pathnameRef.current = path
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ["met", () => ok(report(true, []))],
+    ["unsupported_only", gateSecretsOnly],
+    ["nothing_fillable", () => ok(report(false, []))],
+    ["only a required key it can never save", gateBadNameOnly],
+    ["a failed read", () => ({ ok: false, kind: "http", status: 500 })],
+  ] as const)("stays hidden and releases the message on %s", async (_name, result) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+    pathnameRef.current = "/task"
+    fetchMock.mockResolvedValueOnce(result())
+    renderHarness()
+    const closeSpy = vi.spyOn(latestActions, "close")
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+  })
+
+  it("reads nothing when it mounts off its pages, and releases the message", async () => {
+    pathnameRef.current = "/settings"
+    renderHarness()
+    const closeSpy = vi.spyOn(latestActions, "close")
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+  })
+
+  it("releases the message when the path leaves its pages while the read is in flight", async () => {
+    pathnameRef.current = "/task"
+    let resolveRead: (value: unknown) => void = () => {}
+    fetchMock.mockReturnValueOnce(new Promise((res) => { resolveRead = res }))
+    const view = render(providerTree())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    const seen = await holdFirstMessage()
+    pathnameRef.current = "/settings"
+    view.rerender(providerTree())
+    await act(async () => { resolveRead(gateFillable()) })
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+  })
+
+  it("clears the message when the path leaves its pages after it was shown", async () => {
+    pathnameRef.current = "/task"
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    const view = render(providerTree())
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    pathnameRef.current = "/settings"
+    view.rerender(providerTree())
+    await waitFor(() => expect(seen).toEqual(["cleared"]))
+    expect(closeSpy.mock.calls).toEqual([["left-host", 1]])
+  })
+
+  it("stays open while the path moves between its pages", async () => {
+    pathnameRef.current = "/task"
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    const view = render(providerTree())
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    for (const path of ["/task/1", "/workforces/3"]) {
+      pathnameRef.current = path
+      view.rerender(providerTree())
+      await act(async () => {})
+      expect(screen.getByRole("dialog")).toBeInTheDocument()
+    }
+    expect(closeSpy).not.toHaveBeenCalled()
+    expect(seen).toEqual([])
+  })
+})
+
+describe("save and send lets the message go once nothing is left to fill", () => {
+  async function shownGate() {
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    const closeSpy = vi.spyOn(latestActions, "close")
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "v" } })
+    return { seen, closeSpy }
+  }
+
+  it.each([
+    ["met", () => ok(report(true, [])), []],
+    ["unsupported_only", gateSecretsOnly, [["connectorRuntime.onlyUnsupportedRemaining:{\"keys\":\"api_key\"}"]]],
+    ["nothing_fillable", () => ok(report(false, [])), []],
+    ["only a required key it can never save", gateBadNameOnly, []],
+  ] as const)("releases it when the save lands %s", async (_name, landed, toasts) => {
+    const { seen, closeSpy } = await shownGate()
+    submitMock.mockResolvedValueOnce(landed())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    expect(closeSpy.mock.calls).toEqual([["resent", 1]])
+    expect(toastMock.mock.calls).toEqual(toasts)
+    expect(sendMessageMock).not.toHaveBeenCalled()
+  })
+
+  it("stays, and says the message has not been sent, when the save leaves something to fill", async () => {
+    const { seen, closeSpy } = await shownGate()
+    submitMock.mockResolvedValueOnce(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "other", type: "string", required: true })]),
+    ])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    await waitFor(() => expect(toastMock).toHaveBeenCalledWith("connectorRuntime.savedNotSent"))
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByLabelText("other")).toBeInTheDocument()
+    expect(closeSpy).not.toHaveBeenCalled()
+    expect(seen).toEqual([])
+  })
+
+  it("keeps the save current when a failure frame for the same task lands mid-save", async () => {
+    const { seen, closeSpy } = await shownGate()
+    let resolveSave: (value: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSave = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    const before = latestState.request
+    await act(async () => {
+      latestActions.stagePendingDelivery({ taskId: 1, clientMessageId: "other-turn", text: "hi" })
+    })
+    await openForTask(1)
+    expect(latestState.request).toBe(before)
+    await act(async () => { resolveSave(ok(report(true, []))) })
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    expect(closeSpy.mock.calls).toEqual([["resent", 1]])
+    expect(toastMock).not.toHaveBeenCalled()
+  })
+
+  it("says nothing itself when the request is cleared mid-save", async () => {
+    const { seen } = await shownGate()
+    let resolveSave: (value: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSave = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    await act(async () => { latestActions.retainOnlyTask(null) })
+    await waitFor(() => expect(seen).toEqual(["cleared"]))
+    await act(async () => { resolveSave(ok(report(true, []))) })
+    expect(toastMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("a visible first gate never sends on its own", () => {
+  // A shown gate re-reads only through the refresh a rejected save asks for.
+  async function shownGateThatReReads(reread: () => unknown) {
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    const closeSpy = vi.spyOn(latestActions, "close")
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce({
+      ok: false, kind: "coded", status: 409, code: "runtime_context_immutable",
+      reason: "conflict.context.token", connectorRef: REF_A,
+    })
+    fetchMock.mockResolvedValueOnce(reread())
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.sendHeld")).toBeInTheDocument())
+    return { seen, closeSpy }
+  }
+
+  it.each([
+    ["met", () => ok(report(true, []))],
+    ["unsupported_only", gateSecretsOnly],
+    ["nothing_fillable", () => ok(report(false, []))],
+    ["only a required key it can never save", gateBadNameOnly],
+  ] as const)("offers send message instead of closing when it re-reads %s", async (_name, reread) => {
+    const { seen, closeSpy } = await shownGateThatReReads(reread)
+    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByText("connectorRuntime.firstGateReadyDescription")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.acknowledge")).not.toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveAndSend")).not.toBeInTheDocument()
+    expect(closeSpy).not.toHaveBeenCalled()
+    expect(seen).toEqual([])
+    fireEvent.click(screen.getByText("connectorRuntime.actions.sendHeld"))
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    expect(closeSpy.mock.calls).toEqual([["resent", 1]])
+  })
+
+  it("drops the message when the user closes the dialog", async () => {
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    const closeSpy = vi.spyOn(latestActions, "close")
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.click(screen.getByRole("button", { name: "Close" }))
+    await waitFor(() => expect(seen).toEqual(["discarded"]))
+    expect(closeSpy.mock.calls).toEqual([["dismissed", 1]])
+  })
+})
+
+// A first gate is a message of its own, so it gets a dialog body of its own:
+// whatever was on screen for its task before, its first read decides alone
+// whether it shows.
+describe("a first gate starts from its own first read", () => {
+  it("releases on a met first read even over a session check already on screen", async () => {
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    await act(async () => { latestActions.openSessionCheck(1, "opened") })
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    fetchMock.mockResolvedValueOnce(ok(report(true, [])))
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+    expect(screen.queryByText("connectorRuntime.actions.sendHeld")).not.toBeInTheDocument()
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  it("ends the first gate's save quietly when a second gate for the task replaces it", async () => {
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    const first = await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "v" } })
+    let resolveSave: (value: unknown) => void = () => {}
+    submitMock.mockReturnValueOnce(new Promise((res) => { resolveSave = res }))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    const second = await holdFirstMessage()
+    await waitFor(() => expect(first).toEqual(["cleared"]))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await act(async () => { resolveSave(ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "other", type: "string", required: true })]),
+    ]))) })
+    expect(toastMock).not.toHaveBeenCalled()
+    expect(second).toEqual([])
+    expect(screen.getByLabelText("token")).toHaveValue("")
+  })
+})
+
+// A route gate that finds a request off its pages ends it the way the leave
+// effect would once the dialog was seen: left-host, not not-shown.
+describe("a route gate closes a dialog the user saw as left-host", () => {
+  it("closes as left-host when a retarget lands in the same render as a move off the host pages", async () => {
+    const fillable = () => ok(report(false, [
+      connector(REF_A, "A", [input({ section: "context", key: "token", type: "string", required: true })]),
+    ]))
+    fetchMock.mockResolvedValue(fillable())
+    renderHarness()
+    await openForTask()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    const closeSpy = vi.spyOn(latestActions, "close")
+    await act(async () => {
+      pathnameRef.current = "/settings"
+      latestActions.openForTask(1)
+    })
+    await waitFor(() => expect(latestState.request).toBeNull())
+    expect(closeSpy.mock.calls.length).toBeGreaterThan(0)
+    expect(closeSpy.mock.calls.every(call => call[0] === "left-host")).toBe(true)
+  })
+})
+
+describe("the footer retry repeats save and send", () => {
+  it("releases the message when a retried save lands met", async () => {
+    fetchMock.mockResolvedValueOnce(gateFillable())
+    renderHarness()
+    const closeSpy = vi.spyOn(latestActions, "close")
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "x" } })
+    submitMock.mockResolvedValueOnce({ ok: false, kind: "transport" })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.retry")).toBeInTheDocument())
+    submitMock.mockResolvedValueOnce(ok(report(true, [])))
+    fireEvent.click(screen.getByText("connectorRuntime.actions.retry"))
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    expect(closeSpy.mock.calls).toEqual([["resent", 1]])
+  })
+})
+
+describe("a first gate under StrictMode", () => {
+  it("releases a met first read exactly once", async () => {
+    fetchMock.mockResolvedValue(ok(report(true, [])))
+    render(<React.StrictMode>{providerTree()}</React.StrictMode>)
+    const closeSpy = vi.spyOn(latestActions, "close")
+    const seen = await holdFirstMessage()
+    await waitFor(() => expect(seen).toEqual(["released"]))
+    await act(async () => {})
+    expect(closeSpy.mock.calls).toEqual([["not-shown", 1]])
+    expect(seen).toEqual(["released"])
+  })
+})
+
+// Read off the source: a first gate's save never words a resend, and never
+// reads which button was pressed.
+describe("keeps the first-gate save apart from the resend wording", () => {
+  it("names no resend and reads no alsoResend in the first-gate branch", () => {
+    const start = dialogSource.indexOf("    if (request.trigger === \"first_gate\") {")
+    const end = dialogSource.indexOf("    let current: Finish", start)
+    expect(start).toBeGreaterThan(0)
+    expect(end).toBeGreaterThan(start)
+    const branch = dialogSource.slice(start, end)
+    expect(branch).not.toMatch(/resend-not-sent|saved-not-resent|alsoResend|doResend/)
   })
 })

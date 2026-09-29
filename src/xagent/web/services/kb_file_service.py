@@ -10,33 +10,18 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Union
 
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
-from ...core.tools.core.RAG_tools.LanceDB.schema_manager import (
-    _safe_close_table,
-    ensure_documents_table,
-)
 from ...core.tools.core.RAG_tools.management.status import (
     _load_ingestion_status_impl,
 )
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
-from ...core.tools.core.RAG_tools.utils.lancedb_query_utils import (
-    list_embeddings_table_names,
-    query_to_list,
-)
-from ...core.tools.core.RAG_tools.utils.string_utils import (
-    build_lancedb_filter_expression,
-    escape_lancedb_string,
-)
+from ...core.tools.core.RAG_tools.storage.factory import get_vector_index_store
 from ...core.tools.core.RAG_tools.utils.user_permissions import UserPermissions
 from ...core.tools.core.RAG_tools.utils.user_scope import resolve_user_scope
-from ...core.tools.core.RAG_tools.version_management.cascade_cleaner import (
-    cascade_delete,
-)
-from ...providers.vector_store.lancedb import get_connection_from_env
 from ..models.uploaded_file import UploadedFile
 from .uploaded_file_store import UploadedFileStore
 
@@ -45,10 +30,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_FILE_STATUS_BATCH_SIZE = 200
-_ORPHAN_LOOKUP_BATCH_SIZE = 200
 _STALE_FILE_STATUSES = {"FAILED", "UNKNOWN", "RUNNING"}
 _DEFAULT_DELETABLE_STALE_STATUSES = {"FAILED"}
+KB_RETAINED_DIR = ".kb-retained"
 
 
 def _get_file_compatibility_facade() -> "KBFileCompatibilityFacade":
@@ -165,83 +149,6 @@ def _upsert_uploaded_file_record_impl(
     return file_record
 
 
-def _list_documents_for_user_impl(
-    *,
-    user_id: Optional[int] = None,
-    is_admin: bool,
-    collection_name: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Load KB document metadata rows for a user."""
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    table = None
-    try:
-        table = conn.open_table("documents")
-
-        base_filter = ""
-        if collection_name:
-            base_filter = build_lancedb_filter_expression(
-                {"collection": collection_name}
-            )
-        scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
-        user_filter = UserPermissions.get_user_filter(
-            scope.user_id, is_admin=scope.is_admin
-        )
-        combined_filter = (
-            f"({base_filter}) and ({user_filter})"
-            if user_filter and base_filter
-            else (user_filter or base_filter)
-        )
-        query = table.search()
-        if combined_filter:
-            query = query.where(combined_filter)
-        return query_to_list(query.limit(10000))
-    finally:
-        _safe_close_table(table)
-
-
-def _list_document_records_for_file_ids_impl(
-    file_ids: Iterable[str],
-    *,
-    user_id: Optional[int],
-    is_admin: bool,
-) -> List[DocumentRecord]:
-    """Uncapped: documents in the user's scope that reference any of ``file_ids``."""
-    normalized_file_ids = sorted({file_id for file_id in file_ids if file_id})
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
-    user_filter = UserPermissions.get_user_filter(
-        scope.user_id, is_admin=scope.is_admin
-    )
-    records: List[DocumentRecord] = []
-    table = None
-    try:
-        table = conn.open_table("documents")
-        for offset in range(0, len(normalized_file_ids), _ORPHAN_LOOKUP_BATCH_SIZE):
-            batch = normalized_file_ids[offset : offset + _ORPHAN_LOOKUP_BATCH_SIZE]
-            combined_filter = _combine_lancedb_filters(
-                _build_file_id_in_filter(batch), user_filter
-            )
-            rows = query_to_list(
-                table.search()
-                .where(combined_filter)
-                .select(["doc_id", "file_id", "user_id"])
-                .limit(-1)
-            )
-            records.extend(
-                DocumentRecord(
-                    doc_id=str(row.get("doc_id") or ""),
-                    file_id=str(row["file_id"]),
-                    user_id=None if row.get("user_id") is None else int(row["user_id"]),
-                )
-                for row in rows
-            )
-    finally:
-        _safe_close_table(table)
-    return records
-
-
 def _build_uploaded_filename_map_impl(
     db: Session, *, user_id: Optional[int], file_ids: List[str]
 ) -> Dict[str, str]:
@@ -322,13 +229,18 @@ def _delete_uploaded_file_if_orphaned_impl(
     file_id: str,
     user_id: Optional[int],
     remaining_file_ids: set[str],
+    after_commit: Optional[List[tuple[str, Callable[[], None]]]] = None,
 ) -> bool:
-    """Delete uploaded file row and local file when no documents still reference it.
+    """Delete an uploaded file's row and bytes when no documents still reference it.
+
+    Never commits. With ``after_commit``, the durable delete and local unlink are
+    queued for the caller to run after it commits; without it, the bytes go at once.
 
     Args:
         db: Database session.
         file_id: The ID of the file to check.
-        user_id: User ID for scoping.
+        user_id: Requester; only their rows are freed, except rows collection
+            delete retained under ``.kb-retained``, which go whoever owns them.
         remaining_file_ids: file_id values still referenced by other documents; must include every candidate that still is.
 
     Returns:
@@ -341,15 +253,14 @@ def _delete_uploaded_file_if_orphaned_impl(
     if not file_id or file_id in remaining_file_ids:
         return False
 
-    file_record = (
-        db.query(UploadedFile)
-        .filter(
-            UploadedFile.user_id == scope.user_id,
-            UploadedFile.file_id == file_id,
-        )
-        .first()
-    )
+    file_record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
     if file_record is None:
+        return False
+    retained_dir = Path(str(file_record.storage_path)).parent
+    # Retained rows exist only for surviving references; any requester's last one frees them.
+    if int(file_record.user_id) != scope.user_id and not (
+        retained_dir.name == file_id and retained_dir.parent.name == KB_RETAINED_DIR
+    ):
         return False
 
     uploads_root = get_uploads_dir().resolve()
@@ -363,13 +274,22 @@ def _delete_uploaded_file_if_orphaned_impl(
             file_path,
         )
     else:
-        if resolved_path.exists() and resolved_path.is_file():
-            resolved_path.unlink()
-            logger.info("Deleted orphaned physical file: %s", resolved_path)
 
-    UploadedFileStore(db).delete(file_record, delete_local=False)
+        def _unlink() -> None:
+            if resolved_path.exists() and resolved_path.is_file():
+                resolved_path.unlink()
+                logger.info("Deleted orphaned physical file: %s", resolved_path)
+
+        if after_commit is None:
+            _unlink()
+        else:
+            after_commit.append((file_id, _unlink))
+
+    UploadedFileStore(db).delete(
+        file_record, delete_local=False, after_commit=after_commit
+    )
     # Invalidate cache for this user since file list changed
-    _file_status_cache.invalidate_user(scope.user_id)
+    _file_status_cache.invalidate_user(int(file_record.user_id))
     return True
 
 
@@ -565,109 +485,6 @@ def _restore_uploaded_file_refresh_snapshot_impl(
     return _compensation_complete(*effects)
 
 
-def _build_file_id_in_filter(file_ids: List[str]) -> str:
-    escaped_ids = [f"'{escape_lancedb_string(file_id)}'" for file_id in file_ids]
-    return f"file_id IN ({', '.join(escaped_ids)})"
-
-
-def _build_doc_id_in_filter(doc_ids: List[str]) -> str:
-    escaped_ids = [f"'{escape_lancedb_string(doc_id)}'" for doc_id in doc_ids]
-    return f"doc_id IN ({', '.join(escaped_ids)})"
-
-
-def _combine_lancedb_filters(
-    base_filter: Optional[str], user_filter: Optional[str]
-) -> Optional[str]:
-    if base_filter and user_filter:
-        return f"({base_filter}) and ({user_filter})"
-    return base_filter or user_filter
-
-
-def _load_indexed_doc_refs(
-    conn: Any,
-    *,
-    collections: List[str],
-    doc_refs_by_file_id: Dict[str, List[tuple[str, str]]],
-    user_filter: Optional[str],
-) -> set[tuple[str, str]]:
-    """Return document refs that have searchable artifacts in LanceDB.
-
-    Legacy deployments may not have ingestion status rows. If chunks or
-    embeddings exist for a document, the file was already indexed enough to be
-    user-visible and should be treated as successful for file-list status.
-    """
-    indexed_refs: set[tuple[str, str]] = set()
-    doc_ids_by_collection: Dict[str, set[str]] = {
-        collection: set() for collection in collections
-    }
-    for doc_refs in doc_refs_by_file_id.values():
-        for collection, doc_id in doc_refs:
-            if collection in doc_ids_by_collection:
-                doc_ids_by_collection[collection].add(doc_id)
-
-    candidate_refs = {
-        (collection, doc_id)
-        for collection, doc_ids in doc_ids_by_collection.items()
-        for doc_id in doc_ids
-    }
-    if not candidate_refs:
-        return indexed_refs
-
-    candidate_tables = ["chunks", *list_embeddings_table_names(conn)]
-    for table_name in candidate_tables:
-        if indexed_refs.issuperset(candidate_refs):
-            return indexed_refs
-        table = None
-        try:
-            table = conn.open_table(table_name)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Skipping indexed status fallback table '%s': %s", table_name, exc
-            )
-            continue
-
-        try:
-            for collection, doc_ids in doc_ids_by_collection.items():
-                pending_doc_ids = {
-                    doc_id
-                    for doc_id in doc_ids
-                    if (collection, doc_id) not in indexed_refs
-                }
-                if not pending_doc_ids:
-                    continue
-                collection_filter = build_lancedb_filter_expression(
-                    {"collection": collection},
-                    skip_user_filter=True,
-                )
-                doc_filter = _build_doc_id_in_filter(sorted(pending_doc_ids))
-                combined_filter = _combine_lancedb_filters(
-                    f"({collection_filter}) and ({doc_filter})", user_filter
-                )
-                try:
-                    query = table.search().where(combined_filter)
-                    rows = query_to_list(
-                        query.select(["collection", "doc_id"]).limit(-1)
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(
-                        "Failed indexed status fallback query on '%s' for collection '%s': %s",
-                        table_name,
-                        collection,
-                        exc,
-                    )
-                    continue
-
-                for row in rows:
-                    row_collection = str(row.get("collection") or "").strip()
-                    row_doc_id = str(row.get("doc_id") or "").strip()
-                    if row_collection and row_doc_id:
-                        indexed_refs.add((row_collection, row_doc_id))
-        finally:
-            _safe_close_table(table)
-
-    return indexed_refs
-
-
 def _aggregate_uploaded_file_statuses_impl(
     *,
     file_ids: List[str],
@@ -697,35 +514,18 @@ def _aggregate_uploaded_file_statuses_impl(
             return cached_result
 
     # Cache miss - compute from database
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
-    user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
-
+    vector_store = get_vector_index_store()
     doc_refs_by_file_id: Dict[str, List[tuple[str, str]]] = {
         file_id: [] for file_id in normalized_file_ids
     }
-    documents_table = None
-    try:
-        documents_table = conn.open_table("documents")
-        for offset in range(0, len(normalized_file_ids), _FILE_STATUS_BATCH_SIZE):
-            batch = normalized_file_ids[offset : offset + _FILE_STATUS_BATCH_SIZE]
-            base_filter = _build_file_id_in_filter(batch)
-            combined_filter = _combine_lancedb_filters(base_filter, user_filter)
-
-            query = documents_table.search()
-            if combined_filter:
-                query = query.where(combined_filter)
-            rows = query_to_list(
-                query.select(["file_id", "collection", "doc_id"]).limit(-1)
-            )
-            for row in rows:
-                file_id = str(row.get("file_id") or "").strip()
-                collection = str(row.get("collection") or "").strip()
-                doc_id = str(row.get("doc_id") or "").strip()
-                if file_id and collection and doc_id and file_id in doc_refs_by_file_id:
-                    doc_refs_by_file_id[file_id].append((collection, doc_id))
-    finally:
-        _safe_close_table(documents_table)
+    for record in vector_store.list_document_records_by_file_ids(normalized_file_ids):
+        if not UserPermissions.can_access_data(user_id, record.user_id, is_admin):
+            continue
+        file_id = (record.file_id or "").strip()
+        collection = (record.collection or "").strip()
+        doc_id = record.doc_id.strip()
+        if file_id and collection and doc_id and file_id in doc_refs_by_file_id:
+            doc_refs_by_file_id[file_id].append((collection, doc_id))
 
     collections = sorted(
         {
@@ -746,11 +546,11 @@ def _aggregate_uploaded_file_statuses_impl(
             if doc_id and status:
                 status_by_doc[(collection, doc_id)] = status
 
-    indexed_doc_refs = _load_indexed_doc_refs(
-        conn,
-        collections=collections,
-        doc_refs_by_file_id=doc_refs_by_file_id,
-        user_filter=user_filter,
+    # Legacy deployments may lack status rows; indexed documents then count as SUCCESS.
+    indexed_doc_refs = vector_store.list_indexed_doc_refs(
+        [ref for doc_refs in doc_refs_by_file_id.values() for ref in doc_refs],
+        user_id=user_id,
+        is_admin=is_admin,
     )
 
     status_map: Dict[str, str] = {}
@@ -833,8 +633,6 @@ def _reconcile_uploaded_files_impl(
             else _DEFAULT_DELETABLE_STALE_STATUSES
         )
     }
-    conn = get_connection_from_env()
-    ensure_documents_table(conn)
     for record in uploaded_files:
         scanned += 1
         file_id = str(record.file_id)
@@ -869,17 +667,8 @@ def _reconcile_uploaded_files_impl(
             )
             continue
 
-        safe_file_id = escape_lancedb_string(file_id)
-        # Query documents table to get (collection, doc_id) pairs for cascade deletion
-        documents_table = None
         try:
-            documents_table = conn.open_table("documents")
-            doc_rows = query_to_list(
-                documents_table.search()
-                .where(f"file_id = '{safe_file_id}'")
-                .select(["collection", "doc_id"])
-                .limit(-1)
-            )
+            docs = get_vector_index_store().list_document_records_by_file_ids([file_id])
         except Exception as exc:  # noqa: BLE001
             cleanup_errors += 1
             logger.error(
@@ -888,22 +677,20 @@ def _reconcile_uploaded_files_impl(
                 exc,
             )
             continue
-        finally:
-            _safe_close_table(documents_table)
 
         # Cascade delete all related data for each (collection, doc_id) pair
         # Note: We use cascade_delete for complete cleanup across all tables
         # (parses, chunks, embeddings_*, main_pointers, ingestion_runs, documents)
         cascade_deleted = 0
         cascade_error = False
-        for row in doc_rows:
-            collection = str(row.get("collection") or "").strip()
-            doc_id = str(row.get("doc_id") or "").strip()
+        for doc in docs:
+            collection = (doc.collection or "").strip()
+            doc_id = doc.doc_id.strip()
             if not collection or not doc_id:
                 continue
 
             try:
-                deleted_counts = cascade_delete(
+                deleted_counts = get_vector_index_store().cascade_delete(
                     target="document",
                     collection=collection,
                     doc_id=doc_id,
@@ -998,28 +785,17 @@ def list_documents_for_user(
     *,
     user_id: Optional[int] = None,
     is_admin: bool,
-    collection_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Load KB document metadata rows for a user."""
     return _get_file_compatibility_facade().list_documents_for_user(
         user_id=user_id,
         is_admin=is_admin,
-        collection_name=collection_name,
     )
 
 
-def list_document_records_for_file_ids(
-    file_ids: Iterable[str],
-    *,
-    user_id: Optional[int],
-    is_admin: bool,
-) -> List[DocumentRecord]:
-    """Uncapped: documents in the user's scope that reference any of ``file_ids``."""
-    return _get_file_compatibility_facade().list_document_records_for_file_ids(
-        file_ids,
-        user_id=user_id,
-        is_admin=is_admin,
-    )
+def find_referenced_file_ids(file_ids: Iterable[str]) -> set[str]:
+    """Uncapped: which of ``file_ids`` any document references, whatever its owner."""
+    return _get_file_compatibility_facade().find_referenced_file_ids(file_ids)
 
 
 def build_uploaded_filename_map(
@@ -1056,13 +832,19 @@ def delete_uploaded_file_if_orphaned(
     file_id: str,
     user_id: Optional[int],
     remaining_file_ids: set[str],
+    after_commit: Optional[List[tuple[str, Callable[[], None]]]] = None,
 ) -> bool:
-    """Delete uploaded file row and local file when no documents still reference it."""
+    """Delete an uploaded file's row and bytes when no documents still reference it.
+
+    Never commits. With ``after_commit``, the durable delete and local unlink are
+    queued for the caller to run after it commits; without it, the bytes go at once.
+    """
     return _get_file_compatibility_facade().delete_uploaded_file_if_orphaned(
         db,
         file_id=file_id,
         user_id=user_id,
         remaining_file_ids=remaining_file_ids,
+        after_commit=after_commit,
     )
 
 

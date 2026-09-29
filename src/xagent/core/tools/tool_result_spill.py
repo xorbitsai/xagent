@@ -3,23 +3,35 @@
 This module is the single owner of the tool-result-spill mechanism: the path
 primitives shared by the writer, the engine registration gate and the read
 side (``normalize_spilled_relative_path`` / ``resolve_spilled_under``), the
-walk-and-write entry point (``spill_oversized_values``), the report-record
-shape gate and notice renderer, and the constants that describe the on-disk
-and in-context contract.
+walk-and-write entry point (``spill_oversized_values``), the read-back
+entry points (``read_spilled_result`` / ``list_spilled_results``), the
+report-record shape gate and notice renderer, and the constants that
+describe the on-disk and in-context contract.
 
-Spilling is wired but not enabled. OutputFilteredToolWrapper
-(adapters/vibe/output_filter_wrapper.py) strips a tool-supplied report key
-from every result and, only when it is given a SpillTarget, spills oversized
-values before ordinary output filtering. ExecutionContext
-(core/agent/context/execution.py) validates the report records a result
-carries, registers the accepted ones and renders their notice. The
-production tool factory supplies no SpillTarget, so in a deployed tool set
-the wrapper only strips the reserved key and no spill file is written.
+Spilling is enabled for tool sets that can read a stored result back.
+OutputFilteredToolWrapper (adapters/vibe/output_filter_wrapper.py) strips a
+tool-supplied report key from every result and, only when it is given a
+SpillTarget, spills oversized values before ordinary output filtering.
+ExecutionContext (core/agent/context/execution.py) validates the report
+records a result carries, registers the accepted ones and renders their
+notice. The production tool factory (adapters/vibe/factory.py) gives every
+wrapper in a tool set one shared SpillRunBudget, and one shared SpillTarget
+only when the set contains a read_tool_result bound to a TaskWorkspace,
+taking the directory from spill_dir_for_workspace; the read_tool_result
+wrapper itself gets no target, so what a read-back returns is never itself
+spilled. A tool set without such a reader -- no file tools, a mock
+workspace, or a tool policy that removed read_tool_result by name while
+keeping read_file -- keeps ordinary truncation and writes no spill file.
 
-Read-back is not wired. The read-side helpers here
-(``spill_read_unavailable`` and ``_spill_slice``) have no caller
-outside this module and its tests, and no read_tool_result tool is
-registered.
+Read-back is wired: read_tool_result, registered by
+WorkspaceFileTools.get_tools, checks workspace authority and hands the
+workspace's spill directory to the two read-back entry points here.
+``read_spilled_result`` reads one stored result by its relative path with
+no path search, checks the digest in the file name against the file's
+bytes before decoding them, and slices by item with ``_spill_slice``.
+``list_spilled_results`` lists the files in the spill directory by name
+and size instead, a page at a time, without checking any digest. ReAct adds the tool to the
+model's tool list only once the run's registry holds a record.
 """
 
 from __future__ import annotations
@@ -98,10 +110,26 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
         "unavailable and do not reconstruct it."
     ),
     "invalid_range": (
-        "start and end are 1-based item numbers: both must be 1 or "
-        "greater, and start must not exceed end."
+        "start and end are 1-based item numbers, or entry numbers when "
+        "listing: both must be 1 or greater, and start must not exceed end. "
+        "offset is a 0-based character position in the text of one stored "
+        "result's selected items: it must be 0 or greater and fall inside "
+        "that text, and it is not used when listing."
     ),
 }
+# The read tool's own name, output cap and over-cap instruction. The cap
+# mirrors READ_FILE_CONTEXT_LIMIT (core/agent/context/execution.py), and a
+# test pins the two equal: the context layer's own preview cap applies only
+# to read_file's plain-string results, so the read tool has to cap itself.
+# It is the most one reply ever carries; spill_read_page_chars lowers the
+# page further when the tool output limit is smaller.
+SPILL_READ_TOOL_NAME = "read_tool_result"
+SPILL_READ_MAX_CHARS = 12_000
+SPILL_READ_TRUNCATED_INSTRUCTION = (
+    "Call read_tool_result again with a narrower start/end range to read "
+    "fewer items, or with the same start/end and a larger offset to "
+    "continue reading within them."
+)
 
 # The union of every key the two OutputFilteredToolWrapper bypass branches
 # write back (output_filter_wrapper.py's waiting-for-user and
@@ -470,10 +498,10 @@ def _spill_slice(kind: str, value: Any, content: str, first: int, last: int) -> 
     a negative index as a position counted from the end, so an unchecked
     ``first=0`` returned an empty slice and an unchecked ``first=-2``
     returned the last two items -- each of which reads as a real answer
-    about the stored result rather than as the rejected request it is. The
-    read tool turns a bad range into a classified failure of its own
-    (SPILL_READ_UNAVAILABLE_MESSAGES["invalid_range"]) before calling this,
-    so reaching here with one is a caller bug.
+    about the stored result rather than as the rejected request it is.
+    read_spilled_result turns a bad range into a classified failure of its
+    own (SPILL_READ_UNAVAILABLE_MESSAGES["invalid_range"]) before calling
+    this, so reaching here with one is a caller bug.
     """
     if first < 1 or last < first:
         raise ValueError(
@@ -520,6 +548,319 @@ def spill_read_unavailable(
     else:
         message = SPILL_READ_UNAVAILABLE_MESSAGES[reason]
     return {"success": False, "is_error": True, "status": "error", "output": message}
+
+
+def spill_read_page_chars(max_chars: int) -> int:
+    """The number of characters one read_tool_result reply carries.
+
+    ``max_chars`` is the tool output limit the output filter applies to
+    every string the read tool returns (BaseToolConfig.get_max_output_length).
+    A page longer than that limit would be cut by the filter, and the next
+    offset the model computes from the page size would skip the characters
+    the filter dropped, so a page is never longer than the limit and never
+    longer than SPILL_READ_MAX_CHARS.
+
+    The result is clamped to at least 1. The configuration layer does not
+    enforce a lower bound, so a limit of 0 or below reaches here unchanged,
+    and a page of 0 characters would return the same empty preview for
+    every offset without ever moving forward. Under such a limit the output
+    filter already mangles every string (a limit of 0 leaves only the
+    truncation marker, a negative limit drops that many characters from the
+    end), so the clamp does not make the read tool usable; it only keeps its
+    paging from standing still.
+    """
+    return max(1, min(SPILL_READ_MAX_CHARS, max_chars))
+
+
+def read_spilled_result(
+    spill_dir: str | Path | None,
+    name: Any,
+    *,
+    start: int | None = None,
+    end: int | None = None,
+    offset: int = 0,
+    page_chars: int = SPILL_READ_MAX_CHARS,
+) -> dict[str, Any]:
+    """Read one stored result from ``spill_dir`` without any path search.
+
+    ``name`` is the selector exactly as the model supplied it. It is
+    normalized here (normalize_spilled_relative_path) and located here
+    (resolve_spilled_under), so no caller can read a file this module would
+    not have written a name for. Unlike read_file this never strips a
+    directory prefix beyond the one canonical ``output/``, never looks in
+    input/ or temp/, never retries a normalized filename, and never falls
+    back to fuzzy stem matching: a selector that does not name an existing
+    regular file directly under the spill directory is reported
+    unavailable, full stop.
+
+    The file's bytes are checked against the digest its name carries
+    before they are decoded. The writer names every file after the
+    SHA-256 of the exact bytes it writes. A file whose bytes do not hash
+    to the digest in its own name -- for example one changed after it was
+    written -- is reported unavailable exactly like a missing one. The
+    check proves that the bytes match the name, not who wrote the file.
+
+    start and end are 1-based inclusive item numbers, not line numbers.
+    What one item is comes from the file's own content, decided here on
+    every call: a JSON array addresses elements, a JSON object addresses
+    top-level entries in document order, anything else addresses physical
+    lines. The registry is not consulted and the extension is not trusted.
+
+    At most ``page_chars`` characters come back per call. offset is a
+    0-based character position in the text the selected items render to,
+    and the reply starts there; it is how a single item longer than one page
+    -- one long line of text, or one large array element or object entry --
+    is read to its end, since no start/end range is narrower than one item.
+    A reply that is not the whole selected text uses the preview shape
+    below, which says where it starts, how long the whole text is, how many
+    items the stored result holds, and whether more follows.
+
+    ``page_chars`` is set by the engine, never by the model: the tool that
+    wraps this function computes it once with spill_read_page_chars and
+    does not expose it as a tool argument. It must be an int from 1 to
+    SPILL_READ_MAX_CHARS; any other value is a bug in the caller and raises
+    ValueError, as an unknown reason does in spill_read_unavailable.
+
+    Every rejection is returned as a classified failure
+    (spill_read_unavailable) rather than raised, because the caller
+    records the return value as the tool observation the model reads. A
+    ValueError out of _spill_slice is the exception: the range is validated
+    before the slice, so reaching it with a bad range is a bug in this
+    function, not a model mistake, and it propagates.
+    """
+    if (
+        isinstance(page_chars, bool)
+        or not isinstance(page_chars, int)
+        or not 1 <= page_chars <= SPILL_READ_MAX_CHARS
+    ):
+        raise ValueError(
+            f"read_spilled_result page_chars must be an int from 1 to "
+            f"{SPILL_READ_MAX_CHARS}, got {page_chars!r}"
+        )
+    relative_path = normalize_spilled_relative_path(name)
+    if relative_path is None:
+        return spill_read_unavailable("invalid_path")
+    resolved = resolve_spilled_under(spill_dir, relative_path)
+    if resolved is None:
+        return spill_read_unavailable("not_found")
+    # resolve_spilled_under saw a regular file, but the entry can be
+    # replaced before it is opened, so everything below describes the one
+    # file this open reaches rather than whatever the path names later.
+    # O_NOFOLLOW refuses an entry that became a symlink (ELOOP). O_NONBLOCK
+    # keeps an entry that became a FIFO from blocking the open until a
+    # writer appears; the open then succeeds and fstat rejects it as not a
+    # regular file. On a regular file O_NONBLOCK has no effect on Linux or
+    # macOS: reading one never waits, so it never fails with EAGAIN.
+    #
+    # The writer never produces a file above SPILL_MAX_FILE_BYTES, so a
+    # larger file cannot be a stored result and is not read into memory.
+    # The size is taken from the open descriptor, not from the path, and
+    # the read is bounded to one byte past that size, so a file that grows
+    # after fstat still cannot be read whole.
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return spill_read_unavailable("not_found")
+        size = metadata.st_size
+        if size > SPILL_MAX_FILE_BYTES:
+            return spill_read_unavailable("not_found")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(size + 1)
+    except OSError:
+        return spill_read_unavailable("not_found")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    # The writer replaces a file atomically and never extends one in place,
+    # so a read that returns more bytes than fstat reported means the file
+    # changed after it was opened: it is reported unavailable before any
+    # digest is computed. size is at most SPILL_MAX_FILE_BYTES here, so this
+    # also keeps every read at or under the cap.
+    if len(raw) > size:
+        return spill_read_unavailable("not_found")
+    # The digest is computed over the raw bytes and only then are they
+    # decoded: errors="replace" rewrites invalid bytes, so decoding first
+    # would hash different bytes than the writer did. bytes.decode also
+    # does no newline translation, so a stored \r\n reads back intact,
+    # matching both the byte-original write and the line count
+    # _spill_text_lines computes from the same string. relative_path holds
+    # exactly one "/" (normalize_spilled_relative_path builds it as
+    # "tool-results/<filename>"), and the digest is taken from the name the
+    # caller asked for, not from the resolved file, so a symlink cannot make
+    # a name return bytes that do not hash to the digest in that name.
+    stem = relative_path.rsplit("/", 1)[1].rsplit(".", 1)[0]
+    _, separator, stored_digest = stem.rpartition("-")
+    actual_digest = hashlib.sha256(raw).hexdigest()[:SPILL_DIGEST_HEX_CHARS]
+    if not separator or stored_digest != actual_digest:
+        return spill_read_unavailable("not_found")
+    content = raw.decode("utf-8", errors="replace")
+
+    if (
+        (start is not None and start < 1)
+        or (end is not None and end < 1)
+        or (start is not None and end is not None and start > end)
+        or offset < 0
+    ):
+        return spill_read_unavailable("invalid_range")
+    parsed: tuple[str, Any] | None = None
+    if start is None and end is None:
+        # No range asked: hand back the file as written. Parsing it here
+        # would cost the whole 8 MiB budget and change nothing.
+        output = content
+    else:
+        kind, value = _spill_kind_of(content)
+        parsed = (kind, value)
+        total = _spill_item_count(kind, value, content)
+        first = 1 if start is None else start
+        if first > total:
+            return spill_read_unavailable("invalid_range", item_count=total)
+        last = total if end is None else min(end, total)
+        output = _spill_slice(kind, value, content, first, last)
+
+    if offset == 0 and len(output) <= page_chars:
+        return {"relative_path": relative_path, "output": output}
+    # offset 0 always starts inside the text, even an empty one; any other
+    # offset has to name a character that exists.
+    if offset > 0 and offset >= len(output):
+        return spill_read_unavailable("invalid_range")
+    if parsed is None:
+        # Only a reply that cannot carry the whole text states the item
+        # count, so only this path parses a file read without a range.
+        parsed = _spill_kind_of(content)
+    item_count = _spill_item_count(parsed[0], parsed[1], content)
+    window_end = offset + page_chars
+    truncated = window_end < len(output)
+    # Mirror read_file's over-limit shape (execution.py's
+    # READ_FILE_CONTEXT_LIMIT branch): no "output" key, so
+    # _format_tool_result renders the whole dict and the instruction
+    # stays visible to the model. The instruction is there only while more
+    # of the selected text follows this preview.
+    preview: dict[str, Any] = {
+        "relative_path": relative_path,
+        "content_preview": output[offset:window_end],
+        "content_truncated": truncated,
+        "original_chars": len(output),
+        "item_count": item_count,
+        "offset": offset,
+    }
+    if truncated:
+        preview["instruction"] = SPILL_READ_TRUNCATED_INSTRUCTION
+    return preview
+
+
+def _stored_result_entries(spill_dir: str | Path | None) -> list[dict[str, Any]]:
+    """Every listable entry in ``spill_dir``, sorted by relative_path.
+
+    An entry is listed only if it is a direct child that is a regular
+    file (a symlink is not followed), its name matches the spill file
+    name pattern (1 to 112 ASCII letters, digits, underscores or hyphens,
+    ending in .json or .txt), and that name normalizes as a stored-result
+    path; anything else is skipped silently. The pattern is wider than
+    the names the writer actually produces, so a listed name is not by
+    itself evidence the writer made it. Each relative_path is the
+    canonical spelling normalize_spilled_relative_path returns, the same
+    one the notice shows and a successful read returns.
+
+    A missing spill_dir, a path that is not a directory, and an OSError
+    from opening or iterating the directory all give no entries: a task
+    that never stored anything asking for its stored results is an
+    ordinary question, not a failure. An OSError from one entry's own
+    is_file or stat skips that entry only; the others are still listed.
+    """
+    if not spill_dir:
+        return []
+    found: list[dict[str, Any]] = []
+    try:
+        with os.scandir(spill_dir) as entries:
+            for entry in entries:
+                if not _SPILL_FILENAME_RE.fullmatch(entry.name):
+                    continue
+                relative_path = normalize_spilled_relative_path(
+                    f"{SPILL_DIR_NAME}/{entry.name}"
+                )
+                if relative_path is None:
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    size = entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+                found.append({"relative_path": relative_path, "bytes": size})
+    except OSError:
+        return []
+    found.sort(key=lambda item: item["relative_path"])
+    return found
+
+
+def list_spilled_results(
+    spill_dir: str | Path | None,
+    *,
+    start: int | None = None,
+    end: int | None = None,
+) -> dict[str, Any]:
+    """List one page of the files in ``spill_dir``, by name and size.
+
+    The listing comes from the directory itself, not from the spill
+    registry: the read tool holds only the workspace, and the registry
+    lives on the execution context. So each entry carries its path and
+    size only -- the kind, item count and source characters of a stored
+    result are recorded in the run's registry, not in the directory. The
+    directory belongs to the task, so the listing can include files an
+    earlier run of the same task stored. No digest is checked here --
+    that would read every file in full -- so a listed file can still be
+    reported unavailable when it is read; the listing answers which names
+    are there, and the read answers whether one is a stored result. Which
+    entries qualify is described on _stored_result_entries.
+
+    start and end are 1-based inclusive entry numbers over the entries
+    sorted by relative_path, validated the way read_spilled_result
+    validates item numbers: both 1 or greater and start not past end, else
+    invalid_range; a start past the last entry is invalid_range naming the
+    entry count. Omitted, start is the first entry and end the last. One
+    page holds at most SPILL_MAX_FILES_PER_RUN entries; a range asking for
+    more is cut to that many, and the returned end says where it stopped.
+
+    ``count`` is the number of entries in the whole listing, not in this
+    page; ``start`` and ``end`` are the bounds of the page actually
+    returned (both None when there is nothing to list); ``omitted`` is the
+    number of entries outside the page.
+    """
+    if (
+        (start is not None and start < 1)
+        or (end is not None and end < 1)
+        or (start is not None and end is not None and start > end)
+    ):
+        return spill_read_unavailable("invalid_range")
+    entries = _stored_result_entries(spill_dir)
+    total = len(entries)
+    if start is not None and start > total:
+        return spill_read_unavailable("invalid_range", item_count=total)
+    if not entries:
+        return {
+            "stored_results": [],
+            "count": 0,
+            "start": None,
+            "end": None,
+            "omitted": 0,
+        }
+    first = 1 if start is None else start
+    last = min(
+        total if end is None else end,
+        total,
+        first + SPILL_MAX_FILES_PER_RUN - 1,
+    )
+    page = entries[first - 1 : last]
+    return {
+        "stored_results": page,
+        "count": total,
+        "start": first,
+        "end": last,
+        "omitted": total - len(page),
+    }
 
 
 def strip_reserved_spill_key(result: Any) -> Any:
@@ -1476,14 +1817,13 @@ _SPILL_OBSERVATION_NOTICE_HEADER = (
 )
 # core/agent/context/execution.py has a notice of its own for the compaction
 # summary: COMPACT_REREADABLE_TOOL_NAMES lists the tools whose observation
-# the summary may drop because the model can run them again, and replaces
-# the dropped content with a one-line pointer. This header is not the same
-# mechanism and does not replace it -- an observation that was spilled is
-# not re-runnable, the file is the only remaining copy, and the entry has
-# to name that file and how to read a range of it. The one place they
-# touch is the read tool itself, which is re-readable by that definition
-# once it exists, so the change that wires the read tool in is where the
-# two get reconciled.
+# the summary request may replace with a one-line pointer, because the model
+# can run them again. This header is not the same mechanism and does not
+# replace it -- an observation that was spilled is not re-runnable, the file
+# is the only remaining copy, and the entry has to name that file and how to
+# read a range of it. read_tool_result is deliberately not on that list, so
+# its observations are never replaced by a re-run pointer: the summary
+# request carries them the way it carries any other tool's.
 _SPILL_COMPACTION_NOTICE_HEADER = (
     "Large tool results from this run were stored by the engine. Read one "
     "with read_tool_result, using start and end to take a range of items. "
@@ -1662,10 +2002,16 @@ def render_spill_notice(records: Any, style: str = "observation") -> str:
         # which can lengthen the line again, so the length is recomputed
         # every time round. The header is never given back: a notice with no
         # header does not say what it is listing.
-        omitted_line = f"- ... {omitted} more stored file(s) omitted"
+        omitted_line = (
+            f"- ... {omitted} more stored file(s); call read_tool_result "
+            "with no path to list them"
+        )
         while len(lines) > 1 and total_chars + 1 + len(omitted_line) > max_chars:
             total_chars -= 1 + len(lines.pop())
             omitted += 1
-            omitted_line = f"- ... {omitted} more stored file(s) omitted"
+            omitted_line = (
+                f"- ... {omitted} more stored file(s); call read_tool_result "
+                "with no path to list them"
+            )
         lines.append(omitted_line)
     return "\n".join(lines)

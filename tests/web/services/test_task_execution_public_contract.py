@@ -98,6 +98,14 @@ EXPECTED_RESUME_PARAMETERS: list[tuple[str, Any]] = [
     # downstream keyword set below still binds unchanged; the downstream
     # should start passing it once it has an authoritative row to read.
     ("trusted_task_source", None),
+    # Appended for the same reason: set by the first-party message handoff,
+    # so its lease claim refuses a FAILED or COMPLETED row. The default keeps
+    # every other caller's claim unchanged.
+    ("refuse_terminal_status", False),
+    # Appended for the same reason: set by the first-party handler for a
+    # delivery it claimed itself, so a claim refused for an ended run
+    # withdraws the never-injected row instead of settling it unknown.
+    ("delivery_claimed_fresh", False),
 ]
 
 EXPECTED_EXECUTE_PARAMETERS: list[tuple[str, Any]] = [

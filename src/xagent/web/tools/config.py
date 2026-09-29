@@ -2238,9 +2238,9 @@ class WebToolConfig(BaseToolConfig):
         """Switch the per-turn connector runtime source for reused agents.
 
         ``WebToolConfig`` instances are cached with ``AgentService`` by task.
-        Runtime secrets/auth selectors are intentionally per-turn, so an append
-        turn must not keep using the first turn's resolved connector runtime
-        view or MCP config cache.
+        Resolved connector values/configs are turn-scoped: append and reply
+        turns must reload them. Accepted raw inputs, when retained for the
+        same run, are supplied by the runtime store rather than this cache.
         """
 
         normalized_turn_id = turn_id if isinstance(turn_id, str) else None

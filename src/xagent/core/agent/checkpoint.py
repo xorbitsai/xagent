@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from .trace import TraceAction, TraceCategory, TraceEventType, Tracer, TraceScope
 
@@ -60,6 +60,10 @@ class CheckpointPersistenceError(RuntimeError):
     """Raised when a checkpoint cannot be durably persisted."""
 
 
+class ExecutionEventPersistenceError(CheckpointPersistenceError):
+    """An execution fact failed to commit; apply the checkpoint abort policy."""
+
+
 class CheckpointReadError(RuntimeError):
     """Base for checkpoint read failures that must not collapse to absence.
 
@@ -82,6 +86,14 @@ class CheckpointUnavailableError(CheckpointReadError):
     re-probe at its own boundary). Rows that decode as permanently
     unreadable are classified by the corrupt error instead, once the
     matching set is exhausted.
+    """
+
+
+class UnknownToolEffectError(CheckpointReadError):
+    """A persisted attempt has no confirmed external outcome; do not replay it.
+
+    Unlike a transient read failure, retrying this checkpoint cannot establish
+    whether the tool performed its side effect before interruption.
     """
 
 
@@ -116,6 +128,30 @@ class CheckpointAccessRefusedError(CheckpointReadError):
     def __init__(self, message: str, *, reason: str = "active_run") -> None:
         super().__init__(message)
         self.reason = reason
+
+
+def exposes_checkpoint_reader(reader: Any) -> bool:
+    """Whether ``reader`` has a checkpoint read method (it may still read nothing)."""
+    return any(
+        callable(getattr(reader, name, None)) for name in CHECKPOINT_READER_METHODS
+    )
+
+
+def can_read_checkpoints(reader: Any) -> bool:
+    """Whether a read through ``reader`` reaches a backend that can answer.
+
+    ``Tracer`` always exposes ``load_latest_checkpoint`` and returns ``None``
+    when no handler reads, so its handlers decide. An empty result from a
+    stack without one proves nothing about what was written.
+    """
+    while isinstance(reader, TraceCheckpointStore):
+        reader = reader.tracer
+    if isinstance(reader, Tracer):
+        return any(
+            callable(getattr(handler, "load_latest_checkpoint", None))
+            for handler in reader.handlers
+        )
+    return exposes_checkpoint_reader(reader)
 
 
 async def read_latest_checkpoint_payload(
@@ -153,6 +189,18 @@ class TraceCheckpointStore:
 
     tracer: Any
     require_persisted: bool = True
+
+    @property
+    def records_execution_events(self) -> bool:
+        return getattr(self.tracer, "records_execution_events", False) is True
+
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return cast(
+            dict[str, Any] | None,
+            await self.tracer.load_committed_tool_outcome(tool_call),
+        )
 
     async def checkpoint(self, **payload: Any) -> str | None:
         return await self.save(payload)
@@ -199,6 +247,8 @@ class TraceCheckpointStore:
         self,
         execution_id: str,
     ) -> dict[str, Any] | None:
+        if not exposes_checkpoint_reader(self.tracer):
+            raise CheckpointUnavailableError("Checkpoint store has no readable backend")
         payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
         return self._unwrap_checkpoint_payload(payload)
 

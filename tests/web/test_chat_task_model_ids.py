@@ -2118,7 +2118,7 @@ def test_delete_task_reports_concurrent_disappearance(
     finally:
         db.close()
 
-    monkeypatch.setattr(chat_module, "_delete_task_sync", lambda **_kwargs: False)
+    monkeypatch.setattr(chat_module, "_delete_task_sync", lambda **_kwargs: None)
 
     response = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
 
@@ -2164,7 +2164,7 @@ def test_delete_task_core_failure_is_retry_safe_for_idempotent_provider(
 
     original_delete = chat_module._delete_task_sync
 
-    def fail_delete(*, task_id):
+    def fail_delete(**_kwargs):
         raise RuntimeError("core delete unavailable")
 
     try:

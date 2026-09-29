@@ -62,6 +62,7 @@ def finalize_managed_task_lease_result(
         raise ValueError("Cannot finalize a managed lease with RUNNING status")
 
     from .chat_history_service import persist_assistant_message_no_commit
+    from .task_execution_event_writer import stage_result_fact_no_commit
     from .task_orchestrator import invalidate_task_cache_best_effort
 
     try:
@@ -100,6 +101,9 @@ def finalize_managed_task_lease_result(
                 message_type=history_message_type,
                 turn_id=turn_id,
             )
+        stage_result_fact_no_commit(
+            db, task, dict(execution_result or {"error": error_message})
+        )
         if completion is not None:
             from ..models.task_command import TaskExecutionCommand
 

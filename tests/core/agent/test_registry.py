@@ -9,7 +9,6 @@ import pytest
 
 from xagent.core.agent import (
     Agent,
-    ContextManager,
     ExecutionContext,
     ExecutionLifecycleStatus,
     PatternRuntime,
@@ -18,14 +17,6 @@ from xagent.core.agent import registry as registry_module
 from xagent.core.agent.checkpoint import CheckpointPersistenceError
 from xagent.core.agent.registry import ExecutionRegistry
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
-
-
-@pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
 
 
 @dataclass
@@ -491,6 +482,30 @@ async def test_registry_registers_handle_metadata() -> None:
     assert handle.to_dict()["is_resumable"] is False
 
 
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"success": True, "status": "completed"},
+        {"success": False, "status": "waiting_for_user"},
+        {"success": False, "status": "failed", "error": "tool failed"},
+    ],
+)
+def test_registry_reports_unknown_input_as_interrupted_whatever_the_run_said(
+    result: dict[str, Any],
+) -> None:
+    runner = AgentRunner(agent=Agent(name="writer", patterns=[SuccessfulPattern()]))
+    registry = ExecutionRegistry()
+    events: list[dict[str, Any]] = []
+    handle = registry.register("exec-unknown", runner, requested_task="task")
+    registry.subscribe(events.append)
+
+    registry._apply_result(handle, {**result, "injection_outcome_unknown": True})
+
+    assert handle.status == ExecutionLifecycleStatus.INTERRUPTED
+    assert [event["type"] for event in events] == ["execution.interrupted"]
+    assert handle.last_error == result.get("error")
+
+
 @pytest.mark.asyncio
 async def test_registry_emits_registered_event_for_manual_handle_registration() -> None:
     runner = AgentRunner(agent=Agent(name="writer", patterns=[SuccessfulPattern()]))
@@ -577,7 +592,8 @@ async def test_registry_post_user_message_reports_fresh_vs_replay(
             request_interrupt=False,
         )
         assert second.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
-        assert second.context is first.context
+        # The idle context was evicted, so the replay is read from the checkpoint.
+        assert second.context is not None
         return
 
     assert scenario == "conflicting_content"

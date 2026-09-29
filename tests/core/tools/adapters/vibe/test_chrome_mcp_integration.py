@@ -184,6 +184,61 @@ async def test_chrome_adapter_reuses_scope_and_validates_daemon_result(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_chrome_runtime_bindings_reach_model_observation(monkeypatch):
+    pool = AsyncMock(spec=ChromeExecutionSessionPool)
+    pool.get_or_create.return_value = SimpleNamespace(sandbox=object())
+    pool.invoke_tool.return_value = {
+        "content": [{"type": "text", "text": "bound page"}],
+        "isError": False,
+    }
+    mcp_tool = _tool()
+    mcp_tool.inputSchema = {
+        "type": "object",
+        "properties": {"pageId": {"type": "integer"}},
+        "required": ["pageId"],
+    }
+    monkeypatch.setattr(
+        mcp_adapter, "list_tools_in_sandbox", AsyncMock(return_value=[mcp_tool])
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.chrome_mcp_runtime.get_chrome_execution_session_pool",
+        lambda: pool,
+    )
+    connection = _connection()
+    connection.update(
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "page"},
+                "target": {"target_type": "tool_arguments", "key": "pageId"},
+            }
+        ],
+        connector_runtime={"context": {"page": 2}},
+    )
+    tools = await consume_chrome_actor_stdio_session(
+        server_name="chrome-devtools",
+        connection=connection,
+        session_identity=_identity(),
+        sandbox=None,
+    )
+    tool = tools[0]
+    assert isinstance(tool, ChromeExecutionMCPToolAdapter)
+    assert "pageId" not in tool.args_type().model_fields
+    assert '"pageId":2' in tool.description
+
+    result = await tool.run_json_async({"pageId": 99})
+
+    assert pool.invoke_tool.await_args.args[3] == {"pageId": 2}
+    assert result["runtime_bound_arguments"] == {"pageId": 2}
+    from xagent.core.agent.context import ExecutionContext
+
+    observation = ExecutionContext().add_tool_result(
+        tool.name, result, tool_call_id="chrome-bound"
+    )
+    assert "runtime_bound_arguments" in observation.content
+    assert "'pageId': 2" in observation.content
+
+
+@pytest.mark.asyncio
 async def test_invalid_daemon_result_closes_scope_without_per_call_fallback(
     monkeypatch,
 ):

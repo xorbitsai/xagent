@@ -1530,8 +1530,10 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("is_new_task", [False, True])
 async def test_successful_telegram_turn_hands_finalize_the_execution_result(
     monkeypatch: pytest.MonkeyPatch,
+    is_new_task: bool,
 ) -> None:
     """The waiting-branch call site forwards its own execute_task() result.
 
@@ -1543,7 +1545,8 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
     bot = make_bot()
     bot.channel_id = 1
     bot.channel_name = "Telegram execution result"
-    bot.active_tasks = {}
+    bot.active_tasks = {} if is_new_task else {123: 48}
+    bot._active_tasks_unsaved = False
     bot.bot = object()
     bot._save_active_tasks = lambda: True
     bot._consume_user_stop_request = lambda _user_id: False
@@ -1566,6 +1569,9 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
             return True
 
     execution_result = {"success": True, "output": "Telegram reply"}
+    connector_turn_ids: list[str | None] = []
+    execution_turn_ids: list[str] = []
+    persisted_turn_ids: list[str] = []
 
     class FakeTracer:
         def add_handler(self, _handler: object) -> None:
@@ -1583,9 +1589,11 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
 
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            connector_turn_ids.append(_kwargs.get("connector_runtime_turn_id"))
             return agent_service
 
         async def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
+            execution_turn_ids.append(_kwargs["context"]["turn_id"])
             return execution_result
 
     async def extract_text(_message):  # type: ignore[no-untyped-def]
@@ -1598,13 +1606,13 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
         return SimpleNamespace(
             user_id=5,
             task_id=48,
-            is_new_task=True,
+            is_new_task=is_new_task,
             managed_lease=FakeManagedLease(),
             requested_agent_missing=False,
         )
 
     async def persist_message(**_kwargs) -> None:  # type: ignore[no-untyped-def]
-        return None
+        persisted_turn_ids.append(_kwargs["turn_id"])
 
     monkeypatch.setattr(
         "xagent.web.channels.telegram.bot.prepare_channel_task", fake_prepare
@@ -1658,6 +1666,9 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
 
     assert len(finalized) == 1
     assert finalized[0]["execution_result"] is execution_result
+    assert connector_turn_ids == execution_turn_ids == persisted_turn_ids
+    assert len(connector_turn_ids) == 1
+    assert connector_turn_ids[0]
 
 
 @pytest.mark.asyncio

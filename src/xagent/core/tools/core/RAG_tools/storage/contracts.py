@@ -14,6 +14,7 @@ from enum import Enum
 from typing import (
     Any,
     Dict,
+    Iterable,
     Iterator,
     List,
     Literal,
@@ -227,12 +228,14 @@ class DocumentRecord:
         file_id: Optional file identifier for uploaded file tracking.
         source_path: Original source path if available.
         user_id: Optional tenant owner for owner-aware control-plane cleanup.
+        collection: Owning collection, set by lookups that span collections.
     """
 
     doc_id: str
     file_id: Optional[str] = None
     source_path: Optional[str] = None
     user_id: Optional[int] = None
+    collection: Optional[str] = None
 
 
 class FilterOperator(str, Enum):
@@ -434,6 +437,44 @@ class VectorIndexStore(ABC):
             user_id: User ID for multi-tenancy filtering.
             is_admin: Whether the user has admin privileges.
             max_results: Maximum records to return.
+        """
+
+    @abstractmethod
+    def list_document_records_by_file_ids(
+        self, file_ids: Iterable[str]
+    ) -> List[DocumentRecord]:
+        """Every document row whose ``file_id`` is one of ``file_ids``.
+
+        Uncapped, across collections and owners (rows with no owner included):
+        callers decide what a reference allows. Values come back as stored,
+        with ``None`` read as ``""`` for ``doc_id`` and ``collection``. Empty
+        candidates are skipped, and with none left nothing is read.
+        """
+
+    @abstractmethod
+    def list_document_rows(
+        self,
+        user_id: Optional[int],
+        is_admin: bool,
+        max_results: int = DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    ) -> List[Dict[str, Any]]:
+        """``documents`` rows the user may see in any collection, every column as stored.
+
+        Unlike ``list_document_records``, rows without a ``doc_id`` are kept and
+        nothing is audit-logged. At most ``max_results`` rows.
+        """
+
+    @abstractmethod
+    def list_indexed_doc_refs(
+        self,
+        doc_refs: Iterable[Tuple[str, str]],
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> set[Tuple[str, str]]:
+        """Which ``(collection, doc_id)`` refs have chunk or embedding rows the user may see.
+
+        Best effort: a table or query that fails is skipped. With no refs
+        nothing is read.
         """
 
     @abstractmethod
@@ -1569,6 +1610,35 @@ class IngestionStatusStore(ABC):
 
         Raises:
             DatabaseOperationError: If delete operation fails.
+        """
+
+    @abstractmethod
+    def load_ingestion_status_rows(
+        self, doc_refs: Sequence[Tuple[str, str]]
+    ) -> List[Dict[str, Any]]:
+        """Every status row of ``doc_refs`` (``(collection, doc_id)`` pairs).
+
+        Uncapped and whatever the owner. Rows carry the eight status columns
+        as stored, timestamps included, for :meth:`replace_ingestion_status_rows`.
+        """
+
+    @abstractmethod
+    def replace_ingestion_status_rows(
+        self,
+        doc_refs: Sequence[Tuple[str, str]],
+        rows: Sequence[Dict[str, Any]],
+    ) -> None:
+        """Delete every status row of ``doc_refs``, whatever its owner, then add ``rows``.
+
+        Unlike :meth:`write_ingestion_status`, ``rows`` are written as given,
+        timestamps included.
+
+        Every row's ``(collection, doc_id)`` must be in ``doc_refs``: a row
+        outside them would sit next to rows the delete never touched.
+
+        Raises:
+            ValueError: If a row's ``(collection, doc_id)`` is not in
+                ``doc_refs``, before anything is deleted or added.
         """
 
     @abstractmethod

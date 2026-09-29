@@ -8,6 +8,7 @@ from .chat_message import TaskChatMessage
 from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
 from .deployment import Deployment, DeploymentOwnerType
+from .expired_task import ExpiredTaskTombstone
 from .global_memory_embedding_authority import GlobalMemoryEmbeddingAuthority
 from .gmail_watch import GmailWatchState
 from .kb_ingest_target import KBIngestTarget
@@ -21,7 +22,10 @@ from .sandbox import DurableSandboxLifecycle, SandboxInfo, SandboxSnapshot
 from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
+from .task_admission import TaskAdmissionBucket, TaskAdmissionTicket
+from .task_admission_pacing import TaskAdmissionPacing
 from .task_channel_delivery import TaskChannelDelivery
+from .task_cleanup_obligation import TaskCleanupObligation
 from .task_command import TaskExecutionCommand
 from .task_command_terminal_event import TaskCommandTerminalEvent
 from .task_execution_event import TaskExecutionEvent
@@ -49,6 +53,8 @@ from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, Workf
 
 __all__ = [
     "TaskChannelDelivery",
+    "TaskCleanupObligation",
+    "ExpiredTaskTombstone",
     "Base",
     "ActorOAuthFlowState",
     "ActorMCPServerConnection",
@@ -74,6 +80,9 @@ __all__ = [
     "Deployment",
     "DeploymentOwnerType",
     "Task",
+    "TaskAdmissionPacing",
+    "TaskAdmissionBucket",
+    "TaskAdmissionTicket",
     "TaskExecutionCommand",
     "TaskInputReceipt",
     "TaskCommandTerminalEvent",

@@ -1,6 +1,7 @@
 import type { TranslationKey } from "@/i18n/translations"
 
 export const CLIENT_ERROR_CODES = [
+  "execution_queue_full",
   "message_processing_failed",
   "task_execution_failed",
   "guidance_in_progress",
@@ -55,6 +56,7 @@ export const CLIENT_ERROR_CODES = [
 export type ClientErrorCode = (typeof CLIENT_ERROR_CODES)[number]
 
 const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
+  execution_queue_full: "clientErrors.executionQueueFull",
   message_processing_failed: "clientErrors.messageProcessingFailed",
   task_execution_failed: "clientErrors.taskExecutionFailed",
   guidance_in_progress: "clientErrors.guidanceInProgress",
@@ -86,6 +88,7 @@ const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
 }
 
 const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
+  execution_queue_full: "The team execution queue is full. Please retry shortly.",
   message_processing_failed: "The message could not be processed. Please try again.",
   task_execution_failed: "Task execution failed.",
   guidance_in_progress: "A previous guidance message is still being applied. Please wait for it to finish.",

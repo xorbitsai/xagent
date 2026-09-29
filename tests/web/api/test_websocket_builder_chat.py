@@ -201,6 +201,16 @@ async def test_handle_builder_chat_basic() -> None:
         assert call_kwargs["pattern"] == "react"
         assert call_kwargs["name"] == "builder_chat_agent"
         assert call_kwargs["compact_llm"] is mock_compact_llm
+        # After #2219 the builder chat is the only place the knowledge-base
+        # authoring tools are mounted, so pin the wiring here rather than
+        # only the tool classes.
+        mounted_tool_names = {
+            getattr(tool, "name", None) for tool in call_kwargs["tools"]
+        }
+        assert {
+            "create_knowledge_base_from_file",
+            "create_knowledge_base_from_url",
+        } <= mounted_tool_names
         mock_agent_service.set_allowed_skills.assert_called_once_with(["agent-builder"])
         mock_agent_service.set_recovered_skill_context.assert_called_once()
         mock_agent_service.set_outbound_message_handler.assert_called_once()

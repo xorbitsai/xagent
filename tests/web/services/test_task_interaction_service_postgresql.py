@@ -947,7 +947,7 @@ def test_respond_vs_purge_both_interleavings_leave_no_residue(_respond_pg) -> No
         if order == "purge_first":
             db = _respond_pg()
             try:
-                purge_task_rows(db, task_id=task_id)
+                purge_task_rows(db, task_id=task_id, detached_reason="task_deleted")
                 db.commit()
             finally:
                 db.close()
@@ -968,7 +968,7 @@ def test_respond_vs_purge_both_interleavings_leave_no_residue(_respond_pg) -> No
             assert isinstance(outcome, svc.RespondAccepted)
             db = _respond_pg()
             try:
-                purge_task_rows(db, task_id=task_id)
+                purge_task_rows(db, task_id=task_id, detached_reason="task_deleted")
                 db.commit()
             finally:
                 db.close()

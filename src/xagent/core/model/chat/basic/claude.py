@@ -1262,7 +1262,7 @@ class ClaudeLLM(BaseLLM):
 
     @staticmethod
     async def list_available_models(
-        api_key: str, base_url: Optional[str] = None
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
         """Fetch available models from Anthropic Claude API.
 
@@ -1270,6 +1270,8 @@ class ClaudeLLM(BaseLLM):
             api_key: Anthropic API key
             base_url: Base URL for Claude API (optional). If not provided,
                      uses the official Anthropic API.
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
 
         Returns:
             List of available models with their information
@@ -1333,4 +1335,6 @@ class ClaudeLLM(BaseLLM):
             raise
         except Exception as e:
             logger.error(f"Failed to fetch Claude models: {e}")
+            if raise_on_error:
+                raise
             return []

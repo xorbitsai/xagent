@@ -112,10 +112,17 @@ def pending_user_response_marker(waiting_request: Any) -> dict[str, Any] | None:
         return None
     question = waiting_request.get("message")
     question = question if isinstance(question, str) else ""
-    return {
+    marker: dict[str, Any] = {
         "question": question,
         "message_type": waiting_request.get("message_type", "question"),
     }
+    # Only carried over when the waiting request is itself flagged as a form
+    # (ReActPattern's ask_user_question branch is the only writer of that
+    # flag, see react.py); every other waiting request produces only
+    # ``question`` and ``message_type``.
+    if waiting_request.get("form") is True:
+        marker["form"] = True
+    return marker
 
 
 def _stored_top_level_user_request(context: Any) -> TopLevelUserRequest | None:

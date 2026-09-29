@@ -1,4 +1,4 @@
-"""Orphan checks see references past the 10,000-row document scan cap (#2662)."""
+"""Orphan checks count references past the scan cap and from any owner (#2662)."""
 
 from __future__ import annotations
 
@@ -15,9 +15,11 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     CollectionOperationResult,
     IngestionResult,
 )
+from xagent.core.tools.core.RAG_tools.kb import KBApiCompatibilityFacade
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
     ensure_documents_table,
 )
+from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
 from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
     LanceDBVectorIndexStore,
 )
@@ -25,7 +27,6 @@ from xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.web.api import kb as kb_module
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
-from xagent.web.services import kb_file_service
 
 test_env = kb_dir.test_env
 temp_uploads = kb_dir.temp_uploads
@@ -39,7 +40,9 @@ def _documents() -> Any:
     return conn.open_table("documents")
 
 
-def _doc(collection: str, doc_id: str, file_id: str, user_id: int) -> dict[str, Any]:
+def _doc(
+    collection: str, doc_id: str, file_id: str, user_id: int | None
+) -> dict[str, Any]:
     return {
         "collection": collection,
         "doc_id": doc_id,
@@ -123,11 +126,15 @@ def _stub_rollback_leaves(monkeypatch: pytest.MonkeyPatch, *, may_delete: bool):
     for name, fake in {
         "delete_document": _fake_delete_document,
         "delete_collection": _fake_delete_collection,
-        "_rollback_may_delete_collection": AsyncMock(return_value=may_delete),
         "_cleanup_failed_new_collection_metadata": AsyncMock(),
         "_restore_ingest_file_backup": lambda **_kw: None,
     }.items():
         monkeypatch.setattr(kb_module, name, fake)
+    monkeypatch.setattr(
+        KBApiCompatibilityFacade,
+        "failed_ingest_may_delete_collection",
+        AsyncMock(return_value=may_delete),
+    )
 
 
 async def _rollback(
@@ -157,7 +164,7 @@ async def _rollback(
             file_path=path,
             file_record=db.query(UploadedFile).filter_by(file_id=file_id).one(),
             collection_existed_before=collection_existed_before,
-            uploaded_file_existed_before=True,
+            uploaded_file_existed_before=False,
             file_backup_path=None,
             had_existing_file=True,
         )
@@ -169,7 +176,9 @@ def _break_reference_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     def _raise(*_args, **_kwargs):
         raise RuntimeError("refs down")
 
-    monkeypatch.setattr(kb_file_service, "query_to_list", _raise)
+    monkeypatch.setattr(
+        LanceDBVectorIndexStore, "list_document_records_by_file_ids", _raise
+    )
 
 
 def test_document_delete_keeps_file_referenced_past_scan_cap(test_env, temp_uploads):
@@ -220,34 +229,6 @@ async def test_file_rollback_keeps_file_referenced_past_scan_cap(
         path=path,
         collection="demo",
         collection_existed_before=True,
-    )
-
-    assert _row_exists(sessions, file_id)
-    assert path.exists()
-
-
-async def test_local_collection_rollback_keeps_file_referenced_past_scan_cap(
-    test_env, temp_uploads, monkeypatch
-):
-    _app, _headers, user, sessions = test_env
-    path = temp_uploads / f"user_{user.id}" / "shared" / "shared.txt"
-    file_id = _uploaded(sessions, user.id, path)
-    _seed(
-        user.id,
-        _doc("fresh", "doc-fresh", file_id, user.id),
-        _doc("other", "doc-other", file_id, user.id),
-    )
-    _assert_capped_scan_misses(file_id, user_id=user.id, is_admin=False)
-    _stub_rollback_leaves(monkeypatch, may_delete=True)
-
-    await _rollback(
-        kb_module._rollback_failed_ingestion,
-        sessions,
-        user,
-        file_id=file_id,
-        path=path,
-        collection="fresh",
-        collection_existed_before=False,
     )
 
     assert _row_exists(sessions, file_id)
@@ -314,14 +295,19 @@ def test_admin_collection_delete_keeps_each_owner_file_referenced_past_scan_cap(
         assert not _path(owner, "orphan.txt").exists()
 
 
-def test_document_delete_still_ignores_other_tenant_references(test_env, temp_uploads):
+@pytest.mark.parametrize(
+    "other_owner", [OTHER_TENANT, None], ids=["other-tenant", "unowned"]
+)
+def test_document_delete_keeps_file_another_owner_references(
+    test_env, temp_uploads, other_owner
+):
     app, headers, user, sessions = test_env
     path = temp_uploads / f"user_{user.id}" / "demo" / "shared.txt"
     file_id = _uploaded(sessions, user.id, path)
     _documents().add(
         [
             _doc("demo", "doc-demo", file_id, user.id),
-            _doc("theirs", "doc-theirs", file_id, OTHER_TENANT),
+            _doc("theirs", "doc-theirs", file_id, other_owner),
         ]
     )
 
@@ -330,16 +316,172 @@ def test_document_delete_still_ignores_other_tenant_references(test_env, temp_up
     )
 
     assert response.status_code == 200
-    # Current scope, not desired: #2662 item 5 flips this.
-    assert not _row_exists(sessions, file_id)
-    assert not path.exists()
+    assert response.json()["deleted_doc_ids"] == ["doc-demo"]
+    assert _row_exists(sessions, file_id)
+    assert path.exists()
 
 
-def test_reference_lookup_returns_every_candidate_reference_and_nothing_else(
+@pytest.mark.parametrize(
+    "other_owner", [OTHER_TENANT, None], ids=["other-tenant", "unowned"]
+)
+@pytest.mark.parametrize(
+    "rollback",
+    [kb_module._rollback_failed_ingestion, kb_module._rollback_failed_cloud_ingestion],
+    ids=["local", "cloud"],
+)
+async def test_file_rollback_keeps_file_another_owner_references(
+    test_env, temp_uploads, monkeypatch, rollback, other_owner
+):
+    _app, _headers, user, sessions = test_env
+    path = temp_uploads / f"user_{user.id}" / "demo" / "shared.txt"
+    file_id = _uploaded(sessions, user.id, path)
+    _documents().add(
+        [
+            _doc("demo", "doc-demo", file_id, user.id),
+            _doc("theirs", "doc-theirs", file_id, other_owner),
+        ]
+    )
+    _stub_rollback_leaves(monkeypatch, may_delete=False)
+
+    await _rollback(
+        rollback,
+        sessions,
+        user,
+        file_id=file_id,
+        path=path,
+        collection="demo",
+        collection_existed_before=True,
+    )
+
+    assert _row_exists(sessions, file_id)
+    assert path.exists()
+
+
+@pytest.mark.parametrize(
+    "other_owner", [OTHER_TENANT, None], ids=["other-tenant", "unowned"]
+)
+def test_collection_delete_keeps_file_another_owner_references(
+    test_env, temp_uploads, other_owner
+):
+    app, headers, user, sessions = test_env
+    path = temp_uploads / f"user_{user.id}" / "shared" / "shared.txt"
+    file_id = _uploaded(sessions, user.id, path)
+    _documents().add(
+        [
+            _doc("team", "doc-team", file_id, user.id),
+            _doc("theirs", "doc-theirs", file_id, other_owner),
+        ]
+    )
+
+    response = _delete_via_api(app, headers, "/api/kb/collections/team")
+
+    assert response.status_code == 200, response.text
+    assert _row_exists(sessions, file_id)
+    assert path.exists()
+
+
+@pytest.mark.parametrize("unowned", [False, True], ids=["admin", "unowned"])
+def test_admin_collection_delete_counts_references_from_any_owner(
+    test_env, temp_uploads, unowned
+):
+    app, headers, user, sessions = test_env
+    session = sessions()
+    try:
+        session.add(User(id=OTHER_TENANT, username="owner", password_hash="x"))
+        session.get(User, user.id).is_admin = True
+        session.commit()
+    finally:
+        session.close()
+    kept_path = temp_uploads / f"user_{OTHER_TENANT}" / "shared" / "kept.txt"
+    orphan_path = temp_uploads / f"user_{OTHER_TENANT}" / "shared" / "orphan.txt"
+    kept = _uploaded(sessions, OTHER_TENANT, kept_path)
+    orphan = _uploaded(sessions, OTHER_TENANT, orphan_path)
+    _documents().add(
+        [
+            _doc("team", "team-kept", kept, OTHER_TENANT),
+            _doc("team", "team-orphan", orphan, OTHER_TENANT),
+            _doc("mine", "copy", kept, None if unowned else user.id),
+        ]
+    )
+
+    response = _delete_via_api(app, headers, "/api/kb/collections/team")
+
+    assert response.status_code == 200, response.text
+    assert _row_exists(sessions, kept)
+    assert kept_path.exists()
+    assert not _row_exists(sessions, orphan)
+    assert not orphan_path.exists()
+
+
+def test_deleting_own_document_never_deletes_another_owners_file(
+    test_env, temp_uploads
+):
+    app, headers, user, sessions = test_env
+    session = sessions()
+    try:
+        session.add(User(id=OTHER_TENANT, username="owner", password_hash="x"))
+        session.commit()
+    finally:
+        session.close()
+    path = temp_uploads / f"user_{OTHER_TENANT}" / "uploads" / "theirs.txt"
+    file_id = _uploaded(sessions, OTHER_TENANT, path)
+    _documents().add([_doc("demo", "doc-demo", file_id, user.id)])
+
+    response = _delete_via_api(
+        app, headers, f"/api/kb/collections/demo/documents/theirs.txt?file_id={file_id}"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deleted_doc_ids"] == ["doc-demo"]
+    assert _row_exists(sessions, file_id)
+    assert path.exists()
+
+
+@pytest.mark.parametrize(
+    "other_owner",
+    ["self", OTHER_TENANT, None],
+    ids=["same-owner", "other-tenant", "unowned"],
+)
+def test_collection_delete_keeps_referenced_file_in_its_directory(
+    test_env, temp_uploads, other_owner
+):
+    app, headers, user, sessions = test_env
+    # Resolved: the directory pass compares against the resolved collection path.
+    collection_dir = temp_uploads.resolve() / f"user_{user.id}" / "team"
+    path = collection_dir / "shared.txt"
+    file_id = _uploaded(sessions, user.id, path)
+    _documents().add(
+        [
+            _doc("team", "doc-team", file_id, user.id),
+            _doc(
+                "theirs",
+                "doc-theirs",
+                file_id,
+                user.id if other_owner == "self" else other_owner,
+            ),
+        ]
+    )
+
+    response = _delete_via_api(app, headers, "/api/kb/collections/team")
+
+    assert response.status_code == 200, response.text
+    session = sessions()
+    try:
+        kept = Path(
+            session.query(UploadedFile).filter_by(file_id=file_id).one().storage_path
+        )
+    finally:
+        session.close()
+    assert not collection_dir.exists()
+    assert collection_dir not in kept.parents
+    assert kept.read_text() == "content"
+
+
+def test_reference_lookup_returns_referenced_candidates_of_any_owner(
     test_env, monkeypatch
 ):
     _app, _headers, user, _sessions = test_env
-    monkeypatch.setattr(kb_file_service, "_ORPHAN_LOOKUP_BATCH_SIZE", 2)
+    monkeypatch.setattr(lancedb_stores, "_FILE_ID_LOOKUP_BATCH_SIZE", 2)
     table = _documents()
     table.add(
         [
@@ -347,14 +489,19 @@ def test_reference_lookup_returns_every_candidate_reference_and_nothing_else(
             for i in range(DEFAULT_VECTOR_STORE_SCAN_LIMIT)
         ]
     )
-    table.add([_doc("demo", f"d-{f}", f, user.id) for f in ("f-2", "f-3", "f-x")])
-
-    records = kb_module._list_document_records_for_file_ids(
-        ["f-1", "f-2", "f-3"], user_id=user.id, is_admin=False
+    table.add(
+        [
+            _doc("demo", "d-2", "f-2", OTHER_TENANT),
+            _doc("demo", "d-3", "f-3", None),
+            _doc("demo", "d-x", "f-x", user.id),
+        ]
     )
 
-    assert len(records) == DEFAULT_VECTOR_STORE_SCAN_LIMIT + 2
-    assert {record.file_id for record in records} == {"f-1", "f-2", "f-3"}
+    assert kb_module._find_referenced_file_ids(["f-1", "f-2", "f-3", "f-4"]) == {
+        "f-1",
+        "f-2",
+        "f-3",
+    }
 
 
 def test_document_delete_skips_cleanup_when_reference_lookup_fails(

@@ -17,6 +17,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from ...core.memory.vector_compatibility import (
+    canonical_embedding_identity,
+    embedding_identity_fingerprint,
+)
 from ...core.model.providers import canonical_provider_name
 from ...core.utils.encryption import (
     EncryptionDecodeError,
@@ -140,8 +144,32 @@ class GlobalMemoryEmbeddingAuthoritySnapshot(GlobalMemoryEmbeddingAuthorityRecor
         """Identity of the embedding space alone: only the inputs that decide
         what a vector means. Key rotation and retry changes move
         :meth:`authority_fingerprint` but never this value, so vectors already
-        stored under it stay comparable."""
-        return _fingerprint(self._vector_space_inputs())
+        stored under it stay comparable.
+
+        Derived from the *canonical* identity -- the same one admission builds
+        the embedding adapter and the stored LanceDB vector-space metadata
+        from. That is what makes persistence, fingerprinting, adapter
+        construction, the expected table metadata and the manager's drift
+        check key on one value rather than five nearly-equal ones.
+        """
+        try:
+            identity = canonical_embedding_identity(
+                {
+                    "provider": self.provider,
+                    "model": self.model_name,
+                    "endpoint": self.endpoint,
+                    "dimension": self.dimension,
+                    "instruct": self.instruct,
+                }
+            )
+        except ValueError:
+            # An authority that no longer canonicalizes describes no vector
+            # space at all. Fingerprint the raw inputs under a distinct shape
+            # so the value can never collide with an admitted canonical
+            # identity: a publication keyed on one must be revoked, never
+            # silently kept alive by a fingerprint that happens to match.
+            return _fingerprint(("uncanonical", *self._vector_space_inputs()))
+        return embedding_identity_fingerprint(identity)
 
 
 def _record_from_row(
@@ -152,7 +180,12 @@ def _record_from_row(
         model_name=str(row.model_name),
         endpoint=str(row.base_url),
         dimension=int(row.dimension),
-        instruct=str(row.instruct) if row.instruct is not None else None,
+        # Normalized on the way out as well as on the way in, so a row
+        # persisted as "" by an earlier build materializes as the ``None``
+        # an omitted instruction gives and fingerprints identically.
+        instruct=(str(row.instruct).strip() or None)
+        if row.instruct is not None
+        else None,
         max_retries=int(row.max_retries),
         credential_source=CredentialSource(str(row.credential_source)),
         global_sharing_consent=bool(row.global_sharing_consent),
@@ -184,7 +217,12 @@ def _canonicalize(config: AuthorityConfiguration) -> AuthorityConfiguration:
     # that actually reaches base_url = String(500) is re-checked here.
     if len(endpoint) > _MAX_ENDPOINT_LENGTH:
         raise ValueError("Global memory embedding endpoint is invalid")
-    instruct = config.instruct.strip() if config.instruct else None
+    # Canonicalized before the provider rule, not after: an omitted, null,
+    # empty or whitespace-only instruction all describe the same vector space,
+    # so they must reach persistence as the same stored value. Spelling them
+    # differently would give one space two fingerprints and make a no-op edit
+    # read as drift.
+    instruct = (config.instruct or "").strip() or None
     if provider != "dashscope":
         instruct = None
     if not model_name or len(model_name) > _MAX_MODEL_NAME_LENGTH:

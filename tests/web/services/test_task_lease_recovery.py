@@ -17,6 +17,7 @@ from tests.shared.db_teardown import drop_all_tables
 from tests.web.services.checkpoint_anchor_shared import build_upgraded_sqlite_engine
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.web.models.agent import Agent
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import (
     get_db,
     get_engine,
@@ -24,6 +25,7 @@ from xagent.web.models.database import (
     init_db,
 )
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerRun,
@@ -33,6 +35,20 @@ from xagent.web.models.trigger import (
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_lease_recovery, task_lease_service
+from xagent.web.services.chat_history_service import (
+    DELIVERY_COMPLETED,
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
+    DELIVERY_PENDING,
+)
+from xagent.web.services.task_command_transport import (
+    COMMAND_COMPLETED,
+    COMMAND_FAILED,
+    COMMAND_PENDING,
+    COMMAND_PROCESSING,
+    TaskCommandKind,
+)
 from xagent.web.services.task_lease_recovery import (
     TASK_LEASE_EXPIRED_ERROR,
     TASK_LEASE_PAUSED_TRIGGER_ERROR,
@@ -1622,3 +1638,309 @@ async def test_recovery_loop_survives_pool_timeout_and_waits_for_next_tick(
 
     assert calls == 2
     assert sleeps == [11]
+
+
+# --- Orphaned pending delivery reconciliation (lease recovery owns it) ---
+
+
+def _add_user_row(
+    db,
+    task: Task,
+    *,
+    turn_id: str | None,
+    status: str = DELIVERY_PENDING,
+    role: str = "user",
+    created_at: datetime | None = None,
+) -> int:
+    row = TaskChatMessage(
+        task_id=int(task.id),
+        user_id=int(task.user_id),
+        role=role,
+        message_type="user_message" if role == "user" else "assistant_message",
+        content=f"message {turn_id}",
+        turn_id=turn_id,
+        delivery_status=status,
+    )
+    if created_at is not None:
+        row.created_at = created_at
+    db.add(row)
+    db.commit()
+    return int(row.id)
+
+
+def _add_command(db, task: Task, *, command_id: str, status: str) -> None:
+    db.add(
+        TaskExecutionCommand(
+            task_id=int(task.id),
+            command_id=command_id,
+            kind=TaskCommandKind.MESSAGE.value,
+            payload={"message": "m", "client_message_id": command_id},
+            status=status,
+        )
+    )
+    db.commit()
+
+
+def _delivery_status(db, row_id: int) -> str | None:
+    db.expire_all()
+    row = db.get(TaskChatMessage, row_id)
+    assert row is not None
+    return row.delivery_status
+
+
+@pytest.mark.parametrize(
+    ("with_checkpoint", "verdict"),
+    [(True, TaskStatus.PAUSED), (False, TaskStatus.FAILED)],
+)
+def test_lease_recovery_dispatches_orphaned_pending_rows(
+    db_session,
+    with_checkpoint: bool,
+    verdict: TaskStatus,
+) -> None:
+    user = _create_user(db_session, suffix=f"orphan-{verdict.value}")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix=f"orphan-{verdict.value}",
+        with_checkpoint=with_checkpoint,
+    )
+    orphan = _add_user_row(db_session, task, turn_id="orphan-turn")
+    no_turn = _add_user_row(db_session, task, turn_id=None)
+    settled = _add_user_row(
+        db_session, task, turn_id="settled-turn", status=DELIVERY_FAILED
+    )
+
+    assert _recover_expired_task(db_session, task) == verdict
+
+    # No grace period: the expired run can no longer settle its own rows.
+    assert _delivery_status(db_session, orphan) == DELIVERY_DISPATCHED
+    assert _delivery_status(db_session, no_turn) == DELIVERY_PENDING
+    assert _delivery_status(db_session, settled) == DELIVERY_FAILED
+
+
+@pytest.mark.parametrize(
+    ("command_id", "command_status"),
+    [
+        ("orphan-turn", COMMAND_PENDING),
+        ("orphan-turn", COMMAND_PROCESSING),
+        ("other-command", COMMAND_PENDING),
+        ("other-command", COMMAND_PROCESSING),
+        # A same-id MESSAGE that failed told its sender "not accepted".
+        ("orphan-turn", COMMAND_FAILED),
+    ],
+)
+def test_lease_recovery_leaves_rows_an_unfinished_or_failed_command_owns(
+    db_session,
+    command_id: str,
+    command_status: str,
+) -> None:
+    suffix = f"owned-{command_id}-{command_status}"
+    user = _create_user(db_session, suffix=suffix)
+    task = _create_expired_task(db_session, user_id=int(user.id), suffix=suffix)
+    orphan = _add_user_row(db_session, task, turn_id="orphan-turn")
+    _add_command(db_session, task, command_id=command_id, status=command_status)
+
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+    assert _delivery_status(db_session, orphan) == DELIVERY_PENDING
+
+
+def test_lease_recovery_ignores_settled_commands(db_session) -> None:
+    user = _create_user(db_session, suffix="completed-other")
+    task = _create_expired_task(
+        db_session, user_id=int(user.id), suffix="completed-other"
+    )
+    orphan = _add_user_row(db_session, task, turn_id="orphan-turn")
+    _add_command(db_session, task, command_id="orphan-turn", status=COMMAND_COMPLETED)
+    _add_command(db_session, task, command_id="other-command", status=COMMAND_FAILED)
+
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+    assert _delivery_status(db_session, orphan) == DELIVERY_DISPATCHED
+
+
+def test_fenced_recovery_candidate_writes_no_delivery_state(db_session) -> None:
+    user = _create_user(db_session, suffix="fenced-orphan")
+    task = _create_expired_task(
+        db_session, user_id=int(user.id), suffix="fenced-orphan"
+    )
+    orphan = _add_user_row(db_session, task, turn_id="orphan-turn")
+    candidate = get_expired_task_lease_candidates(
+        db_session,
+        cutoff=utc_now(),
+        limit=1,
+    )[0]
+    # A new owner took the task after the candidate was read.
+    task.runner_id = "replacement-runner"
+    task.lease_expires_at = utc_now() + timedelta(minutes=1)
+    db_session.commit()
+
+    assert (
+        recover_task_lease_candidate_isolated(candidate, recovered_at=utc_now()) is None
+    )
+
+    assert _delivery_status(db_session, orphan) == DELIVERY_PENDING
+    db_session.refresh(task)
+    assert task.status == TaskStatus.RUNNING
+
+
+def _quiescent_task(
+    db,
+    *,
+    user: User,
+    suffix: str,
+    status: TaskStatus = TaskStatus.PAUSED,
+    control_state: str | None = None,
+) -> Task:
+    task = Task(
+        user_id=int(user.id),
+        title=f"Quiescent {suffix}",
+        description="orphan sweep test",
+        status=status,
+        execution_mode="auto",
+        run_id=f"run-{suffix}",
+        state_version=2,
+        control_state=control_state or status.value.lower(),
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def test_periodic_sweep_dispatches_only_quiescent_old_pending_rows(
+    db_session,
+) -> None:
+    user = _create_user(db_session, suffix="sweep")
+    old = utc_now() - timedelta(hours=1)
+    reconciled_rows: list[int] = []
+    untouched: dict[int, str] = {}
+
+    paused: Task | None = None
+    for status in (TaskStatus.PAUSED, TaskStatus.COMPLETED, TaskStatus.FAILED):
+        quiescent = _quiescent_task(
+            db_session, user=user, suffix=f"quiescent-{status.value}", status=status
+        )
+        paused = paused or quiescent
+        reconciled_rows.append(
+            _add_user_row(
+                db_session, quiescent, turn_id=f"old-{status.value}", created_at=old
+            )
+        )
+    assert paused is not None
+    # Rows on the same quiescent task that are not eligible.
+    untouched[_add_user_row(db_session, paused, turn_id="fresh")] = DELIVERY_PENDING
+    for settled in (DELIVERY_COMPLETED, DELIVERY_FAILED, DELIVERY_OUTCOME_UNKNOWN):
+        untouched[
+            _add_user_row(
+                db_session,
+                paused,
+                turn_id=f"settled-{settled}",
+                status=settled,
+                created_at=old,
+            )
+        ] = settled
+    untouched[
+        _add_user_row(
+            db_session, paused, turn_id="assistant", role="assistant", created_at=old
+        )
+    ] = DELIVERY_PENDING
+
+    running = _quiescent_task(
+        db_session, user=user, suffix="running", status=TaskStatus.RUNNING
+    )
+    running.runner_id = "dead-runner"
+    running.lease_expires_at = utc_now() - timedelta(minutes=5)
+    waiting = _quiescent_task(
+        db_session, user=user, suffix="waiting", status=TaskStatus.WAITING_FOR_USER
+    )
+    pending_task = _quiescent_task(
+        db_session, user=user, suffix="pending", status=TaskStatus.PENDING
+    )
+    resume_requested = _quiescent_task(
+        db_session, user=user, suffix="resume", control_state="resume_requested"
+    )
+    pause_requested = _quiescent_task(
+        db_session, user=user, suffix="pause", control_state="pause_requested"
+    )
+    leased = _quiescent_task(db_session, user=user, suffix="leased")
+    leased.runner_id = "idle-owner"
+    leased.lease_expires_at = utc_now() + timedelta(minutes=5)
+    db_session.commit()
+    for blocked in (
+        running,
+        waiting,
+        pending_task,
+        resume_requested,
+        pause_requested,
+        leased,
+    ):
+        untouched[
+            _add_user_row(
+                db_session, blocked, turn_id=f"blocked-{blocked.id}", created_at=old
+            )
+        ] = DELIVERY_PENDING
+
+    reconcile = task_lease_recovery.reconcile_orphaned_pending_deliveries_isolated
+    assert reconcile(batch_size=100) == 3
+    for row_id in reconciled_rows:
+        assert _delivery_status(db_session, row_id) == DELIVERY_DISPATCHED
+    for row_id, expected in untouched.items():
+        assert _delivery_status(db_session, row_id) == expected
+
+    assert reconcile(batch_size=100) == 0
+
+
+def test_periodic_sweep_pages_by_task(db_session) -> None:
+    user = _create_user(db_session, suffix="sweep-page")
+    old = utc_now() - timedelta(hours=1)
+    rows = []
+    for index in range(3):
+        task = _quiescent_task(db_session, user=user, suffix=f"page-{index}")
+        rows.append(
+            _add_user_row(db_session, task, turn_id=f"a-{index}", created_at=old)
+        )
+        rows.append(
+            _add_user_row(db_session, task, turn_id=f"b-{index}", created_at=old)
+        )
+
+    reconcile = task_lease_recovery.reconcile_orphaned_pending_deliveries_isolated
+    # One page covers at most ``batch_size`` tasks, and all of each one's rows.
+    assert reconcile(batch_size=2) == 4
+    assert reconcile(batch_size=2) == 2
+    assert reconcile(batch_size=2) == 0
+    assert {_delivery_status(db_session, row) for row in rows} == {DELIVERY_DISPATCHED}
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_runs_the_sweep_on_its_first_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sweeps: list[int] = []
+
+    async def fake_recover(*, cutoff: datetime, batch_size: int) -> int:
+        return 0
+
+    def fake_sweep(*, batch_size: int) -> int:
+        sweeps.append(batch_size)
+        return 2
+
+    async def stop_sleep(_delay: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        task_lease_recovery,
+        "recover_expired_task_leases_until_cutoff",
+        fake_recover,
+    )
+    monkeypatch.setattr(
+        task_lease_recovery,
+        "reconcile_orphaned_pending_deliveries_isolated",
+        fake_sweep,
+    )
+    monkeypatch.setattr(task_lease_recovery.asyncio, "sleep", stop_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_task_lease_recovery_loop(poll_interval_seconds=30, batch_size=9)
+
+    assert sweeps == [9]

@@ -232,6 +232,11 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         manager.execute_task.await_args.kwargs["task_lease"].run_id == selected.run_id
     )
     forwarded_context = manager.execute_task.await_args.kwargs["context"]
+    assert (
+        manager.get_agent_for_task.await_args.kwargs.get("connector_runtime_turn_id")
+        == forwarded_context["turn_id"]
+        == command.command_id
+    )
     assert forwarded_context["task_source"] == "internal"
     assert forwarded_context["run_id"] == selected.run_id
     with get_session_local()() as db:

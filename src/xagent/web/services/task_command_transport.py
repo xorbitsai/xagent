@@ -18,7 +18,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
 from sqlalchemy import and_, exists, false, or_, select, true
 from sqlalchemy.exc import IntegrityError
@@ -30,6 +30,7 @@ from ...config import (
     get_task_lease_ttl_seconds,
 )
 from ..models.task import Task, TaskStatus, task_status_predicate
+from ..models.task_admission import TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
 from ..models.user import User
 from .db_runtime import (
@@ -37,6 +38,11 @@ from .db_runtime import (
     is_database_pool_timeout,
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
+)
+from .task_admission_execution import (
+    AdmissionWaiting,
+    admission_execution,
+    return_to_admission_queue,
 )
 from .task_command_terminal_events import (
     TerminalTaskEventDraft,
@@ -220,6 +226,7 @@ class ClaimedTaskCommand:
     attempt_count: int
     failure_count: int = 0
     defer_count: int = 0
+    admission_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -551,6 +558,29 @@ def stage_task_command(
     )
     db.add(command)
     db.flush()
+    from .task_execution_event_writer import (
+        append_fact_no_commit,
+        uses_execution_events,
+    )
+
+    if uses_execution_events(db, resolved_task_id):
+        append_fact_no_commit(
+            db,
+            task_id=resolved_task_id,
+            kind="command_accepted",
+            key=f"command:{normalized_id}",
+            run_id=snapshot.run_id,
+            payload={
+                "command_id": normalized_id,
+                "kind": kind.value,
+                "payload": payload,
+                "actor_user_id": actor_user_id,
+                "target_state_version": int(snapshot.state_version or 0),
+            },
+        )
+    from .task_execution_admission import stage_task_admission
+
+    stage_task_admission(db, command)
     return StagedTaskCommand(
         staged_db_id=int(command.id),
         client_command_id=normalized_id,
@@ -754,12 +784,19 @@ def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
 
 
 def _unfinished_earlier_command() -> Any:
+    from .task_execution_admission import waiting_admission
+
     earlier = aliased(TaskExecutionCommand)
     return exists(
         select(1).where(
             earlier.task_id == TaskExecutionCommand.task_id,
             earlier.id < TaskExecutionCommand.id,
             earlier.status.notin_(COMMAND_TERMINAL),
+            ~and_(
+                TaskExecutionCommand.kind.in_(("cancel", "pause")),
+                earlier.status == COMMAND_PENDING,
+                waiting_admission(earlier.id),
+            ),
         )
     )
 
@@ -767,6 +804,8 @@ def _unfinished_earlier_command() -> Any:
 def _claimable_query(
     db: Session, *, runner_id: str, command_db_id: int | None
 ) -> Query[Any]:
+    from .task_execution_admission import admission_eligible
+
     now = _utc_now()
     query = (
         db.query(TaskExecutionCommand)
@@ -781,6 +820,7 @@ def _claimable_query(
                 )
             ),
             _claim_availability_predicate(now),
+            admission_eligible(),
             ~_unfinished_earlier_command(),
             _command_routing_predicate(runner_id, now),
         )
@@ -870,6 +910,11 @@ def claim_task_command(
             or not lock_task_lease_no_commit(db, coordinator.lease)
         ):
             return None
+        from .task_execution_admission import reserve_task_admission
+
+        if not reserve_task_admission(db, int(candidate.id), coordinator.lease):
+            db.rollback()
+            return None
     now = _utc_now()
     expires = now + timedelta(seconds=get_task_lease_ttl_seconds())
     routable_task = exists(
@@ -904,15 +949,15 @@ def claim_task_command(
     if claimed != 1:
         db.rollback()
         return None
-    db.commit()
     fresh = (
         db.query(TaskExecutionCommand)
         .filter(TaskExecutionCommand.id == int(candidate.id))
         .populate_existing()
         .one()
     )
+    admission_required = db.get(TaskAdmissionTicket, fresh.id) is not None
     payload: dict[str, Any] = fresh.payload if isinstance(fresh.payload, dict) else {}
-    return ClaimedTaskCommand(
+    command = ClaimedTaskCommand(
         id=int(fresh.id),
         task_id=int(fresh.task_id),
         actor_user_id=(
@@ -923,9 +968,17 @@ def claim_task_command(
         payload=payload,
         target_run_id=(str(fresh.target_run_id) if fresh.target_run_id else None),
         attempt_count=int(fresh.attempt_count or 0),
+        admission_required=admission_required,
         failure_count=int(fresh.failure_count or 0),
         defer_count=int(fresh.defer_count or 0),
     )
+    accepted_at = cast(datetime, fresh.created_at)
+    db.commit()
+    if admission_required:
+        from .task_admission_observation import record_command_admission
+
+        record_command_admission(command.id, command.attempt_count, accepted_at)
+    return command
 
 
 def _claim_task_command_isolated(
@@ -1051,6 +1104,9 @@ def finish_task_command_no_commit(
         synchronize_session=False,
     )
     if updated == 1:
+        from .task_execution_admission import settle_cancelled_admissions
+
+        settle_cancelled_admissions(db, command_db_id)
         stage_terminal_event(db, command_db_id=command_db_id)
     return updated == 1
 
@@ -1074,6 +1130,15 @@ def finish_task_command(
         )
         db.commit()
         return updated
+
+
+def _records_message_outcome_unknown(result: Any) -> bool:
+    from .chat_history_service import DELIVERY_OUTCOME_UNKNOWN
+
+    return (
+        isinstance(result, dict)
+        and result.get("delivery_outcome") == DELIVERY_OUTCOME_UNKNOWN
+    )
 
 
 def fail_task_command(
@@ -1122,6 +1187,7 @@ def fail_task_command(
         snapshot_query = db.query(
             TaskExecutionCommand.failure_count,
             TaskExecutionCommand.attempt_count,
+            TaskExecutionCommand.result,
         ).filter(
             TaskExecutionCommand.id == command_db_id,
             TaskExecutionCommand.status == COMMAND_PROCESSING,
@@ -1136,6 +1202,11 @@ def fail_task_command(
             return False
         observed_failure_count = int(snapshot.failure_count or 0)
         observed_attempt_count = int(snapshot.attempt_count or 0)
+        if result is None and _records_message_outcome_unknown(snapshot.result):
+            # A MESSAGE attempt recorded that its turn's ``dispatched`` row
+            # means "outcome unknown" before it failed. That record is the
+            # retry's only way to tell it from an accepted turn; keep it.
+            result = snapshot.result
         failure_count = observed_failure_count + 1
         terminal = force_terminal or failure_count >= MAX_COMMAND_FAILURES
         updated = (
@@ -1283,6 +1354,10 @@ def retry_failed_task_command(
     command_db_id: int,
 ) -> bool:
     """Reset one failed command without retargeting its immutable execution."""
+
+    from .task_execution_admission import prepare_task_admission_retry
+
+    prepare_task_admission_retry(db, command_db_id)
 
     now = _utc_now()
     updated = (
@@ -1540,7 +1615,19 @@ async def _dispatch_task_command(
     heartbeat_outcome = TaskCommandClaimHeartbeatOutcome()
     heartbeat_cancellation: asyncio.CancelledError | None = None
     try:
-        result = await executor(command)
+        with admission_execution(
+            command.id, command.task_id, command.admission_required
+        ):
+            result = await executor(command)
+    except AdmissionWaiting:
+        disposition_name = "return_to_admission_queue"
+
+        def persist_admission_wait() -> bool:
+            return return_to_admission_queue(
+                command.id, runner_id, command.attempt_count
+            )
+
+        disposition_operation = persist_admission_wait
     except asyncio.CancelledError:
         # Leave the processing claim intact. Another worker may reclaim it only
         # after the claim expires, which avoids concurrent replay on shutdown.

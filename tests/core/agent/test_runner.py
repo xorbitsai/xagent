@@ -39,14 +39,6 @@ from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
 @pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
-
-
-@pytest.fixture(autouse=True)
 def reset_compact_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
     # The once-per-model warning set is process-global; isolate it per test.
     monkeypatch.setattr(runtime_module, "_COMPACT_WINDOW_WARNED_MODELS", set())
@@ -139,6 +131,16 @@ class FakePattern:
     async def run(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
         return dict(self.result)
+
+
+class CheckpointingPattern(FakePattern):
+    """Checkpoints once, as real patterns do, so later input can restore it."""
+
+    async def run(self, **kwargs: Any) -> dict[str, Any]:
+        await kwargs["runtime"].checkpoint(
+            "before_llm", context=kwargs["context"], pattern=self
+        )
+        return await super().run(**kwargs)
 
 
 class FailingPattern:
@@ -300,6 +302,12 @@ class TracerCheckpointStore:
         return dict(payload) if payload is not None else None
 
 
+class RecordingCheckpointTracer(RecordingTraceEventTracer, TracerCheckpointStore):
+    def __init__(self) -> None:
+        RecordingTraceEventTracer.__init__(self)
+        TracerCheckpointStore.__init__(self)
+
+
 class EmptyCanonicalCheckpointStore:
     def __init__(self) -> None:
         self.legacy_reads = 0
@@ -321,6 +329,7 @@ def test_user_message_injection_outcome_truthiness_contract() -> None:
     assert UserMessageInjectionOutcome.POSTED_FRESH
     assert UserMessageInjectionOutcome.POSTED_REPLAY
     assert UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert UserMessageInjectionOutcome.REJECTED_RETRYABLE
 
 
 def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
@@ -330,6 +339,7 @@ def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
         "POSTED_FRESH",
         "POSTED_REPLAY",
         "OUTCOME_UNKNOWN",
+        "REJECTED_RETRYABLE",
     }
 
 
@@ -522,7 +532,8 @@ async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None
     assert [message.role for message in context.messages] == ["user", "assistant"]
     assert context.messages[0].content == "Write a summary"
     assert context.messages[1].content == "done"
-    assert ContextManager().get_context("exec-1") is context
+    # No run is left, so the checkpoint is authoritative again.
+    assert ContextManager().get_context("exec-1") is None
 
     pattern_call = pattern.calls[0]
     assert pattern_call["task"] == "Write a summary"
@@ -1286,6 +1297,36 @@ def test_merge_context_metadata_restored_keeps_identity_against_none(
     assert context.metadata["run_id"] == "run-original"
 
 
+def test_merge_context_metadata_replaces_legacy_raw_memory_reason(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-safe-memory-reason")
+    context.metadata.update(
+        {
+            "memory_available": False,
+            "memory_availability_reason": "host resolver secret shard eu-3",
+            "other": "checkpointed",
+        }
+    )
+
+    runner._merge_context_metadata(
+        context,
+        {
+            "memory_available": False,
+            "memory_availability_reason": "unavailable",
+        },
+        restored=True,
+    )
+
+    assert context.metadata["memory_available"] is False
+    assert context.metadata["memory_availability_reason"] == "unavailable"
+    assert context.metadata["other"] == "checkpointed"
+
+
 @pytest.mark.asyncio
 async def test_runner_empty_resume_metadata_preserves_non_modality_metadata(
     tmp_path: Path,
@@ -1472,8 +1513,8 @@ async def test_runner_inject_user_message_with_files_dispatches_trace_callback(
     the new Message so they survive checkpoints and (b) fire the trace
     callback so the chip is broadcast live (instead of only appearing after
     a page reload via historical replay)."""
-    tracer = RecordingTraceEventTracer()
-    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    tracer = RecordingCheckpointTracer()
+    agent = Agent(name="writer", patterns=[CheckpointingPattern({"success": True})])
     runner = AgentRunner(
         agent=agent,
         tracer=tracer,
@@ -1579,6 +1620,10 @@ async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_fail
         workspace_manager=FakeWorkspaceManager(tmp_path),
     )
     failing_runner.pause = MagicMock(return_value=True)
+    # A live input needs a run of this execution active in this process.
+    failing_runner.context_manager.set_context(
+        ExecutionContext.from_dict(checkpoint_context.to_dict())
+    )
 
     accepted = await failing_runner.post_user_message(
         execution_id,
@@ -1669,7 +1714,7 @@ async def test_runner_inject_user_message_reports_fresh_vs_replay(
     before this contract existed."""
     tracer = TracerCheckpointStore()
     execution_id = "exec-fresh-replay-grid"
-    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    agent = Agent(name="writer", patterns=[CheckpointingPattern({"success": True})])
     runner = AgentRunner(
         agent=agent,
         tracer=tracer,
@@ -1697,7 +1742,8 @@ async def test_runner_inject_user_message_reports_fresh_vs_replay(
             request_interrupt=False,
         )
         assert second.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
-        assert second.context is first.context
+        # The idle context was evicted, so the replay is read from the checkpoint.
+        assert second.context is not None
         matching = [
             message
             for message in second.context.messages
@@ -1874,7 +1920,7 @@ async def test_runner_attaches_uploaded_image_refs_to_injected_user_message(
     tmp_path: Path,
 ) -> None:
     tracer = TracerCheckpointStore()
-    agent = Agent(name="vision", patterns=[FakePattern({"success": True})])
+    agent = Agent(name="vision", patterns=[CheckpointingPattern({"success": True})])
     runner = AgentRunner(
         agent=agent,
         tracer=tracer,
@@ -2488,6 +2534,26 @@ def test_resume_migration_reaches_a_nested_auto_pattern_child_context() -> None:
 
     nested = checkpoint["pattern_state"]["dag_state"]["active_step_contexts"]["step_1"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in nested["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_try_another_pattern_after_fact_commit_failure() -> None:
+    from xagent.core.agent.checkpoint import ExecutionEventPersistenceError
+
+    class UncertainPattern:
+        async def run(self, **_: Any) -> dict[str, Any]:
+            raise ExecutionEventPersistenceError("tool result commit failed")
+
+    fallback = FakePattern({"success": True, "output": "must not retry"})
+    runner = AgentRunner(
+        agent=Agent(
+            name="fact-failure", patterns=[UncertainPattern(), fallback], llm=None
+        ),
+        workspace_enabled=False,
+    )
+    with pytest.raises(ExecutionEventPersistenceError):
+        await runner.run(task="write once", execution_id="uncertain-effect")
+    assert fallback.calls == []
 
 
 @pytest.mark.parametrize(

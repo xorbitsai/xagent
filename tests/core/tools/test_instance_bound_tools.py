@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
+from xagent.core.tools.adapters.vibe.config import ToolConfig
+from xagent.core.tools.adapters.vibe.workspace_file_tool import (
+    WorkspaceFileTools,
+    create_file_tools,
+)
+from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
 from xagent.core.workspace import create_workspace
 
 
@@ -147,8 +152,17 @@ async def test_tool_creation_function():
 
         # Test that tools are created and bound correctly
         assert (
-            len(file_tools) == 17
-        )  # Should have 17 file tools, including prepare_html_asset.
+            len(file_tools) == 18
+        )  # 18 file tools: prepare_html_asset plus read_tool_result, which
+        # joins the workspace file tools at the end of get_tools().
+
+        # read_tool_result is the last tool get_tools() returns, named by
+        # the spill module's constant, and declared read-only.
+        read_back_tool = file_tools[-1]
+        assert read_back_tool.name == SPILL_READ_TOOL_NAME
+        assert read_back_tool.read_only is True
+        assert read_back_tool.concurrency_safe is True
+        assert [tool.name for tool in file_tools].count(SPILL_READ_TOOL_NAME) == 1
 
         # Test tool functionality
         write_tool = next(tool for tool in file_tools if tool.name == "write_file")
@@ -172,11 +186,27 @@ async def test_tool_creation_function():
         assert "fetch_skill_file" in skill_tool_names
         print("✅ Skill tools creation test passed!")
 
-        # Total tools: 17 file + 3 skill = 20
+        # Total tools: 18 file + 3 skill = 21
         all_tools = file_tools + skill_tools
-        assert len(all_tools) == 20
+        assert len(all_tools) == 21
 
         print("✅ Tool creation function test passed!")
+
+
+async def test_disabled_file_tools_include_no_read_tool_result():
+    """read_tool_result is a file tool: turning the file category off
+    removes it together with every other file tool."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        workspace_config = {"task_id": "_mock_", "base_dir": temp_dir}
+        enabled = await create_file_tools(
+            ToolConfig({"file_tools_enabled": True, "workspace": workspace_config})
+        )
+        disabled = await create_file_tools(
+            ToolConfig({"file_tools_enabled": False, "workspace": workspace_config})
+        )
+
+        assert SPILL_READ_TOOL_NAME in [tool.name for tool in enabled]
+        assert disabled == []
 
 
 async def main():

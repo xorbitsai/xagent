@@ -12,6 +12,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/chat/ChatMessage.tsx",
         "src/components/chat/clarification-form.tsx",
         "src/components/chat/connector-runtime-dialog.tsx",
+        "src/components/chat/connector-runtime-dialog-state.ts",
         "src/components/chat/TraceEventRenderer.tsx",
         "src/components/file/file-preview-content.tsx",
         "src/components/file/file-viewer.tsx",
@@ -67,6 +68,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         },
         "src/components/chat/connector-runtime-dialog.tsx": {
           statements: 90, branches: 85, functions: 95, lines: 90,
+        },
+        "src/components/chat/connector-runtime-dialog-state.ts": {
+          statements: 95, branches: 85, functions: 95, lines: 95,
         },
         "src/components/widget/session-agent-chat-page.tsx": {
           statements: 90, branches: 85, functions: 75, lines: 90,
@@ -167,6 +171,7 @@ export default defineConfig({
       "src/components/chat/trace-event-processing.test.ts",
       "src/components/chat/clarification-form.test.tsx",
       "src/components/chat/connector-runtime-dialog.test.tsx",
+      "src/components/chat/connector-runtime-dialog-state.test.ts",
       "src/components/file/file-preview-content.test.tsx",
       "src/components/file/file-viewer.test.tsx",
       "src/components/file/inline-file-preview.test.tsx",

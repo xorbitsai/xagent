@@ -239,6 +239,11 @@ class FakeRuntime:
         self._interrupt = True
         self.interrupt_reason = reason
 
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return None
+
     async def run_tool_call(self, invoke: Any) -> Any:
         result = invoke()
         if inspect.isawaitable(result):

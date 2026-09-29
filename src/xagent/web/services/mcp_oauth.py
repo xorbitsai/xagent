@@ -1444,6 +1444,42 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def redact_oauth_url_for_diagnostics(value: str | None) -> str | None:
+    """Strip query string, fragment, and userinfo from a user-configured OAuth URL.
+
+    Diagnostic payloads (mcp_runtime.mcp_oauth_runtime_diagnostic) surface
+    ``resource``/``issuer`` in an HTTP 400 body to any user with an active
+    association to the MCP server, not just its owner. ``resource`` in
+    particular is free text set by whoever configured the connector, and
+    commonly carries an API key or token in its query string or userinfo.
+
+    Unlike ``_canonical_url_identifier``, diagnostics must not pass through
+    values without an authority. In ``user:password@host/path``, urlsplit
+    treats the username as a scheme and leaves the password in the path.
+    Omit such ambiguous values instead of returning possible credentials.
+    Protocol-relative URLs still have an authority and can be redacted.
+    """
+    if not value:
+        return None
+    parts = urlsplit(value)
+    if not parts.netloc:
+        return None
+    hostname = (parts.hostname or "").rstrip(".").lower()
+    netloc = (
+        f"[{hostname}]"
+        if ":" in hostname and not hostname.startswith("[")
+        else hostname
+    )
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port:
+        netloc = f"{netloc}:{port}"
+    path = parts.path.rstrip("/")
+    return urlunsplit((parts.scheme.lower(), netloc, path, "", ""))
+
+
 def _canonical_resource(endpoint_url: str) -> str:
     return _canonical_url_identifier(endpoint_url)
 

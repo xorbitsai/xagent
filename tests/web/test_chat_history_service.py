@@ -22,9 +22,8 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
     DELIVERY_OUTCOME_UNKNOWN,
-    claim_user_message_delivery,
+    claim_user_message_delivery_no_commit,
     get_latest_waiting_question,
-    inspect_user_message_delivery,
     load_task_transcript,
     load_task_transcript_window,
     mark_user_message_delivery,
@@ -843,11 +842,19 @@ def test_persist_user_message_stores_attachments_for_chip_replay():
         db_session.close()
 
 
+def _claim_committed(db_session, *args, **kwargs):
+    """Stage a delivery claim and commit it, as the command path does."""
+
+    claim = claim_user_message_delivery_no_commit(db_session, *args, **kwargs)
+    db_session.commit()
+    return claim
+
+
 def test_delivery_claim_rejects_same_turn_with_different_attachments() -> None:
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
-        first = claim_user_message_delivery(
+        first = _claim_committed(
             db_session,
             int(task.id),
             int(task.user_id),
@@ -855,7 +862,7 @@ def test_delivery_claim_rejects_same_turn_with_different_attachments() -> None:
             attachments=[{"file_id": "file-a", "name": "a.pdf"}],
             turn_id="client-turn-files",
         )
-        retried = claim_user_message_delivery(
+        retried = _claim_committed(
             db_session,
             int(task.id),
             int(task.user_id),
@@ -876,7 +883,7 @@ def test_database_rejects_duplicate_user_turn_claims() -> None:
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
-        claim_user_message_delivery(
+        _claim_committed(
             db_session,
             int(task.id),
             int(task.user_id),
@@ -901,43 +908,36 @@ def test_database_rejects_duplicate_user_turn_claims() -> None:
         db_session.close()
 
 
-def test_delivery_claim_recovers_from_unique_constraint_race(monkeypatch) -> None:
+def test_delivery_claim_leaves_a_unique_constraint_race_to_the_caller(
+    monkeypatch,
+) -> None:
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
-        winner = claim_user_message_delivery(
+        winner = _claim_committed(
             db_session,
             int(task.id),
             int(task.user_id),
             "Concurrent guidance",
             turn_id="raced-turn",
         )
-        inspection_count = 0
-
-        def hide_winner_on_initial_inspection(*args, **kwargs):
-            nonlocal inspection_count
-            inspection_count += 1
-            if inspection_count == 1:
-                return None
-            return inspect_user_message_delivery(*args, **kwargs)
-
         monkeypatch.setattr(
             "xagent.web.services.chat_history_service.inspect_user_message_delivery",
-            hide_winner_on_initial_inspection,
+            lambda *args, **kwargs: None,
         )
 
-        loser = claim_user_message_delivery(
-            db_session,
-            int(task.id),
-            int(task.user_id),
-            "Concurrent guidance",
-            turn_id="raced-turn",
-        )
+        with pytest.raises(IntegrityError):
+            claim_user_message_delivery_no_commit(
+                db_session,
+                int(task.id),
+                int(task.user_id),
+                "Concurrent guidance",
+                turn_id="raced-turn",
+            )
+        db_session.rollback()
 
-        assert loser.claimed is False
-        assert loser.message.id == winner.message.id
-        assert inspection_count == 2
-        assert db_session.query(TaskChatMessage).count() == 1
+        rows = db_session.query(TaskChatMessage).all()
+        assert [row.id for row in rows] == [winner.message.id]
     finally:
         db_session.close()
 
@@ -946,7 +946,7 @@ def test_delivery_claim_surfaces_failed_handoff() -> None:
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
-        first = claim_user_message_delivery(
+        first = _claim_committed(
             db_session,
             int(task.id),
             int(task.user_id),
@@ -956,7 +956,7 @@ def test_delivery_claim_surfaces_failed_handoff() -> None:
         first.message.delivery_status = DELIVERY_FAILED
         db_session.commit()
 
-        retried = claim_user_message_delivery(
+        retried = _claim_committed(
             db_session,
             int(task.id),
             int(task.user_id),
@@ -973,7 +973,7 @@ def test_delivery_transition_does_not_regress_a_completed_turn() -> None:
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
-        claim_user_message_delivery(
+        _claim_committed(
             db_session,
             int(task.id),
             int(task.user_id),
@@ -1100,7 +1100,7 @@ def test_unknown_delivery_cannot_be_overwritten_by_task_result(later_status):
     db = _create_db_session()
     try:
         task = _create_task(db)
-        claim_user_message_delivery(
+        _claim_committed(
             db,
             int(task.id),
             int(task.user_id),

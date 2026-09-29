@@ -309,7 +309,10 @@ def test_purge_task_rows_clears_the_anchor_under_fk_enforcement(
     session = sqlite_fk_on_session
     task_id = _seed_task_with_anchored_checkpoint(session, username="u1")
 
-    assert purge_task_rows(session, task_id=task_id) is True
+    assert (
+        purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+        is True
+    )
     session.commit()
 
     assert session.query(Task).filter(Task.id == task_id).count() == 0
@@ -326,7 +329,10 @@ def test_purge_task_rows_clears_the_anchor_on_postgres(postgres_session) -> None
     session = postgres_session
     task_id = _seed_task_with_anchored_checkpoint(session, username="u1")
 
-    assert purge_task_rows(session, task_id=task_id) is True
+    assert (
+        purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+        is True
+    )
     session.commit()
 
     assert session.query(Task).filter(Task.id == task_id).count() == 0
@@ -357,7 +363,10 @@ def test_purge_task_rows_nulls_pointer_before_the_task_delete_flushes(
     task_id = _seed_task_with_anchored_checkpoint(session, username="u1")
 
     with _recorded_statements(session.get_bind()) as seen:
-        assert purge_task_rows(session, task_id=task_id) is True
+        assert (
+            purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+            is True
+        )
     _assert_pointer_nulled_before_trace_events_deleted(seen)
 
     pointer = session.execute(
@@ -389,7 +398,10 @@ def test_purge_task_rows_deletes_an_active_interaction_row_sqlite(
         session, username="u-active-single", status="active"
     )
 
-    assert purge_task_rows(session, task_id=task_id) is True
+    assert (
+        purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+        is True
+    )
     session.commit()
 
     assert session.query(Task).filter(Task.id == task_id).count() == 0
@@ -405,7 +417,10 @@ def test_purge_task_rows_deletes_an_active_interaction_row_postgres(
         session, username="u-active-single", status="active"
     )
 
-    assert purge_task_rows(session, task_id=task_id) is True
+    assert (
+        purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+        is True
+    )
     session.commit()
 
     assert session.query(Task).filter(Task.id == task_id).count() == 0
@@ -427,7 +442,10 @@ def test_purge_task_rows_deletes_a_terminal_interaction_row_sqlite(
         session, username="u-terminal-single", status="terminated"
     )
 
-    assert purge_task_rows(session, task_id=task_id) is True
+    assert (
+        purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+        is True
+    )
     session.commit()
 
     assert session.query(Task).filter(Task.id == task_id).count() == 0
@@ -443,7 +461,10 @@ def test_purge_task_rows_deletes_a_terminal_interaction_row_postgres(
         session, username="u-terminal-single", status="terminated"
     )
 
-    assert purge_task_rows(session, task_id=task_id) is True
+    assert (
+        purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+        is True
+    )
     session.commit()
 
     assert session.query(Task).filter(Task.id == task_id).count() == 0
@@ -481,7 +502,10 @@ def test_purge_task_rows_deletes_interaction_rows_before_trace_events_fk_on(
     )
 
     with _recorded_statements(session.get_bind()) as seen:
-        assert purge_task_rows(session, task_id=task_id) is True
+        assert (
+            purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+            is True
+        )
     _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
     session.commit()
 
@@ -500,7 +524,10 @@ def test_purge_task_rows_deletes_interaction_rows_before_trace_events_upgraded(
     )
 
     with _recorded_statements(session.get_bind()) as seen:
-        assert purge_task_rows(session, task_id=task_id) is True
+        assert (
+            purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+            is True
+        )
     _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
     session.commit()
 
@@ -515,7 +542,10 @@ def test_purge_task_rows_deletes_interaction_rows_before_trace_events_postgres(
     )
 
     with _recorded_statements(session.get_bind()) as seen:
-        assert purge_task_rows(session, task_id=task_id) is True
+        assert (
+            purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+            is True
+        )
     _assert_interaction_delete_between_pointer_update_and_trace_events_delete(seen)
     session.commit()
 
@@ -740,7 +770,10 @@ def test_purge_task_rows_succeeds_without_the_interaction_table_sqlite(
     assert interaction_requests_table_exists(session) is False
     task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-single")
 
-    assert purge_task_rows(session, task_id=task_id) is True
+    assert (
+        purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+        is True
+    )
     session.commit()
 
     assert session.query(Task).filter(Task.id == task_id).count() == 0
@@ -754,7 +787,10 @@ def test_purge_task_rows_succeeds_without_the_interaction_table_postgres(
     assert interaction_requests_table_exists(session) is False
     task_id = _seed_task_with_anchored_checkpoint(session, username="u-no-table-single")
 
-    assert purge_task_rows(session, task_id=task_id) is True
+    assert (
+        purge_task_rows(session, task_id=task_id, detached_reason="task_deleted")
+        is True
+    )
     session.commit()
 
     assert session.query(Task).filter(Task.id == task_id).count() == 0

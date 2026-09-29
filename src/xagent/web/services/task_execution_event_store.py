@@ -1,8 +1,4 @@
-"""Unwired event-store primitives for the conversation migration.
-
-The caller owns the transaction. Runtime integration and event-specific payload
-contracts ship in stage 3.2; no existing task producer calls this module.
-"""
+"""Transactional event-store primitives for the conversation migration."""
 
 from __future__ import annotations
 
@@ -23,6 +19,25 @@ MAX_EXECUTION_EVENT_PAGE_SIZE = 100
 
 class ExecutionEventConflict(ValueError):
     """An idempotency key was reused for a different fact."""
+
+
+def lock_task_execution_events_no_commit(db: Session, task_id: int) -> int:
+    """Serialize pre-append decisions using the same lock as event allocation."""
+    sequence = db.execute(
+        update(Task)
+        .where(Task.id == task_id)
+        .values(
+            conversation_event_sequence=Task.conversation_event_sequence,
+            # Allocating an internal cursor must not reorder the task list.
+            updated_at=Task.updated_at,
+        )
+        .returning(Task.conversation_event_sequence)
+        .execution_options(synchronize_session=False)
+    ).scalar_one_or_none()
+    if sequence is None:
+        raise ValueError(f"Task {task_id} does not exist")
+
+    return int(sequence)
 
 
 def append_task_execution_event_no_commit(
@@ -62,19 +77,7 @@ def append_task_execution_event_no_commit(
         "assistant_message_id": assistant_message_id,
         "tool_attempt_id": tool_attempt_id,
     }
-    sequence = db.execute(
-        update(Task)
-        .where(Task.id == task_id)
-        .values(
-            conversation_event_sequence=Task.conversation_event_sequence,
-            # Allocating an internal cursor must not reorder the task list.
-            updated_at=Task.updated_at,
-        )
-        .returning(Task.conversation_event_sequence)
-        .execution_options(synchronize_session=False)
-    ).scalar_one_or_none()
-    if sequence is None:
-        raise ValueError(f"Task {task_id} does not exist")
+    sequence = lock_task_execution_events_no_commit(db, task_id)
 
     existing = db.scalars(
         select(TaskExecutionEvent).where(
@@ -120,20 +123,22 @@ def load_task_execution_events(
     task_id: int,
     scope_id: str,
     after_sequence: int = 0,
+    through_sequence: int | None = None,
     limit: int = MAX_EXECUTION_EVENT_PAGE_SIZE,
 ) -> list[TaskExecutionEvent]:
-    """Read one scope in commit order; reject page sizes outside 1–100."""
+    """Read one scope in commit order, optionally through a fixed inclusive bound.
+
+    Callers building a history capture the committed task sequence once and
+    reuse it across pages. Omitting the bound preserves the live-tail query.
+    Scope-local gaps are normal because sequence allocation is task-wide.
+    """
     if not 1 <= limit <= MAX_EXECUTION_EVENT_PAGE_SIZE:
         raise ValueError(f"limit must be between 1 and {MAX_EXECUTION_EVENT_PAGE_SIZE}")
-    return list(
-        db.scalars(
-            select(TaskExecutionEvent)
-            .where(
-                TaskExecutionEvent.task_id == task_id,
-                TaskExecutionEvent.scope_id == scope_id,
-                TaskExecutionEvent.sequence > after_sequence,
-            )
-            .order_by(TaskExecutionEvent.sequence)
-            .limit(limit)
-        )
+    query = select(TaskExecutionEvent).where(
+        TaskExecutionEvent.task_id == task_id,
+        TaskExecutionEvent.scope_id == scope_id,
+        TaskExecutionEvent.sequence > after_sequence,
     )
+    if through_sequence is not None:
+        query = query.where(TaskExecutionEvent.sequence <= through_sequence)
+    return list(db.scalars(query.order_by(TaskExecutionEvent.sequence).limit(limit)))

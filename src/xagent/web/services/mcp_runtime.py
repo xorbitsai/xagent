@@ -10,7 +10,11 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ConnectorRuntimeError,
 )
-from .mcp_oauth import MCPOAuthRuntimeError, resolve_mcp_oauth_runtime_auth
+from .mcp_oauth import (
+    MCPOAuthRuntimeError,
+    redact_oauth_url_for_diagnostics,
+    resolve_mcp_oauth_runtime_auth,
+)
 from .user_oauth import normalize_user_oauth_resource_owner_key
 
 HTTP_MCP_TRANSPORTS = frozenset({"sse", "websocket", "streamable_http"})
@@ -618,16 +622,25 @@ def mcp_oauth_runtime_diagnostic(
     scope: Any | None = None,
     issuer: Any | None = None,
 ) -> dict[str, Any]:
-    """Build the common runtime diagnostic payload for MCP OAuth failures."""
+    """Build the common runtime diagnostic payload for MCP OAuth failures.
+
+    ``resource``/``issuer`` are redacted (query string + userinfo stripped)
+    before being placed here -- this dict is returned verbatim as an HTTP 400
+    body (api/mcp.py) to any user with an active association to the server,
+    not just its owner, and ``resource`` is free text that commonly carries
+    an API key or token in its query string. See issue #2239.
+    """
     return {
         "code": code,
         "message": message,
         "server_id": getattr(server, "id", None),
         "server_name": getattr(server, "name", None),
         "resource_owner_key": resource_owner_key,
-        "resource": str(resource) if resource else None,
+        "resource": redact_oauth_url_for_diagnostics(
+            str(resource) if resource else None
+        ),
         "scope": str(scope) if scope else "",
-        "issuer": str(issuer) if issuer else None,
+        "issuer": redact_oauth_url_for_diagnostics(str(issuer) if issuer else None),
     }
 
 

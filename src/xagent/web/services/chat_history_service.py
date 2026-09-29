@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -35,6 +35,10 @@ from .ops_signals import (
     CLARIFICATION_LEGACY_SUPERSEDE_FAILED,
     clear_degradation,
     register_degradation,
+)
+from .task_execution_event_writer import (
+    stage_chat_message_no_commit,
+    stage_delivery_fact_no_commit,
 )
 from .task_retention import touch_task_last_activity
 
@@ -171,67 +175,6 @@ def inspect_user_message_delivery(
     )
 
 
-def claim_user_message_delivery(
-    db: Session,
-    task_id: int,
-    user_id: int,
-    content: str,
-    *,
-    attachments: Optional[List[Dict[str, Any]]] = None,
-    turn_id: str,
-) -> UserMessageDeliveryClaim:
-    """Atomically claim a live-control turn before dispatching it.
-
-    The unique database index is the cross-worker serializer. A concurrent
-    loser rolls back its insert and returns the winner's durable row, so only
-    the claimant may inject the message into an active runtime.
-    """
-
-    existing = inspect_user_message_delivery(
-        db,
-        task_id,
-        content,
-        attachments=attachments,
-        turn_id=turn_id,
-    )
-    if existing is not None:
-        return existing
-
-    message = TaskChatMessage(
-        task_id=task_id,
-        user_id=user_id,
-        role="user",
-        content=content.strip(),
-        message_type="user_message",
-        interactions=None,
-        turn_id=turn_id,
-        delivery_status=DELIVERY_PENDING,
-        attachments=attachments,
-    )
-    db.add(message)
-    touch_task_last_activity(db, task_id)
-    try:
-        db.commit()
-        db.refresh(message)
-        return UserMessageDeliveryClaim(
-            message=message,
-            claimed=True,
-            payload_matches=True,
-        )
-    except IntegrityError:
-        db.rollback()
-        raced = inspect_user_message_delivery(
-            db,
-            task_id,
-            content,
-            attachments=attachments,
-            turn_id=turn_id,
-        )
-        if raced is None:
-            raise
-        return raced
-
-
 def claim_user_message_delivery_no_commit(
     db: Session,
     task_id: int,
@@ -241,8 +184,21 @@ def claim_user_message_delivery_no_commit(
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: str,
 ) -> UserMessageDeliveryClaim:
-    """Stage a delivery claim without committing the caller's transaction."""
+    """Stage a delivery claim without committing the caller's transaction.
 
+    The unique ``(task_id, role, turn_id)`` index rejects a second row for
+    the same turn. This helper does not recover from that: a racing insert
+    raises ``IntegrityError`` on flush or commit, and the caller rolls back
+    and re-inspects the winner. Which worker may run the turn at all is
+    decided by the task lease, not by this claim. Event-backed claims lock
+    the task before the lookup so a reused projection is not a new claimant.
+    """
+
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        lock_task_execution_events_no_commit(db, task_id)
     existing = inspect_user_message_delivery(
         db,
         task_id,
@@ -264,13 +220,13 @@ def claim_user_message_delivery_no_commit(
         delivery_status=DELIVERY_PENDING,
         attachments=attachments,
     )
+    message = stage_chat_message_no_commit(db, message)
     # Before the insert, not after it: this is the one staging path that
     # flushes, and touching afterwards would make it the only site to take
     # the task row *after* writing task_chat_messages. Every other writer in
     # the codebase takes the task row first, so the reversed order here would
     # be a lock cycle waiting for two turns on one task to interleave.
     touch_task_last_activity(db, task_id)
-    db.add(message)
     db.flush()
     return UserMessageDeliveryClaim(
         message=message,
@@ -296,6 +252,12 @@ def mark_user_message_delivery(
         DELIVERY_OUTCOME_UNKNOWN,
     }:
         raise ValueError(f"Unknown delivery status: {status}")
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        # Use the same task-before-message lock order as acceptance/finalization.
+        lock_task_execution_events_no_commit(db, task_id)
     query = db.query(TaskChatMessage).filter(
         TaskChatMessage.task_id == task_id,
         TaskChatMessage.role == "user",
@@ -325,6 +287,9 @@ def mark_user_message_delivery(
         synchronize_session=False,
     )
     if updated:
+        stage_delivery_fact_no_commit(
+            db, task_id=task_id, turn_id=turn_id, status=status
+        )
         return UserMessageDeliveryTransition(status=status, outcome="updated")
 
     # A concurrent terminal transition won after the read. Reload the durable
@@ -359,6 +324,37 @@ def mark_user_message_delivery_sync(
         )
         db.commit()
         return transition
+
+
+def withdraw_pending_user_message_delivery_sync(task_id: int, turn_id: str) -> bool:
+    """Delete a still-pending user row its claimant never injected.
+
+    For a live-control claim whose run ended before the message reached it:
+    removing the row lets the same turn id be accepted as a new turn, which
+    inserts its own row. Only a ``pending`` row is removed, in one conditional
+    DELETE, so a row another writer already settled is left alone. The caller
+    must know the message was never written into a run; a row an earlier
+    attempt may have injected is never withdrawn.
+
+    Returns whether the row was removed.
+    """
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        removed = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == turn_id,
+                TaskChatMessage.delivery_status == DELIVERY_PENDING,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return removed == 1
 
 
 def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
@@ -661,7 +657,7 @@ def persist_user_message_no_commit(
         # "attachments key was set, just empty".
         attachments=attachments,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
     touch_task_last_activity(db, task_id)
     return message
 
@@ -714,8 +710,20 @@ def persist_assistant_message_no_commit(
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
+    source_event_id: Optional[str] = None,
+    execution_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     """Stage an assistant transcript row for an atomic caller-owned commit."""
+
+    # The outbound writer holds the task lock and already recorded this fact.
+    if execution_event_id is not None:
+        existing = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.execution_event_id == execution_event_id)
+            .first()
+        )
+        if existing is not None:
+            return existing
 
     reconciled_content = (
         content
@@ -742,8 +750,13 @@ def persist_assistant_message_no_commit(
         interactions=interactions,
         turn_id=turn_id,
         attachments=None,
+        source_event_id=source_event_id,
+        execution_event_id=execution_event_id,
     )
-    db.add(message)
+    if execution_event_id is not None:
+        db.add(message)
+    else:
+        message = stage_chat_message_no_commit(db, message)
     touch_task_last_activity(db, task_id)
     return message
 
@@ -1082,7 +1095,7 @@ def _persist_message(
         # round-trips as ``[]`` rather than being coerced to ``NULL``.
         attachments=attachments,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
     touch_task_last_activity(db, task_id)
     db.commit()
     db.refresh(message)

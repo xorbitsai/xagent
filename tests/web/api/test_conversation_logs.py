@@ -4,7 +4,7 @@ import logging
 import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 from sqlalchemy import and_, column, event, exists, literal_column, select, text
@@ -27,6 +27,11 @@ from .conftest import (
     _direct_db_session,
     _register_second_user,
     client,
+)
+from .expired_task_shared import (
+    assert_task_expired,
+    insert_tombstone,
+    purge_conversation,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -908,6 +913,7 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
     # Both rows are in the timeline before the purge; the compact one is also
     # read separately into the transcript, which is why it is seeded here.
     assert len(warm.json()["trace_events"]) == 2
+    assert warm.json()["trace_events_expired_at"] is None
     assert any(
         entry.get("message_type") == "compaction" for entry in warm.json()["transcript"]
     ), (
@@ -920,6 +926,12 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
         task.status = TaskStatus.COMPLETED
         task.last_activity_at = base
         task.lease_expires_at = None
+        # The transcript was written at wall-clock time, and the assessment
+        # measures from the newest message as well as the stored anchor
+        # (#2580), so it has to be as old as the anchor it stands beside.
+        db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).update(
+            {TaskChatMessage.created_at: base}, synchronize_session=False
+        )
         db.commit()
         # Task creation stages a start command, and the eligibility predicate
         # counts a pending command as work still owed. Clearing it keeps this
@@ -946,6 +958,8 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["trace_events"] == []
+    # Empty because retention removed it, not because there never was one.
+    assert body["trace_events_expired_at"] is not None
     assert body["log"]["task_id"] == task_id
     # The conversation itself is what the shorter trace period exists to keep.
     transcript = body["transcript"]
@@ -958,6 +972,58 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
     # distinguished by ``message_type``; they carry no ``event_type`` at all,
     # so asserting on that field could never have failed.
     assert all(entry.get("message_type") != "compaction" for entry in transcript)
+
+
+def test_detail_folds_raw_memory_reason_in_historical_checkpoint() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Checkpoint Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Checkpoint REST task",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    raw_reason = "host resolver secret shard eu-3"
+
+    db = _direct_db_session()
+    try:
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                event_id="checkpoint-1",
+                event_type="system_update_general",
+                timestamp=datetime.now(timezone.utc),
+                data={
+                    "checkpoint_type": "agent_execution_checkpoint",
+                    "snapshot": {
+                        "context": {
+                            "metadata": {
+                                "memory_available": False,
+                                "memory_availability_reason": raw_reason,
+                            }
+                        }
+                    },
+                },
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+
+    assert response.status_code == 200, response.text
+    events = response.json()["trace_events"]
+    assert len(events) == 1
+    assert raw_reason not in repr(events)
+    assert (
+        events[0]["data"]["snapshot"]["context"]["metadata"][
+            "memory_availability_reason"
+        ]
+        == "unavailable"
+    )
 
 
 def test_detail_includes_delegated_agent_traces_but_not_builder_traces() -> None:
@@ -1773,3 +1839,392 @@ def test_mcp_actor_tasks_stay_out_of_conversation_logs() -> None:
 
     detail = client.get(f"/api/conversation-logs/{actor_task_id}", headers=headers)
     assert detail.status_code == 404, detail.text
+
+
+# --- Expired conversation logs (#2565) ---------------------------------------
+#
+# The purge refuses SQLite as a job, so most of these insert the tombstone the
+# purge would have left; some run ``purge_task`` itself (via
+# ``expired_task_shared.purge_conversation``) to pin the whole chain.
+# Tombstone-only ids are far above anything a test creates, so no live task
+# can hold them by accident.
+
+_UNUSED_TASK_ID = 900_000
+
+
+def _assert_not_found(response: Any) -> None:
+    # Exactly the answer for an id that never existed, so the response cannot
+    # be used to probe which ids retention expired.
+    assert response.status_code == 404, response.text
+    assert response.json() == {"detail": "Conversation log not found"}
+
+
+def test_purged_conversation_log_detail_is_expired_and_absent_from_the_list() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Expiring Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Conversation retention expires",
+        source="widget",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    listed = client.get("/api/conversation-logs", headers=admin)
+    assert listed.status_code == 200, listed.text
+    assert [log["task_id"] for log in listed.json()["logs"]] == [task_id]
+
+    now = purge_conversation(task_id)
+
+    detail = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+    assert_task_expired(detail, task_id, expired_at=now)
+
+    # Lists are deliberately unchanged: an expired task is simply gone from
+    # them, counts and agent filter options included.
+    listed = client.get("/api/conversation-logs", headers=admin)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["logs"] == []
+    assert listed.json()["source_counts"]["all"] == 0
+    assert listed.json()["agents"] == []
+
+
+def test_expired_log_detail_is_disclosed_to_the_owner_and_admins_only() -> None:
+    admin = _admin_headers()
+    owner = _register_second_user(username="expiredowner")
+    stranger = _register_second_user(username="expiredstranger")
+    task_id = _UNUSED_TASK_ID + 1
+    insert_tombstone(task_id=task_id, user_id=_user_id("expiredowner"))
+
+    assert_task_expired(
+        client.get(f"/api/conversation-logs/{task_id}", headers=owner), task_id
+    )
+    # Admins read hidden external logs across users live, so they are told
+    # about an expired one across users too.
+    assert_task_expired(
+        client.get(f"/api/conversation-logs/{task_id}", headers=admin), task_id
+    )
+    _assert_not_found(client.get(f"/api/conversation-logs/{task_id}", headers=stranger))
+
+
+@pytest.mark.parametrize(
+    ("tombstone", "reason"),
+    [
+        (
+            {"source": "external", "is_channel_plumbing": True},
+            "MCP actor/OAuth turns are channel plumbing, never a conversation log",
+        ),
+        (
+            {"source": "sdk", "is_visible": True},
+            "visible tasks are not hidden external conversation logs",
+        ),
+        (
+            {"source": "internal"},
+            "internal tasks are outside the external-source scope",
+        ),
+        (
+            {"source": None},
+            "a task without a source is outside the external-source scope",
+        ),
+        (
+            {"source": "trigger", "trigger_type": "scheduled"},
+            "a scheduled trigger task was never a Conversation Logs webhook entry",
+        ),
+        (
+            {"source": "trigger", "trigger_type": "gmail"},
+            "a Gmail trigger task was never a Conversation Logs webhook entry",
+        ),
+        (
+            {"source": "trigger", "trigger_type": None},
+            "a trigger task with no recorded trigger type cannot be told apart "
+            "from a scheduled or Gmail one",
+        ),
+    ],
+)
+def test_expired_task_outside_the_log_scope_is_not_found(
+    tombstone: dict[str, Any], reason: str
+) -> None:
+    admin = _admin_headers()
+    task_id = _UNUSED_TASK_ID + 2
+    insert_tombstone(task_id=task_id, user_id=_user_id("admin"), **tombstone)
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+
+    assert response.status_code == 404, reason
+    _assert_not_found(response)
+
+
+def test_expired_direct_and_external_sources_are_in_scope() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    for offset, source in enumerate(("sdk", "widget", "shared_link", "external")):
+        task_id = _UNUSED_TASK_ID + 10 + offset
+        insert_tombstone(task_id=task_id, user_id=admin_id, source=source)
+        assert_task_expired(
+            client.get(f"/api/conversation-logs/{task_id}", headers=admin), task_id
+        )
+
+
+def test_expired_webhook_trigger_source_is_in_scope() -> None:
+    """The stored ``trigger_type`` (#2565 follow-up) lets a webhook trigger
+    tombstone answer 410 like every other in-scope source, instead of every
+    ``trigger``-sourced tombstone falling back to 404.
+    """
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    task_id = _UNUSED_TASK_ID + 20
+    insert_tombstone(
+        task_id=task_id, user_id=admin_id, source="trigger", trigger_type="webhook"
+    )
+
+    assert_task_expired(
+        client.get(f"/api/conversation-logs/{task_id}", headers=admin), task_id
+    )
+
+
+def test_expired_webhook_trigger_conversation_log_is_reported_end_to_end() -> None:
+    """A real purge of a webhook trigger task's conversation reports 410.
+
+    Unlike ``test_expired_webhook_trigger_source_is_in_scope``, which inserts
+    a tombstone directly, this drives the actual ``purge_task`` path so the
+    trigger type it captures before nulling ``TriggerRun.task_id`` is what the
+    detail route reads back.
+    """
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Webhook Retention Agent")
+
+    def _purge(*, trigger_type: str, source_event_id: str) -> tuple[int, datetime]:
+        task_id = _create_task_row(
+            user_id=admin_id,
+            title=f"{trigger_type} trigger conversation",
+            source="trigger",
+            is_visible=False,
+            agent_id=agent_id,
+        )
+        _attach_trigger_run(
+            user_id=admin_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            trigger_type=trigger_type,
+            source_event_id=source_event_id,
+        )
+        return task_id, purge_conversation(task_id)
+
+    webhook_task_id, webhook_expired_at = _purge(
+        trigger_type="webhook", source_event_id="evt-purge-webhook"
+    )
+    webhook_detail = client.get(
+        f"/api/conversation-logs/{webhook_task_id}", headers=admin
+    )
+    assert_task_expired(webhook_detail, webhook_task_id, expired_at=webhook_expired_at)
+
+    # Cheap to pin alongside: a scheduled trigger's purged conversation stays
+    # not-found, since this page never served it live either.
+    scheduled_task_id, _ = _purge(
+        trigger_type="scheduled", source_event_id="evt-purge-scheduled"
+    )
+    _assert_not_found(
+        client.get(f"/api/conversation-logs/{scheduled_task_id}", headers=admin)
+    )
+
+
+def test_live_log_wins_over_a_tombstone_with_the_same_id() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Reused Id Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Live conversation",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    # SQLite hands a deleted id to the next insert, so a tombstone and a live
+    # task can share one; the live task is what the id means now.
+    insert_tombstone(task_id=task_id, user_id=admin_id)
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["log"]["title"] == "Live conversation"
+
+
+def test_live_task_outside_the_log_scope_stays_not_found_despite_a_tombstone() -> None:
+    """A live task the page does not serve is not an expired one.
+
+    ``find_expired_task`` yields nothing while a live row holds the id, so a
+    visible task that shares an id with a tombstone stays a plain 404.
+    """
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    task_id = _create_task_row(
+        user_id=admin_id, title="Visible task", source="sdk", is_visible=True
+    )
+    insert_tombstone(task_id=task_id, user_id=admin_id)
+
+    _assert_not_found(client.get(f"/api/conversation-logs/{task_id}", headers=admin))
+
+
+def test_tombstones_never_appear_in_the_list_or_its_counts() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Listed Agent")
+    live_id = _create_task_row(
+        user_id=admin_id,
+        title="Still here",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    insert_tombstone(task_id=_UNUSED_TASK_ID + 20, user_id=admin_id, agent_id=agent_id)
+    insert_tombstone(
+        task_id=_UNUSED_TASK_ID + 21,
+        user_id=admin_id,
+        source="widget",
+        agent_id=agent_id,
+    )
+
+    for source in ("all", "rest_api", "widget"):
+        response = client.get(
+            "/api/conversation-logs", params={"source": source}, headers=admin
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        expected = [live_id] if source in ("all", "rest_api") else []
+        assert [log["task_id"] for log in body["logs"]] == expected
+        assert body["source_counts"]["all"] == 1
+        assert body["source_counts"]["rest_api"] == 1
+        assert body["source_counts"]["widget"] == 0
+
+
+class _Cell(NamedTuple):
+    """One row of the live/tombstone parity matrix.
+
+    ``trigger_runs`` is ``(trigger_type, source_event_id)`` pairs attached in
+    order, oldest first, so the last entry is the newest ``TriggerRun``.
+    """
+
+    label: str
+    source: str | None
+    is_visible: bool
+    agent_config: dict[str, Any] | None = None
+    trigger_runs: tuple[tuple[str, str], ...] = ()
+
+
+_PARITY_CELLS = [
+    _Cell("visible_sdk", "sdk", True),
+    _Cell("hidden_sdk", "sdk", False),
+    _Cell("hidden_widget", "widget", False),
+    _Cell("hidden_shared_link", "shared_link", False),
+    _Cell("hidden_internal", "internal", False),
+    _Cell("hidden_no_source", None, False),
+    _Cell(
+        "external_mcp_true",
+        "external",
+        False,
+        agent_config={MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: True},
+    ),
+    _Cell(
+        "external_mcp_false",
+        "external",
+        False,
+        agent_config={MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: False},
+    ),
+    _Cell("external_mcp_absent", "external", False),
+    _Cell(
+        "trigger_webhook_run",
+        "trigger",
+        False,
+        trigger_runs=(("webhook", "evt-matrix-webhook"),),
+    ),
+    _Cell(
+        "trigger_scheduled_run",
+        "trigger",
+        False,
+        trigger_runs=(("scheduled", "evt-matrix-scheduled"),),
+    ),
+    _Cell(
+        "trigger_gmail_run",
+        "trigger",
+        False,
+        trigger_runs=(("gmail", "evt-matrix-gmail"),),
+    ),
+    _Cell("trigger_no_run_no_config", "trigger", False),
+    _Cell(
+        "trigger_config_scheduled_run_webhook",
+        "trigger",
+        False,
+        agent_config={"trigger_type": "scheduled"},
+        trigger_runs=(("webhook", "evt-matrix-config-wins"),),
+    ),
+    _Cell(
+        "trigger_two_runs_newest_wins",
+        "trigger",
+        False,
+        trigger_runs=(
+            ("webhook", "evt-matrix-older"),
+            ("scheduled", "evt-matrix-newer"),
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "cell", _PARITY_CELLS, ids=[cell.label for cell in _PARITY_CELLS]
+)
+def test_live_and_tombstone_predicates_agree(cell: _Cell) -> None:
+    """Matrix over task shape x caller, driven by the real purge (#2565).
+
+    ``_apply_external_task_scope`` / ``_ui_source_for_task`` (the live gates)
+    and ``_tombstone_in_external_task_scope`` / ``_tombstone_has_ui_source``
+    (their tombstone mirrors) are two separate implementations of the same
+    predicate. This checks agreement, not a hardcoded expectation per cell:
+    for every caller, the post-purge status is 410 iff the live status was
+    200, and otherwise the exact not-found body -- so the two can never
+    silently drift apart. Whichever of the four functions changes, this test
+    must change with it.
+    """
+    admin_headers = _admin_headers()
+    owner_headers = _register_second_user(username=f"matrix-owner-{cell.label}")
+    other_headers = _register_second_user(username=f"matrix-other-{cell.label}")
+    owner_id = _user_id(f"matrix-owner-{cell.label}")
+
+    agent_id = _create_agent_row(user_id=owner_id, name=f"Matrix Agent {cell.label}")
+    task_id = _create_task_row(
+        user_id=owner_id,
+        title=f"Matrix cell {cell.label}",
+        source=cell.source,
+        is_visible=cell.is_visible,
+        agent_id=agent_id,
+        agent_config=cell.agent_config,
+    )
+    for trigger_type, source_event_id in cell.trigger_runs:
+        _attach_trigger_run(
+            user_id=owner_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            trigger_type=trigger_type,
+            source_event_id=source_event_id,
+        )
+
+    callers = {
+        "owner": owner_headers,
+        "other": other_headers,
+        "admin": admin_headers,
+    }
+    live_status: dict[str, bool] = {}
+    for name, headers in callers.items():
+        live = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+        assert live.status_code in (200, 404), f"{cell.label}/{name}: {live.text}"
+        live_status[name] = live.status_code == 200
+
+    now = purge_conversation(task_id)
+
+    for name, headers in callers.items():
+        after = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+        case = f"{cell.label}/{name}"
+        if live_status[name]:
+            assert_task_expired(after, task_id, expired_at=now)
+        else:
+            assert after.status_code == 404, f"{case}: {after.text}"
+            _assert_not_found(after)

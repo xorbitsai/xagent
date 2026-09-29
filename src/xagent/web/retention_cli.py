@@ -1,4 +1,10 @@
-"""``xagent retention`` -- read-only retention diagnostics (#2562).
+"""``xagent retention`` -- read-only retention diagnostics (#2562, #2587).
+
+``cleanup-pending`` lists the external cleanup task deletions still owe and
+that retrying will not finish: obligations that ran out of attempts, and ones
+that were never going to be retried (a force delete, an unresolvable scope).
+It is the operator's reconciliation list. Like ``preview`` it opens the
+database read-only.
 
 ``preview`` answers the question the policy decision in #2567 is blocked on:
 *if we set the retention period to N days, how much data does that actually
@@ -29,6 +35,12 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from .models.database import configure_db, get_session_local
+from .services.task_cleanup_obligations import (
+    TERMINAL_STATUSES,
+    CleanupObligationStatus,
+    count_cleanup_obligations,
+    list_cleanup_obligations,
+)
 from .services.task_retention import (
     count_quiescent_tasks,
     count_retention_candidate_trace_events,
@@ -134,6 +146,77 @@ def run_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+#: ``last_error`` is shortened in the table; the full text is in the row.
+_ERROR_COLUMN_WIDTH = 100
+
+
+def add_cleanup_pending_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Also list obligations the retry driver is still working on.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        metavar="N",
+        help="List at most N obligations, oldest first. Default: 200.",
+    )
+    parser.add_argument(
+        "--database-url",
+        dest="database_url",
+        help="Override the database to inspect. Defaults to the configured one.",
+    )
+
+
+def run_cleanup_pending(args: argparse.Namespace) -> int:
+    if args.limit < 1:
+        print("--limit must be at least 1.", file=sys.stderr)
+        return 2
+    configure_db(args.database_url, read_only=True)
+    sessions = get_session_local()
+    with sessions() as db:
+        counts = count_cleanup_obligations(db)
+        listed = list_cleanup_obligations(
+            db,
+            statuses=None if args.all else TERMINAL_STATUSES,
+            limit=args.limit,
+        )
+
+    reconcile = sum(counts[status] for status in TERMINAL_STATUSES)
+    print(
+        f"{counts[CleanupObligationStatus.PENDING]} pending retry; "
+        f"{reconcile} need reconciliation "
+        f"({counts[CleanupObligationStatus.EXHAUSTED]} exhausted, "
+        f"{counts[CleanupObligationStatus.ABANDONED]} abandoned)."
+    )
+    if not listed:
+        return 0
+    rows: list[tuple[str, ...]] = [
+        ("id", "task", "owner", "kind", "key", "status", "attempts", "last error")
+    ]
+    for obligation in listed:
+        error = (obligation.last_error or "").replace("\n", " ")
+        if len(error) > _ERROR_COLUMN_WIDTH:
+            error = error[: _ERROR_COLUMN_WIDTH - 3] + "..."
+        rows.append(
+            (
+                str(obligation.id),
+                str(obligation.task_id),
+                str(obligation.owner_id) if obligation.owner_id is not None else "-",
+                obligation.kind.value,
+                obligation.key or "-",
+                obligation.status.value,
+                str(obligation.attempts),
+                error,
+            )
+        )
+    print()
+    print(_format_table(rows))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     parser = argparse.ArgumentParser(
@@ -145,6 +228,8 @@ Examples:
     xagent retention preview                          # compare 90/180/365 days
     xagent retention preview --days 30                # a single candidate
     xagent retention preview --days 90 --days 365     # compare two
+    xagent retention cleanup-pending                  # reconciliation list
+    xagent retention cleanup-pending --all            # include pending retries
         """,
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -153,8 +238,15 @@ Examples:
         help="Report how many tasks and traces a retention period would expire.",
     )
     add_preview_arguments(preview)
+    cleanup_pending = subcommands.add_parser(
+        "cleanup-pending",
+        help="List the task cleanup that retrying will not finish.",
+    )
+    add_cleanup_pending_arguments(cleanup_pending)
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
     if args.command == "preview":
         return run_preview(args)
+    if args.command == "cleanup-pending":
+        return run_cleanup_pending(args)
     parser.error(f"unknown command: {args.command}")
     return 2

@@ -25,6 +25,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointReadError,
     CheckpointUnavailableError,
+    UnknownToolEffectError,
 )
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.web.api import a2a as a2a_api
@@ -715,6 +716,10 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     assert response.status_code == 200, response.text
     assert response.json()["task"]["contextId"] == "ctx-follow-up"
     assert response.json()["task"]["status"]["state"] == "TASK_STATE_WORKING"
+    assert (
+        agent_manager.get_agent_for_task.await_args.kwargs["connector_runtime_turn_id"]
+        == f"a2a:{task_id}:msg-follow-up"
+    )
     agent_service.post_user_message.assert_awaited_once_with(
         task_id,
         execution_message="follow up",
@@ -1411,7 +1416,9 @@ async def test_untagged_checkpoint_is_not_resumed_without_an_exact_run() -> None
         db.refresh(task)
         task_id = int(task.id)
 
-        async def post_user_message(*_args: object, **_kwargs: object) -> bool:
+        async def post_user_message(
+            *_args: object, **_kwargs: object
+        ) -> UserMessageInjectionOutcome:
             lease = current_task_lease()
             assert lease is not None
             assert lease.task_id == task_id
@@ -1423,7 +1430,7 @@ async def test_untagged_checkpoint_is_not_resumed_without_an_exact_run() -> None
                 assert leased.last_checkpoint_event_id is None
             finally:
                 verify_db.close()
-            return False
+            return UserMessageInjectionOutcome.NOT_POSTED
 
         agent_service = MagicMock()
         agent_service.post_user_message = AsyncMock(side_effect=post_user_message)
@@ -1536,7 +1543,9 @@ def test_failed_follow_up_restores_input_required_status() -> None:
         db.close()
 
     agent_service = MagicMock()
-    agent_service.post_user_message = AsyncMock(return_value=False)
+    agent_service.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.NOT_POSTED
+    )
     agent_manager = MagicMock()
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
     with (
@@ -1610,7 +1619,9 @@ def test_failed_follow_up_leaves_a_still_active_question_and_marker_untouched() 
         db.close()
 
     agent_service = MagicMock()
-    agent_service.post_user_message = AsyncMock(return_value=False)
+    agent_service.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.NOT_POSTED
+    )
     agent_manager = MagicMock()
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
     with patch(
@@ -1717,7 +1728,8 @@ def test_prelease_restore_from_a_cancelled_acquisition_leaves_marker_untouched()
         db.close()
 
 
-def test_checkpoint_resume_exception_restores_input_required_status() -> None:
+@pytest.mark.parametrize("after_write", [False, True])
+def test_injection_exception_classification_uses_actual_acceptance(after_write) -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()
     try:
@@ -1739,14 +1751,51 @@ def test_checkpoint_resume_exception_restores_input_required_status() -> None:
         db.close()
 
     agent_service = MagicMock()
-    agent_service.post_user_message = AsyncMock(
-        side_effect=RuntimeError("checkpoint callback failed")
+    from types import SimpleNamespace
+
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.runner import AgentRunner
+
+    manager = ContextManager()
+    manager.remove_context(str(task_id))
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(
+            return_value={
+                "context": {"execution_id": str(task_id), "created_at": "invalid-time"}
+            }
+        ),
+        checkpoint=AsyncMock(),
     )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+
+    if after_write:
+        from xagent.core.agent.registry import ExecutionRegistry
+
+        manager.create_context(str(task_id)).add_user_message("original")
+        tracer.load_latest_checkpoint.return_value = None
+        registry = ExecutionRegistry()
+        registry.register(str(task_id), runner)
+        token = registry.subscribe(lambda _: registry.unsubscribe(token))
+
+    async def inject(execution_id, **kwargs):
+        if after_write:
+            return (await registry.post_user_message(execution_id, **kwargs)).outcome
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    agent_service.post_user_message = AsyncMock(side_effect=inject)
     agent_manager = MagicMock()
     agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
-    with patch(
-        "xagent.web.services.agent_service_manager.get_agent_manager",
-        return_value=agent_manager,
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_a2a_resume",
+            new=AsyncMock(),
+        ) as schedule,
     ):
         response = client.post(
             f"/api/a2a/agents/{agent_id}/message:send",
@@ -1762,7 +1811,11 @@ def test_checkpoint_resume_exception_restores_input_required_status() -> None:
             },
         )
 
-    assert response.status_code == 500
+    # A registry error after the durable write cannot undo acceptance: the
+    # reply is scheduled as accepted, never reported unknown or paused.
+    assert response.status_code == (200 if after_write else 500), response.text
+    assert tracer.checkpoint.await_count == (1 if after_write else 0)
+    assert schedule.await_count == (1 if after_write else 0)
     agent_service.post_user_message.assert_awaited_once_with(
         str(task_id),
         execution_message="retry safely",
@@ -1774,7 +1827,13 @@ def test_checkpoint_resume_exception_restores_input_required_status() -> None:
     db = _direct_db_session()
     try:
         recovered = db.query(Task).filter(Task.id == task_id).one()
-        assert recovered.status == TaskStatus.WAITING_FOR_USER
+        if after_write:
+            # Ownership passed to the (mocked) scheduled resume.
+            assert recovered.status == TaskStatus.RUNNING
+            assert recovered.input == "retry safely"
+        else:
+            assert recovered.status == TaskStatus.WAITING_FOR_USER
+            assert recovered.runner_id is None
     finally:
         db.close()
 
@@ -1858,6 +1917,7 @@ def test_resume_lease_contention_preserves_the_a2a_error() -> None:
         (AutoModelUnavailableError("private model details"), 409),
         (CheckpointUnavailableError("checkpoint query failed"), 503),
         (CheckpointCorruptError("all matching rows undecodable"), 400),
+        (UnknownToolEffectError("unknown external effect"), 400),
         (
             CheckpointAccessRefusedError("active lease is not bound to this reader"),
             400,
@@ -3633,13 +3693,98 @@ def _seed_outcome_unknown_a2a_task(suffix: str) -> tuple[int, str, int, int]:
     return agent_id, full_key, task_id, row_id
 
 
-def test_message_send_reports_unknown_without_closing_interaction():
+def test_message_send_fenced_rejection_restores_prelease_without_resuming():
+    agent_id, full_key, task_id, row_id = _seed_outcome_unknown_a2a_task("fenced")
+    agent = MagicMock(
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.REJECTED_RETRYABLE
+        )
+    )
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_a2a_resume",
+            new=AsyncMock(),
+        ) as schedule,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "fenced-reply",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "fenced reply"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["details"][0]["reason"] == "UNSUPPORTED_OPERATION"
+    assert error["message"] == (
+        "The message was not accepted. Resend it with a new messageId."
+    )
+    assert error["details"][0]["metadata"]["retryWithNewId"] == "True"
+    assert error["details"][0]["metadata"]["accepted"] == "False"
+    agent.post_user_message.assert_awaited_once()
+    schedule.assert_not_awaited()
+    db = _direct_db_session()
+    try:
+        task = db.get(Task, task_id)
+        assert task.status == TaskStatus.PAUSED
+        assert task.runner_id is None
+        assert (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+            .status
+            == "active"
+        )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_message_send_reports_unknown_without_closing_interaction(cancelled):
     agent_id, full_key, task_id, row_id = _seed_outcome_unknown_a2a_task("protocol")
     agent = MagicMock(
         post_user_message=AsyncMock(
             return_value=UserMessageInjectionOutcome.OUTCOME_UNKNOWN
         )
     )
+    from types import SimpleNamespace
+
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.runner import AgentRunner
+
+    manager = ContextManager()
+    manager.remove_context(str(task_id))
+    context = manager.create_context(str(task_id))
+    context.add_user_message("original")
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value=None), checkpoint=AsyncMock()
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+
+    async def failed_write(**payload):
+        tracer.load_latest_checkpoint.side_effect = RuntimeError("read unavailable")
+        if cancelled:
+            raise asyncio.CancelledError()
+        raise RuntimeError("lost acknowledgement")
+
+    tracer.checkpoint.side_effect = failed_write
+
+    async def inject(execution_id, **kwargs):
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    agent.post_user_message.side_effect = inject
     with (
         patch(
             "xagent.web.services.agent_service_manager.get_agent_manager",
@@ -3665,11 +3810,14 @@ def test_message_send_reports_unknown_without_closing_interaction():
         )
     assert response.status_code == 504, response.text
     assert response.json()["error"]["details"][0]["reason"] == "REPLY_OUTCOME_UNKNOWN"
+    assert (
+        response.json()["error"]["details"][0]["metadata"]["commandId"]
+        == "unknown-reply"
+    )
     agent.post_user_message.assert_awaited_once()
     schedule.assert_not_awaited()
     db = _direct_db_session()
     try:
-        # Transitional pre-producer behavior; R1 must replace this restoration.
         assert db.get(Task, task_id).status == TaskStatus.PAUSED
         assert (
             db.query(TaskInteractionRequest)
@@ -3680,3 +3828,73 @@ def test_message_send_reports_unknown_without_closing_interaction():
         )
     finally:
         db.close()
+
+
+def test_message_send_proven_absent_write_asks_for_a_new_message_id() -> None:
+    from types import SimpleNamespace
+
+    from xagent.core.agent.context import ContextManager
+    from xagent.core.agent.runner import AgentRunner
+
+    agent_id, full_key = _create_published_agent_with_key()
+    task_id = _resume_error_task(agent_id, context_id="ctx-proven-absent")
+    manager = ContextManager()
+    manager.remove_context(str(task_id))
+    manager.create_context(str(task_id)).add_user_message("original")
+    tracer = SimpleNamespace(
+        load_latest_checkpoint=AsyncMock(return_value=None),
+        checkpoint=AsyncMock(side_effect=RuntimeError("lost write")),
+    )
+    runner = AgentRunner(
+        SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
+    )
+
+    async def inject(execution_id, **kwargs):
+        return (await runner.inject_user_message(execution_id, **kwargs)).outcome
+
+    agent_service = MagicMock(post_user_message=AsyncMock(side_effect=inject))
+    try:
+        with (
+            patch(
+                "xagent.web.services.agent_service_manager.get_agent_manager",
+                return_value=MagicMock(
+                    get_agent_for_task=AsyncMock(return_value=agent_service)
+                ),
+            ),
+            patch(
+                "xagent.web.services.task_resume._schedule_waiting_a2a_resume",
+                new=AsyncMock(),
+            ) as schedule,
+        ):
+            response = client.post(
+                f"/api/a2a/agents/{agent_id}/message:send",
+                headers=_bearer(full_key),
+                json={
+                    "message": {
+                        "messageId": "msg-proven-absent",
+                        "taskId": task_id,
+                        "role": "ROLE_USER",
+                        "parts": [{"text": "retry me"}],
+                    },
+                    "configuration": {"returnImmediately": True},
+                },
+            )
+        assert response.status_code == 400, response.text
+        error = response.json()["error"]
+        assert error["message"] == (
+            "The message was not accepted. Resend it with a new messageId."
+        )
+        metadata = error["details"][0]["metadata"]
+        assert metadata["retryWithNewId"] == "True"
+        assert metadata["accepted"] == "False"
+        assert tracer.checkpoint.await_count == 1
+        schedule.assert_not_awaited()
+        db = _direct_db_session()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            assert task.status == TaskStatus.WAITING_FOR_USER
+            assert task.runner_id is None
+        finally:
+            db.close()
+    finally:
+        manager.remove_context(str(task_id))

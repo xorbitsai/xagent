@@ -269,9 +269,10 @@ class DeepSeekLLM(OpenAICompatibleLLM):
 
     @staticmethod
     async def list_available_models(
-        api_key: str, base_url: Optional[str] = None
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
-        _ = api_key, base_url
+        # A code-owned list: there is no read that could fail.
+        _ = api_key, base_url, raise_on_error
         return [
             {
                 "id": "deepseek-flash",

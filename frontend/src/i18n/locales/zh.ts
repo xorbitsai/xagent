@@ -1,6 +1,7 @@
 const zh = {
   sharedStream: { interrupted: "实时更新已中断，当前显示的回答可能不完整；已保存的完整结果可用后会自动同步。" },
   clientErrors: {
+    executionQueueFull: "团队执行队列已满，请稍后重试。",
     messageProcessingFailed: "消息处理失败，请重试。",
     taskExecutionFailed: "任务执行失败。",
     guidanceInProgress: "上一条指导消息仍在处理中，请等待处理完成。",
@@ -147,6 +148,10 @@ const zh = {
       filteredTitle: "没有匹配的日志",
       detail: "选择一条会话日志查看对话记录。",
       transcript: "这条会话还没有记录到对话内容。",
+    },
+    expired: {
+      detail: "根据数据保留策略，这条会话已于 {date} 过期。",
+      traceEvents: "根据数据保留策略，{date} 之前的执行步骤已被移除。",
     },
   },
   home: {
@@ -4213,7 +4218,8 @@ const zh = {
       source: "来源",
       task: "任务",
       created: "创建时间",
-      empty: "还没有运行记录"
+      empty: "还没有运行记录",
+      taskExpired: "会话已于 {date} 过期"
     },
     validation: {
       name: "Trigger 名称不能为空",
@@ -4598,6 +4604,7 @@ const zh = {
       untitled: "运行 #{id}",
       previewBadge: "预览",
       taskDeleted: "会话不可用",
+      taskExpired: "会话已于 {date} 过期",
       status: {
         pending: "等待中",
         running: "运行中",
@@ -4942,6 +4949,11 @@ const zh = {
   connectorRuntime: {
     title: "这个连接器还需要一些信息",
     description: "上一条消息没能运行，因为它用到的一个连接器缺少必要的输入。",
+    sessionOpenDescription: "这个会话用到的连接器还缺一些必填信息。补上后再发下一条消息。",
+    sessionOpenNotFillable: "这个会话用到的连接器还缺一些必填信息。",
+    firstGateDescription: "你的消息还没有发送：它用到的一个连接器缺少必要的输入。补上并保存后就会发送这条消息；关闭这个窗口，这条消息就不会发送，已附加的文件仍保留在这个会话里。",
+    firstGateReadyDescription: "你的消息还没有发送，这里也没有可以再填写的内容了。现在发送，或者关闭这个窗口，不发送这条消息，已附加的文件仍保留在这个会话里。",
+    firstGateCleared: "第一条消息没有发送：在补齐连接器所需信息之前，这个新会话已被关闭。",
     metTitle: "这个连接器需要的信息都齐了",
     metNotResent: "这个连接器现在不缺任何输入了。刚才失败的那条消息没有被重新发送；想让它运行，请在输入框里再发一次。",
     metNothingLeft: "这个连接器需要的信息都已保存。",
@@ -4958,6 +4970,7 @@ const zh = {
     savedNotResentIncomplete: "值已保存，但这条消息没有重发：这个连接器还缺别的输入。",
     savedNotResentSuperseded: "值已保存，但这条消息没有重发：重发之前，另一次失败把这个弹窗重新指向了别的请求。",
     savedNotResentUnmounted: "值已保存，但这条消息没有重发：重发之前，这个弹窗已经关闭。",
+    savedNotSent: "值已保存，但消息还没有发送：这个连接器还缺别的输入。",
     resendSupersededSent: "消息已经发出，但这个弹窗已经转向了新的请求，请不要再次重发。",
     stillMissingAfterSave: "保存后这个连接器仍然不可用，还缺 {keys}。",
     sendFailed: "值已保存，但消息没有发出去。",
@@ -4967,6 +4980,8 @@ const zh = {
     actions: {
       saveAndResend: "保存并重发该消息",
       saveOnly: "仅保存",
+      saveAndSend: "保存并发送",
+      sendHeld: "发送消息",
       acknowledge: "知道了",
       retry: "重试",
       resend: "重新发送",

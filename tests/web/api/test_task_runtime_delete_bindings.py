@@ -406,6 +406,7 @@ async def test_admin_user_delete_ignores_providers_no_task_bound_to(
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": False,
+            "external_cleanup_pending": False,
         }
         assert broken.deleted_task_ids == []
         assert db.query(User).filter(User.id == target_id).count() == 0

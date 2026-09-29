@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -230,8 +231,10 @@ class ZhipuLLM(BaseLLM):
             logger.debug("Making Zhipu API call...")
 
             try:
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
+                # asyncio.to_thread runs the SDK call in a copy of the caller's
+                # context, so context variables (log-scoping state among them)
+                # reach the SDK thread.
+                response = await asyncio.to_thread(
                     lambda: self._client.chat.completions.create(**completion_params),  # type: ignore
                 )
                 logger.debug(
@@ -594,8 +597,12 @@ class ZhipuLLM(BaseLLM):
 
                         loop.call_soon_threadsafe(put_exception)
 
-            # Start the producer thread
-            producer_task = loop.run_in_executor(None, stream_producer)
+            # Start the producer thread. The SDK runs there, so it gets the
+            # caller's context (as asyncio.to_thread would give it): context
+            # variables such as log-scoping state apply to its records too.
+            producer_task = loop.run_in_executor(
+                None, contextvars.copy_context().run, stream_producer
+            )
 
             # Consume chunks from the queue as they arrive (true streaming)
             while True:
@@ -884,8 +891,10 @@ class ZhipuLLM(BaseLLM):
             logger.debug("Making Zhipu Vision API call...")
 
             try:
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
+                # asyncio.to_thread runs the SDK call in a copy of the caller's
+                # context, so context variables (log-scoping state among them)
+                # reach the SDK thread.
+                response = await asyncio.to_thread(
                     lambda: self._client.chat.completions.create(**completion_params),  # type: ignore
                 )
                 logger.debug(
@@ -1077,7 +1086,7 @@ class ZhipuLLM(BaseLLM):
 
     @staticmethod
     async def list_available_models(
-        api_key: str, base_url: Optional[str] = None
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
         """Fetch available models from Zhipu AI using their SDK.
 
@@ -1086,6 +1095,8 @@ class ZhipuLLM(BaseLLM):
             base_url: Base URL for Zhipu API (optional).
                 - If not provided, uses official Zhipu API: https://open.bigmodel.cn/v1
                 - If provided, uses the specified endpoint
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
 
         Returns:
             List of available models with their information
@@ -1176,4 +1187,6 @@ class ZhipuLLM(BaseLLM):
             raise
         except Exception as e:
             logger.error(f"Failed to fetch Zhipu models: {e}")
+            if raise_on_error:
+                raise
             return []

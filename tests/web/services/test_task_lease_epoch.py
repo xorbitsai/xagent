@@ -29,6 +29,22 @@ def lease_database(engine, task_id, monkeypatch):
     return factory, task_id
 
 
+def test_failed_release_rolls_back_work_staged_with_it(lease_database):
+    factory, tid = lease_database
+    with factory() as db:
+        old = leases.acquire_task_lease(db, tid, runner_id="worker", new_run=True)
+        leases.acquire_task_lease(
+            db, tid, runner_id="worker", expected_run_id=old.run_id
+        )
+        before = db.get(Task, tid).title
+    with factory() as db:
+        db.get(Task, tid).title = "staged by a superseded holder"
+        db.flush()
+        assert not leases.release_task_lease(db, old, status=TaskStatus.PAUSED)
+    with factory() as db:
+        assert db.get(Task, tid).title == before
+
+
 @pytest.mark.parametrize("change", ["none", "state_version", "expired", "waiting"])
 def test_valid_renewal_and_settlement_survive_epoch_check(lease_database, change):
     factory, tid = lease_database

@@ -46,6 +46,35 @@ class ChatModelConfig(ModelConfig):
     router_config_name: Optional[str] = None
     router_candidate_models: Optional[List[str]] = None
     router_fallback_model: Optional[str] = None
+    # Runtime-only, and deliberately narrow: not a general "no ambient
+    # credentials" switch. When set, ``create_base_llm`` refuses a missing or
+    # placeholder ``api_key`` (which adapters would otherwise replace from the
+    # process environment) and Auto models, and the Azure adapter never sends
+    # an Entra token from ``AZURE_OPENAI_AD_TOKEN``. Only ``create_base_llm``
+    # reads the flag: the LangChain factory (``chat/langchain.py``) ignores
+    # it, Entra token included. An adapter that can add another ambient
+    # credential must honor the flag the same way. Nothing else is enforced:
+    # adapters and provider SDKs still read other settings from the
+    # environment, for example
+    # - ``ANTHROPIC_AUTH_TOKEN``: older anthropic releases (0.84 among them)
+    #   send it as a Bearer token next to the key;
+    # - ``OPENAI_CUSTOM_HEADERS``/``ANTHROPIC_CUSTOM_HEADERS``: newer releases
+    #   send them on every request, auth headers included;
+    # - endpoints whenever no ``base_url`` reaches the client: ``*_BASE_URL``
+    #   variables such as ``OPENAI_BASE_URL`` (also for the official OpenAI
+    #   URL, which the adapter passes as None), ``ANTHROPIC_BASE_URL``,
+    #   ``GOOGLE_GEMINI_BASE_URL``, ``ZHIPU_BASE_URL``, ``ZAI_BASE_URL``,
+    #   ``DEEPSEEK_BASE_URL`` and ``DASHSCOPE_BASE_URL``, and Azure's
+    #   ``AZURE_OPENAI_ENDPOINT``/``OPENAI_API_BASE``;
+    # - ``GOOGLE_GENAI_USE_VERTEXAI`` (sends Gemini requests to Vertex AI),
+    #   Azure's ``OPENAI_API_VERSION``, and ``OPENAI_ORG_ID``/
+    #   ``OPENAI_PROJECT_ID``.
+    # A host keeps these out of the process that runs caller keys.
+    # Hosts running configurations owned by someone other than the deployment
+    # (for example a model a user configured with their own key) set this;
+    # deployment-owned models keep the default and their environment-based
+    # credentials.
+    explicit_credentials_only: bool = False
 
 
 class ImageModelConfig(ModelConfig):

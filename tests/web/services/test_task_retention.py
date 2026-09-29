@@ -332,6 +332,82 @@ def test_null_anchor_falls_back_to_created_at(sessions):
         assert assessment.anchor == NOW - timedelta(days=400)
 
 
+def _insert_unanchored_message(
+    db: Session, *, task_id: int, user_id: int, created_at: datetime
+) -> None:
+    """Persist a transcript row the way a pre-#2571 binary does.
+
+    Deliberately not through ``chat_history_service``: those paths call
+    ``touch_task_last_activity``, and the writer this models is one that does
+    not know the column exists (#2580).
+    """
+    db.add(
+        TaskChatMessage(
+            task_id=task_id,
+            user_id=user_id,
+            role="user",
+            content="written by a binary that never touches the anchor",
+            message_type="text",
+            created_at=created_at,
+        )
+    )
+    db.flush()
+
+
+@pytest.mark.parametrize(
+    ("stored_days", "message_days", "expected_days", "expected"),
+    [
+        pytest.param(
+            400, 10, 10, RetentionDisposition.NOT_ELIGIBLE, id="stale-anchor-retained"
+        ),
+        pytest.param(
+            400, 200, 200, RetentionDisposition.TRACE_EXPIRED, id="stale-downgraded"
+        ),
+        pytest.param(
+            None, 10, 10, RetentionDisposition.NOT_ELIGIBLE, id="null-anchor-retained"
+        ),
+        pytest.param(
+            10, 400, 10, RetentionDisposition.NOT_ELIGIBLE, id="older-message-ignored"
+        ),
+    ],
+)
+def test_assessment_anchor_follows_a_message_the_stored_anchor_missed(
+    sessions, stored_days, message_days, expected_days, expected
+):
+    """The locked assessment measures from the newest message, not the column.
+
+    A writer that never touches ``last_activity_at`` -- an old binary during a
+    rolling deploy, or after a rollback past #2571 -- leaves the stored anchor
+    behind the transcript. Reading only the column would make that
+    conversation look older than it is and expire it early (#2580). The
+    ``older-message-ignored`` case pins the other direction: a message older
+    than the stored anchor must not pull it back.
+    """
+    with sessions() as db:
+        user_id = _make_user(db)
+        stored = None if stored_days is None else NOW - timedelta(days=stored_days)
+        task_id = _make_task(
+            db,
+            user_id=user_id,
+            anchor=stored,
+            created_at=NOW - timedelta(days=500),
+        )
+        _insert_unanchored_message(
+            db,
+            task_id=task_id,
+            user_id=user_id,
+            created_at=NOW - timedelta(days=message_days),
+        )
+        db.commit()
+
+        assessment = _assess(db, task_id)
+        assert assessment.disposition is expected
+        assert assessment.anchor == NOW - timedelta(days=expected_days)
+        db.expire_all()
+        # The fix reads the transcript; it does not repair the column.
+        assert _as_utc(db.get(Task, task_id).last_activity_at) == stored
+
+
 # --------------------------------------------------------------------------
 # The predicate
 # --------------------------------------------------------------------------

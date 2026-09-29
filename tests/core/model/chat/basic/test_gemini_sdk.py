@@ -1,5 +1,6 @@
 """Test cases for Gemini LLM implementation using official SDK."""
 
+from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import MagicMock
 
@@ -222,6 +223,130 @@ class TestGeminiLLMSDK:
             '{"prompt": "Modern Humanistic Conceptual Illustration", '
             '"aspect_ratio": "16:9"}'
         )
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_tool_call_end_chunk_reports_tool_calls(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """The trailing END chunk must not overwrite a tool-call finish reason."""
+        mock_client = MagicMock()
+
+        def make_function_call_chunk(name: str, args: dict[str, Any]) -> MagicMock:
+            mock_chunk = MagicMock()
+            mock_candidate = MagicMock()
+            mock_content = MagicMock()
+            mock_part = MagicMock()
+            mock_function_call = MagicMock()
+
+            mock_function_call.name = name
+            mock_function_call.args = args
+            mock_function_call.partial_args = []
+            mock_function_call.will_continue = None
+            mock_part.function_call = mock_function_call
+            mock_part.text = None
+            mock_content.parts = [mock_part]
+            mock_candidate.content = mock_content
+            mock_chunk.candidates = [mock_candidate]
+            mock_chunk.usage_metadata = None
+            return mock_chunk
+
+        async def mock_stream():
+            yield make_function_call_chunk("get_weather", {"location": "Boston"})
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        runtime = PatternRuntime()
+        result = await runtime.run_streaming_llm_call(
+            llm,
+            messages=[{"role": "user", "content": "What's the weather in Boston?"}],
+            tools=[],
+        )
+
+        assert result["finish_reason"] == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_end_chunk_reports_length_on_max_tokens(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """A MAX_TOKENS candidate finish reason must surface as "length"."""
+        mock_client = MagicMock()
+
+        mock_chunk = MagicMock()
+        mock_candidate = MagicMock()
+        mock_content = MagicMock()
+        mock_part = MagicMock()
+        mock_part.text = "truncated output"
+        mock_part.function_call = None
+        mock_content.parts = [mock_part]
+        mock_candidate.content = mock_content
+        mock_candidate.finish_reason = SimpleNamespace(name="MAX_TOKENS")
+        mock_chunk.candidates = [mock_candidate]
+        mock_chunk.usage_metadata = None
+
+        async def mock_stream():
+            yield mock_chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        messages = [{"role": "user", "content": "Write a long story."}]
+
+        end_chunk = None
+        async for chunk in llm.stream_chat(messages):
+            if chunk.type == ChunkType.END:
+                end_chunk = chunk
+
+        assert end_chunk is not None
+        assert end_chunk.finish_reason == "length"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_end_chunk_reports_stop_for_plain_text(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        """A plain text stream keeps the unchanged "stop" finish reason."""
+        mock_client = MagicMock()
+
+        mock_chunk = MagicMock()
+        mock_candidate = MagicMock()
+        mock_content = MagicMock()
+        mock_part = MagicMock()
+        mock_part.text = "hello there"
+        mock_part.function_call = None
+        mock_content.parts = [mock_part]
+        mock_candidate.content = mock_content
+        # Default MagicMock finish_reason: not a MAX_TOKENS string, exercises
+        # the defensive getattr/isinstance checks against a non-string value.
+        mock_chunk.candidates = [mock_candidate]
+        mock_chunk.usage_metadata = None
+
+        async def mock_stream():
+            yield mock_chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        messages = [{"role": "user", "content": "Say hello."}]
+
+        end_chunk = None
+        async for chunk in llm.stream_chat(messages):
+            if chunk.type == ChunkType.END:
+                end_chunk = chunk
+
+        assert end_chunk is not None
+        assert end_chunk.finish_reason == "stop"
 
     @pytest.mark.asyncio
     async def test_tool_calling_with_sdk(

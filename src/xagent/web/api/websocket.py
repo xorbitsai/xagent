@@ -65,6 +65,7 @@ from ..models.database import (
     release_db_connection_if_clean,
 )
 from ..models.task import Task
+from ..models.task_command import TaskExecutionCommand
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services import task_command_execution as command_execution_service
@@ -76,6 +77,7 @@ from ..services.assistant_history_safety import (
 from ..services.assistant_question_replay import load_transcript_replay
 from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
+    DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
     DELIVERY_OUTCOME_UNKNOWN,
 )
@@ -1502,6 +1504,48 @@ async def handle_chat_message(
         )
 
 
+def _settled_outcome_unknown_command_matches(
+    db: Session,
+    *,
+    task_id: int,
+    command_id: str,
+    actor_user_id: int,
+    kind: TaskCommandKind,
+    payload: dict[str, Any],
+) -> bool | None:
+    """Whether a settled same-id command reported an unknown outcome.
+
+    ``None`` when no such command exists; otherwise whether the resend's
+    payload matches the original command (``False`` is an id conflict).
+    """
+
+    stored = (
+        db.query(TaskExecutionCommand.result)
+        .filter(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.command_id == command_id,
+        )
+        .first()
+    )
+    if stored is None:
+        return None
+    result = stored[0]
+    if not isinstance(result, dict) or (
+        result.get("delivery_outcome") != DELIVERY_OUTCOME_UNKNOWN
+    ):
+        return None
+    return bool(
+        existing_task_command_payload_matches(
+            db,
+            task_id=task_id,
+            command_id=command_id,
+            actor_user_id=actor_user_id,
+            kind=kind,
+            payload=payload,
+        )
+    )
+
+
 def _enqueue_websocket_task_command_sync(
     *,
     task_id: int,
@@ -1553,6 +1597,31 @@ def _enqueue_websocket_task_command_sync(
                 ),
                 turn_id=command_id,
             )
+            if (
+                existing_delivery is not None
+                and str(existing_delivery.message.delivery_status)
+                == DELIVERY_DISPATCHED
+            ):
+                # ``dispatched`` means "do not resend", not "applied": a
+                # recovered turn settled as outcome unknown is also parked
+                # there. Its command's result is the only record of that, so
+                # a same-id resend must read it rather than report success.
+                settled_unknown = _settled_outcome_unknown_command_matches(
+                    db,
+                    task_id=task_id,
+                    command_id=command_id,
+                    actor_user_id=actor_user_id,
+                    kind=kind,
+                    payload=payload,
+                )
+                if settled_unknown is not None:
+                    return EnqueuedTaskCommand(
+                        command_id=0,
+                        client_command_id=command_id,
+                        created=False,
+                        payload_matches=settled_unknown,
+                        status=DELIVERY_OUTCOME_UNKNOWN,
+                    )
             if (
                 existing_delivery is not None
                 and not existing_delivery.pending

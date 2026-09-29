@@ -39,7 +39,11 @@ class UploadedFile(Base):  # type: ignore
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True)
+    task_id = Column(
+        Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
+    )
+    detached_reason = Column(String(32), nullable=True)
+    detached_at = Column(DateTime(timezone=True), nullable=True)
     # Index is created by migration 20260410_add_index_on_uploaded_files_filename.py
     # to ensure existing databases have the index for URL deduplication queries.
     filename = Column(String(512), nullable=False)

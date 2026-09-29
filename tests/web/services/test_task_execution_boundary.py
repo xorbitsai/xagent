@@ -37,6 +37,11 @@ def test_execution_services_and_tracer_load_without_api_routes() -> None:
                 with patch.object(task_execution, "create_terminal_task_error_event", return_value=event):
                     asyncio.run(_broadcast_external_cancel_terminal_event(1))
                 sink.assert_awaited_once_with(event, 1)
+                from xagent.web.models.database import configure_db, get_engine, Base
+                import tempfile
+                database_directory = tempfile.TemporaryDirectory()
+                configure_db(f"sqlite:///{database_directory.name}/tasks.db")
+                Base.metadata.create_all(get_engine())
                 from xagent.web.tracing import create_task_tracer
                 create_task_tracer(1, user_id=1)
                 """
@@ -301,8 +306,10 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
             from xagent.web.services import task_execution, task_resume
             from xagent.web.services.task_orchestrator import TaskTurnOrchestrator, TurnKind
             from xagent.web.services.task_lease_service import (
-                stop_task_lease_heartbeat, release_task_lease_no_commit,
+                TaskLease, get_runner_id, stop_task_lease_heartbeat,
+                release_task_lease_no_commit,
             )
+            from xagent.web.services import task_command_execution
 
 
             async def main():
@@ -333,6 +340,13 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                             )
                             for kind in ["message", "pause", "resume", "cancel"]
                         ]
+                        # Pause is fenced on the acquisition driving the
+                        # local run, so the paused row needs one.
+                        tasks[1].runner_id = get_runner_id()
+                        tasks[1].lease_attempt_id = "pause-attempt"
+                        tasks[1].lease_expires_at = datetime.now(timezone.utc) + timedelta(
+                            minutes=5
+                        )
                         tasks[2].runner_id = "other-runner"
                         tasks[2].lease_expires_at = datetime.now(timezone.utc) + timedelta(
                             minutes=5
@@ -356,7 +370,17 @@ def test_control_and_reply_commands_execute_without_api_routes() -> None:
                         db.commit()
                     agent = AsyncMock()
                     agent.pause_execution.return_value = True
-                    with patch.object(agent_service_manager, "get_agent_manager") as manager:
+                    pause_lease = TaskLease(
+                        task_id=ids[1],
+                        runner_id=get_runner_id(),
+                        run_id="pause",
+                        attempt_id="pause-attempt",
+                    )
+                    with patch.object(agent_service_manager, "get_agent_manager") as manager, patch.object(
+                        task_command_execution,
+                        "local_task_lease_holders",
+                        lambda task_id, run_id: (pause_lease,) if task_id == ids[1] else (),
+                    ):
                         manager.return_value.get_agent_for_task = AsyncMock(return_value=agent)
                         control_kinds = (kind for kind in TaskCommandKind if kind not in (TaskCommandKind.START, TaskCommandKind.RESUME_INPUT))
                         for index, kind in enumerate(control_kinds):

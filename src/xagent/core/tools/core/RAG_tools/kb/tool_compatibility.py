@@ -15,8 +15,6 @@ from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from ......web.tools.config import WebToolConfig
-    from ....adapters.vibe.base import AbstractBaseTool
     from ....adapters.vibe.config import BaseToolConfig
     from ....adapters.vibe.document_search import (
         KnowledgeSearchTool,
@@ -35,7 +33,7 @@ if TYPE_CHECKING:
 class KBToolCompatibilityFacade:
     """Compatibility boundary for KB-facing agent and tool surfaces.
 
-    Tool modules keep their historical imports, factories, names, schemas, and
+    Tool modules keep their historical imports, names, schemas, and
     sync/async behavior while this facade routes their KB semantics through the
     coordinator-owned management, pipeline, and storage boundaries.
     """
@@ -199,22 +197,6 @@ class KBToolCompatibilityFacade:
                 user_id=user_id,
                 is_admin=is_admin,
             )
-
-    async def create_file_ingestion_tools(
-        self,
-        config: WebToolConfig,
-    ) -> list[AbstractBaseTool]:
-        from ....adapters.vibe import file_ingestion_tool
-
-        return await file_ingestion_tool._create_file_ingestion_tools_impl(config)
-
-    async def create_web_ingestion_tools(
-        self,
-        config: WebToolConfig,
-    ) -> list[AbstractBaseTool]:
-        from ....adapters.vibe import web_ingestion_tool
-
-        return await web_ingestion_tool._create_web_ingestion_tools_impl(config)
 
     async def prepare_agent_collection(
         self,

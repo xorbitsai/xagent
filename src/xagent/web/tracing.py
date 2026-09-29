@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from ..core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
+from ..core.agent.checkpoint import (
+    READABLE_CHECKPOINT_TYPES,
+    ExecutionEventPersistenceError,
+)
 from ..core.agent.trace import (
     BaseTraceHandler,
     ConsoleTraceHandler,
@@ -52,6 +55,141 @@ class EphemeralCheckpointTraceHandler(BaseTraceHandler):
         return dict(snapshot) if isinstance(snapshot, dict) else None
 
 
+class ExecutionEventTraceAdapter(DatabaseTraceHandler):
+    """Strict fact writer and event-backed recovery reader.
+
+    Normal observer dispatch must never write the same event a second time.
+    """
+
+    def __init__(self, task_id: int, build_id: str | None = None) -> None:
+        super().__init__(task_id, build_id=build_id)
+        self.authoritative = True
+
+    def _sync_load_latest_checkpoint(self, execution_id: str) -> Any:
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from ..core.agent.checkpoint import CheckpointUnavailableError
+        from .services.ops_signals import (
+            CHECKPOINT_LOAD_UNAVAILABLE,
+            clear_degradation,
+            register_degradation,
+        )
+
+        try:
+            result = super()._sync_load_latest_checkpoint(execution_id)
+        except SQLAlchemyError as exc:
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {self.task_id}: execution-event checkpoint read failed",
+            )
+            raise CheckpointUnavailableError(
+                "Execution-event checkpoint read could not complete"
+            ) from exc
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        return result
+
+    def _task_has_run_tagged_checkpoint(self, db: Any) -> bool:
+        from sqlalchemy import select
+
+        from .models.task_execution_event import TaskExecutionEvent
+
+        return (
+            db.scalar(
+                select(TaskExecutionEvent.id)
+                .where(
+                    TaskExecutionEvent.task_id == self.task_id,
+                    TaskExecutionEvent.scope_id == "root",
+                    TaskExecutionEvent.kind == "recovery_state",
+                    TaskExecutionEvent.run_id.is_not(None),
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
+    def _sync_load_latest_checkpoint_unguarded(
+        self, db: Any, execution_id: str, partition: Any
+    ) -> Any:
+        from .services.task_execution_event_recovery import (
+            check_recovery_owner,
+            read_event_checkpoint,
+        )
+
+        check_recovery_owner(db, self.task_id)
+        result = read_event_checkpoint(
+            db,
+            task_id=self.task_id,
+            scope_id=self.build_id or "root",
+            execution_id=execution_id,
+            run_id=partition.run_id if partition else None,
+            filter_run=partition is not None,
+        )
+        check_recovery_owner(db, self.task_id)
+        return result["snapshot"] if result is not None else None
+
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        import asyncio
+
+        from .models.database import get_session_local
+        from .services.task_execution_event_recovery import (
+            check_recovery_owner,
+            read_committed_tool_outcome,
+        )
+
+        def load() -> dict[str, Any] | None:
+            from sqlalchemy.exc import SQLAlchemyError
+
+            from ..core.agent.checkpoint import CheckpointUnavailableError
+
+            try:
+                with get_session_local()() as db:
+                    check_recovery_owner(db, self.task_id)
+                    result = read_committed_tool_outcome(
+                        db,
+                        task_id=self.task_id,
+                        scope_id=self.build_id or "root",
+                        tool_call=tool_call,
+                    )
+                    check_recovery_owner(db, self.task_id)
+                    return result
+            except SQLAlchemyError as exc:
+                raise CheckpointUnavailableError(
+                    "Committed tool outcome read could not complete"
+                ) from exc
+
+        return await asyncio.to_thread(load)
+
+    async def handle_event(self, event: CoreTraceEvent) -> None:
+        pass
+
+    async def commit_event(self, event: CoreTraceEvent) -> None:
+        required = event.require_persisted
+        event.require_persisted = True
+        try:
+            await self._save_to_database(event)
+        except Exception as exc:
+            raise ExecutionEventPersistenceError(
+                "Conversation event commit failed"
+            ) from exc
+        finally:
+            event.require_persisted = required
+
+
+def task_database_handler(
+    task_id: int, build_id: str | None = None
+) -> DatabaseTraceHandler:
+    from .models.database import get_session_local
+    from .services.task_execution_event_writer import uses_execution_events
+
+    with get_session_local()() as db:
+        canonical = uses_execution_events(db, task_id)
+    if canonical:
+        return ExecutionEventTraceAdapter(task_id, build_id=build_id)
+    return DatabaseTraceHandler(task_id, build_id=build_id)
+
+
 def create_task_tracer(
     task_id: int,
     user: Optional[User] = None,
@@ -64,10 +202,11 @@ def create_task_tracer(
     if user is not None and user.id is not None:
         resolved_user_id = int(user.id)
 
-    return create_agent_tracer(
+    database_handler = task_database_handler(task_id)
+    tracer = create_agent_tracer(
         handlers=[
             ConsoleTraceHandler(),
-            DatabaseTraceHandler(task_id),
+            database_handler,
             TaskEventTraceHandler(task_id),
         ],
         task_id=str(task_id),
@@ -81,6 +220,10 @@ def create_task_tracer(
             "is_preview": False,
         },
     )
+
+    if isinstance(database_handler, ExecutionEventTraceAdapter):
+        tracer.event_writer = database_handler.commit_event
+    return tracer
 
 
 def create_ephemeral_tracer(

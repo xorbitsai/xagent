@@ -1,10 +1,24 @@
+import copy
 import os
-from typing import Any, Optional
+import re
+from typing import Any, Mapping, Optional
 
 # When an OpenRouter or configured router model carries this name, route the
 # prompt through xrouter-llm (in-process) instead of calling a provider directly.
 AUTO_MODEL_NAME = "auto"
 ROUTER_PROVIDER = "router"
+
+# Endpoint kinds for providers' official endpoints. ``official`` resolves from
+# the registry defaults (and narrow env overrides); ``azure_resource`` is
+# constructed from a validated Azure resource name -- still an official
+# Microsoft endpoint, with no URL ever accepted as configuration input.
+ENDPOINT_KIND_OFFICIAL = "official"
+ENDPOINT_KIND_AZURE_RESOURCE = "azure_resource"
+
+# Azure resource names: 2-64 lowercase alphanumerics and hyphens, not
+# starting or ending with a hyphen (Microsoft naming rules for the resource).
+_AZURE_RESOURCE_NAME_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])$")
+AZURE_OPENAI_ENDPOINT_SUFFIX = ".openai.azure.com"
 
 _PROVIDER_ALIASES: dict[str, str] = {
     "ark": "volcengine-ark",
@@ -93,6 +107,27 @@ _CURATED_MODELS_BY_PROVIDER: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# Model ids a provider documents as its own server-side multi-model entry
+# points, so none of them names one fixed model: routers pick a (possibly
+# different) underlying model for every request, and Fusion may answer through
+# a panel of models plus an analyst model (whenever the outer model decides the
+# task warrants deliberation). Source: OpenRouter's "Routers" documentation --
+# Auto Router ``openrouter/auto`` and its ``openrouter/auto-beta`` track, the
+# Free Models Router, the Pareto Router, and Fusion ``openrouter/fusion`` with
+# its ``openrouter/fusion-flash`` preset -- checked 2026-09-25.
+_ROUTING_MODEL_IDS_BY_PROVIDER: dict[str, frozenset[str]] = {
+    "openrouter": frozenset(
+        {
+            "openrouter/auto",
+            "openrouter/auto-beta",
+            "openrouter/free",
+            "openrouter/fusion",
+            "openrouter/fusion-flash",
+            "openrouter/pareto-code",
+        }
+    ),
+}
+
 _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
     {
         "id": "openai",
@@ -123,6 +158,10 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "description": "Xinference models for local inference",
         "requires_base_url": True,
         "category": ["llm", "embedding", "image", "video", "speech", "rerank"],
+        # The server checks a key only when its authentication is enabled.
+        "credential_fields": [
+            {"name": "api_key", "label": "API key", "kind": "secret", "required": False}
+        ],
     },
     {
         "id": "elevenlabs",
@@ -145,14 +184,46 @@ _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
         "requires_base_url": True,
         "compatibility": "openai_compatible",
         "category": ["llm", "embedding"],
+        # Keeps the required default key: the OpenAI adapter fills a missing
+        # key from OPENAI_API_KEY, and recent openai SDKs refuse an empty one.
+    },
+    {
+        "id": "azure_openai",
+        "name": "Azure OpenAI",
+        "description": (
+            "Azure OpenAI Service: the endpoint is built from your resource "
+            "name on the official Microsoft domain"
+        ),
+        # The endpoint is the user's own official Azure resource endpoint,
+        # constructed from a validated resource identifier -- never a URL the
+        # caller types in, so ``requires_base_url`` stays False. Hosts still
+        # store it in ``ModelConfig.base_url``, which the chat adapters pass
+        # on as ``azure_endpoint`` (see official_endpoint_for_provider).
+        "requires_base_url": False,
+        "category": ["llm"],
+        "endpoint_kind": ENDPOINT_KIND_AZURE_RESOURCE,
+        "credential_fields": [
+            {
+                "name": "resource_name",
+                "label": "Resource name",
+                "kind": "plain",
+                "required": True,
+            },
+            {"name": "api_key", "label": "API key", "kind": "secret", "required": True},
+        ],
     },
     {
         "id": "openrouter",
         "name": "OpenRouter",
         "description": (
             "OpenRouter aggregator: reach Claude, Gemini, GPT, DeepSeek, GLM, "
-            "and more through one OpenAI-compatible key. Use model 'auto' to let "
-            "xrouter-llm pick the cheapest capable model per prompt."
+            "and more through one OpenAI-compatible key."
+        ),
+        # How to select a routing model (see is_routing_model), kept apart from
+        # the description so hosts that accept only single models can omit it.
+        "routing_hint": (
+            "Use model 'auto' to let xrouter-llm pick the cheapest capable "
+            "model per prompt."
         ),
         "requires_base_url": False,
         "compatibility": "openai_compatible",
@@ -311,6 +382,30 @@ def is_auto_router_model(provider: str, model_name: Optional[str]) -> bool:
     )
 
 
+def is_routing_model(provider: str, model_name: Optional[str]) -> bool:
+    """True when a model id selects among or combines models instead of naming one.
+
+    Covers the in-process virtual router (:func:`is_auto_router_model`) and
+    the server-side multi-model entry points a provider documents (routers
+    and Fusion). A variant suffix (``openrouter/auto:online``,
+    ``openrouter/fusion:free``) still names the same entry point. Ordinary
+    ids, including a provider's stable aliases for one model, are not
+    routing models.
+
+    The server-side ids come from a static list, so any id not on it is
+    treated as a single model -- including a router the provider adds after
+    the list was last checked. Callers that must refuse routers rely on the
+    list being kept current.
+    """
+    if is_auto_router_model(provider, model_name):
+        return True
+    routers = _ROUTING_MODEL_IDS_BY_PROVIDER.get(canonical_provider_name(provider))
+    if not routers:
+        return False
+    base_name = (model_name or "").strip().lower().split(":", 1)[0]
+    return base_name in routers
+
+
 def provider_compatibility_for_provider(provider: str) -> Optional[str]:
     provider_id = canonical_provider_name(provider)
     for provider_info in _SUPPORTED_PROVIDER_METADATA:
@@ -335,11 +430,119 @@ def provider_requires_base_url(provider: str) -> bool:
 
 
 def get_supported_provider_metadata() -> list[dict[str, Any]]:
+    """Every registered provider, with its registry default base URL added
+    when it has one.
+
+    Each entry is a deep copy, nested lists and dicts included, so callers
+    may edit what they get back (for example to localize labels) without
+    changing the registry.
+    """
     providers: list[dict[str, Any]] = []
     for provider in _SUPPORTED_PROVIDER_METADATA:
-        provider_info = dict(provider)
+        provider_info = copy.deepcopy(provider)
         default_base_url = default_base_url_for_provider(provider_info["id"])
         if default_base_url is not None:
             provider_info["default_base_url"] = default_base_url
         providers.append(provider_info)
     return providers
+
+
+def azure_resource_endpoint_for_resource_name(resource_name: str) -> str:
+    """Construct a resource's official Azure OpenAI endpoint from its name.
+
+    Callers supply only the resource identifier; the official Microsoft
+    domain is fixed here, so no URL (and no other host) can enter provider
+    configuration through this path.
+    """
+    if not isinstance(resource_name, str):
+        raise ValueError("resource_name must be a string")
+    normalized = resource_name.strip().lower()
+    if _AZURE_RESOURCE_NAME_PATTERN.fullmatch(normalized) is None:
+        raise ValueError(
+            "resource_name must be 2-64 lowercase letters, digits, or hyphens, "
+            "not starting or ending with a hyphen"
+        )
+    return f"https://{normalized}{AZURE_OPENAI_ENDPOINT_SUFFIX}"
+
+
+def provider_endpoint_kind(provider: str) -> str:
+    """The endpoint kind declared for a provider, defaulting to ``official``."""
+    provider_id = canonical_provider_name(provider)
+    for provider_info in _SUPPORTED_PROVIDER_METADATA:
+        if provider_info["id"] == provider_id:
+            kind = provider_info.get("endpoint_kind")
+            return str(kind) if kind is not None else ENDPOINT_KIND_OFFICIAL
+    return ENDPOINT_KIND_OFFICIAL
+
+
+_DEFAULT_CREDENTIAL_FIELDS: list[dict[str, Any]] = [
+    {"name": "api_key", "label": "API key", "kind": "secret", "required": True}
+]
+
+
+def provider_credential_fields(provider: str) -> list[dict[str, Any]]:
+    """The credential fields a provider declares, with the single-key default.
+
+    Each field is ``{"name", "label", "kind" ("plain" | "secret"),
+    "required"}``. Providers with more than a bare API key (for example a
+    resource identifier), or whose key is optional, declare the full list on
+    their metadata entry; every other provider, and any unregistered id,
+    gets one required API key rather than being forced through a
+    per-provider branch.
+
+    ``required: False`` means the provider's server can run without the
+    value, not that a missing value stays missing: an adapter may fill it
+    from the environment (the Xinference rerank adapter reads
+    ``XINFERENCE_API_KEY`` when the key is missing or empty).
+    """
+    provider_id = canonical_provider_name(provider)
+    for provider_info in _SUPPORTED_PROVIDER_METADATA:
+        if provider_info["id"] == provider_id:
+            fields = provider_info.get("credential_fields")
+            if fields:
+                return [dict(field) for field in fields]
+            return [dict(field) for field in _DEFAULT_CREDENTIAL_FIELDS]
+    return [dict(field) for field in _DEFAULT_CREDENTIAL_FIELDS]
+
+
+def official_endpoint_for_provider(
+    provider: str, credentials: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
+    """Resolve a provider's official endpoint for model construction.
+
+    Registry-defaulted endpoints come from :func:`resolve_base_url_for_provider`;
+    identifier-derived official endpoints (Azure resources) are constructed
+    and validated here. Raises ValueError when a declared identifier field is
+    missing or malformed, so a bad value fails before any network call.
+
+    Callers store the result in ``ModelConfig.base_url``: model construction
+    takes the endpoint from there. For Azure this is not optional even though
+    ``requires_base_url`` is False (no URL is typed in, but one is still
+    needed): the chat adapters pass ``base_url`` on as ``azure_endpoint``,
+    and when it is unset they fall back to ``AZURE_OPENAI_ENDPOINT``
+    (``AzureOpenAILLM`` also to ``OPENAI_API_BASE``) or fail to construct.
+
+    ``None`` means the registry has no endpoint to give, in one of three
+    cases a caller tells apart from the registry itself:
+
+    - a registered provider without a default (``claude``, ``gemini``): its
+      SDK resolves the endpoint, from the SDK's own base-URL environment
+      variable (such as ``ANTHROPIC_BASE_URL`` or ``GOOGLE_GEMINI_BASE_URL``)
+      when set, else its default;
+    - a provider whose metadata sets ``requires_base_url``
+      (``openai-compatible``, ``xinference``): there is no official
+      endpoint, and the base URL has to come from the caller;
+    - an unregistered id.
+
+    Providers with a scoped ``*_BASE_URL`` environment override (see
+    :func:`resolve_base_url_for_provider`) return the override when it is
+    set, so the result is the deployment's configured endpoint, not always
+    the official one. Deployments that must reach only official endpoints
+    leave those variables, and the SDKs' own base-URL variables, unset.
+    """
+    if provider_endpoint_kind(provider) == ENDPOINT_KIND_AZURE_RESOURCE:
+        resource_name = (credentials or {}).get("resource_name")
+        if resource_name is None:
+            raise ValueError("resource_name is required for this provider")
+        return azure_resource_endpoint_for_resource_name(resource_name)
+    return resolve_base_url_for_provider(provider)

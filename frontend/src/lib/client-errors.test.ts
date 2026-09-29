@@ -10,6 +10,7 @@ import {
 
 describe("client error wire contract", () => {
   it.each([
+    ["execution_queue_full", "clientErrors.executionQueueFull", "The team execution queue is full. Please retry shortly."],
     ["message_processing_failed", "clientErrors.messageProcessingFailed", "The message could not be processed. Please try again."],
     ["task_execution_failed", "clientErrors.taskExecutionFailed", "Task execution failed."],
     ["guidance_in_progress", "clientErrors.guidanceInProgress", "A previous guidance message is still being applied. Please wait for it to finish."],

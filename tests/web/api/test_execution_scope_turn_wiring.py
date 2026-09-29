@@ -972,7 +972,10 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
         }
 
     def release_resume_lease(
-        acquired_lease: object, *, error_message: str | None
+        acquired_lease: object,
+        *,
+        error_message: str | None,
+        injection_outcome_unknown: bool = False,
     ) -> None:
         assert acquired_lease is lease
         assert error_message is None
@@ -1405,6 +1408,9 @@ def _fake_acquire_with_prior_status(lease: TaskLease, prior_status: TaskStatus):
         expected_run_id_arg: str | None,
         *,
         prior_status_out: list[Any] | None = None,
+        refuse_terminal_status: bool = False,
+        run_not_resumable_out: list[bool] | None = None,
+        ended_status_out: list[Any] | None = None,
     ) -> TaskLease:
         if prior_status_out is not None:
             prior_status_out.append(prior_status)

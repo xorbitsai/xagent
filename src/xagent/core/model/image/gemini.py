@@ -27,7 +27,11 @@ from .base import (
     invalid_response_from,
     resolve_requested_size,
 )
-from .usage import record_image_usage, record_unusable_response
+from .usage import (
+    _usable_modality_token_count,
+    record_image_usage,
+    record_unusable_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +53,63 @@ def _gemini_token_usage(response_data: Any) -> Dict[str, Any]:
     )
     if not isinstance(metadata, dict):
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    return {
+    usage: Dict[str, Any] = {
         "prompt_tokens": metadata.get("promptTokenCount", 0),
         "completion_tokens": metadata.get("candidatesTokenCount", 0),
         "total_tokens": metadata.get("totalTokenCount", 0),
     }
+    split = _gemini_input_modality_split(metadata)
+    if split is not None:
+        # The OpenAI-shaped key record_image_usage already reads, so the split
+        # reaches the media row through the one shared path.
+        usage["input_tokens_details"] = {
+            "text_tokens": split[0],
+            "image_tokens": split[1],
+        }
+    return usage
+
+
+def _gemini_input_modality_split(metadata: Dict[str, Any]) -> Optional[tuple[int, int]]:
+    """``(text, image)`` prompt tokens from ``promptTokensDetails``, or ``None``.
+
+    Gemini reports the input breakdown as a list of ``ModalityTokenCount``
+    entries (``{"modality": "TEXT" | "IMAGE" | ..., "tokenCount": n}``); see
+    https://ai.google.dev/api/generate-content#UsageMetadata. A modality absent
+    from the list contributed no tokens, so a text-only prompt yields an
+    explicit image count of 0.
+
+    The split prices text and image input at different rates, so it is given
+    only when it accounts for the whole prompt; otherwise ``None`` leaves the
+    row without a split, which billing reports as unpriced input rather than
+    charging a guessed rate. That covers a missing or malformed list, an entry
+    whose count is not a whole non-negative number, a non-zero count in a
+    modality that is neither text nor image (audio, video, document,
+    unspecified: no text or image price applies to it), and a split that does
+    not sum to ``promptTokenCount``.
+    """
+    details = metadata.get("promptTokensDetails")
+    if not isinstance(details, list):
+        return None
+    prompt_tokens = _usable_modality_token_count(metadata.get("promptTokenCount"))
+    if prompt_tokens is None:
+        return None
+    text_tokens = image_tokens = 0
+    for entry in details:
+        if not isinstance(entry, dict):
+            return None
+        tokens = _usable_modality_token_count(entry.get("tokenCount"))
+        if tokens is None:
+            return None
+        modality = entry.get("modality")
+        if modality == "TEXT":
+            text_tokens += tokens
+        elif modality == "IMAGE":
+            image_tokens += tokens
+        elif tokens:
+            return None
+    if text_tokens + image_tokens != prompt_tokens:
+        return None
+    return text_tokens, image_tokens
 
 
 def _parse_size_to_gemini_config(size: str, model_name: str) -> Dict[str, str]:

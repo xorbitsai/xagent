@@ -201,8 +201,9 @@ class StoreMemoryTool:
         note = MemoryNote(
             content=content,
             category=self.category,
+            # No request text here: it is conversation content, and a note
+            # outlives the conversation it came from (#2753).
             metadata={
-                "task": self.task,
                 "kind": kind,
                 "source": STORE_MEMORY_TOOL_NAME,
             },
@@ -328,9 +329,8 @@ class UpdateMemoryTool:
     )
     args_schema = UpdateMemoryArgs
 
-    def __init__(self, *, memory_store: Any, task: str) -> None:
+    def __init__(self, *, memory_store: Any) -> None:
         self.memory_store = memory_store
-        self.task = task
 
     async def execute(self, memory_id: str, content: str) -> dict[str, Any]:
         memory_id = str(memory_id or "").strip()
@@ -359,8 +359,6 @@ class UpdateMemoryTool:
             note.content = content
             if note.metadata is None:
                 note.metadata = {}
-            if isinstance(note.metadata, dict):
-                note.metadata["updated_by_task"] = self.task
             response = self.memory_store.update(note)
         except Exception:
             logger.exception("update_memory failed")
@@ -451,7 +449,7 @@ def build_memory_tools(
     tools: list[Any] = [
         StoreMemoryTool(memory_store=memory_store, task=task, runtime=runtime),
         SearchMemoryTool(memory_store=memory_store, runtime=runtime),
-        UpdateMemoryTool(memory_store=memory_store, task=task),
+        UpdateMemoryTool(memory_store=memory_store),
         DeleteMemoryTool(memory_store=memory_store),
     ]
     if tools and context is not None and hasattr(context, "metadata"):

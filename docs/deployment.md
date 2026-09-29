@@ -2,11 +2,24 @@
 
 ## LanceDB memory compatibility
 
-The declared LanceDB dependency range is the one in `pyproject.toml`; this
-section does not restate it. CI exercises three representatives of that range:
-the declared minimum, the version pinned in `uv.lock`, and the newest minor
-tested so far. It does not claim that every intervening release is tested
-individually.
+The LanceDB dependency is bounded: `lancedb>=0.32.0,<0.38` in `pyproject.toml`.
+The bound is deliberate. Persistent memory reaches storage only through the
+admission primitives, and those depend on LanceDB table, metadata and commit
+semantics that no minor release is contracted to preserve, so an unbounded
+range would let an untested minor be installed under a runtime that fences
+memory off when it disagrees.
+
+CI exercises three representatives of that range:
+
+| Version | Why |
+| --- | --- |
+| `0.32.0` | The declared minimum. |
+| `0.33.0` | The version pinned in `uv.lock`, which is what a default install resolves to. |
+| `0.37.1` | The newest supported minor. |
+
+Those three are tested, not every intervening release. Raising the upper bound
+means testing the new minor against the admission matrix first and moving the
+`pyproject.toml` bound, the lock and this table together.
 
 ## 2026-08-11 — New public-task File Operation isolation
 
@@ -400,9 +413,27 @@ The purge that acts on the retention predicate. It starts only when a retention 
 
 The job is gated on `XAGENT_CONVERSATION_RETENTION_DAYS` / `XAGENT_TRACE_RETENTION_DAYS` (see `example.env`), and it refuses to start on anything but PostgreSQL — the row lock its eligibility check depends on is compiled away on SQLite, so an assessment there is not a deletion licence. The refusal is logged once and the loop exits; it is not retried, because configuration cannot change under a running process.
 
-**Every retention setting takes effect at process start, and only there.** `.env` is read once and nothing mutates the environment afterwards, so changing a period, the dry-run flag or the kill switch requires a restart. The kill switch exists so that stopping expiry does not mean editing the periods — not so that a running sweep can be halted from outside.
+**Every retention setting takes effect at process start, and only there.** Per-team overrides, when a deployment layer registers them, are the one exception (see the 2026-09-28 entry). `.env` is read once and nothing mutates the environment afterwards, so changing a period, the dry-run flag or the kill switch requires a restart. The kill switch exists so that stopping expiry does not mean editing the periods — not so that a running sweep can be halted from outside.
 
-Before setting a period anywhere, work through the enablement gate on the retention tracking issue — in particular `XAGENT_CONVERSATION_RETENTION_DAYS` must not be set while a mixed-version rollout can still leave `tasks.last_activity_at` behind its task's newest message, since a stale anchor expires a conversation *early*.
+Before setting a period anywhere, work through the enablement gate on the retention tracking issue.
+
+### Mixed-version rollouts and rollbacks
+
+A binary older than the `tasks.last_activity_at` migration writes transcript messages without advancing the anchor. That happens during a rolling deploy, while old workers are still running after the backfill, and for as long as a deployment runs such a binary after rolling back past it. Either way the stored anchor can end up older than the task's newest message.
+
+No drain or reconciliation step is needed for this. Before deleting anything, the purge measures each task from the later of the stored anchor and the task's newest message. It reads both under the task's row lock, and a message insert for that task waits on the lock, so a stale stored anchor cannot expire a conversation early, whichever version wrote the message.
+
+The lock covers message inserts only because `task_chat_messages.task_id` has a foreign key to `tasks.id`. Every supported initialization path creates it, but the revision that introduced the table adds it only when `tasks` already existed. Confirm it on the target database before enabling a period; the query must return one row:
+
+```sql
+SELECT conname
+FROM pg_constraint
+WHERE contype = 'f'
+  AND conrelid = 'task_chat_messages'::regclass
+  AND confrelid = 'tasks'::regclass;
+```
+
+A stale anchor still affects `xagent retention preview` and the purge's candidate scan, which read the stored value only. Both can treat such a task as older than the purge will: the preview over-counts, never under-counts, and the scan hands the purge a candidate it then keeps (`skipped_not_due`) or expires only the trace of (`purged_traces`), where the stored anchor alone would have expired the whole conversation. Because the stored anchor is not repaired, the scan keeps selecting such a task on every sweep: it goes on reporting `skipped_not_due`, or `nothing_to_purge` once its trace is gone, until its newest message itself passes the conversation period.
 
 Recommended first run: set the period together with `XAGENT_RETENTION_DRY_RUN=true`, restart, read the audit line, and only then clear the dry-run flag and restart again. A value the parser does not recognise resolves to a dry run rather than a deletion, but do not rely on that instead of checking the log line.
 
@@ -414,11 +445,11 @@ What it costs is duplicated scanning, which is why there is no advisory lock her
 
 ### Verification and monitoring
 
-`xagent retention preview --days N` reports what a period would expire without touching anything. Once the job runs, each *batch* logs one line beginning `retention purge` — a sweep that drains a backlog logs one per page, not one in total — counting `scanned`, `purged_conversations`, `purged_traces`, `skipped_busy`, `skipped_active_interaction`, `nothing_to_purge` and `failed`.
+`xagent retention preview --days N` reports what a period would expire without touching anything. Once the job runs, each *batch* logs one line beginning `retention purge` — a sweep that drains a backlog logs one per page, not one in total — counting `scanned`, `purged_conversations`, `purged_traces`, `skipped_busy`, `skipped_not_due`, `skipped_override_unresolved`, `skipped_active_interaction`, `nothing_to_purge`, `failed` and `cleanup_owed`.
 
-`scanned` is how many candidates the batch selected, not how many proved expirable — the locked assessment can still refuse any of them. `skipped_busy` covers every such refusal, which is usually a task that is genuinely not quiescent but also includes a row that vanished between the scan and the lock (normal with more than one replica) and a task with no anchor at all. `nothing_to_purge` is a trace-expiry candidate whose trace was already gone by the time the lock was taken. `failed` is a task whose own purge raised: it is logged with its id and traceback, the sweep carries on, and the task is retried on the next pass.
+`scanned` is how many candidates the batch selected, not how many proved expirable — the locked assessment can still refuse any of them. `skipped_busy` is a refusal because the task is not quiescent, which also includes a row that vanished between the scan and the lock (normal with more than one replica) and a task with no anchor at all. `skipped_not_due` is a quiescent task whose period has not elapsed under the lock: its newest message is more recent than its stored anchor, or its team's period changed after the scan. `skipped_override_unresolved` is a task whose team's period could not be resolved (see the 2026-09-28 entry). `nothing_to_purge` is a trace-expiry candidate whose trace was already gone by the time the lock was taken — either removed between the scan and the lock, or, for a task whose stored anchor lags its newest message, removed by an earlier sweep. `failed` is a task whose own purge raised: it is logged with its id and traceback, the sweep carries on, and the task is retried on the next pass.
 
-Those field names deliberately differ from the ones sketched on the tracking issue (`eligible / deleted / skipped-busy / external-pending`): `deleted` is split because the two paths delete different things and an operator needs to know which ran, `skipped_active_interaction` names the one refusal that is permanent rather than transient, and `external-pending` belongs to the external-cleanup work, which this job does not perform.
+Those field names deliberately differ from the ones sketched on the tracking issue (`eligible / deleted / skipped-busy / external-pending`): `deleted` is split because the two paths delete different things and an operator needs to know which ran, `skipped_active_interaction` names the one refusal that is permanent rather than transient, and `external-pending` became `cleanup_owed`: the external cleanup of the conversations the batch expired, which the job records for the cleanup retry driver rather than performs (see the 2026-09-25 entry below).
 
 A persistently high `skipped_busy` means the batch is dominated by tasks that are not actually quiescent. A persistently high `skipped_active_interaction` means tasks are holding interaction rows that nothing is closing, which is worth investigating on its own — the purge will keep skipping them. Any non-zero `failed` deserves the log line that accompanies it: the purge no longer stops on such a task, so the only symptom is that counter.
 
@@ -429,3 +460,366 @@ Bulk deletion pressures autovacuum and can extend replication lag. Watch `n_dead
 `XAGENT_RETENTION_ENABLED=false` followed by a restart stops the job without changing the configured periods; unsetting the periods does the same. Neither restores deleted rows — recovery from an over-broad period is a database restore, which is what makes the dry run the step worth not skipping.
 
 This change adds no migration and no index.
+
+## 2026-09-20 — Persistent memory lifecycle enablement
+
+### Deployment impact
+
+Persistent memory now admits its LanceDB storage once, at worker startup, and
+publishes a store only if that admission succeeds. Two behaviors change.
+
+The runtime reads its embedding identity from the global memory embedding
+authority alone. It no longer falls back to a user's default embedding model or
+to whichever embedding model happens to be configured in the model hub. A
+deployment with no authority configured runs persistent memory in an ephemeral
+in-process store: memory works within a worker's lifetime and is not persisted.
+
+Configuration no longer takes effect online. Changing the authority's provider,
+model, endpoint, dimension, or instruct changes the vector space; running
+workers stop serving memory and report that a restart is required. Rotating the
+credential or changing the retry budget does not change the vector space, so
+workers keep serving with their admitted credential until they restart.
+
+### Prerequisites and configuration
+
+The `global_memory_embedding_authority` table and its migration already ship.
+No new environment variable, dependency, or infrastructure requirement is
+introduced. `MEMORY_SIMILARITY_THRESHOLD` keeps its meaning.
+
+LanceDB support is unchanged: the runtime only reaches storage through the
+admission primitives, so the supported range is the one in `pyproject.toml`
+described under "LanceDB memory compatibility" above.
+
+### Deployment and migration steps
+
+1. Quiesce memory writers first. Stop every API, task-execution and chat
+   worker; do not leave a worker running against the memory LanceDB directory.
+2. Configure the global memory embedding authority if persistent memory is
+   wanted. The credential must be application- or organization-owned; a
+   personal credential is rejected at rest. Never create or change the
+   authority while any API or task worker is serving memory: a running agent
+   keeps the adapter it was built with until its next hand-off, so a live
+   change leaves a window in which the old adapter is still writing, and a
+   same-width change silently mixes two vector spaces in one table. These are
+   the same steps for a first rollout and for a later vector-space change.
+3. Deploy the same version to every API and task-execution worker and start
+   them together. Do not roll the fleet: a mixed fleet can have one worker
+   writing under a vector space another has not admitted.
+4. Confirm the state on each worker with `GET /api/memory/store-info`.
+
+Admission migrates a table at most once. The first admission of a legacy table
+(one without scope columns or without a current full-admission marker) scans
+every row and atomically overwrites the table with the validated result. That
+overwrite replaces whatever the table held when it commits, which is why the
+first upgrade, a release that bumps the validator generation, and any
+explicit repair must run with every writer quiesced.
+Once a table carries the marker, admission is read-only: every later worker
+start, respawn or retry only reads the schema and compares the stored vector
+identity with the authority, and it never stages, rewrites or overwrites the
+table. Publishing the admitted store is read-only as well: the worker opens
+the certified table as is, never creates, reshapes or backfills it, and stays
+fenced if the table no longer matches what admission certified. Ordinary
+memory writes do not remove the marker, so workers can restart while their
+siblings keep serving.
+
+### Verification and monitoring
+
+`GET /api/memory/store-info` reports `state`, `mode`, `supports_vector_search`
+and a caller-safe `detail`. The states are:
+
+| `state` | Meaning | Operator action |
+| --- | --- | --- |
+| `ready` | Admitted; memory is serving. `mode` is `vector`, or `text_only` when the stored vectors do not match the authority. | None when `mode` is `vector`. When `mode` is `text_only`, see "Serving in text_only mode" below: memory is writable but vector search is off, and restoring it is offline work. |
+| `not_configured` | No authority configured; an ephemeral store is in use. | Configure the authority, then restart every worker. |
+| `credential_unavailable` | The stored credential could not be decrypted or failed its verifier. | Re-set the authority, then restart every worker. |
+| `retryable_unavailable` | The admission lock was held, or the backend failed transiently. | Stop every API and task-execution memory writer and keep them all stopped until the retried admission has finished, then restart the fleet together. Ordinary memory writes take neither the admission nor the maintenance lock, and a table that was never fully migrated is rewritten by admission, so a retry that runs beside a live writer on such a table can overwrite a row that writer commits. Checking that no process is mid-maintenance is not enough. |
+| `restart_required` | The authority no longer describes the stored vector space, or maintenance was left incomplete. | Quiesce, re-embed offline if the existing vectors must be kept, restart every worker together. |
+| `blocked_repair` | Storage holds invalid legacy data or an incompatible schema and is fenced off. | Offline repair; see below. |
+
+Memory API routes answer `503` in every state except `ready` and
+`not_configured`, with one stable detail that does not distinguish the faults.
+`/api/memory/store-info` keeps answering `200` in every state, including when
+the database connection pool is exhausted: it then reports the last published
+state rather than failing.
+
+Tasks and chats continue to start while memory is fenced off; they run with
+memory disabled and an inert store, so nothing reads from or writes to the
+storage admission refused.
+
+Where the reason is recorded, and where it is not:
+
+* **Recorded.** The lifecycle state reaches the task's execution metadata
+  (`memory_available`, `memory_availability_reason`), which rides into the
+  tracing backend and into the execution checkpoint, and it is reported by the
+  internal `AgentService` status. That is what to read when asking why a
+  particular task ran without memory.
+* **Not recorded.** It is deliberately *not* written to the durable `Task` or
+  `TaskChatMessage` rows, and it does not appear in the `TaskInfo` or
+  task-completion payloads a caller receives. Do not query task records or
+  public task payloads for it; use the execution metadata above, or
+  `GET /api/memory/store-info` for the worker-wide state.
+
+The operator log carries the detail the API deliberately does not. Search for
+`Persistent memory` at `WARNING` and `ERROR`; each non-ready state logs the
+specific quiescence and repair steps for that state.
+
+### Serving in text_only mode
+
+`state` is `ready` and `mode` is `text_only` when admission found the stored
+vectors were written under a different embedding identity than the authority
+now describes. This is a degraded but stable serving state, not a fault, and it
+is not the same as "memory works normally":
+
+* Memory is **readable and writable**. Tasks and chats keep using it.
+* New notes are stored **without vectors**. They are reachable only by lexical
+  search, never by semantic similarity.
+* **Vector search is off** for the whole table. `supports_vector_search` is
+  `false`, and searches fall back to lexical matching over every row,
+  pre-existing and new alike.
+* Existing vectors are **left exactly as they are**. The runtime holds no
+  embedding adapter in this mode, so no write re-embeds a historical row and
+  no write changes the table's vector width. Nothing mixes two vector spaces.
+
+Restoring vector search is offline work, and it does not happen by itself:
+
+1. Decide which vector identity the table should be in. Either point the
+   authority back at the identity the stored vectors were written under, or
+   keep the current authority and re-embed the data to match it.
+2. If re-embedding: quiesce all writers, back up the memory LanceDB directory,
+   and re-embed every row offline under the current authority. Do not re-embed
+   in place, and do not start a worker to do it.
+3. Restart every worker together. Confirm `mode` is `vector` and
+   `supports_vector_search` is `true`.
+
+Leaving a deployment in `text_only` indefinitely is a supported choice, as long
+as it is a deliberate one: semantic recall stays off until the step above is
+done, and every note written in the meantime will need the same offline
+re-embed before it becomes semantically searchable.
+
+### Repairing BLOCKED_REPAIR
+
+`blocked_repair` means admission found invalid legacy data (a NULL, empty or
+duplicate note id, non-string metadata, or a `user_id` outside signed int64) or
+an incompatible schema, and refused to touch the table. Admission never mutates
+storage in this state, so the data on disk is exactly what it was.
+
+1. Stop every worker. Repair is offline work.
+2. Back up the memory LanceDB directory (`<storage root>/memory_store`, or the
+   project-local `memory_store/` when that legacy location is in use).
+3. Repair or remove the offending rows against the backup, not in place.
+4. Start every worker together and confirm `state` is `ready`.
+
+Do not start a single worker to "test" a repair: a worker that admits
+successfully begins writing, and the rest of the fleet has not admitted.
+
+### Rollback
+
+Rolling back is **not** symmetric with rolling forward, and quiescing writers
+is not sufficient on its own. The previous version does not read the authority.
+It picks its embedding model per user from the model hub, it has none of the
+admission checks this release added, and so it will happily open the memory
+table under an identity that has nothing to do with the vectors in it. Three
+things follow, and all three are silent:
+
+* **Online re-embedding.** If the identity the old code selects has a
+  different dimension than the stored vectors, the first ordinary write
+  rewrites the whole table to the new width and re-embeds every historical row
+  under the new model. This is irreversible and there is no prompt.
+* **Mixed vector spaces.** If the identity has the *same* dimension but a
+  different model or endpoint, nothing rewrites and nothing complains. New
+  vectors are simply written into a different space than the old ones, and
+  recall degrades in a way that no state field reports.
+* **Silent loss of durability.** On an unsupported provider configuration the
+  old manager falls back to an ephemeral in-memory store. Memory appears to
+  work and is discarded when the worker exits.
+
+The previous release also lets an authenticated update overwrite a note's
+`user_id` and scope metadata, so a note can silently end up owned by another
+user or placed in another scope, with values that are well formed. The table
+keeps this release's full-admission marker, so the next roll-forward trusts
+those rows. No later scan can undo this: nothing records the original owner,
+so re-admission, clearing the marker or a forced full rescan all accept the
+new values as valid.
+
+So only a **compatible writer** may open the production memory table: a
+runtime that enforces the same server-side owner and scope rules on every
+write as this release does. The previous release is not one. Unless you roll
+back to a build patched to enforce those rules, roll back with memory storage
+detached (see below). With a compatible rollback build, still gate the
+rollback on the persisted identity, not just on the fleet version:
+
+1. **Quiesce every writer.** Stop all API and task-execution workers. Nothing
+   below is safe against a live writer.
+2. **Establish what the persisted vector identity is.** Read it from the
+   memory table's schema metadata (`xagent.memory.vector_space`), or from this
+   release's `GET /api/memory/store-info` before you stop the fleet — a `mode`
+   of `vector` means the stored vectors match the current authority.
+3. **Establish what identity the previous release would select** for the same
+   deployment: the per-user default embedding model, or the model hub's
+   configured embedding model, as that release resolved it.
+4. **Take a backup and verify it.** Copy the memory LanceDB directory
+   (`<storage root>/memory_store`, or the project-local `memory_store/` when
+   that legacy location is in use) while writers are still fenced, then verify
+   the copy opens and its row count and vector width match the original. An
+   unverified copy is not a backup.
+5. **Compare the two identities.**
+   * **They match** — this proves only that the identities agree, not that
+     the previous release will persist anything. Its memory manager resolves
+     the embedding model from the model hub (never from the authority) and,
+     when it cannot build a persistent store for that row — a failed lookup, a
+     provider it does not build a store for, a construction error — it logs
+     the error and serves the in-memory store instead. So before rolling back,
+     get positive evidence for every identity step 3 found:
+     * a model hub row the previous release will select (the user's default
+       embedding model, else the first active embedding model visible to the
+       user), active and carrying that identity; and
+     * a verified start of the previous version, with memory storage detached
+       (both memory directory locations moved aside) and no other worker
+       running, in which a memory request made as that user (for example
+       `GET /api/memory/list`) is followed by `GET /api/memory/store-info`
+       reporting `store_type` `LanceDBMemoryStore`, `is_lancedb` `true` and
+       the expected `embedding_model_id`. `InMemoryMemoryStore` or
+       `is_lancedb` `false` means the fallback, not a persistent store.
+
+     With both, and only for a rollback build that is a compatible writer,
+     stop that instance, discard whatever memory directory it created,
+     reattach the real one, and redeploy that build to every worker at once.
+     Leave the authority row in place: the old code ignores it, and the new
+     version needs it on the next roll-forward. Without both, treat the case as
+     unprovable and follow the next branch.
+   * **They differ, or the persisted identity or the previous release's
+     persistence under it cannot be proven** — do **not**
+     start the previous version against this data. Keep memory fenced and pick
+     one: restore a verified backup that was written under the identity the
+     previous release will select, or re-embed the table offline into that
+     identity before rolling back. Only then redeploy.
+
+If the rollback build is not a compatible writer, or you must roll the
+application back before either of those can be done, roll back with memory
+storage detached: move the memory directory aside so the old code starts
+against an empty one, and keep the real one out of its reach. Unrelated
+functions are unaffected either way; persistent memory is the only thing at
+stake.
+
+When you roll forward again, reattach only storage that compatible writers
+alone have written: the directory you moved aside, or a verified backup taken
+before the rollback. Notes written while memory was detached are not merged
+back. Reconcile them separately, from a source you trust, if they matter.
+
+Rolling back does not undo an offline repair, and does not need to.
+
+## 2026-09-25 — Task cleanup obligations and retry driver
+
+Task deletion commits its rows before it releases what those rows located — the task's workspace directory and any runtime-extension state — because the rows are how the resources are found and a rollback cannot restore a removed directory. A release that failed, or a process that died between the commit and the release, used to leave nothing behind but a log line. Each such release is now recorded in `task_cleanup_obligations`, in the same transaction as the row deletion, and deleted once the resource is gone.
+
+### Deployment impact
+
+- Migration `20260925_task_cleanup_obligations` adds the table. It has no foreign keys and waits for no other table.
+- Every web process starts a retry driver, whatever the retention settings. On-demand task and account deletion record obligations on any store, SQLite included. The driver claims each obligation with a compare-and-set, so several replicas can run it at once.
+- The retention purge now records the workspace and bound extensions of every conversation it expires. It still releases nothing itself, because it holds the task's row lock; the driver releases them afterwards. The purge's audit line gains `cleanup_owed`.
+- `on_task_deleted` can now run after the task row is gone: the driver dispatches it for everything the purge records and for any binding whose provider is not registered in the deleting process. The extensions an admin force-deleted past a *failing* provider are recorded but never retried.
+- Both deletion endpoints add `external_cleanup_pending` to their response, next to `workspace_cleanup_pending`. It is true when the workspace or any runtime-extension state is still owed. An out-of-tree provider must not need the task row to release its state (see `TaskRuntimeExtensionProvider` in `src/xagent/core/task_runtime.py`).
+
+### Prerequisites and configuration
+
+**Workspace directories must be visible to every replica.** The driver on one replica may retry a removal recorded on another. A replica that cannot see the directory finds nothing, and finding nothing counts as success. A deployment that keeps workspaces on per-node local disks would therefore report leaked directories as removed. Such a deployment needs a host-affinity change before it relies on this record.
+
+`XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS` (default 300) sets how often an idle driver looks for due obligations. `XAGENT_TASK_CLEANUP_MAX_ATTEMPTS` (default 8) sets the attempt budget. Retries back off exponentially from five minutes, doubling each time (5, 10, 20, ..., 320 minutes for the default eight attempts) up to a six-hour cap the default budget never actually reaches, so it keeps retrying for roughly ten and a half hours in total.
+
+### Verification and monitoring
+
+A batch that claimed anything logs one line beginning `task cleanup retry`, counting `claimed`, `completed`, `retrying`, `exhausted` and `abandoned`.
+
+`xagent retention cleanup-pending` opens the database read-only. It prints how many obligations are still being retried and lists the ones retrying will not finish:
+
+- **`exhausted`** — the attempt budget ran out.
+- **`abandoned`** — deliberately not retried. This covers three cases: an admin's force delete, a workspace whose execution scope could not be resolved before its rows were deleted (the unscoped candidates were cleared, but a scoped workspace cannot be located), and a task id that belongs to a live task again. SQLite reuses the highest deleted id, so an old obligation must not remove the new task's directory.
+
+Add `--all` to include the obligations that are still pending. Reconcile each listed row by hand, then delete it from the table.
+
+A runtime-extension obligation whose provider is not registered in this process is not listed as `exhausted` or `abandoned`: it stays `pending` and is rechecked hourly, without spending its attempt budget, until a process that has the provider registered claims it. Such rows show under `--all`, not in the default list.
+
+### Rollback
+
+Rolling back the application leaves the table in place and unread. Downgrading the migration drops it, and with it the record of every cleanup still owed. Export `xagent retention cleanup-pending --all` first.
+
+## 2026-09-26 — Expired-task records
+
+When the retention purge expires a conversation it now leaves a record, so that later readers can report "expired under the retention policy" instead of the not-found a deleted task gets. Nothing reads these records yet; the v1 API and internal surfaces follow separately (#2565). Only the purge writes them, and no deployment configures a retention period yet, so this change is inert on its own.
+
+### Deployment impact
+
+- Migration `20260926_expired_task_tombstones` adds the `expired_task_tombstones` table and three nullable columns: `tasks.traces_expired_at`, `trigger_runs.task_expired_at` and `workforce_runs.task_expired_at`. The columns have no server default, so on PostgreSQL each `ADD COLUMN` is catalog-only: no table rewrite and no backfill on `tasks`.
+- Conversation expiry writes one tombstone per expired task, in the purge's own transaction. It holds no conversation content — only the owner, agent, workforce, source, trigger type, visibility and MCP channel-plumbing marker that the read surfaces' access checks need, plus the task's creation and expiry times. Expect roughly 150–200 bytes per expired task including indexes.
+- The same transaction sets `task_expired_at` on every trigger and workforce run that pointed at the task, without changing the run's status and without advancing `trigger_runs.updated_at` or `workforce_runs.last_activity_at`.
+- Trace expiry stamps `tasks.traces_expired_at` each time it removes a trace.
+- User-initiated task deletion is unchanged and writes no record.
+- Tombstones are removed with their owner's account. Deleting an agent or workforce clears the tombstone's reference to it, as agent deletion already does for live tasks. How long tombstones are otherwise kept is an open policy decision (#2567); today they are kept indefinitely.
+
+### Rollback
+
+Rolling back the application leaves the table and columns in place and unwritten. Downgrading the migration drops them, which loses the record of which tasks retention expired; readers then fall back to not-found for those ids.
+
+## 2026-09-26 — v1 API reports expired tasks
+
+The `/v1` SDK API now reads the expired-task records above (#2565). Internal web surfaces and run history follow separately. No deployment configures a retention period yet, so no tombstone exists and nothing below is observable until one does.
+
+### Client-visible changes
+
+- Every route addressed by a task id — `GET /v1/chat/tasks/{id}`, `/steps`, `/events`, `POST .../messages`, `POST .../reply` and `POST /v1/chat/files?task_id=` — answers **`410`** with error code **`task_expired`** and `details: {task_id, expired_at}` when the retention policy expired a task the calling key could have seen. A key that could not have seen the task (another agent or workforce, or a task not created through the SDK) keeps getting `404 task_not_found`, and so does a task its owner deleted.
+- An events stream that is already open when its task expires closes with a terminal `stream.error` frame with code **`task_expired`** instead of `task_deleted`. Re-attaching then gets the `410`.
+- `GET .../steps` has two new fields, `steps_expired` (boolean) and `steps_expired_at` (timestamp or null). `steps_expired: true` means the retention policy removed the task's historical steps, so the list may be incomplete. It can still hold steps from turns taken after the removal.
+
+A client that does not know the new code still sees a 4xx for the REST routes and a terminal error frame on the stream — the same classes of outcome it gets today for a missing or deleted task. The new `/steps` fields are additive.
+
+### Deployment impact
+
+- No migration and no configuration.
+- Responses cached by the steps cache before this change are still served for tasks the retention policy never touched. The first read of a trace-expired task after the upgrade re-reads and re-caches it.
+- Rolling back makes the API answer `404 task_not_found` again for expired tasks and drops the two `/steps` fields.
+
+## 2026-09-28 — Internal surfaces report expired tasks
+
+The web UI and internal API now read the expired-task records above (#2565), the same way the `/v1` API already does. No deployment configures a retention period yet, so no tombstone exists and this change is inert until one does.
+
+### Client-visible changes
+
+- `GET /api/conversation-logs/{id}` answers **`410`** with `detail: {code: "task_expired", message, task_id, expired_at}` for a task the retention policy expired that was a hidden, external-source conversation (not MCP channel-plumbing) the calling user could have seen live — their own, or any such log for an admin. `GET /api/chat/task/{id}` and `GET /api/chat/task/{id}/status` answer the same `410` for a task the caller could have seen live regardless of source or visibility — their own task, or any task for an admin. Anyone else keeps the same `404` a task that never existed gets, so the answer cannot be used to probe which ids retention expired. Webhook trigger conversation logs are included on the Conversation Logs route; scheduled and Gmail trigger ones are not, since Conversation Logs never served those live either. `PUT /api/chat/task/{id}` and `DELETE /api/chat/task/{id}` are unchanged and keep answering plain `404`: an expired task is never listed, so the UI has no rename or delete control open on one to call either from.
+- Conversation Logs detail gains `trace_events_expired_at`, alongside the existing `trace_events`.
+- The trigger-run and workforce-run APIs gain `task_expired_at`; `status` is unchanged. Fixing that field's serialization to go through the same UTC-aware formatter as the rest of the API means every trigger-run and workforce-run timestamp field (`created_at`, `updated_at`, `started_at`, `finished_at`, `next_run_at`, `last_run_at`, `completed_at`, and now `task_expired_at`) now always carries an explicit UTC offset (`+00:00`) on SQLite; PostgreSQL's output is unchanged, since it was already tz-aware.
+- The web UI shows "Conversation expired on {date}" in run history where it showed a dash or "Conversation unavailable" for a run whose task is gone, and an expiry or trace-removed note on the Conversation Logs page.
+- Lists are unchanged: an expired task is simply absent from them, its source counts and agent filter options included.
+
+### Deployment impact
+
+- No migration and no configuration.
+- Rolling back returns the previous `404` for these routes and drops `trace_events_expired_at` and `task_expired_at`.
+
+## 2026-09-28 — Per-team retention period overrides
+
+The two retention variables are deployment-wide. A deployment layer that lets a team shorten or extend them (shortening on every plan, extension up to two years) now has a hook for it. Nothing in this repository registers one: unregistered, the purge uses the two variables alone and runs the same scan.
+
+### Deployment impact
+
+- No migration, no index, no new environment variable.
+- The purge's audit line gains `skipped_not_due` and `skipped_override_unresolved`. `skipped_not_due` applies with no resolver registered too: a quiescent task whose period has not elapsed under the lock — for example one whose newest message is more recent than its stored anchor — used to be counted as `skipped_busy`. Alerts or dashboards keyed on `skipped_busy` will see it drop by that amount.
+
+### The resolver contract
+
+A deployment layer registers a resolver with `xagent.web.services.task_retention_overrides.set_retention_override_resolver`. It maps each `user_id` whose team has an override to its conversation and trace periods, either of which may be left to inherit the deployment's value.
+
+- An override may set 1 to 730 days. Any other value, including `None`, is refused rather than clamped, and that user's tasks are kept. An unusable value refuses the user even on a leg the deployment left off.
+- A resolver that raises, returns something that is not a mapping, or returns a non-`int` user id keeps everything: the batch selects nothing, and a task already selected is counted as `skipped_override_unresolved`. A single user's value that is not a `RetentionOverride` (or an override with an unusable period) refuses only that user, and the batch proceeds for everyone else. Nothing falls back to the global periods, which would expire a team that extended its period early.
+- An override never enables a leg the deployment left off, and never starts a purge the variables leave disabled.
+- An inherited trace period follows the team's conversation period when the deployment's trace period equals its conversation period — which is what leaving `XAGENT_TRACE_RETENTION_DAYS` unset produces, but also what an operator gets by setting it explicitly equal to the conversation period. Either way, a team extending its conversation period also extends its trace period past the value the operator set. A team shortening its conversation shortens the trace with it, which deletes nothing earlier: conversation expiry removes the whole task, traces included, at that point anyway. Otherwise the trace period stays the deployment's own.
+- Overrides are read once per batch for the scan and again per task inside the task's own transaction, just before its row is locked, so a settings change committed before then applies to that task. The resolver therefore runs inside the purge's transaction and must be a read with no side effects, dry run included.
+
+### Verification and monitoring
+
+- A failed resolver read shows in the audit line only as `scanned=0`, which is indistinguishable from an idle batch. The warning `retention override resolver failed` in the log is the signal, and the cursor restarts from the top of the table on the next sweep.
+- Refused users are logged once per batch with up to 20 of their ids. A non-zero `skipped_override_unresolved` is also logged as one WARNING per batch (`retention purge kept N task(s) ...`). It has two possible sources: the resolver failing on the per-task reads (the traceback for each task is logged at DEBUG by `xagent.web.services.task_retention_overrides`), or a user whose value became unusable after the scan.
+- `xagent retention preview` still counts against the global periods only; it does not apply overrides.
+
+### Rollback
+
+Unregister the resolver (or stop registering it) and restart: the purge returns to the two variables alone. Rows already expired under a team's shorter period are not restored.

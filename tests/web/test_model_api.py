@@ -1963,6 +1963,86 @@ class TestModelAPI:
         assert response.status_code == 400
         assert "base_url is required" in response.json()["detail"]
 
+    def test_fetch_provider_models_base_url_rule_matches_supported_providers(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """The native page fetches models for a listed provider and category;
+        omitting base_url is rejected exactly when the listing marks it
+        mandatory. Only the catalog read is faked, so the endpoint's own
+        checks run as-is."""
+        fetch = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+        listed = client.get(
+            "/api/models/providers/supported", headers=regular_headers
+        ).json()["providers"]
+        assert listed
+
+        outcomes = {}
+        expected = {}
+        for provider in listed:
+            for category in [None, *provider.get("category", [])]:
+                response = client.post(
+                    f"/api/models/providers/{provider['id']}/models",
+                    json={"api_key": "test-api-key", "category": category},
+                    headers=regular_headers,
+                )
+                key = (provider["id"], category)
+                outcomes[key] = (
+                    response.status_code,
+                    "base_url is required" in str(response.json().get("detail", "")),
+                )
+                expected[key] = (
+                    (400, True) if provider["requires_base_url"] else (200, False)
+                )
+
+        assert outcomes == expected
+
+    def test_fetch_provider_models_requires_base_url_for_credential_field_endpoints(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        """With a catalog fetcher registered for Azure, its endpoint (built by
+        official_endpoint_for_provider) would arrive as base_url, so omitting
+        it is rejected for any spelling of the provider instead of falling
+        back to a default endpoint. Azure has no catalog fetcher today, so the
+        test registers one to reach the check."""
+        from xagent.core.model.providers import official_endpoint_for_provider
+        from xagent.web.services.model_list_service import PROVIDER_FETCHERS
+
+        fetch = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+        monkeypatch.setitem(
+            PROVIDER_FETCHERS, "azure_openai", AsyncMock(return_value=[])
+        )
+
+        for provider in ("azure_openai", "Azure_OpenAI"):
+            response = client.post(
+                f"/api/models/providers/{provider}/models",
+                json={"api_key": "test-api-key"},
+                headers=regular_headers,
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"] == (
+                f"base_url is required for the {provider} provider"
+            )
+        fetch.assert_not_awaited()
+
+        endpoint = official_endpoint_for_provider(
+            "azure_openai", {"resource_name": "my-team"}
+        )
+        response = client.post(
+            "/api/models/providers/azure_openai/models",
+            json={"api_key": "test-api-key", "base_url": endpoint},
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+        fetch.assert_awaited_once_with("azure_openai", "test-api-key", endpoint)
+
     def test_list_supported_providers_includes_elevenlabs_audio_generation(
         self, test_db, regular_user, regular_headers
     ):

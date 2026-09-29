@@ -131,6 +131,10 @@ def get_pending_interaction_question(
     # bool it is at runtime. ``object`` rather than ``int | None`` keeps a
     # malformed persisted value dynamic, so it still fails closed below.
     marker = cast("object | None", task.interaction_protocol_version)
+    if marker is None and task.conversation_storage_version == 2:
+        from .task_execution_event_recovery import read_event_waiting_question
+
+        return read_event_waiting_question(db, int(task.id))
     if marker is None:
         # No native row can belong to this task under a NULL marker, so
         # the interaction table is not queried -- and nothing holds this

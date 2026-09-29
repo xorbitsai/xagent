@@ -32,6 +32,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.file_storage.factory import get_unscoped_file_storage
+from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+    ensure_documents_table,
+    ensure_ingestion_runs_table,
+)
+from xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.web.api.kb import (
     _WEB_FILE_LOCKS,
     _atomic_replace_file,
@@ -48,7 +53,6 @@ from xagent.web.api.kb import (
     _RagDocumentSnapshot,
     _recreate_missing_existing_file,
     _refresh_existing_file_if_changed,
-    _restore_rag_snapshot_rows,
     _rollback_failed_web_document_ingestion,
     _upsert_uploaded_file_record,
     _WebFileLock,
@@ -2002,7 +2006,7 @@ class TestWebFileRefreshHelpers:
     def test_web_rollback_exception_path_uses_file_id_after_empty_snapshot(
         self,
     ) -> None:
-        snapshot = _RagDocumentSnapshot(doc_refs=[], rows_by_table={})
+        snapshot = _RagDocumentSnapshot(doc_refs=[], collections=[])
         with (
             patch(
                 "xagent.web.api.kb._restore_rag_document_snapshot"
@@ -2031,134 +2035,6 @@ class TestWebFileRefreshHelpers:
             user_id=1,
             is_admin=False,
         )
-
-    def test_restore_rag_snapshot_rows_batches_unknown_table_delete(self) -> None:
-        table = MagicMock()
-        table.schema.names = []
-
-        _restore_rag_snapshot_rows(
-            table,
-            table_name="custom_table",
-            snapshot_rows=[{"collection": "c1", "doc_id": "doc-old"}],
-            current_rows=[
-                {"collection": "c1", "doc_id": "doc-1"},
-                {"collection": "c1", "doc_id": "doc-2"},
-            ],
-            user_id=1,
-            is_admin=False,
-        )
-
-        table.delete.assert_called_once()
-        delete_filter = table.delete.call_args.args[0]
-        assert "(collection = 'c1' and doc_id = 'doc-1')" in delete_filter
-        assert "(collection = 'c1' and doc_id = 'doc-2')" in delete_filter
-        assert " or " in delete_filter
-        table.add.assert_called_once_with([{"collection": "c1", "doc_id": "doc-old"}])
-
-    def test_restore_rag_snapshot_rows_batches_stale_row_delete(self) -> None:
-        table = MagicMock()
-        table.schema.names = []
-
-        _restore_rag_snapshot_rows(
-            table,
-            table_name="chunks",
-            snapshot_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-old",
-                }
-            ],
-            current_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-old",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-stale",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-stale-2",
-                },
-            ],
-            user_id=1,
-            is_admin=False,
-        )
-
-        table.merge_insert.assert_called_once_with(
-            ["collection", "doc_id", "parse_hash", "chunk_id"]
-        )
-        table.delete.assert_called_once()
-        delete_filter = table.delete.call_args.args[0]
-        assert "chunk_id = 'chunk-old'" not in delete_filter
-        assert "(collection = 'c1'" in delete_filter
-        assert "chunk_id = 'chunk-stale'" in delete_filter
-        assert "chunk_id = 'chunk-stale-2'" in delete_filter
-        assert " or " in delete_filter
-
-    def test_restore_rag_snapshot_rows_keys_embeddings_by_parse_and_model(
-        self,
-    ) -> None:
-        table = MagicMock()
-        table.schema.names = []
-
-        _restore_rag_snapshot_rows(
-            table,
-            table_name="embeddings_text_embedding_v4",
-            snapshot_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-old",
-                    "model": "model-a",
-                }
-            ],
-            current_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-old",
-                    "model": "model-a",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-new",
-                    "model": "model-a",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-old",
-                    "model": "model-b",
-                },
-            ],
-            user_id=1,
-            is_admin=False,
-        )
-
-        table.merge_insert.assert_called_once_with(
-            ["collection", "doc_id", "chunk_id", "parse_hash", "model"]
-        )
-        table.delete.assert_called_once()
-        delete_filter = table.delete.call_args.args[0]
-        assert "parse_hash = 'parse-new'" in delete_filter
-        assert "model = 'model-b'" in delete_filter
-        assert "parse_hash = 'parse-old' and model = 'model-a'" not in delete_filter
-        assert " or " in delete_filter
 
     def test_get_file_sha256_changes_with_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2227,54 +2103,38 @@ class TestWebFileRefreshHelpers:
 
         assert processed_urls["hash-key"] == "new-file-id"
 
-    def test_mark_uploaded_file_for_reindex_clears_ingestion_runs(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        deleted_filters: list[str] = []
-
-        class _FakeTable:
-            def search(self):
-                return self
-
-            def where(self, _expr: str):
-                return self
-
-            def select(self, _fields: list[str]):
-                return self
-
-            def limit(self, _value: int):
-                return self
-
-            def delete(self, expr: str) -> None:
-                deleted_filters.append(expr)
-
-        class _FakeConn:
-            def open_table(self, _name: str):
-                return _FakeTable()
-
-        monkeypatch.setattr(
-            "xagent.providers.vector_store.lancedb.get_connection_from_env",
-            lambda: _FakeConn(),
+    def test_mark_uploaded_file_for_reindex_clears_ingestion_runs(self) -> None:
+        conn = get_connection_from_env()
+        ensure_documents_table(conn)
+        conn.open_table("documents").add(
+            [
+                {"collection": "kb", "doc_id": "doc-1", "file_id": "file-123"},
+                {"collection": "kb2", "doc_id": "doc-2", "file_id": "file-123"},
+                {"collection": "kb", "doc_id": "doc-2", "file_id": "other-file"},
+            ]
         )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_documents_table",
-            lambda _conn: None,
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_ingestion_runs_table",
-            lambda _conn: None,
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.query_to_list",
-            lambda _query: [{"collection": "kb", "doc_id": "doc-1"}],
+        ensure_ingestion_runs_table(conn)
+        conn.open_table("ingestion_runs").add(
+            [
+                {"collection": c, "doc_id": d, "status": "success", "user_id": u}
+                for c, d, u in [
+                    ("kb", "doc-1", 1),
+                    ("kb", "doc-1", None),
+                    ("kb2", "doc-2", 2),
+                    ("kb", "doc-2", 1),
+                    ("kb2", "doc-1", 2),
+                ]
+            ]
         )
 
         marked = _mark_uploaded_file_for_reindex("file-123")
 
         assert marked is True
-        assert len(deleted_filters) == 1
-        assert "collection = 'kb'" in deleted_filters[0]
-        assert "doc_id = 'doc-1'" in deleted_filters[0]
+        left = conn.open_table("ingestion_runs").search().limit(-1).to_list()
+        assert sorted((r["collection"], r["doc_id"]) for r in left) == [
+            ("kb", "doc-2"),
+            ("kb2", "doc-1"),
+        ]
 
     def test_refresh_fails_when_ingestion_run_snapshot_fails(
         self,

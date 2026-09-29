@@ -84,9 +84,9 @@ async def test_store_memory_adds_note_with_metadata() -> None:
     note = store.added[0]
     assert note.content == "User prefers reports in Chinese."
     assert note.category == "react_memory"
-    assert note.metadata["task"] == "Fix the deploy pipeline"
-    assert note.metadata["kind"] == "user_preference"
-    assert note.metadata["source"] == "store_memory"
+    # The user's request text is conversation content and must not outlive a
+    # purged conversation inside the memory store (#2753).
+    assert note.metadata == {"kind": "user_preference", "source": "store_memory"}
     assert tool.stored_count == 1
 
 
@@ -330,13 +330,14 @@ async def test_search_memory_reports_terminal_lancedb_failure(
 @pytest.mark.asyncio
 async def test_update_memory_replaces_content() -> None:
     store = CrudMemoryStore({"mem-1": _note("mem-1", "Old fact.")})
-    tool = UpdateMemoryTool(memory_store=store, task="current task")
+    tool = UpdateMemoryTool(memory_store=store)
 
     result = await tool.execute(memory_id="mem-1", content="Corrected fact.")
 
     assert result == {"success": True, "memory_id": "mem-1"}
     assert store.updated[0].content == "Corrected fact."
-    assert store.updated[0].metadata["updated_by_task"] == "current task"
+    # No request text is stamped onto the rewritten note (#2753).
+    assert store.updated[0].metadata == {}
 
 
 @pytest.mark.asyncio
@@ -344,18 +345,18 @@ async def test_update_memory_initializes_missing_metadata() -> None:
     note = _note("mem-1", "Old fact.")
     note.metadata = None  # type: ignore[assignment]
     store = CrudMemoryStore({"mem-1": note})
-    tool = UpdateMemoryTool(memory_store=store, task="current task")
+    tool = UpdateMemoryTool(memory_store=store)
 
     result = await tool.execute(memory_id="mem-1", content="Corrected fact.")
 
     assert result == {"success": True, "memory_id": "mem-1"}
-    assert store.updated[0].metadata == {"updated_by_task": "current task"}
+    assert store.updated[0].metadata == {}
 
 
 @pytest.mark.asyncio
 async def test_update_memory_reports_missing_note_and_bad_args() -> None:
     store = CrudMemoryStore()
-    tool = UpdateMemoryTool(memory_store=store, task="task")
+    tool = UpdateMemoryTool(memory_store=store)
 
     missing = await tool.execute(memory_id="nope", content="New text.")
     bad = await tool.execute(memory_id="", content="")
@@ -396,7 +397,7 @@ async def test_update_memory_reports_note_without_content() -> None:
         def get(self, note_id: str) -> MemoryResponse:
             return MemoryResponse(success=True, memory_id=note_id, content=None)
 
-    tool = UpdateMemoryTool(memory_store=NoContentStore(), task="task")
+    tool = UpdateMemoryTool(memory_store=NoContentStore())
 
     result = await tool.execute(memory_id="mem-1", content="New text.")
 

@@ -87,6 +87,11 @@ Shared workers process and settle commands under the task coordinator's owner
 attempt. The Registry continues renewing task ownership in batches; shared
 commands no longer have an independent processing lease or heartbeat.
 `retry_available_at` records a business retry delay and is never heartbeat-renewed.
+Every shared agent run holds the task lease. `AgentServiceManager.execute_task`
+refuses to start a run that has none: the caller must pass the lease it owns,
+or let `execute_task` acquire one for a task id. Checkpoints, command results,
+and task settlement are all fenced by that lease, so an unleased run would
+write them unfenced.
 
 Stop all old executors before applying `20260918_command_retry_at`. The migration
 copies pending commands' retry deadlines into `retry_available_at` and preserves
@@ -177,6 +182,54 @@ recovery rather than the old in-memory progress route.
 Stopping a newly selected task or closing it after failed acceptance leaves it
 paused with its uploaded files, so it can be continued. Cleanup applies only to
 the original unaccepted selection; it cannot modify a newer replacement run.
+
+## Admission-queued SDK replies
+
+When a host installs an execution admission policy, an SDK or A2A reply is
+committed as a durable RESUME_INPUT command together with its admission ticket.
+If that ticket is provably waiting for capacity when ingress checks it (the
+bucket is full, an older runnable waiter precedes it, or startup pacing has not
+yet released it), the V1 reply endpoint answers `202` with `status: "queued"`
+immediately instead of holding the request for
+`XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS` and returning `504 reply_outcome_unknown`. The response carries the accepted
+`command_id`, the `run_id` the task is waiting on, the acceptance
+`state_version`, and the task's current `control_state`; the task stays
+`waiting_for_user` until a worker reserves capacity and resumes it. Nothing has been validated at that
+point: checkpoint readability, state fences, and model availability are still
+checked by the worker, so `queued` is not a running result. Repeat the same
+`command_id` with the identical reply body to observe the outcome without
+injecting the answer again (a different body under the same ID is `409
+task_busy`); the replay stays `queued` while capacity is unavailable and
+reports the stored outcome (`running`, or the existing reply errors) once the
+worker has run it. A queued reply that a cancel or pause control stops before
+it runs replays as `409 task_busy` with `retry_with_new_id`: the reply was not
+applied. Resend under a new `command_id` only if the task is still
+`waiting_for_user`; after a cancel or pause it is not, and a new ID receives
+`409 no_pending_interaction`.
+
+That rejected-command mapping applies on every shared-execution host, governed
+or not: a reply the worker's handoff rejected before injection (`state_changed`,
+`stale_owner`, `stale_claim`, `identity_changed`, `invalid_payload`) also
+replays as `409 task_busy` with `retry_with_new_id`, where it previously
+replayed as `504 reply_outcome_unknown`. Only failures without a recorded
+rejection reason remain unknown outcomes.
+
+Waiting consumes no attempt or defer budget. Replies that are not governed by an
+admission policy, and governed replies whose worker is merely slow, keep the
+existing wait and `reply_outcome_unknown` semantics. Only SDK replies receive the
+queued acknowledgment: A2A ingress has no projection for a queued reply, so a
+governed A2A reply keeps the existing wait and `504 reply_outcome_unknown`
+(with `accepted: true` and its `commandId`) until an A2A projection is designed,
+and the durable reply still runs when capacity opens.
+
+Within a bucket the oldest waiting command runs first, including for prompt
+dispatch by ID, and buckets stay independent of each other. A waiter is the
+bucket head only while it is its own task's next runnable command and needs a
+slot: a command behind any earlier unfinished command of its own task, or
+guidance that joins its task's running execution, is not a head and never
+delays other tasks' commands in that bucket. Per-task order still applies to
+the task's own commands, and a head whose business-retry deadline has not
+passed still delays later work in the same bucket.
 
 ## Runtime credential lifetime
 

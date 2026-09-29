@@ -1,7 +1,7 @@
 """Tests for the tool-result-spill module.
 
 Covers the whole module: the two pure path primitives written for the writer,
-an engine registration gate that is not wired up yet, and the read tool
+the engine registration gate and the read tool
 (``normalize_spilled_relative_path`` / ``resolve_spilled_under``); the
 walk/write path that decides what gets spilled and writes it to disk
 (``spill_oversized_values`` and its helpers); and the notice renderer
@@ -24,10 +24,9 @@ them was once broken in a way no test could see:
   than read from the module, so raising a cap in the module shows up as a
   failure instead of moving the expectation with it.
 
-The read tool's own name, character limit, and truncated-read instruction
-still have no consumer and are not in this module; the change that adds
-the read tool brings back what it needs. The unavailable-notice text and
-the record-shape validator are back already, each pinned by tests below.
+The read tool's name, character limit and truncated-read instruction live
+in this module and are pinned below, as are the unavailable-notice text and
+the record-shape validator.
 """
 
 from __future__ import annotations
@@ -54,6 +53,9 @@ from xagent.core.tools.tool_result_spill import (
     SPILL_MAX_FILES_PER_RESULT,
     SPILL_MAX_FILES_PER_RUN,
     SPILL_PLACEHOLDER_TEXT,
+    SPILL_READ_MAX_CHARS,
+    SPILL_READ_TOOL_NAME,
+    SPILL_READ_TRUNCATED_INSTRUCTION,
     SPILL_READ_UNAVAILABLE_MESSAGES,
     SPILL_RESERVED_RESULT_KEY,
     SPILL_UNAVAILABLE_NOTICE,
@@ -65,11 +67,15 @@ from xagent.core.tools.tool_result_spill import (
     _spill_kind_of,
     _spill_slice,
     _spill_text_lines,
+    _write_spill_file,
+    list_spilled_results,
     normalize_spilled_relative_path,
+    read_spilled_result,
     render_spill_notice,
     resolve_spilled_under,
     spill_dir_for_workspace,
     spill_oversized_values,
+    spill_read_page_chars,
     spill_read_unavailable,
     spill_record_shape_is_valid,
     strip_reserved_spill_key,
@@ -342,7 +348,7 @@ def test_spill_dir_for_workspace_spells_output_the_way_the_normalizer_strips_it(
     assert Path(spill_dir_for_workspace("/w")).parts[-2:] == ("output", "tool-results")
 
 
-# --- stage 1-b: the four read-side helpers (pure functions) ---------------
+# --- the four read-side helpers (pure functions) ---------------
 
 
 def test_spill_kind_of_array():
@@ -455,10 +461,71 @@ def test_spill_read_unavailable_is_a_classified_failure(reason):
     assert result["output"] == SPILL_READ_UNAVAILABLE_MESSAGES[reason]
 
 
+def test_spill_read_unavailable_messages_are_pinned():
+    # Written out rather than read back, so a reworded reason or a new one
+    # shows up here instead of moving the expectation with it.
+    assert SPILL_READ_UNAVAILABLE_MESSAGES == {
+        "invalid_path": (
+            "That is not one of the stored result paths. Copy a path from the "
+            "notice exactly as written."
+        ),
+        "not_found": (
+            "That stored result is no longer available: report the value as "
+            "unavailable and do not reconstruct it."
+        ),
+        "invalid_range": (
+            "start and end are 1-based item numbers, or entry numbers when "
+            "listing: both must be 1 or greater, and start must not exceed end. "
+            "offset is a 0-based character position in the text of one stored "
+            "result's selected items: it must be 0 or greater and fall inside "
+            "that text, and it is not used when listing."
+        ),
+    }
+
+
 def test_spill_read_unavailable_names_the_item_count_for_a_range():
     result = spill_read_unavailable("invalid_range", item_count=7)
     assert "7" in result["output"]
     assert result["is_error"] is True
+
+
+@pytest.mark.parametrize("spill_dir", [None, ""])
+def test_read_back_entry_points_treat_no_spill_directory_as_nothing_stored(
+    spill_dir,
+):
+    """With no spill directory at all, a read finds nothing and a listing
+    is empty -- the same answers a task that never stored anything gets."""
+    name = f"tool-results/acme-{'0' * 32}.json"
+
+    assert read_spilled_result(spill_dir, name) == spill_read_unavailable("not_found")
+    assert list_spilled_results(spill_dir) == {
+        "stored_results": [],
+        "count": 0,
+        "start": None,
+        "end": None,
+        "omitted": 0,
+    }
+
+
+def test_read_tool_name_and_truncated_instruction_are_pinned():
+    # Written out rather than read back: the name is what ReAct excludes
+    # from and adds back to the model's tool list, and the instruction is
+    # what the model sees when one read goes over the cap.
+    assert SPILL_READ_TOOL_NAME == "read_tool_result"
+    assert SPILL_READ_TRUNCATED_INSTRUCTION == (
+        "Call read_tool_result again with a narrower start/end range to read "
+        "fewer items, or with the same start/end and a larger offset to "
+        "continue reading within them."
+    )
+    assert SPILL_READ_MAX_CHARS == 12_000
+
+
+def test_read_limit_mirrors_read_file_context_limit():
+    # The read tool caps itself because the context layer's preview cap
+    # covers only read_file; the two caps must not drift apart.
+    from xagent.core.agent.context.execution import READ_FILE_CONTEXT_LIMIT
+
+    assert SPILL_READ_MAX_CHARS == READ_FILE_CONTEXT_LIMIT
 
 
 def test_spill_read_unavailable_rejects_an_undefined_reason():
@@ -469,7 +536,110 @@ def test_spill_read_unavailable_rejects_an_undefined_reason():
         spill_read_unavailable("typo")
 
 
-# --- stage 1-c: walk, second tier, envelope, report construction ----------
+@pytest.mark.parametrize(
+    ("max_chars", "expected"),
+    [(51_200, 12_000), (12_000, 12_000), (8_000, 8_000), (1, 1), (0, 1), (-5, 1)],
+)
+def test_spill_read_page_chars_is_the_smaller_of_the_cap_and_the_output_limit(
+    max_chars, expected
+):
+    # Written out rather than derived: a page is never longer than the
+    # output limit or the read tool's own cap, and a limit of 0 or below
+    # still gives a page that moves forward.
+    assert spill_read_page_chars(max_chars) == expected
+
+
+def _letters(count):
+    """A string whose characters differ from their neighbours, so a skipped
+    or repeated stretch shows up in an equality check."""
+    return "".join(chr(ord("a") + index % 26) for index in range(count))
+
+
+def test_read_spilled_result_pages_at_page_chars_without_a_gap(tmp_path):
+    """A 15,000-character line read with 8,000-character pages comes back in
+    two replies; the second starts at offset 8,000, where the first ended,
+    and the two pages join to the line."""
+    line = _letters(15_000)
+    rel = _write_spill_file(str(tmp_path), "acme", line, "text")
+
+    first = read_spilled_result(tmp_path, rel, start=1, end=1, page_chars=8_000)
+    second = read_spilled_result(
+        tmp_path, rel, start=1, end=1, offset=8_000, page_chars=8_000
+    )
+
+    assert first == {
+        "relative_path": rel,
+        "content_preview": line[:8_000],
+        "content_truncated": True,
+        "original_chars": 15_000,
+        "item_count": 1,
+        "offset": 0,
+        "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
+    }
+    assert second == {
+        "relative_path": rel,
+        "content_preview": line[8_000:],
+        "content_truncated": False,
+        "original_chars": 15_000,
+        "item_count": 1,
+        "offset": 8_000,
+    }
+    assert first["content_preview"] + second["content_preview"] == line
+
+
+def test_read_spilled_result_whole_reply_threshold_follows_page_chars(tmp_path):
+    """A 10,000-character text fits one default page and comes back whole,
+    but with 8,000-character pages it takes the preview shape, which tells
+    the model how long the text is and that more follows."""
+    text = _letters(10_000)
+    rel = _write_spill_file(str(tmp_path), "acme", text, "text")
+
+    assert read_spilled_result(tmp_path, rel) == {
+        "relative_path": rel,
+        "output": text,
+    }
+    assert read_spilled_result(tmp_path, rel, page_chars=8_000) == {
+        "relative_path": rel,
+        "content_preview": text[:8_000],
+        "content_truncated": True,
+        "original_chars": 10_000,
+        "item_count": 1,
+        "offset": 0,
+        "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
+    }
+
+
+@pytest.mark.parametrize(
+    "page_chars", [0, SPILL_READ_MAX_CHARS + 1, True, 8000.0, "8000"]
+)
+def test_read_spilled_result_rejects_a_page_size_outside_its_range(
+    tmp_path, page_chars
+):
+    # page_chars comes from the engine, never from the model, so a value
+    # outside 1..SPILL_READ_MAX_CHARS is a caller bug and raises, even for a
+    # path that names a readable stored result.
+    rel = _write_spill_file(str(tmp_path), "acme", "abc", "text")
+
+    with pytest.raises(ValueError, match="page_chars"):
+        read_spilled_result(tmp_path, rel, page_chars=page_chars)
+
+
+@pytest.mark.parametrize("page_chars", [1, SPILL_READ_MAX_CHARS])
+def test_read_spilled_result_accepts_both_ends_of_the_page_size_range(
+    tmp_path, page_chars
+):
+    rel = _write_spill_file(str(tmp_path), "acme", "abc", "text")
+
+    reply = read_spilled_result(tmp_path, rel, page_chars=page_chars)
+
+    if page_chars == 1:
+        assert reply["content_preview"] == "a"
+        assert reply["content_truncated"] is True
+    else:
+        assert reply == {"relative_path": rel, "output": "abc"}
+
+
+# --- walk, second tier, envelope, report construction ----------
 
 MAX_CHARS = 100
 
@@ -1451,7 +1621,7 @@ def test_spill_structured_content_spills_when_only_it_is_oversized(tmp_path):
     assert spilled["content"][0]["text"] == "small"
 
 
-# --- stage 1-d: write hardening (caps, byte truncation, OSError fallback) --
+# --- write hardening (caps, byte truncation, OSError fallback) --
 
 
 def test_second_tier_write_failure_falls_back_whole(tmp_path, monkeypatch):
@@ -2497,7 +2667,7 @@ def test_non_dict_mapping_spills_like_dict(tmp_path, monkeypatch, case):
         assert record["item_count"] == len(value)
 
 
-# --- stage 1-f: spill_record_shape_is_valid (gate 1) -----------------------
+# --- spill_record_shape_is_valid (gate 1) -----------------------
 
 VALID_SHAPE_RECORD = {
     "relative_path": "tool-results/acme-000000000000000000000000000000.json",
@@ -2713,7 +2883,7 @@ def test_spill_unavailable_notice_names_no_path_and_no_tool():
     assert "/" not in SPILL_UNAVAILABLE_NOTICE
 
 
-# --- stage 1-g: render_spill_notice (pure rendering, not yet wired in) -----
+# --- render_spill_notice (pure rendering) ---
 
 ARRAY_RECORD = {
     "relative_path": "tool-results/acme-812345678901.json",
@@ -2920,7 +3090,22 @@ def test_render_spill_notice_stays_inside_its_own_character_budget():
 
     assert len(notice) <= spill_module.SPILL_OBSERVATION_NOTICE_MAX_CHARS
     assert rendered >= 1
-    assert body_lines[-1] == f"- ... {12 - rendered} more stored file(s) omitted"
+    assert body_lines[-1] == (
+        f"- ... {12 - rendered} more stored file(s); call read_tool_result "
+        "with no path to list them"
+    )
+
+
+def test_render_spill_notice_omitted_line_names_the_listing_call():
+    """One record past the observation entry cap: the last line says how to
+    see every stored file, since the notice itself cannot list them all."""
+    notice = render_spill_notice(_short_records(9), style="observation")
+    body_lines = notice.splitlines()[1:]
+
+    assert len(body_lines) == 9
+    assert body_lines[-1] == (
+        "- ... 1 more stored file(s); call read_tool_result with no path to list them"
+    )
 
 
 def test_render_spill_notice_mentions_read_tool_result_not_read_file():
@@ -3198,6 +3383,9 @@ def test_render_spill_notice_caps_entries_per_style(style, max_entries, max_char
 
     assert len(notice) < max_chars
     assert len(body_lines) == max_entries + 1
-    assert body_lines[-1] == f"- ... {total - max_entries} more stored file(s) omitted"
+    assert body_lines[-1] == (
+        f"- ... {total - max_entries} more stored file(s); call read_tool_result "
+        "with no path to list them"
+    )
     for line in body_lines[:-1]:
         assert line.startswith("- tool-results/s")

@@ -146,6 +146,43 @@ def test_successful_pattern_end_preserves_result() -> None:
     assert data == {"status": "completed", "result": result}
 
 
+def test_public_checkpoint_trace_folds_nested_memory_reason_without_mutation() -> None:
+    raw_reason = "host resolver secret shard eu-3"
+    payload = {
+        "checkpoint_type": "agent_execution_checkpoint",
+        "snapshot": {
+            "context": {
+                "metadata": {
+                    "memory_available": False,
+                    "memory_availability_reason": raw_reason,
+                }
+            }
+        },
+    }
+
+    event_type, data = normalize_public_trace_event("system_update_general", payload)
+
+    assert event_type == "system_update_general"
+    assert raw_reason not in repr(data)
+    assert (
+        data["snapshot"]["context"]["metadata"]["memory_availability_reason"]
+        == "unavailable"
+    )
+    assert (
+        payload["snapshot"]["context"]["metadata"]["memory_availability_reason"]
+        == raw_reason
+    )
+
+
+def test_public_trace_folds_non_string_memory_reason_without_failing() -> None:
+    _, data = normalize_public_trace_event(
+        "task_update_general",
+        {"memory_availability_reason": {"unexpected": "shape"}},
+    )
+
+    assert data == {"memory_availability_reason": "unavailable"}
+
+
 def test_top_level_failed_pattern_status_survives_public_normalization() -> None:
     from xagent.web.api.workforces import _derive_agent_execution_status
 

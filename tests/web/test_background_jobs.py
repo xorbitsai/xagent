@@ -903,6 +903,59 @@ def test_kb_document_job_exception_keeps_previous_config_before_retry(
         db.close()
 
 
+def test_kb_document_job_without_target_path_fails_before_ingestion(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+
+    SessionLocal = _init_test_db(tmp_path / "kb-no-target-path.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-no-target-path-test")
+        stored_file = tmp_path / "uploads" / "doc.txt"
+        stored_file.parent.mkdir(parents=True)
+        stored_file.write_text("stored content", encoding="utf-8")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "existing-kb",
+                "source_path": str(stored_file),
+                "file_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "filename": "doc.txt",
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "collection_existed_before": True,
+            },
+        )
+        # Final attempt: a failed staged run would now unlink source_path.
+        job.attempts = job.max_attempts
+        ingest = MagicMock(side_effect=RuntimeError("ingestion ran"))
+        monkeypatch.setattr("xagent.web.jobs.kb_tasks.run_document_ingestion", ingest)
+
+        # Broad on purpose: the file check must still run if the fake's error escapes.
+        with pytest.raises(RuntimeError) as info:
+            handle_kb_ingest_document(db, job)
+
+        assert stored_file.read_text(encoding="utf-8") == "stored content"
+        ingest.assert_not_called()
+        assert isinstance(info.value, BackgroundJobHandlerError)
+        assert info.value.retryable is False
+        assert str(info.value) == (
+            "Document ingest job payload has no target_path; resubmit the upload"
+        )
+        db.refresh(job)
+        assert job.progress["message"] == "Queued"
+    finally:
+        db.close()
+
+
 def test_background_job_progress_manager_mirrors_rag_progress(tmp_path, monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)

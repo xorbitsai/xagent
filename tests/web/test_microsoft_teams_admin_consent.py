@@ -180,6 +180,10 @@ def test_teams_admin_consent_required_surfaces_a_forwardable_link(db_session):
         query_params={
             "error": "access_denied",
             "error_subcode": "cancel",
+            "error_description": (
+                "AADSTS90094: The app needs permission to access resources "
+                "in your organization that only an admin can grant."
+            ),
             "state": _oauth_state(user),
         }
     )
@@ -297,6 +301,62 @@ def test_bare_microsoft_cancellation_keeps_the_generic_page(db_session):
     assert "adminconsent" not in body
 
 
+def test_connector_cancellation_without_admin_error_keeps_generic_page(db_session):
+    """The cancel subcode alone must not be treated as an admin block."""
+    db, user = db_session
+    request = SimpleNamespace(
+        query_params={
+            "error": "access_denied",
+            "error_subcode": "cancel",
+            "error_description": "AADSTS65004: User declined to consent to the app.",
+            "state": _oauth_state(user),
+        }
+    )
+
+    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+
+    assert response.status_code == 400
+    body = response.body.decode()
+    assert "Error: access_denied" in body
+    assert "adminconsent" not in body
+
+
+def test_sharepoint_delegated_scope_does_not_trigger_admin_handoff(db_session):
+    """Sites.ReadWrite.All is user-consentable when delegated."""
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="sharepoint",
+            name="SharePoint",
+            description="Connect to SharePoint.",
+            icon="https://www.google.com/s2/favicons?domain=sharepoint.com&sz=128",
+            transport="oauth",
+            provider_name="microsoft",
+            category="Storage",
+            oauth_scopes=["Sites.ReadWrite.All"],
+            is_visible_in_connector=True,
+            launch_config={"command": "python", "args": []},
+        )
+    )
+    db.commit()
+
+    request = SimpleNamespace(
+        query_params={
+            "error": "access_denied",
+            "error_subcode": "cancel",
+            "error_description": "AADSTS90094: Admin approval is required.",
+            "state": _oauth_state(user, app_id="sharepoint"),
+        }
+    )
+
+    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+
+    assert response.status_code == 400
+    body = response.body.decode()
+    assert "Error: access_denied" in body
+    assert "adminconsent" not in body
+
+
 def test_hidden_connector_blocks_the_admin_consent_link(db_session):
     """The admin-consent branch returns earlier in generic_oauth_callback
     than the existing hidden-app release gate (_reject_hidden_catalog_app),
@@ -315,6 +375,7 @@ def test_hidden_connector_blocks_the_admin_consent_link(db_session):
         query_params={
             "error": "access_denied",
             "error_subcode": "cancel",
+            "error_description": "AADSTS90094: Admin approval is required.",
             "state": _oauth_state(user),
         }
     )
@@ -446,6 +507,7 @@ def test_admin_consent_state_lifetime_suits_asynchronous_admin_approval(db_sessi
         query_params={
             "error": "access_denied",
             "error_subcode": "cancel",
+            "error_description": "AADSTS90094: Admin approval is required.",
             "state": _oauth_state(user),
         }
     )
@@ -468,8 +530,8 @@ def test_admin_consent_state_lifetime_suits_asynchronous_admin_approval(db_sessi
 # could never do.
 _KNOWN_MICROSOFT_SCOPE_CLASSIFICATION = {
     "User.Read": False,
-    "Team.ReadBasic.All": True,
-    "Channel.ReadBasic.All": True,
+    "Team.ReadBasic.All": False,
+    "Channel.ReadBasic.All": False,
     "TeamMember.Read.All": True,
     "ChannelMessage.Read.All": True,
     "ChannelMessage.Send": False,
@@ -479,16 +541,17 @@ _KNOWN_MICROSOFT_SCOPE_CLASSIFICATION = {
     "Calendars.ReadWrite": False,
     "Contacts.Read": False,
     "Files.ReadWrite": False,
-    "Sites.ReadWrite.All": True,
+    "Files.ReadWrite.All": False,
+    "Tasks.ReadWrite": False,
+    "offline_access": False,
+    "Sites.ReadWrite.All": False,
 }
 
 
 def test_microsoft_admin_consent_scopes_matches_known_classification():
     """Guards against _MICROSOFT_ADMIN_CONSENT_SCOPES silently going stale.
 
-    Without this, a new builtin Microsoft app/scope (the registry already
-    grew a "sharepoint" app with Sites.ReadWrite.All -- itself admin-required
-    and, until this fix, missing from the allowlist) could ship without
+    Without this, a new builtin Microsoft app/scope could ship without
     anyone deciding whether it needs admin consent, and a genuine
     admin-required cancellation for it would silently fall through to the
     generic error page -- regressing to the exact bug this feature exists

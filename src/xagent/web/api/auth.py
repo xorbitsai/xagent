@@ -414,13 +414,26 @@ def _merged_oauth_scopes(
 # page the day someone adds it.
 _MICROSOFT_ADMIN_CONSENT_SCOPES = frozenset(
     {
-        "Team.ReadBasic.All",
-        "Channel.ReadBasic.All",
         "TeamMember.Read.All",
         "ChannelMessage.Read.All",
-        "Sites.ReadWrite.All",
     }
 )
+
+# A bare ``access_denied``/``error_subcode=cancel`` redirect is ambiguous:
+# Microsoft also uses it when a user simply backs out of an ordinary consent
+# prompt. Only these provider error codes explicitly identify an admin/policy
+# block, so do not mint a tenant-wide handoff for a generic cancellation.
+_MICROSOFT_ADMIN_CONSENT_ERROR_CODES = frozenset(
+    {"AADSTS90093", "AADSTS90094", "AADSTS900941"}
+)
+
+
+def _microsoft_admin_consent_error(error_description: str | None) -> bool:
+    """Return whether Microsoft's callback explicitly reports admin blocking."""
+    if not error_description:
+        return False
+    match = re.search(r"\b(AADSTS\d+)\b", error_description.upper())
+    return bool(match and match.group(1) in _MICROSOFT_ADMIN_CONSENT_ERROR_CODES)
 
 # How long a minted admin-consent handoff link stays valid. Deliberately
 # generous (not the 10-minute lifetime of an ordinary oauth_state): the
@@ -3384,6 +3397,9 @@ def generic_oauth_callback(
             # differently-cased value doesn't silently miss this branch and
             # fall back to the unhelpful generic error page.
             and (request.query_params.get("error_subcode") or "").casefold() == "cancel"
+            and _microsoft_admin_consent_error(
+                request.query_params.get("error_description")
+            )
             and db_provider is not None
         ):
             consent_app_id = payload.get("app_id")

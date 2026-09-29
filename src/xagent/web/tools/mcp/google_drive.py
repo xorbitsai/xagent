@@ -1720,8 +1720,11 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
             "supportsAllDrives": True,
             "fields": "id,name,mimeType,parents,webViewLink,trashed",
         }
-        if current_parents:
-            update_kwargs["removeParents"] = ",".join(current_parents)
+        parents_to_remove = [
+            parent for parent in current_parents if parent != resolved_destination_id
+        ]
+        if parents_to_remove:
+            update_kwargs["removeParents"] = ",".join(parents_to_remove)
 
         update_request = service.files().update(**update_kwargs)
         _attach_resource_keys(

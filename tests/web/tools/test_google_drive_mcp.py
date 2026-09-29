@@ -1655,7 +1655,7 @@ def test_move_file_reduces_legacy_multiple_parents(monkeypatch):
     assert result["status"] == "success"
     assert result["already_in_destination"] is False
     assert service.files.return_value.update.call_args.kwargs["removeParents"] == (
-        "folder1,folder2"
+        "folder2"
     )
 
 

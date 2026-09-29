@@ -30,6 +30,7 @@ interface OfficialMcpSettingsDialogProps {
   onConnectStart?: (app: AppIntegration) => void
   onConfigure?: (app: AppIntegration) => void
   onManageKey?: (app: AppIntegration) => void
+  onPickerOpenChange?: (open: boolean) => void
   // True while the parent-owned connect request for this app is in flight
   // (e.g. a keyless connect fired via onConnectStart). Disables the Connect
   // trigger so rapid double-clicks can't fire overlapping POSTs, and gives
@@ -49,6 +50,7 @@ export function OfficialMcpSettingsDialog({
   onConnectStart,
   onConfigure,
   onManageKey,
+  onPickerOpenChange,
   isConnecting = false
 }: OfficialMcpSettingsDialogProps) {
   const { token, inTeam } = useAuth()
@@ -259,6 +261,7 @@ export function OfficialMcpSettingsDialog({
                 // Picker's iframe, which is mounted outside DialogContent.
                 // Close this settings dialog before the browser Picker opens.
                 onBeforeOpen={() => onOpenChange(false)}
+                onPickerOpenChange={onPickerOpenChange}
               />
             )}
             {!isGloballyConnected && (

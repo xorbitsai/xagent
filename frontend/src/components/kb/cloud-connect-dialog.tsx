@@ -58,6 +58,7 @@ interface CloudConnectDialogProps {
   } | null
   initialSelectedFiles?: CloudFile[]
   onConfirm: (selectedFiles: CloudFile[]) => void
+  onPickerOpenChange?: (open: boolean) => void
 }
 
 export function CloudConnectDialog({
@@ -65,7 +66,8 @@ export function CloudConnectDialog({
   onOpenChange,
   provider,
   initialSelectedFiles = [],
-  onConfirm
+  onConfirm,
+  onPickerOpenChange,
 }: CloudConnectDialogProps) {
   const { t } = useI18n()
   const { token } = useAuth()
@@ -85,6 +87,12 @@ export function CloudConnectDialog({
   const [accountToDelete, setAccountToDelete] = useState<{ id: number | null, email: string | null }>({ id: null, email: null })
   const [isDeletingAccount, setIsDeletingAccount] = useState(false)
   const [pickerLoading, setPickerLoading] = useState(false)
+  const pickerOpenRef = useRef(false)
+
+  const setPickerOpen = useCallback((isOpen: boolean) => {
+    pickerOpenRef.current = isOpen
+    onPickerOpenChange?.(isOpen)
+  }, [onPickerOpenChange])
 
   // Helper to check if selected
   const isSelected = (id: string) => selectedFiles.some(f => f.id === id)
@@ -132,6 +140,7 @@ export function CloudConnectDialog({
     )
     if (!selectedAccount) return
 
+    setPickerOpen(true)
     setPickerLoading(true)
     try {
       const response = await apiRequest(
@@ -161,7 +170,11 @@ export function CloudConnectDialog({
 
       const docsView = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
         .setIncludeFolders(true)
-        .setSelectFolderEnabled(true)
+        // Folders remain available for navigation, but only files are
+        // selectable. `drive.file` does not reliably grant access to every
+        // child of a selected folder, so ingesting a folder would be
+        // misleading and would fail later for most users.
+        .setSelectFolderEnabled(false)
       const picker = new pickerApi.PickerBuilder()
         .setDeveloperKey(config.developer_key)
         .setAppId(config.app_id)
@@ -169,6 +182,7 @@ export function CloudConnectDialog({
         .addView(docsView)
         .enableFeature(pickerApi.Feature.MULTISELECT_ENABLED)
         .setCallback(data => {
+          setPickerOpen(false)
           if (data.action !== pickerApi.Action.PICKED) return
 
           const pickedFiles: CloudFile[] = []
@@ -214,6 +228,7 @@ export function CloudConnectDialog({
         .build()
       picker.setVisible(true)
     } catch (error) {
+      setPickerOpen(false)
       console.error("Failed to open Google Drive Picker", error)
       toast.error(error instanceof Error
         ? error.message
@@ -408,7 +423,14 @@ export function CloudConnectDialog({
 
   return (
     <Dialog modal={false} open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[900px] h-[80vh] max-h-[800px] flex flex-col">
+      <DialogContent
+        className="sm:max-w-[900px] h-[80vh] max-h-[800px] flex flex-col"
+        onInteractOutside={(event) => {
+          // The Google Picker is rendered in a separate portal. While it is
+          // open, an outside click belongs to the Picker, not this dialog.
+          if (pickerOpenRef.current) event.preventDefault()
+        }}
+      >
         <DialogHeader>
           <DialogTitle>
             {t("kb.dialog.cloudConnect.auth.title", {

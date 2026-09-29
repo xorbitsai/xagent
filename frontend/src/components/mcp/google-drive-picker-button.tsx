@@ -20,6 +20,7 @@ interface ConnectedAccount {
 interface GoogleDrivePickerButtonProps {
   connectedAccount?: string
   onBeforeOpen?: () => void
+  onPickerOpenChange?: (open: boolean) => void
 }
 
 /**
@@ -30,11 +31,13 @@ interface GoogleDrivePickerButtonProps {
 export function GoogleDrivePickerButton({
   connectedAccount,
   onBeforeOpen,
+  onPickerOpenChange,
 }: GoogleDrivePickerButtonProps) {
   const { t } = useI18n()
   const [loading, setLoading] = useState(false)
 
   const openPicker = async () => {
+    onPickerOpenChange?.(true)
     onBeforeOpen?.()
     setLoading(true)
     try {
@@ -84,7 +87,9 @@ export function GoogleDrivePickerButton({
 
       const docsView = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
         .setIncludeFolders(true)
-        .setSelectFolderEnabled(true)
+        // Keep folders available for navigation, but only authorize files.
+        // `drive.file` does not grant access to every child of a folder.
+        .setSelectFolderEnabled(false)
       const picker = new pickerApi.PickerBuilder()
         .setDeveloperKey(config.developer_key)
         .setAppId(config.app_id)
@@ -92,6 +97,7 @@ export function GoogleDrivePickerButton({
         .addView(docsView)
         .enableFeature(pickerApi.Feature.MULTISELECT_ENABLED)
         .setCallback(data => {
+          onPickerOpenChange?.(false)
           if (data.action !== pickerApi.Action.PICKED) return
           const selected = sanitizeGooglePickerDocuments(data.docs)
           if (selected.length > 0) {
@@ -101,6 +107,7 @@ export function GoogleDrivePickerButton({
         .build()
       picker.setVisible(true)
     } catch (error) {
+      onPickerOpenChange?.(false)
       console.error("Failed to open Google Drive Picker", error)
       toast.error(error instanceof Error
         ? error.message

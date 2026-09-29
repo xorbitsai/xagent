@@ -263,6 +263,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
   const [selectedCloudProvider, setSelectedCloudProvider] = useState<string | null>(null)
   const [isCloudConnecting, setIsCloudConnecting] = useState(false)
   const [isCloudDialogOpen, setIsCloudDialogOpen] = useState(false)
+  const [isCloudPickerOpen, setIsCloudPickerOpen] = useState(false)
   const [cloudSelections, setCloudSelections] = useState<Record<string, CloudFile[]>>({})
 
   const totalCloudFiles = Object.values(cloudSelections).reduce((acc, files) => acc + files.length, 0)
@@ -949,8 +950,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
   return (
     <>
-      <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="sm:max-w-[600px] max-h-[85vh] flex flex-col p-0 bg-slate-50">
+      <Dialog open={open} modal={!isCloudPickerOpen} onOpenChange={onOpenChange}>
+        <DialogContent
+          className="sm:max-w-[600px] max-h-[85vh] flex flex-col p-0 bg-slate-50"
+          onInteractOutside={(event) => {
+            // Google Picker is hosted in its own portal. Do not let the
+            // background knowledge-base dialog consume clicks or dismiss
+            // while that portal is active.
+            if (isCloudPickerOpen) event.preventDefault()
+          }}
+        >
           <div className="p-6 pb-0">
             <DialogHeader>
               <DialogTitle className="text-xl font-bold">{t("kb.dialog.createTitle")}</DialogTitle>
@@ -1564,6 +1573,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         initialSelectedFiles={
           selectedCloudProvider ? cloudSelections[selectedCloudProvider] || [] : []
         }
+        onPickerOpenChange={setIsCloudPickerOpen}
         onConfirm={(files) => {
           if (selectedCloudProvider) {
             setCloudSelections((prev) => ({

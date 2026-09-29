@@ -168,6 +168,7 @@ export function ConnectMcpDialog({
   const [activeStatus, setActiveStatus] = useState("all")
   const [apps, setApps] = useState<AppIntegration[]>([])
   const [selectedApp, setSelectedApp] = useState<AppIntegration | null>(null)
+  const [isGooglePickerOpen, setIsGooglePickerOpen] = useState(false)
   // Key-based (non-oauth) catalog connect: only the required secret(s) are editable.
   const [connectingKeyApp, setConnectingKeyApp] = useState<AppIntegration | null>(null)
   const [keyEnvValues, setKeyEnvValues] = useState<Record<string, string>>({})
@@ -1177,18 +1178,25 @@ export function ConnectMcpDialog({
     <>
     <Dialog
       open={open}
+      modal={!isGooglePickerOpen}
       onOpenChange={(nextOpen) => {
         // Radix's own Escape/outside-click dismissal — route it through the
         // same requestClose() every explicit close action uses, so this is
         // the only place the guard logic lives.
         if (!nextOpen) {
+          if (isGooglePickerOpen) return
           requestClose()
           return
         }
         onOpenChange(nextOpen)
       }}
     >
-      <DialogContent className="sm:max-w-5xl md:max-w-6xl w-[95vw] h-[85vh] flex flex-col p-0 overflow-hidden gap-0 bg-slate-50">
+      <DialogContent
+        className="sm:max-w-5xl md:max-w-6xl w-[95vw] h-[85vh] flex flex-col p-0 overflow-hidden gap-0 bg-slate-50"
+        onInteractOutside={(event) => {
+          if (isGooglePickerOpen) event.preventDefault()
+        }}
+      >
         <DialogHeader className="px-6 py-4 border-b bg-white shrink-0 pr-10">
           <DialogTitle className="text-xl flex items-center gap-2 font-bold text-left">
             <Plug className="h-5 w-5 text-blue-600 shrink-0" /> {t('tools.mcp.dialog.connector')}
@@ -1767,6 +1775,7 @@ export function ConnectMcpDialog({
           setSelectedApp(null);
           openKeyConnect(appToManage);
         }}
+        onPickerOpenChange={setIsGooglePickerOpen}
         onConfigure={(appToConfigure) => {
           if (!appToConfigure.is_custom || !Number.isInteger(appToConfigure.server_id)) {
             return

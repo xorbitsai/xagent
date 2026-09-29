@@ -435,6 +435,7 @@ def _microsoft_admin_consent_error(error_description: str | None) -> bool:
     match = re.search(r"\b(AADSTS\d+)\b", error_description.upper())
     return bool(match and match.group(1) in _MICROSOFT_ADMIN_CONSENT_ERROR_CODES)
 
+
 # How long a minted admin-consent handoff link stays valid. Deliberately
 # generous (not the 10-minute lifetime of an ordinary oauth_state): the
 # whole point of this link is to be forwarded to an org administrator, who

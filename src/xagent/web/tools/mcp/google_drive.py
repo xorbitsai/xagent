@@ -1631,10 +1631,13 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
     Google Drive/Docs/Slides URLs.  The operation preserves the file's
     presentation/document ID; it only changes its parent folder.  The source
     and destination are read before the update so malformed inputs and
-    non-folder destinations fail without mutating anything, and the updated
-    parents are read back before reporting success.
+    non-folder destinations fail without mutating anything. The update response
+    is validated before reporting success.
 
-    This requires the connected account to have permission to move the item.
+    Moving can change who can access the item because it may inherit permissions
+    from the destination folder or shared drive. Confirm the destination and this
+    access change with the user before calling this tool. This also requires the
+    connected account to have permission to move the item.
     For ``drive.file`` accounts, the item and destination folder must first be
     selected through Google's file picker or created by Xagent.
     """
@@ -1647,19 +1650,13 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
         destination_resource_key = _extract_resource_key(destination_folder_id)
 
         if resolved_file_id == requested_destination_id:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "message": "A file or folder cannot be moved into itself.",
-                },
-                ensure_ascii=False,
-            )
+            raise ValueError("A file or folder cannot be moved into itself.")
 
         service = get_drive_service()
         source_get = service.files().get(
             fileId=resolved_file_id,
             supportsAllDrives=True,
-            fields="id,name,webViewLink,mimeType,parents,driveId,trashed",
+            fields="id,name,webViewLink,mimeType,parents,trashed",
         )
         _attach_resource_keys(source_get, [(resolved_file_id, source_resource_key)])
         source = source_get.execute()
@@ -1672,7 +1669,7 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
         destination_get = service.files().get(
             fileId=requested_destination_id,
             supportsAllDrives=True,
-            fields="id,name,mimeType,driveId,trashed",
+            fields="id,name,mimeType,shortcutDetails,trashed",
         )
         _attach_resource_keys(
             destination_get,
@@ -1680,7 +1677,13 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
         )
         destination = destination_get.execute()
 
-        if destination.get("mimeType") != "application/vnd.google-apps.folder":
+        destination_mime_type = destination.get("mimeType")
+        if destination_mime_type == "application/vnd.google-apps.shortcut":
+            raise ValueError(
+                "destination_folder_id must refer to a Drive folder; "
+                "folder shortcuts are not accepted"
+            )
+        if destination_mime_type != "application/vnd.google-apps.folder":
             raise ValueError("destination_folder_id must refer to a Drive folder")
         if destination.get("trashed"):
             raise ValueError("destination_folder_id refers to a trashed folder")
@@ -1688,20 +1691,18 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
         if not isinstance(resolved_destination_id, str) or not resolved_destination_id:
             raise RuntimeError("Drive returned an invalid destination folder id")
         if resolved_file_id == resolved_destination_id:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "message": "A file or folder cannot be moved into itself.",
-                },
-                ensure_ascii=False,
-            )
+            raise ValueError("A file or folder cannot be moved into itself.")
 
-        current_parents = source.get("parents", [])
+        current_parents = source.get("parents")
         if not isinstance(current_parents, list) or not all(
             isinstance(parent, str) for parent in current_parents
         ):
             raise ValueError("Drive returned an invalid parents list for file_id")
-        if resolved_destination_id in current_parents:
+        if not current_parents:
+            raise ValueError(
+                "Drive did not return the current parent folder for file_id"
+            )
+        if current_parents == [resolved_destination_id]:
             return json.dumps(
                 {
                     "status": "success",
@@ -1717,7 +1718,7 @@ def google_drive_move_file(file_id: str, destination_folder_id: str) -> str:
             "body": {},
             "addParents": resolved_destination_id,
             "supportsAllDrives": True,
-            "fields": "id,name,mimeType,parents,driveId,webViewLink,trashed",
+            "fields": "id,name,mimeType,parents,webViewLink,trashed",
         }
         if current_parents:
             update_kwargs["removeParents"] = ",".join(current_parents)

@@ -1320,6 +1320,7 @@ def test_move_file_updates_parents(monkeypatch):
                     }
                 ),
             ]
+            self.used_get_requests = []
             self.update_request = _Request(
                 {
                     "id": "file1",
@@ -1333,6 +1334,7 @@ def test_move_file_updates_parents(monkeypatch):
         def get(self, **kwargs):
             request = self.get_requests.pop(0)
             request.kwargs = kwargs
+            self.used_get_requests.append(request)
             return request
 
         def update(self, **kwargs):
@@ -1353,6 +1355,15 @@ def test_move_file_updates_parents(monkeypatch):
     assert files.update_request.kwargs["removeParents"] == "root"
     assert files.update_request.kwargs["supportsAllDrives"] is True
     assert files.get_requests == []
+    assert [request.kwargs["fileId"] for request in files.used_get_requests] == [
+        "file1",
+        "folder1",
+    ]
+    assert all(
+        request.kwargs["supportsAllDrives"] is True
+        for request in files.used_get_requests
+    )
+    assert all(request.headers == {} for request in files.used_get_requests)
     assert "webViewLink" in files.update_request.kwargs["fields"]
     assert "trashed" in files.update_request.kwargs["fields"]
 
@@ -1539,12 +1550,19 @@ def test_move_file_attaches_both_resource_keys_to_update(monkeypatch):
     )
 
     assert result["status"] == "success"
+    get_calls = service.files.return_value.get.call_args_list
+    assert [call.kwargs["fileId"] for call in get_calls] == ["file1", "folder1"]
+    assert all(call.kwargs["supportsAllDrives"] is True for call in get_calls)
+    assert source_request.headers == {"X-Goog-Drive-Resource-Keys": "file1/source-key"}
+    assert destination_request.headers == {
+        "X-Goog-Drive-Resource-Keys": "folder1/destination-key"
+    }
     assert update_request.headers == {
         "X-Goog-Drive-Resource-Keys": "file1/source-key,folder1/destination-key"
     }
 
 
-@pytest.mark.parametrize("invalid_parents", [None, "root", ["root", 1]])
+@pytest.mark.parametrize("invalid_parents", [None, "root", [], ["root", 1]])
 def test_move_file_rejects_invalid_source_parents(monkeypatch, invalid_parents):
     service = _mock_drive_service(monkeypatch)
     source_request = service.files.return_value.get.return_value
@@ -1569,7 +1587,7 @@ def test_move_file_rejects_invalid_source_parents(monkeypatch, invalid_parents):
     result = json.loads(google_drive.google_drive_move_file("file1", "folder1"))
 
     assert result["status"] == "error"
-    assert "parents" in result["message"]
+    assert "parent" in result["message"]
     service.files.return_value.update.assert_not_called()
 
 
@@ -1598,6 +1616,76 @@ def test_move_file_is_idempotent_when_already_in_destination(monkeypatch):
 
     assert result["status"] == "success"
     assert result["already_in_destination"] is True
+    service.files.return_value.update.assert_not_called()
+
+
+def test_move_file_reduces_legacy_multiple_parents(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = service.files.return_value.get.return_value
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["folder1", "folder2"],
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "folder1",
+        "name": "Testing Files",
+        "mimeType": "application/vnd.google-apps.folder",
+        "trashed": False,
+    }
+    update_request = Mock()
+    update_request.headers = {}
+    update_request.execute.return_value = {
+        "id": "file1",
+        "name": "deck",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["folder1"],
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+    service.files.return_value.update.return_value = update_request
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "folder1"))
+
+    assert result["status"] == "success"
+    assert result["already_in_destination"] is False
+    assert service.files.return_value.update.call_args.kwargs["removeParents"] == (
+        "folder1,folder2"
+    )
+
+
+def test_move_file_rejects_folder_shortcut_destination(monkeypatch):
+    service = _mock_drive_service(monkeypatch)
+    source_request = service.files.return_value.get.return_value
+    source_request.headers = {}
+    source_request.execute.return_value = {
+        "id": "file1",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "parents": ["folder0"],
+        "trashed": False,
+    }
+    destination_request = Mock()
+    destination_request.headers = {}
+    destination_request.execute.return_value = {
+        "id": "shortcut1",
+        "mimeType": "application/vnd.google-apps.shortcut",
+        "shortcutDetails": {
+            "targetId": "folder1",
+            "targetMimeType": "application/vnd.google-apps.folder",
+        },
+        "trashed": False,
+    }
+    service.files.return_value.get.side_effect = [source_request, destination_request]
+
+    result = json.loads(google_drive.google_drive_move_file("file1", "shortcut1"))
+
+    assert result["status"] == "error"
+    assert "shortcuts are not accepted" in result["message"]
     service.files.return_value.update.assert_not_called()
 
 

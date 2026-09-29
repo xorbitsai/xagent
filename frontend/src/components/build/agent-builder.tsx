@@ -748,9 +748,21 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }, [resetPreviewSession])
 
+  // Save/reload re-creates arrays and model objects without necessarily changing
+  // execution config. Compare the values sent to preview, not their references.
+  const previewConfigKey = JSON.stringify({
+    instructions,
+    executionMode,
+    models: [modelConfig.general, modelConfig.small_fast, modelConfig.visual, modelConfig.compact]
+      .map(id => id ? String(id) : null),
+    knowledgeBases: [...selectedKbs].sort(),
+    skills: [...selectedSkills].sort(),
+    toolCategories: [...new Set(buildToolCategories())].sort(),
+  })
+
   useEffect(() => {
     invalidatePreviewTask()
-  }, [instructions, executionMode, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, invalidatePreviewTask])
+  }, [previewConfigKey, invalidatePreviewTask])
 
   // Fetch Data
   useEffect(() => {

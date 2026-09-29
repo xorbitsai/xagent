@@ -353,6 +353,53 @@ describe("AgentBuilder preview", () => {
       expect(step.querySelector("svg") !== null).toBe(complete)
     }
 
+    it.each(["edit", "create"])("preserves a completed preview after saving in %s mode", async (mode) => {
+      const baseImpl = apiRequestMock.getMockImplementation()!
+      let createdAgent: Record<string, unknown> | undefined
+      apiRequestMock.mockImplementation((url: string, init?: RequestInit) => {
+        if (url.endsWith("/api/agents") && init?.method === "POST") {
+          createdAgent = { ...JSON.parse(init.body as string), id: 43, team_id: null, can_edit: true, status: "draft", logo_url: null }
+          return Promise.resolve(new Response(JSON.stringify(createdAgent)))
+        }
+        if (url.endsWith("/api/agents/43")) {
+          return Promise.resolve(new Response(JSON.stringify(createdAgent)))
+        }
+        if (url.endsWith("/api/agents/43/triggers")) {
+          return Promise.resolve(new Response("[]"))
+        }
+        return baseImpl(url, init)
+      })
+      const builder = () => <AgentBuilder agentId={mode === "edit" ? "42" : undefined} />
+      const { rerender } = render(builder())
+      if (mode === "edit") {
+        await screen.findByDisplayValue("Existing SSH agent")
+      } else {
+        fireEvent.change(await screen.findByPlaceholderText("builds.configForm.name.placeholder"), { target: { value: "New preview agent" } })
+        const editor = document.querySelector("[contenteditable]") as HTMLElement
+        editor.textContent = "Saved instructions"
+        fireEvent.input(editor)
+      }
+      // Let the default model finish loading before attempting the preview.
+      await waitFor(() => {
+        if (!sendMessageMock.mock.calls.length) fireEvent.click(screen.getByText("send-preview-message"))
+        expect(sendMessageMock).toHaveBeenCalled()
+      })
+      previewState = { messages: [{ role: "user" }], currentTask: { id: "123", status: "completed" }, taskId: 123, isProcessing: false }
+      rerender(builder())
+      expectPreviewComplete(true)
+      if (mode === "edit") {
+        // Update is disabled for a clean form; renaming enables it without changing execution config.
+        fireEvent.change(screen.getByDisplayValue("Existing SSH agent"), { target: { value: "Renamed preview agent" } })
+      }
+      fireEvent.click(screen.getByText(`builds.editor.header.${mode === "edit" ? "update" : "create"}`))
+      await waitFor(() => expect(screen.getByText("builds.editor.header.update")).toBeDisabled())
+      if (mode === "create") {
+        await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/agents/43"))
+        fireEvent.click(screen.getByText("common.cancel"))
+      }
+      expectPreviewComplete(true)
+    })
+
     it.each(["pending", "running", "failed", "paused", "waiting_for_user"] as const)(
       "does not count a user message on a %s task as a completed preview",
       async (status) => {

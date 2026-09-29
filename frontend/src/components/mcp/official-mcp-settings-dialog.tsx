@@ -254,7 +254,7 @@ export function OfficialMcpSettingsDialog({
           </p>
 
           <div className="flex flex-col items-center justify-center gap-3 w-full">
-            {isGloballyConnected && app.id === "google-drive" && (
+            {isGloballyConnected && app.id === "google-drive" && app.picker_configured !== false && (
               <GoogleDrivePickerButton
                 connectedAccount={app.connected_account}
                 // Radix's modal focus trap/pointer lock can interfere with

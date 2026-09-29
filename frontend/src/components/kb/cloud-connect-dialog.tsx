@@ -87,6 +87,7 @@ export function CloudConnectDialog({
   const [accountToDelete, setAccountToDelete] = useState<{ id: number | null, email: string | null }>({ id: null, email: null })
   const [isDeletingAccount, setIsDeletingAccount] = useState(false)
   const [pickerLoading, setPickerLoading] = useState(false)
+  const [pickerLimitWarning, setPickerLimitWarning] = useState(false)
   const pickerOpenRef = useRef(false)
 
   const setPickerOpen = useCallback((isOpen: boolean) => {
@@ -147,9 +148,12 @@ export function CloudConnectDialog({
         `${getApiUrl()}/api/cloud/google-drive/picker-config?account_id=${selectedAccount.id}`,
       )
       if (!response.ok) {
+        if (response.status === 401) setCloudUser(undefined)
         throw new Error(
-          response.status === 401 || response.status === 409
+          response.status === 401
             ? t("kb.dialog.cloudConnect.auth.expired")
+            : response.status === 409
+              ? t("kb.dialog.cloudConnect.picker.reconnect")
             : response.status === 503
               ? t("kb.dialog.cloudConnect.picker.notConfigured")
               : t("kb.dialog.cloudConnect.picker.error"),
@@ -170,6 +174,7 @@ export function CloudConnectDialog({
 
       const docsView = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
         .setIncludeFolders(true)
+        .setEnableDrives(true)
         // Folders remain available for navigation, but only files are
         // selectable. `drive.file` does not reliably grant access to every
         // child of a selected folder, so ingesting a folder would be
@@ -216,9 +221,7 @@ export function CloudConnectDialog({
                 (file, index, all) => all.findIndex(item => item.id === file.id) === index,
               )
               if (unique.length > MAX_CLOUD_INGEST_FILES) {
-                toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
-                  count: MAX_CLOUD_INGEST_FILES,
-                }))
+                setPickerLimitWarning(true)
               }
               return unique.slice(0, MAX_CLOUD_INGEST_FILES)
             })
@@ -365,6 +368,14 @@ export function CloudConnectDialog({
     }
     prevOpen.current = open
   }, [open, initialSelectedFiles])
+
+  useEffect(() => {
+    if (!pickerLimitWarning) return
+    toast.error(t("kb.dialog.cloudConnect.selectedFiles.limitReached", {
+      count: MAX_CLOUD_INGEST_FILES,
+    }))
+    setPickerLimitWarning(false)
+  }, [pickerLimitWarning, t])
 
   // Reset current path when drive changes
   useEffect(() => {

@@ -13,6 +13,10 @@ export interface AppIntegration {
   server_id?: number
   transport?: string
   connected_account?: string
+  // Whether the deployment has configured the browser-facing Google Picker
+  // key. The connector still works for files created by Xagent when false;
+  // only the existing-file authorization button is hidden.
+  picker_configured?: boolean
   is_custom?: boolean
   // Canonical connect classification derived on the catalog entry by the
   // backend (mcp_apps.classify_app_auth). Read this instead of re-deriving

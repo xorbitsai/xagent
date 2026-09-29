@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import secrets
 import shlex
 from collections.abc import Collection, Sequence
@@ -2940,6 +2941,14 @@ def list_mcp_apps(
             app_copy["user_env_configured"] = app_user_env
             app_copy["configured_env_keys"] = app_configured_keys
             app_copy["env_source"] = app_env_source
+            if app.get("id") == "google-drive":
+                # The connector itself remains useful for files created by
+                # Xagent, but the existing-file authorization affordance must
+                # not be shown when its browser-facing Picker key is absent.
+                # Otherwise every click predictably ends in a 503.
+                app_copy["picker_configured"] = bool(
+                    os.environ.get("GOOGLE_PICKER_API_KEY", "").strip()
+                )
 
             if is_connected:
                 app_copy["server_id"] = server_id

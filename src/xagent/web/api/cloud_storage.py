@@ -2,7 +2,7 @@
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -30,6 +30,7 @@ cloud_router = APIRouter(prefix="/api/cloud", tags=["Cloud Storage"])
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 GOOGLE_DRIVE_SCOPE_PREFIX = "https://www.googleapis.com/auth/drive"
+GOOGLE_TOKEN_REFRESH_SKEW = timedelta(minutes=5)
 
 
 def _google_credentials_expiry(value: datetime | None) -> datetime | None:
@@ -51,6 +52,20 @@ def _google_database_expiry(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _google_token_needs_refresh(creds: Credentials) -> bool:
+    """Refresh a token before Picker/Drive calls get close to its expiry."""
+    if creds.expired:
+        return True
+    expiry_value = getattr(creds, "expiry", None)
+    if expiry_value is None:
+        return False
+    expiry = _google_credentials_expiry(expiry_value)
+    if expiry is None:
+        return False
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return expiry - now <= GOOGLE_TOKEN_REFRESH_SKEW
 
 
 def get_google_oauth_config(db: Session) -> tuple[Optional[str], Optional[str]]:
@@ -117,8 +132,10 @@ def get_google_credentials(
         ),
     )
 
-    # Check if token needs refresh
-    if creds.expired:
+    # Refresh with a safety margin: the Picker request and user interaction
+    # can consume several minutes, so returning a token that is technically
+    # valid but close to expiry creates an avoidable mid-flow failure.
+    if _google_token_needs_refresh(creds):
         if not creds.refresh_token:
             raise HTTPException(
                 status_code=401,
@@ -192,19 +209,10 @@ async def get_google_drive_picker_config(
     token is scoped to the authenticated user and expires normally.
     """
     response.headers["Cache-Control"] = "no-store"
-    creds = get_google_credentials(cast(int, user.id), db, account_id)
-    granted_scopes = set(creds.scopes or ())
-    drive_scopes = {
-        scope for scope in granted_scopes if scope.startswith(GOOGLE_DRIVE_SCOPE_PREFIX)
-    }
-    if drive_scopes != {GOOGLE_DRIVE_FILE_SCOPE}:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This Google Drive connection uses an outdated permission. "
-                "Reconnect it before opening Google Drive Picker."
-            ),
-        )
+
+    # Fail closed before touching account credentials. An unconfigured
+    # deployment should consistently report 503 rather than leaking account
+    # state through a 401/409 response.
     client_id, _ = get_google_oauth_config(db)
     client_id = client_id or os.environ.get("GOOGLE_CLIENT_ID")
 
@@ -228,6 +236,20 @@ async def get_google_drive_picker_config(
             detail=(
                 "Google Drive Picker is not configured. Set "
                 "GOOGLE_PICKER_API_KEY and GOOGLE_PICKER_APP_ID."
+            ),
+        )
+
+    creds = get_google_credentials(cast(int, user.id), db, account_id)
+    granted_scopes = set(creds.scopes or ())
+    drive_scopes = {
+        scope for scope in granted_scopes if scope.startswith(GOOGLE_DRIVE_SCOPE_PREFIX)
+    }
+    if drive_scopes != {GOOGLE_DRIVE_FILE_SCOPE}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Google Drive connection uses an outdated permission. "
+                "Reconnect it before opening Google Drive Picker."
             ),
         )
 

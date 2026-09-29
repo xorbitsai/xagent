@@ -2319,6 +2319,7 @@ Build when you need.`,
         picker: {
           open: "Choose files with Google Picker",
           authorized: "Google Drive files authorized",
+          reconnect: "Google Drive permission is outdated. Reconnect the account before using Picker.",
           notConfigured: "Google Drive Picker is not configured",
           error: "Google Drive Picker could not be opened",
         },

@@ -46,14 +46,19 @@ export function GoogleDrivePickerButton({
       )
       if (!accountsResponse.ok) {
         throw new Error(
-          accountsResponse.status === 401 || accountsResponse.status === 409
+          accountsResponse.status === 401
             ? t("kb.dialog.cloudConnect.auth.expired")
             : t("kb.dialog.cloudConnect.picker.error"),
         )
       }
       const accounts = await accountsResponse.json() as ConnectedAccount[]
       const account = connectedAccount
-        ? accounts.find(item => item.email === connectedAccount)
+        ? accounts
+            .filter(item => item.email === connectedAccount)
+            .reduce<ConnectedAccount | undefined>(
+              (latest, item) => !latest || item.id > latest.id ? item : latest,
+              undefined,
+            )
         : accounts.reduce<ConnectedAccount | undefined>(
             (latest, item) => !latest || item.id > latest.id ? item : latest,
             undefined,
@@ -65,8 +70,10 @@ export function GoogleDrivePickerButton({
       )
       if (!configResponse.ok) {
         throw new Error(
-          configResponse.status === 401 || configResponse.status === 409
+          configResponse.status === 401
             ? t("kb.dialog.cloudConnect.auth.expired")
+            : configResponse.status === 409
+              ? t("kb.dialog.cloudConnect.picker.reconnect")
             : configResponse.status === 503
               ? t("kb.dialog.cloudConnect.picker.notConfigured")
               : t("kb.dialog.cloudConnect.picker.error"),
@@ -87,6 +94,7 @@ export function GoogleDrivePickerButton({
 
       const docsView = new pickerApi.DocsView(pickerApi.ViewId.DOCS)
         .setIncludeFolders(true)
+        .setEnableDrives(true)
         // Keep folders available for navigation, but only authorize files.
         // `drive.file` does not grant access to every child of a folder.
         .setSelectFolderEnabled(false)

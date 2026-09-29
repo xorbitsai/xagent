@@ -17,6 +17,7 @@ interface GooglePickerData {
 interface GooglePickerView {
   setIncludeFolders(includeFolders: boolean): GooglePickerView
   setSelectFolderEnabled(selectFolderEnabled: boolean): GooglePickerView
+  setEnableDrives(enableDrives: boolean): GooglePickerView
 }
 
 interface GooglePickerBuilder {

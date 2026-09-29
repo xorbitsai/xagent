@@ -471,6 +471,7 @@ def _element_text(element: dict[str, Any]) -> str:
     text_elements = element.get("shape", {}).get("text", {}).get("textElements", [])
     own_text = "".join(
         text_element.get("textRun", {}).get("content", "")
+        or text_element.get("autoText", {}).get("content", "")
         for text_element in text_elements
     )
     grouped_text = "".join(
@@ -677,12 +678,12 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
             payload: dict[str, Any] = {
                 "status": "validation_failed",
                 "message": message,
-                "presentation_id": presentation_id,
                 "title": presentation.get("title") or resolved_title,
-                "link": link,
                 **details,
             }
             if not cleanup_succeeded:
+                payload["presentation_id"] = presentation_id
+                payload["link"] = link
                 payload["cleanup_failed"] = True
             return json.dumps(payload, ensure_ascii=False)
 
@@ -814,9 +815,9 @@ def google_slides_add_slide(
     When the presentation was created with google_slides_create_presentation,
     pass its returned default_slide_id when this call may run in another MCP
     process. The known default page is removed even if other pages were added
-    before this call. Without an id, the first empty page is treated as
-    Google's default page and removed after the new slide is created. Set
-    preserve_blank_slide=True when an intentional blank page must be retained.
+    before this call. Without an id, cleanup is limited to a presentation with
+    exactly one empty page; an empty page in a multi-page deck is preserved.
+    Set preserve_blank_slide=True when that sole empty page is intentional.
 
     To fix a slide this call already created (wrong/missing text), use
     google_slides_update_slide with its slide_id — do NOT call
@@ -867,6 +868,12 @@ def google_slides_add_slide(
                 "detail text in 'body' — don't create the slide "
                 "with just a title."
             )
+        if normalized_layout == "BLANK" and not title.strip() and not body.strip():
+            return _error(
+                "layout 'BLANK' creates no content by itself; use "
+                "google_slides_batch_update to add custom content in the same "
+                "workflow"
+            )
         if (
             title_placeholder is not None
             and not body_required
@@ -893,8 +900,8 @@ def google_slides_add_slide(
         # current pages before creating the next real page, then delete that
         # default only after the new page has been created in this same atomic
         # batch. A known id can identify the default even after other pages
-        # were added; without one, the first empty page is the stateless
-        # fallback unless the caller explicitly asks to preserve it.
+        # were added; without one, only a sole empty page is considered the
+        # default, so user content in a multi-page deck is never guessed away.
         existing: dict[str, Any] = {"slides": []}
         if candidate_default_slide_id or not preserve_blank_slide:
             existing = service.presentations().get(presentationId=pres_id).execute()
@@ -917,10 +924,10 @@ def google_slides_add_slide(
                         # The caller used the page before asking us to append
                         # a slide, so it is no longer the untouched default.
                         _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
-            elif existing_slides and _slide_is_empty(existing_slides[0]):
-                # Google creates its default page at index 0. With no
-                # cross-process id available, only remove that first empty
-                # page; an empty page elsewhere is user content.
+            elif len(existing_slides) == 1 and _slide_is_empty(existing_slides[0]):
+                # Without a cross-process id, the only safe inference is a
+                # presentation whose sole page is empty. Never infer that a
+                # blank page in a multi-page deck is Google's default.
                 slide_to_remove = existing_slides[0].get("objectId")
 
         slide_id = f"slide_{uuid.uuid4().hex[:12]}"
@@ -1137,6 +1144,9 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
     requests_json must be a JSON array of request objects following the Slides API
     schema (e.g. createShape, insertText, updateTextStyle, createImage).
     Use this only when the simpler tools cannot express the required change.
+    When following google_slides_create_presentation across MCP processes, use
+    the returned default_slide_id in a deleteObject request after creating the
+    first content slide; this tool cannot infer that id from a later session.
     """
     try:
         pres_id = _resolve_presentation_id(presentation_id)

@@ -34,8 +34,15 @@ simple text/layout edits and do not preserve visual design.
 For simple Google Slides layout edits, pass the `default_slide_id` returned by
 `google_slides_create_presentation` to the first `google_slides_add_slide` call
 when calls may cross MCP processes. Without the id, the connector removes the
-first empty page as the default page; pass `preserve_blank_slide=true` when that
-page is intentional.
+sole empty page as the default page; an empty page in a multi-page deck is
+preserved. Pass `preserve_blank_slide=true` when that sole page is intentional.
+The `BLANK` layout does not create an empty slide by itself; use
+`google_slides_batch_update` to add custom content.
+
+When using `google_slides_batch_update` after `google_slides_create_presentation`,
+the connector cannot infer the default page across MCP processes. Include a
+`deleteObject` request for the returned `default_slide_id` after creating the
+first content page, or use `google_slides_add_slide` with that ID.
 
 ## ⚠️ CRITICAL REQUIREMENTS - READ FIRST
 

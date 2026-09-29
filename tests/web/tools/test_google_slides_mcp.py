@@ -586,10 +586,8 @@ def test_add_slide_allows_whitespace_only_body_on_layout_without_body_placeholde
     assert result["status"] == "success"
 
 
-def test_add_slide_allows_whitespace_only_title_on_blank_layout(monkeypatch):
-    """Regression guard, symmetric with the above: BLANK has no title
-    placeholder either, and a whitespace-only title must not be
-    hard-rejected when it would be treated as absent anyway."""
+def test_add_slide_rejects_whitespace_only_content_on_blank_layout(monkeypatch):
+    """BLANK cannot create an empty page; use batch_update for custom content."""
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
@@ -598,7 +596,9 @@ def test_add_slide_allows_whitespace_only_title_on_blank_layout(monkeypatch):
         google_slides.google_slides_add_slide("pres1", title="   ", layout="BLANK")
     )
 
-    assert result["status"] == "success"
+    assert result["status"] == "error"
+    assert "creates no content by itself" in result["message"]
+    presentations.batchUpdate.assert_not_called()
 
 
 def test_add_slide_rejects_missing_body_for_content_layout(monkeypatch):
@@ -754,22 +754,19 @@ def test_add_slide_blank_layout_rejects_body_alone(monkeypatch):
     presentations.batchUpdate.assert_not_called()
 
 
-def test_add_slide_blank_layout_allows_empty_and_omits_placeholder_mappings(
+def test_add_slide_blank_layout_rejects_empty_slide(
     monkeypatch,
 ):
-    """BLANK is meant to be empty (custom content is added afterwards via
-    google_slides_batch_update); the empty-slide guard must not reject it,
-    and createSlide should omit placeholderIdMappings rather than sending
-    an empty list."""
+    """BLANK has no content primitive; callers must use batch_update to add
+    custom content instead of creating an unidentifiable empty page."""
     presentations = Mock()
-    presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(google_slides.google_slides_add_slide("pres1", layout="BLANK"))
 
-    assert result["status"] == "success"
-    requests = _batch_update_requests(presentations)
-    assert "placeholderIdMappings" not in requests[0]["createSlide"]
+    assert result["status"] == "error"
+    assert "creates no content by itself" in result["message"]
+    presentations.batchUpdate.assert_not_called()
 
 
 def test_add_slide_resolves_full_presentation_url(monkeypatch):
@@ -1783,7 +1780,7 @@ def test_add_slide_removes_known_default_slide_when_other_slides_exist(monkeypat
     }
 
 
-def test_add_slide_removes_first_blank_slide_without_id_after_other_slide_added(
+def test_add_slide_preserves_first_blank_slide_without_id_when_other_pages_exist(
     monkeypatch,
 ):
     presentations = Mock()
@@ -1806,10 +1803,10 @@ def test_add_slide_removes_first_blank_slide_without_id_after_other_slide_added(
     )
 
     assert result["status"] == "success"
-    assert result["default_slide_removed"] is True
-    assert _batch_update_requests(presentations)[-1] == {
-        "deleteObject": {"objectId": "p"}
-    }
+    assert result["default_slide_removed"] is False
+    assert not any(
+        "deleteObject" in request for request in _batch_update_requests(presentations)
+    )
 
 
 def test_add_slide_keeps_untracked_intentional_blank_slide(monkeypatch):
@@ -2042,6 +2039,8 @@ def test_import_pptx_rejects_empty_slide_after_conversion(monkeypatch, tmp_path)
 
     assert result["status"] == "validation_failed"
     assert result["empty_slide_numbers"] == [1]
+    assert "presentation_id" not in result
+    assert "link" not in result
     drive.files.return_value.delete.assert_called_once_with(
         fileId="pres1", supportsAllDrives=True
     )
@@ -2063,6 +2062,18 @@ def test_element_text_reads_grouped_shapes():
     }
 
     assert google_slides._element_text(element) == "Grouped text"
+
+
+def test_element_text_reads_auto_text_content():
+    element = {
+        "shape": {
+            "text": {
+                "textElements": [{"autoText": {"type": "SLIDE_NUMBER", "content": "3"}}]
+            }
+        }
+    }
+
+    assert google_slides._element_text(element) == "3"
 
 
 def test_import_pptx_allows_intentional_blank_source_slide(monkeypatch, tmp_path):

@@ -2143,6 +2143,7 @@ def _load_historical_stream_snapshot_sync(
                     "description": task.description,
                     "status": task.status.value,
                     "model_id": model_id,
+                    "completion_outcome": task.completion_outcome,
                     "small_fast_model_id": small_fast_model_id,
                     "visual_model_id": visual_model_id,
                     "compact_model_id": compact_model_id,

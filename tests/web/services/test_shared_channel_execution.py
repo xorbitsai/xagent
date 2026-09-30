@@ -209,6 +209,7 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         task=SimpleNamespace(user_id=selected.selection.user_id, source="internal"),
         conversation_history=(),
         conversation_watermark=None,
+        conversation_event_watermark=None,
         execution_recovery=TaskExecutionRecoverySnapshot(),
     )
     monkeypatch.setattr(

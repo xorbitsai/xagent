@@ -1,4 +1,9 @@
 const en = {
+  taskCompletion: {
+    completed: "Completed",
+    partial: "Partially completed — see the answer for what is still missing.",
+    blocked: "Blocked — see the answer for what is needed to continue.",
+  },
   sharedStream: { interrupted: "Live updates were interrupted. The displayed answer may be incomplete; saved results will appear when available." },
   clientErrors: {
     executionQueueFull: "The team execution queue is full. Please retry shortly.",

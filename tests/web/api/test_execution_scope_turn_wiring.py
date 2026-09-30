@@ -104,6 +104,7 @@ def _bg_patches(db: Any) -> list[Any]:
         agent=None,
         conversation_history=(),
         conversation_watermark=None,
+        conversation_event_watermark=None,
         execution_recovery=SimpleNamespace(messages=(), selected_skill_name=None),
     )
 
@@ -364,6 +365,7 @@ async def test_bg_turn_resolves_scope_before_loading_snapshot_off_loop() -> None
             agent=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=SimpleNamespace(messages=(), selected_skill_name=None),
         )
 

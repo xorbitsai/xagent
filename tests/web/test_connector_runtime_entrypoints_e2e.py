@@ -494,7 +494,11 @@ class _FakeAgentService:
         pass
 
     def set_conversation_history(
-        self, _messages: list[Any], *, watermark: int | None = None
+        self,
+        _messages: list[Any],
+        *,
+        watermark: int | None = None,
+        event_watermark: dict[str, Any] | None = None,
     ) -> None:
         pass
 

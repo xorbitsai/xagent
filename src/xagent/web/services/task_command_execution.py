@@ -978,6 +978,7 @@ def _load_task_command_routing_snapshot(
             "title": task.title,
             "description": task.description,
             "status": status.value,
+            "completion_outcome": task.completion_outcome,
             "model_id": model_id,
             "small_fast_model_id": small_fast_model_id,
             "visual_model_id": visual_model_id,

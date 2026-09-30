@@ -915,6 +915,7 @@ def acquire_task_lease_no_commit(
     running_control_state = control_state_for_status(TaskStatus.RUNNING).value
     values: dict[str, Any] = {
         "status": task_status_predicate.value(TaskStatus.RUNNING),
+        "completion_outcome": None,
         "runner_id": runner,
         "last_heartbeat_at": now,
         "lease_expires_at": expires_at,

@@ -794,6 +794,7 @@ class TranscriptWindow:
 
     messages: List[Dict[str, Any]]
     watermark: Optional[int]
+    event_watermark: dict[str, Any] | None = None
 
 
 def _latest_compact_summary(
@@ -904,6 +905,15 @@ def load_task_transcript_window(
     *,
     before_message_id: Optional[int] = None,
 ) -> TranscriptWindow:
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        from .task_event_context_service import load_task_event_context
+
+        context = load_task_event_context(
+            db, task_id, before_message_id=before_message_id
+        )
+        return TranscriptWindow(context.messages, None, context.watermark)
     if before_message_id is not None:
         # Check if the reference message actually exists
         exists = (

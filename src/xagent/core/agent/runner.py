@@ -37,6 +37,7 @@ from .context import ContextManager, ExecutionContext
 from .context.execution import (
     ACCEPTED_TURN_IDS_METADATA_KEY,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    MODEL_CONTEXT_WATERMARK_METADATA_KEY,
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     context_checkpoint_gate,
     derive_compact_threshold,
@@ -1618,7 +1619,10 @@ class AgentRunner:
                 context.system_prompt = prompt
 
         for key, value in request_context.items():
-            if key == "system_prompt" or key in RESERVED_ENGINE_METADATA_KEYS:
+            if (
+                key in {"system_prompt", MODEL_CONTEXT_WATERMARK_METADATA_KEY}
+                or key in RESERVED_ENGINE_METADATA_KEYS
+            ):
                 continue
             context.metadata[key] = value
 

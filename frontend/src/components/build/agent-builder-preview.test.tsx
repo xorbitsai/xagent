@@ -177,7 +177,7 @@ let putBody: { tool_categories?: string[] } | undefined
 let availableTools: unknown[] = []
 let previewState: {
   messages: Array<{ role: string }>
-  currentTask: Pick<Task, "id" | "status"> | null
+  currentTask: Pick<Task, "id" | "status" | "completionOutcome"> | null
   taskId: number | null
   isProcessing: boolean
 }
@@ -412,6 +412,21 @@ describe("AgentBuilder preview", () => {
         expectPreviewComplete(false)
       },
     )
+
+    it.each(["partial", "blocked"] as const)("does not count %s as preview completion and permits a completed follow-up", async (completionOutcome) => {
+      const { rerender } = render(<AgentBuilder agentId="42" />)
+      await screen.findByDisplayValue("Existing SSH agent")
+      fireEvent.click(screen.getByText("send-preview-message"))
+      await waitFor(() => expect(sendMessageMock).toHaveBeenCalled())
+      previewState = { messages: [{ role: "user" }], currentTask: { id: "123", status: "completed", completionOutcome }, taskId: 123, isProcessing: false }
+      rerender(<AgentBuilder agentId="42" />)
+      expectPreviewComplete(false)
+      fireEvent.click(screen.getByText("send-preview-message"))
+      await waitFor(() => expect(sendMessageMock).toHaveBeenCalledTimes(2))
+      previewState.currentTask = { id: "123", status: "completed", completionOutcome: "completed" }
+      rerender(<AgentBuilder agentId="42" />)
+      expectPreviewComplete(true)
+    })
 
     it("requires this configuration's completed task and invalidates it on config edits or Clear", async () => {
       const { rerender } = render(<AgentBuilder agentId="42" />)

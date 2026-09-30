@@ -1204,6 +1204,7 @@ def _accept_turn_no_commit(
             Task.status: TaskStatus.RUNNING,
             Task.input: payload.transcript_message,
             Task.output: None,
+            Task.completion_outcome: None,
             Task.error_message: None,
             Task.run_id: run_id,
             Task.last_checkpoint_event_id: None,
@@ -2198,6 +2199,9 @@ def _schedule_bg(
                             task_id,
                             task_owner_user_id,
                             before_message_id=before_message_id,
+                            before_turn_id=payload.turn_id
+                            if before_message_id is not None
+                            else None,
                         )
                     )
                     if snapshot is None:

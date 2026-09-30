@@ -224,7 +224,9 @@ async def restore_telegram_task_context(
 
     transcript_window = load_task_transcript_window(db, task_id)
     agent_service.set_conversation_history(
-        transcript_window.messages, watermark=transcript_window.watermark
+        transcript_window.messages,
+        watermark=transcript_window.watermark,
+        event_watermark=transcript_window.event_watermark,
     )
 
     recovery_state: dict[str, Any] = await load_task_execution_recovery_state(

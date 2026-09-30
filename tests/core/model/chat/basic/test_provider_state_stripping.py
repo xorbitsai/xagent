@@ -24,6 +24,10 @@ import pytest
 import xagent.core.model.chat.basic as basic_pkg
 from xagent.core.model.chat.basic.azure_openai import AzureOpenAILLM
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.basic.call_boundary import (
+    BoundaryLLM,
+    UnavailableVisionModel,
+)
 from xagent.core.model.chat.basic.claude import ClaudeLLM
 from xagent.core.model.chat.basic.dashscope import DashScopeLLM
 from xagent.core.model.chat.basic.deepseek import DeepSeekLLM
@@ -260,6 +264,15 @@ _STRIP_GUARD_EXEMPT: dict[type, str] = {
     _ResolvedRouterLLM: (
         "a thin per-call wrapper around one resolved downstream client; "
         "same reasoning as RouterLLM above."
+    ),
+    BoundaryLLM: (
+        "the safe error boundary: forwards the same message list object to "
+        "the wrapped client unchanged and never builds a provider-bound "
+        "message dict itself, so the wrapped client's own guard is what runs."
+    ),
+    UnavailableVisionModel: (
+        "a refusal stand-in: every call raises before any request exists, so "
+        "no message dict ever reaches a wire."
     ),
 }
 

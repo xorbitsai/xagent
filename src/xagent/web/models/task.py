@@ -272,6 +272,9 @@ class Task(Base):  # type: ignore
             "interaction_protocol_version IS NULL OR interaction_protocol_version = 1",
             name="ck_tasks_interaction_protocol_version",
         ),
+        # Deleted tasks leave retained files under web_task_<id>. Never give
+        # their workspace identity to a later task on SQLite.
+        {"sqlite_autoincrement": True},
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -514,6 +517,10 @@ class Task(Base):  # type: ignore
     total_tokens = Column(Integer, default=0)
     llm_calls = Column(Integer, default=0)
     token_usage_details = Column(JSON, nullable=True)  # Detailed breakdown
+
+    # Semantic result, separate from control status. NULL means unreported
+    # (including legacy rows), not proof that the user's goal was completed.
+    completion_outcome = Column(String(20), nullable=True)
 
     # ----- SDK surface fields (read/written by /v1/* endpoints) -----
     # The four columns below are populated by SDK-driven task lifecycles

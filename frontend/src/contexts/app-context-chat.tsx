@@ -369,7 +369,7 @@ import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
-import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
+import { normalizeCompletionOutcome, normalizeTaskCompletedMessage, type TaskCompletionOutcome } from "@/lib/task-completion"
 import { emitTaskError } from "@/lib/task-error-events"
 import { isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status"
 import {
@@ -686,6 +686,7 @@ export interface Task {
   id: string
   title: string
   status: TaskStatus
+  completionOutcome?: TaskCompletionOutcome
   description: string
   createdAt: string | number
   updatedAt: string | number
@@ -894,6 +895,7 @@ const taskFromTaskInfoData = (
   title: taskData.title as string,
   description: taskData.description as string,
   status: normalizeTaskStatus(taskData.status) || "pending",
+  completionOutcome: normalizeCompletionOutcome(taskData.completion_outcome),
   createdAt: taskData.created_at as string | number,
   updatedAt: taskData.updated_at as string | number,
   modelId: taskData.model_id as string | undefined,
@@ -1251,7 +1253,7 @@ type AppAction =
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
-  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
+  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; completionOutcome?: TaskCompletionOutcome; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -1616,7 +1618,10 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       // never passes through UPDATE_TASK_STATUS either - withDagTerminatedAt
       // backfills the former and clears the latter so a prior run's
       // dagTerminatedAt can't linger into this one.
-      const currentTask = withDagTerminatedAt(mergedTask)
+      const currentTask = withDagTerminatedAt(mergedTask && {
+        ...mergedTask,
+        completionOutcome: mergedTask.status === "completed" ? mergedTask.completionOutcome : undefined,
+      })
 
       return {
         ...state,
@@ -1688,6 +1693,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         currentTask: {
           ...state.currentTask,
           status: nextStatus,
+          completionOutcome: nextStatus === "completed"
+            ? ("completionOutcome" in action.payload ? action.payload.completionOutcome : state.currentTask.completionOutcome)
+            : undefined,
           // Prefer the originating event's own timestamp over the client's
           // current wall-clock time - during historical replay, every event
           // gets processed at "now", so stamping updatedAt with the reducer's
@@ -2937,6 +2945,7 @@ export function AppProvider({
         if (envelope.status) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: {
             status: envelope.status, runId: envelope.runId,
+            completionOutcome: normalizeCompletionOutcome(data.completion_outcome),
             stateVersion: envelope.stateVersion, controlState: envelope.controlState,
             ...(envelope.status === "waiting_for_user" ? {
               waitingQuestion: typeof data.question === "string" ? data.question : undefined,
@@ -3526,7 +3535,12 @@ export function AppProvider({
             const shouldHideAgentMessage =
               isAgentMessage &&
               eventData.visible === false
-            if (expectsUserResponse) {
+            // Replayed questions belong in the transcript, but must not undo
+            // the settled status/outcome already restored by task_info.
+            if (expectsUserResponse && !(
+              isHistoricalDataLoadingRef.current &&
+              isTerminalTaskStatus(currentState.currentTask?.status)
+            )) {
               dispatch({
                 type: "UPDATE_TASK_STATUS",
                 payload: {
@@ -5698,6 +5712,7 @@ export function AppProvider({
           type: "UPDATE_TASK_STATUS",
           payload: {
             status: taskData.status,
+            completionOutcome: taskData.completionOutcome,
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState,

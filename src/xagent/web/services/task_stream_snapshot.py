@@ -23,6 +23,7 @@ def load_task_stream_snapshots(task_ids: list[int]) -> list[dict[str, Any]]:
                 "task_id": int(task.id),
                 **task_control_snapshot(task).as_dict(),
                 "output": task.output if task.status.value == "completed" else None,
+                "completion_outcome": task.completion_outcome,
                 "lease_attempt_id": task.lease_attempt_id,
             }
             if task.status.value == "waiting_for_user":

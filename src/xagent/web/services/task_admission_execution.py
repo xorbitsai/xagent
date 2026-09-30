@@ -26,13 +26,13 @@ class AdmissionWaiting(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _AdmissionExecution:
+class AdmissionExecution:
     command_id: int
     task_id: int
     injected_run_id: str | None = None
 
 
-_current: ContextVar[_AdmissionExecution | None] = ContextVar(
+_current: ContextVar[AdmissionExecution | None] = ContextVar(
     "task_admission_execution", default=None
 )
 
@@ -41,18 +41,38 @@ _current: ContextVar[_AdmissionExecution | None] = ContextVar(
 def admission_execution(
     command_id: int, task_id: int, governed: bool
 ) -> Iterator[None]:
-    token = _current.set(_AdmissionExecution(command_id, task_id) if governed else None)
+    token = _current.set(AdmissionExecution(command_id, task_id) if governed else None)
     try:
         yield
     finally:
         _current.reset(token)
 
 
+def current_admission_execution(task_id: int) -> AdmissionExecution | None:
+    """The governed execution the current context is scheduling, if any."""
+    context = _current.get()
+    if context is None or context.task_id != task_id:
+        return None
+    return context
+
+
 def allow_injected_guidance(task_id: int, run_id: str | None) -> None:
-    """Only a confirmed injection may continue the exact original execution."""
+    """Only a confirmed injection may continue the exact original execution.
+
+    Also pins the continuation's ticket ids on the owning coordinator now,
+    at join confirmation time, rather than letting a later ``track_execution``
+    infer them from whatever handles happen to still be live: the original
+    handle can drain during the await between this call and the continuation
+    handle's own registration, which would otherwise leave nothing to infer.
+    """
     context = _current.get()
     if context is not None and context.task_id == task_id and run_id is not None:
         _current.set(replace(context, injected_run_id=run_id))
+        from .task_coordinator_runtime import current_task_coordinator
+
+        coordinator = current_task_coordinator(task_id)
+        if coordinator is not None:
+            coordinator.pin_continuation(context.command_id)
 
 
 def require_execution_admission(

@@ -661,6 +661,7 @@ async def execute_channel_background(
     service.set_conversation_history(
         [dict(message) for message in snapshot.conversation_history],
         watermark=snapshot.conversation_watermark,
+        event_watermark=snapshot.conversation_event_watermark,
     )
     recovery = await materialize_task_execution_recovery_state(
         snapshot.execution_recovery

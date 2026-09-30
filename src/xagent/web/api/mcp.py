@@ -302,8 +302,8 @@ def _project_mcp_tool_load_result(load_result: Any) -> _MCPToolLoadAPIProjection
 
 # The connection-test endpoint loads tools for a connection that is not saved.
 # It carries its own concurrency cap: at most this many test loads run at once
-# per event loop. The value matches the per-server cap the MCP loader applies
-# to the single server name every test load uses.
+# per event loop. The MCP loader itself does not cap concurrent initializations
+# of a server, so this is the only limit on this endpoint.
 _MCP_CONNECTION_TEST_MAX_INFLIGHT = 4
 
 # Name the unsaved connection is loaded under. The timeout result built below
@@ -355,13 +355,17 @@ async def _load_mcp_connection_test_tools(connection: dict[str, Any]) -> Any:
     * At most ``_MCP_CONNECTION_TEST_MAX_INFLIGHT`` loads run per event loop.
     * Waiting for a slot and the load share one deadline, the MCP
       initialization timeout, so the request returns within it.
-    * When the request reaches that deadline, or is cancelled, the load is
-      cancelled too; its slot is given back once the cancelled load has
-      returned, which the loader makes prompt.
-    * The loader returns from a cancelled load without waiting for the load's
-      transport to shut down, so this cap counts loads, not transports a
-      cancelled load leaves behind. Those are bounded by the loader's own
-      per-server cap on concurrent initializations.
+    * A slot is given back when the load call returns, never earlier: not when
+      the request reaches its deadline and not when the request is cancelled.
+      The load is itself bounded by the loader's timeout, so a slot is held at
+      most that long after it was taken. Cancelling the load early would let
+      a new load start as soon as a request gives up, so the handshakes the
+      loader abandons could pile up as fast as requests arrive.
+    * The loader returns at its timeout without waiting for the abandoned
+      handshake to shut down, so this cap counts loads, not those handshakes.
+      How long they can outlive their load is bounded in the loader: HTTP
+      clients are force-closed after a grace period, and stdio and websocket
+      transports end by their own libraries' shutdown timeouts.
     * At the deadline the request gets the loader's own timeout result.
     * A timeout of 0 disables the deadline: wait for a slot as long as it
       takes, await the load directly, and let cancellation reach it.
@@ -419,17 +423,17 @@ async def _load_mcp_connection_test_tools(connection: dict[str, Any]) -> Any:
         gate.release()
 
     load.add_done_callback(_give_back)
+    # Not cancelled when this request is cancelled or reaches its deadline:
+    # see the docstring. The load ends by the loader's own timeout.
     try:
         done, _pending = await asyncio.wait(
             {load}, timeout=max(0.0, deadline - loop.time())
         )
     except asyncio.CancelledError:
-        load.cancel()
         load.add_done_callback(_consume_abandoned)
         raise
     if load in done:
         return load.result()
-    load.cancel()
     load.add_done_callback(_consume_abandoned)
     logger.error(
         "MCP connection test did not finish within %ss; reporting a timeout",

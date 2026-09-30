@@ -11,6 +11,7 @@ from ...config import get_uploads_dir
 from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
+from ..model.chat.basic.call_boundary import UnavailableVisionModel
 from ..task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     FILE_OPERATION_ACCESS_VERSION_KEY,
@@ -26,7 +27,10 @@ from ..tools.adapters.vibe.config import (
 )
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
-from .context.execution import TRANSCRIPT_WATERMARK_METADATA_KEY
+from .context.execution import (
+    MODEL_CONTEXT_WATERMARK_METADATA_KEY,
+    TRANSCRIPT_WATERMARK_METADATA_KEY,
+)
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
 
@@ -466,7 +470,10 @@ class AgentService:
             "execution_type": self._execution_type(),
             "llm_configured": self.llm is not None,
             "fast_llm_configured": self.fast_llm is not None,
-            "vision_llm_configured": self.vision_llm is not None,
+            # The stand-in for a deliberately missing vision model refuses
+            # every call; it is not a configured vision model.
+            "vision_llm_configured": self.vision_llm is not None
+            and not isinstance(self.vision_llm, UnavailableVisionModel),
             "compact_llm_configured": self.compact_llm is not None,
             "dual_llm_enabled": self.fast_llm is not None,
             "compact_llm_enabled": self.compact_llm is not None,
@@ -480,6 +487,7 @@ class AgentService:
         messages: list[dict[str, Any]],
         *,
         watermark: int | None = None,
+        event_watermark: dict[str, Any] | None = None,
     ) -> None:
         """Install the prior conversation, and where a summary may pick up.
 
@@ -491,6 +499,12 @@ class AgentService:
         summary that no later turn can position -- correct, just not reusable.
         """
         self._conversation_history = list(messages)
+        if event_watermark is not None:
+            self.execution_metadata[MODEL_CONTEXT_WATERMARK_METADATA_KEY] = dict(
+                event_watermark
+            )
+        else:
+            self.execution_metadata.pop(MODEL_CONTEXT_WATERMARK_METADATA_KEY, None)
         if isinstance(watermark, int) and not isinstance(watermark, bool):
             self.execution_metadata[TRANSCRIPT_WATERMARK_METADATA_KEY] = watermark
         else:

@@ -268,16 +268,19 @@ _UPLOAD_STAGING_EXECUTOR = ThreadPoolExecutor(
 _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("onedrive", "onedrive_upload_file"): ("local_file_path",),
     ("sharepoint", "sharepoint_upload_file"): ("local_file_path",),
-    ("google_drive", "google_drive_upload_file"): ("file_path",),
+    ("google-drive", "google_drive_upload_file"): ("file_path",),
     ("slack", "slack_upload_file"): ("file_path",),
 }
 
 
 def _durable_upload_fields(server_name: str, tool_name: str) -> tuple[str, ...]:
-    from .selection_spec import normalize_mcp_server_name
+    # Use the catalog's collision normalizer rather than the generic selector
+    # normalizer. In particular, ``Google_Drive`` is a valid custom name under
+    # the selector normalizer but is not the built-in ``Google Drive`` identity.
+    from .....builtin_identity import canonicalize_builtin_identity
 
     return _DURABLE_UPLOAD_FIELDS.get(
-        (normalize_mcp_server_name(server_name), tool_name), ()
+        (canonicalize_builtin_identity(server_name) or "", tool_name), ()
     )
 
 
@@ -295,6 +298,27 @@ def _file_ref_value(value: Any) -> str | None:
     except (ValueError, AttributeError):
         return None
     return normalized
+
+
+def _replace_staged_upload_paths(value: Any, replacements: Mapping[str, str]) -> Any:
+    """Replace internal staging paths before an MCP result reaches the model."""
+
+    if isinstance(value, str):
+        for path, replacement in sorted(
+            replacements.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            value = value.replace(path, replacement)
+        return value
+    if isinstance(value, Mapping):
+        return {
+            key: _replace_staged_upload_paths(item, replacements)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_staged_upload_paths(item, replacements) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_staged_upload_paths(item, replacements) for item in value)
+    return value
 
 
 # Hard ceiling on how many exception nodes either walk over a failed call
@@ -1335,7 +1359,7 @@ class MCPToolAdapter(AbstractBaseTool):
         self._allow_users = allow_users
         self.source_server = source_server
         self._workspace = workspace
-        self._durable_upload_fields = tuple(durable_upload_fields)
+        self._durable_upload_fields = durable_upload_fields
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
             concurrency_safe=concurrency_safe,
@@ -1917,10 +1941,15 @@ class MCPToolAdapter(AbstractBaseTool):
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
-            try:
-                await asyncio.shield(future)
-            except BaseException:
-                pass
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    # A second cancellation must not skip waiting for a
+                    # worker that may still be mutating the staging area.
+                    continue
+                except BaseException:
+                    break
             raise
 
     async def _stage_external_upload_file(self, file_id: str) -> Any:
@@ -1937,8 +1966,17 @@ class MCPToolAdapter(AbstractBaseTool):
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    # Preserve cancellation, but do not abandon a worker
+                    # that may finish by creating a file we must discard.
+                    continue
+                except BaseException:
+                    break
             try:
-                staged_path = await asyncio.shield(future)
+                staged_path = future.result()
             except BaseException:
                 pass
             else:
@@ -1956,11 +1994,12 @@ class MCPToolAdapter(AbstractBaseTool):
 
     async def _stage_external_upload_args(
         self, tool_args: Mapping[str, Any]
-    ) -> tuple[dict[str, Any], list[Any]]:
+    ) -> tuple[dict[str, Any], list[Any], dict[str, str]]:
         if self._workspace is None or not self._durable_upload_fields:
-            return dict(tool_args), []
+            return dict(tool_args), [], {}
 
         staged: list[Any] = []
+        staged_sources: dict[str, str] = {}
         prepared = dict(tool_args)
         try:
             for field_name in self._durable_upload_fields:
@@ -1970,7 +2009,8 @@ class MCPToolAdapter(AbstractBaseTool):
                 staged_path = await self._stage_external_upload_file(file_id)
                 prepared[field_name] = str(staged_path)
                 staged.append(staged_path)
-            return prepared, staged
+                staged_sources[str(staged_path)] = f"file:{file_id}"
+            return prepared, staged, staged_sources
         except BaseException:
             await self._discard_external_upload_args(staged)
             raise
@@ -2023,9 +2063,17 @@ class MCPToolAdapter(AbstractBaseTool):
                 redact_sensitive=True, log_skipped=False
             )
             tool_meta = self._runtime_mcp_meta()
-            tool_args, staged_uploads = await self._stage_external_upload_args(
-                tool_args
-            )
+            try:
+                (
+                    tool_args,
+                    staged_uploads,
+                    staged_upload_sources,
+                ) = await self._stage_external_upload_args(tool_args)
+            except FileNotFoundError:
+                return {
+                    "content": [{"text": "file_id not found or not accessible."}],
+                    "is_error": True,
+                }
 
             logger.debug(
                 "Executing MCP tool %s with args keys: %s for user %s",
@@ -2066,7 +2114,7 @@ class MCPToolAdapter(AbstractBaseTool):
                         result = retry_result
                     if bound_args:
                         result["runtime_bound_arguments"] = bound_args
-                    return result
+                    return _replace_staged_upload_paths(result, staged_upload_sources)
             finally:
                 await self._discard_external_upload_args(staged_uploads)
 

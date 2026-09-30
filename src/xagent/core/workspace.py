@@ -362,14 +362,16 @@ class TaskWorkspace:
             raise FileNotFoundError(f"File not found: {file_id}")
         try:
             source = Path(source).resolve(strict=True)
-        except RuntimeError:
-            # Python 3.11/3.12 raise RuntimeError for symlink loops. Keep the
-            # unresolved path so the normal filesystem check can fail closed.
-            source = Path(source)
-        if not source.is_file():
+        except (OSError, RuntimeError) as exc:
+            # Python 3.11/3.12 raise RuntimeError for symlink loops. Treat
+            # both that case and a disappearing source as an unavailable file.
+            raise FileNotFoundError(f"File not found: {file_id}") from exc
+        if not source.is_file() or not self._file_operation_path_in_authorized_storage(
+            source
+        ):
             raise FileNotFoundError(f"File not found: {file_id}")
 
-        staging_root = (self.internal_temp_dir / "mcp-upload").resolve()
+        staging_root = self._external_upload_staging_root()
         staging_dir = staging_root / uuid4().hex
         staging_dir.mkdir(parents=True, exist_ok=False)
         target = staging_dir / source.name
@@ -388,12 +390,12 @@ class TaskWorkspace:
         root, so a connector cannot cause arbitrary workspace deletion.
         """
 
+        staging_root = self._external_upload_staging_root()
         try:
             candidate = Path(file_path).resolve()
         except RuntimeError:
             # A symlink loop must not escape cleanup's confined-path check.
             candidate = Path(file_path)
-        staging_root = (self.internal_temp_dir / "mcp-upload").resolve()
         if not candidate.is_relative_to(staging_root) or candidate == staging_root:
             raise ValueError("staged upload path is outside the task staging area")
         try:
@@ -406,6 +408,21 @@ class TaskWorkspace:
                 except OSError:
                     break
                 parent = parent.parent
+
+    def _external_upload_staging_root(self) -> Path:
+        """Return the staging root only when it remains under task temp/.
+
+        ``temp/`` is writable by code-exec tools, so both the internal marker
+        and the upload directory may be replaced with symlinks between task
+        runs. Resolve the complete path before creating or deleting anything,
+        and fail closed if either link escapes the task's temporary directory.
+        """
+
+        temp_root = self.temp_dir.resolve()
+        staging_root = (self.internal_temp_dir / "mcp-upload").resolve()
+        if staging_root == temp_root or not staging_root.is_relative_to(temp_root):
+            raise ValueError("task upload staging area is outside temp directory")
+        return staging_root
 
     def register_internal_file(
         self,

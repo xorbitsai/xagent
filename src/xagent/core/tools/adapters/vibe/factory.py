@@ -1328,16 +1328,14 @@ class ToolFactory:
 
                     # Load MCP tools
                     if connections:
-                        load_kwargs: dict[str, Any] = {"sandbox": sandbox}
-                        if workspace is not None:
-                            load_kwargs["workspace"] = workspace
                         load_result = await load_mcp_tools_as_agent_tools(
                             connections,
                             connector_refs=ToolFactory._mcp_connector_refs(
                                 configs_by_name
                             ),
-                            **load_kwargs,
-                        )  # type: ignore[arg-type]
+                            sandbox=sandbox,
+                            workspace=workspace,
+                        )
                         normal_tools.extend(load_result.tools)
                         unavailable_tools.extend(
                             ToolFactory._unavailable_mcp_tools_from_load_failures(

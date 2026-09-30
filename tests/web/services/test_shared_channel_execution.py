@@ -291,21 +291,34 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
     bridge.discard_command.assert_called_with(command.command_id, command.task_id)
 
 
-@pytest.mark.parametrize("outcome", ["completed", "partial", "blocked", None])
-def test_recovered_channel_result_keeps_persisted_outcome(selected, outcome):
+@pytest.mark.parametrize(
+    "status,outcome,expected_outcome",
+    [
+        (TaskStatus.COMPLETED, outcome, outcome)
+        for outcome in ("completed", "partial", "blocked", None)
+    ]
+    + [
+        (TaskStatus.FAILED, "partial", None),
+        (TaskStatus.WAITING_FOR_USER, "partial", None),
+    ],
+)
+def test_recovered_channel_result_keeps_only_completed_outcome(
+    selected, status, outcome, expected_outcome
+):
     command_id = shared._accept_channel_turn(
         selected, TaskTurnPayload("hello"), "ingress"
     )
     with get_session_local()() as db:
         task = db.get(Task, selected.selection.task_id)
-        task.status = TaskStatus.COMPLETED
+        task.status = status
         task.run_id = selected.run_id
         task.completion_outcome = outcome
         task.output = "Recovered answer"
         db.get(TaskExecutionCommand, command_id).status = "completed"
         db.commit()
     result = shared._read_channel_result(command_id, selected.run_id)
-    assert result["completion_outcome"] == outcome
+    assert result["status"] == status.value
+    assert result["completion_outcome"] == expected_outcome
     assert result["output"] == "Recovered answer"
 
 

@@ -1209,12 +1209,10 @@ def test_slack_only_handles_mentions_in_shared_channels() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auto_unavailable", [False, True])
 @pytest.mark.parametrize("is_new_task", [False, True])
-@pytest.mark.parametrize("outcome", ["partial", "blocked"])
 async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
     monkeypatch: pytest.MonkeyPatch,
     auto_unavailable: bool,
     is_new_task: bool,
-    outcome: str,
 ) -> None:
     bot = make_bot()
     if not is_new_task:
@@ -1275,11 +1273,7 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
         set_recovered_skill_context=lambda _context: None,
     )
 
-    execution_result = {
-        "success": True,
-        "output": "Slack reply",
-        "completion_outcome": outcome,
-    }
+    execution_result = {"success": True, "output": "Slack reply"}
     connector_turn_ids: list[str | None] = []
     execution_turn_ids: list[str] = []
 

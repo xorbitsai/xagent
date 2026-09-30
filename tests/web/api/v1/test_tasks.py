@@ -3733,6 +3733,88 @@ def test_get_steps_returns_mapped_steps_in_order(mock_start_task):
     assert steps[2]["data"] == {"role": "assistant", "content": "Here's the result"}
 
 
+def test_get_steps_on_a_trace_expired_task_is_empty_not_an_error(mock_start_task):
+    """Acceptance criterion from #2563: empty, not 500.
+
+    Retention's trace path deletes a terminal task's ``trace_events`` while
+    keeping the task itself, so this endpoint is left authorizing a task that
+    exists and reading a timeline that no longer does. The cache makes that
+    worth pinning rather than assuming: the cached entry is versioned on
+    ``max(trace_events.id)``, which the purge takes to 0, so a version compared
+    loosely enough could serve the purged steps back.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="evt-expired-1",
+        timestamp=base,
+        data={"content": "before expiry"},
+    )
+
+    # A real backend, because the default is a no-op: without this the
+    # "warm the cache first" step below caches nothing and the versioned-read
+    # path this test exists for is never exercised.
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        _run_trace_expiry_steps_case(task_id, agent_id, full_key, base)
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+def _run_trace_expiry_steps_case(task_id, agent_id, full_key, base) -> None:
+    from datetime import timedelta
+
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services.task_retention_purge import (
+        RetentionPurgeAction,
+        purge_task,
+    )
+
+    # Populate the cache first: a purge that only looked correct on a cold
+    # read would pass without this.
+    warm = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+    assert warm.status_code == 200, warm.text
+    assert len(warm.json()["steps"]) == 1
+
+    now = base + timedelta(days=200)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.COMPLETED
+        task.last_activity_at = base
+        task.lease_expires_at = None
+        db.commit()
+        # Task creation stages a start command; the predicate counts a pending
+        # command as work still owed, which is the point of that leg. Clear it
+        # so this test is about the trace path rather than about eligibility.
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).delete(synchronize_session=False)
+        db.commit()
+        assert (
+            purge_task(
+                db,
+                task_id,
+                now=now,
+                conversation_days=365,
+                trace_days=90,
+            )
+            is RetentionPurgeAction.PURGED_TRACES
+        )
+    finally:
+        db.close()
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["steps"] == []
+
+
 def test_get_steps_task_not_found_returns_404(mock_start_task):
     """Non-existent task_id -> 404 task_not_found."""
     _agent_id, full_key = _create_agent_with_key()

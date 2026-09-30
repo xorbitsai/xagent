@@ -390,3 +390,42 @@ The tokenizer cannot be read back out of a built index, so there is no stored va
 ### Rollback
 
 No rollback path and none needed: the previous index is replaced by one built from the same rows, and the schema, the data files and the row contents are untouched. Reverting the application code leaves the new index in place and searching it with the old tokenizer restores the previous behavior, which is the degraded one this rebuild fixes.
+
+## 2026-09-23 — Retention purge job
+
+The purge that acts on the retention predicate. It starts only when a retention period is configured (see `example.env`), and no deployment configures one yet, so this change is inert on its own.
+
+
+### Enabling the purge
+
+The job is gated on `XAGENT_CONVERSATION_RETENTION_DAYS` / `XAGENT_TRACE_RETENTION_DAYS` (see `example.env`), and it refuses to start on anything but PostgreSQL — the row lock its eligibility check depends on is compiled away on SQLite, so an assessment there is not a deletion licence. The refusal is logged once and the loop exits; it is not retried, because configuration cannot change under a running process.
+
+**Every retention setting takes effect at process start, and only there.** `.env` is read once and nothing mutates the environment afterwards, so changing a period, the dry-run flag or the kill switch requires a restart. The kill switch exists so that stopping expiry does not mean editing the periods — not so that a running sweep can be halted from outside.
+
+Before setting a period anywhere, work through the enablement gate on the retention tracking issue — in particular `XAGENT_CONVERSATION_RETENTION_DAYS` must not be set while a mixed-version rollout can still leave `tasks.last_activity_at` behind its task's newest message, since a stale anchor expires a conversation *early*.
+
+Recommended first run: set the period together with `XAGENT_RETENTION_DRY_RUN=true`, restart, read the audit line, and only then clear the dry-run flag and restart again. A value the parser does not recognise resolves to a dry run rather than a deletion, but do not rely on that instead of checking the log line.
+
+### Multiple web replicas
+
+One purge loop starts per web process, so a deployment running several of them sweeps several times over. That is safe rather than merely tolerated: two purges that select the same task serialize on its row lock. On the conversation path the loser then finds no row and reports the task as not eligible. On the trace path the row survives, so the loser runs its deletes against a trace that is already gone; they remove nothing and it is counted as `nothing_to_purge` rather than as an expiry. Either way no accepted work is lost and no counter claims work that did not happen.
+
+What it costs is duplicated scanning, which is why there is no advisory lock here. If that becomes visible on a large `tasks` table, set the retention variables on one replica only; the loop starts from configuration, so an unconfigured replica starts nothing.
+
+### Verification and monitoring
+
+`xagent retention preview --days N` reports what a period would expire without touching anything. Once the job runs, each *batch* logs one line beginning `retention purge` — a sweep that drains a backlog logs one per page, not one in total — counting `scanned`, `purged_conversations`, `purged_traces`, `skipped_busy`, `skipped_active_interaction`, `nothing_to_purge` and `failed`.
+
+`scanned` is how many candidates the batch selected, not how many proved expirable — the locked assessment can still refuse any of them. `skipped_busy` covers every such refusal, which is usually a task that is genuinely not quiescent but also includes a row that vanished between the scan and the lock (normal with more than one replica) and a task with no anchor at all. `nothing_to_purge` is a trace-expiry candidate whose trace was already gone by the time the lock was taken. `failed` is a task whose own purge raised: it is logged with its id and traceback, the sweep carries on, and the task is retried on the next pass.
+
+Those field names deliberately differ from the ones sketched on the tracking issue (`eligible / deleted / skipped-busy / external-pending`): `deleted` is split because the two paths delete different things and an operator needs to know which ran, `skipped_active_interaction` names the one refusal that is permanent rather than transient, and `external-pending` belongs to the external-cleanup work, which this job does not perform.
+
+A persistently high `skipped_busy` means the batch is dominated by tasks that are not actually quiescent. A persistently high `skipped_active_interaction` means tasks are holding interaction rows that nothing is closing, which is worth investigating on its own — the purge will keep skipping them. Any non-zero `failed` deserves the log line that accompanies it: the purge no longer stops on such a task, so the only symptom is that counter.
+
+Bulk deletion pressures autovacuum and can extend replication lag. Watch `n_dead_tup` on `tasks`, `trace_events` and the two `trace_*_blobs` tables while an initial backlog drains, raise `XAGENT_RETENTION_BATCH_PAUSE_SECONDS` if it is too aggressive, and plan a one-off `pg_repack` afterwards — deleting rows does not return storage to the filesystem.
+
+### Rollback
+
+`XAGENT_RETENTION_ENABLED=false` followed by a restart stops the job without changing the configured periods; unsetting the periods does the same. Neither restores deleted rows — recovery from an over-broad period is a database restore, which is what makes the dry run the step worth not skipping.
+
+This change adds no migration and no index.

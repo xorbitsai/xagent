@@ -92,13 +92,13 @@ def get_google_credentials(
         resource_owner_key=None,
     ).filter(UserOAuth.provider == "google-drive")
 
-    if account_id:
+    if account_id is not None:
         query = query.filter(UserOAuth.id == account_id)
 
     oauth_account = query.first()
 
     if not oauth_account:
-        if account_id:
+        if account_id is not None:
             raise HTTPException(
                 status_code=404, detail="Selected Google Drive account not found"
             )
@@ -197,7 +197,7 @@ async def list_connected_accounts(
 @cloud_router.get("/google-drive/picker-config")
 async def get_google_drive_picker_config(
     response: Response,
-    account_id: Optional[int] = Query(None),
+    account_id: Optional[int] = Query(None, gt=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Dict[str, str]:

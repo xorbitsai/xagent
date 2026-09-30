@@ -839,6 +839,127 @@ def test_detail_returns_trace_events() -> None:
     assert events[0]["data"]["tool_name"] == "search"
 
 
+def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
+    """Acceptance criterion from #2563: empty, not 500.
+
+    Retention's trace path deletes a terminal task's ``trace_events`` while
+    keeping the task and its transcript. This endpoint then authorizes a task
+    that exists and reads a trace that does not, in two places -- the
+    ``action_end_compact`` rows folded into the transcript, and the trace
+    timeline itself. Both must degrade to nothing while the conversation the
+    retention policy promised to keep is still served.
+    """
+    from datetime import timedelta
+
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services.task_retention_purge import (
+        RetentionPurgeAction,
+        purge_task,
+    )
+
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Expired Trace Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Trace expiry task",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+        input_text="hi",
+        output_text="done",
+    )
+    _add_chat_message(
+        task_id=task_id,
+        user_id=admin_id,
+        role="user",
+        content="the conversation retention keeps",
+    )
+
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    db = _direct_db_session()
+    try:
+        db.add_all(
+            [
+                TraceEvent(
+                    task_id=task_id,
+                    event_id="evt-timeline",
+                    event_type="tool_call_start",
+                    timestamp=base,
+                    data={"tool_name": "search", "tool_args": {"q": "x"}},
+                ),
+                # The other reader: folded into the transcript rather than the
+                # timeline, so it would go on rendering if only one were purged.
+                TraceEvent(
+                    task_id=task_id,
+                    event_id="evt-compact",
+                    event_type="action_end_compact",
+                    timestamp=base,
+                    data={"summary": "compacted"},
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    warm = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+    assert warm.status_code == 200, warm.text
+    # Both rows are in the timeline before the purge; the compact one is also
+    # read separately into the transcript, which is why it is seeded here.
+    assert len(warm.json()["trace_events"]) == 2
+    assert any(
+        entry.get("message_type") == "compaction" for entry in warm.json()["transcript"]
+    ), (
+        "the compaction entry must be present before the purge for its absence to mean anything"
+    )
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.COMPLETED
+        task.last_activity_at = base
+        task.lease_expires_at = None
+        db.commit()
+        # Task creation stages a start command, and the eligibility predicate
+        # counts a pending command as work still owed. Clearing it keeps this
+        # test about the trace path rather than about eligibility.
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).delete(synchronize_session=False)
+        db.commit()
+        assert (
+            purge_task(
+                db,
+                task_id,
+                now=base + timedelta(days=200),
+                conversation_days=365,
+                trace_days=90,
+            )
+            is RetentionPurgeAction.PURGED_TRACES
+        )
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["trace_events"] == []
+    assert body["log"]["task_id"] == task_id
+    # The conversation itself is what the shorter trace period exists to keep.
+    transcript = body["transcript"]
+    assert any(
+        entry.get("content") == "the conversation retention keeps"
+        for entry in transcript
+    ), transcript
+    # And the compact row folded into the transcript is gone with the trace,
+    # rather than leaving a half-rendered entry behind. Transcript entries are
+    # distinguished by ``message_type``; they carry no ``event_type`` at all,
+    # so asserting on that field could never have failed.
+    assert all(entry.get("message_type") != "compaction" for entry in transcript)
+
+
 def test_detail_includes_delegated_agent_traces_but_not_builder_traces() -> None:
     admin = _admin_headers()
     admin_id = _user_id("admin")

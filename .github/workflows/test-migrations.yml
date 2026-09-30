@@ -72,7 +72,6 @@ on:
       - 'src/xagent/web/services/channel_runtime.py'
       - 'src/xagent/web/services/task_command_transport.py'
       - 'tests/web/services/test_task_command_transport.py'
-      - 'src/xagent/web/models/task.py'
       - 'tests/web/services/task_status_storage_shared.py'
       - 'tests/web/services/test_task_status_storage_postgresql.py'
       - 'tests/web/services/test_task_status_enum_drift.py'
@@ -125,6 +124,12 @@ on:
       - 'src/xagent/web/tracking/task_tracker.py'
       - 'tests/web/services/test_task_retention.py'
       - 'tests/alembic/test_20260922_task_last_activity_at.py'
+      - 'src/xagent/web/services/task_retention_purge.py'
+      - 'src/xagent/web/models/task.py'
+      - 'tests/web/services/test_task_retention_purge.py'
+      - 'src/xagent/web/services/task_deletion.py'
+      - 'src/xagent/web/models/task_command.py'
+      - 'tests/web/services/test_task_retention_purge_postgresql.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -233,7 +238,6 @@ jobs:
             src/xagent/web/services/channel_runtime.py
             src/xagent/web/services/task_command_transport.py
             tests/web/services/test_task_command_transport.py
-            src/xagent/web/models/task.py
             tests/web/services/task_status_storage_shared.py
             tests/web/services/test_task_status_storage_postgresql.py
             tests/web/services/test_task_status_enum_drift.py
@@ -286,6 +290,12 @@ jobs:
             src/xagent/web/tracking/task_tracker.py
             tests/web/services/test_task_retention.py
             tests/alembic/test_20260922_task_last_activity_at.py
+            src/xagent/web/services/task_retention_purge.py
+            src/xagent/web/models/task.py
+            tests/web/services/test_task_retention_purge.py
+            src/xagent/web/services/task_deletion.py
+            src/xagent/web/models/task_command.py
+            tests/web/services/test_task_retention_purge_postgresql.py
           )
 
           case "$EVENT_NAME" in
@@ -689,6 +699,18 @@ jobs:
         run: |
           pytest tests/web/services/test_task_retention.py -m postgresql -q
           pytest tests/alembic/test_20260922_task_last_activity_at.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      # The purge's fence is a claim about PostgreSQL row locks -- that a
+      # command insert's FOR KEY SHARE on tasks blocks against the purge's
+      # FOR UPDATE. Nothing on SQLite can check it, so this step is the only
+      # place that claim is ever tested.
+      - name: Test retention purge paths and locking (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_task_retention_purge.py -m postgresql -q
+          pytest tests/web/services/test_task_retention_purge_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

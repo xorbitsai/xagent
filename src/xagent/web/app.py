@@ -680,6 +680,126 @@ async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
             )
 
 
+#: How long shutdown waits for the retention purge loop to stop on its own
+#: before cancelling it. One task's purge has to finish first, and a purge is
+#: a handful of indexed deletes -- not a bound anyone should have to tune, so
+#: it is a constant rather than another environment variable.
+RETENTION_PURGE_STOP_GRACE_SECONDS = 10.0
+
+
+def start_retention_purge_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the conversation/trace retention purge loop, if configured (#2563).
+
+    Returns ``None`` -- having started nothing -- in every deployment that has
+    not opted in, which is all of them until the policy decision in #2567 is
+    made. The loop is also the only thing that reads the configured periods, so
+    a deployment with none configured pays nothing for this call.
+
+    The loop itself refuses to run against anything but PostgreSQL, because the
+    row lock its eligibility check depends on is a no-op elsewhere; it logs the
+    refusal and returns rather than retrying something configuration cannot fix.
+    Guarded under pytest like the five sibling loops. The dialect refusal was
+    argued as making the guard unnecessary -- a test suite runs on SQLite, so
+    the loop would end itself on its first batch -- but ``tests/conftest.py``
+    loads a developer's ``.env`` with ``override=True``, so a machine with
+    both a retention period and a PostgreSQL ``DATABASE_URL`` configured would
+    have run a real, deleting sweep against it. The guard costs one line and
+    removes the need for the argument.
+    """
+
+    from .models.database import get_session_local
+    from .services.task_retention_purge import (
+        retention_purge_configured,
+        run_retention_purge_loop,
+    )
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "retention_purge_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        # Same reporting the neighbouring starters do: a loop that died took
+        # its traceback with it, and this is the last place to say so.
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error("Previous retention purge loop failed", exc_info=failure)
+        app_instance.state.retention_purge_task = None
+
+    if not retention_purge_configured():
+        return None
+    if os.getenv("PYTEST_CURRENT_TEST") and not getattr(
+        app_instance.state, "retention_purge_allowed_in_tests", False
+    ):
+        logger.info("Skipping retention purge loop (test environment)")
+        return None
+
+    stop_event = asyncio.Event()
+    app_instance.state.retention_purge_stop = stop_event
+    task = asyncio.create_task(
+        run_retention_purge_loop(get_session_local(), stop_event=stop_event)
+    )
+    app_instance.state.retention_purge_task = task
+    logger.info("Started retention purge loop")
+    return task
+
+
+async def stop_retention_purge_task(app_instance: FastAPI) -> None:
+    """Ask the retention purge loop to stop, give it a moment, then cancel it.
+
+    The signal is not a courtesy. A sweep runs its batch in a worker thread, so
+    cancelling the loop's task would *detach* that thread rather than end it,
+    leaving deletes running while the process tries to exit. The stop event
+    reaches inside the batch, which checks it between tasks and returns.
+
+    The grace window is bounded because between-tasks is not instant: one
+    task's purge has to finish first.
+
+    What cancelling does *not* do is stop that worker. ``task.cancel()`` ends
+    the awaiting coroutine; the thread ``asyncio.to_thread`` handed the batch
+    to keeps running and can still commit the task it is on. That is why the
+    stop event is set at the top of shutdown rather than here -- it is the
+    only thing that reaches inside the batch -- and why the cancel is a
+    backstop for the await, not a way to abort work in flight.
+    """
+
+    stop_event = getattr(app_instance.state, "retention_purge_stop", None)
+    if stop_event is not None:
+        stop_event.set()
+    app_instance.state.retention_purge_stop = None
+
+    task = getattr(app_instance.state, "retention_purge_task", None)
+    app_instance.state.retention_purge_task = None
+    if task is None:
+        return
+    if not task.done():
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=RETENTION_PURGE_STOP_GRACE_SECONDS
+            )
+            return
+        except asyncio.TimeoutError:
+            logger.info("Cancelling retention purge loop after stop grace period...")
+            task.cancel()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("Retention purge loop stopped after failure", exc_info=exc)
+            return
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.error("Retention purge loop stopped after failure", exc_info=exc)
+
+
 def start_temp_file_cleanup_task(
     app_instance: FastAPI,
 ) -> asyncio.Task[Any] | None:
@@ -1339,6 +1459,7 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
         start_task_lease_recovery_task(app_instance)
     start_uploaded_file_recovery_task(app_instance)
     start_orphan_upload_gc_task(app_instance)
+    start_retention_purge_task(app_instance)
 
 
 async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
@@ -1926,6 +2047,16 @@ async def shutdown_event() -> None:
     if temp_file_cleanup_stop is not None:
         temp_file_cleanup_stop.set()
 
+    # WHY: same shape and same reason as the flag above. The purge runs its
+    # batch in a to_thread worker, which a later task cancel cannot stop, so
+    # the signal has to be set before any step that can hang -- otherwise an
+    # unresponsive flush_langfuse leaves the sweep deleting while the process
+    # tries to exit. Setting it is unconditional and cannot hang; the draining
+    # happens later, in stop_retention_purge_task.
+    retention_purge_stop = getattr(app.state, "retention_purge_stop", None)
+    if retention_purge_stop is not None:
+        retention_purge_stop.set()
+
     flush_langfuse()
 
     if _task_command_dispatcher_task is not None:
@@ -1935,6 +2066,7 @@ async def shutdown_event() -> None:
     _task_command_dispatcher_task = None
 
     await stop_orphan_upload_gc_task(app)
+    await stop_retention_purge_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_lease_recovery_task(app)
 

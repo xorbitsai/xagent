@@ -869,11 +869,11 @@ def test_create_resource_warns_when_response_has_no_id(monkeypatch):
     assert result["status"] == "success"
     assert "warning" in result
     assert "no Id" in result["warning"]
-    # Regression guard: this branch and the readback-failed branch both
-    # build their warning from the same is_create-derived retry_note --
-    # a still-earlier version of this fix wired "do not retry" into only
-    # one of the two branches, leaving this one (which deputy_add_employee
-    # hits routinely, per its own docstring) silently without it.
+    # This branch must carry the same "do not retry" guidance as the
+    # readback-failed branch: deputy_add_employee hits it routinely
+    # (Deputy's own OpenAPI spec documents its response as possibly
+    # Id-less), and a caller who retries an unconfirmed create risks a
+    # genuine duplicate record.
     assert "do not retry the create" in result["warning"]
     mock_request.assert_called_once()
 
@@ -1087,11 +1087,10 @@ def test_add_employee_warns_when_response_has_no_id(monkeypatch):
     assert result["status"] == "success"
     assert "warning" in result
     assert "no Id" in result["warning"]
-    # Regression guard: see the identical comment on
-    # test_create_resource_warns_when_response_has_no_id -- this is the
-    # branch deputy_add_employee actually hits routinely, since Deputy's
-    # own OpenAPI spec documents this endpoint's response as possibly
-    # Id-less.
+    # See test_create_resource_warns_when_response_has_no_id -- this is
+    # the branch deputy_add_employee actually hits routinely, since
+    # Deputy's own OpenAPI spec documents this endpoint's response as
+    # possibly Id-less.
     assert "do not retry the create" in result["warning"]
 
 
@@ -1341,48 +1340,55 @@ def test_update_resource_rejects_non_dict_write_response(monkeypatch):
     assert result["status"] == "error"
 
 
-def test_update_resource_downgrades_to_warning_when_readback_fails(monkeypatch):
-    """Same protection as deputy_create_resource/deputy_add_employee: a
-    write that changes an Employee's "Company" (the location/permission-
-    scoping field the 2026-09-21 incident traced the orphaning to) can
-    report success while leaving the record unreadable, even though this
-    is an update, not a create. The write result must still come back
-    (nothing here says the write itself failed), but flagged as
-    unconfirmed rather than a plain success."""
-    mock_request = Mock(
-        side_effect=[
-            MockResponse(json_data={"Id": 123, "Company": 1, "Active": True}),
-            MockResponse(json_data={"Id": 123, "Company": 2, "Active": True}),
+@pytest.mark.parametrize(
+    "third_response,expected_in_warning,expected_not_in_warning",
+    [
+        pytest.param(
             MockResponse(
                 status_code=403,
                 json_data={"error": {"message": "Access to object denied"}},
             ),
-        ]
-    )
-    monkeypatch.setattr(deputy.requests, "request", mock_request)
-
-    result = json.loads(
-        deputy.deputy_update_resource("Employee", "123", {"Company": 2})
-    )
-
-    assert result["status"] == "success"
-    assert result["record"] == {"Id": 123, "Company": 2, "Active": True}
-    assert "warning" in result
-    assert "123" in result["warning"]
-    assert mock_request.call_count == 3
-
-
-def test_update_resource_downgrades_to_warning_when_readback_returns_empty(
-    monkeypatch,
+            ["123", "failed:"],
+            [],
+            id="readback_fails",
+        ),
+        pytest.param(
+            MockResponse(status_code=204),
+            ["returned no record"],
+            [],
+            id="readback_returns_empty",
+        ),
+        pytest.param(
+            MockResponse(json_data=["unexpected", "list"]),
+            ["unexpected response shape"],
+            ["no record"],
+            id="readback_returns_unexpected_shape",
+        ),
+        pytest.param(
+            requests.exceptions.ConnectionError("Connection refused"),
+            ["failed: Connection refused"],
+            [],
+            id="readback_raises_transport_exception",
+        ),
+    ],
+)
+def test_update_resource_downgrades_to_warning_on_unconfirmed_readback(
+    monkeypatch, third_response, expected_in_warning, expected_not_in_warning
 ):
-    """A readback that succeeds but comes back empty (Deputy's own {}
-    normalization for a 204/empty body) is just as unconfirmed as one
-    that errors outright -- must not be silently treated as verified."""
+    """Same protection as deputy_create_resource/deputy_add_employee: a
+    write that changes an Employee's "Company" (the location/permission-
+    scoping field the 2026-09-21 incident traced the orphaning to) can
+    report success while leaving the record unreadable, even though this
+    is an update, not a create -- for every shape an unconfirmed readback
+    can take (an error status, an empty body, an unexpected response
+    shape, or a transport exception), the write result must still come
+    back (nothing here says the write itself failed), but flagged as
+    unconfirmed rather than a plain success."""
     mock_request = Mock(
         side_effect=[
             MockResponse(json_data={"Id": 123, "Active": True}),
             MockResponse(json_data={"Id": 123, "Active": False}),
-            MockResponse(status_code=204),
+            third_response,
         ]
     )
     monkeypatch.setattr(deputy.requests, "request", mock_request)
@@ -1393,7 +1399,11 @@ def test_update_resource_downgrades_to_warning_when_readback_returns_empty(
 
     assert result["status"] == "success"
     assert "warning" in result
-    assert "returned no record" in result["warning"]
+    for substring in expected_in_warning:
+        assert substring in result["warning"]
+    for substring in expected_not_in_warning:
+        assert substring not in result["warning"]
+    assert mock_request.call_count == 3
 
 
 def test_update_resource_returns_the_freshly_read_record_when_verified(monkeypatch):
@@ -1447,57 +1457,6 @@ def test_update_resource_verifies_against_url_resource_id_not_response_body(
     assert verify_call.kwargs["url"] == (
         "https://acme.au.deputy.com/api/v1/resource/Employee/123"
     )
-
-
-def test_update_resource_warning_distinguishes_unexpected_shape_from_empty(
-    monkeypatch,
-):
-    """Mirrors
-    test_create_resource_warning_distinguishes_unexpected_shape_from_empty:
-    a readback that succeeds and returns *something* -- just not a record
-    (e.g. a list) -- is a different, more informative diagnostic than a
-    plain empty response, and the update path must distinguish them the
-    same way create does."""
-    mock_request = Mock(
-        side_effect=[
-            MockResponse(json_data={"Id": 123, "Active": True}),
-            MockResponse(json_data={"Id": 123, "Active": False}),
-            MockResponse(json_data=["unexpected", "list"]),
-        ]
-    )
-    monkeypatch.setattr(deputy.requests, "request", mock_request)
-
-    result = json.loads(
-        deputy.deputy_update_resource("Employee", "123", {"Active": False})
-    )
-
-    assert result["status"] == "success"
-    assert "unexpected response shape" in result["warning"]
-    assert "no record" not in result["warning"]
-
-
-def test_update_resource_downgrades_to_warning_on_transport_exception(monkeypatch):
-    """Mirrors test_add_employee_downgrades_to_warning_on_transport_exception:
-    a readback that fails before ever getting a response (a timeout or
-    connection error, not a 4xx/5xx Deputy responded with) must be caught
-    the same way as any other unconfirmed readback on the update path
-    too, not just create's."""
-    mock_request = Mock(
-        side_effect=[
-            MockResponse(json_data={"Id": 123, "Active": True}),
-            MockResponse(json_data={"Id": 123, "Active": False}),
-            requests.exceptions.ConnectionError("Connection refused"),
-        ]
-    )
-    monkeypatch.setattr(deputy.requests, "request", mock_request)
-
-    result = json.loads(
-        deputy.deputy_update_resource("Employee", "123", {"Active": False})
-    )
-
-    assert result["status"] == "success"
-    assert "warning" in result
-    assert "failed: Connection refused" in result["warning"]
 
 
 def test_update_resource_verifies_even_when_write_response_is_empty(monkeypatch):
@@ -1689,15 +1648,10 @@ def test_create_resource_warning_survives_truncation_with_instruction_intact(
 
 
 def test_create_resource_warning_still_tells_caller_not_to_retry(monkeypatch):
-    """Regression guard: an earlier version of _verify_record_readable's
-    generalization for deputy_update_resource accidentally dropped "do
-    not retry the create, which likely already succeeded" from every
-    caller's warning, not just deputy_update_resource's -- silently
-    reopening the exact duplicate-orphan pattern (Id 5, then Id 6) the
-    2026-09-21 incident hit: create succeeds with an Id, readback fails,
-    caller retries anyway. Only the previous test asserted this warning's
-    wording, and it was updated alongside the regression instead of
-    catching it, so this asserts the retry instruction on its own."""
+    """Create warnings must keep the do-not-retry instruction: an
+    orphaned record is invisible to deputy_query_resource, so a caller
+    that retries after an unconfirmed create risks a genuine duplicate
+    -- the exact Id 5/Id 6 pattern from the 2026-09-21 incident."""
     mock_request = Mock(
         side_effect=[
             MockResponse(json_data={"Id": 1, "FirstName": "Peter"}),

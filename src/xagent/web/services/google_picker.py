@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, cast
 
 from sqlalchemy.orm import Session
 
@@ -22,7 +22,7 @@ def _google_oauth_client_id(db: Session) -> Optional[str]:
     )
     if not provider:
         return os.environ.get("GOOGLE_CLIENT_ID") or None
-    client_id = decrypt_value(provider.client_id)
+    client_id = decrypt_value(cast(str, provider.client_id))
     return client_id or os.environ.get("GOOGLE_CLIENT_ID") or None
 
 

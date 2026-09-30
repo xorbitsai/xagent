@@ -119,6 +119,9 @@ describe("CloudConnectDialog", () => {
           { id: 1, provider: "google-drive", email: "user@example.com", created_at: "now" },
         ]))
       }
+      if (url === "http://api.local/api/cloud/google-drive/picker-availability") {
+        return Promise.resolve(jsonResponse({ configured: true }))
+      }
       if (url === "http://api.local/api/cloud/google-drive/files?folder_id=root&account_id=1") {
         return Promise.resolve(jsonResponse(
           Array.from({ length: 6 }, (_, index) => ({

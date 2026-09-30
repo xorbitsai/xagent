@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union
 from xagent.core.workspace import TaskWorkspace
 
 from ....file_ref import build_workspace_file_ref
+from ....model.chat.basic.adapter import attach_chat_retry_wrapper
 from ....model.chat.basic.base import BaseLLM
 from ...core.vision_tool import (
     DetectObjectsResult,
@@ -418,11 +419,13 @@ def get_default_vision_model() -> Optional[BaseLLM]:
             base_url = os.getenv("OPENAI_BASE_URL")
 
             if model_name:
-                return OpenAILLM(
-                    model_name=model_name,
-                    api_key=openai_key,
-                    base_url=base_url,
-                    abilities=["chat", "tool_calling", "vision"],
+                return attach_chat_retry_wrapper(
+                    OpenAILLM(
+                        model_name=model_name,
+                        api_key=openai_key,
+                        base_url=base_url,
+                        abilities=["chat", "tool_calling", "vision"],
+                    )
                 )
         except Exception as e:
             logger.warning(f"Failed to create OpenAI vision model from env: {e}")
@@ -437,11 +440,13 @@ def get_default_vision_model() -> Optional[BaseLLM]:
             base_url = os.getenv("ZHIPU_BASE_URL")
 
             if model_name:
-                return ZhipuLLM(
-                    model_name=model_name,
-                    api_key=zhipu_key,
-                    base_url=base_url,
-                    abilities=["chat", "tool_calling", "vision"],
+                return attach_chat_retry_wrapper(
+                    ZhipuLLM(
+                        model_name=model_name,
+                        api_key=zhipu_key,
+                        base_url=base_url,
+                        abilities=["chat", "tool_calling", "vision"],
+                    )
                 )
         except Exception as e:
             logger.warning(f"Failed to create Zhipu vision model from env: {e}")
@@ -455,11 +460,13 @@ def get_default_vision_model() -> Optional[BaseLLM]:
             model_name = os.getenv("GEMINI_VISION_MODEL_NAME", "gemini-2.0-flash-exp")
             base_url = os.getenv("GEMINI_BASE_URL")
 
-            return GeminiLLM(
-                model_name=model_name,
-                api_key=gemini_key,
-                base_url=base_url,
-                abilities=["chat", "tool_calling", "vision"],
+            return attach_chat_retry_wrapper(
+                GeminiLLM(
+                    model_name=model_name,
+                    api_key=gemini_key,
+                    base_url=base_url,
+                    abilities=["chat", "tool_calling", "vision"],
+                )
             )
         except Exception as e:
             logger.warning(f"Failed to create Gemini vision model from env: {e}")
@@ -475,11 +482,13 @@ def get_default_vision_model() -> Optional[BaseLLM]:
             )
             base_url = os.getenv("CLAUDE_BASE_URL")
 
-            return ClaudeLLM(
-                model_name=model_name,
-                api_key=claude_key,
-                base_url=base_url,
-                abilities=["chat", "tool_calling", "vision"],
+            return attach_chat_retry_wrapper(
+                ClaudeLLM(
+                    model_name=model_name,
+                    api_key=claude_key,
+                    base_url=base_url,
+                    abilities=["chat", "tool_calling", "vision"],
+                )
             )
         except Exception as e:
             logger.warning(f"Failed to create Claude vision model from env: {e}")

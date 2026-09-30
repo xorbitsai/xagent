@@ -99,6 +99,7 @@ from .mcp_runtime import (
 )
 from .task_command_transport import ClaimedTaskCommand
 from .task_execution_controller import (
+    TaskControlSnapshot,
     TaskControlState,
     apply_task_control_transition,
     task_execution_controller,
@@ -229,6 +230,20 @@ class TaskTurnError(Exception):
     def __init__(self, reason: str = "busy"):
         super().__init__(reason)
         self.reason = reason
+
+
+class TaskTurnAlreadyAccepted(TaskTurnError):
+    """The transcript already holds a user row for this turn id.
+
+    Raised before the insert, inside the claim transaction, so the claim's
+    status flip rolls back with it. Only a same-id redelivery of an accepted
+    turn reaches it: every other caller mints a fresh turn id. The WebSocket
+    adapter settles that turn as outcome unknown; as a ``TaskTurnError`` the
+    other adapters keep their generic busy mapping.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("turn_already_accepted")
 
 
 class TaskTurnNotFoundError(Exception):
@@ -902,10 +917,13 @@ def _reconcile_finalized_turn_delivery(
     (returned ``False``), or the pre-execution SETTLEMENT_READY short-circuit
     fired. A hard process crash skips it too. Of those leftovers, only the
     paused-task resume path has an in-repo consumer that re-posts the same
-    ``turn_id``; ``task_lease_recovery`` terminalizes the *task* but never
-    redrives the turn or touches delivery rows, so the deferral/crash cases
-    remain a narrower instance of the stuck-``pending`` window, not a solved
-    one.
+    ``turn_id``. The rest are closed by ``task_lease_recovery``, which never
+    redrives the turn: when it recovers an expired lease it advances that
+    task's orphaned ``pending`` user rows to ``dispatched`` in the same
+    transaction, and its periodic sweep does the same for rows older than one
+    lease TTL on any quiescent task (appendable status, no pause/resume in
+    flight, no live lease, no unfinished command, no failed same-id command).
+    ``dispatched`` there means "do not resend", not "applied".
 
     Target selection is driven by what finalize actually knows, because the
     downstream contract is asymmetric: the session WS probe answers a
@@ -1007,7 +1025,27 @@ def _persist_accepted_turn_no_commit(
 ) -> _AcceptedTurn:
     """Persist the first message and snapshot one accepted turn."""
 
+    from ..models.chat_message import TaskChatMessage
     from .chat_history_service import persist_user_message_no_commit
+
+    if payload.turn_id is not None and (
+        payload.transcript_message.strip() or payload.attachments
+    ):
+        # Checked before the insert, after the caller's task-row claim (lock
+        # order: task row first). The unique (task_id, role, turn_id) index
+        # would otherwise surface as an IntegrityError that reads as a
+        # delivery failure, although an earlier attempt accepted this turn.
+        already_accepted = (
+            db.query(TaskChatMessage.id)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == payload.turn_id,
+            )
+            .first()
+        )
+        if already_accepted is not None:
+            raise TaskTurnAlreadyAccepted()
 
     persisted_message = persist_user_message_no_commit(
         db=db,
@@ -1166,6 +1204,7 @@ def _accept_turn_no_commit(
             Task.status: TaskStatus.RUNNING,
             Task.input: payload.transcript_message,
             Task.output: None,
+            Task.completion_outcome: None,
             Task.error_message: None,
             Task.run_id: run_id,
             Task.last_checkpoint_event_id: None,
@@ -1210,6 +1249,11 @@ def _accept_turn_no_commit(
         if owned.status == TaskStatus.WAITING_FOR_USER:
             raise TaskTurnError("interaction_response_required")
         raise TaskTurnError("busy")
+
+    if not queued:
+        from .task_admission_execution import require_execution_admission
+
+        require_execution_admission(db, task_id)
 
     result = _persist_accepted_turn_no_commit(
         db,
@@ -1615,6 +1659,60 @@ def _get_agent_manager() -> Any:
     return get_agent_manager()
 
 
+async def pause_unknown_task_lease(
+    lease: TaskLease,
+    *,
+    message: str = "Input outcome unknown; execution paused",
+) -> bool:
+    """Commit an input pause before publishing its fenced snapshot.
+
+    Used for an unknown outcome and for input the fence rejected; ``message``
+    tells clients which one paused the task.
+    """
+    from ..models.database import get_session_local
+    from .task_events import publish_task_event
+    from .workforce_runtime import sync_workforce_run_status
+
+    def settle() -> tuple[bool, TaskControlSnapshot | None]:
+        with get_session_local()() as db:
+            if not lock_task_lease_for_settlement_no_commit(db, lease):
+                return False, None
+            task = db.query(Task).filter(Task.id == lease.task_id).one()
+            snapshot = None
+            if task.status == TaskStatus.RUNNING:
+                snapshot = apply_task_control_transition(
+                    task,
+                    TaskControlState.PAUSED,
+                    status=TaskStatus.PAUSED,
+                    expected_run_id=lease.run_id,
+                )
+                sync_workforce_run_status(db, task, TaskStatus.PAUSED)
+                db.flush()
+            settled = finish_turn(db, lease.task_id, task_lease=lease)
+            return settled, snapshot if settled else None
+
+    settled, snapshot = await run_db_io_cancellation_safe(settle)
+    if snapshot is not None:
+        try:
+            await publish_task_event(
+                {
+                    "type": "task_paused",
+                    "task_id": lease.task_id,
+                    "message": message,
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                    **snapshot.as_dict(),
+                },
+                lease.task_id,
+            )
+        except Exception:
+            logger.warning(
+                "Unknown-input pause committed but broadcast failed for task %s",
+                lease.task_id,
+                exc_info=True,
+            )
+    return settled
+
+
 def settle_task_lease_isolated(
     lease: TaskLease,
     *,
@@ -1665,6 +1763,11 @@ def settle_task_lease_isolated(
                             content=client_error_message,
                             message_type=client_message_type,
                         )
+                    from .task_execution_event_writer import stage_result_fact_no_commit
+
+                    stage_result_fact_no_commit(
+                        settle_db, task, {"error": error_message}
+                    )
                     if get_shared_task_execution_enabled():
                         from .task_runtime_secrets import (
                             delete_runtime_values_no_commit,
@@ -2077,6 +2180,17 @@ def _schedule_bg(
                         return
 
                 async def execute_owned_run() -> None:
+                    if not get_shared_task_execution_enabled() and lease.run_id:
+                        from .connector_runtime import (
+                            bind_ephemeral_runtime_values_to_run,
+                        )
+
+                        bind_ephemeral_runtime_values_to_run(
+                            task_id=task_id,
+                            run_id=lease.run_id,
+                            user_id=task_owner_user_id,
+                            turn_id=payload.turn_id,
+                        )
                     # Snapshot and scope resolution each own a short Session in a
                     # worker. Drain either worker if cancellation arrives so final
                     # settlement never races an abandoned pool checkout.
@@ -2085,6 +2199,9 @@ def _schedule_bg(
                             task_id,
                             task_owner_user_id,
                             before_message_id=before_message_id,
+                            before_turn_id=payload.turn_id
+                            if before_message_id is not None
+                            else None,
                         )
                     )
                     if snapshot is None:
@@ -2368,15 +2485,18 @@ def _schedule_bg(
                     # (returned ``False``), settlement was deferred, or the
                     # pre-execution SETTLEMENT_READY short-circuit fired (the
                     # turn body never ran, so ``completed`` would be a lie).
-                    # KNOWN GAP: rows skipped here stay ``pending`` permanently —
-                    # lease TTL recovery terminalizes the *task* only and nothing
-                    # in this tree redrives delivery rows. The skip is still
-                    # correct (a non-authoritative close is worse). Note the
-                    # deferral triggers correlate with this bug's own trigger:
-                    # post-schedule dispatch, setup/run and settle all draw from
-                    # the same DB pool, so one exhaustion event can both orphan
-                    # the row and defer the settlement that would have closed it.
-                    # Tracked in xorbitsai/xagent-saas#409.
+                    # Rows skipped here are closed by task_lease_recovery instead:
+                    # lease recovery advances the task's orphaned ``pending`` rows
+                    # to ``dispatched`` ("do not resend", not "applied") in its
+                    # recovery transaction, and its periodic sweep does the same
+                    # once the task is quiescent and the row is older than one
+                    # lease TTL. The skip is still correct (a non-authoritative
+                    # close is worse). Note the deferral triggers correlate with
+                    # this bug's own trigger: post-schedule dispatch, setup/run
+                    # and settle all draw from the same DB pool, so one
+                    # exhaustion event can both orphan the row and defer the
+                    # settlement that would have closed it.
+                    # (xorbitsai/xagent-saas#409)
                     if lease_settled and not skip_delivery_reconciliation:
                         try:
                             await run_db_io_cancellation_safe(
@@ -2400,6 +2520,17 @@ def _schedule_bg(
 
                 if turn_id is not None:
                     pop_ephemeral_runtime_values(turn_id)
+                if not get_shared_task_execution_enabled() and lease and lease.run_id:
+                    from .connector_runtime import (
+                        clean_ephemeral_runtime_values_for_run,
+                    )
+
+                    cleanup_run_id = lease.run_id
+                    await run_db_io_cancellation_safe(
+                        lambda: clean_ephemeral_runtime_values_for_run(
+                            task_id=task_id, run_id=cleanup_run_id
+                        )
+                    )
                 if get_shared_task_execution_enabled():
                     from .task_runtime_secrets import clean_finished_runtime_values
 

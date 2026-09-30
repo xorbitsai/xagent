@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Union
 
 from ..storage.contracts import DocumentRecord
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sqlalchemy.orm import Session
 
     from xagent.web.models.uploaded_file import UploadedFile
@@ -20,6 +24,8 @@ if TYPE_CHECKING:
         UploadedFileRefreshSnapshot,
     )
 
+    from .storage_shim import KBStorageShimCompatibilityFacade
+
 
 class KBFileCompatibilityFacade:
     """Compatibility boundary for legacy uploaded-file and physical helpers.
@@ -29,6 +35,22 @@ class KBFileCompatibilityFacade:
     unchanged. This facade gives coordinator-owned callers a stable semantic
     entry point while preserving existing public helper behavior.
     """
+
+    def __init__(
+        self, storage_shim: Optional[KBStorageShimCompatibilityFacade] = None
+    ) -> None:
+        self._storage_shim = storage_shim
+
+    @contextmanager
+    def _storage_context(self) -> Iterator[None]:
+        if self._storage_shim is None:
+            yield
+            return
+
+        from ..storage.factory import bind_storage_shim_for_current_context
+
+        with bind_storage_shim_for_current_context(self._storage_shim):
+            yield
 
     def upsert_uploaded_file_record(
         self,
@@ -60,15 +82,25 @@ class KBFileCompatibilityFacade:
         *,
         user_id: Optional[int] = None,
         is_admin: bool,
-        collection_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        from xagent.web.services.kb_file_service import _list_documents_for_user_impl
+        with self._storage_context():
+            from ..storage.factory import get_vector_index_store
 
-        return _list_documents_for_user_impl(
-            user_id=user_id,
-            is_admin=is_admin,
-            collection_name=collection_name,
+            return get_vector_index_store().list_document_rows(
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+    def find_referenced_file_ids(self, file_ids: Iterable[str]) -> set[str]:
+        from ..storage.factory import get_vector_index_store
+
+        store = (
+            self._storage_shim.get_vector_index_store()
+            if self._storage_shim is not None
+            else get_vector_index_store()
         )
+        records = store.list_document_records_by_file_ids(file_ids)
+        return {record.file_id for record in records if record.file_id}
 
     def build_uploaded_filename_map(
         self, db: Session, *, user_id: Optional[int], file_ids: List[str]
@@ -111,6 +143,7 @@ class KBFileCompatibilityFacade:
         file_id: str,
         user_id: Optional[int],
         remaining_file_ids: set[str],
+        after_commit: Optional[List[tuple[str, Callable[[], None]]]] = None,
     ) -> bool:
         from xagent.web.services.kb_file_service import (
             _delete_uploaded_file_if_orphaned_impl,
@@ -121,6 +154,7 @@ class KBFileCompatibilityFacade:
             file_id=file_id,
             user_id=user_id,
             remaining_file_ids=remaining_file_ids,
+            after_commit=after_commit,
         )
 
     def list_collection_uploaded_file_owner_ids(
@@ -140,6 +174,7 @@ class KBFileCompatibilityFacade:
 
     def delete_collection_physical_dir(
         self,
+        db: Session,
         *,
         user_id: int,
         collection_name: str,
@@ -149,6 +184,7 @@ class KBFileCompatibilityFacade:
         )
 
         return _delete_collection_physical_dir_impl(
+            db,
             user_id=user_id,
             collection_name=collection_name,
         )
@@ -161,6 +197,7 @@ class KBFileCompatibilityFacade:
         collection_file_ids: Set[str],
         remaining_file_ids: Set[str],
         collection_dir: Optional[Path],
+        after_commit: List[tuple[str, Callable[[], None]]],
     ) -> int:
         from xagent.web.services.kb_collection_service import (
             _delete_collection_uploaded_files_impl,
@@ -172,6 +209,7 @@ class KBFileCompatibilityFacade:
             collection_file_ids=collection_file_ids,
             remaining_file_ids=remaining_file_ids,
             collection_dir=collection_dir,
+            after_commit=after_commit,
         )
 
     def rename_collection_storage(
@@ -207,12 +245,13 @@ class KBFileCompatibilityFacade:
             _aggregate_uploaded_file_statuses_impl,
         )
 
-        return _aggregate_uploaded_file_statuses_impl(
-            file_ids=file_ids,
-            user_id=user_id,
-            is_admin=is_admin,
-            use_cache=use_cache,
-        )
+        with self._storage_context():
+            return _aggregate_uploaded_file_statuses_impl(
+                file_ids=file_ids,
+                user_id=user_id,
+                is_admin=is_admin,
+                use_cache=use_cache,
+            )
 
     def reconcile_uploaded_files(
         self,
@@ -228,35 +267,15 @@ class KBFileCompatibilityFacade:
             _reconcile_uploaded_files_impl,
         )
 
-        return _reconcile_uploaded_files_impl(
-            db,
-            user_id=user_id,
-            is_admin=is_admin,
-            stale_ttl_hours=stale_ttl_hours,
-            delete_stale=delete_stale,
-            deletable_statuses=deletable_statuses,
-        )
-
-    def compensate_new_uploaded_file(
-        self,
-        db: Session,
-        *,
-        file_id: str,
-        user_id: Optional[int] = None,
-        delete_local: bool = True,
-        local_root: Optional[Path] = None,
-    ) -> FileCompensationResult:
-        from xagent.web.services.kb_file_service import (
-            _compensate_new_uploaded_file_impl,
-        )
-
-        return _compensate_new_uploaded_file_impl(
-            db,
-            file_id=file_id,
-            user_id=user_id,
-            delete_local=delete_local,
-            local_root=local_root,
-        )
+        with self._storage_context():
+            return _reconcile_uploaded_files_impl(
+                db,
+                user_id=user_id,
+                is_admin=is_admin,
+                stale_ttl_hours=stale_ttl_hours,
+                delete_stale=delete_stale,
+                deletable_statuses=deletable_statuses,
+            )
 
     def cleanup_local_copied_file(
         self,

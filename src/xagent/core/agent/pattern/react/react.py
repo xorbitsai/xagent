@@ -58,13 +58,16 @@ import asyncio
 import copy
 import hashlib
 import inspect
+import itertools
 import json
 import logging
 from dataclasses import dataclass, replace
 from datetime import timezone
 from enum import Enum
 from typing import Any, Callable, cast
+from uuid import uuid4
 
+from .....config import get_form_answer_continuation_enabled
 from ....context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
 from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
@@ -85,12 +88,19 @@ from ....tools.adapters.vibe.mcp_approval_gate import (
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
 )
+from ....tools.tool_result_spill import (
+    SPILL_READ_TOOL_NAME,
+    SPILL_RESERVED_RESULT_KEY,
+    normalize_spilled_relative_path,
+    render_spill_notice,
+)
 from ....tools.user_interaction import (
+    WAITING_FOR_USER_STATUS,
     ToolInteractionSettlement,
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
-from ...checkpoint import CheckpointPersistenceError
+from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...clarification import draft_from_waiting_request
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
@@ -110,6 +120,7 @@ from ...grounding import evidence_facts, grounding_rule
 from ...language import final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
+    tool_result_requires_authentication,
     tool_result_succeeded,
     unwrap_final_answer_content,
 )
@@ -128,6 +139,7 @@ from ...runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
+from ...tool_access import connector_tool_sources, tool_access_context
 from ...trace import TraceAction, TraceCategory, TraceEventType, TraceScope
 from ..base import (
     AgentPattern,
@@ -168,6 +180,26 @@ STRIP_LOG_MAX_TOOL_NAMES = 8
 STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
 # One best-effort delivery turn after the work budget, never another work loop.
 ITERATION_LIMIT_DELIVERY_TIMEOUT_SECONDS = 30.0
+# Stored-result reads a forced answer turn may make, counted over the whole
+# run: reads that ran (the budget) and paths that matched no stored result
+# (the reject cap) are counted apart so neither kind uses up the other.
+FORCED_ANSWER_READ_BUDGET = 3
+FORCED_ANSWER_READ_REJECT_CAP = 3
+# The observations a forced turn's refused read_tool_result calls receive.
+FORCED_ANSWER_READS_USED_UP_TEXT = (
+    "The read allowance for the final answer is used up. Answer from what you "
+    "have already read; do not state a value you did not read."
+)
+FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT = (
+    "Too many paths for the final answer did not match the stored results "
+    "listed above. Answer from what you have; do not state a value you did "
+    "not read."
+)
+FORCED_ANSWER_READ_UNLISTED_PATH_TEXT = (
+    "read_tool_result during the final answer turn is limited to the stored "
+    "results listed above. Copy one of those paths exactly. That path is not "
+    "one of them."
+)
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
@@ -526,6 +558,80 @@ def _is_answerable(interaction: Any) -> bool:
     return not lacks_required_options(interaction)
 
 
+# The rule this implements: a model-authored ask_user_question is a form when
+# at least one of its answerable fields (see ``_is_answerable``) has a type
+# other than confirm or file_upload. Every other answerable type counts,
+# including a select_one whose options are just "Yes" and "No" and
+# action_cards; only the two types below are excluded. ``boolean`` is not
+# listed because it normalizes to confirm before this check runs.
+_NON_FORM_ANSWERABLE_TYPES = frozenset({"confirm", "file_upload"})
+
+
+@dataclass(frozen=True)
+class FormAnswerDecision:
+    """Whether this one LLM call is a form-answer turn, and whether the
+    form-answer-continuation text is applied to it.
+
+    Computed exactly once per call, at the site that builds that call's final
+    messages, so the same object both selects what ``get_messages_for_llm``
+    renders (via ``_messages_for_llm(..., form_answer_continuation=...)``)
+    and what ``trace_metadata`` reports for it -- the two can never disagree
+    about the same call.
+    """
+
+    # Whether this call could carry the text at all: the latest visible user
+    # message answers a model-authored form and the context renders a
+    # "Current user request" block (``form_answer_continuation_target``).
+    # Recorded on every main and protocol-retry call where that holds,
+    # including forced ones and with the switch off, so how often this shape
+    # occurs stays visible either way. A DAG step or a context with no
+    # current request records nothing.
+    turn: bool
+    # Whether the form-answer-continuation text was actually applied to this
+    # call: turn, plus an unforced turn and the global switch
+    # (``get_form_answer_continuation_enabled``) being on.
+    applied: bool
+
+    def trace_metadata(self) -> dict[str, bool]:
+        metadata: dict[str, bool] = {}
+        if self.turn:
+            metadata["form_answer_turn"] = True
+        if self.applied:
+            metadata["form_answer_continuation"] = True
+        return metadata
+
+
+def _form_answer_decision(
+    context: Any, *, force_final_answer: bool
+) -> FormAnswerDecision:
+    """Shared by the main loop and the protocol retry. The iteration-limit
+    delivery does not call this and does not pass ``form_answer_continuation``
+    to ``_messages_for_llm``, so it relies on that parameter's default
+    (False). A forced turn cannot call ``ask_user_question`` again, so it
+    never applies."""
+    turn = context.form_answer_continuation_target() is not None
+    applied = turn and not force_final_answer and get_form_answer_continuation_enabled()
+    return FormAnswerDecision(turn=turn, applied=applied)
+
+
+def _unavailable_tool_call_names(
+    protocol_error: dict[str, Any],
+) -> frozenset[str] | None:
+    """Names a provider refused as unavailable, or None when it does not say.
+
+    Only the structured details["tool_name"] counts. The violation's message
+    also names the call, but it is one adapter's prose and nothing promises
+    its wording.
+    """
+    details = protocol_error.get("details")
+    if not isinstance(details, dict):
+        return None
+    name = details.get("tool_name")
+    if isinstance(name, str) and name:
+        return frozenset({name})
+    return None
+
+
 class ReActPattern(AgentPattern):
     """Minimal ReAct loop for the execution runtime."""
 
@@ -535,6 +641,12 @@ class ReActPattern(AgentPattern):
         *,
         # Intentionally high for interactive and long-running agent tasks; callers
         # can pass a lower value when they need stricter cost or latency bounds.
+        # Reads on a forced answer turn, and reads refused there because the
+        # path is not a stored result, add iterations on top of this bound
+        # (forced_answer_extra_iterations, at most FORCED_ANSWER_READ_BUDGET +
+        # FORCED_ANSWER_READ_REJECT_CAP per run). Only forced answer turns may
+        # use them; every other turn stops at this value, which itself does
+        # not count them.
         max_iterations: int = 200,
         tool_choice: str | dict[str, Any] | None = "required",
         reasoning_mode: ReActReasoningMode | str = ReActReasoningMode.TOOL_CALLING,
@@ -574,6 +686,17 @@ class ReActPattern(AgentPattern):
         self.pending_tool_call_content: dict[str, str] = {}
         self.tool_ledger: dict[str, ToolCallRecord] = {}
         self.force_final_answer_next = False
+        # Forced-answer read state. The two counters are per run and never
+        # reset, so a run makes at most FORCED_ANSWER_READ_BUDGET +
+        # FORCED_ANSWER_READ_REJECT_CAP forced-turn read dispositions.
+        # _forced_answer_read_open says whether the current forced turn offers
+        # read_tool_result; forced_answer_extra_iterations counts the
+        # iterations those dispositions added on top of max_iterations and is
+        # never reset either.
+        self.forced_answer_reads_used = 0
+        self.forced_answer_reads_rejected = 0
+        self._forced_answer_read_open = False
+        self.forced_answer_extra_iterations = 0
         # See _settlement_fence_active: a one-way latch for the single turn
         # that received a rejected / dispatch-unknown settlement.
         self.settlement_final_answer_fence = False
@@ -585,6 +708,7 @@ class ReActPattern(AgentPattern):
         self.memory_input_text: str | None = None
         self._memory_store: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
+        self._connector_tool_sources: dict[str, str] = {}
 
     async def run(
         self,
@@ -752,6 +876,7 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         self.status = "thinking"
         self._tool_decision_groups_by_name = self._tool_decision_groups_for_tools(tools)
+        self._connector_tool_sources = connector_tool_sources(tools)
         # Read by get_system_context to contradict skill text naming edit_image.
         context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] = (
             "generate_image" in self._tool_decision_groups_by_name
@@ -762,8 +887,37 @@ class ReActPattern(AgentPattern):
             if self.tool_choice == "none"
             else self._tool_schemas_with_builtin_controls(tools)
         )
+        # base_tool_schemas never lists the stored-result reader; its schema
+        # is built here from this run's tools and added back per iteration
+        # by _tool_schemas_with_spill_read. None when the run offers no tools
+        # at all or has no reader tool, and then it is never offered.
+        spill_read_tool = (
+            None
+            if self.tool_choice == "none"
+            else next(
+                (
+                    tool
+                    for tool in tools
+                    if self._tool_name(tool) == SPILL_READ_TOOL_NAME
+                ),
+                None,
+            )
+        )
+        spill_read_schema = (
+            None
+            if spill_read_tool is None
+            else self._build_tool_schema(spill_read_tool)
+        )
 
-        for iteration in range(self.current_iteration, self.max_iterations):
+        # The bound is re-read on every pass because a forced-turn read raises
+        # it for forced answer turns; every other turn, and every turn of a
+        # run that made no such read, stays within
+        # range(self.current_iteration, self.max_iterations).
+        for iteration in itertools.count(self.current_iteration):
+            if not self._within_iteration_bound(
+                iteration, runtime=runtime, context=context
+            ):
+                break
             self.current_iteration = iteration
             if self.pending_tool_calls:
                 self._ensure_pending_tool_call_envelope(context)
@@ -789,20 +943,31 @@ class ReActPattern(AgentPattern):
                     return decision_result
 
             settlement_fence = self._settlement_fence_active(runtime)
-            force_final_answer_now = (
-                self.force_final_answer_next
-                or settlement_fence
-                or (
-                    self.finalize_after_tool_result
-                    and not self.pending_tool_calls
-                    and self._latest_tool_result_success(context)
-                )
+            force_final_answer_now = self._forced_answer_turn_now(
+                context, settlement_fence=settlement_fence
             )
-            tool_schemas = (
-                [self._final_answer_tool_schema()]
-                if force_final_answer_now
-                else base_tool_schemas
+            normal_tool_schemas = self._tool_schemas_with_spill_read(
+                base_tool_schemas, spill_read_schema, context
             )
+            if not force_final_answer_now:
+                tool_schemas = normal_tool_schemas
+            elif settlement_fence:
+                # The settlement-fence turn explains a refused or unknown
+                # write and must not reach any tool but final_answer.
+                tool_schemas = [self._final_answer_tool_schema()]
+            else:
+                tool_schemas = self._forced_answer_tool_schemas(normal_tool_schemas)
+            self._forced_answer_read_open = force_final_answer_now and (
+                SPILL_READ_TOOL_NAME in self._schema_tool_names(tool_schemas)
+            )
+            if self._forced_answer_read_open:
+                # A forced turn that offers reads stays forced until it
+                # answers. A turn entered only through the flash-mode derived
+                # condition would otherwise drop out of it after a failed
+                # read and hand the next turn the full tool set. Latched only
+                # when reads are offered, so a run with nothing stored keeps
+                # the flag exactly as before.
+                self.force_final_answer_next = True
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,
@@ -826,18 +991,23 @@ class ReActPattern(AgentPattern):
                 "iteration": iteration,
                 **resolved_llm_metadata(call_llm),
             }
-            # A forced turn's schema is already down to final_answer alone,
-            # so compacting here deletes the values it must answer from and
-            # closes the only route back to them in the same breath. Every
+            # A forced turn's schema is down to final_answer, plus
+            # read_tool_result while this run holds stored results and both
+            # read allowances remain (never on the settlement-fence turn).
+            # Compacting here deletes the values it must answer from, and none
+            # of those tools can run the work that produced them again. Every
             # other turn still holds its tools and can fetch a compacted-away
             # value again. The cost is deliberate: this turn can now exceed
-            # the model's window and fail instead of answering.
+            # the model's window and fail instead of answering. A turn that
+            # offers reads adds to that volume: up to FORCED_ANSWER_READ_BUDGET
+            # reads per run, each of at most SPILL_READ_MAX_CHARS characters,
+            # accumulate on the forced turns and are not compacted either.
             if force_final_answer_now:
                 # Measures the one new failure mode this change introduces,
                 # so it carries no switch. Numbers and ids only -- never
                 # message text, a tool name, or a tool argument. The estimate
                 # counts what this turn actually sends -- the same messages
-                # and the one tool schema handed to the call below -- so it is
+                # and the tool schemas handed to the call below -- so it is
                 # comparable with the threshold logged beside it.
                 context_tokens = context.estimate_context_tokens(
                     route_messages, tool_schemas
@@ -876,11 +1046,20 @@ class ReActPattern(AgentPattern):
                 )
                 note_compaction_evidence_loss(context, compact_result)
 
+            # Computed once, after compaction (compaction can change which
+            # message is the latest visible user message), at the site that
+            # builds this call's real final messages -- not at the routing
+            # build above, whose messages are only used to pick the model.
+            form_answer_decision = _form_answer_decision(
+                context, force_final_answer=force_final_answer_now
+            )
+            llm_metadata.update(form_answer_decision.trace_metadata())
             messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
                 force_final_answer=force_final_answer_now,
                 tool_names=self._schema_tool_names(tool_schemas),
+                form_answer_continuation=form_answer_decision.applied,
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
             await runtime.on_llm_start(
@@ -942,6 +1121,14 @@ class ReActPattern(AgentPattern):
                         "protocol_code": exc.code,
                     },
                 )
+                if (
+                    unavailable_tool_call
+                    and not settlement_fence
+                    and iteration >= self.max_iterations
+                ):
+                    # Past max_iterations only a forced answer turn may run;
+                    # stop rather than restore the full tool set there.
+                    break
                 try:
                     # The settlement fence outranks unavailable-tool recovery:
                     # restoring the full tool set here is exactly the hole that
@@ -958,7 +1145,7 @@ class ReActPattern(AgentPattern):
                         llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
-                        tool_schemas=base_tool_schemas,
+                        tool_schemas=normal_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not restore_full_tool_set
                         ),
@@ -978,7 +1165,7 @@ class ReActPattern(AgentPattern):
                         return interrupted
                     raise
                 if restore_full_tool_set:
-                    self.force_final_answer_next = False
+                    self._release_forced_answer()
                     force_final_answer_now = False
                 protocol_retry_performed = True
                 response_already_traced = True
@@ -993,6 +1180,7 @@ class ReActPattern(AgentPattern):
                 normalized,
                 force_final_answer=force_final_answer_now,
                 reject_mixed_control_calls=protocol_retry_performed,
+                allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
             )
             end_metadata: dict[str, Any] = dict(llm_metadata)
             if requires_protocol_retry:
@@ -1030,13 +1218,31 @@ class ReActPattern(AgentPattern):
                 # fails the run without the user seeing the preamble.
                 # As in the exception path above, the settlement fence wins:
                 # a fenced turn never gets its work tools back.
+                #
+                # While this run holds stored results, a read_tool_result call
+                # on a forced turn whose read allowance ran out is retried on
+                # the same narrowed tools rather than handed the full set
+                # back; otherwise one more read call would reopen every tool.
+                # With nothing stored the reader is not on the ordinary
+                # surface either, and such a call recovers as it always did.
+                recovery_allowed_names = frozenset(
+                    self._schema_tool_names(tool_schemas)
+                )
+                if SPILL_READ_TOOL_NAME in self._schema_tool_names(normal_tool_schemas):
+                    recovery_allowed_names |= {SPILL_READ_TOOL_NAME}
                 recover_full_tool_set = (
                     not settlement_fence
                     and self._requires_full_tool_set_recovery(
                         normalized,
                         force_final_answer=force_final_answer_now,
+                        allowed_tool_names=recovery_allowed_names,
                     )
                 )
+                if recover_full_tool_set and iteration >= self.max_iterations:
+                    # Past max_iterations only a forced answer turn may run.
+                    # Handing this one the full tool set would run ordinary
+                    # work there, so stop as the loop does at its bound.
+                    break
                 empty_final_answer = self._empty_final_answer_call(normalized)
                 if empty_final_answer is not None:
                     logger.warning(
@@ -1062,7 +1268,7 @@ class ReActPattern(AgentPattern):
                         llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
-                        tool_schemas=base_tool_schemas,
+                        tool_schemas=normal_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
                         ),
@@ -1079,7 +1285,7 @@ class ReActPattern(AgentPattern):
                         return interrupted
                     raise
                 if recover_full_tool_set:
-                    self.force_final_answer_next = False
+                    self._release_forced_answer()
                     force_final_answer_now = False
                 self.last_response = response
                 normalized = self._normalize_llm_response(response)
@@ -1087,6 +1293,7 @@ class ReActPattern(AgentPattern):
                     normalized,
                     force_final_answer=force_final_answer_now,
                     reject_mixed_control_calls=recover_full_tool_set,
+                    allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
                 ):
                     return await self._invalid_tool_protocol_result(
                         runtime=runtime,
@@ -1124,6 +1331,11 @@ class ReActPattern(AgentPattern):
 
             assistant_content = normalized.get("content")
             tool_calls = normalized.get("tool_calls", [])
+            if getattr(runtime.tracer, "records_execution_events", False) is True:
+                batch_id = str(uuid4())
+                for tool_call in tool_calls:
+                    tool_call["assistant_message_id"] = batch_id
+                    tool_call["tool_attempt_id"] = str(uuid4())
             if assistant_content is not None or normalized.get("tool_calls"):
                 # A tool-protocol error response never carries tool_calls (see
                 # tool_protocol_error_response), so this guard never mistakes
@@ -1193,7 +1405,11 @@ class ReActPattern(AgentPattern):
         return PatternResult(
             success=False,
             error="ReActPattern reached max iterations without a final answer.",
-            metadata={"iterations": self.max_iterations, "status": self.status},
+            metadata={
+                "iterations": self.max_iterations,
+                "status": self.status,
+                "forced_answer_extra_iterations": self.forced_answer_extra_iterations,
+            },
         ).to_dict()
 
     async def _deliver_at_iteration_limit(
@@ -1319,7 +1535,7 @@ class ReActPattern(AgentPattern):
 
         ``empty_final_answer`` distinguishes "the model never produced an answer"
         from the status's other producers (provider protocol errors, mixed
-        control calls, a non-``final_answer`` tool on a forced turn), whose
+        control calls, a tool the forced turn did not offer), whose
         ``error`` text is the only signal a caller has. Delegated-child
         classification reads it to avoid collapsing all four into "never
         produced an answer" - see ``agent_tool._classify_delegated_failure``.
@@ -1334,6 +1550,9 @@ class ReActPattern(AgentPattern):
         )
         if answer_streamer is not None:
             await answer_streamer.fail(stream_failure_message)
+        # The run ends here, so the forced turn no longer offers reads. The
+        # force flag keeps its value and the per-run counters are not reset.
+        self._forced_answer_read_open = False
         await runtime.checkpoint(
             "invalid_tool_protocol",
             context=context,
@@ -1415,8 +1634,13 @@ class ReActPattern(AgentPattern):
         has_tools: bool,
         force_final_answer: bool = False,
         tool_names: list[str] | None = None,
+        form_answer_continuation: bool = False,
     ) -> list[dict[str, Any]]:
-        messages = list(context.get_messages_for_llm())
+        messages = list(
+            context.get_messages_for_llm(
+                form_answer_continuation=form_answer_continuation
+            )
+        )
         if force_final_answer:
             # One body with switched phrases: hand-written duplicates would
             # drift, and the weaker copy lands on the turn that invents a
@@ -1453,12 +1677,46 @@ class ReActPattern(AgentPattern):
                     "read and outcome=blocked when none of it is. "
                 )
             evidence_facts_text = evidence_facts(state)
+            # The read sentences follow what this turn actually sends: the
+            # reader and its stored-result list when it is offered, the
+            # used-up sentence when an allowance ran out on a turn that would
+            # otherwise offer it, and nothing otherwise, which is the prompt
+            # a run with nothing stored gets.
+            if SPILL_READ_TOOL_NAME in (tool_names or []):
+                read_instruction = self._forced_answer_read_instruction(context)
+                tool_rule = (
+                    "Do not call any tool other than final_answer and "
+                    "read_tool_result, and do not output tool-call markup as "
+                    "plain text. "
+                )
+            else:
+                # The used-up sentence belongs only to a turn whose reads were
+                # withheld by the allowance. The settlement-fence turn never
+                # offers reads, so its prompt stays exactly as before whatever
+                # the counters say; _settlement_fence_active has already
+                # synced the fence flag with this turn.
+                # The sentence names the allowance that ran out, checked in
+                # the order a refused call is judged: the read allowance
+                # first, then the reject allowance.
+                read_instruction = ""
+                if not self.settlement_final_answer_fence:
+                    if self.forced_answer_reads_used >= FORCED_ANSWER_READ_BUDGET:
+                        read_instruction = f"{FORCED_ANSWER_READS_USED_UP_TEXT} "
+                    elif (
+                        self.forced_answer_reads_rejected
+                        >= FORCED_ANSWER_READ_REJECT_CAP
+                    ):
+                        read_instruction = f"{FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT} "
+                tool_rule = (
+                    "Do not call any other tool and do not output "
+                    "tool-call markup as plain text. "
+                )
             instruction = (
                 "Produce the final user-facing answer by calling the final_answer "
                 f"control tool exactly once{source_phrase}. "
                 f"{evidence_facts_text}"
-                "Do not call any other tool and do not output "
-                f"tool-call markup as plain text. {outcome_rule}"
+                f"{read_instruction}"
+                f"{tool_rule}{outcome_rule}"
                 "If a "
                 "previous ask_user_question narrowed the request to a selected "
                 "subset of items or resources, the final answer must cover only "
@@ -1499,6 +1757,16 @@ class ReActPattern(AgentPattern):
                 "the user or attempt an unavailable interaction tool; finish with "
                 "outcome=blocked and explain what is missing. "
             )
+            clarification_instruction = (
+                "Request clarification only when missing information prevents "
+                "correct or authorized work or the user explicitly asked to be "
+                "consulted. "
+                if self.user_interaction_enabled
+                else "User interaction is disabled. If the user explicitly asked "
+                "to choose and that choice is still pending, do not select for "
+                "them; finish with outcome=blocked and explain that the required "
+                "user choice cannot be obtained in this run. "
+            )
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
                 "execute, inspect, read, write, or otherwise produce a concrete result "
@@ -1510,7 +1778,20 @@ class ReActPattern(AgentPattern):
                 "as any other tool call: run the work tools first, then answer on a "
                 "later turn from their results. Do not write assistant text in the "
                 "same response as a work tool call; call the tool directly. "
+                f"{clarification_instruction}"
+                "For nonessential presentation choices, "
+                "including an unspecified output format, choose a sensible "
+                "default and deliver the supported work without pausing unless "
+                "the user explicitly asked to choose. This "
+                "does not permit guessing facts, action targets, or authorization. "
                 f"{missing_information_instruction}"
+                "If a tool reports missing or expired "
+                "authorization, changing unrelated query parameters or switching "
+                "to a generic HTTP tool does not restore access; retry only after "
+                "a relevant authorization or configuration change. Never ask the "
+                "user to paste passwords, API keys, or access tokens into chat or "
+                "a clarification form; direct credential setup to the application's "
+                "connection settings instead. "
                 "If the latest user "
                 "message explicitly asks you to call a named available tool, call "
                 "that tool instead of paraphrasing the request. If a tool "
@@ -1541,6 +1822,11 @@ class ReActPattern(AgentPattern):
                 f"\n\nAvailable tool names for this LLM call are exactly: {available_tools}. "
                 "Never call a tool name that is not in this list."
             )
+            access_context = tool_access_context(
+                self._connector_tool_sources, active_tool_names
+            )
+            if access_context:
+                instruction = f"{instruction}\n\n{access_context}"
         else:
             # Reachable only with tool_choice="none", which no production
             # construction site sets. If that ever changes, this branch needs
@@ -1571,14 +1857,30 @@ class ReActPattern(AgentPattern):
         recovery_reason: str | None = None,
         empty_final_answer: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
-        tools = (
-            [self._final_answer_tool_schema()] if force_final_answer else tool_schemas
+        # tool_schemas is the repaired turn's ordinary surface. Whether that
+        # turn, if forced, offered reads was decided when it was built
+        # (_forced_answer_read_open), so the retry sends exactly the tools the
+        # turn it repairs sent, the settlement-fence turn's final_answer alone
+        # included.
+        if not force_final_answer:
+            tools = tool_schemas
+        elif self._forced_answer_read_open:
+            tools = self._forced_answer_tool_schemas(tool_schemas)
+        else:
+            tools = [self._final_answer_tool_schema()]
+        # The retry can run unforced where the main call was forced
+        # (unavailable-tool recovery restores the full tool set), so it
+        # computes its own decision with its own force flag, by the same
+        # shared formula.
+        form_answer_decision = _form_answer_decision(
+            context, force_final_answer=force_final_answer
         )
         messages = self._messages_for_llm(
             context,
             has_tools=True,
             force_final_answer=force_final_answer,
             tool_names=self._schema_tool_names(tools),
+            form_answer_continuation=form_answer_decision.applied,
         )
         if recovery_reason == "unavailable_tool_call":
             retry_instruction = (
@@ -1608,16 +1910,27 @@ class ReActPattern(AgentPattern):
             )
             retry_phase = "malformed_tool_arguments_recovery"
         elif recovery_reason == "empty_final_answer":
-            # On a forced turn ``tools`` above is final_answer alone, so offering
-            # a work tool would instruct the model to do something the schema
-            # forbids and waste the one repair attempt.
+            # On a forced turn ``tools`` above holds no work tool, so offering
+            # one would instruct the model to do something the schema forbids
+            # and waste the one repair attempt. When the turn also offers
+            # read_tool_result, the answer must still come in a turn of its
+            # own: a final_answer bundled with a read is discarded.
+            if SPILL_READ_TOOL_NAME in self._schema_tool_names(tools):
+                forced_retry_text = (
+                    "Call final_answer again with the complete user-facing "
+                    "response in its answer field, in a turn of its own."
+                )
+            else:
+                forced_retry_text = (
+                    "final_answer is the only tool available on this turn: call it "
+                    "again with the complete user-facing response in its answer "
+                    "field."
+                )
             retry_instruction = (
                 "The previous response called final_answer with an empty answer "
                 "field, so the user received no reply at all. "
                 + (
-                    "final_answer is the only tool available on this turn: call it "
-                    "again with the complete user-facing response in its answer "
-                    "field."
+                    forced_retry_text
                     if force_final_answer
                     else "Retry this turn: if the task is complete, call "
                     "final_answer again with the complete user-facing response in "
@@ -1657,6 +1970,7 @@ class ReActPattern(AgentPattern):
         }
         if recovery_reason:
             metadata["recovery_reason"] = recovery_reason
+        metadata.update(form_answer_decision.trace_metadata())
         await runtime.checkpoint(
             retry_phase,
             context=context,
@@ -1694,6 +2008,7 @@ class ReActPattern(AgentPattern):
             normalized,
             force_final_answer=force_final_answer,
             reject_mixed_control_calls=(recovery_reason == "unavailable_tool_call"),
+            allowed_tool_names=frozenset(self._schema_tool_names(tools)),
         )
         end_metadata = dict(metadata)
         if retry_is_invalid:
@@ -1714,9 +2029,17 @@ class ReActPattern(AgentPattern):
         *,
         force_final_answer: bool,
         reject_mixed_control_calls: bool = False,
+        allowed_tool_names: frozenset[str] | None = None,
     ) -> bool:
+        """Whether a response breaks this turn's tool protocol.
+
+        On a forced turn a call is allowed only if its name is in
+        allowed_tool_names, the names of the tools this turn actually sent;
+        without it only final_answer is allowed.
+        """
         if get_tool_protocol_error(normalized.get("raw")) is not None:
             return True
+        allowed_names = allowed_tool_names or frozenset({"final_answer"})
         tool_calls = normalized.get("tool_calls") or []
         if (
             reject_mixed_control_calls
@@ -1731,7 +2054,7 @@ class ReActPattern(AgentPattern):
         for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
                 continue
-            if force_final_answer and tool_call.get("name") != "final_answer":
+            if force_final_answer and tool_call.get("name") not in allowed_names:
                 return True
         if self._batch_carries_work_tool(tool_calls):
             # A final_answer sharing the batch with a work tool is removed by
@@ -1867,17 +2190,38 @@ class ReActPattern(AgentPattern):
         normalized: dict[str, Any],
         *,
         force_final_answer: bool,
+        allowed_tool_names: frozenset[str] | None = None,
     ) -> bool:
+        """Whether a rejected response should get the full tool set back.
+
+        On a forced turn only a call outside allowed_tool_names does. A plain
+        response is judged by every call it carries; a provider-reported
+        unavailable_tool_call only by the one refused name the provider
+        reports, which is the first call it refused. A reply that mixes a read
+        with another tool can therefore stay on the narrowed tools on the
+        provider path where the plain path hands the full set back; that is
+        the conservative direction. Without allowed_tool_names only
+        final_answer is allowed.
+        """
+        allowed_names = allowed_tool_names or frozenset({"final_answer"})
         protocol_error = get_tool_protocol_error(normalized.get("raw"))
         if (
             isinstance(protocol_error, dict)
             and protocol_error.get("code") == "unavailable_tool_call"
         ):
-            return True
+            # Outside a forced turn the answer is unchanged: restore.
+            if not force_final_answer:
+                return True
+            rejected = _unavailable_tool_call_names(protocol_error)
+            if rejected is None:
+                # The violation does not name the call. Restore, as before,
+                # rather than keep a narrowed set the model cannot leave.
+                return True
+            return not rejected <= allowed_names
         if not force_final_answer:
             return False
         return any(
-            isinstance(tool_call, dict) and tool_call.get("name") != "final_answer"
+            isinstance(tool_call, dict) and tool_call.get("name") not in allowed_names
             for tool_call in normalized.get("tool_calls") or []
         )
 
@@ -1887,6 +2231,168 @@ class ReActPattern(AgentPattern):
             if isinstance(function, dict) and function.get("name") == "final_answer":
                 return schema
         raise RuntimeError("final_answer control tool schema is unavailable")
+
+    def _release_forced_answer(self) -> None:
+        """Leave the forced answer turn.
+
+        The two read counters are per run and are not reset here, so a later
+        forced turn in the same run gets no fresh read allowance.
+        forced_answer_extra_iterations is never reset: it is part of the
+        loop bound, and the iteration may already be past max_iterations.
+        """
+        self.force_final_answer_next = False
+        self._forced_answer_read_open = False
+
+    def _forced_answer_turn_now(self, context: Any, *, settlement_fence: bool) -> bool:
+        """Whether the turn about to call the model is a forced answer turn."""
+        return (
+            self.force_final_answer_next
+            or settlement_fence
+            or (
+                self.finalize_after_tool_result
+                and not self.pending_tool_calls
+                and self._latest_tool_result_success(context)
+            )
+        )
+
+    def _within_iteration_bound(
+        self, iteration: int, *, runtime: PatternRuntime, context: Any
+    ) -> bool:
+        """Whether the loop may run this iteration.
+
+        max_iterations bounds every turn, as it always has. The iterations
+        forced-turn reads added extend it only for a forced answer turn, or
+        for the pending calls such a turn left behind, so an ordinary turn
+        never runs past max_iterations.
+        """
+        if iteration < self.max_iterations:
+            return True
+        if iteration >= self.max_iterations + self.forced_answer_extra_iterations:
+            return False
+        if self.pending_tool_calls:
+            return self._forced_answer_read_open or self.force_final_answer_next
+        return self._forced_answer_turn_now(
+            context, settlement_fence=self._settlement_fence_active(runtime)
+        )
+
+    def _forced_answer_read_allowance_open(self) -> bool:
+        """Both per-run forced-turn read allowances still have room."""
+        return (
+            self.forced_answer_reads_used < FORCED_ANSWER_READ_BUDGET
+            and self.forced_answer_reads_rejected < FORCED_ANSWER_READ_REJECT_CAP
+        )
+
+    def _forced_answer_tool_schemas(
+        self, normal_tool_schemas: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """The tools a forced answer turn offers.
+
+        Built, never filtered. final_answer always comes from
+        _final_answer_tool_schema(): the same-named entry of the ordinary
+        surface can be the variant whose answer description sends the model
+        to get_workspace_output_files, a tool this turn does not offer.
+        read_tool_result is appended only when the turn's ordinary surface
+        carries it -- the one fact that says this run stored a result and has
+        a reader to offer -- and both read allowances still have room.
+        """
+        schemas = [self._final_answer_tool_schema()]
+        if not self._forced_answer_read_allowance_open():
+            return schemas
+        reader = next(
+            (
+                schema
+                for schema in normal_tool_schemas
+                if self._schema_tool_names([schema]) == [SPILL_READ_TOOL_NAME]
+            ),
+            None,
+        )
+        if reader is not None:
+            schemas.append(reader)
+        return schemas
+
+    def _forced_answer_read_was_interrupted(self, tool_call: dict[str, Any]) -> bool:
+        """Whether this pending read was admitted, started and interrupted.
+
+        Only an admitted call runs, so a read whose ledger record says it was
+        interrupted mid-run has already been counted. Resuming replays that
+        same call, recognized by its id, name and arguments.
+        """
+        record = self.tool_ledger.get(str(tool_call.get("id")))
+        return (
+            record is not None
+            and record.status == "interrupted"
+            and record.tool_name == SPILL_READ_TOOL_NAME
+            and record.args_hash
+            == self._args_hash(self._tool_call_args_dict(tool_call))
+        )
+
+    def _apply_forced_answer_read_policy(
+        self, segment: list[dict[str, Any]], context: Any
+    ) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], str]]]:
+        """Admit or refuse each read_tool_result call of a forced turn.
+
+        The one writer of both read counters and of
+        forced_answer_extra_iterations, which moves in lock step with them.
+        Calls are judged one at a time, in order, before any of them runs:
+
+        - not read_tool_result: admitted, nothing counted;
+        - a read that was admitted, started and interrupted, now replayed on
+          resume: admitted, nothing counted again;
+        - read allowance used up: refused, nothing counted;
+        - reject allowance used up: refused, nothing counted;
+        - no path (the key is missing, None or blank, which lists the stored
+          results): admitted as one read;
+        - a path that normalizes to a stored result: admitted as one read,
+          whatever start, end and offset it carries;
+        - any other path: refused and counted as one reject.
+
+        Returns (admitted, refused) for the leading calls of segment that
+        share the first call's outcome, so results still reach the context
+        in call order; the calls after them are judged when the loop reaches
+        them.
+        """
+        stored_paths = self._spilled_paths(context)
+        admitted: list[dict[str, Any]] = []
+        refused: list[tuple[dict[str, Any], str]] = []
+        for tool_call in segment:
+            refusal: str | None = None
+            counts_as_read = False
+            counts_as_reject = False
+            if tool_call.get("name") == SPILL_READ_TOOL_NAME:
+                path = self._tool_call_args_dict(tool_call).get("path")
+                # The same test read_tool_result itself uses to decide that
+                # a call lists the stored results instead of reading one.
+                lists_stored_results = path is None or (
+                    isinstance(path, str) and not path.strip()
+                )
+                if self._forced_answer_read_was_interrupted(tool_call):
+                    # Counted when it was admitted; the replay runs uncounted.
+                    pass
+                elif self.forced_answer_reads_used >= FORCED_ANSWER_READ_BUDGET:
+                    refusal = FORCED_ANSWER_READS_USED_UP_TEXT
+                elif self.forced_answer_reads_rejected >= FORCED_ANSWER_READ_REJECT_CAP:
+                    refusal = FORCED_ANSWER_READ_REJECTS_USED_UP_TEXT
+                elif (
+                    lists_stored_results
+                    or normalize_spilled_relative_path(path) in stored_paths
+                ):
+                    counts_as_read = True
+                else:
+                    refusal = FORCED_ANSWER_READ_UNLISTED_PATH_TEXT
+                    counts_as_reject = True
+            if admitted if refusal is not None else refused:
+                break
+            if counts_as_read:
+                self.forced_answer_reads_used += 1
+                self.forced_answer_extra_iterations += 1
+            if counts_as_reject:
+                self.forced_answer_reads_rejected += 1
+                self.forced_answer_extra_iterations += 1
+            if refusal is None:
+                admitted.append(tool_call)
+            else:
+                refused.append((tool_call, refusal))
+        return admitted, refused
 
     def _schema_tool_names(self, tool_schemas: list[dict[str, Any]]) -> list[str]:
         names: list[str] = []
@@ -1968,6 +2474,14 @@ class ReActPattern(AgentPattern):
                 self.repeated_tool_decision_after_consecutive_work_tool_calls
             ),
             "force_final_answer_next": self.force_final_answer_next,
+            # Scalars, only ever reassigned. forced_answer_read_open must
+            # survive a resume: the read policy also runs for pending calls
+            # replayed from the top of the loop, where the turn that offered
+            # the reads is no longer being computed.
+            "forced_answer_reads_used": self.forced_answer_reads_used,
+            "forced_answer_reads_rejected": self.forced_answer_reads_rejected,
+            "forced_answer_read_open": self._forced_answer_read_open,
+            "forced_answer_extra_iterations": self.forced_answer_extra_iterations,
             # Scalars, so no snapshot needed: the fence flag and the turn it
             # is scoped to are only ever reassigned (see
             # ``_settlement_fence_active`` and ``_record_settled_tool_call``).
@@ -2054,6 +2568,20 @@ class ReActPattern(AgentPattern):
                 int(raw_work_threshold) if raw_work_threshold is not None else None
             )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
+        # A missing, None or negative count reads as 0, and a read-open flag
+        # that is anything but True reads as False, so a checkpoint written
+        # before these keys existed resumes as a run that made no forced-turn
+        # reads.
+        self.forced_answer_reads_used = max(
+            0, int(state.get("forced_answer_reads_used", 0) or 0)
+        )
+        self.forced_answer_reads_rejected = max(
+            0, int(state.get("forced_answer_reads_rejected", 0) or 0)
+        )
+        self._forced_answer_read_open = state.get("forced_answer_read_open") is True
+        self.forced_answer_extra_iterations = max(
+            0, int(state.get("forced_answer_extra_iterations", 0) or 0)
+        )
         self.settlement_final_answer_fence = bool(
             state.get("settlement_final_answer_fence", False)
         )
@@ -2657,7 +3185,7 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
         data: dict[str, Any],
     ) -> None:
-        """Write one settlement trace event, matching runtime's best-effort rule."""
+        """Persist settlement facts strictly and deliver observers best-effort."""
 
         execution_id = getattr(runtime, "execution_id", None)
         step_id = getattr(runtime, "active_react_step_id", None)
@@ -2670,6 +3198,8 @@ class ReActPattern(AgentPattern):
             )
             if inspect.isawaitable(emitted):
                 await emitted
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
             # UI trace events are best-effort, exactly as in
             # PatternRuntime._emit_trace_event; a tracer fault must not undo a
@@ -3183,19 +3713,25 @@ class ReActPattern(AgentPattern):
                     "name": "ask_user_question",
                     "description": (
                         "Ask the user for structured input and pause execution until "
-                        "the user responds. Use this only when execution cannot "
+                        "the user responds. Use this when the user explicitly asks "
+                        "to be consulted, or when execution cannot "
                         "continue without missing user-provided information, such "
                         "as a required file, URL, account, target object, permission, "
                         "a fact-carrying value (one that asserts a real-world fact) "
                         "for a tool argument that the user has not provided, "
                         "or a choice between mutually exclusive actions with "
-                        "different side effects. Do not use it to confirm execution "
+                        "different side effects. Unless the user explicitly asks "
+                        "to be consulted, do not use it to confirm execution "
                         "strategy, whether to search, whether to use memory, whether "
                         "to apply formatting preferences, or whether to proceed with "
                         "a sufficiently specified task; decide those yourself. A task "
                         "is not sufficiently specified if carrying it out would "
                         "require inventing a fact-carrying argument value the user "
-                        "has not provided. " + OPTIONS_REQUIRED_GUIDANCE
+                        "has not provided. Do not request passwords, API keys, or "
+                        "access tokens in these fields. For missing data access, "
+                        "offer uploaded or pasted data where suitable; credentials "
+                        "belong in the application's connection settings, not this "
+                        "form. " + OPTIONS_REQUIRED_GUIDANCE
                     ),
                     "parameters": {
                         "type": "object",
@@ -3266,7 +3802,14 @@ class ReActPattern(AgentPattern):
         external_tools = [
             self._build_tool_schema(tool)
             for tool in tools
-            if self._tool_name(tool) not in control_tool_names
+            if (name := self._tool_name(tool)) not in control_tool_names
+            # Unconditional: this function only sees the static tool list
+            # (it runs once per run, before the iteration loop even starts),
+            # so it cannot know whether the run has stored anything yet.
+            # _tool_schemas_with_spill_read adds the reader back once the
+            # registry is non-empty -- a dynamic fact this function has no
+            # way to observe.
+            and name != SPILL_READ_TOOL_NAME
         ]
         can_lookup_output_files = any(
             schema.get("function", {}).get("name") == WORKSPACE_OUTPUT_FILES_TOOL_NAME
@@ -3279,6 +3822,72 @@ class ReActPattern(AgentPattern):
             ),
         ]
 
+    def _spilled_records(self, context: Any) -> Any:
+        """The records of this execution's stored results, possibly empty.
+
+        Read-only on purpose: it goes through get_component and treats a
+        missing component as empty. The context's spilled_results property
+        creates an empty registry component the first time it is read, and
+        this runs on every iteration, so reading through that property would
+        add an empty spilled_results entry to every checkpoint of every run
+        that never stored anything.
+        """
+        get_component = getattr(context, "get_component", None)
+        component = (
+            get_component("spilled_results") if callable(get_component) else None
+        )
+        return getattr(component, "records", ()) or ()
+
+    def _spilled_paths(self, context: Any) -> frozenset[str]:
+        """Exact relative paths this execution stored results into."""
+        return frozenset(
+            str(record["relative_path"])
+            for record in self._spilled_records(context)
+            if isinstance(record, dict) and isinstance(record.get("relative_path"), str)
+        )
+
+    def _forced_answer_read_instruction(self, context: Any) -> str:
+        """The forced-turn prompt sentences for a turn that offers reads.
+
+        The stored-result list is the compaction-style notice, whose header
+        says what the list is and ends with "Stored results:".
+        """
+        remaining = FORCED_ANSWER_READ_BUDGET - self.forced_answer_reads_used
+        notice = render_spill_notice(self._spilled_records(context), style="compaction")
+        return (
+            "You may call read_tool_result to read the stored results listed "
+            f"below before answering, at most {remaining} more time(s) before "
+            "the final answer. start and "
+            "end are 1-based item numbers for that file. Read in one turn and "
+            "answer in the next: a response that calls read_tool_result and "
+            "final_answer together loses the answer. Copy a path below exactly; "
+            "a path that is not listed does not work and is counted against a "
+            "separate small allowance.\n"
+            f"{notice}\n"
+            "If read_tool_result reports a result is no longer available, treat "
+            "it as unavailable and do not reconstruct it. State in your answer "
+            "which items you did not read. "
+        )
+
+    def _tool_schemas_with_spill_read(
+        self,
+        base_schemas: list[dict[str, Any]],
+        spill_read_schema: dict[str, Any] | None,
+        context: Any,
+    ) -> list[dict[str, Any]]:
+        """Add the stored-result reader once this run has actually stored one.
+
+        base_schemas is built once per run, before the iteration loop, so it
+        cannot know about a registry that fills up mid-run. This runs on
+        every iteration instead, which is the only place that sees the
+        spill that just happened. spill_read_schema is None when the run
+        has no reader to offer (tool_choice "none", or no reader tool), and
+        base_schemas then comes back unchanged whatever the registry holds.
+        """
+        if spill_read_schema is None or not self._spilled_paths(context):
+            return base_schemas  # byte-identical to the baseline surface
+        return [*base_schemas, spill_read_schema]
+
     def _control_tool_names(self) -> set[str]:
         return set(CONTROL_TOOL_NAMES)
 
@@ -3288,7 +3897,13 @@ class ReActPattern(AgentPattern):
             "tool_call_id": tool_call["id"],
             "tool_name": tool_call["name"],
         }
-        for key in ("step_id", "dag_step_id", "turn_id"):
+        for key in (
+            "step_id",
+            "dag_step_id",
+            "turn_id",
+            "assistant_message_id",
+            "tool_attempt_id",
+        ):
             if tool_call.get(key):
                 source[key] = tool_call[key]
         return source
@@ -3524,6 +4139,24 @@ class ReActPattern(AgentPattern):
                 "interactions": interactions,
                 "task_text": self.task_text,
                 "message_count": len(getattr(context, "messages", [])),
+                # A form, for the form-answer-continuation text (react.py's
+                # _form_answer_decision / execution.py's readers), is the
+                # model's own question having at least one answerable field
+                # whose type is neither confirm nor file_upload (the rule
+                # stated at _NON_FORM_ANSWERABLE_TYPES). Computed
+                # from the model-authored, pre-append list -- deduplicated_interactions,
+                # not the ``interactions`` _send_waiting_message may have
+                # appended a default field to -- so an engine-appended
+                # placeholder field never manufactures a form on its own,
+                # and only this branch (ask_user_question) ever writes this
+                # key: send_message(expect_response=True) and a tool's own
+                # waiting request have no model-authored interactions to
+                # judge in the first place.
+                "form": any(
+                    _is_answerable(interaction)
+                    and interaction.get("type") not in _NON_FORM_ANSWERABLE_TYPES
+                    for interaction in deduplicated_interactions
+                ),
             }
             return {
                 "success": False,
@@ -3624,9 +4257,10 @@ class ReActPattern(AgentPattern):
         path restores the full tool set. That bounds the run: a second empty
         answer ends it as ``invalid_tool_protocol`` rather than looping. It does
         not prevent tool re-execution outright - if the forced turn calls a
-        non-``final_answer`` tool, ``_requires_full_tool_set_recovery`` restores
-        the full set and clears the flag, so a discarded work tool can be
-        re-invoked on that turn.
+        tool other than ``final_answer`` or, while this run holds stored
+        results, ``read_tool_result``, ``_requires_full_tool_set_recovery``
+        restores the full set and clears the flag, so a discarded work tool
+        can be re-invoked on that turn.
         """
 
         logger.warning(
@@ -3752,7 +4386,7 @@ class ReActPattern(AgentPattern):
         discarded_calls = self.pending_tool_calls
         self.pending_tool_calls = []
         self.repeated_tool_decision = None
-        self.force_final_answer_next = False
+        self._release_forced_answer()
         self._cancel_tool_calls(
             discarded_calls,
             context,
@@ -3780,6 +4414,21 @@ class ReActPattern(AgentPattern):
                 status="cancelled",
                 result=result,
             )
+
+    def _refuse_forced_answer_read(
+        self, tool_call: dict[str, Any], refusal: str, context: Any
+    ) -> None:
+        """Close a forced-turn read the read policy refused.
+
+        Closed the way _cancel_tool_calls closes a call that will never run:
+        one failed result the model reads, carrying the refusal text in
+        error, and one ledger record, here with status "refused". No tool
+        start or end event is sent, as for a cancelled call: on_tool_start
+        is where a tool invocation is metered, and this read never ran.
+        """
+        result = {"success": False, "status": "refused", "error": refusal}
+        self._backfill_result(tool_call, result, context)
+        self._record_tool_call(tool_call, status="refused", result=result)
 
     async def _pause_for_tool_results(
         self,
@@ -4078,6 +4727,25 @@ class ReActPattern(AgentPattern):
                 return interrupted
 
             segment, kind = self._next_segment(self.pending_tool_calls, tools)
+            if self._forced_answer_read_open:
+                admitted, refused = self._apply_forced_answer_read_policy(
+                    segment, context
+                )
+                for refused_call, refusal in refused:
+                    self._refuse_forced_answer_read(refused_call, refusal, context)
+                if refused:
+                    refused_ids = {id(call) for call, _ in refused}
+                    self.pending_tool_calls = [
+                        call
+                        for call in self.pending_tool_calls
+                        if id(call) not in refused_ids
+                    ]
+                if not admitted:
+                    continue
+                if len(admitted) < len(segment):
+                    # The rest of the segment stays pending for the next pass;
+                    # re-slicing keeps the segment kind right for what is left.
+                    segment, kind = self._next_segment(admitted, tools)
 
             if kind == "control":
                 tool_call = segment[0]
@@ -4240,6 +4908,11 @@ class ReActPattern(AgentPattern):
         context: Any,
         runtime: PatternRuntime,
     ) -> bool:
+        if self._forced_answer_read_open:
+            # A forced turn's reads have allowances of their own. Only the
+            # turn that actually offers reads is exempt: ordinary turns,
+            # stored results or not, still get the decision.
+            return False
         if self.repeated_tool_decision is not None:
             return False
 
@@ -4658,7 +5331,7 @@ class ReActPattern(AgentPattern):
         self.pending_tool_calls = []
         self.waiting_for_user_request = None
         self.pending_tool_interaction_responses = []
-        self.force_final_answer_next = False
+        self._release_forced_answer()
         self.settlement_final_answer_fence = False
         self.settlement_fence_turn_id = None
         self.status = "completed"
@@ -4865,12 +5538,23 @@ class ReActPattern(AgentPattern):
             # those at the top level, so drop them here — unconditionally,
             # not via the split helpers, whose scope validation could raise —
             # or they reach the model as noise nested inside the envelope.
+            # The spill report is one of them: add_tool_result registers it
+            # and keeps it out of the rendered body only at the top level,
+            # so nested here it would print its relative_path in the
+            # envelope's body with no notice. Dropping it loses nothing; the
+            # report was registered when the original call's result was
+            # added.
             prior_result = record.result
             if isinstance(prior_result, dict):
                 prior_result = {
                     key: value
                     for key, value in prior_result.items()
-                    if key not in (CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY)
+                    if key
+                    not in (
+                        CONTEXT_REFS_KEY,
+                        SUPERSEDES_SCOPE_KEY,
+                        SPILL_RESERVED_RESULT_KEY,
+                    )
                 }
             return build_suppression_envelope(
                 tool_name=tool_name,
@@ -4910,6 +5594,20 @@ class ReActPattern(AgentPattern):
         is_control = tool_call["name"] in CONTROL_TOOL_NAMES
         if not is_control:
             tool_call = self._with_trace_safe_tool_args(tool_call, tools)
+            committed = await runtime.load_committed_tool_outcome(tool_call)
+            if committed is not None:
+                result = committed["result"]
+                self._record_tool_call(
+                    tool_call,
+                    status="waiting_for_user"
+                    if tool_result_waits_for_user(result)
+                    else (
+                        "completed" if self._tool_result_success(result) else "failed"
+                    ),
+                    result=result,
+                    error=committed["error"],
+                )
+                return result
             # The duplicate-write scan runs before this call writes any ledger
             # record: provider-supplied tool_call ids are not guaranteed
             # unique (see _run_concurrent_batch), so recording "running" first
@@ -4964,6 +5662,8 @@ class ReActPattern(AgentPattern):
                 )
                 recorded_terminal = True
                 raise
+            except ExecutionEventPersistenceError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 error_result = {
                     "success": False,
@@ -4981,6 +5681,24 @@ class ReActPattern(AgentPattern):
                 )
                 recorded_terminal = True
                 return error_result
+
+            if self.user_interaction_enabled and tool_result_requires_authentication(
+                result
+            ):
+                # Reuse the checkpoint/replan path instead of letting the model
+                # retry unchanged credentials or execute its queued fallback.
+                # Headless runs retain the ordinary classified failure result.
+                result = {
+                    **result,
+                    "status": WAITING_FOR_USER_STATUS,
+                    "message": (
+                        f"The connection used by {tool_call['name']} requires "
+                        "authentication. Please check or update its authorization "
+                        "in the connection settings, then reply to continue. "
+                        "Do not paste credentials into this conversation. You can "
+                        "also provide an exported file or choose another source."
+                    ),
+                }
 
             if tool_result_waits_for_user(result):
                 self._record_tool_call(

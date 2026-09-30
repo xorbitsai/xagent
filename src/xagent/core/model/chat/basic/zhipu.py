@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ except ImportError:
     # Fallback for when zai SDK is not available
     ZhipuAiClient = None
 
+from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
@@ -132,6 +134,11 @@ class ZhipuLLM(BaseLLM):
             self._client = ZhipuAiClient(
                 api_key=self.api_key,
                 base_url=self.base_url,
+                # Retry policy lives in the shared RetryWrapper only. The zai
+                # SDK defaults to three retries of its own, so left alone this
+                # client would issue four requests inside every attempt we
+                # make. See ``OpenAICompatibleLLM._ensure_client``.
+                max_retries=0,
             )
 
     async def chat(
@@ -224,8 +231,10 @@ class ZhipuLLM(BaseLLM):
             logger.debug("Making Zhipu API call...")
 
             try:
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
+                # asyncio.to_thread runs the SDK call in a copy of the caller's
+                # context, so context variables (log-scoping state among them)
+                # reach the SDK thread.
+                response = await asyncio.to_thread(
                     lambda: self._client.chat.completions.create(**completion_params),  # type: ignore
                 )
                 logger.debug(
@@ -588,8 +597,12 @@ class ZhipuLLM(BaseLLM):
 
                         loop.call_soon_threadsafe(put_exception)
 
-            # Start the producer thread
-            producer_task = loop.run_in_executor(None, stream_producer)
+            # Start the producer thread. The SDK runs there, so it gets the
+            # caller's context (as asyncio.to_thread would give it): context
+            # variables such as log-scoping state apply to its records too.
+            producer_task = loop.run_in_executor(
+                None, contextvars.copy_context().run, stream_producer
+            )
 
             # Consume chunks from the queue as they arrive (true streaming)
             while True:
@@ -758,6 +771,16 @@ class ZhipuLLM(BaseLLM):
             raise LLMRetryableError("Streaming timeout exceeded")
 
         except Exception as e:
+            # Streaming swallowed every provider failure into an ERROR chunk,
+            # so the shared RetryWrapper never saw one and the zai SDK's own
+            # budget (three retries) was the only cover a streaming call had.
+            # That budget is now zero (see ``_ensure_client``), so a transient
+            # failure has to raise for the wrapper to retry it. Classified by
+            # the same predicate the wrapper uses, so producer and consumer
+            # cannot drift; permanent failures keep the ERROR chunk.
+            if retry_on(e):
+                raise LLMRetryableError(f"Zhipu streaming API error: {str(e)}") from e
+
             logger.error(f"Zhipu streaming API error: {str(e)}")
             yield StreamChunk(
                 type=ChunkType.ERROR,
@@ -868,8 +891,10 @@ class ZhipuLLM(BaseLLM):
             logger.debug("Making Zhipu Vision API call...")
 
             try:
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
+                # asyncio.to_thread runs the SDK call in a copy of the caller's
+                # context, so context variables (log-scoping state among them)
+                # reach the SDK thread.
+                response = await asyncio.to_thread(
                     lambda: self._client.chat.completions.create(**completion_params),  # type: ignore
                 )
                 logger.debug(
@@ -1061,7 +1086,7 @@ class ZhipuLLM(BaseLLM):
 
     @staticmethod
     async def list_available_models(
-        api_key: str, base_url: Optional[str] = None
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
         """Fetch available models from Zhipu AI using their SDK.
 
@@ -1070,6 +1095,8 @@ class ZhipuLLM(BaseLLM):
             base_url: Base URL for Zhipu API (optional).
                 - If not provided, uses official Zhipu API: https://open.bigmodel.cn/v1
                 - If provided, uses the specified endpoint
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
 
         Returns:
             List of available models with their information
@@ -1160,4 +1187,6 @@ class ZhipuLLM(BaseLLM):
             raise
         except Exception as e:
             logger.error(f"Failed to fetch Zhipu models: {e}")
+            if raise_on_error:
+                raise
             return []

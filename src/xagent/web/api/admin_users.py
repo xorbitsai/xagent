@@ -25,6 +25,15 @@ from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
 from ..services.model_store import ModelStore
+from ..services.task_cleanup_obligations import (
+    CleanupObligation,
+    RecordedCleanupObligation,
+    describe_cleanup_failure,
+    extension_obligation,
+    record_cleanup_obligations_no_commit,
+    settle_cleanup_attempts_sync,
+    workspace_obligation,
+)
 from ..services.task_interaction_schema import interaction_requests_table_exists
 from ..services.task_runtime import (
     TaskRuntimeExtensionError,
@@ -260,35 +269,47 @@ def _capture_page_workspace_targets_sync(
 
 def _remove_workspaces_sync(
     *, targets: list[WorkspaceCleanupTarget], user_id: int
-) -> set[int]:
-    """Remove the captured workspaces, reporting which were left behind.
-
-    Task ids rather than a count, because a task whose capture failed is
-    already pending and is in ``targets`` as well: summing the two would
-    report one task as two leaked directories.
+) -> dict[int, str]:
+    """Remove the captured workspaces, returning the error for each left behind.
 
     Runs after the rows are committed as deleted, so nothing here can fail the
     request: a raised error would tell the admin the account still exists.
+    What it could not remove stays owed -- the obligation was recorded with the
+    deletion -- and the retry driver takes it from there.
     """
 
-    pending: set[int] = set()
+    failures: dict[int, str] = {}
     for target in targets:
         try:
             remove_task_workspace(target)
-        except Exception:
-            pending.add(target.task_id)
+        except Exception as exc:
+            failures[target.task_id] = describe_cleanup_failure(exc)
             logger.error(
                 "User %s was deleted but the workspace of task %s could not be "
-                "removed; the directory is leaked and needs manual reconciliation",
+                "removed; the retry driver will re-attempt it",
                 user_id,
                 target.task_id,
                 exc_info=True,
             )
-    return pending
+    return failures
 
 
-def _delete_user_rows_sync(*, user_id: int) -> bool:
-    """Delete one user and every row it owns in an operation-local session."""
+def _delete_user_rows_sync(
+    *,
+    user_id: int,
+    workspaces: list[CleanupObligation] | None = None,
+    extensions: list[CleanupObligation] | None = None,
+) -> list[RecordedCleanupObligation] | None:
+    """Delete one user and every row it owns in an operation-local session.
+
+    The external cleanup the deleted tasks will owe commits with the rows, so
+    a crash before the workspaces are removed still leaves it on record. The
+    recorded workspace obligations are returned for the caller to settle after
+    its inline removal, and are not due for the retry driver before then; the
+    extensions are nothing this caller will attempt, so they are due at once.
+
+    Returns ``None`` when the user no longer exists.
+    """
 
     from ..models.auto_model import AutoModelCandidate, AutoModelConfig
     from ..models.mcp import UserMCPServer
@@ -301,7 +322,7 @@ def _delete_user_rows_sync(*, user_id: int) -> bool:
     try:
         user = delete_db.query(User).filter(User.id == user_id).first()
         if user is None:
-            return False
+            return None
 
         # Existing deployments may still have the removed Text2SQL table. Clean
         # it up by table name so user deletion keeps working under strict FKs.
@@ -352,9 +373,13 @@ def _delete_user_rows_sync(*, user_id: int) -> bool:
             changed_configs.add(int(config.id))
             delete_db.delete(candidate)
         ModelStore(delete_db).refresh_auto_model_abilities(list(changed_configs))
+        recorded = record_cleanup_obligations_no_commit(
+            delete_db, workspaces or (), inline_attempt=True
+        )
+        record_cleanup_obligations_no_commit(delete_db, extensions or ())
         delete_db.commit()
         ModelStore(delete_db).invalidate_after_user_delete()
-        return True
+        return recorded
     except Exception:
         delete_db.rollback()
         raise
@@ -451,6 +476,9 @@ async def delete_user(
     # by which point no page can be re-read.
     workspace_targets: list[WorkspaceCleanupTarget] = []
     workspace_capture_failures: set[int] = set()
+    # Bindings whose provider is not registered in this process: nothing here
+    # can release them, so they are recorded and stay owed until one can.
+    extensions_owed: list[CleanupObligation] = []
     extension_cleanup_required = bool(registered_task_extensions())
     session_factory = get_session_local()
     cleanup_semaphore = asyncio.Semaphore(_TASK_RUNTIME_DELETE_CONCURRENCY)
@@ -486,6 +514,20 @@ async def delete_user(
         workspace_targets.extend(page_targets)
         workspace_capture_failures |= page_dropped
         if not extension_cleanup_required:
+            # No provider is registered in this process, so none can be
+            # dispatched -- but a bound task's provider state still exists
+            # wherever that provider keeps it. Owed, like any binding whose
+            # provider is not registered, rather than dropped with the rows.
+            extensions_owed.extend(
+                extension_obligation(
+                    task_id=int(task_id),
+                    user_id=int(task_user_id),
+                    source=source,
+                    extension=name,
+                )
+                for task_id, task_user_id, source, agent_config in task_rows
+                for name in task_extension_bindings_from_agent_config(agent_config)
+            )
             continue
         page = [
             (
@@ -530,6 +572,15 @@ async def delete_user(
                 cleanup_failures.append((context.task_id, result))
             else:
                 settled.append((context.task_id, tuple(result)))
+                extensions_owed.extend(
+                    extension_obligation(
+                        task_id=context.task_id,
+                        user_id=context.user_id,
+                        source=context.source,
+                        extension=name,
+                    )
+                    for name in result
+                )
         await asyncio.to_thread(_record_settled_bindings_sync, settled=settled)
 
         if cleanup_failures:
@@ -549,14 +600,41 @@ async def delete_user(
     # The rest of user deletion is synchronous ORM/DBAPI work whose cost scales
     # with the user's task count. Run it in a worker thread and in its own
     # session so an admin deleting a large account cannot stall the event loop.
+    # A task whose scope did not resolve is recorded with the unscoped
+    # candidates and marked, so that clearing them ends on the operator's list
+    # rather than passing for a full cleanup.
+    workspaces_owed = [
+        workspace_obligation(
+            target, scope_resolved=target.task_id not in workspace_capture_failures
+        )
+        for target in workspace_targets
+    ]
+
     release_db_connection_if_clean(db)
-    deleted = await asyncio.to_thread(_delete_user_rows_sync, user_id=user_id)
-    if not deleted:
+    recorded_workspaces = await asyncio.to_thread(
+        _delete_user_rows_sync,
+        user_id=user_id,
+        workspaces=workspaces_owed,
+        extensions=extensions_owed,
+    )
+    if recorded_workspaces is None:
         raise HTTPException(status_code=404, detail="User not found")
 
-    pending = workspace_capture_failures | await asyncio.to_thread(
+    removal_failures = await asyncio.to_thread(
         _remove_workspaces_sync, targets=workspace_targets, user_id=user_id
     )
+    # Task ids rather than a count: pending is whatever is still owed after
+    # settling, whichever of a failed removal or an unresolved scope made it so.
+    statuses = await asyncio.to_thread(
+        settle_cleanup_attempts_sync,
+        session_factory,
+        [(owed, removal_failures.get(owed.task_id)) for owed in recorded_workspaces],
+    )
+    pending = {
+        owed.task_id
+        for owed, status in zip(recorded_workspaces, statuses, strict=True)
+        if status is not None
+    }
 
     if pending:
         logger.error(
@@ -575,4 +653,7 @@ async def delete_user(
         # means the same thing on both endpoints; the count is in the log line
         # above, which is where an operator reconciling them is looking.
         "workspace_cleanup_pending": bool(pending),
+        # The workspaces or any runtime-extension state still owed, as on the
+        # task-level delete.
+        "external_cleanup_pending": bool(pending) or bool(extensions_owed),
     }

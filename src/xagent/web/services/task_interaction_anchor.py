@@ -422,6 +422,36 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
         )
         return None
 
+    if task.conversation_storage_version == 2:
+        if task.last_checkpoint_event_id is None:
+            return None
+
+        from ...core.agent.checkpoint import CheckpointCorruptError
+        from .task_execution_event_recovery import find_event_checkpoint_anchor
+
+        try:
+            event = find_event_checkpoint_anchor(
+                db,
+                task_id=int(task.id),
+                protocol_event_id=str(task.last_checkpoint_event_id),
+                execution_id=str(task.id),
+                run_id=str(task.run_id),
+            )
+        except CheckpointCorruptError:
+            return None
+        if event is None:
+            return None
+        if event.payload["data"]["checkpoint_type"] in LEGACY_CHECKPOINT_TYPES:
+            increment_counter(COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE)
+            return None
+        # The FK remains compatibility control storage until stage 3.5.
+        return InteractionAnchor(
+            trace_event_id=int(pointer_id),
+            resume_event_id=str(task.last_checkpoint_event_id),
+            resume_execution_id=str(task.id),
+            resume_run_partition=str(task.run_id),
+        )
+
     row = db.get(DatabaseTraceEvent, pointer_id)
     if row is None:
         logger.warning(

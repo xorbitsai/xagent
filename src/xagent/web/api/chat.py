@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, NoReturn, Optional, Sequence, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -56,6 +56,7 @@ from ..services.connector_runtime import (
     build_task_runtime_requirements,
     resolve_agent_runtime_requirements,
 )
+from ..services.expired_tasks import find_expired_task
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -69,6 +70,16 @@ from ..services.llm_utils import AutoModelUnavailableError, resolve_llms_from_na
 from ..services.managed_file_ref import ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
 from ..services.public_trace_events import public_task_trace_filter
+from ..services.task_cleanup_obligations import (
+    CleanupObligation,
+    CleanupObligationStatus,
+    RecordedCleanupObligation,
+    captured_workspace_obligation,
+    describe_cleanup_failure,
+    extension_obligation,
+    record_cleanup_obligations_no_commit,
+    settle_cleanup_attempts_sync,
+)
 from ..services.task_deletion import purge_task_rows
 from ..services.task_interaction_read import get_pending_interaction_question
 from ..services.task_runtime import (
@@ -78,6 +89,7 @@ from ..services.task_runtime import (
     create_task_extensions,
     delete_task_extensions,
     get_task_runtime_public_metadata,
+    registered_task_extensions,
     sanitize_client_agent_config,
     task_extension_bindings_from_agent_config,
     validate_task_extension_requests,
@@ -87,6 +99,7 @@ from ..services.task_workspace_cleanup import (
 )
 from ..services.workforce_runtime import resolve_workforce_task_runtime
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
+from .expired_task_errors import task_expired_http_error
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +187,7 @@ def _compensate_failed_task_extension_create(
     """Remove a just-created task after provider binding setup failed."""
 
     db.rollback()
-    deleted = purge_task_rows(db, task_id=task_id)
+    deleted = purge_task_rows(db, task_id=task_id, detached_reason="task_create_failed")
     db.commit()
     if deleted:
         invalidate_task_cache(task_id)
@@ -211,18 +224,38 @@ def _load_task_delete_snapshot_sync(
         delete_db.close()
 
 
-def _delete_task_sync(*, task_id: int) -> bool:
-    """Delete one task in an operation-local session."""
+def _delete_task_sync(
+    *,
+    task_id: int,
+    workspace: CleanupObligation,
+    extensions: Sequence[CleanupObligation] = (),
+) -> RecordedCleanupObligation | None:
+    """Delete one task in an operation-local session.
+
+    The external cleanup this deletion will owe commits with the rows, so it
+    is on record exactly when the rows are gone. The workspace obligation is
+    returned for the caller to settle after its inline removal, and is not due
+    for the retry driver before then; the extensions are nothing this caller
+    will attempt, so they are due at once.
+
+    Returns ``None`` when the task no longer exists.
+    """
 
     session_factory = get_session_local()
     delete_db = session_factory()
     try:
-        deleted = purge_task_rows(delete_db, task_id=task_id)
+        deleted = purge_task_rows(
+            delete_db, task_id=task_id, detached_reason="task_deleted"
+        )
         if not deleted:
             delete_db.rollback()
-            return False
+            return None
+        [recorded] = record_cleanup_obligations_no_commit(
+            delete_db, [workspace], inline_attempt=True
+        )
+        record_cleanup_obligations_no_commit(delete_db, extensions)
         delete_db.commit()
-        return True
+        return recorded
     except Exception:
         delete_db.rollback()
         raise
@@ -606,21 +639,18 @@ async def create_task(
         )
 
         if selected_file_ids:
-            from ..models.uploaded_file import UploadedFile
+            from ..services.file_turn import bind_turn_files_no_commit
 
-            (
-                db.query(UploadedFile)
-                .filter(
-                    UploadedFile.file_id.in_(selected_file_ids),
-                    UploadedFile.user_id == int(user.id),
-                    UploadedFile.task_id.is_(None),
-                    UploadedFile.storage_status != "compensating",
+            if bind_turn_files_no_commit(
+                db=db,
+                file_ids=selected_file_ids,
+                task_id=int(task.id),
+                owner_user_id=int(user.id),
+            ):
+                db.rollback()
+                raise HTTPException(
+                    status_code=409, detail="Selected files are no longer available"
                 )
-                .update(
-                    {UploadedFile.task_id: int(task.id)},
-                    synchronize_session=False,
-                )
-            )
 
         if runtime_extension_requests:
             # Record which providers this task binds to *before* any hook runs,
@@ -940,6 +970,7 @@ async def get_tasks(
                         "task_id": task.id,
                         "title": task.title,
                         "status": status_value,
+                        "completion_outcome": task.completion_outcome,
                         "run_id": task.run_id,
                         "state_version": int(task.state_version or 0),
                         "control_state": str(task.control_state or "idle"),
@@ -1003,6 +1034,26 @@ async def get_tasks(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _raise_task_expired_or_not_found(db: Session, user: User, task_id: int) -> NoReturn:
+    """Raise for a task ``GET`` that found no live row for ``task_id``.
+
+    ``410 task_expired`` to the same callers the live query above would have
+    served the task to -- an admin, or its owner (#2565) -- since a tombstone
+    is what is left of a task retention purged. Anyone else keeps the plain
+    ``404``, so the answer cannot be used to probe for other users' ids.
+    Shared by ``GET /task/{id}`` and ``GET /task/{id}/status``, which apply
+    the same owner-or-admin scope to the live task.
+    """
+    tombstone = find_expired_task(db, task_id)
+    if tombstone is not None and (
+        bool(user.is_admin) or int(tombstone.user_id) == int(user.id)
+    ):
+        raise task_expired_http_error(
+            tombstone, message="Task expired under the retention policy"
+        )
+    raise HTTPException(status_code=404, detail="Task not found")
+
+
 @chat_router.get("/task/{task_id}")
 async def get_task(
     task_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)
@@ -1021,7 +1072,7 @@ async def get_task(
                     .first()
                 )
             if not task:
-                raise HTTPException(status_code=404, detail="Task not found")
+                _raise_task_expired_or_not_found(db, user, task_id)
 
             cache_key = web_task_detail_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)
@@ -1099,6 +1150,7 @@ async def get_task(
                 "title": task.title,
                 "description": task.description,
                 "status": status_value,
+                "completion_outcome": task.completion_outcome,
                 "run_id": task.run_id,
                 "state_version": int(task.state_version or 0),
                 "control_state": str(task.control_state or "idle"),
@@ -1183,7 +1235,7 @@ async def get_task_status(
                     .first()
                 )
             if not task:
-                raise HTTPException(status_code=404, detail="Task not found")
+                _raise_task_expired_or_not_found(db, user, task_id)
 
             cache_key = web_task_status_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)
@@ -1229,6 +1281,7 @@ async def get_task_status(
                 "task_id": task.id,
                 "title": task.title,
                 "status": status_value,
+                "completion_outcome": task.completion_outcome,
                 "run_id": task.run_id,
                 "state_version": int(task.state_version or 0),
                 "control_state": str(task.control_state or "idle"),
@@ -1306,6 +1359,10 @@ async def update_task(
             )
 
         if not task:
+            # Stays a plain 404, unlike the GET route's 410 task_expired: an
+            # expired task is never listed, so the UI has no title field open
+            # on one to submit this from, and disclosing the expiry here would gain
+            # a caller nothing they could not already learn from GET (#2565).
             raise HTTPException(status_code=404, detail="Task not found")
 
         task.title = title
@@ -1618,6 +1675,10 @@ async def delete_task(
             is_admin=is_admin,
         )
         if task_snapshot is None:
+            # Stays a plain 404, unlike the GET route's 410 task_expired: an
+            # expired task is never listed, so the UI never offers a delete
+            # control for one, and a 410 here would gain a caller nothing
+            # beyond what GET already discloses (#2565).
             raise HTTPException(status_code=404, detail="Task not found")
         task_title, task_user_id, task_source, bound_extensions = task_snapshot
         runtime_context = agent_runtime_service._task_runtime_context(
@@ -1660,8 +1721,50 @@ async def delete_task(
             capture_workspace_cleanup_target_best_effort, task_id, task_user_id
         )
 
-        deleted = await asyncio.to_thread(_delete_task_sync, task_id=task_id)
-        if not deleted:
+        # Recorded with the row deletion, before anything is attempted: if the
+        # removal below fails, or this process dies before reaching it, the
+        # obligation is what the retry driver finds. A failed capture records
+        # the unscoped candidates the post-deletion fallback would probe, and
+        # is marked so that clearing them is not mistaken for a full cleanup.
+        workspace_owed = captured_workspace_obligation(
+            task_id, task_user_id, workspace_target
+        )
+        # Provider state still held past this point is one of two things. A
+        # provider that is not registered in this process was never asked, and
+        # stays owed until one that can release it is. A registered provider
+        # that failed was only deleted past because an admin forced it: that
+        # leak was accepted, so it is recorded for the reconciliation list but
+        # never retried.
+        registered = set(registered_task_extensions())
+        extensions_owed = []
+        for name in unreleased:
+            if name in registered:
+                status = CleanupObligationStatus.ABANDONED
+                reason: str | None = (
+                    "force delete accepted this runtime extension's state as "
+                    "leaked; it was not released"
+                )
+            else:
+                status = CleanupObligationStatus.PENDING
+                reason = None
+            extensions_owed.append(
+                extension_obligation(
+                    task_id=task_id,
+                    user_id=task_user_id,
+                    source=task_source,
+                    extension=name,
+                    status=status,
+                    reason=reason,
+                )
+            )
+
+        recorded_workspace = await asyncio.to_thread(
+            _delete_task_sync,
+            task_id=task_id,
+            workspace=workspace_owed,
+            extensions=extensions_owed,
+        )
+        if recorded_workspace is None:
             raise HTTPException(status_code=404, detail="Task no longer exists")
         invalidate_task_cache(task_id)
 
@@ -1712,7 +1815,7 @@ async def delete_task(
         # orchestrator's own call: removal is a recursive rmtree, and a
         # workspace holding a large tree would otherwise stall every request on
         # this worker.
-        workspace_cleanup_pending = workspace_target is None
+        workspace_error: str | None = None
         try:
             await asyncio.to_thread(
                 agent_runtime_service.get_agent_manager(request).remove_agent,
@@ -1720,14 +1823,23 @@ async def delete_task(
                 task_user_id,
                 workspace_target=workspace_target,
             )
-        except Exception:
-            workspace_cleanup_pending = True
+        except Exception as exc:
+            workspace_error = describe_cleanup_failure(exc)
             logger.error(
                 "Task %s rows were deleted but its workspace cleanup failed; "
-                "the directory is leaked and needs manual reconciliation",
+                "the retry driver will re-attempt it",
                 task_id,
                 exc_info=True,
             )
+        # Pending means the obligation is still in the table: a failed removal
+        # the driver will retry, or a scope nobody could resolve, which is on
+        # the operator's list.
+        [workspace_status] = await asyncio.to_thread(
+            settle_cleanup_attempts_sync,
+            get_session_local(),
+            [(recorded_workspace, workspace_error)],
+        )
+        workspace_cleanup_pending = workspace_status is not None
 
         logger.info(f"Task {task_id} deleted successfully")
 
@@ -1738,6 +1850,11 @@ async def delete_task(
             # Always present, so a client can tell "cleaned up" from "rows
             # gone, resources outstanding" without inferring it from absence.
             "workspace_cleanup_pending": workspace_cleanup_pending,
+            # The workspace or any runtime-extension state is still owed --
+            # to the retry driver, or to an operator for what it will not
+            # retry.
+            "external_cleanup_pending": workspace_cleanup_pending
+            or bool(extensions_owed),
         }
 
     except HTTPException:

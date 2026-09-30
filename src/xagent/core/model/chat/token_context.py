@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Sentinel: "argument not supplied", distinct from any value a caller could pass.
+_ABSENT = object()
+_MAX_OPTIONAL_MEDIA_TOKENS = 1_000_000_000
 
 
 class MediaUnit(str, Enum):
@@ -199,6 +201,8 @@ class TokenUsage:
         output_tokens: int = 0,
         resolution: str = "",
         tokens_estimated: bool = False,
+        provider_text_input_tokens: Any = _ABSENT,
+        provider_image_input_tokens: Any = _ABSENT,
     ) -> None:
         """Append one media detail row. The only media write path.
 
@@ -257,38 +261,46 @@ class TokenUsage:
         # LLM path.
         input_tokens = max(0, _coerce_media_tokens(input_tokens))
         output_tokens = max(0, _coerce_media_tokens(output_tokens))
-        self.details.append(
-            {
-                "type": "media",
-                "unit": unit_value,
-                "quantity": quantity,
-                "provider_tokens": input_tokens + output_tokens,
-                "provider_input_tokens": input_tokens,
-                "provider_output_tokens": output_tokens,
-                # `is True`, not bool(...): the aggregator tests this for
-                # truthiness, so a provider string would mark the group
-                # estimated and real measured usage would go unbilled. bool()
-                # fixes the stored *type* but not that: bool("no") is True.
-                # Only a genuine True means estimated; anything else is treated
-                # as provider-reported, which is the safe default because
-                # billing refuses to price estimates.
-                "tokens_estimated": tokens_estimated is True,
-                # Stripped here, the only media write path: the aggregate strips
-                # when grouping, so an unstripped raw row would disagree with
-                # the rollup's view of it and miss a price-table join.
-                "model": model.strip() if isinstance(model, str) else model,
-                "model_id": (
-                    model_id.strip() if isinstance(model_id, str) else model_id
-                ),
-                "call_type": call_type_value,
-                # Stripped for the same reason as model/model_id above: it is
-                # part of the aggregate key, so ' 1K ' and '1K' would bill as
-                # two separate line items for one resolution tier.
-                "resolution": (
-                    resolution.strip() if isinstance(resolution, str) else resolution
-                ),
-            }
-        )
+        detail = {
+            "type": "media",
+            "unit": unit_value,
+            "quantity": quantity,
+            "provider_tokens": input_tokens + output_tokens,
+            "provider_input_tokens": input_tokens,
+            "provider_output_tokens": output_tokens,
+            # `is True`, not bool(...): the aggregator tests this for
+            # truthiness, so a provider string would mark the group
+            # estimated and real measured usage would go unbilled. bool()
+            # fixes the stored *type* but not that: bool("no") is True.
+            # Only a genuine True means estimated; anything else is treated
+            # as provider-reported, which is the safe default because
+            # billing refuses to price estimates.
+            "tokens_estimated": tokens_estimated is True,
+            # Stripped here, the only media write path: the aggregate strips
+            # when grouping, so an unstripped raw row would disagree with
+            # the rollup's view of it and miss a price-table join.
+            "model": model.strip() if isinstance(model, str) else model,
+            "model_id": (model_id.strip() if isinstance(model_id, str) else model_id),
+            "call_type": call_type_value,
+            # Stripped for the same reason as model/model_id above: it is
+            # part of the aggregate key, so ' 1K ' and '1K' would bill as
+            # two separate line items for one resolution tier.
+            "resolution": (
+                resolution.strip() if isinstance(resolution, str) else resolution
+            ),
+        }
+        # Modality splits are optional metadata. Missing or malformed means
+        # "unknown", which must remain distinguishable from a provider's
+        # explicit zero; consequently invalid values omit the key rather than
+        # being coerced to 0 like the backwards-compatible aggregate fields.
+        for key, value in (
+            ("provider_text_input_tokens", provider_text_input_tokens),
+            ("provider_image_input_tokens", provider_image_input_tokens),
+        ):
+            optional_tokens = _coerce_optional_media_tokens(value)
+            if optional_tokens is not None:
+                detail[key] = optional_tokens
+        self.details.append(detail)
 
     def increment_llm_calls(self) -> None:
         """Increment the LLM call counter."""
@@ -487,6 +499,42 @@ def _coerce_float(value: Any) -> float:
         logger.warning("Discarding negative media quantity: %r", value)
         return 0.0
     return result
+
+
+def _coerce_optional_media_tokens(value: Any) -> Optional[int]:
+    """A non-negative token count, or ``None`` when unavailable/invalid.
+
+    Unlike the established aggregate media-token fields, optional modality
+    splits cannot fold bad input to zero: zero is a meaningful provider report
+    while absence means the provider supplied no usable split.
+    """
+    if value is _ABSENT or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= _MAX_OPTIONAL_MEDIA_TOKENS else None
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            text = value.decode() if isinstance(value, (bytes, bytearray)) else value
+            result = int(text.strip())
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return None
+        return result if 0 <= result <= _MAX_OPTIONAL_MEDIA_TOKENS else None
+    if isinstance(value, float):
+        if (
+            not math.isfinite(value)
+            or value < 0
+            or value > _MAX_OPTIONAL_MEDIA_TOKENS
+            or not value.is_integer()
+        ):
+            return None
+        return int(value)
+    try:
+        result = int(value)
+        if not bool(value == result):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return result if 0 <= result <= _MAX_OPTIONAL_MEDIA_TOKENS else None
 
 
 def _usage_field(usage: Any, name: str) -> Any:
@@ -767,6 +815,9 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
     the summed quantity, call count and provider-reported tokens. A group is
     marked ``tokens_estimated`` when any entry in it carried estimated tokens,
     so a consumer never prices a mixed group as if it were measured.
+    Provider input-modality splits are emitted only when every row in a group
+    carries both valid fields; otherwise known subtotals stay hidden rather
+    than being presented as complete coverage of a legacy/unknown row.
 
     Pass a list you own. This iterates ``details`` directly, so handing in a
     live ``TokenUsage.details`` that another thread is appending to yields a
@@ -820,6 +871,7 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
                 "calls": 0,
                 "provider_tokens": 0,
                 "tokens_estimated": False,
+                "_provider_input_modality_complete": True,
             },
         )
         if not aggregate["model_name"] and model_name:
@@ -829,8 +881,35 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
         aggregate["quantity"] += quantity
         aggregate["calls"] += 1
         aggregate["provider_tokens"] += tokens
+        modality_values: list[int] = []
+        for token_field in (
+            "provider_text_input_tokens",
+            "provider_image_input_tokens",
+        ):
+            modality_tokens = (
+                _coerce_optional_media_tokens(detail.get(token_field))
+                if token_field in detail
+                else None
+            )
+            if modality_tokens is None:
+                aggregate["_provider_input_modality_complete"] = False
+                break
+            modality_values.append(modality_tokens)
+        if len(modality_values) == 2:
+            aggregate["provider_text_input_tokens"] = (
+                aggregate.get("provider_text_input_tokens", 0) + modality_values[0]
+            )
+            aggregate["provider_image_input_tokens"] = (
+                aggregate.get("provider_image_input_tokens", 0) + modality_values[1]
+            )
         if detail.get("tokens_estimated"):
             aggregate["tokens_estimated"] = True
+
+    for aggregate in grouped.values():
+        complete = aggregate.pop("_provider_input_modality_complete")
+        if not complete:
+            aggregate.pop("provider_text_input_tokens", None)
+            aggregate.pop("provider_image_input_tokens", None)
 
     return sorted(
         grouped.values(),
@@ -853,6 +932,8 @@ def add_media_usage(
     output_tokens: int = 0,
     resolution: str = "",
     tokens_estimated: bool = False,
+    provider_text_input_tokens: Any = _ABSENT,
+    provider_image_input_tokens: Any = _ABSENT,
 ) -> None:
     """Record non-LLM media model usage on the current context.
 
@@ -882,6 +963,10 @@ def add_media_usage(
             Defining that precedence is tracked in #1461.
         tokens_estimated: True when the token counts are a local heuristic
             rather than provider-reported, so billing can refuse to price them.
+        provider_text_input_tokens: Provider-reported text portion of input
+            tokens. Omitted when unavailable; an explicit 0 is preserved.
+        provider_image_input_tokens: Provider-reported image portion of input
+            tokens. Omitted when unavailable; an explicit 0 is preserved.
 
     Raises:
         ValueError: If ``call_type`` is not a known :class:`MediaCallType`
@@ -902,6 +987,8 @@ def add_media_usage(
         model_id=model_id,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        provider_text_input_tokens=provider_text_input_tokens,
+        provider_image_input_tokens=provider_image_input_tokens,
         resolution=resolution,
         tokens_estimated=tokens_estimated,
     )

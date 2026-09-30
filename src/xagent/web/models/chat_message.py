@@ -1,8 +1,27 @@
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from .database import Base
+
+# The R6 lease-recovery sweep (task_lease_recovery.py) selects rows with this
+# exact predicate every tick, both to page task_ids
+# (reconcile_orphaned_pending_deliveries_isolated) and to close one task's
+# rows inside its own recovery transaction
+# (reconcile_orphaned_pending_deliveries_no_commit). Almost every row settles
+# out of "pending" quickly, so the predicate is highly selective and a
+# partial index keeps the sweep from scanning the whole table as it grows.
+_PENDING_DELIVERY_CLAUSE = text("delivery_status = 'pending'")
 
 
 class TaskChatMessage(Base):  # type: ignore
@@ -16,6 +35,23 @@ class TaskChatMessage(Base):  # type: ignore
             "role",
             "turn_id",
             unique=True,
+        ),
+        # task_id: the per-task reconciliation call (used both from the
+        # lease-recovery fenced transaction and from the isolated sweep's
+        # per-task pass) filters on task_id equality alongside the
+        # delivery_status predicate. created_at: the sweep's initial scan
+        # additionally filters "created_at < created_before" (rows younger
+        # than one lease TTL are left for their own run to settle) and pages
+        # results ordered by task_id, so created_at is carried as a second
+        # key rather than its own index -- it is never queried without the
+        # delivery_status/task_id predicates already narrowing to a handful
+        # of rows.
+        Index(
+            "ix_task_chat_messages_pending_delivery",
+            "task_id",
+            "created_at",
+            sqlite_where=_PENDING_DELIVERY_CLAUSE,
+            postgresql_where=_PENDING_DELIVERY_CLAUSE,
         ),
     )
 
@@ -47,6 +83,8 @@ class TaskChatMessage(Base):  # type: ignore
     # the original file metadata (file_id, name, size, type) is available for
     # historical replay without having to re-derive it from the message body.
     attachments = Column(JSON, nullable=True)
+    # Transitional projection identity; NULL for legacy transcript rows.
+    execution_event_id = Column(String(36), nullable=True, unique=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     task = relationship("Task", back_populates="chat_messages")

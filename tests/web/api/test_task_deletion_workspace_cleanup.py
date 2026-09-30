@@ -35,6 +35,11 @@ from xagent.web.services.agent_service_manager import get_agent_manager
 from xagent.web.services.execution_scope_snapshot import (
     load_task_execution_scope_snapshot,
 )
+from xagent.web.services.task_cleanup_obligations import (
+    CleanupObligationStatus,
+    CleanupResourceKind,
+    list_cleanup_obligations,
+)
 from xagent.web.services.task_runtime import (
     agent_config_with_task_extension_bindings,
     register_task_extension,
@@ -244,6 +249,7 @@ async def test_user_delete_cleans_every_task_workspace(
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": False,
+            "external_cleanup_pending": False,
         }
         assert [workspace.exists() for workspace in workspaces] == [False] * 3
         assert db.query(User).filter(User.id == target_id).count() == 0
@@ -405,6 +411,7 @@ async def test_user_delete_reports_pending_when_a_workspace_cannot_be_removed(
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": True,
+            "external_cleanup_pending": True,
         }
         assert db.query(User).filter(User.id == target_id).count() == 0
     finally:
@@ -495,6 +502,7 @@ async def test_user_delete_cleans_a_scoped_workspace(_workspace_root: Path) -> N
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": False,
+            "external_cleanup_pending": False,
         }
         assert not workspace.exists()
     finally:
@@ -524,6 +532,7 @@ async def test_user_delete_reports_pending_when_a_capture_fails(
             _workspace_root / f"user_{int(target.id)}", int(task.id)
         )
         target_id = int(target.id)
+        task_id = int(task.id)
 
         def _unresolvable(*args, **kwargs):
             raise RuntimeError("scope resolver is down")
@@ -539,9 +548,14 @@ async def test_user_delete_reports_pending_when_a_capture_fails(
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": True,
+            "external_cleanup_pending": True,
         }
         assert not workspace.exists()
         assert db.query(User).filter(User.id == target_id).count() == 0
+        [owed] = list_cleanup_obligations(db)
+        assert owed.kind is CleanupResourceKind.WORKSPACE
+        assert owed.status is CleanupObligationStatus.ABANDONED
+        assert owed.task_id == task_id
     finally:
         db.close()
 

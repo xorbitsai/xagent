@@ -7,14 +7,16 @@ import pytest
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import get_session_local, init_db
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.user import User
 from xagent.web.services import a2a_task_cancel, task_coordinator_service
 from xagent.web.services.task_execution_controller import StaleTaskRunError
 
 
+@pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("fence", ["lock", "update"])
 def test_replaced_attempt_rejects_cancel_and_preserves_task(
-    tmp_path, monkeypatch, fence
+    tmp_path, monkeypatch, fence, version
 ):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     init_db(db_url=f"sqlite:///{tmp_path / 'cancel.db'}")
@@ -29,6 +31,7 @@ def test_replaced_attempt_rejects_cancel_and_preserves_task(
             user_id=user.id,
             agent_id=agent.id,
             source="a2a",
+            conversation_storage_version=version,
             title="Cancel",
             status=TaskStatus.PAUSED,
             control_state="paused",
@@ -69,3 +72,64 @@ def test_replaced_attempt_rejects_cancel_and_preserves_task(
         assert task.lease_attempt_id == "replacement-attempt"
         assert task.state_version == version
         assert task.output == "retained output"
+        assert db.query(TaskExecutionEvent).count() == 0
+
+
+@pytest.mark.parametrize("path", ["direct", "settled_local_cancel"])
+def test_cancel_response_reports_the_state_it_just_wrote(tmp_path, monkeypatch, path):
+    """The returned snapshot must match the row, not the pre-cancel object."""
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    init_db(db_url=f"sqlite:///{tmp_path / 'cancel.db'}")
+    with get_session_local()() as db:
+        user = User(username="owner", password_hash="unused")
+        db.add(user)
+        db.flush()
+        agent = Agent(user_id=user.id, name="Cancel")
+        db.add(agent)
+        db.flush()
+        task = Task(
+            user_id=user.id,
+            agent_id=agent.id,
+            source="a2a",
+            title="Cancel",
+            status=TaskStatus.PAUSED,
+            control_state="paused",
+            run_id="run",
+            output="retained output",
+            agent_config={"a2a_state": "TASK_STATE_WORKING", "kept": "value"},
+        )
+        db.add(task)
+        db.commit()
+        task_id, agent_id = task.id, agent.id
+        version = int(task.state_version or 0)
+        if path == "settled_local_cancel":
+            # The local cancel already settled the run one version later.
+            task.status = TaskStatus.FAILED
+            task.control_state = "failed"
+            task.state_version = version + 1
+            db.commit()
+    monkeypatch.setattr(a2a_task_cancel, "current_task_coordinator", lambda _: None)
+
+    snapshot = a2a_task_cancel._finalize_a2a_cancel_sync(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run",
+        expected_state_version=version,
+        local_cancel_requested=path == "settled_local_cancel",
+    )
+
+    assert snapshot.agent_config == {
+        "a2a_state": "TASK_STATE_CANCELED",
+        "kept": "value",
+    }
+    assert snapshot.status == TaskStatus.FAILED
+    assert snapshot.control_state == "failed"
+    assert snapshot.output is None
+    assert snapshot.error_message == "Task canceled by A2A client."
+    with get_session_local()() as db:
+        row = db.get(Task, task_id)
+        assert row.agent_config == snapshot.agent_config
+        assert row.status == snapshot.status
+        assert row.output == snapshot.output
+        assert row.state_version == version + 1

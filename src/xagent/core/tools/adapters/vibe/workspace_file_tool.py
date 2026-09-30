@@ -16,6 +16,12 @@ from .....core.workspace import (
     TaskWorkspace,
 )
 from ...core.workspace_file_tool import FileInfo, WorkspaceFileOperations
+from ...tool_result_spill import (
+    SPILL_MAX_FILES_PER_RUN,
+    SPILL_READ_MAX_CHARS,
+    SPILL_READ_TOOL_NAME,
+    spill_read_page_chars,
+)
 from .base import ToolCategory
 from .function import FunctionTool
 
@@ -43,15 +49,24 @@ class WorkspaceFileTools(WorkspaceFileOperations):
     file operations restricted to that workspace.
     """
 
-    def __init__(self, workspace: TaskWorkspace):
+    def __init__(
+        self, workspace: TaskWorkspace, *, page_chars: int = SPILL_READ_MAX_CHARS
+    ):
         """
         Initialize with workspace binding.
 
         Args:
             workspace: The workspace to bind to
+            page_chars: How many characters one read_tool_result reply
+                carries, from spill_read_page_chars. It is fixed here, not
+                taken per call, because read_tool_result's signature is the
+                model's argument list. The inner operations object pages at
+                this size, and get_tools() states the same number, read from
+                that object, in the tool description.
         """
-        self.inner = WorkspaceFileOperations(workspace)
+        self.inner = WorkspaceFileOperations(workspace, page_chars=page_chars)
         self.workspace = workspace
+        self.read_page_chars = self.inner.read_page_chars
 
     def read_file(
         self,
@@ -158,6 +173,22 @@ class WorkspaceFileTools(WorkspaceFileOperations):
     def get_workspace_output_files(self) -> Dict[str, Any]:
         """Get output file list from current workspace"""
         return self.inner.get_workspace_output_files()
+
+    def read_tool_result(
+        self,
+        path: str | None = None,
+        start: int | None = None,
+        end: int | None = None,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """Read one engine-stored large tool result, or list them with no path.
+
+        The page size is not a parameter: FunctionTool turns every parameter
+        into a field of the tool schema, so taking it here would let the
+        model pick a page longer than the output limit. The inner operations
+        object pages at the size this instance was built with.
+        """
+        return self.inner.read_tool_result(path, start=start, end=end, offset=offset)
 
     def list_all_user_files(  # type: ignore[override]
         self,
@@ -308,20 +339,47 @@ class WorkspaceFileTools(WorkspaceFileOperations):
                 description="Convenience function to find and replace text content in workspace. Use relative paths (e.g., 'filename.txt'), not absolute paths."
                 + _RESERVED_OUTPUT_NOTE,
             ),
+            FileTool(
+                self.read_tool_result,
+                name=SPILL_READ_TOOL_NAME,
+                description=(
+                    "Read one engine-stored large tool result by the exact path listed "
+                    "in its notice. start and end are 1-based item numbers, not line "
+                    "numbers: array elements for a JSON array, top-level entries for a "
+                    "JSON object, and lines only for plain text. Omit both to read the "
+                    "whole result. One call returns at most "
+                    f"{self.read_page_chars:,} characters; offset is a 0-based "
+                    "character position in the text the selected items render to, and "
+                    "the reply starts there. When a reply is cut short, call again "
+                    "with the same start and end and a larger offset to continue, "
+                    "which is how a single item longer than the limit is read to its "
+                    "end. Omit path to list the stored results instead: relative_path "
+                    "and size in bytes of each, sorted by path, at most "
+                    f"{SPILL_MAX_FILES_PER_RUN} per call. When listing, start and end "
+                    "are 1-based entry numbers that page through that list, count is "
+                    "the total number of entries, and offset is not used."
+                ),
+                read_only=True,
+                concurrency_safe=True,
+            ),
         ]
 
 
-def create_workspace_file_tools(workspace: TaskWorkspace) -> List[FunctionTool]:
+def create_workspace_file_tools(
+    workspace: TaskWorkspace, *, page_chars: int = SPILL_READ_MAX_CHARS
+) -> List[FunctionTool]:
     """
     Create list of file tools bound to specified workspace
 
     Args:
         workspace: Workspace to bind to
+        page_chars: Characters per read_tool_result reply, from
+            spill_read_page_chars
 
     Returns:
         List of tool instances
     """
-    tools_instance = WorkspaceFileTools(workspace)
+    tools_instance = WorkspaceFileTools(workspace, page_chars=page_chars)
     return tools_instance.get_tools()
 
 
@@ -335,7 +393,12 @@ if TYPE_CHECKING:
 
 @register_tool(categories={"file"})
 async def create_file_tools(config: "BaseToolConfig") -> List[Any]:
-    """Create workspace-bound file tools."""
+    """Create workspace-bound file tools.
+
+    read_tool_result pages at the same limit the factory's output filter
+    applies to every tool (config.get_max_output_length()), read from this
+    same config object, so a page is never cut by that filter.
+    """
     if not config.get_file_tools_enabled():
         return []
 
@@ -344,7 +407,8 @@ async def create_file_tools(config: "BaseToolConfig") -> List[Any]:
         return []
 
     try:
-        return create_workspace_file_tools(workspace)
+        page_chars = spill_read_page_chars(config.get_max_output_length())
+        return create_workspace_file_tools(workspace, page_chars=page_chars)
     except Exception as e:
         logger.warning(f"Failed to create file tools: {e}")
         return []

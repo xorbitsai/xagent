@@ -48,6 +48,7 @@ from ..services.triggers import (
     verify_webhook_secret,
 )
 from ..services.workforce_access import ensure_workforce_access
+from ..utils.db_timezone import format_datetime_for_api
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,11 @@ class TriggerRunResponse(BaseModel):
     error_message: str | None
     started_at: str | None
     finished_at: str | None
+    # When the retention purge expired this run's conversation (#2565);
+    # ``task_id`` is null from then on. ``status`` is untouched by it: a run
+    # that completed still completed. A null ``task_id`` without this
+    # timestamp is a task deleted some other way.
+    task_expired_at: str | None
     created_at: str | None
     updated_at: str | None
 
@@ -123,7 +129,16 @@ class TriggerFireResponse(BaseModel):
 
 
 def _dt(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    """Format a trigger/run timestamp for the API response.
+
+    Delegates to ``format_datetime_for_api`` rather than a bare
+    ``value.isoformat()``: for a tz-aware UTC datetime (the PostgreSQL case)
+    the two produce the identical string, but for SQLite's naive-UTC storage
+    ``format_datetime_for_api`` adds the ``+00:00`` offset a bare
+    ``isoformat()`` omits. Applying it here fixes every field this function
+    serializes, not only the new ``task_expired_at`` (#2565).
+    """
+    return format_datetime_for_api(value)
 
 
 def _serialize_trigger(
@@ -177,6 +192,7 @@ def _serialize_run(
         error_message=run.error_message,
         started_at=_dt(getattr(run, "started_at", None)),
         finished_at=_dt(getattr(run, "finished_at", None)),
+        task_expired_at=_dt(getattr(run, "task_expired_at", None)),
         created_at=_dt(getattr(run, "created_at", None)),
         updated_at=_dt(getattr(run, "updated_at", None)),
     )

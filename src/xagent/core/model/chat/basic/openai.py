@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -11,6 +12,13 @@ from openai import AsyncOpenAI
 from ....runtime_performance import run_in_thread_with_telemetry
 from ....utils.security import redact_sensitive_text
 from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
+from ..stream_progress import (
+    NO_PROGRESS_FINISH_REASON,
+    STREAM_ABORTED_KEY,
+    StreamAbort,
+    StreamProgressConfig,
+    StreamProgressGuard,
+)
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import (
@@ -266,6 +274,18 @@ def field_content(message: Any, field_name: str) -> tuple[bool, Any]:
     return value is not None, value
 
 
+def _finish_reason_entry(choice: Any) -> Dict[str, str]:
+    """``{"finish_reason": ...}`` for a choice that reports one, else empty.
+
+    Carried on the response so ``llm_call_end`` can record how the
+    generation ended (#2786); a missing or blank reason adds no key.
+    """
+    finish_reason = getattr(choice, "finish_reason", None)
+    if isinstance(finish_reason, str) and finish_reason:
+        return {"finish_reason": finish_reason}
+    return {}
+
+
 def _message_reasoning_content(message: Any) -> tuple[bool, Any]:
     """Return whether a provider explicitly included reasoning content."""
     return field_content(message, "reasoning_content")
@@ -296,6 +316,46 @@ def _delta_field_names(delta: Any) -> tuple[str, ...]:
         if isinstance(delta_attrs, dict):
             names.update(delta_attrs.keys())
     return tuple(names)
+
+
+def _delta_reasoning_fields(delta: Any) -> tuple[list[str], list[str], bool]:
+    """``(names, texts, opaque)`` for every ``reasoning*`` field on a delta.
+
+    ``names`` feeds the field-name log; ``texts`` and ``opaque`` feed the
+    no-progress guard (#2785). Any spelling counts, not only the recognized
+    ``reasoning_content``: a thinking model behind the generic provider may
+    use another name, and a loop under that name must still be inspected
+    rather than treated as live. Non-string values (a details list) cannot
+    be inspected here and are reported as opaque liveness instead.
+    """
+    names: list[str] = []
+    texts: list[str] = []
+    opaque = False
+    for name in _delta_field_names(delta):
+        if not name.startswith("reasoning"):
+            continue
+        names.append(name)
+        present, value = field_content(delta, name)
+        if not present:
+            continue
+        if isinstance(value, str):
+            texts.append(value)
+        elif value:
+            opaque = True
+    return names, texts, opaque
+
+
+async def _close_stream(stream: Any) -> None:
+    """Close the SDK stream after an early exit; the loop never did before."""
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug("Closing aborted OpenAI stream failed (%s)", type(exc).__name__)
 
 
 def _is_retryable_stream_transport_error(error: BaseException) -> bool:
@@ -386,6 +446,12 @@ class OpenAICompatibleLLM(BaseLLM):
                 else None,
                 api_key=self.api_key,
                 timeout=self.timeout,
+                # Retry policy lives in exactly one layer. Left at the SDK
+                # default this client would retry twice inside every attempt
+                # the shared RetryWrapper makes, multiplying the configured
+                # budget by three and putting the total beyond the reach of
+                # any single bound.
+                max_retries=0,
             )
 
     def _prepare_extra_body(self, extra_body: Dict[str, Any]) -> Dict[str, Any]:
@@ -574,10 +640,14 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs,
         }
 
-        # Only add max_tokens if explicitly provided
-        # Don't set default values - let API use its own defaults
+        # An explicit max_tokens (e.g. the compaction budget) wins; otherwise
+        # fall back to the configured ``default_max_tokens`` (for hub models,
+        # ``models.max_tokens``), consistent with the other provider classes.
+        # Without either, the API's own default applies.
         if max_tokens is not None:
             completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
 
         if temperature is not None:
             completion_params["temperature"] = temperature
@@ -685,6 +755,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     "type": "tool_call",
                     "tool_calls": tool_calls,
                     "raw": resp.model_dump(),
+                    **_finish_reason_entry(choice),
                 }
                 has_reasoning_content, reasoning_content = _message_reasoning_content(
                     message
@@ -740,6 +811,7 @@ class OpenAICompatibleLLM(BaseLLM):
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": resp.model_dump(),
+                        **_finish_reason_entry(choice),
                     }
                 # If there are no tool calls and no content, this is an error
                 raise LLMEmptyContentError(
@@ -750,6 +822,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 "type": "text",
                 "content": content,
                 "raw": resp.model_dump(),
+                **_finish_reason_entry(choice),
             }
             if has_reasoning_content:
                 result["reasoning_content"] = reasoning_content
@@ -946,8 +1019,11 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs,
         }
 
+        # See ``chat()``: explicit max_tokens wins, then the configured default.
         if max_tokens is not None:
             completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
 
         if temperature is not None:
             completion_params["temperature"] = temperature
@@ -1057,6 +1133,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     "type": "tool_call",
                     "tool_calls": tool_calls,
                     "raw": response.model_dump(),
+                    **_finish_reason_entry(choice),
                 }
                 has_reasoning_content, reasoning_content = _message_reasoning_content(
                     message
@@ -1102,6 +1179,7 @@ class OpenAICompatibleLLM(BaseLLM):
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": response.model_dump(),
+                        **_finish_reason_entry(choice),
                     }
                 # If there are no tool calls and no content, this is an error
                 raise LLMEmptyContentError(
@@ -1112,6 +1190,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 "type": "text",
                 "content": content,
                 "raw": response.model_dump(),
+                **_finish_reason_entry(choice),
             }
             if has_reasoning_content:
                 text_result["reasoning_content"] = reasoning_content
@@ -1194,9 +1273,11 @@ class OpenAICompatibleLLM(BaseLLM):
             **kwargs,
         }
 
-        # Only set max_tokens if explicitly provided
+        # See ``chat()``: explicit max_tokens wins, then the configured default.
         if max_tokens is not None:
             completion_params["max_tokens"] = max_tokens
+        elif self.default_max_tokens is not None:
+            completion_params["max_tokens"] = self.default_max_tokens
 
         if temperature is not None:
             completion_params["temperature"] = temperature
@@ -1273,9 +1354,19 @@ class OpenAICompatibleLLM(BaseLLM):
             observed_reasoning_field_names: set[str] = set()
             last_raw_chunk = None  # Track last raw chunk for usage extraction
             usage_received = False
+            # No-progress guard (#2785): fed one observation per raw delta,
+            # because the runtime never sees the deltas ``_parse_stream_chunk``
+            # drops and the interval timeout only measures silence.
+            progress_guard = StreamProgressGuard(
+                StreamProgressConfig.from_env(model_name=self._model_name)
+            )
+            stream_abort: StreamAbort | None = None
+            saw_content = False
+            raw_chunk_count = 0
 
             async for raw_chunk in stream:
                 current_time = time.time()
+                raw_chunk_count += 1
 
                 # Check first token timeout
                 if first_token:
@@ -1303,8 +1394,15 @@ class OpenAICompatibleLLM(BaseLLM):
                 last_raw_chunk = raw_chunk
 
                 # Parse chunk
+                reasoning_texts: list[str] = []
+                reasoning_opaque = False
+                delta_has_finish_reason = False
                 if hasattr(raw_chunk, "choices") and raw_chunk.choices:
-                    delta = raw_chunk.choices[0].delta
+                    choice = raw_chunk.choices[0]
+                    delta = choice.delta
+                    delta_has_finish_reason = bool(
+                        getattr(choice, "finish_reason", None)
+                    )
                     delta_has_reasoning, delta_reasoning_content = (
                         self._delta_reasoning_content(delta)
                     )
@@ -1313,11 +1411,18 @@ class OpenAICompatibleLLM(BaseLLM):
                         accumulated_reasoning_content += str(
                             delta_reasoning_content or ""
                         )
-                    observed_reasoning_field_names.update(
-                        name
-                        for name in _delta_field_names(delta)
-                        if name.startswith("reasoning")
+                    reasoning_names, reasoning_texts, reasoning_opaque = (
+                        _delta_reasoning_fields(delta)
                     )
+                    observed_reasoning_field_names.update(reasoning_names)
+                    # A subclass hook may extract text the raw fields hide
+                    # (e.g. from a details list); let the guard inspect it.
+                    if (
+                        not reasoning_texts
+                        and delta_has_reasoning
+                        and isinstance(delta_reasoning_content, str)
+                    ):
+                        reasoning_texts = [delta_reasoning_content]
 
                 chunk = self._parse_stream_chunk(
                     raw_chunk,
@@ -1325,10 +1430,59 @@ class OpenAICompatibleLLM(BaseLLM):
                     accumulated_reasoning_content,
                     has_reasoning_content=has_reasoning_content,
                 )
+                stream_abort = progress_guard.observe(
+                    has_content=bool(chunk is not None and chunk.is_token()),
+                    reasoning_texts=reasoning_texts,
+                    reasoning_opaque=reasoning_opaque,
+                    has_finish_reason=delta_has_finish_reason,
+                    has_usage=bool(chunk is not None and chunk.is_usage()),
+                    accumulated_tool_calls=accumulated_tool_calls,
+                )
+                if stream_abort is not None:
+                    # The chunk that tripped the guard carries the garbage;
+                    # the tail chunk yielded below stands in for it.
+                    break
                 if chunk:
                     if chunk.is_usage():
                         usage_received = True
+                    elif chunk.is_token():
+                        saw_content = True
                     yield chunk
+
+            if stream_abort is not None:
+                await _close_stream(stream)
+                logger.warning(
+                    "Aborting OpenAI stream for %s after %.1fs and %d chunks: %s "
+                    "(%s; reasoning_fields=%s)",
+                    self._model_name,
+                    time.time() - start_time,
+                    raw_chunk_count,
+                    stream_abort.reason,
+                    stream_abort.detail,
+                    ",".join(sorted(observed_reasoning_field_names)) or "none",
+                )
+                yield self._no_progress_tail_chunk(
+                    stream_abort,
+                    accumulated_tool_calls,
+                    last_raw_chunk,
+                    accumulated_reasoning_content,
+                    has_reasoning_content=has_reasoning_content,
+                )
+
+            if not accumulated_tool_calls and not saw_content:
+                # The runtime retries this shape as a non-streaming call
+                # (#2785); until now nothing recorded that it happened or which
+                # reasoning field the deltas used. Names only, never values.
+                # After an abort the warning above already carries them.
+                logger.log(
+                    logging.DEBUG if stream_abort is not None else logging.WARNING,
+                    "OpenAI stream for %s ended with no content or tool calls after "
+                    "%d chunks (reasoning_fields=%s, aborted=%s)",
+                    self._model_name,
+                    raw_chunk_count,
+                    ",".join(sorted(observed_reasoning_field_names)) or "none",
+                    stream_abort.reason if stream_abort is not None else "no",
+                )
 
             # One-time hook for a subclass to detect a silent streaming
             # capture failure (the request did not go out with reasoning
@@ -1350,7 +1504,14 @@ class OpenAICompatibleLLM(BaseLLM):
 
             # Fallback: Ensure usage chunk is always sent
             # If no usage chunk was received, try to extract from the last raw chunk
-            if not usage_received and last_raw_chunk is not None:
+            # Skipped after an abort: the stream was cut before its usage chunk,
+            # so the aborted generation's tokens are not recorded anywhere; the
+            # trace shows ``usage_missing`` and the abort reason instead.
+            if (
+                stream_abort is None
+                and not usage_received
+                and last_raw_chunk is not None
+            ):
                 logger.warning(
                     "OpenAI stream ended without usage chunk, attempting to extract from last chunk"
                 )
@@ -1429,6 +1590,56 @@ class OpenAICompatibleLLM(BaseLLM):
                 ) from e
             raise RuntimeError(f"LLM stream chat failed: {str(e)}") from e
 
+    def _no_progress_tail_chunk(
+        self,
+        abort: StreamAbort,
+        accumulated_tool_calls: Dict[str, Dict],
+        last_raw_chunk: Any,
+        accumulated_reasoning_content: str,
+        *,
+        has_reasoning_content: bool,
+    ) -> StreamChunk:
+        """The chunk that ends an aborted stream (#2785).
+
+        With tool calls accumulated it is a final ``TOOL_CALL`` snapshot with
+        the rejected delta undone: the call the guard named is cut back to
+        ``abort.keep_length``, its length before that delta, which equals or
+        extends the snapshot the runtime holds (a wrapper such as the
+        DeepSeek tool-protocol adapter may have streamed a shorter prefix; a
+        snapshot shorter than the runtime's would be merged as a delta
+        there). Otherwise an ``END``. Either way
+        ``finish_reason`` is ``no_progress`` so the runtime's #2786 markers
+        record the abort.
+        """
+        if abort.tool_call_id is not None and abort.keep_length is not None:
+            call = accumulated_tool_calls.get(abort.tool_call_id)
+            if call is not None:
+                function = call["function"]
+                function["arguments"] = function["arguments"][: abort.keep_length]
+        raw = self._attach_reasoning_content_to_raw(
+            last_raw_chunk,
+            accumulated_reasoning_content,
+            has_reasoning_content=has_reasoning_content,
+        )
+        if hasattr(raw, "model_dump"):
+            raw = raw.model_dump()
+        raw = dict(raw) if isinstance(raw, dict) else {}
+        # The runtime lifts this onto the response (and the no-payload
+        # fallback), so the trace records which predicate fired.
+        raw[STREAM_ABORTED_KEY] = abort.reason
+        if accumulated_tool_calls:
+            return StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=list(accumulated_tool_calls.values()),
+                finish_reason=NO_PROGRESS_FINISH_REASON,
+                raw=raw,
+            )
+        return StreamChunk(
+            type=ChunkType.END,
+            finish_reason=NO_PROGRESS_FINISH_REASON,
+            raw=raw,
+        )
+
     def _parse_stream_chunk(
         self,
         raw_chunk: Any,
@@ -1474,6 +1685,10 @@ class OpenAICompatibleLLM(BaseLLM):
 
         choice = raw_chunk.choices[0]
         delta = choice.delta
+        # Some OpenAI-compatible endpoints put ``finish_reason`` on the same
+        # chunk as the final delta instead of on a trailing empty one, so the
+        # delta-bearing chunks below carry it as well (#2786).
+        finish_reason = getattr(choice, "finish_reason", None) or ""
 
         # Handle token content
         if hasattr(delta, "content") and delta.content:
@@ -1481,6 +1696,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 type=ChunkType.TOKEN,
                 content=delta.content,
                 delta=delta.content,
+                finish_reason=finish_reason,
                 raw=self._attach_reasoning_content_to_raw(
                     raw_chunk,
                     accumulated_reasoning_content,
@@ -1557,6 +1773,7 @@ class OpenAICompatibleLLM(BaseLLM):
                 return StreamChunk(
                     type=ChunkType.TOOL_CALL,
                     tool_calls=tool_calls_list,
+                    finish_reason=finish_reason,
                     raw=self._attach_reasoning_content_to_raw(
                         raw_chunk,
                         accumulated_reasoning_content,
@@ -1636,7 +1853,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
     @staticmethod
     async def list_available_models(
-        api_key: str, base_url: Optional[str] = None
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
         """Fetch available models from OpenAI-compatible API using SDK.
 
@@ -1645,6 +1862,8 @@ class OpenAICompatibleLLM(BaseLLM):
             base_url: Base URL for the API (optional).
                 - If not provided, uses official OpenAI API: https://api.openai.com/v1
                 - If provided, uses the specified endpoint (e.g., proxy or custom service)
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
 
         Returns:
             List of available models with their information
@@ -1696,6 +1915,8 @@ class OpenAICompatibleLLM(BaseLLM):
             raise ValueError("Invalid API key") from e
         except Exception as e:
             logger.error("Failed to fetch models: %s", redact_sensitive_text(str(e)))
+            if raise_on_error:
+                raise
             return []
         finally:
             await client.close()

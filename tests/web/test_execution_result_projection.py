@@ -1,3 +1,5 @@
+import pytest
+
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.web.models.task import TaskStatus
 from xagent.web.services.execution_result_projection import (
@@ -21,6 +23,32 @@ def test_project_execution_result_waiting_for_user_uses_chat_message_as_question
     assert projection.transcript_content == "Choose A or B"
     assert projection.message_type == "question"
     assert projection.interactions == []
+
+
+@pytest.mark.parametrize(
+    "outcome", ["completed", "partial", "blocked", None, "invalid", ["partial"]]
+)
+@pytest.mark.parametrize(
+    "status,success",
+    [
+        ("completed", True),
+        ("failed", False),
+        ("waiting_for_user", True),
+        ("interrupted", True),
+    ],
+)
+def test_projection_keeps_valid_outcome_only_for_completed_execution(
+    status, success, outcome
+):
+    projection = project_execution_result_for_channel(
+        {"status": status, "success": success, "completion_outcome": outcome}
+    )
+    expected = (
+        outcome
+        if status == "completed" and outcome in ("completed", "partial", "blocked")
+        else None
+    )
+    assert projection.completion_outcome == expected
 
 
 def test_project_execution_result_appends_interactions_to_visible_text():

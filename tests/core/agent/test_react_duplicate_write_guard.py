@@ -30,6 +30,7 @@ from xagent.core.agent.pattern.react.duplicate_write_guard import (
     build_suppression_envelope,
     tool_requires_duplicate_write_guard,
 )
+from xagent.core.tools.tool_result_spill import SPILL_RESERVED_RESULT_KEY
 
 TURN_1 = {"turn_id": "turn-1"}
 TURN_2 = {"turn_id": "turn-2"}
@@ -678,6 +679,52 @@ async def test_envelope_strips_reserved_transport_keys() -> None:
     assert "_xagent_context_refs" not in envelope["result"]
     assert "_xagent_supersedes_scope" not in envelope["result"]
     assert envelope["result"]["record_id"] == "rec-1"
+
+
+@pytest.mark.asyncio
+async def test_envelope_drops_the_spill_report() -> None:
+    # The spill report is registered, and kept out of the rendered body,
+    # only at the top level of a result. Nested inside the envelope it would
+    # print its relative_path in the repeat's observation body with no
+    # notice, so the envelope must not carry it.
+    args = {"title": "invoice"}
+    relative_path = "tool-results/create_record-result.json"
+
+    class SpilledResultTool(FakeWriteTool):
+        async def run_json_async(self, tool_args: dict[str, Any]) -> Any:
+            self.calls.append(dict(tool_args))
+            return {
+                "success": True,
+                "output": "[stored in a workspace file]",
+                SPILL_RESERVED_RESULT_KEY: [
+                    {
+                        "relative_path": relative_path,
+                        "kind": "array",
+                        "item_count": 3,
+                        "original_chars": 42,
+                        "value_path": "content[0].text",
+                        "record_fields": ["id", "name"],
+                        "truncated_after_items": None,
+                    }
+                ],
+            }
+
+    llm = _run_twice_llm("create_record", args, dict(args))
+    tool = SpilledResultTool()
+    context = _turn_context()
+
+    await _pattern().run(context=context, tools=[tool], llm=llm)
+
+    assert len(tool.calls) == 1
+    tool_messages = [m for m in context.messages if m.role == "tool"]
+    envelope = tool_messages[1].metadata["raw_result"]
+    assert envelope[DUPLICATE_WRITE_SUPPRESSED_KEY] is True
+    assert SPILL_RESERVED_RESULT_KEY not in envelope["result"]
+    assert envelope["result"]["output"] == "[stored in a workspace file]"
+    assert relative_path not in tool_messages[1].content
+    assert SPILL_RESERVED_RESULT_KEY not in tool_messages[1].content
+    # The original call's own result keeps its report.
+    assert SPILL_RESERVED_RESULT_KEY in tool_messages[0].metadata["raw_result"]
 
 
 def test_suppression_envelope_shape() -> None:

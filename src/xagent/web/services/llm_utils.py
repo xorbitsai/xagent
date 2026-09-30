@@ -8,7 +8,10 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 
 from sqlalchemy.orm import Session, joinedload
 
-from ...core.model.chat.basic.adapter import create_base_llm
+from ...core.model.chat.basic.adapter import (
+    attach_chat_retry_wrapper,
+    create_base_llm,
+)
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.claude import ClaudeLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
@@ -1266,10 +1269,12 @@ def create_llm_from_env() -> Optional[BaseLLM]:
         try:
             model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4")
             base_url = os.getenv("OPENAI_BASE_URL")
-            return OpenAILLM(
-                model_name=model_name,
-                api_key=openai_key,
-                base_url=base_url,
+            return attach_chat_retry_wrapper(
+                OpenAILLM(
+                    model_name=model_name,
+                    api_key=openai_key,
+                    base_url=base_url,
+                )
             )
         except Exception as e:
             logger.error(f"Error creating OpenAI LLM from env: {e}")
@@ -1280,10 +1285,12 @@ def create_llm_from_env() -> Optional[BaseLLM]:
         try:
             model_name = os.getenv("ZHIPU_MODEL_NAME", "glm-4")
             base_url = os.getenv("ZHIPU_BASE_URL")
-            return ZhipuLLM(
-                model_name=model_name,
-                api_key=zhipu_key,
-                base_url=base_url,
+            return attach_chat_retry_wrapper(
+                ZhipuLLM(
+                    model_name=model_name,
+                    api_key=zhipu_key,
+                    base_url=base_url,
+                )
             )
         except Exception as e:
             logger.error(f"Error creating Zhipu LLM from env: {e}")
@@ -1294,10 +1301,12 @@ def create_llm_from_env() -> Optional[BaseLLM]:
         try:
             model_name = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")
             base_url = os.getenv("DEEPSEEK_BASE_URL")
-            return DeepSeekLLM(
-                model_name=model_name,
-                api_key=deepseek_key,
-                base_url=base_url,
+            return attach_chat_retry_wrapper(
+                DeepSeekLLM(
+                    model_name=model_name,
+                    api_key=deepseek_key,
+                    base_url=base_url,
+                )
             )
         except Exception as e:
             logger.error(f"Error creating DeepSeek LLM from env: {e}")
@@ -1308,10 +1317,12 @@ def create_llm_from_env() -> Optional[BaseLLM]:
         try:
             model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.0-flash-exp")
             base_url = os.getenv("GEMINI_BASE_URL")
-            return GeminiLLM(
-                model_name=model_name,
-                api_key=gemini_key,
-                base_url=base_url,
+            return attach_chat_retry_wrapper(
+                GeminiLLM(
+                    model_name=model_name,
+                    api_key=gemini_key,
+                    base_url=base_url,
+                )
             )
         except Exception as e:
             logger.error(f"Error creating Gemini LLM from env: {e}")
@@ -1322,10 +1333,12 @@ def create_llm_from_env() -> Optional[BaseLLM]:
         try:
             model_name = os.getenv("CLAUDE_MODEL_NAME", "claude-3-5-sonnet-20241022")
             base_url = os.getenv("CLAUDE_BASE_URL")
-            return ClaudeLLM(
-                model_name=model_name,
-                api_key=claude_key,
-                base_url=base_url,
+            return attach_chat_retry_wrapper(
+                ClaudeLLM(
+                    model_name=model_name,
+                    api_key=claude_key,
+                    base_url=base_url,
+                )
             )
         except Exception as e:
             logger.error(f"Error creating Claude LLM from env: {e}")

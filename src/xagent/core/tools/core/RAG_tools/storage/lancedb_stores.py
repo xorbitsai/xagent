@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 from collections import OrderedDict, defaultdict
+from collections.abc import Iterable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -31,6 +32,7 @@ from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
 from ..utils.lancedb_query_utils import (
     build_fts_query,
+    list_embeddings_table_names,
     list_table_names,
     query_to_list,
 )
@@ -58,6 +60,18 @@ from .lancedb_filter_utils import (
 from .logging_utils import log_audit, log_performance
 
 logger = logging.getLogger(__name__)
+
+_FILE_ID_LOOKUP_BATCH_SIZE = 200
+_INGESTION_STATUS_COLUMNS = (
+    "collection",
+    "doc_id",
+    "status",
+    "message",
+    "parse_hash",
+    "created_at",
+    "updated_at",
+    "user_id",
+)
 
 
 def _fragment_count(table: Any) -> int:
@@ -824,6 +838,145 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return records
         finally:
             _safe_close_table(table)
+
+    def list_document_records_by_file_ids(
+        self, file_ids: Iterable[str]
+    ) -> List[DocumentRecord]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        normalized_file_ids = sorted({file_id for file_id in file_ids if file_id})
+        if not normalized_file_ids:
+            return []
+        conn = self._get_connection()
+        ensure_documents_table(conn)
+        records: List[DocumentRecord] = []
+        table = None
+        try:
+            table = conn.open_table("documents")
+            for offset in range(
+                0, len(normalized_file_ids), _FILE_ID_LOOKUP_BATCH_SIZE
+            ):
+                batch = normalized_file_ids[
+                    offset : offset + _FILE_ID_LOOKUP_BATCH_SIZE
+                ]
+                escaped = ", ".join(f"'{escape_lancedb_string(f)}'" for f in batch)
+                rows = query_to_list(
+                    table.search()
+                    .where(f"file_id IN ({escaped})")
+                    .select(["collection", "doc_id", "file_id", "user_id"])
+                    .limit(-1)
+                )
+                records.extend(
+                    DocumentRecord(
+                        doc_id=str(row.get("doc_id") or ""),
+                        file_id=str(row["file_id"]),
+                        user_id=(
+                            None if row.get("user_id") is None else int(row["user_id"])
+                        ),
+                        collection=str(row.get("collection") or ""),
+                    )
+                    for row in rows
+                )
+        finally:
+            _safe_close_table(table)
+        return records
+
+    def list_document_rows(
+        self,
+        user_id: Optional[int],
+        is_admin: bool,
+        max_results: int = DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    ) -> List[Dict[str, Any]]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_connection()
+        ensure_documents_table(conn)
+        table = None
+        try:
+            table = conn.open_table("documents")
+            user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
+            query = table.search()
+            if user_filter:
+                query = query.where(user_filter)
+            return query_to_list(query.limit(max_results))
+        finally:
+            _safe_close_table(table)
+
+    def list_indexed_doc_refs(
+        self,
+        doc_refs: Iterable[Tuple[str, str]],
+        user_id: Optional[int],
+        is_admin: bool,
+    ) -> set[Tuple[str, str]]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        candidate_refs = set(doc_refs)
+        indexed_refs: set[Tuple[str, str]] = set()
+        if not candidate_refs:
+            return indexed_refs
+        doc_ids_by_collection: Dict[str, set[str]] = defaultdict(set)
+        for collection, doc_id in sorted(candidate_refs):
+            doc_ids_by_collection[collection].add(doc_id)
+        user_filter = UserPermissions.get_user_filter(user_id, is_admin=is_admin)
+
+        conn = self._get_connection()
+        for table_name in ["chunks", *list_embeddings_table_names(conn)]:
+            if indexed_refs.issuperset(candidate_refs):
+                return indexed_refs
+            table = None
+            try:
+                table = conn.open_table(table_name)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Skipping indexed status fallback table '%s': %s", table_name, exc
+                )
+                continue
+
+            try:
+                for collection, doc_ids in doc_ids_by_collection.items():
+                    pending_doc_ids = {
+                        doc_id
+                        for doc_id in doc_ids
+                        if (collection, doc_id) not in indexed_refs
+                    }
+                    if not pending_doc_ids:
+                        continue
+                    collection_filter = build_lancedb_filter_expression(
+                        {"collection": collection},
+                        skip_user_filter=True,
+                    )
+                    escaped = ", ".join(
+                        f"'{escape_lancedb_string(doc_id)}'"
+                        for doc_id in sorted(pending_doc_ids)
+                    )
+                    combined_filter = (
+                        f"({collection_filter}) and (doc_id IN ({escaped}))"
+                    )
+                    if user_filter:
+                        combined_filter = f"({combined_filter}) and ({user_filter})"
+                    try:
+                        query = table.search().where(combined_filter)
+                        rows = query_to_list(
+                            query.select(["collection", "doc_id"]).limit(-1)
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "Failed indexed status fallback query on '%s' for collection '%s': %s",
+                            table_name,
+                            collection,
+                            exc,
+                        )
+                        continue
+
+                    for row in rows:
+                        row_collection = str(row.get("collection") or "").strip()
+                        row_doc_id = str(row.get("doc_id") or "").strip()
+                        if row_collection and row_doc_id:
+                            indexed_refs.add((row_collection, row_doc_id))
+            finally:
+                _safe_close_table(table)
+
+        return indexed_refs
 
     def count_documents_grouped_by_collection(
         self,
@@ -3814,6 +3967,56 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         finally:
             _safe_close_table(table)
 
+    def load_ingestion_status_rows(
+        self, doc_refs: Sequence[Tuple[str, str]]
+    ) -> List[Dict[str, Any]]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        table = None
+        try:
+            conn = self._get_sync_connection()
+            self._ensure_ingestion_runs_table(conn)
+            table = conn.open_table("ingestion_runs")
+            if not doc_refs:
+                return []
+            return query_to_list(
+                table.search()
+                .where(self._build_doc_refs_filter(doc_refs))
+                .select(list(_INGESTION_STATUS_COLUMNS))
+                .limit(-1)
+            )
+        except Exception as e:
+            logger.error("Failed to load ingestion status rows: %s", e)
+            raise
+        finally:
+            _safe_close_table(table)
+
+    def replace_ingestion_status_rows(
+        self,
+        doc_refs: Sequence[Tuple[str, str]],
+        rows: Sequence[Dict[str, Any]],
+    ) -> None:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        stray = {(row.get("collection"), row.get("doc_id")) for row in rows}
+        stray -= set(doc_refs)
+        if stray:
+            raise ValueError(f"Status rows outside doc_refs: {stray}")
+        table = None
+        try:
+            conn = self._get_sync_connection()
+            self._ensure_ingestion_runs_table(conn)
+            table = conn.open_table("ingestion_runs")
+            if doc_refs:
+                table.delete(self._build_doc_refs_filter(doc_refs))
+            if rows:
+                table.add(list(rows))
+        except Exception as e:
+            logger.error("Failed to replace ingestion status rows: %s", e)
+            raise
+        finally:
+            _safe_close_table(table)
+
     # Deprecated: use KBCollectionHandle.rename_collection_status instead. Remove in #514.
     def rename_collection_status(
         self,
@@ -3937,6 +4140,13 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         safe_collection = escape_lancedb_string(collection)
         safe_doc_id = escape_lancedb_string(doc_id)
         return f"collection == '{safe_collection}' AND doc_id == '{safe_doc_id}'"
+
+    def _build_doc_refs_filter(self, doc_refs: Sequence[Tuple[str, str]]) -> str:
+        """Callers skip empty ``doc_refs``: they yield ``""``, which is no filter."""
+        return " or ".join(
+            f"({self._build_base_filter(collection, doc_id)})"
+            for collection, doc_id in doc_refs
+        )
 
     def _build_load_filter(
         self,
@@ -4509,6 +4719,8 @@ class LanceDBMainPointerStore(MainPointerStore):
         try:
             normalized_tag = self._normalize_model_tag(model_tag)
             now = datetime.now(timezone.utc).replace(tzinfo=None)
+            # main_pointers is timestamp[ms]; merge_insert rejects sub-ms values.
+            now = now.replace(microsecond=now.microsecond // 1000 * 1000)
 
             # Check if pointer already exists to preserve created_at
             existing = self.get_main_pointer(collection, doc_id, step_type, model_tag)

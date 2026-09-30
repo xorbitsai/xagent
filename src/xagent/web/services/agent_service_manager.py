@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_external_upload_dirs,
+    get_shared_task_execution_enabled,
 )
 from ...core.agent.service import AgentService
 from ...core.execution_scope import (
@@ -27,6 +28,7 @@ from ...core.execution_scope import (
 )
 from ...core.memory.base import MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
+from ...core.model.chat.basic.adapter import attach_chat_retry_wrapper
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
@@ -47,6 +49,7 @@ from ...core.tools.adapters.vibe.selection_spec import (
 from ...core.utils.setup_metrics import agent_setup
 from ...sandbox import SandboxMountIntent
 from ..dynamic_memory_store import get_memory_store
+from ..memory_lifecycle import MemoryUnavailableError
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.database import (
     get_session_local,
@@ -86,6 +89,22 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicyMismatchError,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from .memory_availability import (
+    GENERIC_MEMORY_AVAILABILITY_REASON as GENERIC_MEMORY_AVAILABILITY_REASON,
+)
+from .memory_availability import (
+    MEMORY_AVAILABILITY_REASON_METADATA_KEY,
+    MEMORY_AVAILABLE_METADATA_KEY,
+)
+from .memory_availability import (
+    PUBLIC_MEMORY_AVAILABILITY_REASONS as PUBLIC_MEMORY_AVAILABILITY_REASONS,
+)
+from .memory_availability import (
+    caller_facing_execution_metadata as caller_facing_execution_metadata,
+)
+from .memory_availability import (
+    public_memory_availability_reason,
+)
 from .memory_policy import (
     MemoryPolicyRequest,
     resolve_trusted_memory_policy,
@@ -117,6 +136,7 @@ from .task_runtime import (
 )
 from .task_setup_snapshot import (
     RuntimeUserFields,
+    TaskModelOverride,
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
     detach_runtime_user_fields,
@@ -210,6 +230,27 @@ class AgentServiceMemoryPolicy:
     memory_available: bool = True
     memory_availability_reason: str | None = None
 
+    @property
+    def public_availability_reason(self) -> str | None:
+        """The reason as a caller may see it."""
+        return public_memory_availability_reason(self.memory_availability_reason)
+
+    def execution_metadata(self) -> dict[str, Any]:
+        """Caller-safe availability for checkpoints and task trace metadata.
+
+        Empty while memory is available, so an ordinary task's trace is
+        unchanged. Execution metadata is checkpointed and can later reach
+        owner-facing trace APIs, so a trusted host's arbitrary diagnostic must
+        be folded before persistence. The raw reason remains available on this
+        policy object for operator logging only.
+        """
+        if self.memory_available:
+            return {}
+        return {
+            MEMORY_AVAILABLE_METADATA_KEY: False,
+            MEMORY_AVAILABILITY_REASON_METADATA_KEY: self.public_availability_reason,
+        }
+
 
 def _optional_task_int(task: Any, field: str) -> int | None:
     value = getattr(task, field, None)
@@ -245,7 +286,37 @@ def resolve_agent_service_memory_policy(
     use_in_memory = (is_preview and not enabled) or (
         override is not None and not override.available
     )
-    memory = InMemoryMemoryStore() if use_in_memory else get_memory_store()
+    if use_in_memory:
+        if override is not None and not override.available:
+            logger.warning(
+                "Trusted memory policy made persistent memory unavailable (%s)",
+                override.reason,
+            )
+        return AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(),
+            memory_enabled=enabled,
+            memory_available=True if override is None else override.available,
+            memory_availability_reason=None if override is None else override.reason,
+        )
+
+    try:
+        memory = get_memory_store()
+    except MemoryUnavailableError as error:
+        # Persistent memory is fenced off -- blocked on repair, awaiting a
+        # restart, or transiently unavailable. The task still starts; it simply
+        # runs with memory disabled and an inert store, so nothing reads from or
+        # writes to the storage that admission refused.
+        logger.warning(
+            "Task memory unavailable (%s); running with memory disabled",
+            error.status.state.value,
+        )
+        return AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(),
+            memory_enabled=False,
+            memory_available=False,
+            memory_availability_reason=error.status.state.value,
+        )
+
     return AgentServiceMemoryPolicy(
         memory=memory,
         memory_enabled=enabled,
@@ -261,10 +332,10 @@ async def resolve_agent_service_memory_policy_async(
 ) -> AgentServiceMemoryPolicy:
     """Resolve runtime memory without blocking the asyncio event loop.
 
-    ``get_memory_store`` refreshes its embedding-model configuration through
-    synchronous SQLAlchemy queries. Task setup supplies detached task/config
-    data here, while the worker owns the short database Session used by the
-    dynamic store manager.
+    ``get_memory_store`` re-reads the global memory embedding authority
+    through synchronous SQLAlchemy queries to check for vector-space drift.
+    Task setup supplies detached task/config data here, while the worker owns
+    the short database Session used by the store manager.
     """
 
     return await run_db_io_cancellation_safe(
@@ -327,11 +398,13 @@ def create_default_llm() -> Optional[BaseLLM]:
                 thinking_mode = (
                     None if thinking_mode_env == "auto" else thinking_mode_env == "true"
                 )
-                return ZhipuLLM(
-                    model_name=zhipu_model or "glm-4.7-flash",
-                    api_key=zhipu_api_key,
-                    base_url=zhipu_base_url,
-                    thinking_mode=thinking_mode,
+                return attach_chat_retry_wrapper(
+                    ZhipuLLM(
+                        model_name=zhipu_model or "glm-4.7-flash",
+                        api_key=zhipu_api_key,
+                        base_url=zhipu_base_url,
+                        thinking_mode=thinking_mode,
+                    )
                 )
             else:
                 logger.error(
@@ -342,17 +415,21 @@ def create_default_llm() -> Optional[BaseLLM]:
             openai_api_key == "" or not is_placeholder_api_key(openai_api_key)
         ):
             logger.info(f"Using OpenAI LLM with model: {openai_model}")
-            return OpenAILLM(
-                model_name=openai_model or "gpt-4o-mini",
-                base_url=openai_base_url,
-                api_key=openai_api_key,
+            return attach_chat_retry_wrapper(
+                OpenAILLM(
+                    model_name=openai_model or "gpt-4o-mini",
+                    base_url=openai_base_url,
+                    api_key=openai_api_key,
+                )
             )
         elif deepseek_api_key and not is_placeholder_api_key(deepseek_api_key):
             logger.info(f"Using DeepSeek LLM with model: {deepseek_model}")
-            return DeepSeekLLM(
-                model_name=deepseek_model or "deepseek-v4-flash",
-                base_url=deepseek_base_url,
-                api_key=deepseek_api_key,
+            return attach_chat_retry_wrapper(
+                DeepSeekLLM(
+                    model_name=deepseek_model or "deepseek-v4-flash",
+                    base_url=deepseek_base_url,
+                    api_key=deepseek_api_key,
+                )
             )
 
         # No LLM available - AgentService will run without DAG pattern
@@ -789,6 +866,7 @@ def _register_selected_task_files_isolated(
                     UploadedFile.file_id == selected_file_id,
                     UploadedFile.user_id == task_owner_id,
                     UploadedFile.storage_status != "compensating",
+                    UploadedFile.detached_reason.is_(None),
                     or_(
                         UploadedFile.task_id == task_id,
                         UploadedFile.task_id.is_(None),
@@ -1189,6 +1267,13 @@ class AgentServiceManager:
         # different scope between turns must evict and rebuild instead of
         # silently executing in the old scope's namespace.
         self._agent_scope_fingerprints: Dict[int, Optional[ScopeFingerprint]] = {}
+        # Task model override (``apply_task_model_override``) each cached
+        # AgentService was built from, with the service it belongs to. Its
+        # slots and tools hold that override's models, so a request carrying
+        # a different override -- or none -- must evict and rebuild.
+        self._agent_model_overrides: Dict[
+            int, tuple[AgentService, TaskModelOverride]
+        ] = {}
         # Ephemeral trusted actor policy bound once to an actor-marked task.
         # The durable task marker survives restarts; the credential owner does
         # not, so generic reconstruction remains unsupported.
@@ -1280,6 +1365,7 @@ class AgentServiceManager:
         self._agent_sandbox_keys.pop(task_key, None)
         self._agent_sandbox_providers.pop(task_key, None)
         self._agent_scope_fingerprints.pop(task_key, None)
+        self._agent_model_overrides.pop(task_key, None)
         raise RuntimeError(
             f"The sandbox for task {task_key} was reclaimed before "
             "execution started (idle reclamation or capacity "
@@ -1310,6 +1396,7 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_key, None)
             self._agent_sandbox_providers.pop(task_key, None)
             self._agent_scope_fingerprints.pop(task_key, None)
+            self._agent_model_overrides.pop(task_key, None)
             logger.info(
                 "Evicted cached AgentService for task %s after releasing sandbox %s",
                 task_key,
@@ -1537,6 +1624,16 @@ class AgentServiceManager:
         # Configuration is now stored in Task table, this method is kept for backward compatibility
         # If AgentService already exists, update its LLM configuration
         if task_id in self._agents:
+            if self._cached_model_override(task_id) is not None:
+                # Built from a caller-selected override: swapping in the
+                # task's configured (unguarded) models would undo it for the
+                # rest of this run. The next build follows its own snapshot.
+                logger.info(
+                    "Leaving the models of task %s unchanged: its AgentService "
+                    "runs on a task model override",
+                    task_id,
+                )
+                return
             # This method doesn't have user context, use None for user_id
             default_llm, fast_llm, vision_llm, compact_llm = resolve_llms_from_names(
                 llm_ids, db, None
@@ -1577,7 +1674,9 @@ class AgentServiceManager:
             return
 
         agent.set_conversation_history(
-            conversation_history, watermark=transcript_window.watermark
+            conversation_history,
+            watermark=transcript_window.watermark,
+            event_watermark=transcript_window.event_watermark,
         )
         logger.info(
             f"Loaded {len(conversation_history)} persisted chat messages for task {task_id}"
@@ -2301,6 +2400,7 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
 
         # Scope invariant: the cached instance baked its sandbox key (and,
         # later, workspace paths and memory dimensions) in at build time.
@@ -2342,7 +2442,51 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
 
+        # Model override invariant: the cached instance holds the models it
+        # was built with, in its slots and in its tools. A request carrying a
+        # task model override must not be served by an instance built from
+        # other models, and one built from an override must not serve a new
+        # run that did not bring it; evict and rebuild instead. A lookup
+        # without an override while that instance's run is in progress or
+        # waiting -- pause, resume, a reply injected into the waiting run --
+        # keeps reaching it. The workspace is NOT cleaned up here: same owner.
+        requested_model_override = (
+            task_setup_snapshot.model_override
+            if task_setup_snapshot is not None
+            else None
+        )
+        cached_model_override = (
+            self._cached_model_override(task_id) if task_id in self._agents else None
+        )
+        if (
+            task_id in self._agents
+            and cached_model_override is not requested_model_override
+            and requested_model_override is None
+            and self._agent_run_in_progress(task_id)
+        ):
+            requested_model_override = cached_model_override
+        if (
+            task_id in self._agents
+            and cached_model_override is not requested_model_override
+        ):
+            logger.info(
+                "Rebuilding cached AgentService for task %s: its task model "
+                "override differs from the request's",
+                task_id,
+            )
+            del self._agents[task_id]
+            self._agent_owner_ids.pop(task_id, None)
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
+
+        # A cache hit re-checks owner, scope and model override invariants; memory policy
+        # is resolved on construction. Remembered here so the fall-through can
+        # reconcile the cached service before it is handed to the next turn.
+        rebuilt_this_call = task_id not in self._agents
         if task_id not in self._agents:
             # Check if task exists in database
             task_exists = task_setup_snapshot is not None
@@ -2459,6 +2603,9 @@ class AgentServiceManager:
                             )
                             self._agent_owner_ids[task_id] = runtime_user_id
                             self._agent_scope_fingerprints[task_id] = fingerprint
+                            self._record_model_override(
+                                task_id, requested_model_override
+                            )
                             self._sync_connector_runtime_turn(
                                 task_id, connector_runtime_turn_id
                             )
@@ -2480,6 +2627,7 @@ class AgentServiceManager:
                         self._agent_sandbox_keys.pop(task_id, None)
                         self._agent_sandbox_providers.pop(task_id, None)
                         self._agent_scope_fingerprints.pop(task_id, None)
+                        self._agent_model_overrides.pop(task_id, None)
                         raise
                     except Exception as e:
                         # Clean up any partial reconstruction that might have occurred
@@ -2492,6 +2640,7 @@ class AgentServiceManager:
                             self._agent_sandbox_keys.pop(task_id, None)
                             self._agent_sandbox_providers.pop(task_id, None)
                             self._agent_scope_fingerprints.pop(task_id, None)
+                            self._agent_model_overrides.pop(task_id, None)
                         if is_database_pool_timeout(e):
                             raise
                         logger.warning(
@@ -2886,6 +3035,9 @@ class AgentServiceManager:
                         task_id=str(task_id),  # Pass task_id for proper tracing
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
                         memory_enabled=memory_policy.memory_enabled,
+                        memory_available=memory_policy.memory_available,
+                        memory_availability_reason=memory_policy.public_availability_reason,
+                        execution_metadata=memory_policy.execution_metadata(),
                         system_prompt=system_prompt,  # Pass agent builder instructions
                     )
 
@@ -2918,6 +3070,7 @@ class AgentServiceManager:
                     agent_service.set_conversation_history(
                         [dict(message) for message in snapshot.conversation_history],
                         watermark=snapshot.conversation_watermark,
+                        event_watermark=snapshot.conversation_event_watermark,
                     )
                     recovery_state = await materialize_task_execution_recovery_state(
                         snapshot.execution_recovery
@@ -2944,12 +3097,122 @@ class AgentServiceManager:
                 # Re-raise the exception - no fallback logic allowed
                 raise
 
+        if not rebuilt_this_call:
+            await self._reconcile_cached_agent_memory_policy(
+                task_id,
+                task=(
+                    task_setup_snapshot.task
+                    if task_setup_snapshot is not None
+                    else None
+                ),
+                agent_config=persisted_agent_config,
+            )
+
         self._agent_owner_ids[task_id] = runtime_user_id
         self._agent_scope_fingerprints[task_id] = fingerprint
+        self._record_model_override(task_id, requested_model_override)
         self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
         self._sync_mcp_actor_execution_identity(task_id, mcp_actor_execution_identity)
         self._sync_execution_scope(task_id, scope)
         return self._agents[task_id]
+
+    def _agent_run_in_progress(self, task_id: int) -> bool:
+        """Whether the cached AgentService has a running or resumable execution."""
+        agent = self._agents.get(task_id)
+        try:
+            status = agent.get_execution_status(str(task_id))  # type: ignore[union-attr]
+            if not status:
+                return False
+            return bool(status.get("is_running") or status.get("is_resumable"))
+        except Exception:  # noqa: BLE001 - unknown: keep the run reachable
+            return True
+
+    def _cached_model_override(self, task_id: int) -> Optional[TaskModelOverride]:
+        """The task model override the cached AgentService was built from."""
+        entry = self._agent_model_overrides.get(task_id)
+        if entry is None or entry[0] is not self._agents.get(task_id):
+            return None
+        return entry[1]
+
+    def _record_model_override(
+        self, task_id: int, override: Optional[TaskModelOverride]
+    ) -> None:
+        agent = self._agents.get(task_id)
+        if agent is None or override is None:
+            self._agent_model_overrides.pop(task_id, None)
+        else:
+            self._agent_model_overrides[task_id] = (agent, override)
+
+    async def _reconcile_cached_agent_memory_policy(
+        self,
+        task_id: int,
+        *,
+        task: Optional[Any],
+        agent_config: Optional[Mapping[str, Any]],
+    ) -> None:
+        """Re-resolve memory policy for a cached AgentService before its turn.
+
+        The cache-hit path checks owner, scope and model override invariants, so
+        without this a service built while memory was serving would keep
+        ``memory_enabled``, its published store and its execution-scoped
+        memory tools for the rest of its life -- reading and writing through
+        the adapter built for a vector space the authority no longer
+        describes.
+
+        This resolution is also the cross-worker signal. It reaches
+        ``get_memory_store()``, whose drift check re-reads the shared
+        authority row, so an authority change an administrator made, or a
+        revocation another worker already performed, advances *this* worker's
+        publication generation too -- and from that point every proxy this
+        worker has handed out fails closed on its own process-local check,
+        including one a cached agent is already holding. That is the
+        non-obvious part: nothing else on the cache-hit path re-reads the
+        shared authority, so a worker that is not building agents would never
+        learn. It costs exactly the one authority read the manager's drift
+        check already performs, and nothing is added to any per-operation
+        path: ``RevocableMemoryStore._live()`` stays lock-free and never
+        touches the database.
+
+        Reconciliation is one-directional and atomic with respect to the turn.
+        One-directional, because this path does not carry every input that
+        decided enablement when the service was built -- a preview or an
+        agent-backed task runs with memory off by configuration, not by
+        lifecycle -- so a policy that now reports memory as available never
+        turns memory back on. Atomic, because the policy is resolved first and
+        then applied without awaiting in between, under the per-task build
+        lock: the turn either runs with memory or runs disabled with a
+        recorded reason, never half-reconciled.
+
+        An operation already past its ``_live()`` check completes. That is
+        inherent to any revocation boundary -- the check cannot un-issue a
+        call that is already inside the store -- and the deployment contract
+        already requires quiescing writers for a vector-space change, so
+        nothing here tries to abort work in flight.
+        """
+        agent = self._agents.get(task_id)
+        if agent is None or not getattr(agent, "memory_enabled", False):
+            # Already running without memory. Nothing to reconcile, and this
+            # path never re-enables, so there is no reason to read anything.
+            return
+
+        policy = await resolve_agent_service_memory_policy_async(
+            task=task,
+            agent_config=agent_config,
+        )
+        if policy.memory_available:
+            return
+
+        agent.revoke_memory(
+            inert_store=policy.memory,
+            availability_reason=policy.public_availability_reason,
+            execution_metadata=policy.execution_metadata(),
+        )
+        logger.warning(
+            "Reconciled cached AgentService for task %s onto an inert memory "
+            "store (%s); this turn runs with memory disabled",
+            task_id,
+            policy.memory_availability_reason,
+        )
 
     def _sync_connector_runtime_turn(
         self, task_id: int, connector_runtime_turn_id: Optional[str]
@@ -3138,6 +3401,7 @@ class AgentServiceManager:
                 self._agent_sandbox_keys.pop(task_id, None)
                 self._agent_sandbox_providers.pop(task_id, None)
                 self._agent_scope_fingerprints.pop(task_id, None)
+                self._agent_model_overrides.pop(task_id, None)
                 self._agent_evicted_scope_fingerprints.pop(task_id, None)
                 evicted_task_ids.append(task_id)
             finally:
@@ -3259,6 +3523,7 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_model_overrides.pop(task_id, None)
             self._agent_evicted_scope_fingerprints.pop(task_id, None)
             self._mcp_actor_policies.pop(task_id, None)
 
@@ -3309,16 +3574,35 @@ class AgentServiceManager:
                 snapshot, leaving tasks stuck RUNNING for SDK clients.
             task_lease: Lease owned by an outer orchestrator. Its run id fences
                 tracker writes when this method does not manage the lease.
+                Under shared task execution a run must hold a lease: either
+                this one, or one acquired here for a task id when
+                ``manage_task_lease`` is true.
             task_lease_heartbeat_task: Heartbeat owned by an inline transport
                 for ``task_lease``. When provided, definitive ownership loss
                 cancels and drains agent execution before this method returns.
 
         Returns:
             Execution result dictionary
+
+        Raises:
+            RuntimeError: Shared task execution is enabled and the run would
+                hold no task lease.
         """
         # Initialize tracker if db_session and task_id are provided
         tracker = None
         tracker_task_id = tracking_task_id or task_id
+        # Shared workers fence checkpoints, command results and task
+        # settlement by the current lease. A run without one would write them
+        # unfenced, so refuse it before any side effect instead of running it.
+        if (
+            task_lease is None
+            and not (manage_task_lease and tracker_task_id)
+            and get_shared_task_execution_enabled()
+        ):
+            raise RuntimeError(
+                "Shared task execution requires a task lease: pass task_lease "
+                "or let execute_task manage the lease for a task id."
+            )
         lease = None
         lease_stop_event = None
         lease_heartbeat_task = None
@@ -3914,6 +4198,9 @@ class AgentServiceManager:
                     task_id=str(task_id),
                     memory_similarity_threshold=memory_similarity_threshold,
                     memory_enabled=memory_policy.memory_enabled,
+                    memory_available=memory_policy.memory_available,
+                    memory_availability_reason=memory_policy.public_availability_reason,
+                    execution_metadata=memory_policy.execution_metadata(),
                 )
 
             agent_service = self._agents[task_id]
@@ -3925,6 +4212,7 @@ class AgentServiceManager:
             agent_service.set_conversation_history(
                 [dict(message) for message in snapshot.conversation_history],
                 watermark=snapshot.conversation_watermark,
+                event_watermark=snapshot.conversation_event_watermark,
             )
             recovery_state = await materialize_task_execution_recovery_state(
                 snapshot.execution_recovery

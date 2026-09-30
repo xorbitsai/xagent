@@ -272,18 +272,21 @@ class Task(Base):  # type: ignore
             "interaction_protocol_version IS NULL OR interaction_protocol_version = 1",
             name="ck_tasks_interaction_protocol_version",
         ),
+        # Deleted tasks leave retained files under web_task_<id>. Never give
+        # their workspace identity to a later task on SQLite.
+        {"sqlite_autoincrement": True},
     )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String(200), nullable=False)
     description = Column(Text)
-    # Stage 3.1 only supports legacy routing. Widen this pin together with
-    # the event-backed runtime, never by changing the creation default alone.
+    # Production creation remains legacy; version 2 is exercised by migration
+    # tests until the event readers are ready for production routing.
     conversation_storage_version = Column(
         Integer,
         CheckConstraint(
-            "conversation_storage_version = 1",
+            "conversation_storage_version IN (1, 2)",
             name="ck_tasks_conversation_storage_version",
         ),
         nullable=False,
@@ -351,6 +354,12 @@ class Task(Base):  # type: ignore
     # migration transaction. Whoever adds the scan adds the index, with the
     # deployment procedure that goes with it.
     last_activity_at = Column(DateTime(timezone=True), nullable=True)
+    # When the retention purge last removed this task's execution trace
+    # (#2565). The conversation survives trace expiry and can take new turns,
+    # which write new trace rows, so this does not mean "has no steps": it
+    # means the steps from before this moment were removed and a steps read
+    # may be incomplete. NULL when retention never touched the trace.
+    traces_expired_at = Column(DateTime(timezone=True), nullable=True)
     runner_id = Column(String(255), nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
@@ -508,6 +517,10 @@ class Task(Base):  # type: ignore
     total_tokens = Column(Integer, default=0)
     llm_calls = Column(Integer, default=0)
     token_usage_details = Column(JSON, nullable=True)  # Detailed breakdown
+
+    # Semantic result, separate from control status. NULL means unreported
+    # (including legacy rows), not proof that the user's goal was completed.
+    completion_outcome = Column(String(20), nullable=True)
 
     # ----- SDK surface fields (read/written by /v1/* endpoints) -----
     # The four columns below are populated by SDK-driven task lifecycles

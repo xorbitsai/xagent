@@ -48,6 +48,7 @@ from .models import (
     KBBackendCapabilities,
     KBCollectionContext,
     KBContextRequest,
+    KBDocumentRowsSnapshot,
     KBStorageBackend,
     KBUserScope,
     KBVectorStorageCleanupResult,
@@ -137,7 +138,9 @@ class KBCoordinator:
         self._storage_shim = storage_shim or KBStorageShimCompatibilityFacade(
             storage_factory=self._storage_factory
         )
-        self._file_compatibility = file_compatibility or KBFileCompatibilityFacade()
+        self._file_compatibility = file_compatibility or KBFileCompatibilityFacade(
+            storage_shim=self._storage_shim
+        )
         self._management = management_facade or KBCoreManagementCompatibilityFacade(
             coordinator=self
         )
@@ -2074,6 +2077,45 @@ class KBCoordinator:
             )
         )
 
+    def capture_document_rows_sync(
+        self,
+        collection: str,
+        doc_ids: Sequence[str],
+        *,
+        user_id: int,
+        is_admin: bool,
+    ) -> KBDocumentRowsSnapshot:
+        """Open the collection handle and capture these documents' rows."""
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.READ,
+                hide_missing=True,
+            )
+        )
+        return handle.capture_document_rows(doc_ids, user_id=user_id, is_admin=is_admin)
+
+    def restore_document_rows_sync(
+        self,
+        snapshot: KBDocumentRowsSnapshot,
+        *,
+        user_id: int,
+        is_admin: bool,
+    ) -> None:
+        """Open the snapshot's collection handle and restore its rows."""
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=snapshot.collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        handle.restore_document_rows(snapshot, user_id=user_id, is_admin=is_admin)
+
     async def restore_candidate_cleanup_snapshot(
         self,
         snapshot: "KBVersionCandidateCleanupSnapshot",
@@ -2132,12 +2174,6 @@ class KBCoordinator:
         if request.operation is not None:
             return self._rollback_boundaries_with_operation(request)
         return self._rollback_boundaries_callbacks_only(request)
-
-    async def rollback_failed_ingestion(
-        self, request: RollbackFailedIngestionRequest
-    ) -> RollbackFailedIngestionResult:
-        """Async twin of ``rollback_failed_ingestion_sync``, run in a worker thread."""
-        return await asyncio.to_thread(self.rollback_failed_ingestion_sync, request)
 
     async def rollback_failed_upload_ingestion(
         self, request: RollbackFailedUploadIngestionRequest

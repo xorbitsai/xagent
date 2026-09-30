@@ -13,6 +13,8 @@ from pathlib import Path
 
 import xagent.core.tools.core.RAG_tools.kb.collection_handle as handle_module
 import xagent.core.tools.core.RAG_tools.kb.coordinator as coordinator_module
+import xagent.web.api.kb as kb_api_module
+import xagent.web.services.kb_file_service as file_service_module
 
 # A new backend store module (e.g. qdrant_stores.py) is not auto-detected and
 # must be appended here.
@@ -143,6 +145,88 @@ def test_handle_guard_flags_web_imports() -> None:
     assert flagged.count("xagent.web.api.kb") == 2
     # Backend imports are legitimate below the boundary.
     assert "xagent.core.tools.core.RAG_tools.storage.lancedb_stores" not in flagged
+
+
+# kb_file_service and web/api/kb.py reach LanceDB only through the storage
+# contracts (#2665).
+LANCEDB_ACCESS_FORBIDDEN_SUBSTRINGS = ("lancedb", "schema_manager")
+LANCEDB_ACCESS_FORBIDDEN_NAMES = frozenset(
+    {
+        "open_table",
+        "get_connection_from_env",
+        "get_raw_connection",
+        "get_vector_store_raw_connection",
+        "_get_connection",
+        "_get_sync_connection",
+        "_get_async_connection",
+        "_get_table",
+    }
+)
+
+
+def _lancedb_access_offenders(source: str, package: str = "") -> list[tuple[int, str]]:
+    offenders = [
+        (lineno, mod)
+        for lineno, mod in _imported_modules(source, package)
+        if any(sub in mod.lower() for sub in LANCEDB_ACCESS_FORBIDDEN_SUBSTRINGS)
+    ]
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.alias):
+            name = node.name.rsplit(".", 1)[-1]
+        else:
+            name = getattr(node, "attr", None) or getattr(node, "id", None)
+        if name in LANCEDB_ACCESS_FORBIDDEN_NAMES:
+            offenders.append((node.lineno, name))
+    return offenders
+
+
+def test_kb_file_service_opens_no_lancedb() -> None:
+    source = Path(file_service_module.__file__).read_text()
+    offenders = _lancedb_access_offenders(source, file_service_module.__package__)
+    assert offenders == [], (
+        f"kb_file_service must read LanceDB through the storage contracts: {offenders}"
+    )
+
+
+def test_kb_api_opens_no_lancedb() -> None:
+    source = Path(kb_api_module.__file__).read_text()
+    offenders = _lancedb_access_offenders(source, kb_api_module.__package__)
+    assert offenders == [], (
+        f"web/api/kb.py must read LanceDB through the storage contracts: {offenders}"
+    )
+
+
+def test_file_service_guard_flags_direct_lancedb_access() -> None:
+    snippet = (
+        "from ...providers.vector_store.lancedb import get_connection_from_env\n"
+        "from ..LanceDB.schema_manager import ensure_documents_table\n"
+        "from ..utils.lancedb_query_utils import query_to_list\n"
+        "from ...storage.factory import get_vector_store_raw_connection as raw\n"
+        "store.get_raw_connection().open_table('documents')\n"
+        "get_connection_from_env()\n"
+        "store._get_connection()\n"
+        "store._get_table('documents')\n"
+        "from ..LanceDB import model_tag_utils\n"
+        "import xagent.core.tools.core.RAG_tools.LanceDB as ldb\n"
+        "status_store._get_sync_connection()\n"
+        "store._get_async_connection()\n"
+    )
+    offenders = set(_lancedb_access_offenders(snippet, "xagent.web.services"))
+    assert {
+        (1, "xagent.providers.vector_store.lancedb"),
+        (2, "xagent.web.LanceDB.schema_manager"),
+        (3, "xagent.web.utils.lancedb_query_utils.query_to_list"),
+        (4, "get_vector_store_raw_connection"),
+        (5, "get_raw_connection"),
+        (5, "open_table"),
+        (6, "get_connection_from_env"),
+        (7, "_get_connection"),
+        (8, "_get_table"),
+        (9, "xagent.web.LanceDB"),
+        (10, "xagent.core.tools.core.RAG_tools.LanceDB"),
+        (11, "_get_sync_connection"),
+        (12, "_get_async_connection"),
+    } <= offenders
 
 
 def test_relative_resolution_clamps_impossible_depth() -> None:

@@ -91,11 +91,12 @@ def test_redis_gap_preserves_result_and_rejects_unaccepted_start(shared_app):
         process.join(30)
         assert process.exitcode == 0, app.diagnostics()
     app.client.close()
+    app.processes.clear()
+    app.pipes.clear()
     proxy = _RedisProxy(app.environment["XAGENT_REDIS_URL"])
     try:
         app.environment["XAGENT_REDIS_URL"] = proxy.url
-        app.start("web")
-        app.start("worker")
+        app.start_all("web", "worker")
         agent_id, headers = app.create_agent()
         request = {
             "agent_id": agent_id,

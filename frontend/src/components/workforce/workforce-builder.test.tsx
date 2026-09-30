@@ -13,7 +13,9 @@ const routerReplaceMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 const searchParamsMock = vi.hoisted(() => new URLSearchParams())
 const translateMock = vi.hoisted(() => (key: string) => key)
+const dispatchMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
+const setTaskIdMock = vi.hoisted(() => vi.fn())
 
 // Spied rather than mocked via vi.mock: handleCreate now updates the address
 // bar via the native History API instead of router.replace/push, precisely
@@ -44,9 +46,9 @@ vi.mock("@/contexts/i18n-context", () => ({
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
     sendMessage: sendMessageMock,
-    setTaskId: vi.fn(),
+    setTaskId: setTaskIdMock,
     closeFilePreview: vi.fn(),
-    dispatch: vi.fn(),
+    dispatch: dispatchMock,
     state: { currentTask: null, traceEvents: [], filePreview: { isOpen: false, fileId: "", fileName: "", viewMode: "preview" } },
   }),
 }))
@@ -75,6 +77,7 @@ vi.mock("sonner", () => ({
   toast: { error: vi.fn(), success: vi.fn() },
 }))
 
+import { toast } from "sonner"
 import { WorkforceBuilder } from "./workforce-builder"
 
 describe("WorkforceBuilder — create mode (no workforceId)", () => {
@@ -107,7 +110,9 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     runWorkforcePreviewMock.mockReset()
     getWorkforceMock.mockReset()
     runWorkforceMock.mockReset()
+    dispatchMock.mockReset()
     sendMessageMock.mockReset().mockResolvedValue(undefined)
+    setTaskIdMock.mockReset()
     historyReplaceStateSpy.mockClear()
   })
 
@@ -587,6 +592,55 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     })
   })
 
+  it("nulls the shared task when a config edit invalidates the test preview", async () => {
+    runWorkforcePreviewMock.mockResolvedValueOnce({
+      workforce_run_id: 1,
+      task_id: 42,
+      status: "running",
+      redirect_url: "/task/42",
+    })
+
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    fireEvent.click(screen.getByText("workforces.canvas.title"))
+    fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+    fireEvent.click(await screen.findByText("Project Coordinator"))
+    fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+    fireEvent.click(await screen.findByText("Web Researcher"))
+    await waitFor(() => {
+      expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("Send Test"))
+    await waitFor(() => expect(setTaskIdMock).toHaveBeenCalledWith(42, { navigate: false }))
+    setTaskIdMock.mockClear()
+
+    fireEvent.click(screen.getByText("workforces.actions.addAgent"))
+    fireEvent.click(await screen.findByText("Silent Analyst"))
+
+    await waitFor(() => {
+      expect(setTaskIdMock).toHaveBeenCalledWith(null, { navigate: false })
+    })
+  })
+
+  it("nulls the shared task on mount", async () => {
+    render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+
+    expect(setTaskIdMock).toHaveBeenCalledWith(null, { navigate: false })
+  })
+
+  it("nulls the shared task when the builder unmounts", async () => {
+    const { unmount } = render(<WorkforceBuilder />)
+    await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+    setTaskIdMock.mockClear()
+
+    unmount()
+
+    expect(setTaskIdMock).toHaveBeenCalledWith(null, { navigate: false })
+  })
+
   it("does not fire a second concurrent preview-creation request when a draft edit invalidates the first one mid-flight", async () => {
     let resolveFirstPreview: (value: unknown) => void = () => {}
     runWorkforcePreviewMock
@@ -1038,5 +1092,78 @@ describe("WorkforceBuilder — create mode (no workforceId)", () => {
     await waitFor(() => expect(createWorkforceMock).toHaveBeenCalledOnce())
 
     confirmSpy.mockRestore()
+  })
+
+  describe("while a test run request is pending", () => {
+    let settleRun: { resolve: (value: unknown) => void; reject: (error: Error) => void }
+
+    beforeEach(() => {
+      vi.mocked(toast.error).mockClear()
+      runWorkforcePreviewMock.mockImplementationOnce(
+        () => new Promise((resolve, reject) => { settleRun = { resolve, reject } }),
+      )
+    })
+
+    const startPendingRun = async () => {
+      const view = render(<WorkforceBuilder />)
+      await waitFor(() => expect(listAgentOptionsMock).toHaveBeenCalledOnce())
+      fireEvent.click(screen.getByText("workforces.canvas.title"))
+      fireEvent.click(screen.getByText("workforces.canvas.chooseLead.title"))
+      fireEvent.click(await screen.findByText("Project Coordinator"))
+      fireEvent.click(screen.getByText("workforces.canvas.addFirstAgent.title"))
+      fireEvent.click(await screen.findByText("Web Researcher"))
+      await waitFor(() => {
+        expect(screen.queryByText("workforces.detail.addMemberTitle")).not.toBeInTheDocument()
+      })
+      fireEvent.click(screen.getByText("Send Test"))
+      await waitFor(() => expect(runWorkforcePreviewMock).toHaveBeenCalledOnce())
+      return view
+    }
+
+    const settle = (fn: () => void) =>
+      act(async () => {
+        fn()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      })
+
+    it("does not attach a run that resolves after the builder unmounts", async () => {
+      const { unmount } = await startPendingRun()
+
+      unmount()
+      await settle(() => settleRun.resolve({ workforce_run_id: 1, task_id: 42, status: "running", redirect_url: "/task/42" }))
+
+      expect(setTaskIdMock).not.toHaveBeenCalledWith(42, expect.anything())
+      expect(dispatchMock).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: "SET_CURRENT_TASK", payload: expect.objectContaining({ id: "42" }) }),
+      )
+      expect(dispatchMock).not.toHaveBeenCalledWith({ type: "TRIGGER_TASK_UPDATE" })
+    })
+
+    it("does not report a run that fails after the builder unmounts", async () => {
+      const { unmount } = await startPendingRun()
+
+      unmount()
+      await settle(() => settleRun.reject(new Error("run failed")))
+
+      expect(toast.error).not.toHaveBeenCalled()
+    })
+
+    it("does not report a run that fails after a draft edit resets the preview", async () => {
+      await startPendingRun()
+
+      fireEvent.click(screen.getByText("workforces.actions.addAgent"))
+      fireEvent.click(await screen.findByText("Silent Analyst"))
+      await settle(() => settleRun.reject(new Error("run failed")))
+
+      expect(toast.error).not.toHaveBeenCalled()
+    })
+
+    it("still reports a run that fails without a reset", async () => {
+      await startPendingRun()
+
+      await settle(() => settleRun.reject(new Error("run failed")))
+
+      expect(toast.error).toHaveBeenCalledWith("run failed")
+    })
   })
 })

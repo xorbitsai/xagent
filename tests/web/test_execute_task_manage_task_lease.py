@@ -130,6 +130,78 @@ async def test_execute_task_binds_outer_lease_only_during_agent_execution() -> N
     assert current_task_lease() is None
 
 
+class _MustNotRunAgent(_FakeAgentService):
+    async def execute_task(self, **_kwargs):
+        raise AssertionError("an unleased shared run must not reach the agent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("manage_task_lease", "task_id"),
+    [
+        # An outer orchestrator claims ownership but hands over no lease.
+        (False, "42"),
+        # Nothing to acquire a lease for.
+        (True, None),
+    ],
+)
+async def test_shared_execute_task_refuses_a_run_without_a_lease(
+    manage_task_lease: bool, task_id: str | None
+) -> None:
+    manager = AgentServiceManager()
+    acquire_sandbox = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager."
+            "get_shared_task_execution_enabled",
+            return_value=True,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
+        ) as mock_acquire,
+        patch.object(manager, "_acquire_sandbox_task", new=acquire_sandbox),
+    ):
+        with pytest.raises(RuntimeError, match="requires a task lease"):
+            await manager.execute_task(
+                agent_service=_MustNotRunAgent(),
+                task="hello",
+                task_id=task_id,
+                manage_task_lease=manage_task_lease,
+            )
+
+    mock_acquire.assert_not_called()
+    acquire_sandbox.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_local_execute_task_still_runs_without_a_lease() -> None:
+    manager = AgentServiceManager()
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager."
+            "get_shared_task_execution_enabled",
+            return_value=False,
+        ),
+        patch.object(
+            manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+    ):
+        result = await manager.execute_task(
+            agent_service=_FakeAgentService(),
+            task="hello",
+            manage_task_lease=False,
+        )
+
+    assert result["success"] is True
+
+
 @pytest.mark.asyncio
 async def test_execute_task_tracks_usage_for_outer_owned_lease() -> None:
     manager = AgentServiceManager()
@@ -986,8 +1058,10 @@ async def test_execute_task_rejects_dirty_caller_session_before_worker_io(
 
 
 @pytest.mark.asyncio
+# Shared execution accepts a run whose lease execute_task acquires itself.
+@pytest.mark.parametrize("shared", [False, True])
 async def test_execute_task_acquires_and_releases_lease_when_manage_true(
-    db_session,
+    db_session, shared: bool
 ) -> None:
     user = User(username="lease-user", password_hash="hash", is_admin=False)
     db_session.add(user)
@@ -1011,6 +1085,11 @@ async def test_execute_task_acquires_and_releases_lease_when_manage_true(
     manager = AgentServiceManager()
 
     with (
+        patch(
+            "xagent.web.services.agent_service_manager."
+            "get_shared_task_execution_enabled",
+            return_value=shared,
+        ),
         patch(
             "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=fake_lease,

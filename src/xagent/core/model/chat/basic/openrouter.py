@@ -768,6 +768,16 @@ class OpenRouterLLM(OpenAILLM):
         run whose errors keep alternating between a compat-fixable shape and
         an outer-retryable one can reach at most 50 upstream requests without
         ``response_format`` or 80 with it.
+
+        Those figures count actual HTTP requests only because the SDK client
+        is built with ``max_retries=0``
+        (``OpenAICompatibleLLM._ensure_client``). While the SDK kept its
+        default budget of two retries they were understated threefold, since
+        every request above could become three. The attempt arithmetic still
+        does not bound wall clock -- each request may consume a full request
+        timeout -- so the ceiling that actually holds is the
+        ``RetryBudget`` deadline the per-model wrapper carries
+        (``xagent.core.retry.policy``).
         """
         current_tool_choice = tool_choice
         current_thinking = thinking

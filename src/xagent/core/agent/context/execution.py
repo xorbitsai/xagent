@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import time
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -17,7 +18,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import tiktoken
 
-from ....config import get_compact_threshold_ratio
+from ....config import (
+    get_checkpoint_gate_stall_warning_seconds,
+    get_compact_threshold_ratio,
+)
 from ...context_ref import (
     CONTEXT_REFS_KEY,
     ContextReference,
@@ -30,6 +34,7 @@ from ...model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
 )
+from ...runtime_performance import increment_counter, observe_value
 from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
@@ -64,6 +69,7 @@ from .enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    TopLevelUserRequest,
     latest_pending_user_response,
     pending_user_response,
     pending_user_response_lifecycle,
@@ -128,6 +134,8 @@ SPILL_REGISTRY_MAX_RECORDS = 64
 # caller that issued it -- but carrying it through compaction is what lets a
 # later turn know which stored rows the summary already stands in for.
 TRANSCRIPT_WATERMARK_METADATA_KEY = "transcript_watermark"
+# Explicit root event-history prefix; never a legacy transcript row id.
+MODEL_CONTEXT_WATERMARK_METADATA_KEY = "model_context_watermark"
 # Wire name: ``to_dict`` writes ``self.metadata`` unfiltered, so renaming this
 # strands every checkpoint written before the rename, and request_context keys
 # reach this dict verbatim, which is why AgentRunner refuses this one there.
@@ -137,6 +145,12 @@ TRANSCRIPT_WATERMARK_METADATA_KEY = "transcript_watermark"
 # A value under this key is only trusted when the payload it arrived in also
 # carried ``EVIDENCE_MARKER_WRITER_FIELD``; see ``ExecutionContext.from_dict``.
 TOOL_EVIDENCE_REMOVED_METADATA_KEY = "tool_evidence_removed"
+# Engine-owned record of the user turns an execution has durably accepted;
+# ``AgentRunner`` owns its shape and semantics. Defined here so that
+# ``create_child_context`` can keep it out of DAG step contexts: only the root
+# context's record is read, and copying it would repeat it in every active
+# step context serialized into pattern state.
+ACCEPTED_TURN_IDS_METADATA_KEY = "_accepted_user_turn_ids"
 # Serialized writer seal, a sibling of ``metadata`` in ``to_dict``'s payload.
 # ``from_dict`` refuses to carry ``TOOL_EVIDENCE_REMOVED_METADATA_KEY`` in
 # from a payload that arrives without it: a build that does not know that key
@@ -161,6 +175,13 @@ COMPACT_WATERMARK_METADATA_KEY = "watermark_message_id"
 # restores the summary must restore them too or it silently drops images the
 # compaction judged worth the budget.
 COMPACT_CONTEXT_REFS_METADATA_KEY = "summary_context_refs"
+# Marks the system message a compaction inserts to list this execution's
+# stored tool results. That message is written by the engine from the spill
+# registry and is not history: it is kept out of the persisted summary, out of
+# the summary request, and out of a compaction's original_count and
+# removed_count. final_count is the size of the compacted context, so it
+# includes the list.
+COMPACT_SPILL_INDEX_METADATA_KEY = "compacted_spill_index"
 
 # Floor for the per-message cap on what compaction is asked to read. Unlike
 # the summary's output budget this has no ceiling: providers cap output far
@@ -486,6 +507,10 @@ class _ContextCheckpointGate:
     """
 
     def __init__(self) -> None:
+        self.injection_uncertain = False
+        self.run_finishing = False
+        # Injections holding this context; the runner keeps it cached meanwhile.
+        self.injections_in_flight = 0
         self._shared = 0
         self._exclusive = False
         self._writers_waiting = 0
@@ -517,7 +542,27 @@ class _ContextCheckpointGate:
                 self._wake()
 
     @asynccontextmanager
-    async def exclusive(self) -> AsyncIterator[None]:
+    async def exclusive(self, owner: str | None = None) -> AsyncIterator[None]:
+        """Hold the gate alone; ``owner`` only labels stall reports.
+
+        Never timed out (see ``get_checkpoint_gate_stall_warning_seconds``):
+        a long hold is reported while it lasts and measured on release.
+        """
+        # Resolve everything that can fail before acquiring, so nothing runs
+        # between taking the gate and the ``finally`` that releases it.
+        loop = asyncio.get_running_loop()
+        interval = get_checkpoint_gate_stall_warning_seconds()
+        stall: list[asyncio.TimerHandle] = []
+
+        def report_stall() -> None:
+            increment_counter("xagent.agent.checkpoint_gate.exclusive.stalls")
+            logger.warning(
+                "Exclusive checkpoint section for %s still held after %.1fs",
+                owner or "unknown execution",
+                time.monotonic() - started,
+            )
+            stall[0] = loop.call_later(interval, report_stall)
+
         self._writers_waiting += 1
         try:
             while self._exclusive or self._shared:
@@ -529,11 +574,20 @@ class _ContextCheckpointGate:
             # acquisitions were blocked, even while other readers remain.
             if not self._exclusive:
                 self._wake()
+        started = time.monotonic()
         try:
+            stall.append(loop.call_later(interval, report_stall))
             yield
         finally:
+            if stall:
+                stall[0].cancel()
             self._exclusive = False
             self._wake()
+            observe_value(
+                "xagent.agent.checkpoint_gate.exclusive.duration",
+                (time.monotonic() - started) * 1_000.0,
+                unit="ms",
+            )
 
 
 def context_checkpoint_gate(context: ExecutionContext) -> _ContextCheckpointGate:
@@ -543,6 +597,34 @@ def context_checkpoint_gate(context: ExecutionContext) -> _ContextCheckpointGate
         gate = _ContextCheckpointGate()
         context.__dict__[_CHECKPOINT_GATE_ATTR] = gate
     return cast(_ContextCheckpointGate, gate)
+
+
+# The two form-answer-continuation texts (see ``get_messages_for_llm``'s
+# ``form_answer_continuation`` parameter). Both are inert prose gated behind
+# one global switch (``get_form_answer_continuation_enabled``) and a per-call
+# decision (``ReActPattern``'s ``FormAnswerDecision``); neither constant is
+# ever rendered on its own account.
+#
+# The framing only says what the message is. Whether to continue, change or
+# cancel the request is left to the system instruction, because the message
+# the framing lands on can be any typed reply, not only a filled-in form.
+#
+# A trailing "\n\n" lets this slot directly between the task text's own
+# "\n\n" and "Conversation focus rules: ..." in ``_system_context`` without a
+# separate blank-line rule when the flag is off (the empty string inserts
+# nothing).
+FORM_ANSWER_CONTINUATION_INSTRUCTION = (
+    "The latest user message answers the form you asked for. Use those "
+    "answers to continue the current user request. Do not ask again for "
+    "information those answers already provide; if something required is "
+    "still missing or unusable, ask only for that. If the answers change or "
+    "cancel the request, follow the answers. This does not replace any "
+    "confirmation or approval your instructions require before an action. "
+    "Approving one proposal does not approve a changed or different "
+    "action.\n\n"
+)
+
+FORM_ANSWER_FRAMING = "It replies to the form you asked for. "
 
 
 @dataclass
@@ -697,8 +779,21 @@ class ExecutionContext:
         (existence) failures are real reports pointing at a file that is
         gone (e.g. an external-credential task's workspace was removed at
         the end of the previous turn); those count toward the caller's
-        unavailable-value notice. Gate 3 (capacity) stops registering new
-        files once the registry is full but still returns the record for
+        unavailable-value notice and each one logs a warning, worded
+        differently for "this execution has no spill directory" and "the
+        file is not under it". Outside the removed-workspace case, a gate 2
+        failure means the tool layer wrote a file this execution cannot
+        find -- the tool set and the execution resolved different
+        directories -- and every spill then reaches the model as
+        "unavailable", which is worse than not spilling; the warning is how
+        that shows up in the logs. Logging relative_path is safe: gate 1
+        has already held it to the canonical spilled-result path, whose
+        file name uses only the filename character set. The writer's
+        per-run file cap bounds how many records one tool set produces; a
+        replay re-validates the same records and logs them again.
+
+        Gate 3 (capacity) stops registering new files once the registry is
+        full but still returns the record for
         this message's own observation text, the same way an
         already-registered relative_path is returned without being
         duplicated.
@@ -727,10 +822,24 @@ class ExecutionContext:
             if not spill_record_shape_is_valid(record):
                 continue
             relative_path = record["relative_path"]
-            if (
-                spill_dir is None
-                or resolve_spilled_under(spill_dir, relative_path) is None
-            ):
+            if spill_dir is None:
+                logger.warning(
+                    "Stored tool result %s cannot be registered: this "
+                    "execution has no workspace path, so it has no spill "
+                    "directory to look in. The model is told the value is "
+                    "unavailable.",
+                    relative_path,
+                )
+                unavailable_count += 1
+                continue
+            if resolve_spilled_under(spill_dir, relative_path) is None:
+                logger.warning(
+                    "Stored tool result %s cannot be registered: it is not a "
+                    "file directly under this execution's spill directory %s. "
+                    "The model is told the value is unavailable.",
+                    relative_path,
+                    spill_dir,
+                )
                 unavailable_count += 1
                 continue
             accepted.append(record)
@@ -905,22 +1014,24 @@ class ExecutionContext:
         unavailable_count: int = 0,
     ) -> str:
         formatted: Any
-        if isinstance(result, dict) and isinstance(result.get("artifacts"), list):
-            formatted = format_tool_result_for_observation(tool_name, result)
-        elif isinstance(result, dict):
-            if "output" in result:
-                formatted = result["output"]
+        if isinstance(result, dict):
+            # The reserved key (and the relative_path inside its records)
+            # stays in result itself for raw_result, but none of the branches
+            # below may render it: the notice appended after the body is the
+            # only place a path may appear. Dropping it once here keeps every
+            # branch -- the artifact formatter's metadata line included --
+            # from seeing it at all.
+            visible = {
+                key: value
+                for key, value in result.items()
+                if key != SPILL_RESERVED_RESULT_KEY
+            }
+            if isinstance(visible.get("artifacts"), list):
+                formatted = format_tool_result_for_observation(tool_name, visible)
+            elif "output" in visible:
+                formatted = visible["output"]
             else:
-                # No "output" key falls back to the whole dict; the reserved
-                # key (and the relative_path inside its records) must not
-                # leak into this rendered text even though it stays in
-                # result itself for raw_result -- the notice below is the
-                # only place a path may appear.
-                formatted = {
-                    key: value
-                    for key, value in result.items()
-                    if key != SPILL_RESERVED_RESULT_KEY
-                }
+                formatted = visible
         else:
             formatted = result
         parts = [f"Tool {tool_name} returned: {formatted}"]
@@ -1016,13 +1127,24 @@ class ExecutionContext:
         self,
         include_system: bool = True,
         max_tokens: int | None = None,
+        *,
+        form_answer_continuation: bool = False,
     ) -> list[dict[str, Any]]:
+        # Computed once per call (not once per candidate message, and not
+        # again inside ``_system_context``): the system-context instruction
+        # and the answer-message framing both key off this single object, so
+        # a decision made here can only ever line up with itself.
+        form_answer_target = (
+            self.form_answer_continuation_target() if form_answer_continuation else None
+        )
         messages: list[dict[str, Any]] = []
         system_parts: list[str] = []
         if include_system and self.system_prompt:
             system_parts.append(self.system_prompt)
         if include_system:
-            system_parts.append(self._system_context())
+            system_parts.append(
+                self._system_context(form_answer_continuation_target=form_answer_target)
+            )
 
         visible_messages = [message for message in self.messages if not message.hidden]
         if max_tokens:
@@ -1043,6 +1165,9 @@ class ExecutionContext:
                 provider_state = message.metadata.get("_xagent_provider_state")
                 if isinstance(provider_state, dict):
                     message_dict["_xagent_provider_state"] = provider_state
+            form_answer_framing = (
+                FORM_ANSWER_FRAMING if message is form_answer_target else ""
+            )
             waiting_response = pending_user_response(message)
             if waiting_response is not None:
                 if message is latest_pending_message:
@@ -1058,6 +1183,7 @@ class ExecutionContext:
                 message_dict["content"] = (
                     "This user message is the answer to a pending agent question "
                     "and is the primary response, not an independent task. "
+                    f"{form_answer_framing}"
                     f"{framing}\nExecution-enriched message content follows:\n"
                     f"{str(message_dict.get('content') or '')}"
                 )
@@ -1065,12 +1191,21 @@ class ExecutionContext:
                 message_dict["content"] = (
                     "This user message is the primary response in a waiting lifecycle "
                     "whose question text is unavailable or blank, not an independent "
-                    "task. Execution-enriched message content follows:\n"
+                    "task. "
+                    f"{form_answer_framing}"
+                    "Execution-enriched message content follows:\n"
                     f"{str(message_dict.get('content') or '')}"
                 )
             if include_system and message_dict.get("role") == "system":
                 content = str(message_dict.get("content") or "").strip()
-                if content:
+                if content and self._is_spill_index_message(message):
+                    # Only the leading message may be a system one, so this
+                    # one is sent as a user message too. It is not an earlier
+                    # system context, though: compaction built it from the
+                    # spill registry, and its own header says what it lists,
+                    # so it goes to the model as written.
+                    messages.append({"role": "user", "content": content})
+                elif content:
                     continuity_message: dict[str, Any] = {
                         "role": "user",
                         "content": (
@@ -1164,22 +1299,30 @@ class ExecutionContext:
             return request.language_text
         return request.execution_text
 
-    def _system_context(self) -> str:
+    def _system_context(
+        self, *, form_answer_continuation_target: Message | None = None
+    ) -> str:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
         request = top_level_user_request(self)
         current_task = request.execution_text
         pending_response = latest_pending_user_response(self)
         output_language = effective_output_language(self)
-        if current_task and not dag_step_id:
+        if self._renders_current_request_block(request):
             language_directives = render_root_request_language_harness(
                 request,
                 pending_response,
                 output_language,
             )
+            form_answer_instruction = (
+                FORM_ANSWER_CONTINUATION_INSTRUCTION
+                if form_answer_continuation_target is not None
+                else ""
+            )
             parts.append(
                 "Current user request:\n"
                 f"{current_task}\n\n"
+                f"{form_answer_instruction}"
                 "Conversation focus rules: answer the current user request above. "
                 "Earlier user and assistant messages are context only; use them to "
                 "resolve references and preserve continuity, but do not re-answer "
@@ -1534,6 +1677,8 @@ class ExecutionContext:
         # request provenance before metadata is cloned.
         top_level_user_request(self)
         child_metadata = dict(self.metadata)
+        child_metadata.pop(ACCEPTED_TURN_IDS_METADATA_KEY, None)
+        child_metadata.pop(MODEL_CONTEXT_WATERMARK_METADATA_KEY, None)
         if metadata:
             child_metadata.update(metadata)
         if task:
@@ -1799,7 +1944,15 @@ class ExecutionContext:
         if total_tokens <= self.compact_config.threshold:
             return None
 
-        visible_messages = [message for message in self.messages if not message.hidden]
+        # The stored-result list an earlier compaction inserted is not
+        # history and is not handed to the summary model: the summary written
+        # from this request is persisted and replayed into later turns, and
+        # compact_with_llm_response rebuilds the list from the registry.
+        visible_messages = [
+            message
+            for message in self.messages
+            if not message.hidden and not self._is_spill_index_message(message)
+        ]
         if not visible_messages:
             return None
 
@@ -1882,15 +2035,32 @@ class ExecutionContext:
         """Keep a tail window and discard everything before it.
 
         Lossy: the dropped turns are not summarized, recorded, or recoverable
-        from the context. ``strategy="truncate"`` on the result is the trace
-        label for that outcome, not a mode.
+        from the context; the only text re-inserted is the engine's list of
+        stored tool results, built from the spill registry. ``strategy=
+        "truncate"`` on the result is the trace label for that outcome, not a
+        mode.
 
         Note that ``compacted=True`` does not imply anything was removed. When
         the context is over budget but holds no more than ``max_messages``
         messages -- a handful of very large tool results, say -- the window
         keeps all of them and ``removed_count`` is 0. Callers that need to know
         whether the context actually shrank must read ``removed_count``.
+
+        When the registry lists stored results, that list goes in front of the
+        window as one system message, so the context then holds one message
+        more than the window. A list inserted by an earlier compaction is
+        taken out first and is not history: it is not kept in the window, not
+        counted in ``original_count`` or ``removed_count``, and not left beside
+        the new one -- which, when the window keeps every message, would
+        otherwise add one more list on every compaction.
         """
+        history = [
+            message
+            for message in self.messages
+            if not self._is_spill_index_message(message)
+        ]
+        if len(history) != len(self.messages):
+            self.messages = history
         original_count = len(self.messages)
         keep_count = min(max(0, self.compact_config.max_messages), original_count)
         retained = self._tail_window_preserving_tool_pairs(keep_count)
@@ -1902,6 +2072,9 @@ class ExecutionContext:
             [message for message in self.messages if id(message) not in retained_ids]
         )
         self.messages = retained
+        spill_notice = self._spilled_tool_results_notice()
+        if spill_notice:
+            self.messages = [self._spill_index_message(spill_notice), *retained]
         return CompactResult(
             compacted=True,
             original_count=original_count,
@@ -1957,7 +2130,8 @@ class ExecutionContext:
             self._context_refs_removed_by_compaction(latest_user)
         )
         dropped_refs_notice = self._dropped_context_refs_notice(dropped_context_refs)
-        # next_messages below keeps only the system summary and, at most, a
+        # next_messages below keeps only the system summary, at most one
+        # engine-written list of stored tool results, and at most a
         # role=="user" message, so no tool observation survives: here the whole
         # list is the diff. truncate needs a real diff; this does not.
         dropped_tool_counts = self._dropped_tool_result_counts(self.messages)
@@ -1994,6 +2168,22 @@ class ExecutionContext:
         next_messages = [summary_message]
         if latest_user is not None:
             next_messages.append(latest_user)
+        # A list inserted by an earlier compaction is replaced along with the
+        # rest, but it is not history, so it is not counted as history this
+        # summary replaced -- the same rule the message-dropping path follows.
+        original_count = sum(
+            1 for message in self.messages if not self._is_spill_index_message(message)
+        )
+        removed_count = max(0, original_count - len(next_messages))
+        # The stored-result list is its own message rather than part of
+        # summary_content: the summary is persisted below and replayed into a
+        # later turn as a system message, while the list names files that only
+        # this execution's registry vouches for -- a later turn's registry may
+        # not hold them, and its tool set may not include the tool that reads
+        # them. It goes right after the summary it supplements.
+        spill_notice = self._spilled_tool_results_notice()
+        if spill_notice:
+            next_messages.insert(1, self._spill_index_message(spill_notice))
         self.messages = next_messages
         result = CompactResult(
             compacted=True,
@@ -2001,7 +2191,7 @@ class ExecutionContext:
             final_count=len(self.messages),
             strategy="llm_summary",
             metadata={
-                "removed_count": max(0, original_count - len(self.messages)),
+                "removed_count": removed_count,
                 "summary_chars": len(summary),
                 "compact_model": getattr(llm, "model_name", None),
                 "retained_context_ref_count": len(compacted_context_refs),
@@ -2018,6 +2208,11 @@ class ExecutionContext:
                 ],
             },
         )
+        event_watermark = self.metadata.get(MODEL_CONTEXT_WATERMARK_METADATA_KEY)
+        if event_watermark is not None:
+            result.metadata[MODEL_CONTEXT_WATERMARK_METADATA_KEY] = dict(
+                event_watermark
+            )
         watermark = self.metadata.get(TRANSCRIPT_WATERMARK_METADATA_KEY)
         # Omitted rather than stored as None when the caller issued no
         # watermark: a reader must be able to tell "this summary covers stored
@@ -2167,12 +2362,123 @@ class ExecutionContext:
             )
         return prefix + "\n".join(lines)
 
+    def _spilled_tool_results_notice(self) -> str:
+        """List this execution's stored tool results for a compacted context.
+
+        Compaction removes the observations whose notices named these files,
+        so the list is drawn from the spill registry rather than from the
+        messages being removed. Each compaction builds the list again from
+        what the registry holds at that moment -- results stored since the
+        last one are added -- so the files are still named after the list
+        an earlier compaction inserted has itself been removed.
+
+        The registry is read through get_component, never _spill_component
+        or the spilled_results property: both attach an empty registry to a
+        context that never stored anything, and such a context's checkpoint
+        must read exactly as it would without spill support. An empty
+        registry returns "" before anything else is looked at.
+
+        Each record's file is looked up again, with the same lookup
+        registration uses, and a record whose file cannot be found is left
+        out. A registry restored from a checkpoint is not re-checked on
+        load, and the workspace behind it may be gone by now; listing such a
+        record would name a file the model cannot read. The same lookup
+        leaves out a record that is not a dict or whose path is not a
+        stored-result path, so those never reach the renderer.
+        render_spill_notice checks the remaining records' field shape and
+        drops a malformed one itself; this method writes no text of its own.
+        """
+        component = self.get_component("spilled_results")
+        records = (
+            component.records if isinstance(component, SpillRegistryComponent) else []
+        )
+        if not records:
+            return ""
+        spill_dir = self._spill_dir()
+        present = [
+            record
+            for record in records
+            if isinstance(record, dict)
+            and resolve_spilled_under(spill_dir, record.get("relative_path"))
+            is not None
+        ]
+        if len(present) < len(records):
+            # A count only: the paths are the tool's own strings. A record
+            # that is not a dict, or whose path is not a stored-result path,
+            # fails the same lookup as one whose file is gone.
+            logger.info(
+                "Compaction left %d stored tool result(s) out of its list "
+                "(missing file or malformed record)",
+                len(records) - len(present),
+            )
+        # Newest first. The registry holds results in the order they were
+        # stored, and past COMPACT_SPILL_NOTICE_MAX_ENTRIES the renderer folds
+        # the remaining entries into one "... N more" line; after compaction
+        # the latest results are the ones the next step most often needs, so
+        # the oldest are the ones folded away. The forced-answer prompt
+        # renders the registry in stored order, which its own tests pin, so
+        # past the entry cap the two lists name different files.
+        return render_spill_notice(present[::-1], style="compaction")
+
+    @staticmethod
+    def _spill_index_message(notice: str) -> Message:
+        return Message.role_system(
+            notice, metadata={COMPACT_SPILL_INDEX_METADATA_KEY: True}
+        )
+
+    @staticmethod
+    def _is_spill_index_message(message: Message) -> bool:
+        return bool((message.metadata or {}).get(COMPACT_SPILL_INDEX_METADATA_KEY))
+
     def _latest_visible_user_message(self) -> Message | None:
         for message in reversed(self.messages):
             if message.hidden or message.role != "user":
                 continue
             return message
         return None
+
+    def latest_form_answer_message(self) -> Message | None:
+        """The latest visible user message, iff it answers a model-authored
+        form (``waiting_for_user_request["form"] is True`` when the answer
+        was recorded; see react.py's ask_user_question branch and
+        ``pending_user_response_marker``).
+
+        Deliberately the *latest* visible user message only, not the latest
+        one that happens to carry a form marker: an independent message typed
+        after the answer must turn this off, not fall back to an older
+        answer.
+        """
+        message = self._latest_visible_user_message()
+        if message is None:
+            return None
+        metadata = message.metadata
+        if not isinstance(metadata, dict):
+            return None
+        marker = metadata.get("response_to_waiting_for_user")
+        if not isinstance(marker, dict):
+            return None
+        return message if marker.get("form") is True else None
+
+    def _renders_current_request_block(self, request: TopLevelUserRequest) -> bool:
+        """Whether ``_system_context`` renders its "Current user request"
+        block for ``request`` (the context's ``top_level_user_request``): the
+        request text is non-empty and this is not a DAG step (a DAG step
+        builds its own step context instead).
+
+        The one place this condition lives: ``_system_context`` uses it to
+        decide whether to render the block, and
+        ``form_answer_continuation_target`` uses it so the instruction that
+        goes inside that block is only ever targeted when the block exists.
+        """
+        return bool(request.execution_text) and not self.metadata.get("dag_step_id")
+
+    def form_answer_continuation_target(self) -> Message | None:
+        """``latest_form_answer_message()``, but only when
+        ``_system_context`` renders its "Current user request" block
+        (``_renders_current_request_block``); otherwise None."""
+        if not self._renders_current_request_block(top_level_user_request(self)):
+            return None
+        return self.latest_form_answer_message()
 
     def _build_llm_compact_prompt(
         self,

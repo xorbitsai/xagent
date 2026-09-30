@@ -247,3 +247,66 @@ async def test_checkpoint_without_execution_context_keeps_existing_payload() -> 
     payload = await runtime.checkpoint("empty", context=None, pattern=None)
     assert payload["execution_id"] == "generic"
     assert payload["context"] is None
+
+
+@pytest.mark.asyncio
+async def test_failing_stall_timer_still_releases_the_gate() -> None:
+    gate = context_checkpoint_gate(ExecutionContext(execution_id="timer-fails"))
+    loop = asyncio.get_running_loop()
+
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("timer unavailable")
+
+    loop.call_later = refuse  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="timer unavailable"):
+            async with gate.exclusive("timer-fails"):
+                pytest.fail("the section must not run without its stall timer")
+    finally:
+        del loop.call_later
+
+    async def acquire_both() -> None:
+        async with gate.shared():
+            pass
+        async with gate.exclusive():
+            pass
+
+    # Released: both kinds of acquisition proceed instead of waiting forever.
+    await asyncio.wait_for(acquire_both(), 1)
+
+
+@pytest.mark.asyncio
+async def test_long_exclusive_hold_is_reported_but_never_interrupted(
+    monkeypatch, caplog
+) -> None:
+    from xagent.core.agent.context import execution
+
+    stalls: list[str] = []
+    durations: list[tuple[str, float]] = []
+    monkeypatch.setenv("XAGENT_CHECKPOINT_GATE_STALL_WARNING_SECONDS", "0.01")
+    monkeypatch.setattr(execution, "increment_counter", stalls.append)
+    monkeypatch.setattr(
+        execution,
+        "observe_value",
+        lambda metric, value, **kwargs: durations.append((metric, value)),
+    )
+    gate = context_checkpoint_gate(ExecutionContext(execution_id="stalled"))
+
+    async def reported_twice() -> None:
+        while len(stalls) < 2:
+            await asyncio.sleep(0.005)
+
+    with caplog.at_level("WARNING", logger=execution.__name__):
+        async with gate.exclusive("stalled"):
+            await asyncio.wait_for(reported_twice(), 5)
+        reported = len(stalls)
+        await asyncio.sleep(0.05)
+
+    # Released: the repeating report is cancelled, and the hold is measured.
+    assert len(stalls) == reported
+    assert set(stalls) == {"xagent.agent.checkpoint_gate.exclusive.stalls"}
+    assert "Exclusive checkpoint section for stalled still held" in caplog.text
+    assert [metric for metric, _ in durations] == [
+        "xagent.agent.checkpoint_gate.exclusive.duration"
+    ]
+    assert durations[0][1] > 0

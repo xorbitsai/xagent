@@ -10,9 +10,7 @@ from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
-from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
-from .factory import register_tool
 
 logger = logging.getLogger(__name__)
 
@@ -321,30 +319,3 @@ async def _create_knowledge_base_from_file_impl(
             message=str(e),
             files_ingested=0,
         ).model_dump()
-
-
-@register_tool(categories={"knowledge"})
-async def create_file_ingestion_tools(config: WebToolConfig) -> list[AbstractBaseTool]:
-    """Create file ingestion tools."""
-    return await _get_tool_compatibility_facade().create_file_ingestion_tools(config)
-
-
-async def _create_file_ingestion_tools_impl(
-    config: WebToolConfig,
-) -> list[AbstractBaseTool]:
-    """Create file ingestion tools."""
-    try:
-        user_id = config.get_user_id()
-        is_admin = config.is_admin()
-        if not user_id:
-            return []
-
-        tool = CreateKnowledgeBaseFromFileTool(
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        logger.debug("Created CreateKnowledgeBaseFromFileTool for user %s", user_id)
-        return [tool]
-    except Exception as e:
-        logger.warning("Failed to create CreateKnowledgeBaseFromFileTool: %s", e)
-        return []

@@ -187,6 +187,16 @@ class TaskRuntimeExtensionProvider(Protocol):
     that release an external lease or sandbox should persist a provider-side
     "release requested" state and reconcile it safely on repeated calls instead
     of treating the first release attempt as an irreversible one-shot action.
+
+    ``on_task_deleted`` may also run **after** the core task row is gone. The
+    on-demand deletion paths dispatch it before deleting the rows, but the
+    retention purge cannot -- it deletes under a row lock and makes no external
+    call -- so it records the release as owed and a retry driver dispatches it
+    later; an unregistered provider, or one an admin force-deleted past, is
+    retried the same way. The context then carries only what was captured
+    beforehand: ``task_id``, the owner's ``user_id``, the task ``source`` and a
+    ``session_factory``. A provider must not require the task row, or anything
+    that cascades from it, to still exist.
     """
 
     def on_task_created(

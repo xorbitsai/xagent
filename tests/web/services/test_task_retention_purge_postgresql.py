@@ -299,7 +299,7 @@ def test_trace_expiry_holds_the_lock_through_its_deletes(sessions) -> None:
             trace_days=TRACE_DAYS,
         )
         assert assessment.disposition is RetentionDisposition.TRACE_EXPIRED
-        _purge_trace_rows(purger, task_id)
+        _purge_trace_rows(purger, task_id, now=NOW)
         purger.flush()
 
         producer.execute(sa.text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"))

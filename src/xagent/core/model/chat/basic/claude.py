@@ -16,6 +16,7 @@ else:
         Anthropic = None  # type: ignore
         AsyncAnthropic = None  # type: ignore
 
+from ..error import is_retryable_http_status
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
@@ -263,6 +264,11 @@ class ClaudeLLM(BaseLLM):
             client_kwargs: Dict[str, Any] = {
                 "api_key": self.api_key,
                 "timeout": self.timeout,
+                # Retry policy lives in the shared RetryWrapper only; the
+                # anthropic SDK defaults to two retries of its own, which
+                # would nest inside every attempt we make. See
+                # ``OpenAICompatibleLLM._ensure_client``.
+                "max_retries": 0,
             }
 
             if self.base_url:
@@ -1150,6 +1156,25 @@ class ClaudeLLM(BaseLLM):
                     raise LLMRetryableError(error_msg) from e
 
                 if isinstance(e, APIStatusError):
+                    # ``chat`` turns every APIStatusError into
+                    # LLMRetryableError; streaming swallowed them into an
+                    # ERROR chunk instead, so the shared RetryWrapper never
+                    # saw one and the anthropic SDK's own budget was the only
+                    # cover a streaming call had. That budget is now zero
+                    # (see ``_ensure_client``), so transient statuses have to
+                    # raise -- a 529 Overloaded is exactly the capacity shape
+                    # this policy exists for. Permanent statuses keep the
+                    # ERROR chunk: replaying them cannot help, and ``chat``'s
+                    # blanket retry of 4xx is a separate defect, not one to
+                    # copy here.
+                    status = getattr(e, "status_code", None)
+                    # Same status set the shared predicate uses, so the
+                    # streaming guard and ``retry_on`` cannot drift apart.
+                    if isinstance(status, int) and is_retryable_http_status(status):
+                        raise LLMRetryableError(
+                            f"Claude API status error: {str(e)}"
+                        ) from e
+
                     error_msg = f"Claude API status error: {str(e)}"
                     yield StreamChunk(type=ChunkType.ERROR, content=error_msg, raw=e)
                     return
@@ -1237,7 +1262,7 @@ class ClaudeLLM(BaseLLM):
 
     @staticmethod
     async def list_available_models(
-        api_key: str, base_url: Optional[str] = None
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
         """Fetch available models from Anthropic Claude API.
 
@@ -1245,6 +1270,8 @@ class ClaudeLLM(BaseLLM):
             api_key: Anthropic API key
             base_url: Base URL for Claude API (optional). If not provided,
                      uses the official Anthropic API.
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
 
         Returns:
             List of available models with their information
@@ -1308,4 +1335,6 @@ class ClaudeLLM(BaseLLM):
             raise
         except Exception as e:
             logger.error(f"Failed to fetch Claude models: {e}")
+            if raise_on_error:
+                raise
             return []

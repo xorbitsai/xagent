@@ -59,6 +59,7 @@ def _metadata_response(content: bytes, etag: str = '"etag-1"') -> MockResponse:
             "id": "item-1",
             "size": len(content),
             "eTag": etag,
+            "parentReference": {"driveId": "drive-1"},
             "@microsoft.graph.downloadUrl": "https://download.example/deck.pptx",
         }
     )
@@ -624,6 +625,57 @@ def test_get_presentation_text(monkeypatch):
     assert "headers" not in mock_get.call_args.kwargs
 
 
+def test_get_presentation_text_falls_back_to_authenticated_content_endpoint(
+    monkeypatch,
+):
+    content = _pptx_bytes()
+    metadata = _metadata_response(content)
+    metadata._json_data.pop("@microsoft.graph.downloadUrl")
+    content_response = MockResponse(content=content)
+    mock_request = Mock(side_effect=[metadata, content_response])
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    mock_get = Mock()
+    monkeypatch.setattr(powerpoint.requests, "get", mock_get)
+
+    result = json.loads(powerpoint.powerpoint_get_presentation_text("Deck.pptx"))
+
+    assert result["status"] == "success"
+    assert mock_get.call_count == 0
+    content_call = mock_request.call_args_list[1]
+    assert content_call.kwargs["method"] == "GET"
+    assert content_call.kwargs["url"].endswith("/drives/drive-1/items/item-1/content")
+    assert content_call.kwargs["headers"]["Authorization"] == "Bearer test-graph-token"
+    assert content_call.kwargs["stream"] is True
+
+
+def test_get_presentation_text_treats_empty_download_url_as_absent(monkeypatch):
+    content = _pptx_bytes()
+    metadata = _metadata_response(content)
+    metadata._json_data["@microsoft.graph.downloadUrl"] = ""
+    content_response = MockResponse(content=content)
+    mock_request = Mock(side_effect=[metadata, content_response])
+    monkeypatch.setattr(powerpoint.requests, "request", mock_request)
+    monkeypatch.setattr(powerpoint.requests, "get", Mock())
+
+    result = json.loads(powerpoint.powerpoint_get_presentation_text("Deck.pptx"))
+
+    assert result["status"] == "success"
+    assert (
+        mock_request.call_args_list[1]
+        .kwargs["url"]
+        .endswith("/drives/drive-1/items/item-1/content")
+    )
+
+
+def test_presentation_metadata_rejects_non_string_download_url(monkeypatch):
+    metadata = _metadata_response(b"")
+    metadata._json_data["@microsoft.graph.downloadUrl"] = 123
+    monkeypatch.setattr(powerpoint.requests, "request", Mock(return_value=metadata))
+
+    with pytest.raises(RuntimeError, match="invalid presentation download URL"):
+        powerpoint._presentation_metadata("Deck.pptx", None, None)
+
+
 def test_get_presentation_text_returns_resumable_bounded_pages(monkeypatch):
     def build(prs):
         for index in range(5):
@@ -787,6 +839,64 @@ def test_download_stream_enforces_byte_limit_when_metadata_is_wrong(monkeypatch)
 
     assert result["status"] == "error"
     assert "download exceeded" in result["message"]
+
+
+def test_authenticated_download_maps_http_error(monkeypatch):
+    response = MockResponse(status_code=403)
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "request",
+        Mock(return_value=response),
+    )
+
+    with pytest.raises(powerpoint._GraphRequestError, match="HTTP 403"):
+        powerpoint._download_authenticated_content(
+            "/drives/drive-1/items/item-1/content", 0
+        )
+
+
+def test_authenticated_download_enforces_byte_limit(monkeypatch):
+    monkeypatch.setattr(powerpoint, "_MAX_PRESENTATION_BYTES", 10)
+    response = MockResponse(content=b"x" * 11)
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "request",
+        Mock(return_value=response),
+    )
+
+    with pytest.raises(ValueError, match="download exceeded"):
+        powerpoint._download_authenticated_content(
+            "/drives/drive-1/items/item-1/content", 11
+        )
+
+
+def test_authenticated_download_rejects_size_mismatch(monkeypatch):
+    response = MockResponse(content=b"content")
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "request",
+        Mock(return_value=response),
+    )
+
+    with pytest.raises(RuntimeError, match="size changed"):
+        powerpoint._download_authenticated_content(
+            "/drives/drive-1/items/item-1/content", len(response.content) + 1
+        )
+
+
+def test_authenticated_download_sanitizes_request_failure(monkeypatch):
+    secret_url = "https://graph.microsoft.com/v1.0/drives/secret?token=secret"
+    monkeypatch.setattr(
+        powerpoint.requests,
+        "request",
+        Mock(side_effect=requests.ConnectionError(secret_url)),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        powerpoint._download_authenticated_content(
+            "/drives/drive-1/items/item-1/content", 0
+        )
+    assert "secret" not in str(exc_info.value)
 
 
 def test_validate_presentation_archive_bounds_expanded_size(monkeypatch):
@@ -1341,7 +1451,11 @@ def test_upload_session_follows_server_reported_next_offset(monkeypatch):
     assert item["id"] == "item-1"
     assert [
         call.kwargs["headers"]["Content-Range"] for call in mock_put.call_args_list
-    ] == ["bytes 0-4/10", "bytes 3-7/10", "bytes 8-9/10"]
+    ] == [
+        "bytes 0-4/10",
+        "bytes 3-7/10",
+        "bytes 8-9/10",
+    ]
 
 
 def test_add_slide_maps_upload_precondition_failure_to_conflict(monkeypatch):

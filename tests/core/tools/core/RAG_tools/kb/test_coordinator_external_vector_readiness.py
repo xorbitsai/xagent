@@ -29,7 +29,9 @@ from xagent.core.tools.core.RAG_tools.kb import (
     KBContextRequest,
     KBCoordinator,
     KBStorageBackend,
+    KBUserScope,
 )
+from xagent.core.tools.core.RAG_tools.kb.models import KBDocumentRowsSnapshot
 
 # Every route from a coordinator method to a store: the shim, the public
 # property that returns it, the factory the shim is built from, and the
@@ -401,3 +403,28 @@ async def test_a_scoped_cleanup_forwards_its_target_and_write_access() -> None:
     context = provider.contexts[0]
     assert context.access_mode is KBAccessMode.WRITE
     assert context.user_scope.user_id == 7
+
+
+def test_document_row_snapshot_routes_through_the_handle() -> None:
+    """Capture opens a READ context and restore a WRITE one on its collection."""
+    coordinator, provider, metadata_store = _coordinator()
+    snapshot = KBDocumentRowsSnapshot(collection="c2", doc_ids=("d",), rows_by_table={})
+
+    captured = coordinator.capture_document_rows_sync(
+        "c1", ["d"], user_id=7, is_admin=False
+    )
+    coordinator.restore_document_rows_sync(snapshot, user_id=7, is_admin=False)
+
+    assert captured == "capture_document_rows-result"
+    assert [handle.calls for handle in provider.handles] == [
+        [("capture_document_rows", (["d"],), {"user_id": 7, "is_admin": False})],
+        [("restore_document_rows", (snapshot,), {"user_id": 7, "is_admin": False})],
+    ]
+    assert [
+        (context.collection, context.access_mode, context.user_scope)
+        for context in provider.contexts
+    ] == [
+        ("c1", KBAccessMode.READ, KBUserScope(user_id=7, is_admin=False)),
+        ("c2", KBAccessMode.WRITE, KBUserScope(user_id=7, is_admin=False)),
+    ]
+    assert metadata_store.calls == ["c1", "c2"]

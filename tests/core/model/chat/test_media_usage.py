@@ -70,6 +70,18 @@ def test_add_media_usage_carries_accompanying_tokens() -> None:
     assert usage.output_tokens == 0
 
 
+def test_existing_positional_media_call_contract_is_unchanged() -> None:
+    usage = TokenUsage()
+    usage.record_media_call("generate_image", 1, "model", "id", 2, 3, "1K", True)
+
+    entry = usage.details[0]
+    assert entry["provider_tokens"] == 5
+    assert entry["resolution"] == "1K"
+    assert entry["tokens_estimated"] is True
+    assert "provider_text_input_tokens" not in entry
+    assert "provider_image_input_tokens" not in entry
+
+
 def test_estimated_tokens_are_flagged() -> None:
     with TokenContextManager() as manager:
         add_media_usage(
@@ -117,7 +129,13 @@ def test_dirty_quantity_on_requests_unit_is_rejected_not_coerced() -> None:
 def test_to_dict_from_dict_roundtrip_preserves_media() -> None:
     with TokenContextManager() as manager:
         add_token_usage(input_tokens=10, output_tokens=4, model="gpt", model_id="g1")
-        add_media_usage(quantity=3.5, model="tts", call_type="asr")
+        add_media_usage(
+            quantity=3.5,
+            model="tts",
+            call_type="asr",
+            provider_text_input_tokens=0,
+            provider_image_input_tokens=9,
+        )
         usage = manager.get_usage()
 
     data = usage.to_dict()
@@ -131,6 +149,9 @@ def test_to_dict_from_dict_roundtrip_preserves_media() -> None:
     # 2 token entries (one input, one output) + 1 media entry.
     assert len(restored.details) == 3
     assert sum(1 for d in restored.details if d["type"] == "media") == 1
+    media = next(d for d in restored.details if d["type"] == "media")
+    assert media["provider_text_input_tokens"] == 0
+    assert media["provider_image_input_tokens"] == 9
 
 
 def test_merge_combines_media_calls_and_details() -> None:
@@ -176,6 +197,62 @@ def test_media_aggregation_groups_by_model_unit_and_call_type() -> None:
     assert by_unit["images"]["call_type"] == "generate_image"
     assert by_unit["seconds"]["quantity"] == 4.0
     assert by_unit["seconds"]["calls"] == 1
+
+
+def test_media_aggregation_only_exposes_a_complete_modality_split() -> None:
+    complete = TokenUsage()
+    complete.record_media_call(
+        quantity=1,
+        model="gpt-image-1",
+        call_type="generate_image",
+        provider_text_input_tokens=3,
+        provider_image_input_tokens=0,
+    )
+    complete.record_media_call(
+        quantity=1,
+        model="gpt-image-1",
+        call_type="generate_image",
+        provider_text_input_tokens=5,
+        provider_image_input_tokens=7,
+    )
+
+    aggregate = aggregate_media_usage_by_model(complete.details)[0]
+    assert aggregate["provider_text_input_tokens"] == 8
+    assert aggregate["provider_image_input_tokens"] == 7
+
+    # One legacy/unknown row makes the group incomplete. Publishing the known
+    # subtotal as if it covered the whole group would let a billing consumer
+    # underprice the unknown row.
+    complete.record_media_call(
+        quantity=1, model="gpt-image-1", call_type="generate_image"
+    )
+    incomplete = aggregate_media_usage_by_model(complete.details)[0]
+    assert "provider_text_input_tokens" not in incomplete
+    assert "provider_image_input_tokens" not in incomplete
+
+
+@pytest.mark.parametrize(
+    ("text_tokens", "image_tokens"),
+    [(True, 2), (1.5, 2), (-1, 2), ("bad", 2)],
+)
+def test_invalid_optional_modality_counts_omit_the_split(
+    text_tokens, image_tokens
+) -> None:
+    usage = TokenUsage()
+    usage.record_media_call(
+        quantity=1,
+        call_type="generate_image",
+        provider_text_input_tokens=text_tokens,
+        provider_image_input_tokens=image_tokens,
+    )
+
+    entry = usage.details[0]
+    assert "provider_text_input_tokens" not in entry
+    # A valid sibling can remain on the raw provider row, but aggregation only
+    # publishes the pair when every row has both fields.
+    aggregate = aggregate_media_usage_by_model(usage.details)[0]
+    assert "provider_text_input_tokens" not in aggregate
+    assert "provider_image_input_tokens" not in aggregate
 
 
 def test_media_aggregation_splits_by_resolution() -> None:

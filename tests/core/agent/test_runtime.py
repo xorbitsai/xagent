@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
@@ -33,12 +36,23 @@ from xagent.core.agent.runtime import (
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
+from xagent.core.model.chat.basic.adapter import create_base_llm
+from xagent.core.model.chat.basic.call_boundary import (
+    BUDGET_INSENSITIVE_FAILURE_CODES,
+    PROVIDER_CALL_FAILURE_CODES,
+    ProviderCallError,
+    guard_llm_calls,
+)
+from xagent.core.model.chat.exceptions import LLMRetryableError
+from xagent.core.model.chat.stream_progress import STREAM_ABORTED_KEY
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
     ChunkType,
     StreamChunk,
 )
+from xagent.core.model.model import ChatModelConfig
+from xagent.core.retry.strategy import ExponentialBackoff
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
@@ -1129,6 +1143,8 @@ async def test_runtime_streaming_llm_call_merges_tool_call_argument_deltas() -> 
                 },
             }
         ],
+        # The stub never sends a usage chunk (#2786).
+        "usage_missing": True,
     }
 
 
@@ -1614,29 +1630,32 @@ class StreamingLLMWithCachedUsage:
         yield StreamChunk(type=ChunkType.END)
 
 
+class _CaptureTracer:
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self._events = events
+
+    async def trace_event(
+        self,
+        event_type: Any,
+        task_id: Any = None,
+        step_id: Any = None,
+        data: Any = None,
+        parent_id: Any = None,
+    ) -> str:
+        self._events.append({"data": dict(data or {})})
+        return "evt"
+
+
 @pytest.mark.asyncio
 async def test_runtime_surfaces_cached_tokens_in_usage_and_trace() -> None:
     """Provider cache telemetry reaches the merged usage payload and the
     LLM end trace event as a normalized cached_input_tokens count."""
     events: list[dict[str, Any]] = []
-
-    class _CaptureTracer:
-        async def trace_event(
-            self,
-            event_type: Any,
-            task_id: Any = None,
-            step_id: Any = None,
-            data: Any = None,
-            parent_id: Any = None,
-        ) -> str:
-            events.append({"data": dict(data or {})})
-            return "evt"
-
     outbound = OutboundCollector()
     runtime = PatternRuntime(
         execution_id="task-123",
         outbound_message_handler=outbound,
-        tracer=_CaptureTracer(),
+        tracer=_CaptureTracer(events),
     )
     context = ExecutionContext(execution_id="task-123")
 
@@ -1648,6 +1667,183 @@ async def test_runtime_surfaces_cached_tokens_in_usage_and_trace() -> None:
     await runtime.on_llm_end(context=context, response=result)
     assert events[-1]["data"]["cached_input_tokens"] == 4
     assert events[-1]["data"]["input_tokens"] == 7
+
+
+class StreamingToolCallCutAtCapLLM:
+    """A stream that emits a complete tool call, then is cut at the output cap:
+    the provider reports ``finish_reason="length"`` and never sends usage."""
+
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call-1",
+                    "function": {"name": "calculator", "arguments": '{"a":1}'},
+                }
+            ],
+        )
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call-1",
+                    "function": {"name": "calculator", "arguments": '{"a":1}'},
+                }
+            ],
+            finish_reason="length",
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_without_usage_marks_usage_missing_and_finish_reason() -> (
+    None
+):
+    """#2786: a stream cut at the output cap without a usage chunk must leave
+    a visible marker on the reconstructed response and on ``llm_call_end``,
+    instead of silently dropping the token fields."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingToolCallCutAtCapLLM(), messages=[]
+    )
+
+    assert result["tool_calls"][0]["function"]["name"] == "calculator"
+    # The final chunk repeats the accumulated arguments as a snapshot.
+    assert result["tool_calls"][0]["function"]["arguments"] == '{"a":1}'
+    assert "usage" not in result
+    assert result["finish_reason"] == "length"
+    assert result["usage_missing"] is True
+
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data["finish_reason"] == "length"
+    assert data["usage_missing"] is True
+    assert "input_tokens" not in data
+    assert "usage_missing" not in data["response"]
+    assert "finish_reason" not in data["response"]
+
+
+class StreamingProtocolErrorWithoutUsageLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(
+            type=ChunkType.PROTOCOL_ERROR,
+            protocol_error={"code": "unavailable_tool_call"},
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_protocol_error_response_carries_markers() -> None:
+    """The protocol-error envelope also reaches ``on_llm_end``, so it is
+    stamped like every other dict the stream reconstruction returns."""
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingProtocolErrorWithoutUsageLLM(), messages=[]
+    )
+
+    assert result["type"] == "tool_protocol_error"
+    assert result["finish_reason"] == "stop"
+    assert result["usage_missing"] is True
+
+
+class StreamingTextWithReasoningNoUsageLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(
+            type=ChunkType.TOKEN,
+            delta="hello",
+            raw={"reasoning_content": "thinking"},
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="length")
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_provider_payload_without_usage_carries_markers() -> None:
+    """A stream that never emits a usage chunk but does carry provider payload
+    (e.g. ``reasoning_content``) must still surface ``finish_reason`` and
+    ``usage_missing`` on the reconstructed response, not just the payload."""
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingTextWithReasoningNoUsageLLM(), messages=[]
+    )
+
+    assert result["content"] == "hello"
+    assert result["reasoning_content"] == "thinking"
+    assert result["finish_reason"] == "length"
+    assert result["usage_missing"] is True
+
+
+class StreamingTextWithUsageAndStopLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(type=ChunkType.TOKEN, delta="hello")
+        yield StreamChunk(
+            type=ChunkType.USAGE,
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="stop")
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_with_usage_keeps_shape_and_records_finish_reason() -> (
+    None
+):
+    """A clean stream keeps its existing token fields and gains only
+    ``finish_reason``; ``usage_missing`` is never emitted as ``False``."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingTextWithUsageAndStopLLM(), messages=[]
+    )
+    assert result["content"] == "hello"
+    assert result["finish_reason"] == "stop"
+    assert "usage_missing" not in result
+
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data["input_tokens"] == 7
+    assert data["output_tokens"] == 3
+    assert data["finish_reason"] == "stop"
+    assert "usage_missing" not in data
+
+
+@pytest.mark.asyncio
+async def test_on_llm_end_omits_markers_for_responses_without_them() -> None:
+    """Non-streaming responses that carry neither key produce the same
+    ``llm_call_end`` payload as before #2786."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    await runtime.on_llm_end(context=context, response={"content": "plain"})
+    data = events[-1]["data"]
+    assert data["response"] == {"content": "plain"}
+    assert "finish_reason" not in data
+    assert "usage_missing" not in data
+
+    await runtime.on_llm_end(
+        context=context, response={"content": "x", "finish_reason": ""}
+    )
+    assert "finish_reason" not in events[-1]["data"]
 
 
 class RaisingCompactLLM:
@@ -1978,6 +2174,432 @@ async def test_compaction_stops_descending_once_a_budget_is_accepted() -> None:
     assert llm.budgets == [8000]
     assert result.strategy == "truncate"
     assert result.metadata["llm_summary_unusable"] is True
+
+
+class _BudgetLadderProbe:
+    """Fake chat model that fails with the given errors and records budgets.
+
+    The last error repeats once the list runs out.
+    """
+
+    model_name = "compact-test"
+    context_window = 64_000
+
+    def __init__(self, *errors: Exception) -> None:
+        self.errors = list(errors)
+        self.budgets: list[int] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        self.budgets.append(kwargs["max_tokens"])
+        raise self.errors[min(len(self.budgets), len(self.errors)) - 1]
+
+
+# A guarded failure a smaller budget may fix keeps stepping down: a rejected
+# ``max_tokens`` arrives as invalid_request or provider_error, and some
+# providers refuse an over-budget request with 402 (provider_quota).
+_BUDGET_SENSITIVE_CODES = {"invalid_request", "provider_error", "provider_quota"}
+
+
+@pytest.mark.asyncio
+async def test_an_unguarded_transient_failure_does_not_walk_the_ladder() -> None:
+    """A transient failure means the model's retries are spent; stop at once.
+
+    The ladder is for budgets the provider refused. Sending the same request
+    again with less output would not address an outage and would multiply
+    its cost, so a failure ``retry_on`` recognizes ends compaction's summary
+    attempt after one request.
+    """
+    llm = _BudgetLadderProbe(LLMRetryableError("rate limited, retries spent"))
+    result = await PatternRuntime().compact_context_if_needed(
+        context=_oversized_context("unguarded-transient"),
+        llm=llm,
+        metadata={"phase": "test"},
+    )
+
+    assert llm.budgets == [8000]
+    assert result.strategy == "truncate"
+
+
+@pytest.mark.parametrize(
+    "code", sorted(PROVIDER_CALL_FAILURE_CODES - {"context_length"})
+)
+@pytest.mark.asyncio
+async def test_a_guarded_failure_walks_the_ladder_only_when_the_budget_can_help(
+    code: str,
+) -> None:
+    """A guarded model's error carries no cause for ``retry_on`` to read.
+
+    Its fixed code is what tells the ladder whether a smaller budget can
+    help. The budget-sensitive codes still step down; every other code stops
+    after the first request, as an unguarded transient failure does.
+    ``context_length`` has its own handling and is covered elsewhere.
+    """
+    llm = _BudgetLadderProbe(ProviderCallError(code))
+    await PatternRuntime().compact_context_if_needed(
+        context=_oversized_context(f"guarded-{code}"),
+        llm=llm,
+        metadata={"phase": "test"},
+    )
+
+    if code in _BUDGET_SENSITIVE_CODES:
+        assert llm.budgets == [8000, 4096, 2048, 1024, 256]
+    else:
+        assert llm.budgets == [8000]
+
+
+@pytest.mark.asyncio
+async def test_a_transient_guarded_failure_stops_the_ladder_on_a_lower_rung() -> None:
+    """The stop condition also applies on every rung, not only the first."""
+    llm = _BudgetLadderProbe(
+        ProviderCallError("invalid_request"), ProviderCallError("rate_limited")
+    )
+    result = await PatternRuntime().compact_context_if_needed(
+        context=_oversized_context("guarded-rung"),
+        llm=llm,
+        metadata={"phase": "test"},
+    )
+
+    assert llm.budgets == [8000, 4096]
+    assert result.strategy == "truncate"
+
+
+@pytest.mark.parametrize("code", sorted(_BUDGET_SENSITIVE_CODES))
+@pytest.mark.asyncio
+async def test_a_guarded_failure_already_retried_as_transient_stops_the_ladder(
+    code: str,
+) -> None:
+    """``transient`` carries what the guarded model's retry layer decided.
+
+    A budget-sensitive code alone would keep stepping down; when the retry
+    layer already treated the failure as transient (a 409, a quota 429, a
+    Claude-family 4xx, an empty completion), its retries are spent and a
+    smaller budget would only repeat them, so the ladder stops as it does for
+    the same unguarded model.
+    """
+    llm = _BudgetLadderProbe(ProviderCallError(code, transient=True))
+    result = await PatternRuntime().compact_context_if_needed(
+        context=_oversized_context(f"guarded-transient-{code}"),
+        llm=llm,
+        metadata={"phase": "test"},
+    )
+
+    assert llm.budgets == [8000]
+    assert result.strategy == "truncate"
+
+
+def test_only_the_budget_sensitive_codes_keep_the_ladder_going() -> None:
+    # Pinned exactly: widening the set would cost a real budget refusal its
+    # step-down; narrowing it would bring back one retry cycle per rung.
+    assert BUDGET_INSENSITIVE_FAILURE_CODES == PROVIDER_CALL_FAILURE_CODES - (
+        _BUDGET_SENSITIVE_CODES | {"context_length"}
+    )
+
+
+_LADDER_KEY = "sk-synthetic-compaction-ladder-0001"
+_LADDER_ATTEMPTS = 3
+_LADDER_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "claude": "https://api.anthropic.com",
+}
+
+
+def _openai_completion() -> dict[str, Any]:
+    return {
+        "id": "c1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "gpt-x",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "summary of the work"},
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+
+
+def _claude_message() -> dict[str, Any]:
+    return {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-x",
+        "content": [{"type": "text", "text": "summary of the work"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+
+
+class TestGuardedCompactionBudgetLadder:
+    """The ladder behind ``guard_llm_calls``, through the real retry layer.
+
+    create_base_llm -> RetryWrapper -> adapter -> provider SDK -> httpx, with
+    every request answered locally. For the failures the guard codes as
+    budget-insensitive, a guarded model must cost no more than the same
+    unguarded model: one retry cycle at the first budget. A budget the
+    provider refused must still step down.
+    """
+
+    @pytest.fixture
+    def provider(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        state: dict[str, Any] = {"mode": "429", "budget_limit": 1500, "seen": []}
+
+        async def handle_async_request(self: Any, request: httpx.Request) -> Any:
+            body = json.loads((await request.aread()) or b"{}")
+            budget = body.get("max_tokens") or body.get("max_completion_tokens")
+            state["seen"].append(budget)
+            claude = request.url.host == "api.anthropic.com"
+            mode = state["mode"]
+            if mode == "connect":
+                raise httpx.ConnectError("connection refused", request=request)
+            if (
+                mode in {"budget", "credits"}
+                and budget is not None
+                and budget <= state["budget_limit"]
+            ):
+                payload = _claude_message() if claude else _openai_completion()
+                response = httpx.Response(200, json=payload)
+            elif mode == "credits":
+                # OpenRouter's affordability refusal: a 402 a smaller budget fixes.
+                message = (
+                    "This request requires more credits, or fewer max_tokens. "
+                    f"You requested up to {budget} tokens, but can only afford "
+                    f"{state['budget_limit']}."
+                )
+                response = httpx.Response(
+                    402, json={"error": {"message": message, "code": 402}}
+                )
+            elif mode == "empty":
+                # A completion with no content: the adapter raises
+                # LLMEmptyContentError, which the retry layer retries.
+                payload = _claude_message() if claude else _openai_completion()
+                if claude:
+                    payload["content"] = [{"type": "text", "text": ""}]
+                else:
+                    payload["choices"][0]["message"]["content"] = ""
+                response = httpx.Response(200, json=payload)
+            elif mode == "quota429":
+                # OpenAI's out-of-quota 429, with its structured code.
+                message = "You exceeded your current quota, please check your plan."
+                response = httpx.Response(
+                    429,
+                    json={
+                        "error": {
+                            "message": message,
+                            "type": "insufficient_quota",
+                            "code": "insufficient_quota",
+                        }
+                    },
+                )
+            elif mode == "credit":
+                # A Claude-family 4xx that is not about the budget.
+                message = "Your credit balance is too low to access the API."
+                response = httpx.Response(
+                    400,
+                    json={
+                        "type": "error",
+                        "error": {"type": "invalid_request_error", "message": message},
+                    },
+                )
+            else:
+                status = {
+                    "429": 429,
+                    "500": 500,
+                    "401": 401,
+                    "409": 409,
+                    "budget": 400,
+                }[mode]
+                error = {
+                    "type": {
+                        401: "authentication_error",
+                        400: "invalid_request_error",
+                        409: "conflict_error",
+                        429: "rate_limit_error",
+                        500: "api_error",
+                    }[status],
+                    "message": f"max_tokens: {budget} is too large"
+                    if status == 400
+                    else "simulated provider failure",
+                }
+                payload = (
+                    {"type": "error", "error": error}
+                    if claude
+                    else {"error": {**error, "code": None}}
+                )
+                response = httpx.Response(status, json=payload)
+            response.request = request
+            return response
+
+        monkeypatch.setattr(
+            httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request
+        )
+        monkeypatch.setattr(ExponentialBackoff, "get_delay", lambda self, attempt: 0)
+        for name in (
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENROUTER_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        return state
+
+    @staticmethod
+    def _llm(provider_id: str, *, guarded: bool) -> Any:
+        llm = create_base_llm(
+            ChatModelConfig(
+                id=f"{provider_id}-model",
+                model_provider=provider_id,
+                model_name={"openrouter": "openai/gpt-x", "claude": "claude-x"}.get(
+                    provider_id, "gpt-x"
+                ),
+                api_key=_LADDER_KEY,
+                base_url=_LADDER_BASE_URLS[provider_id],
+                context_window=64_000,
+                max_retries=_LADDER_ATTEMPTS,
+            )
+        )
+        if not guarded:
+            return llm
+        return guard_llm_calls(llm, call_scope=contextlib.nullcontext)
+
+    async def _compact(self, llm: Any, execution_id: str) -> Any:
+        return await PatternRuntime().compact_context_if_needed(
+            context=_oversized_context(execution_id),
+            llm=llm,
+            metadata={"phase": "test"},
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["429", "connect", "500"])
+    async def test_a_transient_failure_costs_one_retry_cycle_when_guarded(
+        self, provider: dict[str, Any], mode: str
+    ) -> None:
+        provider["mode"] = mode
+        await self._compact(self._llm("openai", guarded=False), f"plain-{mode}")
+        baseline = list(provider["seen"])
+        provider["seen"].clear()
+
+        result = await self._compact(self._llm("openai", guarded=True), f"guard-{mode}")
+
+        # One full retry cycle at the first budget, exactly as unguarded.
+        assert baseline == [8000] * _LADDER_ATTEMPTS
+        assert provider["seen"] == baseline
+        assert result.strategy == "truncate"
+
+    @pytest.mark.asyncio
+    async def test_a_doubly_guarded_rate_limit_costs_one_retry_cycle(
+        self, provider: dict[str, Any]
+    ) -> None:
+        provider["mode"] = "429"
+        llm = guard_llm_calls(
+            self._llm("openai", guarded=True), call_scope=contextlib.nullcontext
+        )
+        result = await self._compact(llm, "guard-guard-429")
+
+        assert provider["seen"] == [8000] * _LADDER_ATTEMPTS
+        assert result.strategy == "truncate"
+
+    @pytest.mark.asyncio
+    async def test_an_unguarded_claude_budget_refusal_stops_after_one_cycle(
+        self, provider: dict[str, Any]
+    ) -> None:
+        # The baseline the guarded step-down below improves on: the Claude
+        # adapter retries the refusal as transient, so unguarded the ladder
+        # stops after one cycle and compaction falls back to truncation.
+        provider["mode"] = "budget"
+        result = await self._compact(
+            self._llm("claude", guarded=False), "plain-budget-claude"
+        )
+
+        assert provider["seen"] == [8000] * _LADDER_ATTEMPTS
+        assert result.strategy == "truncate"
+
+    @pytest.mark.asyncio
+    async def test_a_claude_credential_rejection_costs_one_retry_cycle_when_guarded(
+        self, provider: dict[str, Any]
+    ) -> None:
+        # The Claude adapter treats every status error as retryable, so a 401
+        # already costs one full cycle unguarded; guarded it must not cost one
+        # cycle per rung.
+        provider["mode"] = "401"
+        await self._compact(self._llm("claude", guarded=True), "guard-claude-401")
+
+        assert provider["seen"] == [8000] * _LADDER_ATTEMPTS
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("provider_id", "mode"),
+        [
+            # Each of these is retried by the retry layer as transient but is
+            # coded budget-sensitive (invalid_request, provider_quota,
+            # provider_error); only ``transient`` tells the ladder to stop.
+            ("openai", "409"),
+            ("openai", "quota429"),
+            ("openai", "empty"),
+            ("claude", "credit"),
+        ],
+    )
+    async def test_a_failure_retried_as_transient_costs_one_retry_cycle_when_guarded(
+        self, provider: dict[str, Any], provider_id: str, mode: str
+    ) -> None:
+        provider["mode"] = mode
+        await self._compact(
+            self._llm(provider_id, guarded=False), f"plain-{mode}-{provider_id}"
+        )
+        baseline = list(provider["seen"])
+        provider["seen"].clear()
+
+        result = await self._compact(
+            self._llm(provider_id, guarded=True), f"guard-{mode}-{provider_id}"
+        )
+
+        # One full retry cycle at the first budget, exactly as unguarded.
+        assert baseline == [8000] * _LADDER_ATTEMPTS
+        assert provider["seen"] == baseline
+        assert result.strategy == "truncate"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("provider_id", "mode", "expected"),
+        [
+            # A 400 is not retried by the OpenAI adapter: one request per rung.
+            ("openai", "budget", [8000, 4096, 2048, 1024]),
+            # A 402 is not retried either; it is coded provider_quota.
+            ("openrouter", "credits", [8000, 4096, 2048, 1024]),
+            # The Claude adapter retries every status error, so each refused
+            # rung costs one cycle; unguarded it would not step down at all.
+            # The refusal names max_tokens, so it is not marked transient.
+            (
+                "claude",
+                "budget",
+                [8000] * _LADDER_ATTEMPTS
+                + [4096] * _LADDER_ATTEMPTS
+                + [2048] * _LADDER_ATTEMPTS
+                + [1024],
+            ),
+        ],
+    )
+    async def test_a_refused_budget_still_steps_down_when_guarded(
+        self,
+        provider: dict[str, Any],
+        provider_id: str,
+        mode: str,
+        expected: list[int],
+    ) -> None:
+        provider["mode"] = mode
+        result = await self._compact(
+            self._llm(provider_id, guarded=True), f"guard-{mode}-{provider_id}"
+        )
+
+        # Stepped down to the first rung the provider accepts and summarized.
+        assert provider["seen"] == expected
+        assert result.strategy == "llm_summary"
 
 
 @pytest.mark.asyncio
@@ -2571,7 +3193,9 @@ async def test_compaction_publishes_the_summary_and_its_watermark() -> None:
     assert result.strategy == "llm_summary"
     assert result.metadata[COMPACT_WATERMARK_METADATA_KEY] == 42
     # Byte-identical to the system message this turn actually ran on, so a
-    # replay reproduces the context rather than an approximation of it.
+    # replay reproduces the context rather than an approximation of it. The
+    # stored-result list compaction may insert after it is a separate message
+    # and is deliberately not part of what is replayed.
     assert result.metadata[COMPACT_SUMMARY_METADATA_KEY] == context.messages[0].content
 
 
@@ -2735,3 +3359,231 @@ async def test_on_pattern_error_marks_the_pattern_error_as_reported() -> None:
     )
 
     assert runtime.pattern_error_reported is True
+
+
+class StreamingNoPayloadThenChatLLM:
+    """A stream that ends with nothing usable (only an END chunk, as an
+    aborted or cap-cut reasoning-only stream does) and a non-streaming
+    ``chat`` that answers. The runtime retries the call non-streaming."""
+
+    def __init__(
+        self,
+        *,
+        finish_reason: str = "no_progress",
+        chat_result: Any = None,
+        end_raw: Any = None,
+        usage: dict[str, int] | None = None,
+    ) -> None:
+        self.finish_reason = finish_reason
+        self.end_raw = end_raw
+        self.usage = usage
+        self.chat_result = (
+            chat_result
+            if chat_result is not None
+            else {"type": "text", "content": "retry answer", "finish_reason": "stop"}
+        )
+        self.chat_calls = 0
+
+    async def stream_chat(self, **_: Any) -> Any:
+        if self.finish_reason:
+            yield StreamChunk(
+                type=ChunkType.END, finish_reason=self.finish_reason, raw=self.end_raw
+            )
+        if self.usage is not None:
+            yield StreamChunk(type=ChunkType.USAGE, usage=self.usage)
+
+    async def chat(self, **_: Any) -> Any:
+        self.chat_calls += 1
+        return self.chat_result
+
+
+@pytest.mark.asyncio
+async def test_runtime_no_payload_fallback_is_stamped_and_lifted_to_trace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#2785: the non-streaming retry taken because the stream produced no
+    payload must be visible on the response and on ``llm_call_end`` (the
+    #2786 markers only cover streams that returned a dict), and logged."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+    llm = StreamingNoPayloadThenChatLLM()
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await runtime.run_streaming_llm_call(llm, messages=[])
+
+    assert llm.chat_calls == 1
+    assert result["content"] == "retry answer"
+    assert result["finish_reason"] == "stop"  # the retry's own reason
+    assert result["stream_fallback"] == "no_payload"
+    assert result["stream_finish_reason"] == "no_progress"
+    assert "usage_missing" not in result  # not a stream reconstruction
+    fallback_logs = [
+        r for r in caplog.records if "no content or tool calls" in r.getMessage()
+    ]
+    assert len(fallback_logs) == 1
+    assert "no_progress" in fallback_logs[0].getMessage()
+
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data["stream_fallback"] == "no_payload"
+    assert data["stream_finish_reason"] == "no_progress"
+    assert data["finish_reason"] == "stop"
+    assert "stream_fallback" not in data["response"]
+    assert "stream_finish_reason" not in data["response"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_no_payload_fallback_carries_abort_reason_and_stream_usage() -> (
+    None
+):
+    """The provider names the predicate that aborted the stream in the END
+    chunk's ``raw``; a cap-cut stream that did send usage keeps that usage.
+    Both ride on the fallback response and reach ``llm_call_end``."""
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    aborted = StreamingNoPayloadThenChatLLM(
+        end_raw={STREAM_ABORTED_KEY: "empty_deltas"}
+    )
+    result = await runtime.run_streaming_llm_call(aborted, messages=[])
+    assert result[STREAM_ABORTED_KEY] == "empty_deltas"
+    assert "stream_usage" not in result
+    await runtime.on_llm_end(context=context, response=result)
+    assert events[-1]["data"][STREAM_ABORTED_KEY] == "empty_deltas"
+    assert "stream_usage" not in events[-1]["data"]
+
+    cap_cut = StreamingNoPayloadThenChatLLM(
+        finish_reason="length",
+        usage={"prompt_tokens": 6523, "completion_tokens": 8192, "total_tokens": 14715},
+    )
+    result = await runtime.run_streaming_llm_call(cap_cut, messages=[])
+    assert result["stream_finish_reason"] == "length"
+    assert result["stream_usage"]["completion_tokens"] == 8192
+    assert STREAM_ABORTED_KEY not in result
+    assert "usage" not in result  # the retry's own usage, not the stream's
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data["stream_usage"]["completion_tokens"] == 8192
+    assert "input_tokens" not in data
+    assert "stream_usage" not in data["response"]
+
+
+class StreamingToolCallAbortedLLM:
+    """A stream the provider aborted after a complete tool call: the final
+    TOOL_CALL snapshot carries the abort reason in ``raw``."""
+
+    async def stream_chat(self, **_: Any) -> Any:
+        tool_call = {
+            "index": 0,
+            "id": "call-1",
+            "function": {"name": "search", "arguments": '{"q":"x"}'},
+        }
+        yield StreamChunk(type=ChunkType.TOOL_CALL, tool_calls=[tool_call])
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[tool_call],
+            finish_reason="no_progress",
+            raw={STREAM_ABORTED_KEY: "tool_call_trailing_whitespace"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_aborted_tool_call_stream_lifts_abort_reason() -> None:
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingToolCallAbortedLLM(), messages=[]
+    )
+
+    assert result["tool_calls"][0]["function"]["arguments"] == '{"q":"x"}'
+    assert result["finish_reason"] == "no_progress"
+    assert result[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
+    assert result["usage_missing"] is True
+    assert "stream_fallback" not in result
+
+    await runtime.on_llm_end(context=context, response=result)
+    data = events[-1]["data"]
+    assert data[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
+    assert data["finish_reason"] == "no_progress"
+    assert STREAM_ABORTED_KEY not in data["response"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_no_payload_fallback_without_stream_finish_reason() -> None:
+    """An empty stream (no chunk at all) is still marked as a fallback; the
+    absent stream finish reason adds no key."""
+    runtime = PatternRuntime()
+    llm = StreamingNoPayloadThenChatLLM(finish_reason="")
+
+    result = await runtime.run_streaming_llm_call(llm, messages=[])
+
+    assert result["stream_fallback"] == "no_payload"
+    assert "stream_finish_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_runtime_no_payload_fallback_leaves_a_bare_string_alone() -> None:
+    """A provider whose ``chat`` returns plain text cannot carry the marker;
+    the text is returned unchanged rather than wrapped (mirrors #2788)."""
+    runtime = PatternRuntime()
+    llm = StreamingNoPayloadThenChatLLM(chat_result="plain text")
+
+    result = await runtime.run_streaming_llm_call(llm, messages=[])
+
+    assert result == "plain text"
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_with_payload_carries_no_fallback_marker() -> None:
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingToolCallCutAtCapLLM(), messages=[]
+    )
+
+    assert "stream_fallback" not in result
+    assert "stream_finish_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_on_llm_end_ignores_non_string_fallback_markers() -> None:
+    events: list[dict[str, Any]] = []
+    runtime = PatternRuntime(
+        execution_id="task-123",
+        outbound_message_handler=OutboundCollector(),
+        tracer=_CaptureTracer(events),
+    )
+    context = ExecutionContext(execution_id="task-123")
+
+    await runtime.on_llm_end(
+        context=context,
+        response={
+            "content": "x",
+            "stream_fallback": True,
+            "stream_finish_reason": 3,
+            STREAM_ABORTED_KEY: ["empty_deltas"],
+            "stream_usage": "8192",
+        },
+    )
+
+    data = events[-1]["data"]
+    assert "stream_fallback" not in data
+    assert "stream_finish_reason" not in data
+    assert STREAM_ABORTED_KEY not in data
+    assert "stream_usage" not in data

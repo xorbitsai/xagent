@@ -296,6 +296,7 @@ async def test_control_reaches_local_execution(bot, monkeypatch, command):
             runtime_user=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
             # The turn binds ``task.source`` (MCP approval gate identity);
             # "internal" is the column default a channel task gets.

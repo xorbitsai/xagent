@@ -672,7 +672,12 @@ class TestCreateLLMFromEnv:
             api_key="deepseek-api-key",
             base_url="https://api.deepseek.com",
         )
-        assert result is mock_llm
+        # The factory now installs the shared retry layer (#2605): these
+        # env fallbacks had no wrapper, so zeroing the SDK retry budget
+        # would have left them with no retries at all. The constructed
+        # model is reachable through the proxy.
+        assert result is not None
+        assert result._inner is mock_llm
 
     def test_ignores_deepseek_placeholder_api_key(self, monkeypatch):
         for key in (
@@ -726,4 +731,9 @@ class TestCreateLLMFromEnv:
             api_key="deepseek-api-key",
             base_url=None,
         )
-        assert result is mock_llm
+        # The factory now installs the shared retry layer (#2605): these
+        # env fallbacks had no wrapper, so zeroing the SDK retry budget
+        # would have left them with no retries at all. The constructed
+        # model is reachable through the proxy.
+        assert result is not None
+        assert result._inner is mock_llm

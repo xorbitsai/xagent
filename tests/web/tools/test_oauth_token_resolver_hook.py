@@ -1862,8 +1862,8 @@ async def test_hook_failure_warning_redacts_resource_userinfo_pushed_out_by_quer
 
     assert configs[0]["transport"] == "unavailable"
     assert "SECRET_API_KEY" not in caplog.text
-    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] == "<url redacted>"
-    assert configs[0]["config"]["diagnostic"]["resource"] == "<url redacted>"
+    assert cfg.get_mcp_oauth_diagnostics()[0]["resource"] is None
+    assert configs[0]["config"]["diagnostic"]["resource"] is None
 
 
 @pytest.mark.asyncio

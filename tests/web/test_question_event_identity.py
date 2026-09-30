@@ -18,7 +18,9 @@ async def test_question_identity_is_shared_by_runtime_persistence_and_broadcast(
     persisted: list[dict[str, Any]] = []
     broadcast: list[dict[str, Any]] = []
 
-    def fake_persist(_task_id: int, event: dict[str, Any]) -> None:
+    def fake_persist(
+        _task_id: int, event: dict[str, Any], *, authoritative: bool = False
+    ) -> None:
         persisted.append(dict(event))
 
     async def fake_broadcast(event: dict[str, Any], _task_id: int) -> None:
@@ -29,7 +31,7 @@ async def test_question_identity_is_shared_by_runtime_persistence_and_broadcast(
         fake_persist,
     )
     monkeypatch.setattr(
-        "xagent.web.api.websocket.manager.broadcast_to_task",
+        "xagent.web.services.task_execution.publish_task_event",
         fake_broadcast,
     )
 

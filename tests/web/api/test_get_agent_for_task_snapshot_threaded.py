@@ -186,10 +186,12 @@ async def test_live_request_session_releases_clean_read_before_snapshot_worker(
     engine.dispose()
 
 
+@pytest.mark.parametrize("state", ["available", "detached", "compensating"])
 def test_selected_file_registration_materializes_after_read_session_closes(
     tmp_path,
     monkeypatch,
     mock_workspace_db,
+    state,
 ) -> None:
     del mock_workspace_db
     engine = create_engine(
@@ -240,7 +242,8 @@ def test_selected_file_registration_materializes_after_read_session_closes(
             task_id=None,
             filename=source_path.name,
             storage_path=str(source_path),
-            storage_status="available",
+            storage_status="compensating" if state == "compensating" else "available",
+            detached_reason="task_deleted" if state == "detached" else None,
             mime_type="text/plain",
             file_size=source_path.stat().st_size,
         )
@@ -273,7 +276,7 @@ def test_selected_file_registration_materializes_after_read_session_closes(
         selected_file_ids=["selected-file-id"],
     )
 
-    assert observed_checked_out == [0]
+    assert observed_checked_out == ([0] if state == "available" else [])
     assert engine.pool.checkedout() == 0
     with session_factory() as verify_db:
         record = (
@@ -281,10 +284,14 @@ def test_selected_file_registration_materializes_after_read_session_closes(
             .filter(UploadedFile.file_id == "selected-file-id")
             .one()
         )
-        assert record.task_id == task_id
-        assert str(record.storage_key).startswith(
-            f"users/{user_id}/tasks/{task_id}/outputs/selected-file-id/_versions/"
-        )
+        if state == "available":
+            assert record.task_id == task_id
+            assert str(record.storage_key).startswith(
+                f"users/{user_id}/tasks/{task_id}/outputs/selected-file-id/_versions/"
+            )
+        else:
+            assert record.task_id is None
+            assert record.storage_key is None
 
     get_unscoped_file_storage.cache_clear()
     engine.dispose()
@@ -518,7 +525,11 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
         def cleanup_workspace(self) -> None: ...
 
         def set_conversation_history(
-            self, _messages: list[dict[str, str]], *, watermark: int | None = None
+            self,
+            _messages: list[dict[str, str]],
+            *,
+            watermark: int | None = None,
+            event_watermark: dict[str, Any] | None = None,
         ) -> None: ...
 
         def set_execution_context_messages(self, _messages: list[Any]) -> None: ...

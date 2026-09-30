@@ -16,7 +16,10 @@ from .mcp_runtime import MCPActorExecutionIdentity
 logger = logging.getLogger(__name__)
 
 SLACK_CHANNEL_ACCESS_POLICY_ENV = "XAGENT_SLACK_CHANNEL_ACCESS_POLICY"
+SLACK_ACTOR_RUNTIME_REFRESH_KEY = "_slack_actor_runtime_refresh"
+SLACK_READ_CAPABILITY = "read"
 _SLACK_CONVERSATION_ID = re.compile(r"^[CGD][A-Z0-9]{5,}$")
+_SLACK_RUNTIME_CAPABILITIES = frozenset({SLACK_READ_CAPABILITY})
 
 
 class _SensitiveRuntimeValue(str):
@@ -32,6 +35,7 @@ class SlackChannelAccessPolicy:
 
     channel_ids: frozenset[str] = field(repr=False)
     expires_at: datetime = field(repr=False)
+    capabilities: frozenset[str] = field(repr=False)
 
     def __post_init__(self) -> None:
         if type(self.channel_ids) is not frozenset or any(
@@ -46,6 +50,11 @@ class SlackChannelAccessPolicy:
             or self.expires_at.utcoffset() is None
         ):
             raise ValueError("expires_at must be a timezone-aware datetime")
+        if (
+            type(self.capabilities) is not frozenset
+            or self.capabilities != _SLACK_RUNTIME_CAPABILITIES
+        ):
+            raise ValueError("capabilities must contain only the read capability")
 
 
 @dataclass(frozen=True)
@@ -142,9 +151,10 @@ def serialize_slack_channel_access_policy(policy: SlackChannelAccessPolicy) -> s
     return _SensitiveRuntimeValue(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "channel_ids": sorted(policy.channel_ids),
                 "expires_at": policy.expires_at.timestamp(),
+                "capabilities": sorted(policy.capabilities),
             },
             separators=(",", ":"),
         )

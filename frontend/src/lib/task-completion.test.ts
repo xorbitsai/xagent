@@ -3,6 +3,22 @@ import { describe, expect, it } from "vitest"
 import { normalizeTaskCompletedMessage } from "./task-completion"
 
 describe("task-completion", () => {
+  it.each(["completed", "partial", "blocked"])("preserves %s independently of execution status", (outcome) => {
+    for (const wrapped of [false, true]) {
+      const payload = { success: true, completion_outcome: outcome }
+      expect(normalizeTaskCompletedMessage(wrapped ? { data: payload } : payload)).toMatchObject({
+        status: "completed", success: true, completionOutcome: outcome,
+      })
+    }
+  })
+
+  it.each([undefined, null, "unknown", {}, ["partial"]])("does not invent an outcome for %j", (outcome) => {
+    expect(normalizeTaskCompletedMessage({ success: true, completion_outcome: outcome }).completionOutcome).toBeUndefined()
+  })
+
+  it("does not report semantic success on a failed execution", () => {
+    expect(normalizeTaskCompletedMessage({ success: false, completion_outcome: "completed" }).completionOutcome).toBeUndefined()
+  })
   it("normalizes legacy nested data payloads", () => {
     const payload = normalizeTaskCompletedMessage({
       type: "task_completed",

@@ -31,11 +31,13 @@ names must keep it importable from this module.
 
 import asyncio
 import enum
+import json
 import logging
 import re
 import shutil
 import time
 import uuid
+import weakref
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,7 +55,7 @@ from typing import (
 )
 from urllib.parse import unquote
 
-from sqlalchemy import case, func, or_, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -63,7 +65,12 @@ from ...core.agent.checkpoint import (
     CheckpointAccessRefusedError,
     CheckpointUnavailableError,
 )
-from ...core.agent.runner import UserMessageInjectionOutcome
+from ...core.agent.runner import (
+    InjectionDisposition,
+    UserMessageInjectionOutcome,
+    classify_injection,
+    track_user_message_injection,
+)
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -76,10 +83,11 @@ from ..models.database import (
     get_db,
     get_session_local,
 )
-from ..models.task import Task, TaskStatus
+from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
 from .task_events import DeliveryNotifier, publish_task_event
+from .task_execution_event_writer import stage_result_fact_no_commit
 from .task_lease_service import (
     lock_task_lease_for_settlement_no_commit,
     lock_task_lease_no_commit,
@@ -88,6 +96,7 @@ from .task_lease_service import (
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
+
 from ...core.file_storage.keys import (
     build_task_output_storage_key,
 )
@@ -105,6 +114,7 @@ from .chat_history_service import (
     DELIVERY_FAILED,
     DELIVERY_OUTCOME_UNKNOWN,
     mark_user_message_delivery_sync,
+    withdraw_pending_user_message_delivery_sync,
 )
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
@@ -120,6 +130,7 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .execution_result_projection import completion_outcome_for_status
 from .file_reference_output_service import (
     reconcile_assistant_file_references,
 )
@@ -131,6 +142,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
 )
 from .task_execution_controller import (
+    NON_RESUMABLE_STATUSES,
     TaskControlSnapshot,
     TaskControlState,
     apply_task_control_transition,
@@ -323,6 +335,35 @@ class ClientVisibleValidationError(ClientVisibleError, ValueError):
     """A validation failure whose text is safe to show the sender."""
 
 
+class _DeferredInjectionRejectedRetryableError(RuntimeError):
+    """The deferred message was not accepted; nothing was written for it.
+
+    ``fenced`` is True when an earlier uncertain input still fences the run
+    (``REJECTED_RETRYABLE``), and False when a read-back proved this write
+    absent, which leaves the context unfenced.
+    """
+
+    def __init__(self, message: str, *, fenced: bool) -> None:
+        super().__init__(message)
+        self.fenced = fenced
+
+
+def _resume_cancel_settlement_error(task_source: str | None) -> str:
+    """Settlement text for a cancelled resume, matching a cancelled run.
+
+    An external visitor reads this text in the transcript, and the external
+    cancel command recognizes it as its own settled outcome.
+    """
+    from .external_task_cancel import (
+        EXTERNAL_TASK_SOURCE,
+        EXTERNAL_TURN_INTERRUPTED_MESSAGE,
+    )
+
+    if task_source == EXTERNAL_TASK_SOURCE:
+        return EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    return "resume execution cancelled"
+
+
 def client_safe_error_message(
     error: BaseException,
     *,
@@ -384,7 +425,11 @@ def _terminal_task_error_payload(
 ) -> dict[str, Any] | None:
     SessionLocal = get_session_local()
     db = SessionLocal()
+    canonical = False
     try:
+        from .task_execution_event_writer import uses_execution_events
+
+        canonical = uses_execution_events(db, task_id)
         failed_control_state = TaskControlState.FAILED.value
         current_version = func.coalesce(Task.state_version, 0)
         statement = (
@@ -457,10 +502,15 @@ def _terminal_task_error_payload(
                         message_type=TASK_FAILURE_MESSAGE_TYPE,
                     )
                 except Exception:
+                    if task.conversation_storage_version == 2:
+                        raise
                     logger.warning(
                         "Failed to persist terminal error chat message",
                         exc_info=True,
                     )
+            if canonical:
+                db.refresh(task)
+                stage_result_fact_no_commit(db, task, {"error": message})
             db.commit()
         return _task_error_payload(
             db,
@@ -468,8 +518,14 @@ def _terminal_task_error_payload(
             CLIENT_SAFE_TASK_FAILURE,
             event_type=event_type,
         )
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        if canonical:
+            from ...core.agent.checkpoint import ExecutionEventPersistenceError
+
+            raise ExecutionEventPersistenceError(
+                "Terminal failure event commit failed"
+            ) from exc
         logger.warning("Failed to persist terminal task error", exc_info=True)
         return {
             "type": event_type,
@@ -511,7 +567,7 @@ def create_final_answer_stream_event(
     data: Dict[str, Any],
     timestamp: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Create non-persistent final-answer UI stream events."""
+    """Create final-answer UI stream envelopes without changing their protocol."""
 
     payload = dict(data)
     payload.pop("type", None)
@@ -539,17 +595,66 @@ def _stream_timestamp(timestamp: Optional[Any] = None) -> float:
     return float(timestamp)
 
 
-def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
+def _outbound_message_business_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare a message effect without attributing a replay to its new run."""
+    metadata = dict(data.get("metadata") or {})
+    for key in ("step_id", "dag_step_id", "turn_id"):
+        metadata.pop(key, None)
+    if "tool_calls" in metadata:
+        metadata["tool_calls"] = [
+            {
+                key: value
+                for key, value in source.items()
+                if key not in {"step_id", "dag_step_id", "turn_id"}
+            }
+            for source in metadata["tool_calls"]
+        ]
+    return {
+        "message": data.get("message"),
+        "message_type": data.get("message_type"),
+        "expect_response": data.get("expect_response"),
+        "visible": data.get("visible"),
+        "metadata": metadata,
+    }
+
+
+def _persist_agent_outbound_event(
+    task_id: int, event: Dict[str, Any], *, authoritative: bool = False
+) -> None:
     """Persist agent outbound events and durable waiting prompts."""
 
     from ..models.task import Task as DatabaseTask
     from ..models.task import TraceEvent as DatabaseTraceEvent
-    from .chat_history_service import persist_assistant_message
+    from .chat_history_service import persist_assistant_message_no_commit
 
+    execution_event_id: str | None = None
     db_gen = get_db()
     db = next(db_gen)
     try:
+        from .task_lease_service import current_task_lease
+
+        lease = current_task_lease()
+        if authoritative and event.get("type") == "final_answer_delta":
+            # Chunks are ephemeral; complete answers and stream boundaries are
+            # durable. Check ownership without serializing every chunk against
+            # fact writers. Publication already occurs outside the transaction.
+            if lease is not None and (
+                lease.task_id != task_id
+                or db.query(DatabaseTask.id)
+                .filter(
+                    DatabaseTask.id == task_id,
+                    DatabaseTask.runner_id == lease.runner_id,
+                    DatabaseTask.run_id == lease.run_id,
+                    task_lease_attempt_predicate(lease),
+                )
+                .first()
+                is None
+            ):
+                raise TaskLeaseLostError("Outbound event producer lost its task lease")
+            return
         event_data = event.get("data")
+        if authoritative and event_data is None:
+            event_data = dict(event)
         data: Dict[str, Any] = cast(
             Dict[str, Any], event_data if isinstance(event_data, dict) else {}
         )
@@ -575,14 +680,103 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
             parent_event_id=None,
             data=data,
         )
-        from .task_lease_service import current_task_lease
-
-        lease = current_task_lease()
         if lease is not None and (
             lease.task_id != task_id or not lock_task_lease_no_commit(db, lease)
         ):
             raise TaskLeaseLostError("Outbound event producer lost its task lease")
-        db.add(trace_event)
+        if authoritative:
+            from ..models.task_execution_event import TaskExecutionEvent
+            from .task_execution_event_store import (
+                ExecutionEventConflict,
+                lock_task_execution_events_no_commit,
+            )
+            from .task_execution_event_writer import append_fact_no_commit
+
+            lock_task_execution_events_no_commit(db, task_id)
+            task = db.get(DatabaseTask, task_id)
+            assert task is not None
+            metadata = data.get("metadata") or {}
+            sources = metadata.get("tool_calls") or [metadata]
+            if all(source.get("tool_attempt_id") for source in sources):
+                existing = (
+                    db.query(TaskExecutionEvent)
+                    .filter(
+                        TaskExecutionEvent.task_id == task_id,
+                        TaskExecutionEvent.scope_id == "root",
+                        TaskExecutionEvent.idempotency_key
+                        == f"outbound:{trace_event.event_id}",
+                    )
+                    .first()
+                )
+                if existing is not None:
+                    original_payload = cast(Dict[str, Any], existing.payload)
+                    if existing.kind != trace_event.event_type or (
+                        json.dumps(
+                            _outbound_message_business_payload(
+                                original_payload["data"]
+                            ),
+                            sort_keys=True,
+                        )
+                        != json.dumps(
+                            _outbound_message_business_payload(data), sort_keys=True
+                        )
+                    ):
+                        raise ExecutionEventConflict(
+                            "Tool message identity identifies a different message"
+                        )
+                    # The fact and its projections committed together. Reuse
+                    # the envelope, but permit retransmission after a crash
+                    # between commit and broadcast. Do not execute a new send.
+                    event.clear()
+                    event.update(
+                        create_stream_event(
+                            str(existing.kind),
+                            task_id,
+                            original_payload["data"],
+                            timestamp=existing.occurred_at,
+                            event_id=original_payload["protocol_event_id"],
+                        )
+                    )
+                    db.commit()
+                    return
+            fact = append_fact_no_commit(
+                db,
+                task_id=task_id,
+                kind=str(trace_event.event_type),
+                key=f"outbound:{trace_event.event_id}",
+                run_id=cast(str | None, task.run_id),
+                assistant_message_id=metadata.get("assistant_message_id"),
+                tool_attempt_id=metadata.get("tool_attempt_id"),
+                payload={"data": data, "protocol_event_id": trace_event.event_id},
+                occurred_at=event_time,
+            )
+            setattr(trace_event, "data", fact.payload["data"])
+            if trace_event.event_type.startswith("final_answer_"):
+                db.commit()
+                return
+            execution_event_id = cast(str, fact.event_id)
+            data = cast(Dict[str, Any], fact.payload)["data"]
+            setattr(trace_event, "timestamp", fact.occurred_at)
+            # Protocol replay retains the original envelope as well as the
+            # same chat projection. The task lock serializes both lookups.
+            event.update(
+                create_stream_event(
+                    str(fact.kind),
+                    task_id,
+                    data,
+                    timestamp=fact.occurred_at,
+                    event_id=cast(Dict[str, Any], fact.payload)["protocol_event_id"],
+                )
+            )
+        if not authoritative or not (
+            db.query(DatabaseTraceEvent.id)
+            .filter(
+                DatabaseTraceEvent.task_id == task_id,
+                DatabaseTraceEvent.event_id == trace_event.event_id,
+            )
+            .first()
+        ):
+            db.add(trace_event)
 
         if bool(data.get("expect_response")):
             task = db.query(DatabaseTask).filter(DatabaseTask.id == task_id).first()
@@ -596,7 +790,7 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
                     and isinstance(metadata.get("interactions"), list)
                     else None
                 )
-                persist_assistant_message(
+                persist_assistant_message_no_commit(
                     db,
                     task_id=task_id,
                     user_id=task_user_id,
@@ -604,11 +798,18 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
                     message_type="question",
                     interactions=interactions,
                     source_event_id=str(trace_event.event_id),
+                    execution_event_id=execution_event_id,
                 )
 
         db.commit()
     except Exception as exc:
         db.rollback()
+        if authoritative:
+            from ...core.agent.checkpoint import ExecutionEventPersistenceError
+
+            raise ExecutionEventPersistenceError(
+                "Outbound event commit failed"
+            ) from exc
         if isinstance(exc, TaskLeaseLostError):
             raise
         logger.exception(
@@ -646,10 +847,10 @@ def _reconcile_streamed_final_answer(task_id: int, content: str) -> str:
         db.close()
 
 
-def make_agent_outbound_handler(task_id: int) -> Any:
+def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
-    async def handle_outbound_message(payload: Dict[str, Any]) -> None:
+    async def handle_outbound_message(payload: Dict[str, Any]) -> Dict[str, Any] | None:
         payload_type = str(payload.get("type") or "")
         if payload_type in {
             "final_answer_start",
@@ -666,14 +867,20 @@ def make_agent_outbound_handler(task_id: int) -> Any:
                     task_id,
                     str(payload["content"]),
                 )
-            await publish_task_event(
-                create_final_answer_stream_event(payload_type, task_id, dict(payload)),
-                task_id,
+            final_answer_event = create_final_answer_stream_event(
+                payload_type, task_id, dict(payload)
             )
-            return
+            if authoritative:
+                await run_db_io_cancellation_safe(
+                    lambda: _persist_agent_outbound_event(
+                        task_id, final_answer_event, authoritative=True
+                    )
+                )
+            await publish_task_event(final_answer_event, task_id)
+            return None
 
         if payload.get("visible") is False:
-            return
+            return None
 
         event_type = _agent_outbound_event_type(payload)
         event = create_stream_event(
@@ -693,9 +900,12 @@ def make_agent_outbound_handler(task_id: int) -> Any:
             event_id=payload.get("event_id"),
         )
         await run_db_io_cancellation_safe(
-            lambda: _persist_agent_outbound_event(task_id, event)
+            lambda: _persist_agent_outbound_event(
+                task_id, event, authoritative=authoritative
+            )
         )
         await publish_task_event(event, task_id)
+        return cast(Dict[str, Any], event["data"]) if authoritative else None
 
     return handle_outbound_message
 
@@ -862,6 +1072,8 @@ def _uploaded_file_record_in_task_scope(
     if record_user_id != int(task_user_id):
         return False
 
+    if getattr(file_record, "detached_reason", None) is not None:
+        return False
     record_task_id = getattr(file_record, "task_id", None)
     if record_task_id is None:
         return True
@@ -1102,6 +1314,7 @@ def _prepare_task_file_outputs_isolated(
                     .filter(
                         UploadedFile.file_id == resolved_input.item_file_id,
                         UploadedFile.user_id == owner_user_id,
+                        UploadedFile.detached_reason.is_(None),
                         or_(
                             UploadedFile.task_id == task_id,
                             UploadedFile.task_id.is_(None),
@@ -1207,6 +1420,7 @@ def _prepare_task_file_outputs_isolated(
                     .filter(
                         UploadedFile.file_id == resolved_input.item_file_id,
                         UploadedFile.user_id == owner_user_id,
+                        UploadedFile.detached_reason.is_(None),
                         or_(
                             UploadedFile.task_id == task_id,
                             UploadedFile.task_id.is_(None),
@@ -1596,6 +1810,9 @@ def _finalize_task_execution_result_isolated(
 
         waiting_for_control = False
         terminal_state_committed = False
+        # Only a pause transition owns this transaction. Canceled, failed and
+        # already-paused tasks ignore the late result and roll back its files.
+        pause_commit_pending = False
         final_control_snapshot: TaskControlSnapshot | None = None
         final_task_status = pre_run_status.value
 
@@ -1605,14 +1822,34 @@ def _finalize_task_execution_result_isolated(
                 if isinstance(task_updated.agent_config, dict)
                 else {}
             )
-            if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
+            if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED" or (
+                result.get("injection_outcome_unknown")
+                and task_updated.status == TaskStatus.FAILED
+            ):
                 waiting_for_control = True
                 logger.info(
                     "Task %s was canceled while execution was in flight; "
                     "ignoring the late result",
                     task_id,
                 )
-            elif result.get("status") == "waiting_for_user":
+            elif task_updated.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+                # Settled terminal while this run was still in flight, without
+                # the A2A marker above -- an external cancel that finalized
+                # FAILED after its wait for the runner timed out, for one. The
+                # lease fence still matches in coordinator context, where
+                # settlement leaves ownership to the coordinator, so a late
+                # interrupt must not resurrect the row as PAUSED, nor a late
+                # success rewrite FAILED as COMPLETED.
+                waiting_for_control = True
+                logger.info(
+                    "Task %s already settled %s; ignoring the late %s result",
+                    task_id,
+                    task_updated.status.value,
+                    result.get("status") or "execution",
+                )
+            elif result.get("status") == "waiting_for_user" and not result.get(
+                "injection_outcome_unknown"
+            ):
                 next_control_state = (
                     TaskControlState.RESUME_REQUESTED
                     if task_updated.control_state
@@ -1630,11 +1867,22 @@ def _finalize_task_execution_result_isolated(
                     task_updated,
                     task_updated.status,
                 )
+                stage_result_fact_no_commit(finalize_db, task_updated, result)
                 finalize_db.commit()
                 metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
-            elif result.get("status") == "interrupted":
+            elif (
+                result.get("injection_outcome_unknown")
+                and (
+                    result.get("success", False)
+                    or result.get("status") == "waiting_for_user"
+                )
+            ) or result.get("status") == "interrupted":
+                # A resume requested mid-run carries input that was already
+                # accepted. Its handoff acquires the lease without reading this
+                # state and resumes from the checkpoint, even when later input
+                # became unknown, so keep the row saying a resume is coming.
                 next_control_state = (
                     TaskControlState.RESUME_REQUESTED
                     if task_updated.control_state
@@ -1652,10 +1900,9 @@ def _finalize_task_execution_result_isolated(
                     task_updated,
                     task_updated.status,
                 )
-                finalize_db.commit()
-                metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
+                pause_commit_pending = True
             elif task_updated.status not in {
                 TaskStatus.PAUSED,
                 TaskStatus.WAITING_FOR_USER,
@@ -1672,6 +1919,11 @@ def _finalize_task_execution_result_isolated(
                     else TaskControlState.FAILED,
                     status=final_status,
                     expected_run_id=expected_run_id,
+                )
+                setattr(
+                    task_updated,
+                    "completion_outcome",
+                    completion_outcome_for_status(result, final_status),
                 )
                 if final_status == TaskStatus.FAILED:
                     diagnostic_error = safe_str(result.get("error")).strip()
@@ -1692,7 +1944,12 @@ def _finalize_task_execution_result_isolated(
                 terminal_state_committed = True
 
             final_task_status = task_updated.status.value
-            if not waiting_for_control:
+            preserve_unknown_result = (
+                bool(result.get("injection_outcome_unknown"))
+                and bool(result.get("success", False))
+                and task_updated.status == TaskStatus.PAUSED
+            )
+            if not waiting_for_control or preserve_unknown_result:
                 if task_user_id is None:
                     raise ValueError(
                         f"Task {task_id}: cannot persist assistant message "
@@ -1715,6 +1972,7 @@ def _finalize_task_execution_result_isolated(
                     "output",
                     history_content
                     if task_updated.status == TaskStatus.COMPLETED
+                    or (preserve_unknown_result and result.get("success", False))
                     else None,
                 )
                 persist_assistant_message_no_commit(
@@ -1731,16 +1989,22 @@ def _finalize_task_execution_result_isolated(
                     ),
                     content_is_reconciled=True,
                 )
+                stage_result_fact_no_commit(finalize_db, task_updated, result)
                 finalize_db.commit()
                 metadata_committed = True
                 terminal_state_committed = True
 
+            if pause_commit_pending and not metadata_committed:
+                stage_result_fact_no_commit(finalize_db, task_updated, result)
+                finalize_db.commit()
+                metadata_committed = True
             broadcast_meta = {
                 "id": int(task_updated.id),
                 "title": task_updated.title,
                 "description": task_updated.description,
                 "execution_mode": getattr(task_updated, "execution_mode", None),
                 "updated_at": task_updated.updated_at,
+                "completion_outcome": task_updated.completion_outcome,
             }
         else:
             broadcast_meta = {
@@ -1749,6 +2013,7 @@ def _finalize_task_execution_result_isolated(
                 "description": None,
                 "execution_mode": None,
                 "updated_at": None,
+                "completion_outcome": None,
             }
 
         return _TaskExecutionFinalization(
@@ -1817,6 +2082,11 @@ async def execute_task_background(
                     task_id,
                     task_owner_user_id,
                     before_message_id=before_message_id,
+                    before_turn_id=(
+                        context.get("turn_id")
+                        if isinstance(context, dict) and before_message_id is not None
+                        else None
+                    ),
                 )
             )
         if snapshot is None:
@@ -1884,11 +2154,18 @@ async def execute_task_background(
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
                 agent_service.set_outbound_message_handler(
-                    make_agent_outbound_handler(task_id)
+                    make_agent_outbound_handler(
+                        task_id,
+                        authoritative=getattr(
+                            agent_service.tracer, "records_execution_events", False
+                        )
+                        is True,
+                    )
                 )
             agent_service.set_conversation_history(
                 [dict(message) for message in snapshot.conversation_history],
                 watermark=snapshot.conversation_watermark,
+                event_watermark=snapshot.conversation_event_watermark,
             )
             recovery_state = await materialize_task_execution_recovery_state(
                 snapshot.execution_recovery
@@ -2005,6 +2282,9 @@ async def execute_task_background(
                             "title": broadcast_meta["title"],
                             "description": broadcast_meta["description"],
                             "status": final_task_status,
+                            "completion_outcome": broadcast_meta.get(
+                                "completion_outcome"
+                            ),
                             "execution_mode": broadcast_meta["execution_mode"],
                             "agent_id": broadcast_agent_meta["agent_id"],
                             "agent_name": broadcast_agent_meta["agent_name"],
@@ -2015,7 +2295,11 @@ async def execute_task_background(
                     ),
                     task_id,
                 )
-                logger.info(f"Background task {task_id} paused for v2 control")
+                logger.info(
+                    "Background task %s left %s for v2 control",
+                    task_id,
+                    final_task_status,
+                )
                 return
 
             # Send task completion event (includes agent response info)
@@ -2027,6 +2311,7 @@ async def execute_task_background(
                         "status": final_task_status,
                         "description": broadcast_meta["description"],
                     },
+                    "completion_outcome": broadcast_meta.get("completion_outcome"),
                     "result": ai_response,
                     "output": ai_response,
                     "file_outputs": normalized_outputs,
@@ -2207,6 +2492,9 @@ def _acquire_resume_task_lease(
     expected_run_id: str | None,
     *,
     prior_status_out: list[TaskStatus] | None = None,
+    refuse_terminal_status: bool = False,
+    run_not_resumable_out: list[bool] | None = None,
+    ended_status_out: list[TaskStatus] | None = None,
 ) -> TaskLease | None:
     """Validate and claim a resume lease in one worker transaction.
 
@@ -2217,6 +2505,17 @@ def _acquire_resume_task_lease(
     is an out parameter rather than part of the return value because this
     function is called through ``acquire_task_lease_cancellation_safe``,
     whose acquire/cleanup pair is typed for a bare ``TaskLease``.
+
+    ``refuse_terminal_status`` adds ``status NOT IN (FAILED, COMPLETED)`` to
+    the claim UPDATE, so a run that ended after the caller's snapshot is
+    never flipped back to RUNNING. When the claim is refused and the row is
+    in one of those statuses or on another run -- the fenced run is not
+    resumable either way -- ``run_not_resumable_out`` receives ``True``; a
+    refusal by a live owner of the same run leaves it empty. The caller only
+    uses the distinction to say which one it was. ``ended_status_out``
+    additionally receives the row's status when the refusal found it in one
+    of those statuses, whatever its run: the one case where a message that
+    was never injected can be withdrawn and delivered as a new turn instead.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -2238,8 +2537,34 @@ def _acquire_resume_task_lease(
             db,
             task_id,
             expected_run_id=expected_run_id,
+            claim_predicates=(
+                (task_status_predicate.not_in(NON_RESUMABLE_STATUSES),)
+                if refuse_terminal_status
+                else ()
+            ),
         )
         if lease is None:
+            if refuse_terminal_status and (
+                run_not_resumable_out is not None or ended_status_out is not None
+            ):
+                current = db.execute(
+                    select(Task.status, Task.run_id).where(Task.id == task_id)
+                ).first()
+                if (
+                    run_not_resumable_out is not None
+                    and current is not None
+                    and (
+                        current.status in NON_RESUMABLE_STATUSES
+                        or current.run_id != expected_run_id
+                    )
+                ):
+                    run_not_resumable_out.append(True)
+                if (
+                    ended_status_out is not None
+                    and current is not None
+                    and current.status in NON_RESUMABLE_STATUSES
+                ):
+                    ended_status_out.append(TaskStatus(current.status))
             db.commit()
             return None
         if task is not None:
@@ -2347,6 +2672,24 @@ def _finalize_resumed_task(
         if task is None:
             finalized["late_result"] = True
             return finalized
+        if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+            # Explicit cancellation/failure already owns the terminal result,
+            # whatever this run returned -- including a late interrupt, which
+            # must not turn the row back into PAUSED (see the same guard in
+            # ``_finalize_task_execution_result_isolated``).
+            #
+            # As a late result, the caller leaves a carried delivery where it
+            # is rather than marking it completed: this run's result was
+            # discarded, so "applied" is not proven. DISPATCHED already means
+            # "do not resend"; a still-PENDING row is advanced to that by the
+            # orphan sweep once the task is quiescent.
+            if not release_task_lease_no_commit(db, task_lease, status=task.status):
+                db.rollback()
+                finalized["late_result"] = True
+                return finalized
+            db.commit()
+            finalized["late_result"] = True
+            return finalized
 
         (
             normalized_outputs,
@@ -2375,7 +2718,11 @@ def _finalize_resumed_task(
                 finalized["agent_name"] = cast(Any, agent.name)
                 finalized["agent_logo_url"] = cast(Any, agent.logo_url)
 
-        if status == "waiting_for_user":
+        if result.get("injection_outcome_unknown") and (
+            success or status in {"waiting_for_user", "interrupted"}
+        ):
+            final_task_status = TaskStatus.PAUSED
+        elif status == "waiting_for_user":
             final_task_status = TaskStatus.WAITING_FOR_USER
         elif status == "interrupted":
             final_task_status = TaskStatus.PAUSED
@@ -2395,6 +2742,13 @@ def _finalize_resumed_task(
             status=final_task_status,
             expected_run_id=task_lease.run_id,
         )
+
+        setattr(
+            task,
+            "completion_outcome",
+            completion_outcome_for_status(result, final_task_status),
+        )
+        finalized["completion_outcome"] = task.completion_outcome
 
         if success and output.strip() and task_owner_user_id is not None:
             persist_assistant_message_no_commit(
@@ -2438,6 +2792,7 @@ def _finalize_resumed_task(
             db.rollback()
             finalized["late_result"] = True
             return finalized
+        stage_result_fact_no_commit(db, task, result)
         db.commit()
         metadata_committed = True
         finalized["lease_released"] = True
@@ -2461,9 +2816,52 @@ def _settle_resumed_task_lease(
     error_message: str | None,
 ) -> bool:
     """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
+    from .assistant_history_safety import CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    from .external_task_cancel import EXTERNAL_TURN_INTERRUPTED_MESSAGE
     from .task_orchestrator import settle_task_lease_isolated
 
-    return settle_task_lease_isolated(lease, error_message=error_message)
+    if error_message == EXTERNAL_TURN_INTERRUPTED_MESSAGE:
+        # Written for the external visitor, as a cancelled run writes it.
+        return settle_task_lease_isolated(
+            lease,
+            error_message=error_message,
+            client_error_message=error_message,
+            client_message_type=CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+        )
+    return settle_task_lease_isolated(
+        lease,
+        error_message=error_message,
+    )
+
+
+async def publish_message_outcome_unknown_notice(task_id: int, turn_id: str) -> None:
+    """Tell every subscriber of the task a message's outcome is unknown.
+
+    For when the sender cannot be answered personally. It carries only ids,
+    the error code and the generic client-safe text, never the message body.
+    Best effort: a failure is logged, never raised.
+    """
+
+    notice = {
+        "type": "error",
+        "task_id": task_id,
+        "client_message_id": turn_id,
+        "turn_id": turn_id,
+        "error_code": ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+        "message": client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+    }
+    try:
+        await publish_task_event(
+            {**notice, "timestamp": datetime.now(timezone.utc).timestamp()},
+            task_id,
+        )
+    except Exception:
+        logger.warning(
+            "task %s outcome-unknown notice for message %s was not published",
+            task_id,
+            turn_id,
+            exc_info=True,
+        )
 
 
 async def execute_resume_background(
@@ -2500,12 +2898,27 @@ async def execute_resume_background(
     # value", never "this task has no source": the runner's overlay ignores a
     # None and keeps whatever the checkpoint carries.
     trusted_task_source: str | None = None,
+    # Appended for the same reason. True for a message handoff: its run must
+    # never be resumed once it ended (FAILED or COMPLETED), so the lease claim
+    # refuses those statuses atomically. A recovered delivery (a retried
+    # command whose pending row an earlier attempt claimed) then settles as
+    # outcome unknown; see ``delivery_claimed_fresh`` for a fresh one.
+    refuse_terminal_status: bool = False,
+    # Appended for the same reason. True when the caller claimed the delivery
+    # row itself in this attempt (a fresh message), so no earlier attempt can
+    # have applied it. Only meaningful with ``refuse_terminal_status``: a
+    # claim refused because the run ended then withdraws the row, which was
+    # never injected, so the message can be accepted as a new turn; any other
+    # refusal keeps the ordinary failed-delivery answer.
+    delivery_claimed_fresh: bool = False,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
     ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
     resume executes as (``UserContext``), not the acting principal.
     """
+    from .agent_service_manager import caller_facing_execution_metadata
+
     resume_owner_task = asyncio.current_task()
     if resume_owner_task is None:
         raise RuntimeError(f"Task {task_id} resume has no asyncio task")
@@ -2517,6 +2930,8 @@ async def execute_resume_background(
     settlement_error: str | None = None
     broadcast_error_message: str | None = None
     defer_db_cleanup_to_ttl_recovery = False
+    # A fenced rejection keeps the uncertain run paused instead of failing it.
+    pause_rejected_lease = False
     # The status this task held before a lease claim flipped it to RUNNING;
     # the checkpoint-unavailable/refused recovery path below restores to
     # this instead of a terminal FAILED. Captured at acquisition when this
@@ -2543,6 +2958,9 @@ async def execute_resume_background(
     agent_logo_url: str | None = None
     delivery_outcome_unknown = False
     delivery_was_dispatched = delivery_already_dispatched
+    # Set when a cancellation or lease loss lands after the deferred turn was
+    # durably accepted; the handlers below record the acceptance.
+    delivery_accepted_unrecorded = False
     control_event_state: dict[str, Any] = {}
 
     async def notify_deferred_delivery(
@@ -2584,6 +3002,31 @@ async def execute_resume_background(
                 task_id,
                 exc_info=True,
             )
+
+    async def record_accepted_delivery() -> None:
+        """Record a durably accepted turn whose resume did not proceed."""
+        nonlocal delivery_accepted_unrecorded
+        if not delivery_accepted_unrecorded:
+            return
+        delivery_accepted_unrecorded = False
+        if delivery_turn_id is not None:
+            try:
+                await run_db_io_cancellation_safe(
+                    lambda: mark_user_message_delivery_sync(
+                        task_id,
+                        delivery_turn_id,
+                        DELIVERY_DISPATCHED,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "delivery marker failed after an interrupted accepted "
+                    "deferred message for task %s turn %s",
+                    task_id,
+                    delivery_turn_id,
+                    exc_info=True,
+                )
+        await notify_deferred_delivery(True)
 
     async def mark_deferred_delivery_failed() -> bool:
         """Persist a failed delivery without amplifying pool exhaustion."""
@@ -2666,12 +3109,17 @@ async def execute_resume_background(
 
         if lease is None:
             prior_status_box: list[TaskStatus] = []
+            run_not_resumable_box: list[bool] = []
+            ended_status_box: list[TaskStatus] = []
             lease = await acquire_task_lease_cancellation_safe(
                 lambda: _acquire_resume_task_lease(
                     task_id,
                     task_owner_user_id,
                     expected_run_id,
                     prior_status_out=prior_status_box,
+                    refuse_terminal_status=refuse_terminal_status,
+                    run_not_resumable_out=run_not_resumable_box,
+                    ended_status_out=ended_status_box,
                 ),
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
@@ -2680,6 +3128,155 @@ async def execute_resume_background(
             )
             if prior_status_box:
                 resume_prior_status = prior_status_box[0]
+            if (
+                lease is None
+                and refuse_terminal_status
+                and delivery_claimed_fresh
+                and ended_status_box
+                and delivery_turn_id is not None
+                and not delivery_was_dispatched
+            ):
+                # A fresh message whose run ended before this claim. Its row
+                # was claimed by this very handoff and the message was never
+                # written into the run, so withdrawing the row is safe and
+                # lets the message be accepted as a new turn: a durable
+                # command's retry finds no row and appends it (a caller with
+                # a delivery notifier, which production does not route here,
+                # is told to resend). The ended run is not resumed.
+                fresh_turn_id = delivery_turn_id
+                withdrawn = False
+                try:
+                    withdrawn = await run_db_io_cancellation_safe(
+                        lambda: withdraw_pending_user_message_delivery_sync(
+                            task_id, fresh_turn_id
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Task %s resume of run %s refused: its run ended; could "
+                        "not withdraw undelivered message %s",
+                        task_id,
+                        expected_run_id,
+                        fresh_turn_id,
+                        exc_info=True,
+                    )
+                if withdrawn:
+                    logger.info(
+                        "Task %s resume of run %s refused: its run ended (%s); "
+                        "withdrew undelivered message %s so it can start a new "
+                        "turn",
+                        task_id,
+                        expected_run_id,
+                        ended_status_box[0].value,
+                        fresh_turn_id,
+                    )
+                    await notify_deferred_delivery(
+                        False,
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                        retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
+                    )
+                    return
+                # The row is no longer this handoff's to withdraw (another
+                # writer settled it), or the withdrawal failed and it is still
+                # pending. Neither proves anything about delivery any more, so
+                # settle it the conservative way below.
+            if (
+                lease is None
+                and refuse_terminal_status
+                and (not delivery_claimed_fresh or ended_status_box)
+            ):
+                # A recovered delivery: an earlier attempt claimed its row and
+                # may already have applied the turn, so a refused resume is
+                # never recorded as failed, which would invite a resend. The
+                # run is not resumed either way; the task keeps the state its
+                # last writer gave it. A fresh message reaches here only when
+                # its run ended: after it was injected (the notice below), or
+                # when its row could not be withdrawn above. Any other refusal
+                # of a fresh message keeps the ordinary answer further down.
+                refusal = (
+                    "its run ended or was replaced"
+                    if run_not_resumable_box
+                    else "another runner owns the lease"
+                )
+                if delivery_turn_id is None:
+                    logger.warning(
+                        "Task %s resume of run %s refused: %s",
+                        task_id,
+                        expected_run_id,
+                        refusal,
+                    )
+                elif delivery_was_dispatched:
+                    # The injection already landed in the run's checkpoint
+                    # and the sender was told it was accepted, but no resume
+                    # will answer it. Tell the task's audience its outcome is
+                    # unknown, as the durable answer does for a lost origin.
+                    # Known limitation: the notice is best effort, and the
+                    # command already completed as accepted, so a same-id
+                    # resend is still answered accepted.
+                    logger.warning(
+                        "Task %s resume of run %s refused: %s; delivery %s was "
+                        "already accepted, publishing an outcome-unknown notice",
+                        task_id,
+                        expected_run_id,
+                        refusal,
+                        delivery_turn_id,
+                    )
+                    await publish_message_outcome_unknown_notice(
+                        task_id, delivery_turn_id
+                    )
+                else:
+                    delivery_outcome_unknown = True
+                    try:
+                        unknown_transition = await run_db_io_cancellation_safe(
+                            lambda: mark_user_message_delivery_sync(
+                                task_id,
+                                delivery_turn_id,
+                                DELIVERY_OUTCOME_UNKNOWN,
+                            )
+                        )
+                    except Exception:
+                        # Returning here keeps a possibly COMPLETED task out
+                        # of the generic failure handler below. The row stays
+                        # pending, so the retried command settles it again.
+                        logger.warning(
+                            "Task %s resume of run %s refused: %s; could not "
+                            "record delivery %s as outcome unknown",
+                            task_id,
+                            expected_run_id,
+                            refusal,
+                            delivery_turn_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if unknown_transition.status is None:
+                            # No row to record, so nothing was recorded. A
+                            # raised withdrawal above does not prove the row
+                            # still pending: its DELETE can commit with only
+                            # the acknowledgement lost. That message was never
+                            # injected; the retry finds no row and appends it
+                            # as a new turn.
+                            logger.warning(
+                                "Task %s resume of run %s refused: %s; "
+                                "delivery %s has no row left to record as "
+                                "outcome unknown (already withdrawn)",
+                                task_id,
+                                expected_run_id,
+                                refusal,
+                                delivery_turn_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Task %s resume of run %s refused: %s; recorded "
+                                "delivery %s as outcome unknown",
+                                task_id,
+                                expected_run_id,
+                                refusal,
+                                delivery_turn_id,
+                            )
+                    await notify_deferred_delivery(False)
+                return
             if lease is None:
                 logger.info(
                     "Task %s resume skipped; another runner owns the lease", task_id
@@ -2731,7 +3328,13 @@ async def execute_resume_background(
         # that already installed one is harmless.
         if hasattr(agent_service, "set_outbound_message_handler"):
             agent_service.set_outbound_message_handler(
-                make_agent_outbound_handler(task_id)
+                make_agent_outbound_handler(
+                    task_id,
+                    authoritative=getattr(
+                        agent_service.tracer, "records_execution_events", False
+                    )
+                    is True,
+                )
             )
 
         # The task row can become RUNNING before the original AgentRunner has
@@ -2742,23 +3345,72 @@ async def execute_resume_background(
         # not allowed to run the resume.
         if pending_user_message is not None:
             assert lease_heartbeat_task is not None
-            with bind_task_lease_context(lease):
-                posted = await run_while_task_lease_owned(
-                    agent_service.post_user_message(
-                        str(task_id),
-                        execution_message=pending_user_message.get("execution_message"),
-                        display_message=pending_user_message.get("display_message"),
-                        files=pending_user_message.get("files"),
-                        turn_id=pending_user_message.get("turn_id"),
-                        request_interrupt=False,
-                        reason="deferred websocket user message",
-                    ),
-                    lease_heartbeat_task,
+            with track_user_message_injection() as attempt:
+                try:
+                    with bind_task_lease_context(lease):
+                        posted = await run_while_task_lease_owned(
+                            agent_service.post_user_message(
+                                str(task_id),
+                                execution_message=pending_user_message.get(
+                                    "execution_message"
+                                ),
+                                display_message=pending_user_message.get(
+                                    "display_message"
+                                ),
+                                files=pending_user_message.get("files"),
+                                turn_id=pending_user_message.get("turn_id"),
+                                request_interrupt=False,
+                                reason="deferred websocket user message",
+                            ),
+                            lease_heartbeat_task,
+                        )
+                except BaseException as injection_error:
+                    disposition = classify_injection(
+                        attempt.outcome, error=injection_error
+                    )
+                    if (
+                        disposition is InjectionDisposition.ACCEPTED
+                        and isinstance(injection_error, Exception)
+                        and not isinstance(injection_error, TaskLeaseLostError)
+                    ):
+                        # The turn is durable; only a later projection (such
+                        # as the registry event) failed. Continue as accepted.
+                        logger.warning(
+                            "post-acceptance injection error for deferred "
+                            "message on task %s",
+                            task_id,
+                            exc_info=True,
+                        )
+                        posted = attempt.outcome
+                    elif disposition is (
+                        InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+                    ) and isinstance(injection_error, Exception):
+                        raise _DeferredInjectionRejectedRetryableError(
+                            "The user message was not accepted",
+                            fenced=attempt.outcome
+                            is UserMessageInjectionOutcome.REJECTED_RETRYABLE,
+                        ) from injection_error
+                    else:
+                        delivery_outcome_unknown = (
+                            disposition is InjectionDisposition.UNKNOWN
+                        )
+                        if disposition is InjectionDisposition.ACCEPTED:
+                            # Cancellation or lease loss after the durable
+                            # write: the handlers below record acceptance.
+                            delivery_was_dispatched = True
+                            delivery_accepted_unrecorded = True
+                        raise
+                else:
+                    disposition = classify_injection(attempt.outcome, posted=posted)
+            delivery_outcome_unknown = disposition is InjectionDisposition.UNKNOWN
+            if disposition is InjectionDisposition.NOT_ACCEPTED_RETRYABLE:
+                raise _DeferredInjectionRejectedRetryableError(
+                    "The user message was not accepted by a fenced execution",
+                    fenced=True,
                 )
-            if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
-                delivery_outcome_unknown = True
+            if disposition is InjectionDisposition.UNKNOWN:
                 raise RuntimeError("The user message injection outcome is unknown")
-            if not posted:
+            if disposition is InjectionDisposition.DEFER:
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "
                     "checkpoint became available."
@@ -3037,7 +3689,7 @@ async def execute_resume_background(
                 )
             )
 
-        if status in {"interrupted", "waiting_for_user"}:
+        if final_status in {TaskStatus.PAUSED.value, TaskStatus.WAITING_FOR_USER.value}:
             await publish_task_event(
                 create_stream_event(
                     "task_info",
@@ -3068,6 +3720,7 @@ async def execute_resume_background(
                 },
                 "result": output,
                 "output": output,
+                "completion_outcome": finalized.get("completion_outcome"),
                 "file_outputs": normalized_outputs,
                 "success": success,
                 # Forward the coded reason so a mid-run quota interrupt on a
@@ -3076,12 +3729,20 @@ async def execute_resume_background(
                 "error_details": result.get("error_details"),
                 **control_event_state,
                 "type": "task_completed",
-                "metadata": result.get("metadata", {}),
+                # The owner's socket, not the operator trace: fold the raw
+                # memory availability reason.
+                "metadata": caller_facing_execution_metadata(
+                    result.get("metadata", {})
+                ),
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
             task_id,
         )
     except TaskLeaseLostError:
+        if delivery_outcome_unknown:
+            if await mark_deferred_delivery_failed():
+                await notify_deferred_delivery(False)
+        await record_accepted_delivery()
         defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
         logger.warning(
             "Task %s resume execution cancelled after lease ownership loss",
@@ -3089,8 +3750,9 @@ async def execute_resume_background(
         )
         return
     except asyncio.CancelledError:
-        settlement_error = "resume execution cancelled"
+        settlement_error = _resume_cancel_settlement_error(trusted_task_source)
         logger.info(f"V2 resume background task {task_id} cancelled")
+        await record_accepted_delivery()
         if delivery_turn_id is not None and not delivery_was_dispatched:
             if await mark_deferred_delivery_failed():
                 await notify_deferred_delivery(
@@ -3126,6 +3788,40 @@ async def execute_resume_background(
             # otherwise left reclaimable when no lease was acquired). Do not
             # emit the generic FAILED/task_error payload below.
             return
+        elif delivery_outcome_unknown:
+            if await mark_deferred_delivery_failed():
+                await notify_deferred_delivery(False)
+        elif isinstance(e, _DeferredInjectionRejectedRetryableError):
+            # Nothing was written for this message, so it is never failed or
+            # resumed for. A fence left by an earlier uncertain input keeps the
+            # task paused for the user. Without one (a read-back proved this
+            # write absent) the task returns to its prior resting status; a
+            # prior status that cannot be restored without re-running or
+            # re-announcing a result is paused instead.
+            if (
+                not e.fenced
+                and lease is not None
+                and not lease_released
+                and resume_prior_status
+                in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}
+            ):
+                restore_lease_to_prior_status = resume_prior_status
+            else:
+                pause_rejected_lease = True
+            logger.warning(
+                "Task %s deferred message was not accepted (fenced=%s)",
+                task_id,
+                e.fenced,
+            )
+            if delivery_turn_id is not None and not delivery_was_dispatched:
+                if await mark_deferred_delivery_failed():
+                    await notify_deferred_delivery(
+                        False,
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                        retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
+                    )
         elif (
             isinstance(e, (CheckpointUnavailableError, CheckpointAccessRefusedError))
             and lease is not None
@@ -3221,6 +3917,7 @@ async def execute_resume_background(
 
         async def finalize_resume_resources() -> None:
             nonlocal defer_db_cleanup_to_ttl_recovery, lease_released
+            nonlocal settlement_error
             nonlocal prepared_outputs
 
             try:
@@ -3371,12 +4068,39 @@ async def execute_resume_background(
                     and not defer_db_cleanup_to_ttl_recovery
                 ):
                     try:
-                        settled = await run_db_io_cancellation_safe(
-                            lambda: _settle_resumed_task_lease(
-                                lease,
-                                error_message=settlement_error,
-                            )
+                        explicit_cancel = background_task_manager.cancel_was_requested(
+                            resume_owner_task
                         )
+                        pause_for_input = (
+                            delivery_outcome_unknown or pause_rejected_lease
+                        )
+                        if explicit_cancel and pause_for_input:
+                            # An explicit cancel wins over the uncertain-input
+                            # pause: the task fails as cancelled while the
+                            # delivery keeps its recorded outcome (an unknown
+                            # one is never resendable).
+                            settlement_error = (
+                                settlement_error
+                                or _resume_cancel_settlement_error(trusted_task_source)
+                            )
+                        if pause_for_input and not explicit_cancel:
+                            from .task_orchestrator import pause_unknown_task_lease
+
+                            settled = await pause_unknown_task_lease(
+                                lease,
+                                message=(
+                                    "Input outcome unknown; execution paused"
+                                    if delivery_outcome_unknown
+                                    else "Input was not accepted; execution paused"
+                                ),
+                            )
+                        else:
+                            settled = await run_db_io_cancellation_safe(
+                                lambda: _settle_resumed_task_lease(
+                                    lease,
+                                    error_message=settlement_error,
+                                )
+                            )
                         if settled:
                             lease_released = True
                             if broadcast_error_message is not None:
@@ -3466,6 +4190,10 @@ class BackgroundTaskManager:
         self._resume_run_ids: dict[int, str | None] = {}
         self._resume_reservations: set[int] = set()
         self._resume_owner_started_at: dict[int, float] = {}
+        # Tasks cancelled through ``cancel_task``: an explicit stop request,
+        # as opposed to shutdown or lease-loss cancellation. Recorded before
+        # ``Task.cancel()`` so the cancelled task's own cleanup can read it.
+        self._explicitly_cancelled: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
 
@@ -3706,6 +4434,7 @@ class BackgroundTaskManager:
         for task in tasks:
             if task.done():
                 continue
+            self._explicitly_cancelled.add(task)
             requested = task.cancel() or requested
             try:
                 await asyncio.wait_for(task, timeout=timeout_seconds)
@@ -3730,6 +4459,11 @@ class BackgroundTaskManager:
             self._resume_run_ids.pop(task_id, None)
             self._resume_owner_started_at.pop(task_id, None)
         return BackgroundTaskCancelOutcome(requested=requested)
+
+    def cancel_was_requested(self, task: asyncio.Task | None) -> bool:
+        """Whether ``task`` was cancelled by an explicit ``cancel_task`` call."""
+
+        return task is not None and task in self._explicitly_cancelled
 
     async def shutdown(self) -> None:
         """Fence new work, cancel every owned task, and drain its cleanup."""

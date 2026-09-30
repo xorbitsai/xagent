@@ -5,9 +5,10 @@ import json
 import logging
 import os
 import zipfile
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import quote
 
 import requests
@@ -205,8 +206,7 @@ def _decode_read_cursor(
         raise ValueError("cursor is invalid") from exc
     if cursor_etag != etag:
         raise _ConflictError(
-            "The presentation changed while reading a paginated result; restart "
-            "without a cursor"
+            "The presentation changed while reading a paginated result; restart without a cursor"
         )
     if cursor_scope != scope:
         raise ValueError("cursor does not belong to this PowerPoint read operation")
@@ -290,8 +290,7 @@ def _bounded_page_response(
                 if len(omitted_response) <= max_chars:
                     return omitted_response
                 return _bounded_error(
-                    "PowerPoint oversized-item metadata exceeds the configured "
-                    "output limit"
+                    "PowerPoint oversized-item metadata exceeds the configured output limit"
                 )
             break
         items.append(item)
@@ -379,8 +378,7 @@ def _site_segment(site_id: str) -> str:
     value = site_id.strip()
     if any(segment in (".", "..", "") for segment in value.split("/")):
         raise ValueError(
-            f"site_id must not contain '.', '..', or empty (e.g. '//') segments: "
-            f"{site_id!r}"
+            f"site_id must not contain '.', '..', or empty (e.g. '//') segments: {site_id!r}"
         )
     return quote(value, safe=":/,")
 
@@ -402,8 +400,7 @@ def _normalize_relative_path(path: str) -> str:
         raise ValueError("file_path must use '/' separators and must not contain '\\'")
     if any(segment in (".", "..", "") for segment in value.split("/")):
         raise ValueError(
-            f"file_path must not contain '.', '..', or empty (e.g. '//') segments: "
-            f"{path!r}"
+            f"file_path must not contain '.', '..', or empty (e.g. '//') segments: {path!r}"
         )
     if value.rsplit("/", 1)[-1].endswith("."):
         raise ValueError(f"file_path filename must not end with a period: {path!r}")
@@ -466,7 +463,7 @@ def _presentation_metadata(
     item = _graph_request(
         "GET",
         _item_path(file_path, site_id, drive_id),
-        params={"$select": "id,size,eTag,@microsoft.graph.downloadUrl"},
+        params={"$select": "id,size,eTag,parentReference,@microsoft.graph.downloadUrl"},
     )
     if not isinstance(item, dict) or not item.get("id"):
         raise RuntimeError("Graph did not return presentation metadata")
@@ -480,29 +477,19 @@ def _presentation_metadata(
         )
     _require_etag(item.get("eTag"), "Graph presentation eTag")
     download_url = item.get("@microsoft.graph.downloadUrl")
-    if not isinstance(download_url, str) or not download_url:
-        raise RuntimeError("Graph did not return a presentation download URL")
+    if download_url is not None and not isinstance(download_url, str):
+        raise RuntimeError("Graph returned an invalid presentation download URL")
     return item
 
 
-def _download_preauthenticated_content(download_url: str, expected_size: int) -> bytes:
-    """Download a signed Graph URL without exposing it or buffering past limits."""
-    try:
-        response = requests.get(
-            download_url,
-            stream=True,
-            timeout=_BINARY_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException:
-        raise RuntimeError("PowerPoint presentation download failed") from None
-
+def _read_bounded_response(response: requests.Response, expected_size: int) -> bytes:
+    """Read a binary response with bounded, sanitized error handling."""
     try:
         try:
             response.raise_for_status()
         except requests.HTTPError:
             raise _GraphRequestError(
-                "PowerPoint presentation download failed with HTTP "
-                f"{response.status_code}",
+                f"PowerPoint presentation download failed with HTTP {response.status_code}",
                 status_code=response.status_code,
             ) from None
 
@@ -527,6 +514,62 @@ def _download_preauthenticated_content(download_url: str, expected_size: int) ->
             "PowerPoint presentation size changed while it was being downloaded"
         )
     return bytes(content)
+
+
+def _download_preauthenticated_content(download_url: str, expected_size: int) -> bytes:
+    """Download a signed Graph URL without exposing it or buffering past limits."""
+    try:
+        response = requests.get(
+            download_url,
+            stream=True,
+            timeout=_BINARY_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        raise RuntimeError("PowerPoint presentation download failed") from None
+
+    return _read_bounded_response(response, expected_size)
+
+
+def _stable_content_path(item: dict[str, Any], drive_id: str | None) -> str:
+    """Build an item-ID content path to avoid path replacement races."""
+    item_id = item.get("id")
+    parent_reference = item.get("parentReference")
+    metadata_drive_id = (
+        parent_reference.get("driveId") if isinstance(parent_reference, dict) else None
+    )
+    effective_drive_id = drive_id or metadata_drive_id
+    if not isinstance(item_id, str) or not item_id.strip():
+        raise RuntimeError("Graph did not return a presentation item id")
+    if not isinstance(effective_drive_id, str) or not effective_drive_id.strip():
+        raise RuntimeError("Graph did not return a presentation drive id")
+    item_path = (
+        f"/drives/{url_path_id(effective_drive_id, 'drive_id')}/items/"
+        f"{url_path_id(item_id, 'item_id')}"
+    )
+    return f"{item_path}/content"
+
+
+def _download_authenticated_content(content_path: str, expected_size: int) -> bytes:
+    """Download Graph ``/content`` when metadata has no signed URL.
+
+    Personal OneDrive and some Graph-compatible drives omit
+    ``@microsoft.graph.downloadUrl`` even though the authenticated content
+    endpoint is available. Keep the same bounded streaming and safe-error
+    behavior as the signed-URL path. ``requests`` follows the normal Graph
+    redirect and strips the bearer header when the redirect crosses hosts.
+    """
+    try:
+        response = requests.request(
+            method="GET",
+            url=f"{GRAPH_BASE_URL}{content_path}",
+            headers=_graph_headers(),
+            timeout=_BINARY_TIMEOUT_SECONDS,
+            stream=True,
+        )
+    except requests.RequestException:
+        raise RuntimeError("PowerPoint presentation download failed") from None
+
+    return _read_bounded_response(response, expected_size)
 
 
 def _validate_presentation_archive(content: bytes) -> None:
@@ -561,9 +604,13 @@ def _download_presentation(
         raise _ConflictError(
             "The presentation changed after it was read; fetch it again before editing"
         )
-    content = _download_preauthenticated_content(
-        item["@microsoft.graph.downloadUrl"], item["size"]
-    )
+    download_url = item.get("@microsoft.graph.downloadUrl")
+    if isinstance(download_url, str) and download_url:
+        content = _download_preauthenticated_content(download_url, item["size"])
+    else:
+        content = _download_authenticated_content(
+            _stable_content_path(item, drive_id), item["size"]
+        )
     _validate_presentation_archive(content)
     try:
         presentation = Presentation(io.BytesIO(content))
@@ -675,8 +722,7 @@ def _upload_presentation_session(
                     ) from None
                 _cancel_upload_session(http, upload_url)
                 raise _GraphRequestError(
-                    "PowerPoint presentation upload failed with HTTP "
-                    f"{response.status_code}",
+                    f"PowerPoint presentation upload failed with HTTP {response.status_code}",
                     status_code=response.status_code,
                 ) from None
             except requests.RequestException:
@@ -1093,8 +1139,7 @@ def _delete_slide(presentation: PresentationType, slide_index: int) -> None:
                 and element.get("id") == target_slide_id
             ):
                 raise ValueError(
-                    "The slide is referenced by a presentation section and cannot "
-                    "be deleted safely"
+                    "The slide is referenced by a presentation section and cannot be deleted safely"
                 )
 
         target_part = presentation.part.related_part(relationship_id)
@@ -1107,8 +1152,7 @@ def _delete_slide(presentation: PresentationType, slide_index: int) -> None:
                     and relationship.target_part is target_part
                 ):
                     raise ValueError(
-                        "The slide is linked from another slide and cannot be "
-                        "deleted safely"
+                        "The slide is linked from another slide and cannot be deleted safely"
                     )
 
     slide_id_list.remove(target)
@@ -1409,8 +1453,7 @@ def powerpoint_add_slide(
         if title is not None:
             if slide.shapes.title is None:
                 raise ValueError(
-                    f"slide layout {layout_index} has no title placeholder; "
-                    "title was not applied"
+                    f"slide layout {layout_index} has no title placeholder; title was not applied"
                 )
             slide.shapes.title.text = title
             title_applied = True

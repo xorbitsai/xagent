@@ -324,6 +324,88 @@ class TestScopedByIdAccess:
             assert store.delete(note_a.id).success is True
         assert note_a.id not in store._base_store.notes
 
+    @pytest.mark.parametrize(
+        "replacement_metadata",
+        [
+            {},
+            {"user_id": "NaN"},
+            {"user_id": 2},
+            {
+                "user_id": None,
+                "execution_scope_tenant": "attacker",
+                "execution_scope_extra": "injected",
+            },
+        ],
+    )
+    def test_update_restores_authenticated_owner_and_existing_scope(
+        self, store, replacement_metadata
+    ):
+        note_a = self._note_in(store, SCOPE_A, "a note")
+        edited = note_a.model_copy(deep=True)
+        edited.content = "edited"
+        edited.metadata = dict(replacement_metadata)
+
+        with UserContext(1), ExecutionScopeContext(SCOPE_A):
+            assert store.update(edited).success is True
+
+        persisted = store._base_store.notes[note_a.id]
+        assert persisted.metadata == {
+            "user_id": 1,
+            "execution_scope_tenant": "a",
+        }
+        with UserContext(1), ExecutionScopeContext(SCOPE_A):
+            assert store.get(note_a.id).success is True
+
+    def test_unscoped_update_preserves_existing_scope_namespace(self, store):
+        note_a = self._note_in(store, SCOPE_A, "a note")
+        edited = note_a.model_copy(deep=True)
+        edited.metadata = {"source": "replacement"}
+
+        with UserContext(1):
+            assert store.update(edited).success is True
+
+        assert store._base_store.notes[note_a.id].metadata == {
+            "source": "replacement",
+            "user_id": 1,
+            "execution_scope_tenant": "a",
+        }
+
+    def test_update_preserves_scope_when_backend_returns_same_note_instance(
+        self, store
+    ):
+        note_a = self._note_in(store, SCOPE_A, "a note")
+        stored = store._base_store.notes[note_a.id]
+        stored.content = "edited in place"
+
+        with UserContext(1), ExecutionScopeContext(SCOPE_A):
+            assert store.update(stored).success is True
+
+        assert store._base_store.notes[note_a.id].metadata == {
+            "user_id": 1,
+            "execution_scope_tenant": "a",
+        }
+
+    def test_update_cannot_add_scope_to_an_unscoped_note(self, store):
+        with UserContext(1):
+            note = _add(store, "an unscoped note")
+        edited = note.model_copy(deep=True)
+        edited.metadata = {"source": "replacement", "execution_scope_tenant": "b"}
+
+        with UserContext(1):
+            assert store.update(edited).success is True
+
+        assert store._base_store.notes[note.id].metadata == {
+            "source": "replacement",
+            "user_id": 1,
+        }
+        # Still unscoped: a strict dimension-less caller keeps seeing it, and
+        # another user still cannot reach it.
+        strict = ExecutionScope(strict_memory_isolation=True)
+        with UserContext(1), ExecutionScopeContext(strict):
+            assert [n.id for n in store.search("unscoped")] == [note.id]
+        with UserContext(2):
+            assert store.get(note.id).success is False
+
     def test_strict_dimensionless_cannot_touch_scoped_note_by_id(self, store):
         note_a = self._note_in(store, SCOPE_A, "a note")
         strict = ExecutionScope(strict_memory_isolation=True)

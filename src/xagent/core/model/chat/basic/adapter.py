@@ -1,13 +1,14 @@
 import os
-from typing import Callable, Optional
+from typing import Callable, Optional, overload
 
 from ....model import ChatModelConfig, ModelConfig
-from ....retry import create_retry_wrapper
+from ....retry import chat_retry_budget, create_retry_wrapper
 from ...providers import (
     AUTO_MODEL_NAME,
     ROUTER_PROVIDER,
     canonical_provider_name,
     is_auto_router_model,
+    is_placeholder_api_key,
     provider_compatibility_for_provider,
     resolve_base_url_for_provider,
 )
@@ -23,6 +24,51 @@ from .openrouter import OpenRouterLLM
 from .router import RouterLLM
 from .xinference import XinferenceLLM
 from .zhipu import ZhipuLLM
+
+
+@overload
+def attach_chat_retry_wrapper(
+    llm: BaseLLM, max_retries: Optional[int] = ...
+) -> BaseLLM: ...
+
+
+@overload
+def attach_chat_retry_wrapper(llm: None, max_retries: Optional[int] = ...) -> None: ...
+
+
+def attach_chat_retry_wrapper(
+    llm: Optional[BaseLLM], max_retries: Optional[int] = None
+) -> Optional[BaseLLM]:
+    """Install the shared retry layer on a chat model.
+
+    ``create_base_llm`` is not the only way a chat model gets built: the
+    environment and default fallbacks construct one directly. Those paths used
+    to lean on the provider SDK's own retry budget, which is now zero so that
+    retry policy lives in one layer -- this is that layer, and every
+    construction path has to reach it or it has no retries at all.
+
+    ``max_retries`` defaults to what a model row without an explicit value
+    would carry, read off the config model so the two cannot drift.
+    """
+    # The env and default factories are all ``Optional``-returning, and this
+    # sits on their ``return`` statements: pass a missing model through rather
+    # than handing callers a retry proxy wrapped around nothing.
+    if llm is None:
+        return None
+    if max_retries is None:
+        max_retries = int(ModelConfig.model_fields["max_retries"].default)
+    return create_retry_wrapper(
+        llm,
+        BaseLLM,  # type: ignore[type-abstract]
+        retry_methods={"chat", "vision_chat", "stream_chat"},
+        max_retries=max_retries,
+        retry_on=retry_on,
+        # ``max_retries`` alone cannot bound how long one call holds an
+        # execution slot, because each attempt may consume a full request
+        # timeout. The budget adds the wall-clock ceiling and the short
+        # capacity-refusal budget on top of it.
+        budget=chat_retry_budget(),
+    )
 
 
 def create_base_llm(
@@ -41,6 +87,19 @@ def create_base_llm(
     provider = canonical_provider_name(model.model_provider)
     compatibility = provider_compatibility_for_provider(provider)
     llm: BaseLLM
+
+    if model.explicit_credentials_only and is_auto_router_model(
+        provider, model.model_name
+    ):
+        # Auto runs other configurations (its candidates, or one the router
+        # derives), which this flag does not reach. Not supported for now:
+        # refuse it rather than let those run without the flag.
+        raise ValueError("Auto models do not support explicit_credentials_only")
+
+    if model.explicit_credentials_only and is_placeholder_api_key(model.api_key):
+        # Adapters treat a missing or placeholder key as "use the environment";
+        # an explicit-credentials config must never end up on those.
+        raise ValueError("An explicit, non-placeholder api_key is required")
 
     if is_auto_router_model(provider, model.model_name):
         # Pick a concrete model via xrouter-llm. Legacy OpenRouter Auto clones
@@ -127,6 +186,7 @@ def create_base_llm(
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,
             abilities=model.abilities,
+            api_key_only=model.explicit_credentials_only,
         )
     elif provider == "zhipu":
         llm = ZhipuLLM(
@@ -165,10 +225,4 @@ def create_base_llm(
     # Stamp the unique model id so token-usage details can disambiguate models
     # that share a model_name (e.g. a platform model vs a user's own).
     llm._model_id = model.id
-    return create_retry_wrapper(
-        llm,
-        BaseLLM,  # type: ignore[type-abstract]
-        retry_methods={"chat", "vision_chat", "stream_chat"},
-        max_retries=model.max_retries,
-        retry_on=retry_on,
-    )
+    return attach_chat_retry_wrapper(llm, model.max_retries)

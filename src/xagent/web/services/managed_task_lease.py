@@ -20,6 +20,7 @@ from .db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from .execution_result_projection import completion_outcome_for_status
 from .task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -44,15 +45,9 @@ def finalize_managed_task_lease_result(
     interactions: list[dict[str, Any]] | None = None,
     message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
     error_message: str | None = None,
-    # Reserved for a future reader and unconsumed today: this function
-    # never reads it, and resolve_publishable_clarification -- the reader
-    # it is reserved for -- has no production caller anywhere yet. The
-    # change that wires that resolver is what will read it. Never pass
-    # this to a logger or an exception.
-    # finalize_managed_task_lease_result_isolated
-    # hands its call off to a worker thread, so this mapping is held by a
-    # closure across that thread boundary for a while, and it can carry
-    # large structures such as file_outputs with no truncation applied.
+    # Used for semantic completion and the durable execution fact. It crosses
+    # the isolated finalizer's worker-thread boundary and can contain large or
+    # sensitive payloads; never pass the raw result to a logger or exception.
     execution_result: Mapping[str, Any] | None = None,
     completion: tuple[int, dict[str, Any]] | None = None,
 ) -> bool:
@@ -62,6 +57,7 @@ def finalize_managed_task_lease_result(
         raise ValueError("Cannot finalize a managed lease with RUNNING status")
 
     from .chat_history_service import persist_assistant_message_no_commit
+    from .task_execution_event_writer import stage_result_fact_no_commit
     from .task_orchestrator import invalidate_task_cache_best_effort
 
     try:
@@ -71,6 +67,11 @@ def finalize_managed_task_lease_result(
 
         db.expire_all()
         task = db.query(Task).filter(Task.id == lease.task_id).one()
+        setattr(
+            task,
+            "completion_outcome",
+            completion_outcome_for_status(execution_result, status),
+        )
         history_content, history_message_type = (
             assistant_history_values_for_persistence(
                 content=assistant_content or "",
@@ -100,6 +101,9 @@ def finalize_managed_task_lease_result(
                 message_type=history_message_type,
                 turn_id=turn_id,
             )
+        stage_result_fact_no_commit(
+            db, task, dict(execution_result or {"error": error_message})
+        )
         if completion is not None:
             from ..models.task_command import TaskExecutionCommand
 

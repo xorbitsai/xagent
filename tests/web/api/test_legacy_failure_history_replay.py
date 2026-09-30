@@ -831,3 +831,95 @@ async def test_failed_managed_result_replays_only_safe_history(
         for event in events
     )
     _assert_safe_failure_persisted(task_id, raw_error)
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("success", [False, True])
+def test_unknown_input_preserves_completed_work_result(_test_db, resumed, success):
+    task_id, user_id = _running_task(
+        username="unknown-result",
+        title="Unknown input",
+        runner_id="owner",
+        run_id="run",
+    )
+    lease = TaskLease(task_id, "owner", "run", "test-attempt")
+    result = {
+        "success": success,
+        "output": "valuable final answer" if success else "",
+        "error": None if success else "original execution failure",
+        "injection_outcome_unknown": True,
+    }
+    prepared = task_execution_service._PreparedTaskFileOutputs((), (), ())
+    if resumed:
+        task_execution_service._finalize_resumed_task(
+            task_id,
+            status="",
+            success=success,
+            output=result["output"],
+            task_owner_user_id=user_id,
+            result=result,
+            task_lease=lease,
+            prepared_outputs=prepared,
+        )
+    else:
+        task_execution_service._finalize_task_execution_result_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            pre_run_status=TaskStatus.RUNNING,
+            result=result,
+            expected_run_id="run",
+            task_lease=lease,
+            resolved_scope_segments=(),
+            prepared_outputs=prepared,
+        )
+    with _direct_db_session() as db:
+        task = db.get(Task, task_id)
+        row = (
+            db.query(TaskChatMessage).filter_by(task_id=task_id, role="assistant").one()
+        )
+        if success:
+            assert task.status == TaskStatus.PAUSED
+            assert task.output == "valuable final answer"
+            assert row.content == "valuable final answer"
+        else:
+            assert task.status == TaskStatus.FAILED
+            assert task.error_message == "original execution failure"
+            assert row.content == CLIENT_SAFE_TASK_FAILURE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["running", "failed", "new-owner"])
+async def test_unknown_pause_broadcasts_only_committed_transition(
+    _test_db, state, monkeypatch
+):
+    from unittest.mock import AsyncMock
+
+    from xagent.web.services import task_events
+    from xagent.web.services.task_orchestrator import pause_unknown_task_lease
+
+    task_id, user_id = _running_task(
+        username="pause-event", title="Unknown input", runner_id="owner", run_id="run"
+    )
+    if state != "running":
+        with _direct_db_session() as db:
+            task = db.get(Task, task_id)
+            if state == "failed":
+                task.status = TaskStatus.FAILED
+            else:
+                task.runner_id = "replacement"
+            db.commit()
+    events = []
+
+    async def publish(event, event_task_id):
+        with _direct_db_session() as db:
+            assert db.get(Task, task_id).status == TaskStatus.PAUSED
+        events.append(event)
+
+    monkeypatch.setattr(
+        task_events, "publish_task_event", AsyncMock(side_effect=publish)
+    )
+    await pause_unknown_task_lease(TaskLease(task_id, "owner", "run", "test-attempt"))
+    assert len(events) == (1 if state == "running" else 0)
+    if events:
+        assert events[0]["type"] == "task_paused"
+        assert events[0]["run_id"] == "run"

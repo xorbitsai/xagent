@@ -78,6 +78,9 @@ export interface ConversationLogDetailResponse {
   log: ConversationLogSummary
   transcript: ConversationLogTranscriptMessage[]
   trace_events?: ConversationLogTraceEvent[]
+  // When the retention policy last removed this task's execution trace. Later
+  // turns add new events, so trace_events may be non-empty but incomplete.
+  trace_events_expired_at?: string | null
   metadata: {
     task?: {
       task_id: number
@@ -115,11 +118,41 @@ export async function fetchConversationLogs(params: {
   return response.json()
 }
 
+/**
+ * The detail endpoint answers 410 `task_expired` for a conversation the
+ * retention policy expired, and only to callers who could have seen it live
+ * (everyone else gets the usual 404). A log can be listed and then expire
+ * before its detail is fetched, so the page tells that apart from a failure.
+ */
+export class ConversationLogExpiredError extends Error {
+  readonly expiredAt: string | null
+
+  constructor(expiredAt: string | null) {
+    super("Conversation log expired")
+    this.name = "ConversationLogExpiredError"
+    this.expiredAt = expiredAt
+  }
+}
+
+async function expiredAtFromGoneResponse(response: Response): Promise<string | null | undefined> {
+  const body: unknown = await response.json().catch(() => null)
+  const detail =
+    body && typeof body === "object" ? (body as { detail?: unknown }).detail : undefined
+  if (!detail || typeof detail !== "object") return undefined
+  const { code, expired_at: expiredAt } = detail as { code?: unknown; expired_at?: unknown }
+  if (code !== "task_expired") return undefined
+  return typeof expiredAt === "string" ? expiredAt : null
+}
+
 export async function fetchConversationLogDetail(
   taskId: number
 ): Promise<ConversationLogDetailResponse> {
   const response = await apiRequest(`${getApiUrl()}/api/conversation-logs/${taskId}`)
   if (!response.ok) {
+    if (response.status === 410) {
+      const expiredAt = await expiredAtFromGoneResponse(response)
+      if (expiredAt !== undefined) throw new ConversationLogExpiredError(expiredAt)
+    }
     throw new Error("Failed to load conversation detail")
   }
   return response.json()

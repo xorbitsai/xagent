@@ -188,6 +188,15 @@ def settle_failed_start_no_commit(db: Session, row: TaskExecutionCommand) -> Non
     )
     # A never-started new Task needs a terminal result. An append's failure
     # belongs to its command and must not overwrite the previous run's result.
+    stopped_before_start = (
+        isinstance(row.result, dict)
+        and row.result.get("rejection_reason") == "cancelled_before_admission"
+    )
+    error_message = (
+        "Task stopped before execution started."
+        if stopped_before_start
+        else "Task could not start."
+    )
     changed = (
         db.query(Task)
         .filter(
@@ -207,7 +216,7 @@ def settle_failed_start_no_commit(db: Session, row: TaskExecutionCommand) -> Non
                 Task.status: TaskStatus.FAILED,
                 Task.control_state: "failed",
                 Task.state_version: func.coalesce(Task.state_version, 0) + 1,
-                Task.error_message: "Task could not start.",
+                Task.error_message: error_message,
             },
             synchronize_session=False,
         )

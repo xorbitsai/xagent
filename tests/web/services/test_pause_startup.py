@@ -39,7 +39,9 @@ async def test_startup_pause_defers_without_error_and_success_uses_events(
         SimpleNamespace(running_tasks={1: pending}),
     )
     monkeypatch.setattr(
-        commands, "_apply_pause_requested_isolated", lambda *a, **k: True
+        commands,
+        "_apply_pause_requested_isolated",
+        lambda *a, **k: commands.PauseWriteOutcome.APPLIED,
     )
     monkeypatch.setattr(commands, "_mark_task_pause_accepted", lambda *a: None)
     publish = AsyncMock()

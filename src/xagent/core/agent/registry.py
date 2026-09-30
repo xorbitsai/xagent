@@ -349,7 +349,7 @@ class ExecutionRegistry:
         handle.last_error = None
 
         status = result.get("status")
-        if status == "interrupted":
+        if result.get("injection_outcome_unknown") or status == "interrupted":
             handle.status = ExecutionLifecycleStatus.INTERRUPTED
             error = result.get("error")
             handle.last_error = str(error) if error is not None else None

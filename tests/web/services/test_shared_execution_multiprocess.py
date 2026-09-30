@@ -105,6 +105,7 @@ def _execution_host(pipe, env, task_id):
             runtime_user=object(),
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
         )
         task_orchestrator.load_task_setup_snapshot_sync = lambda *args, **kwargs: (

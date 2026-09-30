@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable
-from uuid import uuid4
+from typing import Any, Callable, cast
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from ...config import COMPACT_THRESHOLD_DEFAULT
 from ..agent.trace import (
@@ -23,8 +24,16 @@ from ..context_materializer import (
 )
 from ..inline_file_delivery import InlineFileDelivery, InlineFileStreamGuard
 from ..model.chat.basic.base import BaseLLM
+from ..model.chat.basic.call_boundary import (
+    BUDGET_INSENSITIVE_FAILURE_CODES,
+    ProviderCallError,
+)
 from ..model.chat.error import is_context_length_error, retry_on
 from ..model.chat.exceptions import LLMContextLengthError, LLMToolProtocolError
+from ..model.chat.stream_progress import (
+    NO_PAYLOAD_STREAM_FALLBACK,
+    STREAM_ABORTED_KEY,
+)
 from ..model.chat.token_context import extract_cached_input_tokens
 from ..model.chat.tool_protocol import TOOL_PROTOCOL_ERROR_KEY
 from ..model.chat.types import ChunkType
@@ -36,7 +45,11 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
-from .checkpoint import CheckpointPersistenceError, TraceCheckpointStore
+from .checkpoint import (
+    CheckpointPersistenceError,
+    ExecutionEventPersistenceError,
+    TraceCheckpointStore,
+)
 from .context.execution import (
     COMPACT_SUMMARY_FALLBACK_BUDGETS,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -292,6 +305,24 @@ def resolved_llm_metadata(llm: Any) -> dict[str, Any]:
     return metadata
 
 
+def _budget_cannot_help(exc: Exception) -> bool:
+    """True when asking again with a smaller output budget is pointless.
+
+    Either the failure is transient by class (``retry_on``), so the model's
+    own retries are already spent, or it is a ``ProviderCallError`` -- which
+    by construction carries no cause for ``retry_on`` to read -- whose code a
+    smaller budget cannot fix, or whose ``transient`` flag says the guarded
+    model's retry layer already treated it as transient. ``retry_on`` itself
+    is deliberately not taught these: a host that wraps a guarded model in
+    another retry layer would then retry every exhausted call again.
+    """
+    if retry_on(exc):
+        return True
+    return isinstance(exc, ProviderCallError) and (
+        exc.code in BUDGET_INSENSITIVE_FAILURE_CODES or exc.transient
+    )
+
+
 @dataclass
 class PatternRuntime:
     """Thin runtime services shared by execution patterns.
@@ -504,6 +535,7 @@ class PatternRuntime:
             provider_payload: dict[str, Any] = {}
             protocol_error_payload: dict[str, Any] = {}
             saw_payload_chunk = False
+            finish_reason = ""
             stream = aiter(stream_chat(**kwargs))
             loop_completed = False
             try:
@@ -543,6 +575,9 @@ class PatternRuntime:
                     if chunk_usage:
                         self._merge_usage(usage_payload, chunk_usage)
                     self._merge_provider_payload(provider_payload, chunk)
+                    chunk_finish_reason = getattr(chunk, "finish_reason", None)
+                    if isinstance(chunk_finish_reason, str) and chunk_finish_reason:
+                        finish_reason = chunk_finish_reason
                     if on_chunk is not None:
                         await self._maybe_await(on_chunk(chunk))
                 loop_completed = True
@@ -569,6 +604,21 @@ class PatternRuntime:
             tool_calls = [
                 tool_call_chunks[index] for index in sorted(tool_call_chunks.keys())
             ]
+
+            def stamp_stream_markers(response: dict[str, Any]) -> dict[str, Any]:
+                # Keep a truncated or usage-less stream visible in the trace
+                # (#2786): ``on_llm_end`` lifts both keys onto ``llm_call_end``.
+                # ``usage_missing`` is stamped here, not inferred from an absent
+                # ``usage`` key downstream, because non-streaming envelopes
+                # never carry top-level usage and must not be counted as
+                # truncated streams. Every dict return is stamped; the
+                # bare-string return at the end cannot carry either key.
+                if finish_reason:
+                    response["finish_reason"] = finish_reason
+                if not usage_payload:
+                    response["usage_missing"] = True
+                return response
+
             if protocol_error_payload:
                 protocol_response = {
                     "type": "tool_protocol_error",
@@ -578,7 +628,7 @@ class PatternRuntime:
                 }
                 if usage_payload:
                     protocol_response["usage"] = usage_payload
-                return protocol_response
+                return stamp_stream_markers(protocol_response)
             if tool_calls:
                 response: dict[str, Any] = {
                     "content": content,
@@ -588,9 +638,25 @@ class PatternRuntime:
                     response["usage"] = usage_payload
                 if provider_payload:
                     response.update(provider_payload)
-                return response
+                return stamp_stream_markers(response)
             if not saw_payload_chunk:
-                return await self.run_llm_call(llm, **kwargs)
+                # A stream that produced neither content nor a tool call
+                # (an aborted or cap-cut reasoning-only stream, #2785) is
+                # retried non-streaming. Log and mark it: the #2786 markers
+                # above only cover streams that returned a dict, so this
+                # path was invisible in the trace.
+                logger.warning(
+                    "LLM stream ended with no content or tool calls "
+                    "(finish_reason=%s); retrying as a non-streaming call",
+                    finish_reason or "none",
+                )
+                fallback_response = await self.run_llm_call(llm, **kwargs)
+                return self._stamp_stream_fallback(
+                    fallback_response,
+                    finish_reason,
+                    stream_aborted=provider_payload.get(STREAM_ABORTED_KEY),
+                    stream_usage=usage_payload,
+                )
             if usage_payload:
                 response = {
                     "content": content,
@@ -598,9 +664,9 @@ class PatternRuntime:
                 }
                 if provider_payload:
                     response.update(provider_payload)
-                return response
+                return stamp_stream_markers(response)
             if provider_payload:
-                return {"content": content, **provider_payload}
+                return stamp_stream_markers({"content": content, **provider_payload})
             return content
 
         task: asyncio.Future[Any] = asyncio.ensure_future(consume_stream())
@@ -615,6 +681,35 @@ class PatternRuntime:
             raise
         finally:
             self._active_llm_tasks.discard(task)
+
+    def _stamp_stream_fallback(
+        self,
+        response: Any,
+        stream_finish_reason: str,
+        *,
+        stream_aborted: Any = None,
+        stream_usage: dict[str, Any] | None = None,
+    ) -> Any:
+        """Mark a non-streaming retry taken because the stream had no payload.
+
+        ``stream_fallback`` says the retry happened; ``stream_finish_reason``
+        is how the discarded stream ended (``no_progress`` for an abort,
+        ``length`` for a cap cut); ``stream_aborted`` names the predicate
+        that aborted it; ``stream_usage`` is the discarded stream's usage
+        when the provider sent one. ``on_llm_end`` lifts all of them onto
+        ``llm_call_end``. A bare-string response cannot carry them and is
+        returned unchanged.
+        """
+        if not isinstance(response, dict):
+            return response
+        response["stream_fallback"] = NO_PAYLOAD_STREAM_FALLBACK
+        if stream_finish_reason:
+            response["stream_finish_reason"] = stream_finish_reason
+        if isinstance(stream_aborted, str) and stream_aborted:
+            response[STREAM_ABORTED_KEY] = stream_aborted
+        if stream_usage:
+            response["stream_usage"] = dict(stream_usage)
+        return response
 
     async def _raise_if_interrupted(self, message: str) -> None:
         if await self.should_interrupt():
@@ -699,7 +794,7 @@ class PatternRuntime:
             raw = model_dump()
         if not isinstance(raw, dict):
             return
-        for key in ("reasoning_content", "reasoning"):
+        for key in ("reasoning_content", "reasoning", STREAM_ABORTED_KEY):
             if key in raw and raw[key] is not None:
                 current[key] = raw[key]
         provider_state = raw.get("_xagent_provider_state")
@@ -913,6 +1008,14 @@ class PatternRuntime:
             else nullcontext()
         )
         async with gate:
+            if (
+                isinstance(context, ExecutionContext)
+                and context_checkpoint_gate(context).injection_uncertain
+            ):
+                # Tool steps after the fence may re-run on explicit resume.
+                raise ExecutionInterrupted(
+                    "Injection outcome unknown; explicit resume must reload the checkpoint."
+                )
             payload = self._build_checkpoint_payload(
                 label=label,
                 context=context,
@@ -923,6 +1026,35 @@ class PatternRuntime:
             self.last_checkpoint = payload
             self.checkpoints.append(payload)
             await self._emit_checkpoint(payload)
+            return payload
+
+    async def checkpoint_context_tail(
+        self, label: str, *, context: ExecutionContext
+    ) -> dict[str, Any] | None:
+        """Re-persist the last checkpoint with context changes made after it.
+
+        The runner still edits the context once the pattern's final checkpoint
+        is written (it appends or rewrites the delivered answer). The pattern
+        state is reused from that checkpoint, never rebuilt, because the
+        pattern has already returned. Returns ``None`` when nothing was
+        written: no checkpoint in this run, a fenced context, or no change.
+        """
+        gate = context_checkpoint_gate(context)
+        async with gate.shared():
+            baseline = self.last_checkpoint
+            if baseline is None or gate.injection_uncertain:
+                return None
+            # ``to_dict`` snapshots every container a writer mutates in place,
+            # so the stored payload is an exact record of what was persisted
+            # and equality is precise. It is also the serialization the write
+            # itself needs, so the comparison adds no extra snapshot.
+            context_payload = context.to_dict()
+            if baseline.get("context") == context_payload:
+                return None
+            payload = {**baseline, "label": label, "context": context_payload}
+            await self._emit_checkpoint(payload)
+            self.last_checkpoint = payload
+            self.checkpoints.append(payload)
             return payload
 
     async def send_message(
@@ -954,14 +1086,32 @@ class PatternRuntime:
             "visible": visible,
             "metadata": outbound_metadata,
         }
-        if expect_response or message_type == "question":
+        sources = outbound_metadata.get("tool_calls") or [outbound_metadata]
+        attempts = [source.get("tool_attempt_id") for source in sources]
+        if all(attempts):
+            # One direct message per control attempt; aggregated questions are
+            # a distinct effect of an ordered set of tool attempts. Neither
+            # current run/step nor message text defines occurrence identity.
+            purpose = (
+                "tool-question" if "tool_calls" in outbound_metadata else "tool-message"
+            )
+            payload["event_id"] = str(
+                uuid5(NAMESPACE_URL, json.dumps([purpose, attempts]))
+            )
+        elif expect_response or message_type == "question":
             payload["event_id"] = str(uuid4())
         if step_id:
             payload["step_id"] = str(step_id)
         self.outbound_messages.append(payload)
 
         if self.outbound_message_handler is not None:
-            await self._maybe_await(self.outbound_message_handler(payload))
+            committed = self.outbound_message_handler(payload)
+            if inspect.isawaitable(committed):
+                committed = await committed
+            if all(attempts) and isinstance(committed, dict):
+                # A replay returns the original committed message, including
+                # its source attribution, for waiting-state reconstruction.
+                payload.update(committed)
         elif expect_response or message_type == "question":
             # A dropped question parks the run waiting for a reply that can
             # never arrive, so this is worth a warning.
@@ -1096,6 +1246,20 @@ class PatternRuntime:
                 # pattern exception instead of aborting the run.
                 logger.exception("finish_trace failed while reporting a pattern error")
 
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if (
+            self.tracer is None
+            or getattr(self.tracer, "records_execution_events", False) is not True
+            or not tool_call.get("tool_attempt_id")
+        ):
+            return None
+        return cast(
+            dict[str, Any] | None,
+            await self.tracer.load_committed_tool_outcome(tool_call),
+        )
+
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         # Count one billable action per tool invocation, at invocation time.
         # Deliberately NOT gated on tool success: success is derived from the
@@ -1115,6 +1279,11 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
         }
         assistant_content = tool_call.get("assistant_content")
         if isinstance(assistant_content, str) and assistant_content.strip():
@@ -1148,6 +1317,11 @@ class PatternRuntime:
                 "tool_name": tool_call.get("name"),
                 "tool_params": tool_call.get("args", {}),
                 "tool_call_id": tool_call.get("id"),
+                **{
+                    key: tool_call[key]
+                    for key in ("assistant_message_id", "tool_attempt_id")
+                    if key in tool_call
+                },
                 "result": result,
                 "success": False,
                 "status": WAITING_FOR_USER_STATUS,
@@ -1185,6 +1359,11 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
             "result": result,
             "success": True,
         }
@@ -1215,6 +1394,11 @@ class PatternRuntime:
             "error_message": str(error),
             "tool_name": tool_call.get("name"),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
         }
         if result is not None:
             data["result"] = result
@@ -1252,6 +1436,11 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
+            **{
+                key: tool_call[key]
+                for key in ("assistant_message_id", "tool_attempt_id")
+                if key in tool_call
+            },
             "success": False,
             "interrupted": True,
             "interrupt_reason": cancellation_reason,
@@ -1355,6 +1544,12 @@ class PatternRuntime:
                 prompt_message_count=len(getattr(context, "messages", [])),
             )
         cached_tokens = self._extract_cached_tokens(response)
+        finish_reason = self._get_value(response, "finish_reason")
+        usage_missing = self._get_value(response, "usage_missing") is True
+        stream_fallback = self._get_value(response, "stream_fallback")
+        stream_finish_reason = self._get_value(response, "stream_finish_reason")
+        stream_aborted = self._get_value(response, STREAM_ABORTED_KEY)
+        stream_usage = self._get_value(response, "stream_usage")
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
@@ -1372,6 +1567,32 @@ class PatternRuntime:
                     else {}
                 ),
                 **({"cached_input_tokens": cached_tokens} if cached_tokens else {}),
+                **(
+                    {"finish_reason": finish_reason}
+                    if isinstance(finish_reason, str) and finish_reason
+                    else {}
+                ),
+                **({"usage_missing": True} if usage_missing else {}),
+                **(
+                    {"stream_fallback": stream_fallback}
+                    if isinstance(stream_fallback, str) and stream_fallback
+                    else {}
+                ),
+                **(
+                    {"stream_finish_reason": stream_finish_reason}
+                    if isinstance(stream_finish_reason, str) and stream_finish_reason
+                    else {}
+                ),
+                **(
+                    {STREAM_ABORTED_KEY: stream_aborted}
+                    if isinstance(stream_aborted, str) and stream_aborted
+                    else {}
+                ),
+                **(
+                    {"stream_usage": dict(stream_usage)}
+                    if isinstance(stream_usage, dict) and stream_usage
+                    else {}
+                ),
                 **event_metadata,
             },
         )
@@ -1505,9 +1726,10 @@ class PatternRuntime:
             ]
             if not budgets:
                 raise
-            if retry_on(exc):
+            if _budget_cannot_help(exc):
                 # Transient by class -- the LLM object is already wrapped in
-                # backoff retries, so reaching here means those are spent.
+                # backoff retries, so reaching here means those are spent --
+                # or a guarded model's failure that is not about the budget.
                 # Sending the same request again with a smaller output budget
                 # would not address the cause and would double an outage's
                 # cost, for a fallback that is free.
@@ -1533,7 +1755,7 @@ class PatternRuntime:
                     exc = retry_exc
                     if (
                         is_context_length_error(retry_exc)
-                        or retry_on(retry_exc)
+                        or _budget_cannot_help(retry_exc)
                         or self._interrupt_requested
                     ):
                         break
@@ -1678,7 +1900,7 @@ class PatternRuntime:
                                 "llm_summary_unusable": True,
                                 **request_metadata,
                             }
-                    except LLMCallInterrupted:
+                    except (LLMCallInterrupted, ExecutionEventPersistenceError):
                         raise
                     except Exception as exc:  # noqa: BLE001
                         await self.on_llm_error(
@@ -1981,7 +2203,11 @@ class PatternRuntime:
         # truncates bulky content (messages, response, tool_calls, ...).
         # Non-LLM categories (TOOL / DAG / REACT / COMPACT / GENERAL)
         # pass through unchanged.
-        if data and getattr(event_type, "category", None) == TraceCategory.LLM:
+        if (
+            data
+            and getattr(event_type, "category", None) == TraceCategory.LLM
+            and getattr(self.tracer, "records_execution_events", False) is not True
+        ):
             data = normalize_llm_trace_payload(data)
         try:
             await self._maybe_await(
@@ -1992,6 +2218,8 @@ class PatternRuntime:
                     data=data or {},
                 )
             )
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
             # UI trace events are best-effort; checkpoint persistence remains strict.
             return
@@ -2014,11 +2242,11 @@ class PatternRuntime:
         # user Message's own metadata (AgentRunner.inject_user_message's
         # _ensure_user_message_turn_id), which is guaranteed fresh per turn.
         # Deliberately NOT stashed in context.metadata instead: that dict is
-        # scoped to the whole execution/task, not one turn - it's the SAME
-        # object reused across every follow-up message in the task
-        # (inject_user_message calls context_manager.get_context, never
-        # rebuilding it), so a value stored there would persist unchanged
-        # into turn 2, 3, etc., never actually distinguishing runs.
+        # scoped to the whole execution/task, not one turn - it's carried
+        # across every follow-up message in the task (reused from the context
+        # cache while a run or injection holds it, otherwise restored from the
+        # checkpoint), so a value stored there would persist unchanged into
+        # turn 2, 3, etc., never actually distinguishing runs.
         messages = getattr(context, "messages", None) or []
         for message in reversed(messages):
             if getattr(message, "role", None) != "user":

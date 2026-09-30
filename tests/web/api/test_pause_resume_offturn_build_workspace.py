@@ -183,7 +183,7 @@ async def test_pause_cache_miss_builds_under_resolver_namespace_not_snapshot(
             patch.object(
                 command_execution_service,
                 "_apply_pause_requested_isolated",
-                lambda *a, **k: True,
+                lambda *a, **k: command_execution_service.PauseWriteOutcome.APPLIED,
             )
         )
         _enter_build_only_patches(stack, manager)
@@ -412,7 +412,7 @@ async def test_pause_cache_hit_returns_running_agent_without_new_namespace(
             patch.object(
                 command_execution_service,
                 "_apply_pause_requested_isolated",
-                lambda *a, **k: True,
+                lambda *a, **k: command_execution_service.PauseWriteOutcome.APPLIED,
             )
         )
         stack.enter_context(

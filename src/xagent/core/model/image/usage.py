@@ -112,6 +112,57 @@ def _read_raw(payload: Any, *names: str) -> Any:
     return 0 if fallback is _ABSENT else fallback
 
 
+def _read_optional_raw(payload: Any, *names: str) -> Any:
+    """First usable provider count, or ``_ABSENT`` when none is available.
+
+    This is for optional schema fields where missing/invalid must not collapse
+    into the provider explicitly reporting zero.
+    """
+    if payload is None:
+        return _ABSENT
+    for name in names:
+        try:
+            value = (
+                payload.get(name)
+                if isinstance(payload, dict)
+                else getattr(payload, name, None)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Reading optional usage field %r failed: %s", name, e)
+            continue
+        tokens = _usable_modality_token_count(value)
+        if tokens is not None:
+            return tokens
+    return _ABSENT
+
+
+def _usable_modality_token_count(value: Any) -> Optional[int]:
+    """A provider-reported whole non-negative modality count, else ``None``."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= _MAX_TOKENS else None
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            text = value.decode() if isinstance(value, (bytes, bytearray)) else value
+            tokens = int(text.strip())
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return None
+        return tokens if 0 <= tokens <= _MAX_TOKENS else None
+    try:
+        numeric = float(value)
+    except Exception:  # noqa: BLE001
+        return None
+    if (
+        not math.isfinite(numeric)
+        or numeric < 0
+        or numeric > _MAX_TOKENS
+        or not numeric.is_integer()
+    ):
+        return None
+    return int(numeric)
+
+
 def _is_authoritative_zero(value: Any) -> bool:
     """Whether a value that ``int()`` reduced to 0 *is* the provider's zero.
 
@@ -381,6 +432,17 @@ def record_image_usage(
         # module docstring for why pre-coercion here loses rows.
         input_tokens = _read_raw(usage, "prompt_tokens", "input_tokens")
         output_tokens = _read_raw(usage, "completion_tokens", "output_tokens")
+        try:
+            input_token_details = (
+                usage.get("input_tokens_details")
+                if isinstance(usage, dict)
+                else getattr(usage, "input_tokens_details", None)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Reading input token details failed: %s", e)
+            input_token_details = None
+        text_input_tokens = _read_optional_raw(input_token_details, "text_tokens")
+        image_input_tokens = _read_optional_raw(input_token_details, "image_tokens")
         quantity = 1 if image_count is _ABSENT else image_count
         reported = _first_usable_count(
             reported_count_from, "image_count", "output_image_count"
@@ -390,6 +452,11 @@ def record_image_usage(
         reported_resolution = _reported_dimensions(reported_size_from)
         if reported_resolution:
             resolution = reported_resolution
+        modality_kwargs: dict[str, Any] = {}
+        if text_input_tokens is not _ABSENT:
+            modality_kwargs["provider_text_input_tokens"] = text_input_tokens
+        if image_input_tokens is not _ABSENT:
+            modality_kwargs["provider_image_input_tokens"] = image_input_tokens
         add_media_usage(
             call_type=call_type,
             quantity=quantity,
@@ -403,6 +470,7 @@ def record_image_usage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             resolution=resolution,
+            **modality_kwargs,
         )
     except Exception as e:  # noqa: BLE001
         # exc_info: a persisted billing row cannot be repaired after the

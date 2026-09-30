@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from ...core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from ..models.task import TaskStatus
@@ -11,6 +11,20 @@ from .assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
 from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 
 EMPTY_CHANNEL_OUTPUT_FALLBACK = "Task completed, but no output was generated."
+
+
+def completion_outcome_for_status(
+    result: Mapping[str, Any] | None, status: TaskStatus
+) -> str | None:
+    """Keep semantic completion separate from failed or suspended execution."""
+    if status != TaskStatus.COMPLETED or result is None:
+        return None
+    outcome = result.get("completion_outcome")
+    return (
+        outcome
+        if isinstance(outcome, str) and outcome in {"completed", "partial", "blocked"}
+        else None
+    )
 
 
 @dataclass(frozen=True)
@@ -21,6 +35,7 @@ class ChannelExecutionProjection:
     message_type: str
     interactions: list[dict[str, Any]]
     diagnostic_error: str | None
+    completion_outcome: str | None
 
 
 def project_execution_result_for_channel(
@@ -73,6 +88,7 @@ def project_execution_result_for_channel(
         else ASSISTANT_RESPONSE_MESSAGE_TYPE,
         interactions=interactions,
         diagnostic_error=diagnostic_error,
+        completion_outcome=completion_outcome_for_status(result, task_status),
     )
 
 

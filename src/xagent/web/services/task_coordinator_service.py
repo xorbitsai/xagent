@@ -235,6 +235,7 @@ def begin_task_execution_no_commit(
     control_state = TaskControlState.RUNNING.value
     values = {
         "status": task_status_predicate.value(TaskStatus.RUNNING),
+        "completion_outcome": None,
         "control_state": control_state,
         "state_version": lease_state_version_case(
             TaskStatus.RUNNING, control_state, func.coalesce(Task.state_version, 0)
@@ -265,6 +266,11 @@ def begin_task_execution_no_commit(
     ).scalar_one_or_none()
     if started_run is None:
         return None
+    from .task_admission_execution import require_execution_admission
+
+    require_execution_admission(
+        db, lease.task_id, continuing_run_id=None if new_run else str(started_run)
+    )
     return TaskExecutionContext(lease=lease, run_id=str(started_run))
 
 

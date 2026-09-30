@@ -327,8 +327,10 @@ async def test_batch_commit_failure_is_not_acknowledged(
         await registry.close()
 
 
+@pytest.mark.parametrize("kind", ["pause", "cancel"])
+@pytest.mark.timeout(30)
 async def test_brief_deferral_still_allows_command_and_close_release(
-    engine, task_id, monkeypatch
+    engine, task_id, monkeypatch, kind
 ):
     if engine.dialect.name != "postgresql":
         pytest.skip("PostgreSQL row locks")
@@ -349,7 +351,7 @@ async def test_brief_deferral_still_allows_command_and_close_release(
         execute = AsyncMock(return_value="applied")
         assert (
             await owner.execute_command(
-                SimpleNamespace(kind=SimpleNamespace(value="stop")), execute
+                SimpleNamespace(kind=SimpleNamespace(value=kind)), execute
             )
             == "applied"
         )

@@ -7,6 +7,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import DataError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
+from tests.web.pool_contention_shared import GUARD_TIMEOUT
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_database_shared import task_id as task_id_fixture
 from xagent.web.models.chat_message import TaskChatMessage
@@ -216,6 +217,23 @@ def test_missing_identity_must_never_renew(scenario, field):
     )
 
 
+@pytest.fixture
+def inline_db_io(monkeypatch):
+    """Keep fake-clock scheduling tests independent of thread-pool latency.
+
+    Only for stubs that return immediately; blocking stubs must keep the
+    worker boundary to avoid stalling the event loop.
+
+    Tests of real locks, in-flight replacement and cancellation deliberately
+    keep the production database worker boundary instead.
+    """
+
+    async def run_inline(operation):
+        return operation()
+
+    monkeypatch.setattr(ls, "run_db_io_cancellation_safe", run_inline)
+
+
 def _manager_with_clock(monkeypatch):
     """Advance heartbeat deadlines without wall-clock sleeps or short SQL budgets."""
     from unittest.mock import Mock
@@ -239,11 +257,13 @@ async def _advance_heartbeat(manager, clock, settled, at):
     settled.clear()
     clock.time.return_value = at
     manager._wake_event.set()
-    await asyncio.wait_for(settled.wait(), timeout=2)
+    await asyncio.wait_for(settled.wait(), timeout=GUARD_TIMEOUT)
 
 
 @pytest.mark.asyncio
-async def test_deferred_subset_retries_without_speeding_up_healthy_leases(monkeypatch):
+async def test_deferred_subset_retries_without_speeding_up_healthy_leases(
+    monkeypatch, inline_db_io
+):
     manager, clock, settled = _manager_with_clock(monkeypatch)
     batch = tuple(
         ls.TaskLease(task_id=i, runner_id="r", run_id="run", attempt_id="a")
@@ -287,7 +307,7 @@ async def test_deferred_subset_retries_without_speeding_up_healthy_leases(monkey
 
 
 @pytest.mark.asyncio
-async def test_retry_database_error_waits_for_normal_tick(monkeypatch):
+async def test_retry_database_error_waits_for_normal_tick(monkeypatch, inline_db_io):
     manager, clock, settled = _manager_with_clock(monkeypatch)
     lease = ls.TaskLease(task_id=1, runner_id="r", run_id="run", attempt_id="a")
     calls = []
@@ -309,8 +329,8 @@ async def test_retry_database_error_waits_for_normal_tick(monkeypatch):
         await _advance_heartbeat(manager, clock, settled, 40)
         assert len(calls) == 3
         assert registration._entry.retry_at == 41
-        await asyncio.wait_for(registration.close(), 1)
-        await asyncio.wait_for(manager.wait_until_idle(), 1)
+        await asyncio.wait_for(registration.close(), GUARD_TIMEOUT)
+        await asyncio.wait_for(manager.wait_until_idle(), GUARD_TIMEOUT)
         assert len(calls) == 3  # Closing does not wait for a future retry.
     finally:
         await registration.close()
@@ -332,7 +352,7 @@ async def test_late_deferred_result_cannot_schedule_replacement_registration(
         calls.append(items)
         if len(calls) == 1:
             ready.set()
-            assert release.wait(5)
+            assert release.wait(GUARD_TIMEOUT)
             return {ls._task_lease_key(lease): DEFERRED}
         return {
             ls._task_lease_key(item): ls.TaskLeaseRefreshState.REFRESHED
@@ -347,7 +367,7 @@ async def test_late_deferred_result_cannot_schedule_replacement_registration(
         await asyncio.sleep(0)
         clock.time.return_value = 20
         manager._wake_event.set()
-        assert await asyncio.to_thread(ready.wait, 2)
+        assert await asyncio.to_thread(ready.wait, GUARD_TIMEOUT)
         closing = asyncio.create_task(old.close())
         await asyncio.sleep(0)
         assert not closing.done()
@@ -356,7 +376,7 @@ async def test_late_deferred_result_cannot_schedule_replacement_registration(
         new = manager.register(lease)
         assert old._entry is not new._entry
         release.set()
-        await asyncio.wait_for(closing, 2)
+        await asyncio.wait_for(closing, GUARD_TIMEOUT)
         assert new._entry.retry_at is None
         await _advance_heartbeat(manager, clock, settled, 40)
         assert calls == [(lease,), (lease,)]
@@ -463,7 +483,9 @@ def test_preexecution_validation_waits_for_definitive_ownership(scenario, monkey
 
 
 @pytest.mark.asyncio
-async def test_slow_subset_retry_does_not_skip_normal_batch_deadline(monkeypatch):
+async def test_slow_subset_retry_does_not_skip_normal_batch_deadline(
+    monkeypatch, inline_db_io
+):
     manager, clock, settled = _manager_with_clock(monkeypatch)
     batch = tuple(
         ls.TaskLease(task_id=i, runner_id="r", run_id="run", attempt_id="a")
@@ -492,7 +514,7 @@ async def test_slow_subset_retry_does_not_skip_normal_batch_deadline(monkeypatch
         await asyncio.sleep(0)
         await _advance_heartbeat(manager, clock, settled, 20)
         await _advance_heartbeat(manager, clock, settled, 21)
-        await asyncio.wait_for(normal_batch.wait(), 2)
+        await asyncio.wait_for(normal_batch.wait(), GUARD_TIMEOUT)
         assert calls == [batch, (batch[1],), batch]
     finally:
         for registration in registrations:
@@ -516,7 +538,7 @@ async def test_repeated_cancellation_drains_inflight_retry(monkeypatch):
             return {ls._task_lease_key(lease): DEFERRED}
         try:
             ready.set()
-            assert release.wait(5)
+            assert release.wait(GUARD_TIMEOUT)
             return {ls._task_lease_key(lease): ls.TaskLeaseRefreshState.REFRESHED}
         finally:
             finished.set()
@@ -529,7 +551,7 @@ async def test_repeated_cancellation_drains_inflight_retry(monkeypatch):
         await _advance_heartbeat(manager, clock, settled, 20)
         clock.time.return_value = 21
         manager._wake_event.set()
-        assert await asyncio.to_thread(ready.wait, 2)
+        assert await asyncio.to_thread(ready.wait, GUARD_TIMEOUT)
         for _ in range(2):
             heartbeat.cancel()
             await asyncio.sleep(0)
@@ -538,9 +560,9 @@ async def test_repeated_cancellation_drains_inflight_retry(monkeypatch):
             assert not finished.is_set()
         release.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(heartbeat, 2)
+            await asyncio.wait_for(heartbeat, GUARD_TIMEOUT)
         assert finished.is_set()
-        await asyncio.wait_for(manager.wait_until_idle(), 2)
+        await asyncio.wait_for(manager.wait_until_idle(), GUARD_TIMEOUT)
         assert len(calls) == 2
         assert not manager._entries
     finally:

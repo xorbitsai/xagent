@@ -33,6 +33,9 @@ MAX_RETRY_AFTER_SECONDS = 30
 MAX_SEARCH_THREADS = 20
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_SLACK_FILE_ALLOWED_DIRS"
 _CHANNEL_ACCESS_POLICY_ENV_VAR = "XAGENT_SLACK_CHANNEL_ACCESS_POLICY"
+_READ_CAPABILITY = "read"
+_WRITE_CAPABILITY = "write"
+_SUPPORTED_POLICY_CAPABILITIES = frozenset({_READ_CAPABILITY})
 
 # Slack conversation ids are uppercase alphanumerics prefixed by their
 # conversation type: "C" (public channel), "G" (private channel or
@@ -61,7 +64,9 @@ def _policy_now() -> float:
     return time.time()
 
 
-def _channel_access_policy() -> frozenset[str] | None:
+def _channel_access_policy(
+    required_capability: str = _READ_CAPABILITY,
+) -> frozenset[str] | None:
     """Load the trusted child policy; absence preserves standalone behavior."""
 
     raw = os.environ.get(_CHANNEL_ACCESS_POLICY_ENV_VAR)
@@ -73,9 +78,10 @@ def _channel_access_policy() -> frozenset[str] | None:
             raise ValueError
         channel_ids = payload["channel_ids"]
         expires_at = payload["expires_at"]
+        capabilities = payload["capabilities"]
         if (
             type(payload.get("version")) is not int
-            or payload["version"] != 1
+            or payload["version"] != 2
             or type(channel_ids) is not list
             or any(
                 not isinstance(channel_id, str)
@@ -87,9 +93,19 @@ def _channel_access_policy() -> frozenset[str] | None:
             or not isinstance(expires_at, (int, float))
             or not math.isfinite(float(expires_at))
             or _policy_now() >= float(expires_at)
+            or type(capabilities) is not list
+            or any(not isinstance(capability, str) for capability in capabilities)
+            or len(capabilities) != len(set(capabilities))
+            or frozenset(capabilities) != _SUPPORTED_POLICY_CAPABILITIES
         ):
             raise ValueError
+        if required_capability not in capabilities:
+            raise _SlackChannelAccessDenied(
+                "Slack runtime policy does not allow this operation"
+            )
         return frozenset(channel_ids)
+    except _SlackChannelAccessDenied:
+        raise
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         raise _SlackChannelAccessDenied(
             "Slack channel access policy is unavailable or expired"
@@ -544,6 +560,7 @@ def slack_join_channel(channel: str) -> str:
     to run `/invite @<this app's bot name>` instead.
     """
     try:
+        _channel_access_policy(_WRITE_CAPABILITY)
         channel_id = _resolve_channel_id(channel)
         # A missing_scope failure here (e.g. a connection that hasn't been
         # reconnected since channels:join was added) already gets a
@@ -707,7 +724,7 @@ def slack_post_message(channel: str, text: str, thread_ts: str = "") -> str:
     fails with not_in_channel; ask a member to `/invite` the bot there.
     """
     try:
-        policy = _channel_access_policy()
+        policy = _channel_access_policy(_WRITE_CAPABILITY)
         resolved_channel = (
             _normalize_channel(channel)
             if policy is None
@@ -1195,6 +1212,7 @@ def _set_reaction(action: str, channel: str, timestamp: str, emoji_name: str) ->
     action: the Slack API method suffix — "add" or "remove"."""
     name = emoji_name.strip().strip(":")
     try:
+        _channel_access_policy(_WRITE_CAPABILITY)
         channel_id = _resolve_channel_id(channel)
         _request_requiring_membership(
             "POST",
@@ -1267,6 +1285,7 @@ def slack_upload_file(
     storage.
     """
     try:
+        _channel_access_policy(_WRITE_CAPABILITY)
         channel_id = _resolve_channel_id(channel)
         local_path = _resolve_allowed_file_path(file_path)
         resolved_filename = filename.strip() or local_path.name

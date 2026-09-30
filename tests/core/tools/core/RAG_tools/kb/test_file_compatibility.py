@@ -25,6 +25,7 @@ def test_kb_file_compatibility_methods_match_public_helper_signatures() -> None:
             kb_file_service.upsert_uploaded_file_record,
         ),
         (facade.list_documents_for_user, kb_file_service.list_documents_for_user),
+        (facade.find_referenced_file_ids, kb_file_service.find_referenced_file_ids),
         (
             facade.build_uploaded_filename_map,
             kb_file_service.build_uploaded_filename_map,
@@ -110,26 +111,19 @@ def test_public_collection_helper_delegates_through_facade(monkeypatch) -> None:
 
 def test_file_status_aggregation_impl_uses_status_private_impl(monkeypatch) -> None:
     """File private impl should not re-enter the public management wrapper."""
+    from xagent.core.tools.core.RAG_tools.storage.contracts import DocumentRecord
     from xagent.web.services import kb_file_service
 
-    class FakeQuery:
-        def where(self, _filter: str) -> "FakeQuery":
-            return self
+    class FakeStore:
+        def list_document_records_by_file_ids(self, _file_ids):
+            return [
+                DocumentRecord(
+                    doc_id="doc-1", file_id="file-1", user_id=7, collection="kb"
+                )
+            ]
 
-        def select(self, _columns: list[str]) -> "FakeQuery":
-            return self
-
-        def limit(self, _limit: int) -> "FakeQuery":
-            return self
-
-    class FakeTable:
-        def search(self) -> FakeQuery:
-            return FakeQuery()
-
-    class FakeConnection:
-        def open_table(self, table_name: str) -> FakeTable:
-            assert table_name == "documents"
-            return FakeTable()
+        def list_indexed_doc_refs(self, _doc_refs, user_id, is_admin):
+            return set()
 
     load_calls: list[dict[str, object]] = []
 
@@ -137,20 +131,11 @@ def test_file_status_aggregation_impl_uses_status_private_impl(monkeypatch) -> N
         load_calls.append(dict(kwargs))
         return [{"doc_id": "doc-1", "status": "success"}]
 
-    monkeypatch.setattr(kb_file_service, "get_connection_from_env", FakeConnection)
-    monkeypatch.setattr(kb_file_service, "ensure_documents_table", lambda _conn: None)
-    monkeypatch.setattr(
-        kb_file_service,
-        "query_to_list",
-        lambda _query: [{"file_id": "file-1", "collection": "kb", "doc_id": "doc-1"}],
-    )
+    monkeypatch.setattr(kb_file_service, "get_vector_index_store", FakeStore)
     monkeypatch.setattr(
         kb_file_service,
         "_load_ingestion_status_impl",
         fake_load_ingestion_status_impl,
-    )
-    monkeypatch.setattr(
-        kb_file_service, "_load_indexed_doc_refs", lambda *_, **__: set()
     )
 
     result = kb_file_service._aggregate_uploaded_file_statuses_impl(
@@ -187,6 +172,7 @@ def test_collection_uploaded_file_cleanup_impl_uses_file_private_impl(
         file_id: str,
         user_id: int,
         remaining_file_ids: set[str],
+        after_commit: list[object],
     ) -> bool:
         calls.append(
             {
@@ -210,10 +196,11 @@ def test_collection_uploaded_file_cleanup_impl_uses_file_private_impl(
         collection_file_ids={"file-a", "file-b"},
         remaining_file_ids={"file-b"},
         collection_dir=None,
+        after_commit=[],
     )
 
     assert result == 1
-    assert commit_calls == [True]
+    assert commit_calls == []
     assert sorted(calls, key=lambda call: str(call["file_id"])) == [
         {
             "db": fake_db,

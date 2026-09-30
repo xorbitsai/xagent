@@ -69,7 +69,14 @@ from ..core.schemas import (
     SparseSearchResponse,
 )
 from ..LanceDB.model_tag_utils import to_model_tag
-from ..LanceDB.schema_manager import _safe_close_table
+from ..LanceDB.schema_manager import (
+    _safe_close_table,
+    ensure_chunks_table,
+    ensure_documents_table,
+    ensure_ingestion_runs_table,
+    ensure_main_pointers_table,
+    ensure_parses_table,
+)
 from ..retrieval.search_hybrid import _linear_fusion, _rrf_fusion
 from ..storage.contracts import (
     FilterCondition,
@@ -83,10 +90,15 @@ from ..storage.contracts import (
 from ..utils import check_file_type, compute_file_hash
 from ..utils.filter_utils import parse_legacy_filters, validate_filter_depth
 from ..utils.hash_utils import compute_chunk_hash
-from ..utils.lancedb_query_utils import build_fts_query
+from ..utils.lancedb_query_utils import build_fts_query, list_table_names, query_to_list
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
-from ..utils.string_utils import generate_deterministic_doc_id
-from .models import KBBackendCapabilities, KBCollectionContext, KBStorageBackend
+from ..utils.string_utils import escape_lancedb_string, generate_deterministic_doc_id
+from .models import (
+    KBBackendCapabilities,
+    KBCollectionContext,
+    KBDocumentRowsSnapshot,
+    KBStorageBackend,
+)
 from .version_compatibility import (
     KBMainPointerSnapshot,
     KBVersionCandidateCleanupSnapshot,
@@ -164,6 +176,106 @@ def validate_query_vector_format(query_vector: list[float]) -> None:
             raise VectorValidationError(
                 "query_vector contains invalid values (NaN or infinity)"
             )
+
+
+_DOCUMENT_ROW_KEYS: dict[str, tuple[str, ...]] = {
+    "documents": ("collection", "doc_id"),
+    "parses": ("collection", "doc_id", "parse_hash"),
+    "chunks": ("collection", "doc_id", "parse_hash", "chunk_id"),
+    "main_pointers": ("collection", "doc_id", "step_type", "model_tag"),
+    "ingestion_runs": ("collection", "doc_id"),
+}
+_EMBEDDING_ROW_KEY = ("collection", "doc_id", "chunk_id", "parse_hash", "model")
+
+
+def _document_row_key_columns(table_name: str) -> tuple[str, ...] | None:
+    if table_name.startswith("embeddings_"):
+        return _EMBEDDING_ROW_KEY
+    return _DOCUMENT_ROW_KEYS.get(table_name)
+
+
+def _lancedb_literal(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return f"'{escape_lancedb_string(str(value))}'"
+
+
+def _any_of(filters: list[str]) -> str:
+    return " or ".join(f"({filter_expr})" for filter_expr in filters)
+
+
+def _owned_row_filter(
+    table: Any, clauses: list[str], *, user_id: int, is_admin: bool
+) -> str:
+    if not is_admin and "user_id" in (
+        getattr(getattr(table, "schema", None), "names", None) or []
+    ):
+        clauses = [*clauses, f"user_id = {int(user_id)}"]
+    return " and ".join(clauses)
+
+
+def _row_key_filter(
+    table: Any,
+    row: dict[str, Any],
+    key_columns: tuple[str, ...],
+    *,
+    user_id: int,
+    is_admin: bool,
+) -> str:
+    clauses = [
+        f"{column} IS NULL"
+        if row.get(column) is None
+        else f"{column} = {_lancedb_literal(row.get(column))}"
+        for column in key_columns
+    ]
+    return _owned_row_filter(table, clauses, user_id=user_id, is_admin=is_admin)
+
+
+def _restore_document_table_rows(
+    table: Any,
+    *,
+    table_name: str,
+    snapshot_rows: list[dict[str, Any]],
+    current_rows: list[dict[str, Any]],
+    user_id: int,
+    is_admin: bool,
+) -> None:
+    """Upsert old rows before deleting stale rows introduced by a failed refresh."""
+    key_columns = _document_row_key_columns(table_name)
+    if key_columns is None:
+        delete_filters = [
+            _row_key_filter(
+                table, row, ("collection", "doc_id"), user_id=user_id, is_admin=is_admin
+            )
+            for row in current_rows
+        ]
+        if delete_filters:
+            table.delete(_any_of(delete_filters))
+        if snapshot_rows:
+            table.add(snapshot_rows)
+        return
+
+    if snapshot_rows:
+        (
+            table.merge_insert(list(key_columns))
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(snapshot_rows)
+        )
+
+    def row_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(row.get(column) for column in key_columns)
+
+    snapshot_keys = {row_key(row) for row in snapshot_rows}
+    delete_filters = [
+        _row_key_filter(table, row, key_columns, user_id=user_id, is_admin=is_admin)
+        for row in current_rows
+        if row_key(row) not in snapshot_keys
+    ]
+    if delete_filters:
+        table.delete(_any_of(delete_filters))
 
 
 class KBHandleProvider:
@@ -247,6 +359,25 @@ class KBCollectionHandle(ABC):
         self, doc_id: str, *, user_id: int | None = None, is_admin: bool = False
     ) -> int:
         """Idempotently delete a newly created document row (compensation)."""
+
+    @abstractmethod
+    def capture_document_rows(
+        self, doc_ids: Sequence[str], *, user_id: int, is_admin: bool
+    ) -> KBDocumentRowsSnapshot:
+        """Capture these documents' rows across the document and embedding tables.
+
+        Non-admin reads are limited to ``user_id`` on tables with that column.
+        """
+
+    @abstractmethod
+    def restore_document_rows(
+        self, snapshot: KBDocumentRowsSnapshot, *, user_id: int, is_admin: bool
+    ) -> None:
+        """Upsert the snapshot's rows and delete its documents' rows it lacks.
+
+        Reads and deletes are limited to ``user_id`` on tables with that column;
+        upserts match by row key only.
+        """
 
     # --- Parse data-plane (#509) ---
 
@@ -1181,6 +1312,132 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     ) -> int:
         """Idempotently delete a newly created document row (row-only)."""
         return self.delete_document_record(doc_id, user_id=user_id, is_admin=is_admin)
+
+    def _document_row_connection(self) -> Any:
+        conn = self.vector_index_store.get_raw_connection()
+        ensure_documents_table(conn)
+        ensure_parses_table(conn)
+        ensure_chunks_table(conn)
+        ensure_main_pointers_table(conn)
+        ensure_ingestion_runs_table(conn)
+        return conn
+
+    def _read_document_rows(
+        self, table: Any, doc_ids: Sequence[str], *, user_id: int, is_admin: bool
+    ) -> list[dict[str, Any]]:
+        if not doc_ids:
+            return []
+        safe_collection = escape_lancedb_string(self.context.collection)
+        doc_filters = [
+            _owned_row_filter(
+                table,
+                [
+                    f"collection = '{safe_collection}'",
+                    f"doc_id = '{escape_lancedb_string(doc_id)}'",
+                ],
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+            for doc_id in doc_ids
+        ]
+        return query_to_list(table.search().where(_any_of(doc_filters)).limit(-1))
+
+    def capture_document_rows(
+        self, doc_ids: Sequence[str], *, user_id: int, is_admin: bool
+    ) -> KBDocumentRowsSnapshot:
+        """Capture every row of ``doc_ids`` in the document and embedding tables.
+
+        Non-admin reads are limited to ``user_id`` on tables with that column.
+        """
+        if isinstance(doc_ids, str):
+            raise DocumentValidationError(
+                "doc_ids must be a sequence of ids, not a str"
+            )
+        doc_ids = tuple(doc_ids)
+        conn = self._document_row_connection()
+        table_names = set(list_table_names(conn))
+        target_tables = [name for name in _DOCUMENT_ROW_KEYS if name in table_names]
+        target_tables.extend(
+            sorted(name for name in table_names if name.startswith("embeddings_"))
+        )
+        rows_by_table: dict[str, list[dict[str, Any]]] = {}
+        for table_name in target_tables:
+            table = None
+            try:
+                table = conn.open_table(table_name)
+                rows_by_table[table_name] = self._read_document_rows(
+                    table, doc_ids, user_id=user_id, is_admin=is_admin
+                )
+            finally:
+                _safe_close_table(table)
+        return KBDocumentRowsSnapshot(
+            collection=self.context.collection,
+            doc_ids=doc_ids,
+            rows_by_table=rows_by_table,
+        )
+
+    def restore_document_rows(
+        self, snapshot: KBDocumentRowsSnapshot, *, user_id: int, is_admin: bool
+    ) -> None:
+        """Restore a :meth:`capture_document_rows` snapshot table by table.
+
+        Rows of the snapshot's documents that it does not hold are deleted, so
+        rows written after the capture do not survive. Reads and deletes are
+        limited to ``user_id`` on tables with that column; upserts match by row
+        key only.
+        """
+        if snapshot.collection != self.context.collection:
+            raise DocumentValidationError(
+                f"Handle bound to collection {self.context.collection!r} "
+                f"cannot restore a snapshot from {snapshot.collection!r}"
+            )
+        for rows in snapshot.rows_by_table.values():
+            for row in rows:
+                if (
+                    row.get("collection") != self.context.collection
+                    or row.get("doc_id") not in snapshot.doc_ids
+                ):
+                    raise DocumentValidationError(
+                        f"Snapshot of {self.context.collection!r} holds a row of "
+                        f"{row.get('collection')!r}/{row.get('doc_id')!r} "
+                        "outside its documents"
+                    )
+        conn = self._document_row_connection()
+        table_names = set(list_table_names(conn))
+        restore_tables = [
+            name
+            for name in _DOCUMENT_ROW_KEYS
+            if name in table_names or name in snapshot.rows_by_table
+        ]
+        restore_tables.extend(
+            sorted(name for name in table_names if name.startswith("embeddings_"))
+        )
+        for name in snapshot.rows_by_table:
+            if name.startswith("embeddings_") and name not in restore_tables:
+                restore_tables.append(name)
+
+        for table_name in restore_tables:
+            table = None
+            try:
+                table = conn.open_table(table_name)
+                _restore_document_table_rows(
+                    table,
+                    table_name=table_name,
+                    snapshot_rows=snapshot.rows_by_table.get(table_name, []),
+                    current_rows=self._read_document_rows(
+                        table, snapshot.doc_ids, user_id=user_id, is_admin=is_admin
+                    ),
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            finally:
+                _safe_close_table(table)
+
+        invalidate_cache = getattr(
+            self.vector_index_store, "invalidate_table_cache", None
+        )
+        if callable(invalidate_cache):
+            invalidate_cache()
 
     # --- Parse data-plane (#509) ---
 

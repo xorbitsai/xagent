@@ -45,7 +45,7 @@ def test_defaults_pin_legacy_without_events(engine, task_id):
         assert task.conversation_storage_version == 1
         assert task.conversation_event_sequence == 0
         assert load_task_execution_events(db, task_id=task_id, scope_id="root") == []
-        task.conversation_storage_version = 2
+        task.conversation_storage_version = 3
         with pytest.raises(IntegrityError):
             db.flush()
 
@@ -272,3 +272,65 @@ def test_page_size_bounds_and_default_preserve_cursor_pagination(engine, task_id
             db, task_id=task_id, scope_id="root", after_sequence=100
         )
         assert [row.sequence for row in last] == [101]
+
+
+def test_fixed_history_bound_excludes_later_commits_across_scope_gaps(engine, task_id):
+    with Session(engine) as writer:
+        append(writer, task_id, key="first")
+        append(writer, task_id, key="child", scope_id="child-1")
+        append(writer, task_id, key="last")
+        writer.commit()
+    with Session(engine) as reader:
+        high_watermark = reader.scalar(
+            sa.select(Task.conversation_event_sequence).where(Task.id == task_id)
+        )
+        first = load_task_execution_events(
+            reader,
+            task_id=task_id,
+            scope_id="root",
+            through_sequence=high_watermark,
+            limit=1,
+        )
+        assert [row.sequence for row in first] == [1]
+    # End the read transaction: the fixed bound, not snapshot isolation,
+    # must exclude a later commit from the next page.
+    with Session(engine) as writer:
+        append(writer, task_id, key="newer")
+        writer.commit()
+    with Session(engine) as reader:
+        page = load_task_execution_events(
+            reader,
+            task_id=task_id,
+            scope_id="root",
+            after_sequence=1,
+            through_sequence=high_watermark,
+        )
+        assert [row.sequence for row in page] == [3]
+        assert (
+            load_task_execution_events(
+                reader,
+                task_id=task_id,
+                scope_id="root",
+                after_sequence=3,
+                through_sequence=high_watermark,
+            )
+            == []
+        )
+        assert [
+            row.sequence
+            for row in load_task_execution_events(
+                reader,
+                task_id=task_id,
+                scope_id="root",
+                after_sequence=3,
+            )
+        ] == [4]
+        assert (
+            load_task_execution_events(
+                reader,
+                task_id=task_id,
+                scope_id="root",
+                through_sequence=0,
+            )
+            == []
+        )

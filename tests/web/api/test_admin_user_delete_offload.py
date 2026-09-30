@@ -82,6 +82,7 @@ async def test_admin_user_delete_runs_task_purge_off_the_event_loop() -> None:
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": False,
+            "external_cleanup_pending": False,
         }
         assert delete_threads, "no DELETE FROM tasks statement was observed"
         assert loop_thread_ident not in delete_threads, (
@@ -161,6 +162,7 @@ async def test_admin_user_delete_is_fk_safe_under_enforced_foreign_keys() -> Non
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": False,
+            "external_cleanup_pending": False,
         }
         assert db.query(User).filter(User.id == target_id).count() == 0
         assert db.query(Task).filter(Task.id.in_(task_ids)).count() == 0
@@ -253,6 +255,7 @@ async def test_admin_user_delete_runs_keyset_pages_off_the_event_loop(
         assert response == {
             "message": "User deleted successfully",
             "workspace_cleanup_pending": False,
+            "external_cleanup_pending": False,
         }
         # 5 tasks / page size 2 -> 3 full pages plus the terminating empty page.
         assert len(page_threads) == 4, page_threads

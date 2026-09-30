@@ -1916,27 +1916,37 @@ def test_upload_document_rejects_stale_etag_at_content_put(monkeypatch):
         )
 
 
-def test_upload_document_reconciles_committed_timeout(monkeypatch):
+@pytest.mark.parametrize(
+    "put_outcome",
+    [
+        pytest.param(
+            requests.ConnectionError("connection dropped"), id="connection-dropped"
+        ),
+        pytest.param(MockResponse({}, status_code=416), id="stale-content-range"),
+    ],
+)
+def test_upload_document_reconciles_ambiguous_commit(monkeypatch, put_outcome):
+    """A dropped response or stale Content-Range can hide a committed upload."""
     _bypass_edit_checkout(monkeypatch)
     document = Document()
-    buffer = io.BytesIO()
-    document.save(buffer)
-    uploaded = buffer.getvalue()
+    put = Mock(side_effect=[put_outcome])
     responses = iter(
         [
             MockResponse({"uploadUrl": "https://upload.example/session"}),
-            MockResponse(content=uploaded),
             MockResponse({"id": "item-1", "eTag": '"new"'}),
         ]
     )
-    monkeypatch.setattr(
-        word.requests, "request", Mock(side_effect=lambda *a, **k: next(responses))
-    )
-    monkeypatch.setattr(
-        word.requests,
-        "put",
-        Mock(side_effect=requests.ConnectionError("connection dropped")),
-    )
+
+    def request(*args, **kwargs):
+        if kwargs["url"].endswith("/content"):
+            # Echo the committed PUT bytes. Saving the same document again
+            # can produce different ZIP timestamps despite identical content.
+            return MockResponse(content=put.call_args.kwargs["data"])
+        return next(responses)
+
+    mock_request = Mock(side_effect=request)
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(word.requests, "put", put)
 
     result = word._upload_document(
         document,
@@ -1946,41 +1956,8 @@ def test_upload_document_reconciles_committed_timeout(monkeypatch):
 
     assert result["id"] == "item-1"
     assert result["eTag"] == '"new"'
-
-
-def test_upload_document_reconciles_after_stale_content_range(monkeypatch):
-    """A 416 (Content-Range desync, e.g. after a prior ambiguous PUT actually
-    landed more bytes than this session's local offset tracked) is retryable
-    ambiguity, like a dropped connection -- not a definite failure that
-    should discard the in-progress edit before checking whether it already
-    committed."""
-    _bypass_edit_checkout(monkeypatch)
-    document = Document()
-    buffer = io.BytesIO()
-    document.save(buffer)
-    uploaded = buffer.getvalue()
-    responses = iter(
-        [
-            MockResponse({"uploadUrl": "https://upload.example/session"}),
-            MockResponse(content=uploaded),
-            MockResponse({"id": "item-1", "eTag": '"new"'}),
-        ]
-    )
-    monkeypatch.setattr(
-        word.requests, "request", Mock(side_effect=lambda *a, **k: next(responses))
-    )
-    monkeypatch.setattr(
-        word.requests, "put", Mock(return_value=MockResponse({}, status_code=416))
-    )
-
-    result = word._upload_document(
-        document,
-        "Report.docx",
-        _snapshot_for(document),
-    )
-
-    assert result["id"] == "item-1"
-    assert result["eTag"] == '"new"'
+    put.assert_called_once()
+    assert mock_request.call_count == 3
 
 
 def test_upload_document_resumes_from_server_offset(monkeypatch):

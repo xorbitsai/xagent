@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from xagent.core.execution_scope import ExecutionScope
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
@@ -26,6 +27,7 @@ from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
 )
 from xagent.web.services.slack_actor_runtime import (
+    SLACK_ACTOR_RUNTIME_REFRESH_KEY,
     SLACK_CHANNEL_ACCESS_POLICY_ENV,
     SlackActorRuntimeGrant,
     SlackChannelAccessPolicy,
@@ -240,6 +242,7 @@ def _config(
     connector_team_id: int | None = None,
     mcp_auth_context: dict | None = None,
     execution_identity: MCPActorExecutionIdentity | None = None,
+    execution_scope: ExecutionScope | None = None,
 ) -> WebToolConfig:
     return WebToolConfig(
         db=seeded.db,
@@ -252,6 +255,7 @@ def _config(
         mcp_auth_context=mcp_auth_context,
         mcp_runtime_authorization_policy=policy,
         mcp_actor_execution_identity=execution_identity,
+        execution_scope=execution_scope,
     )
 
 
@@ -331,6 +335,19 @@ def test_actor_policy_rejects_non_boolean_stdio_capability(value: object) -> Non
 def test_actor_policy_rejects_invalid_owner(value: object) -> None:
     with pytest.raises((TypeError, ValueError)):
         MCPBuiltinOAuthActorPolicy(resource_owner_key=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [frozenset(), frozenset({"write"}), frozenset({"read", "write"}), {"read"}],
+)
+def test_slack_runtime_policy_rejects_non_read_capabilities(capabilities) -> None:
+    with pytest.raises(ValueError, match="only the read capability"):
+        SlackChannelAccessPolicy(
+            channel_ids=frozenset({"C0123456789"}),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            capabilities=capabilities,
+        )
 
 
 def test_actor_remote_legacy_classification_queries_each_live_view(db_session) -> None:
@@ -1206,6 +1223,7 @@ async def test_actor_slack_missing_credential_uses_paired_trusted_grant(
             channel_access=SlackChannelAccessPolicy(
                 channel_ids=frozenset({"C0123456789"}),
                 expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                capabilities=frozenset({"read"}),
             ),
         )
 
@@ -1231,6 +1249,77 @@ async def test_actor_slack_missing_credential_uses_paired_trusted_grant(
     assert "run-1" not in repr(request)
     assert "workspace-slack-token" not in str(configs)
     assert "C0123456789" not in str(configs)
+    assert '"version":2' in serialized
+    assert '"capabilities":["read"]' in serialized
+    assert callable(configs[0]["config"][SLACK_ACTOR_RUNTIME_REFRESH_KEY])
+
+
+@pytest.mark.asyncio
+async def test_actor_slack_invocation_refresh_keeps_actor_and_scope_isolated(
+    db_session,
+) -> None:
+    _add_slack_builtin_server(db_session.db, db_session.user)
+    identity_a = _execution_identity()
+    identity_b = MCPActorExecutionIdentity(
+        task_id=2,
+        run_id="run-2",
+        turn_id="turn-2",
+        lease_attempt_id="attempt-2",
+    )
+    scope_a = ExecutionScope(sandbox_key_suffix="scope-a")
+    scope_b = ExecutionScope(sandbox_key_suffix="scope-b")
+    seen = []
+
+    def resolver(request):
+        seen.append(request)
+        suffix = request.execution_identity.turn_id
+        return SlackActorRuntimeGrant(
+            access_token=f"token-{suffix}-{len(seen)}",
+            channel_access=SlackChannelAccessPolicy(
+                channel_ids=frozenset({"C0123456789"}),
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                capabilities=frozenset({"read"}),
+            ),
+        )
+
+    set_slack_actor_runtime_grant_resolver(resolver)
+    configs_a = await _config(
+        db_session,
+        policy=_policy(OWNER_A),
+        execution_identity=identity_a,
+        execution_scope=scope_a,
+    ).get_mcp_server_configs()
+    configs_b = await _config(
+        db_session,
+        policy=_policy(OWNER_B),
+        execution_identity=identity_b,
+        execution_scope=scope_b,
+    ).get_mcp_server_configs()
+
+    refresh_a = configs_a[0]["config"][SLACK_ACTOR_RUNTIME_REFRESH_KEY]
+    refresh_b = configs_b[0]["config"][SLACK_ACTOR_RUNTIME_REFRESH_KEY]
+    assert refresh_a.__closure__ is None
+    assert refresh_b.__closure__ is None
+    connection_a = await refresh_a()
+    connection_b = await refresh_b()
+
+    assert [request.resource_owner_key for request in seen] == [
+        OWNER_A,
+        OWNER_B,
+        OWNER_A,
+        OWNER_B,
+    ]
+    assert [request.execution_identity for request in seen] == [
+        identity_a,
+        identity_b,
+        identity_a,
+        identity_b,
+    ]
+    assert [request.scope for request in seen] == [scope_a, scope_b, scope_a, scope_b]
+    assert connection_a["env"]["SLACK_ACCESS_TOKEN"] == "token-turn-1-3"
+    assert connection_b["env"]["SLACK_ACCESS_TOKEN"] == "token-turn-2-4"
+    assert SLACK_ACTOR_RUNTIME_REFRESH_KEY not in connection_a
+    assert SLACK_ACTOR_RUNTIME_REFRESH_KEY not in connection_b
 
 
 @pytest.mark.asyncio
@@ -1259,6 +1348,7 @@ async def test_actor_slack_existing_exact_row_never_uses_fallback(
             channel_access=SlackChannelAccessPolicy(
                 channel_ids=frozenset({"C0123456789"}),
                 expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                capabilities=frozenset({"read"}),
             ),
         )
 
@@ -1273,6 +1363,7 @@ async def test_actor_slack_existing_exact_row_never_uses_fallback(
     if token:
         assert configs[0]["config"]["env"]["SLACK_ACCESS_TOKEN"] == token
         assert SLACK_CHANNEL_ACCESS_POLICY_ENV not in configs[0]["config"]["env"]
+        assert SLACK_ACTOR_RUNTIME_REFRESH_KEY not in configs[0]["config"]
     else:
         assert configs[0]["transport"] == "unavailable"
 
@@ -1286,6 +1377,7 @@ async def test_actor_slack_rejects_expired_fallback_grant(db_session) -> None:
             channel_access=SlackChannelAccessPolicy(
                 channel_ids=frozenset({"C0123456789"}),
                 expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+                capabilities=frozenset({"read"}),
             ),
         )
     )

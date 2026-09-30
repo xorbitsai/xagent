@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Iterator, Mapping
+import logging
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import (
@@ -39,11 +40,14 @@ from .operation_compatibility import (
 from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 
 if TYPE_CHECKING:
+    from ..storage.contracts import DocumentRecord
     from .coordinator import KBCoordinator
     from .operation_compatibility import KBOperationCompatibilityFacade
     from .storage_shim import KBStorageShimCompatibilityFacade
 
 T_Result = TypeVar("T_Result")
+
+logger = logging.getLogger(__name__)
 
 
 def _has_store_method(metadata_store: object, name: str) -> bool:
@@ -402,6 +406,177 @@ class KBApiCompatibilityFacade:
             return bool(result.get("side_effects_may_remain", False))
         return bool(getattr(result, "side_effects_may_remain", False))
 
+    def collection_holds_documents(
+        self,
+        *,
+        collection_name: str,
+        user_id: int,
+        context: str,
+        on_error: bool,
+    ) -> bool:
+        """Whether the collection currently holds any document.
+
+        This is the single question behind both halves of the ingest lifecycle:
+        a collection with documents must be published and must never be cleaned up,
+        an empty one must be neither. Asking the store at decision time avoids
+        trusting `collection_existed_before`, which is stamped when the request or
+        job is submitted and goes stale while a sibling ingest runs.
+
+        The two halves need opposite behaviour when the store cannot be read, so
+        `on_error` is explicit: a cleanup passes `True` (unknown state must not
+        authorize a delete), a publish passes `False` (unknown state must not make
+        a possibly empty knowledge base visible).
+
+        Reads are owner-scoped: every decision it gates acts on the caller's own
+        rows, and an admin-wide read would match rows another tenant owns.
+
+        Callers that roll back their own document must do so before asking.
+        """
+        try:
+            records = self.list_document_records(
+                collection_name=collection_name,
+                user_id=user_id,
+                is_admin=False,
+                max_results=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to list documents of %s/user_%s during %s, assuming %s: %s",
+                collection_name,
+                user_id,
+                context,
+                "documents exist" if on_error else "no documents",
+                exc,
+            )
+            return on_error
+        return bool(records)
+
+    async def _collection_config_exists(
+        self,
+        *,
+        collection_name: str,
+        user_id: int,
+        context: str,
+    ) -> bool:
+        """Whether a config row is already published for this collection."""
+        try:
+            config = await self.get_collection_config(
+                collection=collection_name,
+                user_id=user_id,
+                is_admin=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Unreadable state must not authorize a destructive rollback.
+            logger.warning(
+                "Failed to read the collection config of %s/user_%s during %s: %s",
+                collection_name,
+                user_id,
+                context,
+                exc,
+            )
+            return True
+        return config is not None
+
+    async def failed_ingest_may_delete_collection(
+        self,
+        *,
+        collection_name: str,
+        user_id: int,
+        collection_existed_before: bool,
+        collection_records: list[Any],
+        register_created: bool,
+        doc_id: Optional[str],
+        context: str,
+    ) -> bool:
+        """Whether a failed ingest may delete the whole collection.
+
+        `collection_records` is the caller's read of the collection. A record is
+        another ingest's unless `register_created` and its doc_id is `doc_id`; a
+        caller that already removed its own document passes
+        `register_created=False`, so every remaining record counts.
+
+        `collection_existed_before` is stamped when the request or job is submitted,
+        so a sibling ingest into the same new collection may have landed a document
+        or published the config since. Either one makes the delete destructive, and
+        both are re-read here rather than inferred from the stamp.
+
+        The stamp itself cannot be re-read: `initialize_collection` creates the
+        collection metadata row at step 0 of the ingest (collection_manager.py:598),
+        so by rollback time the row exists for every run and says nothing about
+        whether the collection predated this one.
+
+        Caveat: these reads are not atomic with the delete that follows, so a
+        sibling that commits inside the window is still exposed. Closing it needs a
+        per-collection lock, which the codebase does not have anywhere yet — tracked
+        in https://github.com/xorbitsai/xagent/issues/1242 rather than invented here.
+
+        Caveat: when the config read itself fails, this fails safe and a brand-new
+        zero-document collection keeps its metadata row with no config — invisible
+        to its owner and still answering 409 for the name. That row is deliberately
+        not cleaned up on this branch: the cleanup deletes this owner's config row
+        first, so on the other reading of an unreadable state — a sibling published
+        it — it would drop settings that sibling just saved.
+        """
+        # Compare doc_ids, not file_ids: same-path ingests share a file_id.
+        other_document_present = any(
+            not register_created
+            or (
+                record.get("doc_id")
+                if isinstance(record, dict)
+                else getattr(record, "doc_id", None)
+            )
+            != doc_id
+            for record in collection_records
+        )
+        if collection_existed_before or other_document_present:
+            return False
+        return not await self._collection_config_exists(
+            collection_name=collection_name,
+            user_id=user_id,
+            context=context,
+        )
+
+    async def cleanup_failed_new_collection_metadata(
+        self,
+        *,
+        collection_name: str,
+        user_id: int,
+    ) -> None:
+        """Remove config rows left behind when a brand-new collection ingest fails.
+
+        Every caller reaches here from a stale `collection_existed_before`, so the
+        documents check is the last guard before a row a sibling ingest owns is
+        deleted by name.
+        """
+        # Read as the owner, and delete as the owner too: an admin-scoped delete
+        # bypasses owner scoping entirely and would wipe a metadata row another
+        # tenant owns under the same name, which the owner-scoped read never saw.
+        if self.collection_holds_documents(
+            collection_name=collection_name,
+            user_id=user_id,
+            context="failed-ingest metadata cleanup",
+            on_error=True,
+        ):
+            logger.info(
+                "Skipping failed-ingest collection metadata cleanup for %s/user_%s "
+                "because the collection holds documents",
+                collection_name,
+                user_id,
+            )
+            return
+
+        cleanup_result = await self.delete_collection_metadata(
+            collection_name=collection_name,
+            user_id=user_id,
+            is_admin=False,
+            delete_orphaned_metadata=True,
+        )
+        logger.info(
+            "Cleaned failed-ingest collection metadata for %s: %s",
+            collection_name,
+            cleanup_result,
+        )
+
     async def save_collection_config(
         self,
         *,
@@ -633,6 +808,32 @@ class KBApiCompatibilityFacade:
             if max_results is not None:
                 kwargs["max_results"] = max_results
             return store.list_document_records(**kwargs)
+
+    def list_document_records_by_file_ids(
+        self, file_ids: Iterable[str]
+    ) -> list[DocumentRecord]:
+        with self._storage_context():
+            from ..storage.factory import get_vector_index_store
+
+            return get_vector_index_store().list_document_records_by_file_ids(file_ids)
+
+    def load_ingestion_status_rows(
+        self, doc_refs: Sequence[tuple[str, str]]
+    ) -> list[dict[str, Any]]:
+        with self._storage_context():
+            from ..storage.factory import get_ingestion_status_store
+
+            return get_ingestion_status_store().load_ingestion_status_rows(doc_refs)
+
+    def replace_ingestion_status_rows(
+        self,
+        doc_refs: Sequence[tuple[str, str]],
+        rows: Sequence[dict[str, Any]],
+    ) -> None:
+        with self._storage_context():
+            from ..storage.factory import get_ingestion_status_store
+
+            get_ingestion_status_store().replace_ingestion_status_rows(doc_refs, rows)
 
     def delete_document(
         self,

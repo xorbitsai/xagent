@@ -1208,11 +1208,15 @@ def test_slack_only_handles_mentions_in_shared_channels() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auto_unavailable", [False, True])
+@pytest.mark.parametrize("is_new_task", [False, True])
 async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
     monkeypatch: pytest.MonkeyPatch,
     auto_unavailable: bool,
+    is_new_task: bool,
 ) -> None:
     bot = make_bot()
+    if not is_new_task:
+        bot.active_tasks["T1:D1:U1:direct"] = 45
     bot._save_active_tasks = lambda: None  # type: ignore[method-assign]
     lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
     finalized: list[tuple[TaskStatus, str]] = []
@@ -1247,7 +1251,7 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
         return SimpleNamespace(
             user_id=5,
             task_id=45,
-            is_new_task=True,
+            is_new_task=is_new_task,
             managed_lease=managed,
         )
 
@@ -1261,20 +1265,27 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
     agent_service = SimpleNamespace(
         workspace=None,
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages, *, watermark=None: None,
+        set_conversation_history=lambda _messages,
+        *,
+        watermark=None,
+        event_watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
 
     execution_result = {"success": True, "output": "Slack reply"}
+    connector_turn_ids: list[str | None] = []
+    execution_turn_ids: list[str] = []
 
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
+            connector_turn_ids.append(_kwargs.get("connector_runtime_turn_id"))
             if auto_unavailable:
                 raise AutoModelUnavailableError("private model details")
             return agent_service
 
         async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+            execution_turn_ids.append(_kwargs["context"]["turn_id"])
             return execution_result
 
     persisted: list[dict[str, Any]] = []
@@ -1307,6 +1318,7 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
             runtime_user=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
             # The turn binds ``task.source`` into the agent context (MCP
             # approval gate identity), so the stand-in row carries the
@@ -1345,6 +1357,8 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
         assert managed.closed is True
         return
     assert persisted[0]["content"] == "hello"
+    assert connector_turn_ids == execution_turn_ids == [persisted[0]["turn_id"]]
+    assert connector_turn_ids[0]
     assert finalized == [(TaskStatus.COMPLETED, "Slack reply")]
     assert finalized_execution_results == [execution_result]
     assert final_messages == [

@@ -21,6 +21,13 @@ used to make the two paths answer differently on SQLite, because its
 across time zones, which are the two places the paths could plausibly
 drift.
 
+They are allowed to disagree in exactly one direction. The locked path also
+measures from the task's newest message, which a stale stored anchor may lag
+(#2580); the set paths read only the stored anchor, so for such a task they
+report it as expirable where the locked path does not. That is the safe side
+for both: the preview over-counts and the purge's scan hands the locked path a
+candidate it then declines.
+
 What the row lock does and does not fence
 -----------------------------------------
 :func:`assess_task_retention` takes ``SELECT ... FOR UPDATE`` on the task
@@ -54,6 +61,13 @@ taking ``FOR KEY SHARE`` on the parent row -- and that conflicts with the
 blocks until this transaction ends, whichever module issues it and whatever
 it locks itself. ``test_task_retention_purge_postgresql.py`` pins that against
 a real server rather than against a reading of the lock-compatibility matrix.
+
+The same foreign-key fence covers the anchor. ``task_chat_messages.task_id``
+is a NOT NULL foreign key to ``tasks.id`` too, so the newest-message read the
+assessment takes under the lock cannot be overtaken by a message committing
+before the delete -- whichever binary writes it, including one that predates
+``last_activity_at`` and never touches it (#2580).
+``test_task_retention_anchor_postgresql.py`` pins it.
 """
 
 from __future__ import annotations
@@ -67,6 +81,7 @@ from sqlalchemy import and_, exists, false, func, or_, select, update
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+from ..models.chat_message import TaskChatMessage
 from ..models.task import Task, TaskStatus, TraceEvent, task_status_predicate
 from ..models.task_command import TaskExecutionCommand
 from .task_command_transport import COMMAND_PENDING, COMMAND_PROCESSING
@@ -118,8 +133,9 @@ class RetentionAssessment:
     quiescent: bool
     #: Leg names that refused this task: any of ``"missing"`` (no such row),
     #: ``"status"``, ``"lease"``, ``"commands"``, or ``"anchor"`` -- the last
-    #: meaning the row is quiescent but carries neither ``last_activity_at``
-    #: nor ``created_at``, so there is nothing to measure a period against.
+    #: meaning the row is quiescent but carries no ``last_activity_at``, no
+    #: ``created_at`` and no message, so there is nothing to measure a period
+    #: against.
     #: Empty when the task is quiescent and has an anchor.
     blockers: tuple[str, ...] = ()
 
@@ -135,6 +151,14 @@ def retention_anchor() -> ColumnElement[datetime]:
     whose backfill has not reached it, still ages: comparing a NULL anchor
     against a cutoff yields NULL, which every WHERE clause reads as "not
     eligible" -- silently immortal rows, forever.
+
+    This is the *stored* anchor, and it can lag the transcript: a writer that
+    never touches the column leaves it older than the task's newest message
+    (#2580). The set-scanning paths use it as it is, which errs toward
+    over-selecting -- a stale row looks older, never younger -- so the preview
+    over-counts and the purge's scan admits extra candidates.
+    :func:`assess_task_retention` is what corrects it before anything is
+    deleted, by also reading the newest message under the row lock.
     """
     return func.coalesce(Task.last_activity_at, Task.created_at)
 
@@ -342,6 +366,12 @@ def assess_task_retention(
     the preview, and the purge's own batch selection -- compose the leaf
     conditions into their own query instead.
 
+    The anchor is the later of :func:`retention_anchor` and the task's newest
+    ``task_chat_messages.created_at``, so a stale stored anchor cannot expire a
+    conversation early (#2580). The message read is fenced by the same foreign
+    key mechanism as the command leg: a message insert takes ``FOR KEY SHARE``
+    on this row and blocks until the transaction ends.
+
     The legs are evaluated in SQL, not re-implemented in Python, so this shares
     one definition with the set-scanning path. Only the expiry comparison
     happens here, against :func:`retention_cutoff` -- the same function the SQL
@@ -359,9 +389,17 @@ def assess_task_retention(
             blockers=("missing",),
         )
 
+    # Read after the lock statement, so under READ COMMITTED it sees every
+    # message committed before the lock was granted (#2580).
+    newest_message = (
+        select(func.max(TaskChatMessage.created_at))
+        .where(TaskChatMessage.task_id == Task.id)
+        .scalar_subquery()
+    )
     row = db.execute(
         select(
             retention_anchor().label("anchor"),
+            newest_message.label("newest_message"),
             retention_terminal_condition().label("terminal"),
             retention_lease_clear_condition(now=now).label("lease_clear"),
             retention_commands_clear_condition().label("commands_clear"),
@@ -375,7 +413,16 @@ def assess_task_retention(
             blockers=("missing",),
         )
 
-    anchor = _as_utc(row.anchor)
+    # The later of the two, compared in Python: SQLite has no ``GREATEST``,
+    # and both values are normalized to aware UTC first.
+    anchor = max(
+        (
+            value
+            for value in (_as_utc(row.anchor), _as_utc(row.newest_message))
+            if value is not None
+        ),
+        default=None,
+    )
     blockers = tuple(
         name
         for name, passed in (

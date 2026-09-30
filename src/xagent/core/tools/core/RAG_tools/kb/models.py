@@ -183,3 +183,15 @@ class KBVectorStorageCleanupResult:
     preview_only: bool = True
     warnings: tuple[str, ...] = ()
     side_effects_may_remain: bool = False
+
+
+@dataclass(frozen=True)
+class KBDocumentRowsSnapshot:
+    """Rows of some documents in one collection, keyed by table name.
+
+    A non-admin capture holds only the caller's rows on tables with ``user_id``.
+    """
+
+    collection: str
+    doc_ids: tuple[str, ...]
+    rows_by_table: dict[str, list[dict[str, Any]]]

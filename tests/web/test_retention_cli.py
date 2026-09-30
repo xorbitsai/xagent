@@ -257,3 +257,79 @@ def test_retention_is_dispatched_from_the_module_entry_point(monkeypatch):
         entry.main()
     assert exit_info.value.code == 0
     assert seen["argv"] == ["preview", "--days", "7"]
+
+
+# ---------------------------------------------------------------------------
+# ``cleanup-pending``: the operator's reconciliation list (#2587).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def obligations_url(tmp_path):
+    """One obligation in each status, with distinguishable task ids."""
+    from xagent.web.services.task_cleanup_obligations import (
+        CleanupObligationStatus,
+        extension_obligation,
+        record_cleanup_obligations_no_commit,
+    )
+
+    url = f"sqlite:///{tmp_path / 'obligations.db'}"
+    engine = sa.create_engine(url)
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        record_cleanup_obligations_no_commit(
+            db,
+            [
+                extension_obligation(
+                    task_id=task_id,
+                    user_id=7,
+                    source=None,
+                    extension="sandbox_lease",
+                    status=status,
+                    reason=f"reason for {task_id}",
+                )
+                for task_id, status in (
+                    (501, CleanupObligationStatus.PENDING),
+                    (502, CleanupObligationStatus.EXHAUSTED),
+                    (503, CleanupObligationStatus.ABANDONED),
+                )
+            ],
+        )
+        db.commit()
+    engine.dispose()
+    return url
+
+
+def test_cleanup_pending_lists_only_what_needs_an_operator(capsys, obligations_url):
+    assert (
+        retention_cli.main(["cleanup-pending", "--database-url", obligations_url]) == 0
+    )
+    out = capsys.readouterr().out
+
+    assert "502" in out and "reason for 502" in out
+    assert "503" in out and "reason for 503" in out
+    # Still being retried, so not on the list -- but counted.
+    assert "501" not in out.split("pending retry")[1]
+    assert "1 pending retry" in out
+
+
+def test_cleanup_pending_all_includes_what_is_still_retried(capsys, obligations_url):
+    retention_cli.main(["cleanup-pending", "--all", "--database-url", obligations_url])
+    out = capsys.readouterr().out
+
+    assert "reason for 501" in out
+
+
+def test_cleanup_pending_writes_nothing(obligations_url):
+    engine = sa.create_engine(obligations_url)
+    with engine.connect() as connection:
+        before = connection.execute(
+            sa.text("SELECT id, status, attempts FROM task_cleanup_obligations")
+        ).all()
+    retention_cli.main(["cleanup-pending", "--all", "--database-url", obligations_url])
+    with engine.connect() as connection:
+        after = connection.execute(
+            sa.text("SELECT id, status, attempts FROM task_cleanup_obligations")
+        ).all()
+    engine.dispose()
+    assert after == before

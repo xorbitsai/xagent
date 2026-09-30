@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -21,9 +22,11 @@ from xagent.core.model.chat.basic.openai import (
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
+from xagent.core.model.chat.stream_progress import STREAM_ABORTED_KEY
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
+    ChunkType,
 )
 from xagent.core.retry.strategy import FixedDelay
 from xagent.core.retry.wrapper import create_retry_wrapper
@@ -47,6 +50,12 @@ def _tool_call_delta(index, call_id, name, arguments, call_type="function"):
         type=call_type,
         function=SimpleNamespace(name=name, arguments=arguments),
     )
+
+
+async def _empty_stream():
+    """A stream that ends without yielding any chunk."""
+    if False:
+        yield None
 
 
 def _response_format_bad_request(message: str) -> openai.BadRequestError:
@@ -121,8 +130,9 @@ class TestOpenAILLM:
         assert call_args.kwargs["model"] == "gpt-4o-mini"
         assert call_args.kwargs["messages"] == messages
         assert call_args.kwargs["temperature"] == 0.7
-        # max_tokens should not be in the call if not explicitly provided
-        assert "max_tokens" not in call_args.kwargs
+        # The configured default_max_tokens (models.max_tokens) applies when
+        # the caller passes none, consistent with the other provider classes.
+        assert call_args.kwargs["max_tokens"] == 1024
 
     @pytest.mark.asyncio
     async def test_tool_calling(self, llm, mock_tool_call_completion, mocker):
@@ -216,12 +226,8 @@ class TestOpenAILLM:
     ):
         """Thinking intent should not add unsupported OpenAI chat parameters."""
 
-        async def empty_stream():
-            if False:
-                yield None
-
         mock_client = mocker.AsyncMock()
-        mock_client.chat.completions.create.return_value = empty_stream()
+        mock_client.chat.completions.create.return_value = _empty_stream()
         mocker.patch(
             "xagent.core.model.chat.basic.openai.AsyncOpenAI",
             return_value=mock_client,
@@ -606,6 +612,79 @@ class TestOpenAILLM:
         assert call_args.kwargs["max_tokens"] == 50
 
     @pytest.mark.asyncio
+    async def test_stream_chat_uses_default_max_tokens(self, openai_llm_config, mocker):
+        """stream_chat falls back to the configured default_max_tokens."""
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "Hi"}])
+        ]
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_explicit_max_tokens_overrides_default_on_stream_and_vision(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """An explicit max_tokens (e.g. the compaction budget) wins over the default."""
+
+        mock_client = mocker.AsyncMock()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Hi"}], max_tokens=50
+            )
+        ]
+        assert mock_client.chat.completions.create.call_args.kwargs["max_tokens"] == 50
+
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        await llm.vision_chat([{"role": "user", "content": "Hi"}], max_tokens=60)
+        assert mock_client.chat.completions.create.call_args.kwargs["max_tokens"] == 60
+
+    @pytest.mark.asyncio
+    async def test_no_default_max_tokens_omits_parameter(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Without a configured default the request keeps the API's own default."""
+
+        mock_client = mocker.AsyncMock()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        config = {**openai_llm_config, "default_max_tokens": None}
+        llm = OpenAILLM(**config, abilities=["chat", "vision"])
+        messages = [{"role": "user", "content": "Hi"}]
+
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        await llm.chat(messages)
+        await llm.vision_chat(messages)
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        _ = [chunk async for chunk in llm.stream_chat(messages)]
+
+        calls = mock_client.chat.completions.create.call_args_list
+        assert len(calls) == 3
+        for call in calls:
+            assert "max_tokens" not in call.kwargs
+            assert "max_completion_tokens" not in call.kwargs
+
+    @pytest.mark.asyncio
     async def test_vision_chat_preserves_zero_temperature(
         self, openai_llm_config, mock_chat_completion, mocker
     ):
@@ -640,7 +719,7 @@ class TestOpenAILLM:
 
         call_args = mock_client.chat.completions.create.call_args
         assert call_args.kwargs["temperature"] == 0.0
-        assert "max_tokens" not in call_args.kwargs
+        assert call_args.kwargs["max_tokens"] == 1024
 
     @pytest.mark.asyncio
     async def test_vision_chat_returns_the_response_format_retry_result(
@@ -675,6 +754,7 @@ class TestOpenAILLM:
             "type": "text",
             "content": "Hello World",
             "raw": mock_chat_completion.model_dump(),
+            "finish_reason": "stop",
         }
         assert mock_client.chat.completions.create.await_count == 2
         retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
@@ -952,6 +1032,54 @@ class TestOpenAILLM:
         assert result["content"] == "Here"
         assert result["reasoning_content"] == "Here"
         assert result["reasoning"] == "Here"
+        assert result["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_empty_content_falls_back_to_reasoning_content_with_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        """The vision_chat path must surface finish_reason the same way
+        chat() does when content is empty and reasoning_content is used
+        as a fallback (see
+        test_empty_content_falls_back_to_reasoning_content above)."""
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "length"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = "Here"
+        mock_choice.message = mock_message
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.model_dump.return_value = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Here",
+                    },
+                }
+            ]
+        }
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image"}]
+        )
+
+        assert result["content"] == "Here"
+        assert result["finish_reason"] == "length"
 
     @pytest.mark.asyncio
     async def test_whitespace_only_reasoning_content_still_raises(
@@ -1381,6 +1509,7 @@ class TestOpenAILLM:
 
         assert response["type"] == "tool_call"
         assert response["tool_calls"][0]["function"]["arguments"] == expected
+        assert response["finish_reason"] == "tool_calls"
 
     @pytest.mark.parametrize(
         ("empty_arguments", "expected"),
@@ -1774,9 +1903,10 @@ _REASONING_TOOLS_REJECTION = (
 class TestRejectedParameterDegrade:
     """Reasoning models spell the output budget ``max_completion_tokens``.
 
-    Context compaction is the only caller that sends an output budget at all,
-    so without this a reasoning model converses normally while every
-    compaction fails and falls back to dropping messages.
+    Context compaction always sends an output budget, and a configured
+    ``default_max_tokens`` sends one on every call, so without this a
+    reasoning model converses normally while every compaction fails and
+    falls back to dropping messages.
     """
 
     @pytest.mark.asyncio
@@ -1804,6 +1934,62 @@ class TestRejectedParameterDegrade:
         # summary from re-triggering the next compaction.
         assert "max_tokens" not in retry_kwargs
         assert retry_kwargs["max_completion_tokens"] == 5000
+
+    @pytest.mark.asyncio
+    async def test_chat_renames_default_max_tokens(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """A budget that came from default_max_tokens rides the same rename."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        response = await llm.chat([{"role": "user", "content": "Summarize."}])
+
+        assert response["content"] == "Hello World"
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert first_kwargs["max_tokens"] == 1024
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_renames_default_max_tokens(
+        self, openai_llm_config, mocker
+    ):
+        """Main agent turns stream with no explicit budget, so the
+        default-sourced one must ride the same rename on that path."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _bad_request(_MAX_TOKENS_REJECTION),
+            _empty_stream(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config)
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Summarize."}]
+            )
+        ]
+
+        assert mock_client.chat.completions.create.await_count == 2
+        first_kwargs = mock_client.chat.completions.create.call_args_list[0].kwargs
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert first_kwargs["max_tokens"] == 1024
+        assert "max_tokens" not in retry_kwargs
+        assert retry_kwargs["max_completion_tokens"] == 1024
 
     @pytest.mark.asyncio
     async def test_chat_disables_reasoning_for_function_tools(
@@ -2340,3 +2526,540 @@ class TestSequentiallyRejectedParameters:
         final_kwargs = mock_client.chat.completions.create.call_args_list[2].kwargs
         assert final_kwargs["max_completion_tokens"] == 5000
         assert "response_format" not in final_kwargs
+
+
+class TestFinishReasonOnResponse:
+    """#2786: non-streaming responses carry the provider's ``finish_reason``
+    so ``llm_call_end`` can record it."""
+
+    @staticmethod
+    def _text_response(finish_reason):
+        message = SimpleNamespace(content="Hello", tool_calls=None)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason=finish_reason, message=message)],
+            usage=None,
+            model_dump=lambda: {"choices": [{"finish_reason": finish_reason}]},
+        )
+
+    @staticmethod
+    def _tool_call_response():
+        tool_call = SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="search", arguments='{"q":"x"}'),
+        )
+        message = SimpleNamespace(content=None, tool_calls=[tool_call])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="tool_calls", message=message)],
+            usage=None,
+            model_dump=lambda: {"choices": [{"finish_reason": "tool_calls"}]},
+        )
+
+    @staticmethod
+    def _patch_client(mocker, response):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = response
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+    @pytest.mark.asyncio
+    async def test_chat_text_response_carries_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        self._patch_client(mocker, self._text_response("length"))
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert result["content"] == "Hello"
+        assert result["finish_reason"] == "length"
+
+    @pytest.mark.asyncio
+    async def test_chat_tool_call_response_carries_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        self._patch_client(mocker, self._tool_call_response())
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Search"}], tools=[{}])
+
+        assert result["type"] == "tool_call"
+        assert result["finish_reason"] == "tool_calls"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("finish_reason", [None, ""])
+    async def test_chat_omits_finish_reason_when_provider_sends_none(
+        self, openai_llm_config, mocker, finish_reason
+    ):
+        self._patch_client(mocker, self._text_response(finish_reason))
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat([{"role": "user", "content": "Hello"}])
+
+        assert "finish_reason" not in result
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_carries_finish_reason(
+        self, openai_llm_config, mocker
+    ):
+        self._patch_client(mocker, self._text_response("stop"))
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat([{"role": "user", "content": "Describe"}])
+
+        assert result["content"] == "Hello"
+        assert result["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_carries_finish_reason_on_final_content_delta(
+        self, openai_llm_config, mocker
+    ):
+        """An endpoint that reports ``finish_reason`` on the same chunk as the
+        last content delta must not lose it: the runtime reads the reason from
+        whichever chunk carries it."""
+
+        async def stream():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="Hello", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ]
+            )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=" world", tool_calls=None),
+                        finish_reason="length",
+                    )
+                ]
+            )
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = stream()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        chunks = [c async for c in llm.stream_chat([{"role": "user", "content": "x"}])]
+
+        tokens = [c for c in chunks if c.is_token()]
+        assert [c.delta for c in tokens] == ["Hello", " world"]
+        assert [c.finish_reason for c in tokens] == ["", "length"]
+
+    @pytest.mark.asyncio
+    async def test_parse_stream_chunk_tool_call_delta_carries_finish_reason(
+        self, openai_llm_config
+    ):
+        """A tool-call delta chunk that also carries ``finish_reason`` (some
+        OpenAI-compatible endpoints put it on the same chunk as the final
+        delta, see ``_parse_stream_chunk`` above) must surface that reason on
+        the returned ``StreamChunk`` rather than dropping it."""
+        llm = OpenAILLM(**openai_llm_config)
+
+        chunk = llm._parse_stream_chunk(
+            _stream_chunk(
+                [_tool_call_delta(0, "call_1", "search", '{"q":1}')],
+                finish_reason="length",
+            ),
+            {},
+        )
+
+        assert chunk is not None
+        assert chunk.is_tool_call()
+        assert chunk.finish_reason == "length"
+
+
+class TestStreamNoProgressAbort:
+    """#2785: a stream that keeps emitting chunks but stopped making progress
+    is abandoned by ``stream_chat`` itself, since the runtime never sees the
+    deltas ``_parse_stream_chunk`` drops and the interval timeout only
+    measures silence."""
+
+    _ENV = {
+        "XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT": "5",
+        "XAGENT_LLM_STREAM_DEGENERATE_WINDOW": "32",
+        "XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD": "8",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _small_thresholds(self, monkeypatch):
+        for name, value in self._ENV.items():
+            monkeypatch.setenv(name, value)
+        monkeypatch.delenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", raising=False)
+
+    class _ClosableStream:
+        """An async iterable with the ``close()`` coroutine the OpenAI SDK's
+        ``AsyncStream`` exposes; records whether the abort closed it."""
+
+        def __init__(self, chunks, *, before_yield=None):
+            self._chunks = chunks
+            self._before_yield = before_yield
+            self.closed = False
+            self.consumed = 0
+
+        def __aiter__(self):
+            return self._iterate()
+
+        async def _iterate(self):
+            for chunk in self._chunks:
+                if self._before_yield is not None:
+                    self._before_yield()
+                self.consumed += 1
+                yield chunk
+
+        async def close(self):
+            self.closed = True
+
+    @staticmethod
+    def _delta_chunk(*, content=None, tool_calls=None, finish_reason=None, **fields):
+        delta = SimpleNamespace(content=content, tool_calls=tool_calls, **fields)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)]
+        )
+
+    @staticmethod
+    def _patch_client(mocker, stream):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = stream
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+    async def _collect(self, llm):
+        return [c async for c in llm.stream_chat([{"role": "user", "content": "x"}])]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_loop_without_payload_ends_with_no_progress(
+        self, openai_llm_config, mocker, caplog
+    ):
+        """The dominant prod shape: reasoning deltas to the cap, no content, no
+        tool call. The stream is closed early and ends with an END chunk whose
+        ``finish_reason`` marks the abort, so the runtime's no-payload
+        fallback runs after seconds instead of ~105 s."""
+        chunks = [self._delta_chunk(reasoning_content="Let me think about it. ")]
+        chunks += [self._delta_chunk(reasoning_content="verify ") for _ in range(200)]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        with caplog.at_level(
+            logging.WARNING, logger="xagent.core.model.chat.basic.openai"
+        ):
+            result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "no_progress"
+        assert result[0].raw[STREAM_ABORTED_KEY] == "reasoning_repetition"
+        assert stream.closed is True
+        assert stream.consumed < 40  # cut at the window, not at the cap
+        abort_logs = [r for r in caplog.records if "Aborting" in r.getMessage()]
+        assert len(abort_logs) == 1
+        message = abort_logs[0].getMessage()
+        assert "gpt-4o-mini" in message
+        assert "reasoning_repetition" in message
+        assert "reasoning_fields=reasoning_content" in message
+        assert "verify" not in message  # names only, never values
+        # One warning per abort: the standalone field-name line is debug here.
+        assert not [
+            r
+            for r in caplog.records
+            if "no content or tool calls" in r.getMessage()
+            and r.levelno >= logging.WARNING
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_reasoning_spelling_is_still_inspected(
+        self, openai_llm_config, mocker
+    ):
+        """Predicate 1 reads whatever ``reasoning*`` field the delta carries, so
+        a loop under a non-default spelling is caught without waiting for the
+        field name to be learned from logs."""
+        chunks = [self._delta_chunk(reasoning="   ") for _ in range(200)]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "no_progress"
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_empty_deltas_end_with_no_progress(self, openai_llm_config, mocker):
+        chunks = [self._delta_chunk() for _ in range(50)]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "no_progress"
+        assert stream.consumed == 5
+
+    @pytest.mark.asyncio
+    async def test_whitespace_tail_after_complete_tool_call_keeps_the_call(
+        self, openai_llm_config, mocker
+    ):
+        """Trace 5040325 shape: valid JSON followed by a whitespace loop. The
+        call survives; the delta that tripped the guard is dropped and the
+        trailing whitespace already streamed (below the window) is harmless
+        to ``json.loads``."""
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": ')]
+            ),
+            self._delta_chunk(tool_calls=[_tool_call_delta(0, None, None, '"x"}')]),
+        ]
+        chunks += [
+            self._delta_chunk(tool_calls=[_tool_call_delta(0, None, None, "\n\t")])
+            for _ in range(100)
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        final = result[-1]
+        assert final.is_tool_call()
+        assert final.finish_reason == "no_progress"
+        assert final.raw[STREAM_ABORTED_KEY] == "tool_call_trailing_whitespace"
+        final_arguments = final.tool_calls[0]["function"]["arguments"]
+        assert json.loads(final_arguments) == {"q": "x"}
+        assert len(final_arguments) < len('{"q": "x"}') + 32
+        assert stream.closed is True
+        assert stream.consumed < 30
+        # The tail equals the last snapshot already streamed, so the runtime's
+        # merge sees a repeat, never a shorter "delta".
+        assert all(c.is_tool_call() for c in result)
+        assert final_arguments == result[-2].tool_calls[0]["function"]["arguments"]
+
+    @pytest.mark.asyncio
+    async def test_repeated_object_after_complete_tool_call_is_cut_at_first_byte(
+        self, openai_llm_config, mocker
+    ):
+        """Trace 4580191 shape: the same object repeated. Cut at the first
+        non-whitespace byte after the object closed; the first object is kept."""
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": "x"}')]
+            ),
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, None, None, '{"q": "x"}')]
+            ),
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, None, None, '{"q": "x"}')]
+            ),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert result[-1].finish_reason == "no_progress"
+        assert result[-1].tool_calls[0]["function"]["arguments"] == '{"q": "x"}'
+        assert stream.consumed == 2
+
+    @pytest.mark.asyncio
+    async def test_long_legitimate_reasoning_then_tool_call_is_untouched(
+        self, openai_llm_config, mocker
+    ):
+        """The DeepSeek / Qwen-thinking shape: many non-repetitive reasoning
+        deltas, then a tool call and a clean finish. Nothing is aborted and the
+        provider's own ``finish_reason`` survives."""
+        words = "first consider the user asked for a shift on Monday so we need".split()
+        chunks = [
+            self._delta_chunk(reasoning_content=f"{words[i % len(words)]}{i} ")
+            for i in range(300)
+        ]
+        chunks += [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": "x"}')]
+            ),
+            self._delta_chunk(finish_reason="tool_calls"),
+            SimpleNamespace(
+                choices=[],
+                usage=SimpleNamespace(
+                    prompt_tokens=3, completion_tokens=5, total_tokens=8
+                ),
+            ),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert stream.closed is False
+        assert stream.consumed == len(chunks)
+        tool_chunks = [c for c in result if c.is_tool_call()]
+        assert tool_chunks[-1].finish_reason == "tool_calls"
+        assert result[-1].is_usage()
+        assert not any(c.finish_reason == "no_progress" for c in result)
+
+    @pytest.mark.asyncio
+    async def test_parallel_tool_call_after_a_complete_one_is_untouched(
+        self, openai_llm_config, mocker
+    ):
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(0, "call_1", "search", '{"q": "x"}')]
+            ),
+            self._delta_chunk(
+                tool_calls=[_tool_call_delta(1, "call_2", "search", '{"q": ')]
+            ),
+            self._delta_chunk(tool_calls=[_tool_call_delta(1, None, None, '"y"}')]),
+            self._delta_chunk(finish_reason="tool_calls"),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert stream.closed is False
+        final = [c for c in result if c.is_tool_call()][-1]
+        assert final.finish_reason == "tool_calls"
+        assert [tc["function"]["arguments"] for tc in final.tool_calls] == [
+            '{"q": "x"}',
+            '{"q": "y"}',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_open_object_growing_is_left_to_max_tokens(
+        self, openai_llm_config, mocker
+    ):
+        """The ``create_shift`` runaway: the object never closes, so the guard
+        does not fire and the stream runs to its (test) end."""
+        chunks = [
+            self._delta_chunk(
+                tool_calls=[
+                    _tool_call_delta(0, "call_1", "create_shift", '{"staff_ids": [')
+                ]
+            )
+        ]
+        chunks += [
+            self._delta_chunk(tool_calls=[_tool_call_delta(0, None, None, f"{i},")])
+            for i in range(300)
+        ]
+        chunks.append(self._delta_chunk(finish_reason="length"))
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert stream.closed is False
+        assert stream.consumed == len(chunks)
+        assert result[-1].finish_reason == "length"
+
+    @pytest.mark.asyncio
+    async def test_no_payload_timeout_is_opt_in_by_model_name(
+        self, openai_llm_config, mocker, monkeypatch
+    ):
+        """The wall-clock trigger fires only for an allow-listed wire model
+        name, measured from the first delta, and only before any payload."""
+        monkeypatch.setenv(
+            "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", "gpt-4o-mini,other"
+        )
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", "30")
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", "0")
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "0")
+        now = [1000.0]
+        monkeypatch.setattr(
+            "xagent.core.model.chat.stream_progress.time.monotonic", lambda: now[0]
+        )
+        words = "genuinely different reasoning every single time here".split()
+        chunks = [
+            self._delta_chunk(reasoning_content=words[i % len(words)] + str(i))
+            for i in range(50)
+        ]
+
+        def tick():
+            now[0] += 1.0  # one delta per simulated second
+
+        listed = self._ClosableStream(chunks, before_yield=tick)
+        self._patch_client(mocker, listed)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert result[-1].finish_reason == "no_progress"
+        assert listed.closed is True
+        assert 30 <= listed.consumed <= 32
+
+        # Same stream, model not listed: runs to the end.
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", "other")
+        now[0] = 1000.0
+        unlisted = self._ClosableStream(chunks, before_yield=tick)
+        self._patch_client(mocker, unlisted)
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await self._collect(llm)
+
+        assert unlisted.closed is False
+        assert unlisted.consumed == 50
+        assert not any(c.finish_reason == "no_progress" for c in result)
+
+    @pytest.mark.asyncio
+    async def test_clean_stream_with_no_payload_logs_field_names(
+        self, openai_llm_config, mocker, caplog
+    ):
+        """A stream that ends on its own with neither content nor tool calls is
+        the invisible fallback path; log the reasoning field names (never their
+        values) so the spelling can be read off prod logs."""
+        chunks = [
+            self._delta_chunk(reasoning_details=[{"text": "secret thought"}]),
+            self._delta_chunk(finish_reason="length"),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        with caplog.at_level(
+            logging.WARNING, logger="xagent.core.model.chat.basic.openai"
+        ):
+            result = await self._collect(llm)
+
+        assert [c.type for c in result] == [ChunkType.END]
+        assert result[0].finish_reason == "length"
+        assert stream.closed is False
+        field_logs = [
+            r for r in caplog.records if "no content or tool calls" in r.getMessage()
+        ]
+        assert len(field_logs) == 1
+        message = field_logs[0].getMessage()
+        assert "reasoning_details" in message
+        assert "secret thought" not in message
+        assert "aborted=no" in message
+
+    @pytest.mark.asyncio
+    async def test_stream_with_content_does_not_log_field_names(
+        self, openai_llm_config, mocker, caplog
+    ):
+        chunks = [
+            self._delta_chunk(content="Hello", reasoning_content="hmm"),
+            self._delta_chunk(finish_reason="stop"),
+        ]
+        stream = self._ClosableStream(chunks)
+        self._patch_client(mocker, stream)
+        llm = OpenAILLM(**openai_llm_config)
+
+        with caplog.at_level(
+            logging.WARNING, logger="xagent.core.model.chat.basic.openai"
+        ):
+            await self._collect(llm)
+
+        assert not [
+            r for r in caplog.records if "no content or tool calls" in r.getMessage()
+        ]

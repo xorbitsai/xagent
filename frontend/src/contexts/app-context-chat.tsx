@@ -20,7 +20,7 @@ import {
   type FileAccessPolicy,
 } from "@/contexts/file-access-context"
 import { useConnectorRuntimeDialogActionsIfMounted } from "@/contexts/connector-runtime-dialog-context"
-import { isConnectorRuntimeDialogTriggerCode } from "@/lib/connector-runtime-api"
+import { FIRST_GATE_CLEARED_MESSAGE_KEY, isConnectorRuntimeDialogTriggerCode, shouldHoldFirstMessage } from "@/lib/connector-runtime-api"
 
 interface WebSocketMessage {
   type: string
@@ -369,7 +369,7 @@ import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
-import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
+import { normalizeCompletionOutcome, normalizeTaskCompletedMessage, type TaskCompletionOutcome } from "@/lib/task-completion"
 import { emitTaskError } from "@/lib/task-error-events"
 import { isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status"
 import {
@@ -686,6 +686,7 @@ export interface Task {
   id: string
   title: string
   status: TaskStatus
+  completionOutcome?: TaskCompletionOutcome
   description: string
   createdAt: string | number
   updatedAt: string | number
@@ -894,6 +895,7 @@ const taskFromTaskInfoData = (
   title: taskData.title as string,
   description: taskData.description as string,
   status: normalizeTaskStatus(taskData.status) || "pending",
+  completionOutcome: normalizeCompletionOutcome(taskData.completion_outcome),
   createdAt: taskData.created_at as string | number,
   updatedAt: taskData.updated_at as string | number,
   modelId: taskData.model_id as string | undefined,
@@ -1251,7 +1253,7 @@ type AppAction =
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
-  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
+  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; completionOutcome?: TaskCompletionOutcome; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -1616,7 +1618,10 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       // never passes through UPDATE_TASK_STATUS either - withDagTerminatedAt
       // backfills the former and clears the latter so a prior run's
       // dagTerminatedAt can't linger into this one.
-      const currentTask = withDagTerminatedAt(mergedTask)
+      const currentTask = withDagTerminatedAt(mergedTask && {
+        ...mergedTask,
+        completionOutcome: mergedTask.status === "completed" ? mergedTask.completionOutcome : undefined,
+      })
 
       return {
         ...state,
@@ -1688,6 +1693,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         currentTask: {
           ...state.currentTask,
           status: nextStatus,
+          completionOutcome: nextStatus === "completed"
+            ? ("completionOutcome" in action.payload ? action.payload.completionOutcome : state.currentTask.completionOutcome)
+            : undefined,
           // Prefer the originating event's own timestamp over the client's
           // current wall-clock time - during historical replay, every event
           // gets processed at "now", so stamping updatedAt with the reducer's
@@ -2044,6 +2052,9 @@ interface AppContextType {
   selectStep: (stepId: string | null) => void
   clearMessages: () => void
   isConnected: boolean
+  // Counts onConnect's same-task branch: the socket reopened for the task it
+  // was last connected to. The first connect for a task does not count.
+  sameTaskReconnects: number
   connectionError: Error | null
   startNewConversation: () => Promise<void>
   isConversationResetPending: boolean
@@ -2170,6 +2181,7 @@ export function AppProvider({
     createInitialState,
   )
   const pendingTaskToExecuteRef = useRef<{ description: string } | null>(null)
+  const firstGateTaskIdRef = useRef<number | null>(null)
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
   // Read through a ref, not a useCallback dependency, so the dialog
   // provider's state changes never change handleMessage's or sendMessage's
@@ -2306,6 +2318,7 @@ export function AppProvider({
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
+  const [sameTaskReconnects, setSameTaskReconnects] = useState(0)
   const sharedStreamRef = useRef<{
     taskId?: number
     runId?: string | null
@@ -2531,6 +2544,7 @@ export function AppProvider({
     // This prevents stale data issues and fixes race conditions
     if (lastConnectedTaskId.current === stateRef.current.taskId) {
       // Reconnection to SAME task -> Clear messages
+      setSameTaskReconnects(count => count + 1)
       dispatch({
         type: "CLEAR_MESSAGES",
         payload: {
@@ -2931,6 +2945,7 @@ export function AppProvider({
         if (envelope.status) {
           dispatch({ type: "UPDATE_TASK_STATUS", payload: {
             status: envelope.status, runId: envelope.runId,
+            completionOutcome: normalizeCompletionOutcome(data.completion_outcome),
             stateVersion: envelope.stateVersion, controlState: envelope.controlState,
             ...(envelope.status === "waiting_for_user" ? {
               waitingQuestion: typeof data.question === "string" ? data.question : undefined,
@@ -3260,8 +3275,9 @@ export function AppProvider({
             // gated by the dispatch wrapper's task scoping, so a stray
             // background task's own pending task_info must not overwrite
             // what's about to be auto-sent for the task actually being
-            // viewed/connected.
-            if (taskStatus === 'pending' && task.description && !isMessageForOtherTask) {
+            // viewed/connected. A task whose first message went to the first
+            // gate is never armed: its description is that message (sendMessage).
+            if (taskStatus === 'pending' && task.description && !isMessageForOtherTask && taskId !== firstGateTaskIdRef.current) {
               pendingTaskToExecuteRef.current = { description: task.description }
               console.log('💾 Stored pending task for auto-execution:', taskData.description)
             }
@@ -3519,7 +3535,12 @@ export function AppProvider({
             const shouldHideAgentMessage =
               isAgentMessage &&
               eventData.visible === false
-            if (expectsUserResponse) {
+            // Replayed questions belong in the transcript, but must not undo
+            // the settled status/outcome already restored by task_info.
+            if (expectsUserResponse && !(
+              isHistoricalDataLoadingRef.current &&
+              isTerminalTaskStatus(currentState.currentTask?.status)
+            )) {
               dispatch({
                 type: "UPDATE_TASK_STATUS",
                 payload: {
@@ -5691,6 +5712,7 @@ export function AppProvider({
           type: "UPDATE_TASK_STATUS",
           payload: {
             status: taskData.status,
+            completionOutcome: taskData.completionOutcome,
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState,
@@ -6863,6 +6885,31 @@ export function AppProvider({
 
           // User message will be handled by backend via trace event
 
+          // A create report with a context value the user can fill here holds
+          // the message before it is staged or queued, so nothing of it reaches
+          // the transport or the dialog's resend candidates until the dialog
+          // ends the hold (FirstGateDecision); the per-turn check still decides
+          // whether the turn runs. Opened here, after the create response, not
+          // from a mount effect: a gate opened in the provider's mount commit is
+          // cleared by its identity effect. The pending-task auto-send never
+          // sends this task's description, which is the held text: its ref is
+          // cleared here, and this task's pending task_info never arms it.
+          if (shouldHoldFirstMessage(taskData.connector_runtime_requirements)) {
+            // null: no provider mounted, or an id it rejects; nothing is held.
+            const held = connectorRuntimeDialogRef.current.openFirstGate(newTaskId)
+            firstGateTaskIdRef.current = newTaskId
+            pendingTaskToExecuteRef.current = null
+            const decision = held === null ? null : await held
+            if (decision === "discarded") return
+            if (decision === "cleared") {
+              // Fixed, translated text naming nothing the user typed. The new
+              // conversation page rethrows it to ChatInput, which shows a userFacing
+              // message instead of "please try again"; the agent page's handler
+              // toasts any error's message itself.
+              throw Object.assign(new Error(t(FIRST_GATE_CLEARED_MESSAGE_KEY)), { userFacing: true })
+            }
+          }
+
           // For new tasks, always send chat message to support file uploads
           console.log('💬 Queuing chat message for new task:', {
             taskId: newTaskId,
@@ -7241,6 +7288,9 @@ export function AppProvider({
     if (taskId) {
       isHistoricalDataLoadingRef.current = true
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
+    } else {
+      // The task socket is keyed on taskId, so no terminal WS event will clear this.
+      dispatch({ type: "SET_PROCESSING", payload: false })
     }
   }, [dispatch, router])
 
@@ -7334,6 +7384,7 @@ export function AppProvider({
           selectStep,
           clearMessages,
           isConnected,
+          sameTaskReconnects,
           connectionError,
           startNewConversation,
           isConversationResetPending:

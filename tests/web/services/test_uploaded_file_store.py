@@ -234,6 +234,8 @@ def test_upsert_already_durable_allows_explicit_same_owner_task_rebind():
     db = _session()
     user = _user(db)
     user_id = int(user.id)
+    db.add(Task(id=24, user_id=user_id, title="rebind target"))
+    db.commit()
     record = UploadedFile(
         file_id="file-task-rebind",
         user_id=user_id,
@@ -385,6 +387,8 @@ def test_two_sessions_cannot_apply_the_same_stale_uploaded_file_snapshot(tmp_pat
     with SessionLocal() as seed_db:
         user = _user(seed_db)
         user_id = int(user.id)
+        seed_db.add(Task(id=11, user_id=user_id, title="stale task"))
+        seed_db.flush()
         old_key = _generation_key(
             user_id=user_id,
             task_id=11,

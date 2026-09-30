@@ -180,7 +180,13 @@ export function WorkforceRunsList({
                   {!run.task_id && (
                     <>
                       <span>·</span>
-                      <span>{t("workforces.runs.taskDeleted")}</span>
+                      <span>
+                        {run.task_expired_at
+                          ? t("workforces.runs.taskExpired", {
+                              date: formatTime(run.task_expired_at, "date"),
+                            })
+                          : t("workforces.runs.taskDeleted")}
+                      </span>
                     </>
                   )}
                 </div>

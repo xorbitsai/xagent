@@ -1723,6 +1723,69 @@ def test_execution_adapter_does_not_promote_unknown_termination_reason(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("remove_tool", [False, True])
+async def test_execution_adapter_resume_refreshes_cached_runner_tools(
+    remove_tool: bool,
+) -> None:
+    old_tool = FakeTool()
+    new_tool = FakeTool()
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-ask",
+                        "name": "ask_user_question",
+                        "args": {
+                            "message": "Reconnect the data source, then continue."
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="refresh-tools",
+            pattern="react",
+            llm=llm,
+            tools=[old_tool],
+            tracer=TracerCheckpointStore(),
+            skill_manager=NoSkillManager(),
+        )
+    )
+    waiting = await adapter.execute(task="Read data", task_id="refresh-tools-exec")
+    assert waiting["status"] == "waiting_for_user"
+    handle = adapter.registry.get("refresh-tools-exec")
+    assert handle is not None
+    assert handle.runner.agent.tools == [old_tool]
+
+    await adapter.post_user_message(
+        "refresh-tools-exec", "Connection settings updated.", request_interrupt=False
+    )
+    # AgentService rebuilds its tools before resuming an existing runner.
+    # The refreshed objects (including removals) must reach that runner too.
+    adapter.config.tools = [] if remove_tool else [new_tool]
+    # Even if the model repeats the old tool name, a removed tool must not run.
+    llm.responses.append(
+        {"tool_calls": [{"id": "call-noop", "name": "noop", "args": {}}]}
+    )
+    llm.responses.append("done")
+
+    resumed = await adapter.resume("refresh-tools-exec")
+
+    assert resumed is not None
+    assert resumed["status"] == "completed"
+    assert old_tool.calls == []
+    assert old_tool.setup_calls == ["refresh-tools-exec"]
+    assert old_tool.teardown_calls == ["refresh-tools-exec"]
+    assert new_tool.calls == ([] if remove_tool else [{}])
+    assert handle.runner.agent.tools == adapter.config.tools
+    resumed_names = {schema["function"]["name"] for schema in llm.calls[1]["tools"]}
+    assert ("noop" in resumed_names) is not remove_tool
+
+
+@pytest.mark.asyncio
 async def test_execution_adapter_resume_restores_from_tracer_after_restart() -> None:
     tracer = TracerCheckpointStore()
     first_llm = BlockingLLM(

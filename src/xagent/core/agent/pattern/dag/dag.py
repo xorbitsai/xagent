@@ -12,7 +12,8 @@ from ....task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
-from ...checkpoint import CheckpointPersistenceError
+from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME
+from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
@@ -123,6 +124,11 @@ class _DAGStepRuntime:
 
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
+
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return await self.parent.load_committed_tool_outcome(tool_call)
 
     async def run_tool_call(self, invoke: Any) -> Any:
         return await self.parent.run_tool_call(invoke)
@@ -1676,6 +1682,8 @@ class DAGPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
             raise
+        except ExecutionEventPersistenceError:
+            raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(
                 context=context,
@@ -2158,7 +2166,14 @@ class DAGPattern(AgentPattern):
             replan=replan,
             completed_step_results=dict(self.step_results),
             previous_plan=self.plan,
-            available_tool_names=[self._tool_name(tool) for tool in tools],
+            # ReAct offers the stored-result reader per turn, once the run's
+            # registry holds a record; this list is not gated on the
+            # registry, so it leaves the reader out entirely.
+            available_tool_names=[
+                name
+                for tool in tools
+                if (name := self._tool_name(tool)) != SPILL_READ_TOOL_NAME
+            ],
             completion_feedback=self.completion_feedback,
             reply_driven=reply_driven,
         )

@@ -56,6 +56,56 @@ def test_record_image_usage_records_resolution_tier() -> None:
     assert entry["provider_output_tokens"] == 3
 
 
+def test_record_image_usage_preserves_input_modality_split_and_zero() -> None:
+    with TokenContextManager() as manager:
+        record_image_usage(
+            {
+                "usage": {
+                    "input_tokens": 23,
+                    "output_tokens": 5,
+                    "input_tokens_details": {
+                        "text_tokens": 23,
+                        "image_tokens": 0,
+                    },
+                }
+            },
+            model_name="gpt-image-1",
+        )
+        entry = manager.get_usage().details[0]
+
+    assert entry["provider_input_tokens"] == 23
+    assert entry["provider_text_input_tokens"] == 23
+    assert entry["provider_image_input_tokens"] == 0
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        None,
+        {},
+        {"text_tokens": True, "image_tokens": -1},
+        {"text_tokens": 1.5, "image_tokens": "not-a-count"},
+        {"text_tokens": float("inf"), "image_tokens": 10**400},
+    ],
+)
+def test_absent_or_malformed_input_modality_split_is_omitted(details) -> None:
+    with TokenContextManager() as manager:
+        record_image_usage(
+            {
+                "usage": {
+                    "input_tokens": 17,
+                    "input_tokens_details": details,
+                }
+            },
+            model_name="gpt-image-1",
+        )
+        entry = manager.get_usage().details[0]
+
+    assert entry["provider_input_tokens"] == 17
+    assert "provider_text_input_tokens" not in entry
+    assert "provider_image_input_tokens" not in entry
+
+
 class _FakeResponse:
     """Minimal stand-in for an httpx/aiohttp 200 response."""
 
@@ -774,6 +824,58 @@ async def test_openai_edit_records_through_the_real_context(monkeypatch) -> None
     assert entry["model_id"] == "oa-1"
 
 
+@pytest.mark.parametrize(
+    ("method", "text_tokens", "image_tokens"),
+    [("generate", 19, 0), ("edit", 7, 11)],
+)
+@pytest.mark.asyncio
+async def test_openai_paths_record_provider_input_modalities(
+    monkeypatch, method: str, text_tokens: int, image_tokens: int
+) -> None:
+    from xagent.core.model.image.openai import OpenAIImageModel
+
+    class _InputDetails:
+        pass
+
+    class _Usage:
+        input_tokens = text_tokens + image_tokens
+        output_tokens = 3
+        input_tokens_details = _InputDetails()
+
+    _Usage.input_tokens_details.text_tokens = text_tokens
+    _Usage.input_tokens_details.image_tokens = image_tokens
+
+    class _Response:
+        data = [_StubOpenAIImage()]
+        usage = _Usage()
+        id = "modality-response"
+
+    class _Images:
+        async def generate(self, **kwargs):
+            return _Response()
+
+        async def edit(self, **kwargs):
+            return _Response()
+
+    model = OpenAIImageModel(api_key="k", model_id="oa-modalities")
+    monkeypatch.setattr(model, "_ensure_client", lambda: None)
+    monkeypatch.setattr(model, "_client", type("_C", (), {"images": _Images()})())
+    monkeypatch.setattr("builtins.open", lambda path, mode: _CloseableFile())
+
+    with TokenContextManager() as manager:
+        if method == "generate":
+            await model.generate_image(prompt="draw")
+        else:
+            await model.edit_image(image_url="local.png", prompt="edit")
+        usage = manager.get_usage()
+        entry = usage.details[0]
+
+    assert usage.media_calls == 1
+    assert entry["provider_input_tokens"] == text_tokens + image_tokens
+    assert entry["provider_text_input_tokens"] == text_tokens
+    assert entry["provider_image_input_tokens"] == image_tokens
+
+
 class _CloseableFile:
     def close(self) -> None:
         return None
@@ -1037,6 +1139,225 @@ async def test_gemini_edit_records_one_image_through_the_real_context(
     assert entry["quantity"] == 1.0
     assert entry["provider_tokens"] == 13
     assert entry["model_id"] == "gem-cfg"
+
+
+async def _record_gemini_call(monkeypatch, method: str, usage_metadata: dict):
+    """Run one Gemini generate/edit call and return its persisted media row."""
+    from xagent.core.model.image import gemini as gemini_mod
+
+    payload = {
+        "candidates": [
+            {
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [{"text": "![Image](https://example.com/out.png)"}]
+                },
+            }
+        ],
+        "usageMetadata": usage_metadata,
+    }
+    monkeypatch.setattr(
+        gemini_mod.httpx, "AsyncClient", _gemini_client_factory(payload, {"n": 0})
+    )
+    model = gemini_mod.GeminiImageModel(
+        model_name="gemini-3-pro-image-preview-2k",
+        api_key="k",
+        abilities=["generate", "edit"],
+        model_id="gem-modalities",
+    )
+
+    with TokenContextManager() as manager:
+        if method == "generate":
+            await model.generate_image(prompt="draw")
+        else:
+            await model.edit_image(
+                image_url="data:image/png;base64,iVBORw0KGgo=", prompt="edit"
+            )
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 1
+    return usage.details[0]
+
+
+@pytest.mark.parametrize(
+    ("method", "details", "text_tokens", "image_tokens"),
+    [
+        # A text-only prompt lists no IMAGE entry: that is an explicit zero,
+        # not an unknown image count.
+        ("generate", [{"modality": "TEXT", "tokenCount": 12}], 12, 0),
+        (
+            "edit",
+            [
+                {"modality": "TEXT", "tokenCount": 9},
+                {"modality": "IMAGE", "tokenCount": 1290},
+            ],
+            9,
+            1290,
+        ),
+        # A zero-token entry in another modality carries no charge.
+        (
+            "generate",
+            [
+                {"modality": "TEXT", "tokenCount": 12},
+                {"modality": "AUDIO", "tokenCount": 0},
+            ],
+            12,
+            0,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_gemini_paths_record_provider_input_modalities(
+    monkeypatch, method: str, details: list, text_tokens: int, image_tokens: int
+) -> None:
+    prompt_tokens = text_tokens + image_tokens
+    entry = await _record_gemini_call(
+        monkeypatch,
+        method,
+        {
+            "promptTokenCount": prompt_tokens,
+            "candidatesTokenCount": 1290,
+            "promptTokensDetails": details,
+        },
+    )
+
+    assert entry["call_type"] == f"{method}_image"
+    assert entry["provider_input_tokens"] == prompt_tokens
+    assert entry["provider_text_input_tokens"] == text_tokens
+    assert entry["provider_image_input_tokens"] == image_tokens
+    [group] = aggregate_media_usage_by_model([entry])
+    assert group["provider_text_input_tokens"] == text_tokens
+    assert group["provider_image_input_tokens"] == image_tokens
+
+
+@pytest.mark.parametrize(
+    "usage_metadata",
+    [
+        pytest.param({"promptTokenCount": 12}, id="details-absent"),
+        pytest.param(
+            {"promptTokenCount": 12, "promptTokensDetails": []}, id="details-empty"
+        ),
+        pytest.param(
+            {"promptTokenCount": 12, "promptTokensDetails": {"TEXT": 12}},
+            id="details-not-a-list",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 10}],
+            },
+            id="split-below-total",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "IMAGE", "tokenCount": 5},
+                ],
+            },
+            id="split-above-total",
+        ),
+        pytest.param(
+            {"promptTokensDetails": [{"modality": "TEXT", "tokenCount": 12}]},
+            id="total-absent",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": "not-a-count",
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 12}],
+            },
+            id="total-malformed",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 30,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "AUDIO", "tokenCount": 18},
+                ],
+            },
+            id="other-modality",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 30,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "HOLOGRAM", "tokenCount": 18},
+                ],
+            },
+            id="unknown-modality",
+        ),
+        # Tokens outside text and image void the split even when the provider's
+        # total leaves them out.
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "VIDEO", "tokenCount": 18},
+                ],
+            },
+            id="other-modality-outside-total",
+        ),
+        # A missing count is unknown, not zero, even when the rest would
+        # balance.
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 12},
+                    {"modality": "IMAGE"},
+                ],
+            },
+            id="count-absent",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 1,
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": True}],
+            },
+            id="count-boolean",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 13},
+                    {"modality": "IMAGE", "tokenCount": -1},
+                ],
+            },
+            id="count-negative",
+        ),
+        pytest.param(
+            {
+                "promptTokenCount": 12,
+                "promptTokensDetails": [
+                    {"modality": "TEXT", "tokenCount": 11.5},
+                    {"modality": "IMAGE", "tokenCount": 0.5},
+                ],
+            },
+            id="count-fractional",
+        ),
+        pytest.param(
+            {"promptTokenCount": 12, "promptTokensDetails": ["TEXT"]},
+            id="entry-not-a-dict",
+        ),
+    ],
+)
+@pytest.mark.parametrize("method", ["generate", "edit"])
+@pytest.mark.asyncio
+async def test_gemini_untrustworthy_input_modality_split_is_omitted(
+    monkeypatch, method: str, usage_metadata: dict
+) -> None:
+    entry = await _record_gemini_call(monkeypatch, method, usage_metadata)
+
+    # The row still records the call and its aggregate tokens; only the split
+    # is left out, so billing reports unpriced input instead of guessing.
+    assert entry["quantity"] == 1.0
+    assert "provider_text_input_tokens" not in entry
+    assert "provider_image_input_tokens" not in entry
 
 
 @pytest.mark.asyncio

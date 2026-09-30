@@ -713,9 +713,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const previewTaskIdRef = useRef<number | null>(null)
+  // Bumped by resetPreviewSession (Clear, mount/unmount); a mismatch silently drops an in-flight send's task and error.
+  const previewGenerationRef = useRef(0)
+  // Bumped by invalidatePreviewTask on config changes; a mismatch still sends the in-flight message but won't cache its task.
+  const previewConfigGenerationRef = useRef(0)
+  // Only an accepted send for the current configuration can complete the guide.
+  // Keep this reactive: invalidating the cached task must also remove its checkmark.
+  const [previewCompletionTaskId, setPreviewCompletionTaskId] = useState<number | null>(null)
 
   const resetPreviewSession = useCallback(() => {
+    previewGenerationRef.current += 1
     previewTaskIdRef.current = null
+    setPreviewCompletionTaskId(null)
     closeFilePreview()
     dispatch({ type: "CLEAR_MESSAGES" })
     dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
@@ -727,7 +736,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [closeFilePreview, dispatch, setTaskId])
 
   const invalidatePreviewTask = useCallback(() => {
+    previewConfigGenerationRef.current += 1
     previewTaskIdRef.current = null
+    setPreviewCompletionTaskId(null)
   }, [])
 
   useEffect(() => {
@@ -737,12 +748,21 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }, [resetPreviewSession])
 
+  // Save/reload re-creates arrays and model objects without necessarily changing
+  // execution config. Compare the values sent to preview, not their references.
+  const previewConfigKey = JSON.stringify({
+    instructions,
+    executionMode,
+    models: [modelConfig.general, modelConfig.small_fast, modelConfig.visual, modelConfig.compact]
+      .map(id => id ? String(id) : null),
+    knowledgeBases: [...selectedKbs].sort(),
+    skills: [...selectedSkills].sort(),
+    toolCategories: [...new Set(buildToolCategories())].sort(),
+  })
+
   useEffect(() => {
-    if (!previewTaskIdRef.current) {
-      return
-    }
     invalidatePreviewTask()
-  }, [instructions, executionMode, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, invalidatePreviewTask])
+  }, [previewConfigKey, invalidatePreviewTask])
 
   // Fetch Data
   useEffect(() => {
@@ -1173,6 +1193,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   const handlePreviewSendMessage = async (content: string, _config?: any, files?: File[]) => {
+    const generationAtStart = previewGenerationRef.current
+    const configGenerationAtStart = previewConfigGenerationRef.current
+    setPreviewCompletionTaskId(null)
     try {
       // Check if general model is selected
       if (!modelConfig.general) {
@@ -1235,11 +1258,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }
 
         const taskData = await response.json()
+        if (previewGenerationRef.current !== generationAtStart) return
         previewTaskId = Number(taskData.task_id)
         if (!Number.isFinite(previewTaskId)) {
           throw new Error("Preview task creation returned an invalid task id")
         }
-        previewTaskIdRef.current = previewTaskId
+        // Config edited mid-create: this message still goes to the pre-edit task, the next send starts a fresh one.
+        if (previewConfigGenerationRef.current === configGenerationAtStart) {
+          previewTaskIdRef.current = previewTaskId
+        }
 
         // Close any file preview opened from the previous preview task before switching context.
         closeFilePreview()
@@ -1272,8 +1299,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       }
 
       await sendMessage(backendMessage, { force: true, targetTaskId: previewTaskId }, files)
+      if (
+        previewGenerationRef.current === generationAtStart
+        && previewConfigGenerationRef.current === configGenerationAtStart
+      ) {
+        setPreviewCompletionTaskId(previewTaskId)
+      }
     } catch (error) {
       console.error("Preview failed:", error)
+      if (previewGenerationRef.current !== generationAtStart) return
       dispatch({
         type: "ADD_MESSAGE",
         payload: {
@@ -1872,7 +1906,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         selectedToolCategories.length > 0 ||
         selectedMcpServers.length > 0
       )
-  const previewStepCompleted = state.messages.some((message) => message.role === "user")
+  const previewStepCompleted = previewCompletionTaskId !== null
+    && state.taskId === previewCompletionTaskId
+    && state.currentTask?.id === String(previewCompletionTaskId)
+    && state.currentTask?.status === "completed"
+    && state.currentTask.completionOutcome !== "partial"
+    && state.currentTask.completionOutcome !== "blocked"
+    && !state.isProcessing
   const shouldHighlightConfigStep = !configStepCompleted
   const shouldHighlightKbSection = useTemplateSpecificHighlights ? templateMissingKb : shouldHighlightConfigStep
   const shouldHighlightSkillsSection = useTemplateSpecificHighlights ? templateMissingSkills : shouldHighlightConfigStep

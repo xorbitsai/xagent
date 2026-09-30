@@ -126,6 +126,13 @@ _STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
 _STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
 _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
+LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
+LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
+LLM_STREAM_EMPTY_DELTA_LIMIT = "XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT"
+LLM_STREAM_DEGENERATE_WINDOW = "XAGENT_LLM_STREAM_DEGENERATE_WINDOW"
+LLM_STREAM_DEGENERATE_MAX_PERIOD = "XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD"
+LLM_STREAM_NO_PAYLOAD_ABORT_MODELS = "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS"
+LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS = "XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_ENV = "SANDBOX_ENV"
@@ -155,6 +162,7 @@ TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS = (
 )
 CHECKPOINT_ENCODING_V2 = "XAGENT_CHECKPOINT_ENCODING_V2"
 CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
+CHECKPOINT_GATE_STALL_WARNING_SECONDS = "XAGENT_CHECKPOINT_GATE_STALL_WARNING_SECONDS"
 ASYNC_TRACE_DB_ENABLED = "XAGENT_ASYNC_TRACE_DB_ENABLED"
 TRACE_DB_MAX_INFLIGHT = "XAGENT_TRACE_DB_MAX_INFLIGHT"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
@@ -174,6 +182,8 @@ BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
+TASK_CLEANUP_RETRY_INTERVAL_SECONDS = "XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS"
+TASK_CLEANUP_MAX_ATTEMPTS = "XAGENT_TASK_CLEANUP_MAX_ATTEMPTS"
 WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
 TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
@@ -242,6 +252,7 @@ OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
 XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
+FORM_ANSWER_CONTINUATION_ENABLED = "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
 TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
@@ -718,6 +729,17 @@ def get_xrouter_excluded_models() -> tuple[str, ...]:
     )
 
 
+def get_form_answer_continuation_enabled() -> bool:
+    """Return whether the form-answer continuation text may be applied.
+
+    One switch for every model, on by default. Unset means on; any set value
+    other than ``1``, ``true``, ``yes`` or ``on`` (case-insensitive, surrounding
+    whitespace ignored) means off, including an empty value. Read on every
+    call (not cached).
+    """
+    return _get_bool_env(FORM_ANSWER_CONTINUATION_ENABLED, True)
+
+
 def get_mcp_oauth_allow_private_hosts() -> bool:
     """Return whether MCP OAuth URL policy may target local/private hosts.
 
@@ -831,13 +853,14 @@ def get_channel_ingress_enabled() -> bool:
 
 
 def validate_task_execution_host_config() -> None:
-    """Reject incomplete shared deployments before accepting tasks."""
+    """Reject invalid execution configuration before accepting tasks."""
     role = get_task_execution_role()
     if not get_shared_task_execution_enabled():
         if role != "combined":
             raise ValueError(
                 f"{TASK_EXECUTION_ROLE}={role} requires {SHARED_TASK_EXECUTION_ENABLED}"
             )
+        get_task_runtime_secrets_ttl_seconds()
         return
     if not get_redis_url():
         raise ValueError(f"{SHARED_TASK_EXECUTION_ENABLED} requires {REDIS_URL}")
@@ -1109,6 +1132,27 @@ def get_checkpoint_history_limit() -> int:
     return _get_positive_int_env(CHECKPOINT_HISTORY_LIMIT, 8, minimum=0)
 
 
+def get_checkpoint_gate_stall_warning_seconds() -> float:
+    """Seconds an exclusive checkpoint section may run before it is reported.
+
+    The section is never timed out: abandoning a write that may still land
+    would create the uncertain outcome it exists to rule out. Crossing this
+    threshold only logs a warning and counts a stall, repeating each interval
+    while the section is still held.
+
+    Priority:
+        1. XAGENT_CHECKPOINT_GATE_STALL_WARNING_SECONDS environment variable
+        2. Default ``30``
+
+    Invalid or non-positive values fall back to the default.
+
+    Returns:
+        The stall warning interval in seconds.
+    """
+    value = _get_positive_float_env(CHECKPOINT_GATE_STALL_WARNING_SECONDS, 30.0)
+    return 30.0 if value is None else value
+
+
 def get_compact_threshold_ratio() -> float:
     """Fraction of a model's context window at which to trigger compaction.
 
@@ -1247,6 +1291,39 @@ def get_orphan_upload_sweep_interval_seconds() -> int:
         60 * 60,
         minimum=60,
     )
+
+
+def get_task_cleanup_retry_interval_seconds() -> int:
+    """How often the task-cleanup retry driver looks for due obligations (#2587).
+
+    A task deletion that could not release a workspace directory or a
+    runtime-extension's state records the obligation and this driver retries
+    it. The interval only sets how often an idle driver re-checks; per-row
+    backoff decides when a given obligation is due.
+
+    Priority:
+        1. XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS environment variable
+        2. Default 300 (5 minutes)
+    """
+    return _get_positive_int_env(
+        TASK_CLEANUP_RETRY_INTERVAL_SECONDS,
+        5 * 60,
+        minimum=30,
+    )
+
+
+def get_task_cleanup_max_attempts() -> int:
+    """Attempts before a cleanup obligation stops retrying (#2587).
+
+    After this many failed attempts the obligation moves to the terminal
+    ``exhausted`` state, where it stays for an operator to reconcile rather
+    than being retried forever against a resource that will never come back.
+
+    Priority:
+        1. XAGENT_TASK_CLEANUP_MAX_ATTEMPTS environment variable
+        2. Default 8
+    """
+    return _get_positive_int_env(TASK_CLEANUP_MAX_ATTEMPTS, 8)
 
 
 def get_workforce_preview_run_stale_seconds() -> int:
@@ -2830,6 +2907,148 @@ def get_mcp_tool_init_timeout_seconds() -> int:
         Seconds allowed per MCP server; 0 disables the timeout.
     """
     return _get_positive_int_env(MCP_TOOL_INIT_TIMEOUT_SECONDS, 60, minimum=0)
+
+
+def get_llm_retry_deadline_seconds() -> float:
+    """Get the wall-clock ceiling for one LLM call's whole retry loop.
+
+    Attempt counting cannot bound how long one call holds an execution slot,
+    because every attempt may consume a full request timeout. This is the
+    bound that does. It gates whether a *new* attempt may start, so one call
+    can still overrun it by a single attempt's duration.
+
+    Priority:
+        1. XAGENT_LLM_RETRY_DEADLINE_SECONDS environment variable
+        2. 300
+
+    Returns:
+        Seconds allowed for one call's retry loop; invalid or non-positive
+        values fall back to the default, because an unbounded loop is the
+        defect this exists to prevent.
+    """
+    deadline = _get_positive_float_env(LLM_RETRY_DEADLINE_SECONDS, 300.0)
+    return 300.0 if deadline is None else deadline
+
+
+def get_llm_capacity_max_attempts() -> int:
+    """Get the attempt budget for a provider capacity refusal.
+
+    Deliberately far below the per-model ``max_retries``: a provider that
+    reports being over capacity has asked us not to grow its load, so
+    replaying the identical request is the wrong response. Only ever lowers
+    a call's ceiling -- it cannot raise it above ``max_retries``.
+
+    Priority:
+        1. XAGENT_LLM_CAPACITY_MAX_ATTEMPTS environment variable
+        2. 2
+
+    Returns:
+        Attempts allowed for a capacity refusal; invalid or non-positive
+        values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_CAPACITY_MAX_ATTEMPTS, 2)
+
+
+def get_llm_stream_empty_delta_limit() -> int:
+    """Get the consecutive-empty-delta budget before an LLM stream is abandoned.
+
+    Counts streaming deltas in a row that carry no content, no tool-call
+    bytes, no reasoning text and no finish_reason -- a stream stuck emitting
+    nothing is making no progress even though the connection is still open.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT environment variable
+        2. 200
+
+    Returns:
+        The count of consecutive empty deltas at which the stream is
+        abandoned (the Nth empty delta in a row triggers it); 0 disables the
+        check. Invalid or negative values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_EMPTY_DELTA_LIMIT, 200, minimum=0)
+
+
+def get_llm_stream_degenerate_window() -> int:
+    """Get the trailing-character window inspected for a degenerate stream tail.
+
+    Used two ways: to size the trailing slice of reasoning text checked for a
+    whitespace-only or periodic (repeated) tail, and as the trailing-whitespace
+    budget allowed after a complete tool-call JSON object has already been
+    emitted.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_DEGENERATE_WINDOW environment variable
+        2. 256
+
+    Returns:
+        Trailing characters inspected; 0 disables the whitespace and
+        periodicity checks (non-whitespace after a complete tool-call object
+        is still rejected: it can never parse). Invalid or
+        negative values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_DEGENERATE_WINDOW, 256, minimum=0)
+
+
+def get_llm_stream_degenerate_max_period() -> int:
+    """Get the longest repeat period the periodicity check searches for.
+
+    Bounds how far the degenerate-tail check looks inside the trailing
+    window (``get_llm_stream_degenerate_window``) for a repeating substring,
+    e.g. a model looping on the same few characters instead of finishing.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD environment variable
+        2. 64
+
+    Returns:
+        Longest repeat period, in characters, considered. Invalid or
+        non-positive values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_DEGENERATE_MAX_PERIOD, 64)
+
+
+def get_llm_stream_no_payload_abort_models() -> frozenset[str]:
+    """Get the model allowlist for the opt-in no-payload wall-clock abort.
+
+    The wall-clock abort in ``get_llm_stream_no_payload_timeout_seconds`` only
+    applies to models named here, because it is a blunter, time-based signal
+    than the delta- and degenerate-tail checks above and is meant for models
+    known to stall without ever emitting the finish signals those checks rely
+    on. Matching is exact and case-sensitive against the model string sent on
+    the wire (e.g. ``moonshotai.kimi-k2.5``) -- no normalization or prefix
+    matching is applied.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS environment variable
+        2. empty (no models opted in)
+
+    Returns:
+        Frozenset of wire model names for which the no-payload abort is
+        enabled; empty when unset or blank.
+    """
+    raw = os.getenv(LLM_STREAM_NO_PAYLOAD_ABORT_MODELS, "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
+def get_llm_stream_no_payload_timeout_seconds() -> float:
+    """Get the no-payload wall-clock timeout for allow-listed models.
+
+    Seconds after the first streamed chunk before an allow-listed model's
+    stream (see ``get_llm_stream_no_payload_abort_models``) is abandoned if it
+    has produced no content and no tool-call chunk in that time. Only applies
+    to models on that allowlist; other models are governed solely by the
+    delta- and degenerate-tail checks above.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS environment variable
+        2. 30
+
+    Returns:
+        Seconds allowed with no payload before the stream is abandoned;
+        invalid or non-positive values fall back to the default.
+    """
+    timeout = _get_positive_float_env(LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS, 30.0)
+    return 30.0 if timeout is None else timeout
 
 
 def get_sandbox_cpus() -> int | None:

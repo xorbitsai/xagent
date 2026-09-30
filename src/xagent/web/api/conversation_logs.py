@@ -17,6 +17,7 @@ from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
+from ..models.expired_task import ExpiredTaskTombstone
 from ..models.task import Task, TraceEvent
 from ..models.trigger import AgentTrigger, TriggerRun
 from ..models.uploaded_file import UploadedFile
@@ -26,6 +27,7 @@ from ..services.conversation_log_sources import (
     get_external_task_public_context,
     get_external_task_source_branches,
 )
+from ..services.expired_tasks import find_expired_task
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -35,8 +37,9 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
-from ..services.task_runtime import MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY
+from ..services.task_runtime import mcp_runtime_authorization_policy_required_clause
 from ..utils.db_timezone import format_datetime_for_api
+from .expired_task_errors import task_expired_http_error
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +313,12 @@ def _external_ui_source_for_task(db: Session, task: Task) -> str:
 
 
 def _ui_source_for_task(db: Session, task: Task) -> str | None:
+    """The second live gate: ``None`` here is a 404 even for an in-scope task.
+
+    Mirrored by ``_tombstone_has_ui_source`` below for a task retention
+    purged; see ``test_live_and_tombstone_predicates_agree`` in
+    ``tests/web/api/test_conversation_logs.py`` -- change the two together.
+    """
     source = str(task.source or "")
     if source == EXTERNAL_TASK_SOURCE:
         return _external_ui_source_for_task(db, task)
@@ -325,7 +334,15 @@ def _message_sort_key(message: TaskChatMessage) -> tuple[bool, Any, int]:
 
 
 def _apply_external_task_scope(query: Any, user: User) -> Any:
-    """Admins can inspect hidden external conversation logs across all users."""
+    """Admins can inspect hidden external conversation logs across all users.
+
+    Mirrored by ``_tombstone_in_external_task_scope`` below for a task
+    retention purged; ``tests/web/api/test_conversation_logs.py``'s
+    ``test_live_and_tombstone_predicates_agree`` runs both live and
+    post-purge over the same task shapes and checks they agree, so a term
+    changed here without changing there fails that test rather than silently
+    disclosing (or hiding) an expired task. Change the two together.
+    """
     query = query.filter(
         Task.is_visible.is_(False),
         Task.source.in_(sorted(EXTERNAL_TASK_SOURCES)),
@@ -333,14 +350,85 @@ def _apply_external_task_scope(query: Any, user: User) -> Any:
         # tasks too (``channel_runtime`` selects them by this key). They are
         # channel plumbing, not conversations, so keep them off this page as
         # they were before ``external`` entered the scope. NULL IS NOT TRUE
-        # holds, so rows without the key are unaffected.
-        Task.agent_config[MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY]
-        .as_boolean()
-        .isnot(True),
+        # holds, so rows without the key are unaffected. Spelled through the
+        # shared helper so the expired-task tombstone's stored flag
+        # (``services.expired_tasks``) is this same predicate, not a second
+        # implementation of it.
+        mcp_runtime_authorization_policy_required_clause().isnot(True),
     )
     if not bool(user.is_admin):
         query = query.filter(Task.user_id == int(user.id))
     return query
+
+
+def _tombstone_in_external_task_scope(
+    tombstone: ExpiredTaskTombstone, user: User
+) -> bool:
+    """``_apply_external_task_scope``, applied to an expired task's tombstone.
+
+    The tombstone stores exactly the inputs that filter reads, so this is the
+    same predicate term for term: hidden, an external source, not MCP channel
+    plumbing, and the caller's own unless the caller is an admin. Keep the two
+    in step -- a term added there and not here would let an expired task be
+    disclosed to a caller who could never have seen it live.
+
+    ``test_live_and_tombstone_predicates_agree``
+    (``tests/web/api/test_conversation_logs.py``) is what would catch the two
+    drifting apart; change it alongside ``_apply_external_task_scope``.
+    """
+    if tombstone.is_visible:
+        return False
+    if tombstone.source not in EXTERNAL_TASK_SOURCES:
+        return False
+    if tombstone.is_channel_plumbing:
+        return False
+    return bool(user.is_admin) or int(tombstone.user_id) == int(user.id)
+
+
+def _tombstone_has_ui_source(tombstone: ExpiredTaskTombstone) -> bool:
+    """The detail route's second gate, ``_ui_source_for_task``, on a tombstone.
+
+    Mirrors ``_ui_source_for_task`` by running the tombstone's stored
+    ``source`` and ``trigger_type`` through the same ``_ui_source_from_values``
+    mapping the live task uses: direct sources map to a UI source
+    unconditionally, and a ``trigger`` row passes only for a webhook trigger
+    type, exactly like the live task's ``AgentTrigger.type``. ``external`` rows
+    are handled separately here because live, ``_external_ui_source_for_task``
+    always resolves to a UI source -- it falls back to the REST API default
+    when no deployment branch matches -- so an external tombstone always
+    passes too.
+
+    ``test_live_and_tombstone_predicates_agree``
+    (``tests/web/api/test_conversation_logs.py``) is what would catch the two
+    drifting apart; change it alongside ``_ui_source_for_task``.
+    """
+    source = str(tombstone.source or "")
+    if source == EXTERNAL_TASK_SOURCE:
+        return True
+    return _ui_source_from_values(source, tombstone.trigger_type) is not None
+
+
+def _missing_conversation_log_error(
+    db: Session, user: User, task_id: int
+) -> HTTPException:
+    """The error for a detail request whose task is not served live.
+
+    ``410 task_expired`` when retention expired the task and the tombstone
+    passes the same gates the live task would have (see
+    ``expired_task_errors``); otherwise this route's ordinary 404, so the
+    answer never reveals that an id the caller could not see ever existed.
+    """
+    tombstone = find_expired_task(db, task_id)
+    if (
+        tombstone is not None
+        and _tombstone_in_external_task_scope(tombstone, user)
+        and _tombstone_has_ui_source(tombstone)
+    ):
+        return task_expired_http_error(
+            tombstone,
+            message="Conversation log expired under the retention policy",
+        )
+    return HTTPException(status_code=404, detail="Conversation log not found")
 
 
 def _apply_task_filters(
@@ -788,12 +876,14 @@ async def get_conversation_log_detail(
     """Return one hidden external conversation log.
 
     Admin users can inspect hidden external conversation logs across all users.
-    Non-admin users are limited to their own logs.
+    Non-admin users are limited to their own logs. A log the retention purge
+    expired answers ``410 task_expired`` to exactly those callers and 404 to
+    everyone else; the list never includes it.
     """
     query = _base_task_query(db, user).filter(Task.id == task_id)
     task = query.first()
     if task is None:
-        raise HTTPException(status_code=404, detail="Conversation log not found")
+        raise _missing_conversation_log_error(db, user, task_id)
 
     ui_source = _ui_source_for_task(db, task)
     if ui_source is None:
@@ -814,6 +904,11 @@ async def get_conversation_log_detail(
             file_reference_records,
         ),
         "trace_events": _serialize_trace_events(db, int(task.id)),
+        # When retention last removed this task's trace (#2565). Later turns
+        # write new trace rows, so a non-null value does not mean
+        # ``trace_events`` is empty: it means the events from before this
+        # moment are gone and the timeline may be incomplete.
+        "trace_events_expired_at": format_datetime_for_api(task.traces_expired_at),
         "metadata": {
             "task": {
                 "task_id": int(task.id),

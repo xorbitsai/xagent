@@ -38,6 +38,7 @@ from ..models.database import release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from .managed_file_ref import ensure_uploaded_file_local_path
+from .task_file_lifecycle import lock_attachment_task
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +311,8 @@ def bind_turn_files_no_commit(
     if not ids:
         return []
     ids = list(dict.fromkeys(ids))
+    if lock_attachment_task(db, task_id, owner_user_id=owner_user_id) is None:
+        return ids
     # Claim every currently-unbound row first. On PostgreSQL the conditional
     # UPDATE waits for a concurrent writer and then re-evaluates its predicate;
     # on SQLite the serialized writer lock provides the same winner/loser
@@ -320,7 +323,14 @@ def bind_turn_files_no_commit(
         UploadedFile.user_id == owner_user_id,
         UploadedFile.task_id.is_(None),
         UploadedFile.storage_status != "compensating",
-    ).update({UploadedFile.task_id: task_id}, synchronize_session=False)
+    ).update(
+        {
+            UploadedFile.task_id: task_id,
+            UploadedFile.detached_reason: None,
+            UploadedFile.detached_at: None,
+        },
+        synchronize_session=False,
+    )
     bound_rows = (
         db.query(UploadedFile.file_id)
         .filter(
@@ -335,9 +345,7 @@ def bind_turn_files_no_commit(
     return [file_id for file_id in ids if file_id not in bound]
 
 
-def build_uploaded_files_context(
-    file_info_list: List[Dict[str, Any]], *, is_agent_builder: bool = False
-) -> str:
+def build_uploaded_files_context(file_info_list: List[Dict[str, Any]]) -> str:
     """Build stable LLM context for files already uploaded for this turn."""
     if not file_info_list:
         return ""
@@ -364,16 +372,6 @@ def build_uploaded_files_context(
         "",
         FILE_REF_MODEL_INSTRUCTIONS,
     ]
-    if is_agent_builder:
-        joined_file_ids = ", ".join(f'"{file_id}"' for file_id in file_ids)
-        lines.extend(
-            [
-                "",
-                "For knowledge-base creation, call `create_knowledge_base_from_file` with:",
-                f"  file_ids = [{joined_file_ids}]",
-                "Do NOT ask the user to upload again unless these file_ids fail.",
-            ]
-        )
     return "\n".join(lines)
 
 

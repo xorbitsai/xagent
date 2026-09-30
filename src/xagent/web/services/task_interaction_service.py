@@ -2274,6 +2274,41 @@ def _resolve_read_direction_anchor(
     alone -- see that resolver's own docstring for the full account.
     """
 
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, int(row.task_id)):
+        from ...core.agent.checkpoint import CheckpointCorruptError
+        from .task_execution_event_recovery import find_event_checkpoint_anchor
+
+        try:
+            event = find_event_checkpoint_anchor(
+                db,
+                task_id=int(row.task_id),
+                protocol_event_id=str(row.resume_event_id),
+                execution_id=str(row.resume_execution_id),
+                run_id=str(row.resume_run_partition),
+            )
+        except CheckpointCorruptError:
+            event = None
+        except (
+            sa.exc.OperationalError,
+            sa.exc.InterfaceError,
+            sa.exc.DisconnectionError,
+            sa.exc.TimeoutError,
+        ):
+            register_degradation(
+                CHECKPOINT_LOAD_UNAVAILABLE,
+                f"task {row.task_id}: interaction {row.id} event anchor fetch failed",
+            )
+            return _AnchorUnresolved(reason="checkpoint_unavailable")
+        if event is None:
+            register_degradation(
+                CHECKPOINT_PK_ANCHOR_DANGLING,
+                f"task {row.task_id}: interaction {row.id} has no usable event anchor",
+            )
+            return _AnchorUnresolved(reason="anchor_dangling")
+        return None
+
     if row.resume_trace_event_id is None:
         register_degradation(
             CHECKPOINT_PK_ANCHOR_DANGLING,
@@ -2387,6 +2422,15 @@ class CompatibilityQuestionView:
 def _legacy_view(
     db: "Session", task_id: int, *, allow_superseded: bool = False
 ) -> CompatibilityQuestionView:
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        from .task_execution_event_recovery import read_event_waiting_question
+
+        question, interactions = read_event_waiting_question(db, task_id)
+        return CompatibilityQuestionView(
+            tier="legacy", question=question, interactions=interactions
+        )
     question, interactions = get_latest_waiting_question(
         db, task_id, allow_superseded=allow_superseded
     )

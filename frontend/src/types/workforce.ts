@@ -38,6 +38,7 @@ export interface WorkforceRunListItem {
   id: number
   task_id: number | null
   status: string
+  task_expired_at?: string | null
   created_at: string | null
   completed_at?: string | null
   task?: {
@@ -50,7 +51,11 @@ export interface WorkforceRunListItem {
 export interface WorkforceRunHistoryItem {
   id: number
   task_id: number | null
+  // The run's own outcome; retention expiring its task does not change it.
   status: string
+  // Set when the retention policy expired this run's conversation; task_id is
+  // null from then on. A null task_id without it is a task deleted otherwise.
+  task_expired_at?: string | null
   is_preview: boolean
   task_title: string | null
   message: string | null

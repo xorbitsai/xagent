@@ -813,6 +813,10 @@ class TaskWorkspace:
                     "Cannot register a workspace file over metadata owned by "
                     "another user"
                 )
+            if existing_record.detached_reason is not None:
+                raise ValueError(
+                    "Retained files must be explicitly reattached before registration"
+                )
             existing = WorkspaceUploadedFileSnapshot(
                 version=snapshot_uploaded_file_version(existing_record),
                 file_id=str(existing_record.file_id),
@@ -1308,6 +1312,11 @@ class TaskWorkspace:
     def _file_record_allowed_for_workspace(
         self, record: Any, path: Optional[Path] = None
     ) -> bool:
+        if (
+            getattr(record, "detached_reason", None) is not None
+            or getattr(record, "storage_status", None) == "compensating"
+        ):
+            return False
         if path is not None:
             workspace_abs = self.workspace_dir.resolve()
             resolved_path = path.resolve()

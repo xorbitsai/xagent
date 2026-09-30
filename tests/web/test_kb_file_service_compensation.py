@@ -16,7 +16,6 @@ from xagent.web.models.user import User
 from xagent.web.services import kb_file_service
 from xagent.web.services.kb_file_service import (
     capture_uploaded_file_refresh_snapshot,
-    compensate_new_uploaded_file,
     restore_uploaded_file_refresh_snapshot,
     upsert_uploaded_file_record,
 )
@@ -42,73 +41,6 @@ def compensation_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     finally:
         db.close()
         get_unscoped_file_storage.cache_clear()
-
-
-def test_compensate_new_uploaded_file_removes_row_local_and_durable(
-    compensation_env,
-) -> None:
-    db, uploads_dir = compensation_env
-    file_path = uploads_dir / "user_1" / "kb" / "page.md"
-    file_path.parent.mkdir(parents=True)
-    file_path.write_text("content", encoding="utf-8")
-
-    file_record = upsert_uploaded_file_record(
-        db,
-        user_id=1,
-        filename="page.md",
-        storage_path=file_path,
-        mime_type="text/markdown",
-        file_size=file_path.stat().st_size,
-    )
-    file_id = str(file_record.file_id)
-    storage_key = str(file_record.storage_key)
-    assert get_unscoped_file_storage().exists(storage_key)
-
-    result = compensate_new_uploaded_file(db, file_id=file_id, user_id=1)
-    db.commit()
-
-    assert result.complete
-    assert (
-        db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first() is None
-    )
-    assert not file_path.exists()
-    assert not get_unscoped_file_storage().exists(storage_key)
-
-    second = compensate_new_uploaded_file(db, file_id=file_id, user_id=1)
-    assert second.complete
-
-
-def test_compensate_new_uploaded_file_reports_incomplete_on_cleanup_failure(
-    compensation_env,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    db, uploads_dir = compensation_env
-    file_path = uploads_dir / "user_1" / "kb" / "page.md"
-    file_path.parent.mkdir(parents=True)
-    file_path.write_text("content", encoding="utf-8")
-    file_record = upsert_uploaded_file_record(
-        db,
-        user_id=1,
-        filename="page.md",
-        storage_path=file_path,
-        mime_type="text/markdown",
-        file_size=file_path.stat().st_size,
-    )
-
-    def fail_delete(*_args, **_kwargs) -> None:
-        raise RuntimeError("durable delete failed")
-
-    monkeypatch.setattr(kb_file_service.UploadedFileStore, "delete", fail_delete)
-
-    result = compensate_new_uploaded_file(
-        db,
-        file_id=str(file_record.file_id),
-        user_id=1,
-    )
-
-    assert result.status == "incomplete"
-    assert result.side_effects_may_remain is True
-    assert "durable delete failed" in result.errors[0]
 
 
 def test_restore_uploaded_file_refresh_snapshot_restores_row_local_and_durable(

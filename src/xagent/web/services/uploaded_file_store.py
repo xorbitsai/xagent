@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Optional, Sequence, cast
@@ -32,6 +33,7 @@ from .managed_file_ref import (
     ManagedFileRef,
     guess_media_type,
 )
+from .task_file_lifecycle import lock_attachment_task
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +243,8 @@ class UploadedFileVersionSnapshot:
     storage_status: str
     mime_type: str | None
     file_size: int
+    detached_reason: str | None = None
+    detached_at: datetime | None = None
 
 
 class UploadedFileVersionConflict(RuntimeError):
@@ -310,6 +314,8 @@ def snapshot_uploaded_file_version(
             str(file_record.mime_type) if file_record.mime_type is not None else None
         ),
         file_size=int(file_record.file_size or 0),
+        detached_reason=cast(str | None, file_record.detached_reason),
+        detached_at=cast(datetime | None, file_record.detached_at),
     )
 
 
@@ -317,6 +323,8 @@ def _snapshot_staged_uploaded_file_version(
     staged: StagedUploadedFile,
     *,
     row_id: int,
+    detached_reason: str | None = None,
+    detached_at: datetime | None = None,
 ) -> UploadedFileVersionSnapshot:
     return UploadedFileVersionSnapshot(
         row_id=row_id,
@@ -335,6 +343,8 @@ def _snapshot_staged_uploaded_file_version(
         storage_status="available",
         mime_type=staged.mime_type,
         file_size=staged.file_size,
+        detached_reason=detached_reason,
+        detached_at=detached_at,
     )
 
 
@@ -354,6 +364,8 @@ def _uploaded_file_version_match_predicates(
         UploadedFile.file_id == expected.file_id,
         UploadedFile.user_id == expected.user_id,
         _nullable_version_match(UploadedFile.task_id, expected.task_id),
+        _nullable_version_match(UploadedFile.detached_reason, expected.detached_reason),
+        _nullable_version_match(UploadedFile.detached_at, expected.detached_at),
         UploadedFile.filename == expected.filename,
         UploadedFile.storage_path == expected.storage_path,
         _nullable_version_match(
@@ -1384,6 +1396,14 @@ class UploadedFileStore:
         """
 
         if expected is None:
+            if (
+                staged.task_id is not None
+                and lock_attachment_task(
+                    self.db, staged.task_id, owner_user_id=staged.user_id
+                )
+                is None
+            ):
+                raise UploadedFileVersionConflict("Attachment task no longer exists")
             file_record = staged.to_record()
             try:
                 self.add_already_durable(file_record)
@@ -1401,7 +1421,19 @@ class UploadedFileStore:
             raise ValueError("Cannot replace an uploaded file owned by another user")
         if expected.task_id != staged.task_id and not allow_task_rebind:
             raise ValueError("Cannot replace an uploaded file bound to another task")
+        if staged.task_id is not None:
+            if (
+                lock_attachment_task(
+                    self.db, staged.task_id, owner_user_id=staged.user_id
+                )
+                is None
+            ):
+                raise UploadedFileVersionConflict("Attachment task no longer exists")
 
+        detached_reason = (
+            None if staged.task_id is not None else expected.detached_reason
+        )
+        detached_at = None if staged.task_id is not None else expected.detached_at
         statement = (
             update(UploadedFile)
             .where(
@@ -1412,6 +1444,8 @@ class UploadedFileStore:
                 file_id=staged.file_id,
                 user_id=staged.user_id,
                 task_id=staged.task_id,
+                detached_reason=detached_reason,
+                detached_at=detached_at,
                 filename=staged.filename,
                 storage_path=staged.storage_path,
                 storage_backend=staged.storage_backend,
@@ -1445,6 +1479,8 @@ class UploadedFileStore:
             snapshot=_snapshot_staged_uploaded_file_version(
                 staged,
                 row_id=expected.row_id,
+                detached_reason=detached_reason,
+                detached_at=detached_at,
             ),
             superseded_cleanup_claim=cleanup_claim,
         )
@@ -1471,6 +1507,14 @@ class UploadedFileStore:
             raise ValueError("Metadata rollback must preserve uploaded-file identity")
         if replacement.storage_status not in {"available", "legacy"}:
             raise ValueError("Metadata rollback target must be a stable file state")
+        if replacement.task_id is not None:
+            if (
+                lock_attachment_task(
+                    self.db, replacement.task_id, owner_user_id=replacement.user_id
+                )
+                is None
+            ):
+                raise UploadedFileVersionConflict("Attachment task no longer exists")
         statement = (
             update(UploadedFile)
             .where(
@@ -1481,6 +1525,12 @@ class UploadedFileStore:
                 file_id=replacement.file_id,
                 user_id=replacement.user_id,
                 task_id=replacement.task_id,
+                detached_reason=None
+                if replacement.task_id is not None
+                else replacement.detached_reason,
+                detached_at=None
+                if replacement.task_id is not None
+                else replacement.detached_at,
                 filename=replacement.filename,
                 storage_path=replacement.storage_path,
                 storage_backend=replacement.storage_backend,
@@ -1510,7 +1560,11 @@ class UploadedFileStore:
             else None
         )
         return AppliedUploadedFileVersion(
-            snapshot=replacement,
+            snapshot=(
+                replace(replacement, detached_reason=None, detached_at=None)
+                if replacement.task_id is not None
+                else replacement
+            ),
             superseded_cleanup_claim=cleanup_claim,
         )
 
@@ -1826,15 +1880,33 @@ class UploadedFileStore:
         *,
         delete_local: bool = True,
         local_root: Optional[Path] = None,
+        after_commit: Optional[list[tuple[str, Callable[[], None]]]] = None,
     ) -> None:
-        ManagedFileRef(file_record).delete_durable()
+        """Delete the row (flushed, not committed) and its bytes.
+
+        With ``after_commit``, the durable delete and local unlink are queued as
+        ``(label, fn)`` for the caller to run after it commits; without it they run now.
+        """
+        ref = ManagedFileRef(file_record)
+        file_id = str(getattr(file_record, "file_id", "") or "")
+        if after_commit is None:
+            ref.delete_durable()
+        elif ref.has_durable_object:
+            storage = get_user_file_storage(int(file_record.user_id))
+            key = ref.storage_key
+            after_commit.append((key, lambda: storage.delete(key)))
         if delete_local:
-            self._delete_local(file_record, local_root=local_root)
+            unlink = functools.partial(
+                self._delete_local, str(file_record.storage_path), local_root=local_root
+            )
+            if after_commit is None:
+                unlink()
+            else:
+                after_commit.append((file_id, unlink))
         # Remove any server-side PDF preview cache so derived content doesn't
         # outlive the source upload.  Called here (not only in the HTTP route)
         # so reconcile / orphan-cleanup paths that go through this service also
         # clean up the cache.
-        file_id = str(getattr(file_record, "file_id", "") or "")
         delete_registered_preview_caches(file_id)
         self.db.delete(file_record)
         self.db.flush()
@@ -1871,10 +1943,8 @@ class UploadedFileStore:
         return digest.hexdigest()
 
     @staticmethod
-    def _delete_local(
-        file_record: UploadedFile, *, local_root: Optional[Path] = None
-    ) -> None:
-        local_path = Path(str(file_record.storage_path))
+    def _delete_local(storage_path: str, *, local_root: Optional[Path] = None) -> None:
+        local_path = Path(storage_path)
         if local_root is not None:
             resolved_path = local_path.resolve()
             if not resolved_path.is_relative_to(local_root.resolve()):

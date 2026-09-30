@@ -221,14 +221,30 @@ def _finalize_a2a_cancel_sync(
                 Task.runner_id.is_(None), Task.lease_expires_at.is_(None)
             )
 
+        # ``task`` is already in the identity map, so RETURNING hands back that
+        # same object. Without populate_existing its loaded attributes keep
+        # their pre-cancel values and the response would omit the cancel.
         updated = db.execute(
-            statement.returning(Task).execution_options(synchronize_session=False)
+            statement.returning(Task).execution_options(
+                synchronize_session=False,
+                populate_existing=True,
+            )
         ).scalar_one_or_none()
         if updated is None:
             db.rollback()
             raise StaleTaskRunError(
                 f"task {task_id} changed while finalizing cancel target "
                 f"{expected_run_id}/{expected_state_version}"
+            )
+        if direct_cancel:
+            from .task_execution_event_writer import stage_result_fact_no_commit
+
+            # A locally settled execution already recorded its own result.
+            # Direct cancellation owns this transition and its result fact.
+            stage_result_fact_no_commit(
+                db,
+                updated,
+                {"status": "cancelled", "error": updated.error_message},
             )
         snapshot = A2ATaskSnapshot.from_task(updated)
         db.commit()

@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from xagent.core.agent import Agent, ContextManager, ExecutionContext, PatternRuntime
+from xagent.core.agent import Agent, ExecutionContext, PatternRuntime
 from xagent.core.agent.execution_adapter import (
     AgentExecutionAdapter,
     AgentExecutionConfig,
@@ -25,14 +25,6 @@ from xagent.core.agent.execution_adapter import (
 from xagent.core.agent.registry import ExecutionRegistry
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
-
-
-@pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
 
 
 @dataclass

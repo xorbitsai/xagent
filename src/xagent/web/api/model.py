@@ -31,10 +31,12 @@ from xagent.core.model.model import (
     VideoModelConfig,
 )
 from xagent.core.model.providers import (
+    ENDPOINT_KIND_OFFICIAL,
     ROUTER_PROVIDER,
     canonical_provider_name,
     default_base_url_for_provider,
     is_auto_router_model,
+    provider_endpoint_kind,
     provider_requires_base_url,
 )
 from xagent.core.utils.security import redact_sensitive_text
@@ -70,7 +72,6 @@ from ..services.llm_utils import (
     is_platform_model_id,
 )
 from ..services.model_store import ModelSharingConflictError, ModelStore
-from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
 
@@ -1893,21 +1894,9 @@ async def set_user_default_model(
         user_model=user_model,
     )
 
-    # If this is an embedding model configuration, trigger memory store check
-    if config.config_type == "embedding":
-        try:
-            from ..dynamic_memory_store import get_memory_store_manager
-
-            manager = get_memory_store_manager()
-            with UserContext(int(user.id)):
-                if manager.check_embedding_model_change():
-                    logger.info(
-                        f"Memory store updated for user {user.id} after setting default embedding model"
-                    )
-        except Exception as e:
-            logger.error(
-                f"Error updating memory store after setting default embedding model: {e}"
-            )
+    # A user's default embedding model has no bearing on persistent memory:
+    # the memory runtime consumes only the explicit global memory embedding
+    # authority, and it never reloads it online.
 
     return UserDefaultModelResponse.model_validate(user_default)
 
@@ -2360,11 +2349,14 @@ async def fetch_provider_models(
     else:
         provider_to_use = provider.lower()
 
-    # Providers that mark base_url as mandatory (e.g. Azure OpenAI,
-    # Xinference, OpenAI-Compatible) must not silently fall back to a
-    # provider-side default when it's omitted.
+    # Providers that mark base_url as mandatory (e.g. Xinference,
+    # OpenAI-Compatible) must not silently fall back to a provider-side
+    # default when it's omitted, and neither may providers whose endpoint is
+    # built from credential fields (an Azure resource): base_url carries it.
+    # Both checks read the base provider, not a provider+category fetcher key.
     if not base_url and (
-        provider_to_use == "azure_openai" or provider_requires_base_url(provider)
+        provider_endpoint_kind(provider) != ENDPOINT_KIND_OFFICIAL
+        or provider_requires_base_url(provider)
     ):
         raise HTTPException(
             status_code=400,

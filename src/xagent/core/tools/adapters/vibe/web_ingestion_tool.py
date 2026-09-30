@@ -3,9 +3,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
-from .factory import register_tool
 
 logger = logging.getLogger(__name__)
 
@@ -239,30 +237,3 @@ async def _create_knowledge_base_from_url_impl(
             message=str(e),
             pages_crawled=0,
         ).model_dump()
-
-
-@register_tool(categories={"knowledge"})
-async def create_web_ingestion_tools(config: WebToolConfig) -> list[AbstractBaseTool]:
-    """Create web ingestion tools."""
-    return await _get_tool_compatibility_facade().create_web_ingestion_tools(config)
-
-
-async def _create_web_ingestion_tools_impl(
-    config: WebToolConfig,
-) -> list[AbstractBaseTool]:
-    """Create web ingestion tools."""
-    try:
-        user_id = config.get_user_id()
-        is_admin = config.is_admin()
-        if not user_id:
-            return []
-
-        tool = CreateKnowledgeBaseFromUrlTool(
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        logger.debug(f"Created CreateKnowledgeBaseFromUrlTool for user {user_id}")
-        return [tool]
-    except Exception as e:
-        logger.warning(f"Failed to create CreateKnowledgeBaseFromUrlTool: {e}")
-        return []

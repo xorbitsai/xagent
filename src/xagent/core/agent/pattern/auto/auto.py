@@ -10,6 +10,7 @@ from json_repair import loads as repair_json_loads
 
 from ....file_ref import final_deliverable_file_reference_instructions
 from ....model.chat.exceptions import LLMToolProtocolError
+from ....tools.tool_result_spill import SPILL_READ_TOOL_NAME
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
@@ -213,6 +214,11 @@ class _AutoChildRuntime:
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
 
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return await self.parent.load_committed_tool_outcome(tool_call)
+
     async def run_tool_call(self, invoke: Any) -> Any:
         return await self.parent.run_tool_call(invoke)
 
@@ -286,6 +292,14 @@ class _AutoChildRuntime:
             pattern=self.auto_pattern,
             status=status,
             metadata=child_metadata,
+        )
+
+    async def checkpoint_context_tail(
+        self, label: str, *, context: Any
+    ) -> dict[str, Any] | None:
+        # Checkpoints are always written for the root context.
+        return await self.parent.checkpoint_context_tail(
+            label, context=self.root_context
         )
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
@@ -1270,7 +1284,13 @@ class AutoPattern(AgentPattern):
             if memory_tools_available
             else ""
         )
-        tool_count = len(tools)
+        # Both the count and the name list leave out the stored-result reader
+        # (see _execution_tool_names), so its exclusion changes neither.
+        tool_count = sum(
+            1
+            for tool in tools
+            if self._execution_tool_name(tool) != SPILL_READ_TOOL_NAME
+        )
         tool_names = self._execution_tool_names(tools)
         tool_capability_summary = (
             f"{tool_count} execution tools are available to the downstream "
@@ -1377,27 +1397,35 @@ class AutoPattern(AgentPattern):
         )
 
     @staticmethod
+    def _execution_tool_name(tool: Any) -> str:
+        name: Any = None
+        if isinstance(tool, dict):
+            function = tool.get("function")
+            if isinstance(function, dict):
+                name = function.get("name")
+            if not name:
+                name = tool.get("name")
+        else:
+            metadata = getattr(tool, "metadata", None)
+            if metadata is not None:
+                name = getattr(metadata, "name", None)
+            if not name:
+                name = getattr(tool, "name", None)
+            if not name:
+                name = getattr(tool, "__name__", None)
+        return str(name or "").strip()
+
+    @staticmethod
     def _execution_tool_names(tools: list[Any]) -> list[str]:
         names: list[str] = []
         seen: set[str] = set()
         for tool in tools:
-            name: Any = None
-            if isinstance(tool, dict):
-                function = tool.get("function")
-                if isinstance(function, dict):
-                    name = function.get("name")
-                if not name:
-                    name = tool.get("name")
-            else:
-                metadata = getattr(tool, "metadata", None)
-                if metadata is not None:
-                    name = getattr(metadata, "name", None)
-                if not name:
-                    name = getattr(tool, "name", None)
-                if not name:
-                    name = getattr(tool, "__name__", None)
-
-            normalized = str(name or "").strip()
+            normalized = AutoPattern._execution_tool_name(tool)
+            # ReAct offers the stored-result reader per turn, once the run's
+            # registry holds a record; this list is not gated on the
+            # registry, so it leaves the reader out entirely.
+            if normalized == SPILL_READ_TOOL_NAME:
+                continue
             if normalized and normalized not in seen:
                 names.append(normalized)
                 seen.add(normalized)

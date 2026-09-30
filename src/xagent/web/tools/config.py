@@ -73,6 +73,7 @@ from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
 )
 from ..services.slack_actor_runtime import (
+    SLACK_ACTOR_RUNTIME_REFRESH_KEY,
     SLACK_CHANNEL_ACCESS_POLICY_ENV,
     resolve_slack_actor_runtime_grant,
     serialize_slack_channel_access_policy,
@@ -2237,9 +2238,9 @@ class WebToolConfig(BaseToolConfig):
         """Switch the per-turn connector runtime source for reused agents.
 
         ``WebToolConfig`` instances are cached with ``AgentService`` by task.
-        Runtime secrets/auth selectors are intentionally per-turn, so an append
-        turn must not keep using the first turn's resolved connector runtime
-        view or MCP config cache.
+        Resolved connector values/configs are turn-scoped: append and reply
+        turns must reload them. Accepted raw inputs, when retained for the
+        same run, are supplied by the runtime store rather than this cache.
         """
 
         normalized_turn_id = turn_id if isinstance(turn_id, str) else None
@@ -4358,6 +4359,9 @@ class WebToolConfig(BaseToolConfig):
                     )
                 access_token = legacy_token.access_token
                 serialized_slack_policy: str | None = None
+                slack_runtime_refresh_args: (
+                    tuple[int, str, MCPActorExecutionIdentity, Any] | None
+                ) = None
                 actor_policy = self._mcp_runtime_authorization_policy
                 if (
                     actor_builtin
@@ -4376,6 +4380,19 @@ class WebToolConfig(BaseToolConfig):
                         access_token = grant.access_token
                         serialized_slack_policy = serialize_slack_channel_access_policy(
                             grant.channel_access
+                        )
+                        execution_identity = self._mcp_actor_execution_identity
+                        if (
+                            execution_identity is None
+                        ):  # pragma: no cover - resolver gate
+                            raise RuntimeError(
+                                "Slack actor runtime grant requires execution identity"
+                            )
+                        slack_runtime_refresh_args = (
+                            cast(int, self._user_id),
+                            actor_policy.resource_owner_key,
+                            execution_identity,
+                            self.get_execution_scope(),
                         )
                 if access_token is None:
                     logger.info(
@@ -4399,6 +4416,54 @@ class WebToolConfig(BaseToolConfig):
                         transport_config.setdefault("env", {})[
                             SLACK_CHANNEL_ACCESS_POLICY_ENV
                         ] = serialized_slack_policy
+                    if slack_runtime_refresh_args is not None:
+                        (
+                            refresh_user_id,
+                            refresh_owner,
+                            refresh_identity,
+                            refresh_scope,
+                        ) = slack_runtime_refresh_args
+                        refresh_template = dict(transport_config)
+                        refresh_env = dict(refresh_template.get("env") or {})
+                        refresh_env.pop("SLACK_ACCESS_TOKEN", None)
+                        refresh_env.pop(SLACK_CHANNEL_ACCESS_POLICY_ENV, None)
+                        refresh_template["env"] = MappingProxyType(refresh_env)
+
+                        async def refresh_slack_actor_runtime_connection(
+                            *,
+                            _user_id: int = refresh_user_id,
+                            _owner: str = refresh_owner,
+                            _identity: MCPActorExecutionIdentity = refresh_identity,
+                            _scope: Any = refresh_scope,
+                            _template: Mapping[str, Any] = MappingProxyType(
+                                refresh_template
+                            ),
+                        ) -> dict[str, Any] | None:
+                            refreshed_grant = await resolve_slack_actor_runtime_grant(
+                                user_id=_user_id,
+                                resource_owner_key=_owner,
+                                execution_identity=_identity,
+                                scope=_scope,
+                            )
+                            if refreshed_grant is None:
+                                return None
+                            refreshed_connection = dict(_template)
+                            refreshed_connection["transport"] = "stdio"
+                            refreshed_env = dict(_template.get("env") or {})
+                            refreshed_env["SLACK_ACCESS_TOKEN"] = (
+                                refreshed_grant.access_token
+                            )
+                            refreshed_env[SLACK_CHANNEL_ACCESS_POLICY_ENV] = (
+                                serialize_slack_channel_access_policy(
+                                    refreshed_grant.channel_access
+                                )
+                            )
+                            refreshed_connection["env"] = refreshed_env
+                            return refreshed_connection
+
+                        transport_config[SLACK_ACTOR_RUNTIME_REFRESH_KEY] = (
+                            refresh_slack_actor_runtime_connection
+                        )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
                         "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",

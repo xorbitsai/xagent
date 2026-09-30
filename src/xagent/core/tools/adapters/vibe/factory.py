@@ -23,6 +23,12 @@ from .....config import get_uploads_dir
 from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
 from ...core.knowledge_base_scope import KnowledgeBaseScopeError
+from ...tool_result_spill import (
+    SPILL_READ_TOOL_NAME,
+    SpillRunBudget,
+    SpillTarget,
+    spill_dir_for_workspace,
+)
 from .base import BINDING_AUTHORIZED_CATEGORIES, AbstractBaseTool, Tool
 from .config import (
     ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
@@ -176,7 +182,6 @@ class ToolRegistry:
                 browser_tools,
                 current_time_tool,
                 custom_api_factory,
-                file_ingestion_tool,
                 image_tool,
                 knowledge_tools,
                 mcp_tools,
@@ -189,7 +194,6 @@ class ToolRegistry:
                 translate_json,
                 video_tool,
                 vision_tool,
-                web_ingestion_tool,
                 workspace_file_tool,
             )
 
@@ -843,6 +847,14 @@ class ToolFactory:
         max_chars = config.get_max_output_length()
         max_fields = config.get_max_field_count()
         max_recursion = config.get_max_recursion_depth()
+        spill_target = ToolFactory._resolve_spill_target(tools, max_chars)
+        # One budget per tool-set construction, shared by reference with
+        # every wrapper built below: the 64-file cap accumulates across every
+        # tool result produced while this one set of tools is in use -- not
+        # per tool, not per call, and not per run. It holds a lock, so it must
+        # never be copied, deep-copied, asdict'ed or pickled -- see its
+        # docstring in tool_result_spill.py.
+        spill_run_budget = SpillRunBudget()
 
         filtered_tools: list[Tool] = []
         for tool in tools:
@@ -853,6 +865,14 @@ class ToolFactory:
                     max_chars=max_chars,
                     max_fields=max_fields,
                     max_recursion=max_recursion,
+                    # The stored-result reader never spills its own output:
+                    # its oversized-item shape carries content_preview, which
+                    # is not an envelope field and would be replaced by the
+                    # placeholder, so a read-back would return nothing.
+                    spill_target=(
+                        None if tool.name == SPILL_READ_TOOL_NAME else spill_target
+                    ),
+                    spill_run_budget=spill_run_budget,
                 )
                 filtered_tools.append(wrapper)
             else:
@@ -866,6 +886,70 @@ class ToolFactory:
             )
 
         return filtered_tools
+
+    @staticmethod
+    def _resolve_spill_target(
+        tools: list[Tool], max_chars: int
+    ) -> "SpillTarget | None":
+        """Find this tool set's read_tool_result bound to a real task workspace.
+
+        A stored result is only useful if the model can read it back, so the
+        decision rests on the reader itself: a target is built only when the
+        tool set contains a FunctionTool named SPILL_READ_TOOL_NAME whose
+        function is a bound method on an instance exposing a `workspace`
+        attribute (WorkspaceFileTools), looked at before any tool has been
+        wrapped for output filtering, and only when that workspace is a
+        TaskWorkspace. The tool-listing endpoint binds the file tools to a
+        MockWorkspace, which never creates directories on disk, so it must
+        not get a spill target. The directory comes from
+        spill_dir_for_workspace, the same function the execution context and
+        the stored-result reader use.
+
+        No such reader means no spill target, and the tool set keeps today's
+        truncation behavior unchanged: a deployment with no file tools, one
+        whose tool policy removes read_tool_result by name (a legacy
+        allowed_tools list, a per-user disabled-tools table or a per-user
+        allowlist written before the reader existed, any of which can keep
+        read_file while dropping the reader), or a tool set bound to a mock
+        workspace. A tool with the reader's name that is not a FunctionTool
+        -- a task runtime extension may contribute one when the file tools
+        are disabled -- has no bound method to inspect, so it is treated the
+        same as a reader not bound to a task workspace.
+        """
+        from .function import FunctionTool
+        from .sandboxed_tool.sandbox_config import extract_bound_method_target
+
+        found_reader = False
+        for tool in tools:
+            if getattr(tool, "name", None) != SPILL_READ_TOOL_NAME:
+                continue
+            found_reader = True
+            if not isinstance(tool, FunctionTool):
+                continue
+            target = extract_bound_method_target(tool)
+            if target is None:
+                continue
+            instance, _ = target
+            workspace = getattr(instance, "workspace", None)
+            if not isinstance(workspace, TaskWorkspace):
+                continue
+            return SpillTarget(
+                spill_dir=spill_dir_for_workspace(workspace.workspace_dir),
+                max_chars=max_chars,
+            )
+        if found_reader:
+            logger.info(
+                "Tool result spill disabled: read_tool_result is not bound "
+                "to a task workspace (tools=%d)",
+                len(tools),
+            )
+        else:
+            logger.info(
+                "Tool result spill disabled: no read_tool_result in the tool "
+                "set (tools=%d)",
+                len(tools),
+            )
+        return None
 
     @staticmethod
     async def _wrap_sandbox_tools(tools: list[Tool], sandbox: Any) -> list[Tool]:

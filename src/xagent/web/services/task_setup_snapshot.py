@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from sqlalchemy.orm import Session
@@ -70,6 +70,7 @@ class _TaskFields:
     run_id: str | None = None
     state_version: int = 0
     control_state: str | None = None
+    conversation_storage_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,117 @@ class TaskSetupSnapshot:
     # Resolved by ``resolve_task_runtime_config_core`` using this same Session.
     # Kept as the service-layer frozen dataclass; no ORM row is retained.
     workforce_runtime: WorkforceTaskRuntime | None = None
+    # Set by ``apply_task_model_override``: the caller-selected models this
+    # snapshot's slots hold. ``AgentServiceManager`` rebuilds a cached
+    # service that was not built from this same override.
+    model_override: Optional["TaskModelOverride"] = None
+    conversation_event_watermark: dict[str, Any] | None = None
+
+
+class TaskModelOverrideError(ValueError):
+    """A task model override cannot be applied as requested."""
+
+
+# ``ToolCategory.VISION``: the tools that read images with the vision model.
+_VISION_TOOL_CATEGORY = "vision"
+
+
+@dataclass(frozen=True)
+class TaskModelOverride:
+    """One caller-selected model for every conversational role of a task run.
+
+    Applied to a :class:`TaskSetupSnapshot` after the Agent Builder overlay
+    has resolved the task's models, so nothing built from the snapshot --
+    the ``AgentService`` model slots, and the tool models handed to
+    ``create_default_tools`` (a later tool rebuild reuses that tool config) --
+    can still reach the models the overlay chose.
+
+    ``vision_llm`` is the model vision tools use. ``None`` means vision is
+    deliberately unavailable for this run: an :class:`UnavailableVisionModel`
+    takes the slot, so nothing falls back to a default vision model and any
+    vision call is refused with ``vision_unavailable``, and an explicit tool
+    category list loses its ``vision`` category, so no vision tool is offered.
+    (An unrestricted selection has no list to remove it from; its vision tools
+    are built on the stand-in and refuse.) ``excluded_tool_categories``
+    removes tool categories from this run's selection; it requires an
+    explicit category list, since an unrestricted selection has no list to
+    remove from.
+
+    Handing ``AgentServiceManager.get_agent_for_task`` a snapshot this was
+    applied to rebuilds a cached service for the task unless that service
+    was built from this same override object, so a later turn cannot run on
+    an earlier turn's models. A lookup without an override rebuilds a
+    service built from one too, unless its run is still in progress or
+    waiting, so pause, resume and replies keep reaching that run.
+    """
+
+    llm: BaseLLM
+    vision_llm: BaseLLM | None = None
+    excluded_tool_categories: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.llm, BaseLLM):
+            raise TypeError("llm must be a BaseLLM")
+        if self.vision_llm is not None and not isinstance(self.vision_llm, BaseLLM):
+            raise TypeError("vision_llm must be a BaseLLM or None")
+        categories: Any = self.excluded_tool_categories
+        # A bare string would be read character by character, or matched as
+        # a substring; neither is a category selection.
+        if isinstance(categories, (str, bytes)):
+            raise TypeError(
+                "excluded_tool_categories must be a collection of category "
+                "names, not a single string"
+            )
+        normalized = frozenset(categories)
+        if not all(isinstance(category, str) for category in normalized):
+            raise TypeError("excluded_tool_categories must hold category names")
+        object.__setattr__(self, "excluded_tool_categories", normalized)
+
+
+def apply_task_model_override(
+    snapshot: TaskSetupSnapshot, override: TaskModelOverride
+) -> TaskSetupSnapshot:
+    """Return ``snapshot`` with ``override`` in every model slot it resolved.
+
+    Raises :class:`TaskModelOverrideError` when categories are to be excluded
+    from a selection that is not an explicit list.
+    """
+    from ...core.model.chat.basic.call_boundary import UnavailableVisionModel
+
+    agent_config = snapshot.agent_config
+    categories = agent_config.get("tool_categories") if agent_config else None
+    if override.excluded_tool_categories and not isinstance(categories, list):
+        raise TaskModelOverrideError(
+            "tool categories can only be excluded from an explicit selection"
+        )
+    removed = set(override.excluded_tool_categories)
+    if override.vision_llm is None:
+        # Vision tools on the stand-in could only refuse; offer none.
+        removed.add(_VISION_TOOL_CATEGORY)
+    if isinstance(categories, list) and removed & set(categories):
+        agent_config = {
+            **cast(dict[str, Any], agent_config),
+            "tool_categories": [
+                category for category in categories if category not in removed
+            ],
+        }
+    # Deliberately a truthy stand-in, never ``None``: the tool configuration
+    # falls back to the owner's configured vision model when its explicit one
+    # is missing or falsy.
+    vision_llm = (
+        override.vision_llm
+        if override.vision_llm is not None
+        else UnavailableVisionModel()
+    )
+    return replace(
+        snapshot,
+        task_llm=override.llm,
+        task_fast_llm=override.llm,
+        task_vision_llm=vision_llm,
+        task_compact_llm=override.llm,
+        agent_config=agent_config,
+        model_override=override,
+    )
 
 
 # NOTE: All LLM resolution + agent-builder merge + execution-mode →
@@ -190,6 +302,56 @@ def load_task_reconstruction_snapshot_sync(
     task_id: int,
 ) -> TaskReconstructionSnapshot:
     """Load and decode reconstruction rows before the worker Session closes."""
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(session, task_id):
+        from sqlalchemy import select
+
+        from ...core.agent.checkpoint import CheckpointCorruptError
+        from ..models.task_execution_event import TaskExecutionEvent
+        from .task_execution_event_recovery import event_checkpoint_data
+
+        # AgentService.reconstruct_from_history currently only restores the task
+        # id. Keep its history-presence gate event-backed; actual execution state
+        # is selected under the runner's partition and lease by the reader.
+        # If reconstruction starts consuming history/plan again, first apply
+        # run/execution/horizon selection and adapt this pattern state to the
+        # legacy plan shape; these arguments are currently ignored by it.
+        event = session.scalar(
+            select(TaskExecutionEvent)
+            .where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.kind == "recovery_state",
+            )
+            .order_by(TaskExecutionEvent.sequence.desc())
+            .limit(1)
+        )
+        if event is None:
+            return TaskReconstructionSnapshot()
+        data = event_checkpoint_data(event)
+        protocol_event_id = event.payload.get("protocol_event_id")
+        if not isinstance(protocol_event_id, str) or not protocol_event_id:
+            raise CheckpointCorruptError(
+                "Recovery state has no valid protocol event ID"
+            )
+        state = data["snapshot"].get("pattern_state") or {}
+        return TaskReconstructionSnapshot(
+            tracer_events=(
+                {
+                    "id": protocol_event_id,
+                    "event_type": "system_update_general",
+                    "task_id": str(task_id),
+                    "step_id": event.payload.get("step_id"),
+                    "timestamp": event.occurred_at.timestamp(),
+                    "data": deepcopy(data),
+                    "parent_id": event.payload.get("parent_event_id"),
+                },
+            ),
+            plan_state=deepcopy(state.get("plan")),
+            has_history=True,
+        )
+
     from .trace_message_storage import decode_trace_events_data
 
     trace_rows = (
@@ -264,6 +426,7 @@ def load_task_setup_snapshot_sync(
     task_owner_user_id: Optional[int],
     *,
     before_message_id: Optional[int] = None,
+    before_turn_id: str | None = None,
     actor_user_id: Optional[int] = None,
     actor_is_admin: bool = False,
 ) -> Optional[TaskSetupSnapshot]:
@@ -318,6 +481,7 @@ def load_task_setup_snapshot_sync(
 
         task_fields = _TaskFields(
             id=int(task_row.id),
+            conversation_storage_version=int(task_row.conversation_storage_version),
             user_id=int(task_row.user_id),
             status=task_row.status,
             source=str(task_row.source) if task_row.source is not None else None,
@@ -364,16 +528,33 @@ def load_task_setup_snapshot_sync(
 
         from .chat_history_service import load_task_transcript_window
 
-        transcript_window = load_task_transcript_window(
-            session,
-            task_id,
-            before_message_id=before_message_id,
-        )
-        conversation_history = tuple(transcript_window.messages)
-        execution_recovery = load_task_execution_recovery_snapshot_sync(
-            session,
-            task_id,
-        )
+        event_watermark = None
+        if task_fields.conversation_storage_version == 2:
+            from .task_event_context_service import load_task_event_context
+
+            event_context = load_task_event_context(
+                session,
+                task_id,
+                before_message_id=before_message_id,
+                before_turn_id=before_turn_id,
+            )
+            conversation_history = tuple(event_context.messages)
+            conversation_watermark = None
+            event_watermark = event_context.watermark
+            execution_recovery = TaskExecutionRecoverySnapshot(
+                selected_skill_name=event_context.selected_skill_name,
+            )
+        else:
+            transcript_window = load_task_transcript_window(
+                session,
+                task_id,
+                before_message_id=before_message_id,
+            )
+            conversation_history = tuple(transcript_window.messages)
+            conversation_watermark = transcript_window.watermark
+            execution_recovery = load_task_execution_recovery_snapshot_sync(
+                session, task_id
+            )
         reconstruction = load_task_reconstruction_snapshot_sync(session, task_id)
 
         # ``core.agent_fields`` is already an ``AgentRuntimeFields``
@@ -391,7 +572,8 @@ def load_task_setup_snapshot_sync(
             agent_config=core.agent_config,
             excluded_agent_id=excluded_agent_id,
             conversation_history=conversation_history,
-            conversation_watermark=transcript_window.watermark,
+            conversation_watermark=conversation_watermark,
+            conversation_event_watermark=event_watermark,
             execution_recovery=execution_recovery,
             reconstruction=reconstruction,
             workforce_runtime=deepcopy(core.workforce),

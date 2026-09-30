@@ -584,7 +584,7 @@ async def test_stop_heartbeat_waits_for_shared_batch_result(monkeypatch) -> None
         leases: tuple[TaskLease, ...],
     ) -> dict[tuple[int, str, str | None], TaskLeaseRefreshState]:
         refresh_started.set()
-        assert allow_refresh_to_finish.wait(timeout=2)
+        assert allow_refresh_to_finish.wait(timeout=GUARD_TIMEOUT)
         return {
             (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id): (
                 TaskLeaseRefreshState.REFRESHED
@@ -615,7 +615,7 @@ async def test_stop_heartbeat_waits_for_shared_batch_result(monkeypatch) -> None
             stop_event,
         )
     )
-    await asyncio.wait_for(asyncio.to_thread(refresh_started.wait, 1), timeout=1)
+    assert await asyncio.to_thread(refresh_started.wait, GUARD_TIMEOUT)
 
     stopping = asyncio.create_task(
         stop_task_lease_heartbeat(heartbeat_task, stop_event)
@@ -624,7 +624,7 @@ async def test_stop_heartbeat_waits_for_shared_batch_result(monkeypatch) -> None
     assert not stopping.done()
 
     allow_refresh_to_finish.set()
-    outcome = await asyncio.wait_for(stopping, timeout=1)
+    outcome = await asyncio.wait_for(stopping, timeout=GUARD_TIMEOUT)
     await task_lease_service.wait_for_heartbeat_manager_idle()
 
     assert outcome.requires_ttl_recovery is False
@@ -641,7 +641,7 @@ async def test_cancelled_heartbeat_manager_settles_active_registration(
         leases: tuple[TaskLease, ...],
     ) -> dict[tuple[int, str, str | None], TaskLeaseRefreshState]:
         refresh_started.set()
-        assert allow_refresh_to_finish.wait(timeout=2)
+        assert allow_refresh_to_finish.wait(timeout=GUARD_TIMEOUT)
         return {
             (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id): (
                 TaskLeaseRefreshState.REFRESHED
@@ -666,7 +666,7 @@ async def test_cancelled_heartbeat_manager_settles_active_registration(
             task_id=1, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
         )
     )
-    await asyncio.wait_for(asyncio.to_thread(refresh_started.wait, 1), timeout=1)
+    assert await asyncio.to_thread(refresh_started.wait, GUARD_TIMEOUT)
 
     runner = manager._runner
     assert runner is not None
@@ -675,7 +675,7 @@ async def test_cancelled_heartbeat_manager_settles_active_registration(
     with pytest.raises(asyncio.CancelledError):
         await runner
 
-    outcome = await asyncio.wait_for(registration.close(), timeout=1)
+    outcome = await asyncio.wait_for(registration.close(), timeout=GUARD_TIMEOUT)
 
     assert outcome.requires_ttl_recovery is False
     assert registration._entry.refresh_waiter is None
@@ -730,7 +730,7 @@ async def test_repeated_cancellation_drains_heartbeat_close_and_waiters(
         leases: tuple[TaskLease, ...],
     ) -> dict[tuple[int, str, str | None], TaskLeaseRefreshState]:
         refresh_started.set()
-        assert allow_refresh_to_finish.wait(timeout=2)
+        assert allow_refresh_to_finish.wait(timeout=GUARD_TIMEOUT)
         return {
             (lease.task_id, lease.runner_id, lease.run_id, lease.attempt_id): (
                 TaskLeaseRefreshState.REFRESHED
@@ -766,7 +766,7 @@ async def test_repeated_cancellation_drains_heartbeat_close_and_waiters(
             asyncio.Event(),
         )
     )
-    await asyncio.wait_for(asyncio.to_thread(refresh_started.wait, 1), timeout=1)
+    assert await asyncio.to_thread(refresh_started.wait, GUARD_TIMEOUT)
 
     manager = task_lease_service._get_task_lease_heartbeat_manager()
     entry = next(iter(manager._entries.values()))
@@ -778,7 +778,7 @@ async def test_repeated_cancellation_drains_heartbeat_close_and_waiters(
     assert not heartbeat_task.done()
 
     allow_refresh_to_finish.set()
-    await asyncio.wait_for(gather_started.wait(), timeout=1)
+    await asyncio.wait_for(gather_started.wait(), timeout=GUARD_TIMEOUT)
 
     heartbeat_task.cancel()
     await asyncio.sleep(0.02)
@@ -788,7 +788,7 @@ async def test_repeated_cancellation_drains_heartbeat_close_and_waiters(
         allow_gather_to_finish.set()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(heartbeat_task, timeout=1)
+        await asyncio.wait_for(heartbeat_task, timeout=GUARD_TIMEOUT)
     await task_lease_service.wait_for_heartbeat_manager_idle()
 
     assert refresh_waiter.done()
@@ -923,10 +923,10 @@ async def test_old_batch_result_does_not_contaminate_replacement_registration(
         attempts += 1
         if attempts == 1:
             first_refresh_started.set()
-            assert allow_first_refresh.wait(timeout=2)
+            assert allow_first_refresh.wait(timeout=GUARD_TIMEOUT)
             return {key: TaskLeaseRefreshState.LOST}
         second_refresh_started.set()
-        assert allow_second_refresh.wait(timeout=2)
+        assert allow_second_refresh.wait(timeout=GUARD_TIMEOUT)
         return {key: TaskLeaseRefreshState.REFRESHED}
 
     monkeypatch.setattr(
@@ -942,7 +942,7 @@ async def test_old_batch_result_does_not_contaminate_replacement_registration(
 
     first_stop = asyncio.Event()
     first_task = asyncio.create_task(run_task_lease_heartbeat(lease, first_stop))
-    assert await asyncio.to_thread(first_refresh_started.wait, 1)
+    assert await asyncio.to_thread(first_refresh_started.wait, GUARD_TIMEOUT)
 
     first_stopping = asyncio.create_task(
         stop_task_lease_heartbeat(first_task, first_stop)
@@ -956,10 +956,10 @@ async def test_old_batch_result_does_not_contaminate_replacement_registration(
     )
     allow_first_refresh.set()
 
-    first_outcome = await asyncio.wait_for(first_stopping, timeout=1)
+    first_outcome = await asyncio.wait_for(first_stopping, timeout=GUARD_TIMEOUT)
     assert first_outcome.lease_lost is True
     assert not replacement_task.done()
-    assert await asyncio.to_thread(second_refresh_started.wait, 1)
+    assert await asyncio.to_thread(second_refresh_started.wait, GUARD_TIMEOUT)
 
     replacement_stopping = asyncio.create_task(
         stop_task_lease_heartbeat(replacement_task, replacement_stop)
@@ -970,7 +970,7 @@ async def test_old_batch_result_does_not_contaminate_replacement_registration(
     allow_second_refresh.set()
     replacement_outcome = await asyncio.wait_for(
         replacement_stopping,
-        timeout=1,
+        timeout=GUARD_TIMEOUT,
     )
     await task_lease_service.wait_for_heartbeat_manager_idle()
 
@@ -1144,7 +1144,7 @@ async def test_stop_heartbeat_reports_lost_ownership(monkeypatch) -> None:
             stop_event,
         )
     )
-    await asyncio.wait_for(heartbeat_task, timeout=1)
+    await asyncio.wait_for(heartbeat_task, timeout=GUARD_TIMEOUT)
 
     outcome = await stop_task_lease_heartbeat(heartbeat_task, stop_event)
     await task_lease_service.wait_for_heartbeat_manager_idle()
@@ -1196,7 +1196,7 @@ async def test_heartbeat_does_not_report_settlement_ready_as_lease_lost(
             ),
             asyncio.Event(),
         ),
-        timeout=5,
+        timeout=GUARD_TIMEOUT,
     )
     await task_lease_service.wait_for_heartbeat_manager_idle()
 
@@ -1249,7 +1249,7 @@ async def test_batch_heartbeat_recovers_after_transient_pool_timeout(
             stop_event,
         )
     )
-    assert await asyncio.to_thread(refresh_recovered.wait, 1)
+    assert await asyncio.to_thread(refresh_recovered.wait, GUARD_TIMEOUT)
 
     outcome = await stop_task_lease_heartbeat(heartbeat_task, stop_event)
     await task_lease_service.wait_for_heartbeat_manager_idle()
@@ -1270,29 +1270,29 @@ async def test_cancellation_safe_acquire_drains_and_cleans_returned_lease() -> N
 
     def acquire() -> TaskLease:
         acquire_started.set()
-        assert allow_acquire_to_finish.wait(timeout=2)
+        assert allow_acquire_to_finish.wait(timeout=GUARD_TIMEOUT)
         return expected_lease
 
     def cleanup(lease: TaskLease) -> None:
         cleanup_started.set()
-        assert allow_cleanup_to_finish.wait(timeout=2)
+        assert allow_cleanup_to_finish.wait(timeout=GUARD_TIMEOUT)
         cleaned_leases.append(lease)
 
     operation = asyncio.create_task(
         task_lease_service.acquire_task_lease_cancellation_safe(acquire, cleanup)
     )
-    await asyncio.wait_for(asyncio.to_thread(acquire_started.wait, 1), timeout=1)
+    assert await asyncio.to_thread(acquire_started.wait, GUARD_TIMEOUT)
     operation.cancel()
     await asyncio.sleep(0.02)
     assert not operation.done()
 
     allow_acquire_to_finish.set()
-    await asyncio.wait_for(asyncio.to_thread(cleanup_started.wait, 1), timeout=1)
+    assert await asyncio.to_thread(cleanup_started.wait, GUARD_TIMEOUT)
     assert not operation.done()
 
     allow_cleanup_to_finish.set()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(operation, timeout=1)
+        await asyncio.wait_for(operation, timeout=GUARD_TIMEOUT)
     assert cleaned_leases == [expected_lease]
 
 

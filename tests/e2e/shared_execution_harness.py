@@ -316,25 +316,35 @@ class SharedExecutionApp:
         return {"Authorization": f"Bearer {self.token}"}
 
     def start(self, role: str):
+        return self.start_all(role)[0]
+
+    def start_all(self, *roles: str):
+        """Spawn hosts together, then wait; each host pays a cold import."""
         context = multiprocessing.get_context("spawn")
-        parent, child = context.Pipe()
-        process = context.Process(
-            target=_host, args=(child, self.environment, role, str(self.root))
-        )
-        process.start()
-        child.close()
-        self.processes.append(process)
-        self.pipes.append(parent)
-        assert parent.poll(60), self.diagnostics()
-        try:
-            ready = parent.recv()
-        except EOFError:
-            pytest.fail(self.diagnostics())
-        if role in {"web", "combined"}:
-            self.client = httpx.Client(
-                base_url=f"http://127.0.0.1:{ready['port']}", timeout=30
+        launched = []
+        for role in roles:
+            parent, child = context.Pipe()
+            process = context.Process(
+                target=_host, args=(child, self.environment, role, str(self.root))
             )
-        return process, parent
+            process.start()
+            child.close()
+            self.processes.append(process)
+            self.pipes.append(parent)
+            launched.append((role, process, parent))
+        for role, _, parent in launched:
+            assert parent.poll(60), self.diagnostics()
+            try:
+                ready = parent.recv()
+            except EOFError:
+                pytest.fail(self.diagnostics())
+            if role in {"web", "combined"}:
+                if self.client is not None:
+                    self.client.close()
+                self.client = httpx.Client(
+                    base_url=f"http://127.0.0.1:{ready['port']}", timeout=30
+                )
+        return [(process, parent) for _, process, parent in launched]
 
     def diagnostics(self):
         return "\n".join(
@@ -446,8 +456,7 @@ def shared_app(tmp_path, monkeypatch):
         user_id,
     )
     try:
-        app.start("web")
-        app.start("worker")
+        app.start_all("web", "worker")
         yield app
     finally:
         try:

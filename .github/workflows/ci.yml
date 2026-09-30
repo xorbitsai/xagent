@@ -246,6 +246,7 @@ jobs:
 
   pre-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
 
     steps:
@@ -327,6 +328,7 @@ jobs:
   pytest-fast:
     name: Pytest Fast (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
     strategy:
@@ -425,6 +427,7 @@ jobs:
   pytest-fast-deepdoc:
     name: Pytest Fast Deepdoc (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, prepare-deepdoc-cache, pre-commit]
     strategy:
@@ -595,6 +598,7 @@ jobs:
 
   pytest-slow:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, prepare-deepdoc-cache, pre-commit]
 
@@ -732,10 +736,31 @@ jobs:
           python3 -m uv run python -m pytest -m "slow and not postgresql" -v
 
   e2e:
+    name: e2e (${{ matrix.shard }})
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      # Every shared-execution test cold-starts its own web and worker hosts,
+      # so the suite is split by file, balanced on recorded file durations.
+      matrix:
+        include:
+          - shard: shared-execution
+            paths: tests/e2e/test_shared_execution.py
+          - shard: shared-happy-paths
+            paths: >-
+              tests/e2e/test_shared_happy_paths.py
+              tests/e2e/test_shared_gmail.py
+              tests/e2e/test_shared_network_recovery.py
+          - shard: rest
+            paths: >-
+              tests/e2e
+              --ignore=tests/e2e/test_shared_execution.py
+              --ignore=tests/e2e/test_shared_happy_paths.py
+              --ignore=tests/e2e/test_shared_gmail.py
+              --ignore=tests/e2e/test_shared_network_recovery.py
 
     services:
       redis:
@@ -799,14 +824,14 @@ jobs:
         shell: bash
         run: |
           set -e
-          .github/scripts/docker-pull-retry.sh quay.io/minio/minio postgres:17-bookworm
+          .github/scripts/docker-pull-retry.sh cgr.dev/chainguard/minio postgres:17-bookworm
 
       - name: Run e2e tests
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest tests/e2e --run-special -v --durations=20
+          python3 -m uv run python -m pytest ${{ matrix.paths }} --run-special -v --durations=20
 
   frontend-build:
     runs-on: ubuntu-latest
@@ -932,6 +957,7 @@ jobs:
   lancedb-memory-compatibility:
     name: LanceDB Memory Compatibility (${{ matrix.lancedb }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     strategy:
       fail-fast: false

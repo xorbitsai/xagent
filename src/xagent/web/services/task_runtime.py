@@ -16,7 +16,9 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import RLock
-from typing import Any, Literal
+from typing import Any, Literal, cast
+
+from sqlalchemy.sql import ColumnElement
 
 from ...config import (
     get_task_runtime_hook_max_workers,
@@ -51,6 +53,7 @@ from ...core.task_runtime import (
 from ...core.task_runtime import (
     requires_exact_file_operation_scope as requires_exact_file_operation_scope,
 )
+from ..models.task import Task
 
 _EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PROVIDER_METHODS = (
@@ -93,6 +96,31 @@ MCP_RUNTIME_AUTHORIZATION_POLICY_IDENTITY_KEY = (
 MCP_RUNTIME_AUTHORIZATION_POLICY_STDIO_KEY = (
     "__xagent_mcp_runtime_authorization_policy_allow_builtin_stdio"
 )
+
+
+def mcp_runtime_authorization_policy_required_clause() -> ColumnElement[bool]:
+    """The channel-plumbing marker as a SQL expression over ``tasks``.
+
+    Same test as :func:`mcp_runtime_authorization_policy_required`, spelled so
+    a query can apply it directly instead of pulling ``agent_config`` into
+    Python first. Both ``api.conversation_logs``'s live scope filter and
+    ``services.expired_tasks``'s tombstone write read this one expression, so
+    the stored flag equals the live predicate on every dialect by
+    construction rather than by two implementations agreeing.
+
+    ``NULL`` for a missing key or a non-boolean JSON value, same as the raw
+    ``as_boolean()`` cast; the caller picks ``.is_(True)`` or ``.isnot(True)``
+    for what that ``NULL`` should mean at that read.
+
+    ``Column.__getitem__``'s return is untyped, hence the cast -- the same
+    idiom ``task_retention.py``'s ``retention_terminal_condition`` uses.
+    """
+    return cast(
+        "ColumnElement[bool]",
+        Task.agent_config[MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY].as_boolean(),
+    )
+
+
 # Keys in ``tasks.agent_config`` that only the server may write. Task-create
 # request bodies carry a free-form ``agent_config`` dict that endpoints copy
 # wholesale, so anything the server later reads back as authoritative has to
@@ -558,7 +586,12 @@ async def delete_task_extensions(
     bound_extensions: Iterable[str],
     force: bool = False,
 ) -> tuple[str, ...]:
-    """Release provider-owned state before the core task row is deleted.
+    """Release provider-owned state for one task.
+
+    The on-demand deletion paths call this before the core task row is
+    deleted; the cleanup retry driver (``task_cleanup_obligations``) calls it
+    after, for a release that is owed -- see the provider contract in
+    ``core.task_runtime``.
 
     Only providers listed in ``bound_extensions`` -- the per-task binding record
     written when the task was created -- are dispatched. Deletion is therefore

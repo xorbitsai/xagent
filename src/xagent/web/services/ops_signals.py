@@ -27,6 +27,8 @@ GMAIL_WATCH_REGISTRATION_DISABLED = "gmail_watch_registration_disabled"
 CHECKPOINT_DECODE_FALLBACK = "checkpoint_decode_fallback"
 CHECKPOINT_LEGACY_POINTER_AMBIGUOUS = "checkpoint_legacy_pointer_ambiguous"
 CHECKPOINT_LOAD_UNAVAILABLE = "checkpoint_load_unavailable"
+# Cleared once per lease-recovery sweep; any unavailable candidate sets it again.
+CHECKPOINT_RECOVERY_UNAVAILABLE = "checkpoint_recovery_unavailable"
 CHECKPOINT_PK_ANCHOR_DANGLING = "checkpoint_pk_anchor_dangling"
 CHECKPOINT_PRUNE_FAILED = "checkpoint_prune_failed"
 # Set when the interaction rollout gate (or /ready, in native mode) finds

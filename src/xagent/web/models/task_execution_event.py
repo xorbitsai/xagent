@@ -1,4 +1,4 @@
-"""Conversation/execution facts; not wired into runtime producers yet."""
+"""Authoritative conversation/execution facts for version-two tasks."""
 
 from sqlalchemy import (
     JSON,

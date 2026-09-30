@@ -83,7 +83,13 @@ def test_turn_delta_slice_carries_media_rows_added_after_the_baseline() -> None:
         add_token_usage(input_tokens=5, output_tokens=1, model="gpt", model_id="g1")
         baseline = len(manager.get_usage().details)
 
-        add_media_usage(quantity=3, model="sd", call_type=MediaCallType.GENERATE_IMAGE)
+        add_media_usage(
+            quantity=3,
+            model="sd",
+            call_type=MediaCallType.GENERATE_IMAGE,
+            provider_text_input_tokens=4,
+            provider_image_input_tokens=6,
+        )
         add_token_usage(input_tokens=7, output_tokens=2, model="gpt", model_id="g1")
 
         delta = manager.get_usage().details[baseline:]
@@ -93,3 +99,5 @@ def test_turn_delta_slice_carries_media_rows_added_after_the_baseline() -> None:
     media = [d for d in delta if d.get("type") == "media"][0]
     assert media["unit"] == "images"
     assert media["quantity"] == 3.0
+    assert media["provider_text_input_tokens"] == 4
+    assert media["provider_image_input_tokens"] == 6

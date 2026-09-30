@@ -697,15 +697,28 @@ def test_database_trace_handler_stores_checkpoint_messages_as_refs(
         db.close()
 
 
-def test_database_trace_handler_redacts_runtime_secrets_in_tool_events() -> None:
+@pytest.mark.parametrize("storage_version", [1, 2])
+@pytest.mark.parametrize(
+    "action", [TraceAction.START, TraceAction.END, TraceAction.ERROR]
+)
+def test_database_trace_handler_redacts_runtime_secrets_in_tool_events(
+    storage_version, action
+) -> None:
     SessionLocal = _session_factory()
     db = SessionLocal()
     try:
         task = _create_task(db)
+        task.conversation_storage_version = storage_version
+        db.commit()
         task_id = int(task.id)
-        handler = DatabaseTraceHandler(task_id)
+        if storage_version == 2:
+            from xagent.web.tracing import ExecutionEventTraceAdapter
+
+            handler = ExecutionEventTraceAdapter(task_id)
+        else:
+            handler = DatabaseTraceHandler(task_id)
         event = TraceEvent(
-            TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.TOOL),
+            TraceEventType(TraceScope.ACTION, action, TraceCategory.TOOL),
             task_id=str(task_id),
             step_id="step-1",
             data={
@@ -726,6 +739,13 @@ def test_database_trace_handler_redacts_runtime_secrets_in_tool_events() -> None
         handler._save_trace_event(db, event)
 
         row = db.query(DatabaseTraceEvent).filter_by(task_id=task_id).one()
+        if storage_version == 2:
+            from xagent.web.models.task_execution_event import TaskExecutionEvent
+
+            fact = db.query(TaskExecutionEvent).filter_by(task_id=task_id).one()
+            assert fact.payload["data"] == row.data
+            assert "raw-runtime-token" not in str(fact.payload)
+            assert "xagent:user:1" not in str(fact.payload)
         assert "raw-runtime-token" not in str(row.data)
         assert "xagent:user:1" not in str(row.data)
         tool_args = row.data["tool_args"]

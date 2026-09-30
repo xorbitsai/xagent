@@ -443,6 +443,139 @@ def test_deepseek_codec_bounds_original_argument_diagnostics() -> None:
     assert details["original_arguments_truncated"] is True
 
 
+def _unavailable_call_error(name: str, arguments: object) -> tuple[dict, dict]:
+    normalized = normalize_deepseek_response(
+        {
+            "type": "tool_call",
+            "tool_calls": [
+                {
+                    "id": "call_ghost",
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ],
+        },
+        tools=[WRITE_FILE_TOOL],
+    )
+    error = get_tool_protocol_error(normalized)
+    assert error is not None
+    assert error["code"] == "unavailable_tool_call"
+    return normalized, error
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{"file_path": "a"}, '{"file_path": "a"}', "", "   "],
+    ids=["object", "json_string", "empty_string", "blank_string"],
+)
+def test_unavailable_tool_call_violation_carries_the_tool_name(
+    arguments: object,
+) -> None:
+    """Arguments that needed no repair leave nothing but the refused name."""
+    normalized, error = _unavailable_call_error("fetch_web_content", arguments)
+
+    assert error["details"] == {"tool_name": "fetch_web_content"}
+    assert normalized["tool_calls"] == []
+
+
+def test_unavailable_tool_call_violation_keeps_the_argument_diagnostics() -> None:
+    """A repaired argument string keeps every diagnostic key byte for byte
+    and only gains tool_name."""
+    original = "{'file_path': 'a', 'content': 'b',}"
+    try:
+        json.loads(original)
+    except json.JSONDecodeError as exc:
+        json_error = str(exc)
+    else:  # pragma: no cover - the fixture must be invalid JSON
+        raise AssertionError("fixture arguments must not be valid JSON")
+
+    normalized, error = _unavailable_call_error("fetch_web_content", original)
+
+    assert error["details"] == {
+        "original_arguments_preview": original,
+        "original_arguments_length": len(original),
+        "original_arguments_truncated": False,
+        "json_error": json_error,
+        "repair_status": "repaired",
+        "tool_name": "fetch_web_content",
+    }
+    assert normalized["tool_calls"] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("获取网页内容", "获取网页内容"),
+        ("x" * 5000, "x" * 4096),
+    ],
+    ids=["non_ascii", "longer_than_the_preview_limit"],
+)
+def test_unavailable_tool_call_violation_bounds_the_tool_name(
+    name: str, expected: str
+) -> None:
+    normalized, error = _unavailable_call_error(name, "{}")
+
+    assert error["details"] == {"tool_name": expected}
+    assert normalized["tool_calls"] == []
+
+
+@pytest.mark.parametrize(
+    ("tool_call", "tools", "expected_code"),
+    [
+        (
+            {"function": {"arguments": "{}"}},
+            [WRITE_FILE_TOOL],
+            "malformed_tool_call",
+        ),
+        (
+            {
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps(
+                        {
+                            "file_path": "a.md",
+                            "content": "<｜｜DSML｜｜tool_calls>",
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            },
+            [WRITE_FILE_TOOL],
+            "nested_serialized_tool_call",
+        ),
+        (
+            {
+                "function": {
+                    "name": "final_answer",
+                    "arguments": json.dumps(
+                        {
+                            "response_language": "English",
+                            "answer": "Done.",
+                            "content": "unexpected",
+                        }
+                    ),
+                }
+            },
+            [FINAL_ANSWER_TOOL],
+            "unexpected_tool_arguments",
+        ),
+    ],
+)
+def test_other_tool_violations_do_not_carry_a_tool_name(
+    tool_call, tools, expected_code
+) -> None:
+    normalized = normalize_deepseek_response(
+        {"type": "tool_call", "tool_calls": [tool_call]},
+        tools=tools,
+    )
+
+    error = get_tool_protocol_error(normalized)
+    assert error is not None
+    assert error["code"] == expected_code
+    assert "tool_name" not in (error.get("details") or {})
+    assert normalized["tool_calls"] == []
+
+
 def test_tool_protocol_error_response_never_carries_tool_calls() -> None:
     """A protocol-error response is never mistaken for a real tool-call turn.
 

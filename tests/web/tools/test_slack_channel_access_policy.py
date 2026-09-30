@@ -22,9 +22,10 @@ def _install_policy(monkeypatch, *, channel_ids=(ALLOWED,), expires_at=None) -> 
         slack._CHANNEL_ACCESS_POLICY_ENV_VAR,
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "channel_ids": list(channel_ids),
                 "expires_at": expires_at or time.time() + 300,
+                "capabilities": ["read"],
             }
         ),
     )
@@ -35,8 +36,12 @@ def _install_policy(monkeypatch, *, channel_ids=(ALLOWED,), expires_at=None) -> 
     [
         "not-json",
         "{}",
-        '{"version":1,"channel_ids":[],"expires_at":NaN}',
+        '{"version":1,"channel_ids":[],"expires_at":9999999999}',
+        '{"version":2,"channel_ids":[],"expires_at":NaN,"capabilities":["read"]}',
         '{"version":true,"channel_ids":[],"expires_at":9999999999}',
+        '{"version":2,"channel_ids":[],"expires_at":9999999999,"capabilities":[]}',
+        '{"version":2,"channel_ids":[],"expires_at":9999999999,"capabilities":["read","write"]}',
+        '{"version":2,"channel_ids":[],"expires_at":9999999999,"capabilities":[true]}',
     ],
 )
 def test_malformed_policy_denies_listing_before_slack_api(monkeypatch, payload) -> None:
@@ -116,7 +121,36 @@ def test_every_channel_operation_denies_out_of_policy_before_api(
     result = json.loads(operation(*args))
 
     assert result["status"] == "error"
-    assert "does not allow this channel" in result["message"]
+    assert "does not allow" in result["message"]
+    request.assert_not_called()
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("operation", "args"),
+    [
+        (slack.slack_join_channel, (ALLOWED,)),
+        (slack.slack_post_message, (ALLOWED, "hello")),
+        (slack.slack_add_reaction, (ALLOWED, "1.0", "eyes")),
+        (slack.slack_remove_reaction, (ALLOWED, "1.0", "eyes")),
+        (slack.slack_upload_file, (ALLOWED, "/does/not/matter")),
+    ],
+)
+def test_read_only_policy_denies_every_mutation_before_io(
+    monkeypatch, operation, args
+) -> None:
+    _install_policy(monkeypatch)
+    request = Mock()
+    post = Mock()
+    monkeypatch.setattr(slack.requests, "request", request)
+    monkeypatch.setattr(slack.requests, "post", post)
+
+    result = json.loads(operation(*args))
+
+    assert result == {
+        "status": "error",
+        "message": "Slack runtime policy does not allow this operation",
+    }
     request.assert_not_called()
     post.assert_not_called()
 

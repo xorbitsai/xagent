@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import pathlib
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -7,7 +9,13 @@ from unittest.mock import Mock
 
 import pytest
 
+from xagent.core.agent.service import AgentService
 from xagent.core.memory.in_memory import InMemoryMemoryStore
+from xagent.web.memory_lifecycle import (
+    MemoryLifecycleState,
+    MemoryLifecycleStatus,
+    MemoryUnavailableError,
+)
 from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services.memory_policy import (
     MEMORY_POLICY_RESOLVER_FAILURE_REASON,
@@ -229,3 +237,159 @@ def test_resolver_receives_none_for_missing_or_nonprimitive_task_fields() -> Non
             is_preview=False,
         )
     )
+
+
+# --------------------------------------------------------------------------
+# A fenced memory state reaches the runtime that has to explain it.
+#
+# docs/deployment.md promises that tasks and chats keep starting while memory
+# is fenced off, running with memory disabled and recording the state as their
+# memory availability reason. Both AgentService call sites must therefore carry
+# memory_available and memory_availability_reason, not just memory_enabled.
+# --------------------------------------------------------------------------
+
+FENCED_STATES = [
+    MemoryLifecycleState.BLOCKED_REPAIR,
+    MemoryLifecycleState.RESTART_REQUIRED,
+    MemoryLifecycleState.CREDENTIAL_UNAVAILABLE,
+    MemoryLifecycleState.RETRYABLE_UNAVAILABLE,
+]
+
+
+def _fenced_policy(monkeypatch: pytest.MonkeyPatch, state: MemoryLifecycleState):
+    def refuse() -> Any:
+        raise MemoryUnavailableError(MemoryLifecycleStatus(state))
+
+    monkeypatch.setattr(agent_runtime_service, "get_memory_store", refuse)
+    return agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+
+
+@pytest.mark.parametrize("state", FENCED_STATES, ids=lambda s: s.value)
+def test_fenced_memory_still_starts_a_task_and_records_the_reason(
+    monkeypatch: pytest.MonkeyPatch, state: MemoryLifecycleState
+) -> None:
+    policy = _fenced_policy(monkeypatch, state)
+
+    # The task still starts: an inert store, memory off, and the state on record.
+    assert isinstance(policy.memory, InMemoryMemoryStore)
+    assert policy.memory_enabled is False
+    assert policy.memory_available is False
+    assert policy.memory_availability_reason == state.value
+    # Every lifecycle state is already published by /api/memory/store-info, so
+    # it survives the caller-safety fold unchanged.
+    assert policy.public_availability_reason == state.value
+    assert policy.execution_metadata() == {
+        "memory_available": False,
+        "memory_availability_reason": state.value,
+    }
+
+
+@pytest.mark.parametrize("state", FENCED_STATES, ids=lambda s: s.value)
+def test_an_agent_service_built_from_a_fenced_policy_reports_the_reason(
+    monkeypatch: pytest.MonkeyPatch, state: MemoryLifecycleState
+) -> None:
+    """What both call sites construct, for a task and for a chat alike."""
+    policy = _fenced_policy(monkeypatch, state)
+
+    service = AgentService(
+        name="fenced",
+        id="fenced-agent",
+        tools=[],
+        enable_workspace=False,
+        memory=policy.memory,
+        memory_enabled=policy.memory_enabled,
+        memory_available=policy.memory_available,
+        memory_availability_reason=policy.public_availability_reason,
+        execution_metadata=policy.execution_metadata(),
+    )
+
+    status = service.get_status()
+    assert status["memory_enabled"] is False
+    assert status["memory_available"] is False
+    assert status["memory_availability_reason"] == state.value
+    assert service.execution_metadata["memory_availability_reason"] == state.value
+
+
+def test_available_memory_records_no_reason_and_no_extra_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ordinary task's status and trace are unchanged."""
+    monkeypatch.setattr(
+        agent_runtime_service, "get_memory_store", Mock(return_value=Mock())
+    )
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+
+    assert policy.memory_available is True
+    assert policy.public_availability_reason is None
+    assert policy.execution_metadata() == {}
+
+
+def test_a_host_resolver_reason_is_not_published_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host-supplied text stays operator-only and is safe before persistence."""
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=False,
+            available=False,
+            reason="pgbouncer-7 in eu-west-1 refused the memory credential",
+        )
+    )
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+
+    assert policy.memory_available is False
+    # Raw on the short-lived policy for operator diagnostics...
+    assert policy.memory_availability_reason.startswith("pgbouncer-7")
+    # ...folded before checkpoint/trace persistence and for every caller.
+    assert (
+        policy.execution_metadata()["memory_availability_reason"]
+        == agent_runtime_service.GENERIC_MEMORY_AVAILABILITY_REASON
+    )
+    assert (
+        policy.public_availability_reason
+        == agent_runtime_service.GENERIC_MEMORY_AVAILABILITY_REASON
+    )
+
+
+def test_resolver_failure_reason_is_also_folded() -> None:
+    set_trusted_memory_policy_resolver(Mock(side_effect=RuntimeError("boom")))
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+
+    assert policy.memory_availability_reason == MEMORY_POLICY_RESOLVER_FAILURE_REASON
+    assert (
+        policy.public_availability_reason
+        == agent_runtime_service.GENERIC_MEMORY_AVAILABILITY_REASON
+    )
+
+
+def test_both_agent_service_call_sites_carry_the_memory_policy() -> None:
+    """Pins the defect: one call site propagating it is not enough.
+
+    The two constructions live in long async methods whose dependencies make
+    an end-to-end build impractical here, so this reads the call sites
+    directly rather than claiming coverage the suite does not have.
+    """
+    tree = ast.parse(
+        pathlib.Path(agent_runtime_service.__file__).read_text(encoding="utf-8")
+    )
+    required = {
+        "memory",
+        "memory_enabled",
+        "memory_available",
+        "memory_availability_reason",
+        "execution_metadata",
+    }
+    call_sites = [
+        {keyword.arg for keyword in node.keywords}
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "AgentService"
+    ]
+
+    assert len(call_sites) == 2, "expected the fresh-agent and reconstruction sites"
+    for keywords in call_sites:
+        assert required <= keywords

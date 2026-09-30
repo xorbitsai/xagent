@@ -174,7 +174,7 @@ def test_websocket_task_info_exposes_persisted_runtime_extension_bindings(
         db.commit()
         db.refresh(task)
 
-        routing, _ = command_execution_service._load_task_command_routing_snapshot(
+        routing = command_execution_service._load_task_command_routing_snapshot(
             db, task
         )
 

@@ -68,6 +68,8 @@ const routerPushMock = vi.hoisted(() => vi.fn())
 // simulate the viewed page without touching every other test in this file,
 // which all rely on the "/" default.
 const currentPathname = vi.hoisted(() => ({ current: "/" as string | null }))
+// Signed-in user seen by the connector-runtime dialog provider; no user by default.
+const authHarness = vi.hoisted(() => ({ user: undefined as { id: number } | undefined }))
 
 vi.mock("@/lib/api-wrapper", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api-wrapper")>()
@@ -83,7 +85,7 @@ vi.mock("next/navigation", () => ({
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
-  useAuth: () => ({ token: "token" }),
+  useAuth: () => ({ token: "token", user: authHarness.user }),
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -167,6 +169,9 @@ import {
   useConnectorRuntimeDialogActions,
 } from "@/contexts/connector-runtime-dialog-context"
 import { CONNECTOR_RUNTIME_DIALOG_TRIGGER_CODES } from "@/lib/connector-runtime-api"
+import { readdirSync, readFileSync } from "node:fs"
+import path from "node:path"
+import { toast } from "sonner"
 
 type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
 
@@ -205,6 +210,7 @@ function StateProbe() {
       </div>
       <div data-testid="last-task-update">{state.lastTaskUpdate}</div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
+      <div data-testid="task-outcome">{state.currentTask?.completionOutcome || ""}</div>
       <div data-testid="waiting-request-id">{state.currentTask?.waitingRequestId || ""}</div>
       <div data-testid="waiting-interactions">{JSON.stringify(state.currentTask?.waitingInteractions || [])}</div>
       <div data-testid="task-dag-terminated-at">{state.currentTask?.dagTerminatedAt ?? ""}</div>
@@ -1856,6 +1862,60 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("task-status").textContent).toBe("completed")
   })
 
+  it.each(["completed", "partial", "blocked"])("preserves %s through live, history, and snapshot paths and clears it for a new run", (outcome) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: TestWebSocketMessage) => act(() => webSocketOptions.current?.onMessage?.(message))
+    send({ type: "task_completed", task_id: 1, timestamp: "2026-05-27T05:00:02Z", data: {
+      task: { id: 1, status: "completed" }, success: true, completion_outcome: outcome,
+    } })
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent(outcome)
+    expect(screen.getByTestId("task-status")).toHaveTextContent("completed")
+    send(taskInfoMessage(1, { status: "running" }))
+    expect(screen.getByTestId("task-outcome").textContent).toBe("")
+    send(taskInfoMessage(1, { status: "completed", completion_outcome: outcome }))
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent(outcome)
+    send({ type: "task_stream_snapshot", task_id: 1, timestamp: "2026-05-27T05:00:03Z", run_id: "run-2", state_version: 4, status: "completed", control_state: "completed", data: { completion_outcome: "completed" } } as TestWebSocketMessage)
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent("completed")
+    send({ type: "task_completed", task_id: 1, timestamp: "2026-05-27T05:00:02Z", run_id: "run-1", state_version: 2, status: "completed", control_state: "completed", data: { success: true, completion_outcome: "blocked" } } as TestWebSocketMessage)
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent("completed")
+  })
+
+  it.each([
+    ["partial", "ai_message"],
+    ["blocked", "ai_message"],
+    ["partial", "task_completion"],
+    ["blocked", "task_completion"],
+  ])("keeps %s during historical questions followed by %s", (outcome, finalEvent) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: TestWebSocketMessage) => act(() => webSocketOptions.current?.onMessage?.(message))
+    act(() => webSocketOptions.current?.onConnect?.())
+    send(taskInfoMessage(1, { status: "completed", completion_outcome: outcome }))
+    const question = (requestId: string): TestWebSocketMessage => ({
+      type: "trace_event", task_id: 1, timestamp: "2026-05-27T05:00:01Z",
+      data: { event_type: "agent_message", event_id: requestId, data: {
+        message: "Which file?", expect_response: true, request_id: requestId, role: "assistant",
+      } },
+    })
+    send(question("historical-question"))
+    expect(screen.getByTestId("messages").textContent).toContain("Which file?")
+    expect(screen.getByTestId("task-status")).toHaveTextContent("completed")
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent(outcome)
+    send({ type: "trace_event", task_id: 1, timestamp: "2026-05-27T05:00:02Z", data: {
+      event_type: finalEvent, data: finalEvent === "ai_message"
+        ? { message: "Delivered answer", status: "completed" }
+        : { result: { content: "Delivered answer" }, success: true },
+    } })
+    send({ type: "historical_data_complete", task_id: 1, timestamp: "2026-05-27T05:00:03Z" })
+    expect(screen.getByTestId("task-status")).toHaveTextContent("completed")
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent(outcome)
+
+    // A live question must still clear the old outcome and request a response.
+    send(question("live-question"))
+    expect(screen.getByTestId("task-status")).toHaveTextContent("waiting_for_user")
+    expect(screen.getByTestId("task-outcome").textContent).toBe("")
+    expect(screen.getByTestId("waiting-request-id")).toHaveTextContent("live-question")
+  })
+
   it("clears a stale dagTerminatedAt once a rerun's task_info reports running again", async () => {
     render(
       <AppProvider token="token">
@@ -1890,6 +1950,24 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("running")
     })
     expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("")
+  })
+
+  it.each([
+    ["clears processing on setTaskId(null)", null, "false"],
+    ["keeps processing on a task switch", 2, "true"],
+  ] as const)("%s", (_label, next, processing) => {
+    let setTask: ((taskId: number | null) => void) | undefined
+    function SetTaskProbe() {
+      const { setTaskId } = useApp()
+      setTask = (taskId) => setTaskId(taskId, { navigate: false })
+      return null
+    }
+    render(<AppProvider token="token"><SeedRunningTask /><SetTaskProbe /><StateProbe /></AppProvider>)
+    expect(screen.getByTestId("processing").textContent).toBe("true")
+
+    act(() => { setTask?.(next) })
+
+    expect(screen.getByTestId("processing").textContent).toBe(processing)
   })
 
   it("rejects a queued message once the conversation is reset before delivery", async () => {
@@ -7942,7 +8020,7 @@ describe("connector runtime dialog trigger", () => {
     act(() => { dialogActions?.recordDelivery({ taskId: 1, clientMessageId: "x", text: "hi" }) })
     expect(appRenderCount).toBe(0)
 
-    act(() => { dialogActions?.close("dismissed") })
+    act(() => { dialogActions?.close("dismissed", 1) })
     expect(appRenderCount).toBe(0)
 
     // Control: a real app-state dispatch does bump the counter, proving it
@@ -8351,6 +8429,91 @@ describe("connector runtime dialog trigger", () => {
     )
   })
 
+  // The task page counts on this order when it checks a conversation it has
+  // just started showing: for a first message that is not held, sendMessage
+  // stages its ticket in the same synchronous stretch that sets the new task
+  // id, so a check asked for from an effect on that task id always finds the
+  // ticket and yields. A held first message has no ticket until it is
+  // released; there the check yields to the first-gate request on the same
+  // task instead, which the first-gate cases below pin.
+  it("stages a new conversation's first message before an effect on its task id can ask for a check", async () => {
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (typeof url === "string" && url.endsWith("/api/chat/task/create")) {
+        return jsonResponse({ task_id: 31, title: "hello", description: "hello", status: "pending" })
+      }
+      if (typeof url === "string" && url.includes("connector-runtime-requirements")) {
+        return jsonResponse(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+      }
+      return jsonResponse({})
+    })
+    const checked: number[] = []
+    let send: (() => Promise<void>) | undefined
+    function NewConversationPage() {
+      const { state, sendMessage } = useApp()
+      const { openSessionCheck } = useConnectorRuntimeDialogActions()
+      send = () => sendMessage("hello", { clientMessageId: "turn-first" })
+      React.useEffect(() => {
+        if (state.taskId === null) return
+        checked.push(state.taskId)
+        openSessionCheck(state.taskId, "opened")
+      }, [state.taskId, openSessionCheck])
+      return null
+    }
+    // Disconnected, so the first message stays queued with its ticket held.
+    wsHarness.isConnected = false
+    render(
+      <ConnectorRuntimeDialogProvider>
+        <AppProvider token="token">
+          <ConnectorRuntimeStateProbe />
+          <NewConversationPage />
+        </AppProvider>
+      </ConnectorRuntimeDialogProvider>
+    )
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = send?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(checked).toEqual([31])
+    expect(connectorRuntimeState.request).toBeNull()
+
+    await act(async () => {
+      wsHarness.isConnected = true
+      webSocketOptions.current?.onConnect?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    await act(async () => { await delivery })
+    expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("counts a socket open as a same-task reconnect only when the task was already connected", () => {
+    let reconnects: number | undefined
+    let setTask: ((taskId: number) => void) | undefined
+    function ReconnectProbe() {
+      const app = useApp()
+      reconnects = app.sameTaskReconnects
+      setTask = (taskId) => app.setTaskId(taskId, { navigate: false })
+      return null
+    }
+    render(<AppProvider token="token"><ReconnectProbe /></AppProvider>)
+    const open = () => act(() => { webSocketOptions.current?.onConnect?.() })
+
+    act(() => { setTask?.(5) })
+    open()
+    expect(reconnects).toBe(0)
+    open()
+    expect(reconnects).toBe(1)
+    act(() => { setTask?.(6) })
+    open()
+    expect(reconnects).toBe(1)
+    // Two opens that land before one render still count as two.
+    act(() => {
+      webSocketOptions.current?.onConnect?.()
+      webSocketOptions.current?.onConnect?.()
+    })
+    expect(reconnects).toBe(3)
+  })
+
   // A companion assertion -- this context runs with no
   // ConnectorRuntimeDialogProvider above it on widget/share pages, and that
   // must never trip the dev-only "called outside provider" warning -- lives
@@ -8588,5 +8751,478 @@ describe("error frame display projection", () => {
     expect(
       projectErrorFrameForDisplay(frame, { trustLegacyErrorProse, translate, controlEnvelope }),
     ).toEqual(expected)
+  })
+})
+
+// A new conversation's first message, sent through the create branch of
+// sendMessage with the real dialog provider and the real dialog: the create
+// response carries `requirements`, and the dialog's own per-task read
+// answers with `read()`. The first gate holds the message only while that
+// create report has something the user can fill here.
+const FIRST_GATE_TASK_ID = 41
+const FIRST_GATE_REPORTS = {
+  met: { satisfied: true, secrets_expires_at: null, connectors: [] },
+  secretsOnly: {
+    satisfied: false,
+    secrets_expires_at: null,
+    connectors: [{
+      connector_ref: { connector_type: "custom_api", connector_id: 1 },
+      name: "A",
+      inputs: [{ section: "secrets", key: "api_key", type: "string", required: true, satisfied: false, expired: false }],
+    }],
+  },
+  nothingFillable: { satisfied: false, secrets_expires_at: null, connectors: [] },
+  // The server rejects any value saved under this name.
+  badNameOnly: {
+    satisfied: false,
+    secrets_expires_at: null,
+    connectors: [{
+      connector_ref: { connector_type: "custom_api", connector_id: 1 },
+      name: "A",
+      inputs: [{ section: "context", key: "bad key", type: "string", required: true, satisfied: false, expired: false }],
+    }],
+  },
+}
+
+function stubFirstMessage(requirements: unknown, read: () => Response = () => jsonResponse(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)): void {
+  apiRequestMock.mockImplementation(async (url: string) => {
+    if (typeof url === "string" && url.endsWith("/api/chat/task/create")) {
+      return jsonResponse({
+        task_id: FIRST_GATE_TASK_ID, title: "hello", description: "hello", status: "pending",
+        connector_runtime_requirements: requirements,
+      })
+    }
+    if (typeof url === "string" && url.includes("connector-runtime-requirements")) return read()
+    if (typeof url === "string" && url.includes("connector-runtime-values")) return jsonResponse(FIRST_GATE_REPORTS.met)
+    return jsonResponse({})
+  })
+}
+
+let firstGateApp: ReturnType<typeof useApp> | undefined
+let firstGateActions: ReturnType<typeof useConnectorRuntimeDialogActions> | undefined
+function FirstMessageProbe() {
+  firstGateApp = useApp()
+  return null
+}
+function FirstGateActionsProbe() {
+  firstGateActions = useConnectorRuntimeDialogActions()
+  return null
+}
+
+function firstGateTree() {
+  return (
+    <ConnectorRuntimeDialogProvider>
+      <AppProvider token="token">
+        <StateProbe />
+        <ConnectorRuntimeStateProbe />
+        <FirstMessageProbe />
+        <FirstGateActionsProbe />
+      </AppProvider>
+    </ConnectorRuntimeDialogProvider>
+  )
+}
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+// Starts the first message and lets the create response land. The returned
+// promise never rejects: it settles to "resolved" or to the error sendMessage
+// threw, so a test can read either without an unhandled rejection.
+async function sendFirstMessage(): Promise<{ settled: Promise<"resolved" | unknown>; done: () => boolean }> {
+  let finished = false
+  let settled: Promise<"resolved" | unknown> = Promise.resolve("resolved")
+  await act(async () => {
+    settled = firstGateApp!.sendMessage("hello", {
+      clientMessageId: "turn-first",
+      metadata: { request_id: "req-first" },
+    }).then(() => "resolved" as const, (error: unknown) => error)
+    void settled.then(() => { finished = true })
+    await tick()
+  })
+  return { settled, done: () => finished }
+}
+
+// The new task's socket opening (each test starts disconnected), so a
+// queued message goes out.
+async function connectNewTask(): Promise<void> {
+  await act(async () => {
+    wsHarness.isConnected = true
+    webSocketOptions.current?.onConnect?.()
+    await tick()
+  })
+}
+
+// Renders the tree with a create report the user can fill, sends the first
+// message and opens the new task's socket, then waits for the held dialog.
+// `beforeSend` runs between the render and the send.
+async function startHeld(tree = firstGateTree(), beforeSend?: () => Promise<void> | void) {
+  stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+  const view = render(tree)
+  const stage = vi.spyOn(firstGateActions!, "stagePendingDelivery")
+  const openFirstGate = vi.spyOn(firstGateActions!, "openFirstGate")
+  await beforeSend?.()
+  const sent = await sendFirstMessage()
+  await connectNewTask()
+  await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument())
+  return { ...sent, stage, openFirstGate, view }
+}
+
+function userMessages(): unknown[] {
+  const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{ role: string }>
+  return messages.filter(message => message.role === "user")
+}
+
+describe("a new conversation's first message behind the first gate", () => {
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    wsHarness.isConnected = false
+    apiRequestMock.mockReset()
+    routerPushMock.mockReset()
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue({ client_message_id: "turn-first", turn_id: "turn-first" })
+    vi.mocked(toast.error).mockClear()
+    currentPathname.current = "/task"
+    authHarness.user = undefined
+    connectorRuntimeState = { request: null, payload: null }
+    firstGateApp = undefined
+    firstGateActions = undefined
+    localStorage.clear()
+    ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
+      .clearDuplicateMessageCache?.()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    cleanup()
+    localStorage.clear()
+    currentPathname.current = "/"
+    authHarness.user = undefined
+  })
+
+  describe("holds the first message only while a real dialog holds it", () => {
+    it("stages, queues and shows nothing until save and send lets it go", async () => {
+      // The socket is open for the new task: anything queued would go now.
+      const { settled, done, stage } = await startHeld()
+
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+      expect(stage).not.toHaveBeenCalled()
+      expect(userMessages()).toEqual([])
+      expect(connectorRuntimeState.payload).toBeNull()
+      expect((connectorRuntimeState.request as { trigger: string }).trigger).toBe("first_gate")
+      expect(done()).toBe(false)
+
+      fireEvent.change(screen.getByLabelText("token"), { target: { value: "v" } })
+      fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+
+      await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
+      expect(sendChatMessageMock.mock.calls[0]).toEqual(["hello", undefined, undefined, "turn-first", "req-first"])
+      await act(async () => { await settled })
+      expect(await settled).toBe("resolved")
+      expect(stage.mock.calls).toEqual([[{ taskId: FIRST_GATE_TASK_ID, clientMessageId: "turn-first", text: "hello", files: [] }]])
+      expect(userMessages()).toHaveLength(1)
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    })
+
+    it("sends it once, with its own ids, when the first read finds nothing to fill", async () => {
+      stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL, () => jsonResponse(FIRST_GATE_REPORTS.met))
+      render(firstGateTree())
+      const openFirstGate = vi.spyOn(firstGateActions!, "openFirstGate")
+      const { settled } = await sendFirstMessage()
+      await connectNewTask()
+      await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
+      expect(sendChatMessageMock.mock.calls[0]).toEqual(["hello", undefined, undefined, "turn-first", "req-first"])
+      expect(await settled).toBe("resolved")
+      expect(openFirstGate.mock.calls).toEqual([[FIRST_GATE_TASK_ID]])
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    })
+
+    it("returns without sending when the user closes the dialog", async () => {
+      const { settled, stage } = await startHeld()
+
+      fireEvent.click(screen.getByRole("button", { name: "Close" }))
+
+      expect(await settled).toBe("resolved")
+      await act(async () => { await tick() })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+      expect(stage).not.toHaveBeenCalled()
+      expect(userMessages()).toEqual([])
+      expect(connectorRuntimeState.request).toBeNull()
+    })
+
+    it("fails with the translated cleared sentence when a task switch takes the dialog away", async () => {
+      const { settled, stage } = await startHeld()
+
+      await act(async () => { firstGateApp!.setTaskId(99, { navigate: false }) })
+
+      const error = await settled
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toBe("connectorRuntime.firstGateCleared")
+      expect((error as { userFacing?: unknown }).userFacing).toBe(true)
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+      expect(stage).not.toHaveBeenCalled()
+    })
+
+    it("fails with the cleared sentence when the signed-in user changes during the hold", async () => {
+      authHarness.user = { id: 1 }
+      const { settled, stage, view } = await startHeld()
+
+      authHarness.user = undefined
+      view.rerender(firstGateTree())
+
+      const error = await settled
+      expect((error as Error).message).toBe("connectorRuntime.firstGateCleared")
+      expect((error as { userFacing?: unknown }).userFacing).toBe(true)
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+      expect(stage).not.toHaveBeenCalled()
+    })
+
+    it("fails with the cleared sentence when the dialog provider unmounts during the hold", async () => {
+      const { settled, stage, view } = await startHeld()
+
+      view.unmount()
+
+      const error = await settled
+      expect((error as Error).message).toBe("connectorRuntime.firstGateCleared")
+      expect((error as { userFacing?: unknown }).userFacing).toBe(true)
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+      expect(stage).not.toHaveBeenCalled()
+    })
+
+    it("sends at once with no dialog provider mounted", async () => {
+      stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+      render(
+        <AppProvider token="token">
+          <StateProbe />
+          <FirstMessageProbe />
+        </AppProvider>
+      )
+      const { settled } = await sendFirstMessage()
+      await connectNewTask()
+      await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
+      expect(await settled).toBe("resolved")
+      expect(apiRequestMock).not.toHaveBeenCalledWith(...connectorRuntimeReadCall)
+    })
+
+    it.each([
+      ["no report (public and share create paths)", null],
+      ["a response without the field", undefined],
+      ["a malformed report", { satisfied: "no" }],
+      ["a met report", FIRST_GATE_REPORTS.met],
+      ["secrets only", FIRST_GATE_REPORTS.secretsOnly],
+      ["nothing fillable", FIRST_GATE_REPORTS.nothingFillable],
+      ["only a required key it can never save", FIRST_GATE_REPORTS.badNameOnly],
+    ] as const)("does not hold on %s: staged with the new task id, then sent", async (_name, requirements) => {
+      stubFirstMessage(requirements)
+      render(firstGateTree())
+      const openFirstGate = vi.spyOn(firstGateActions!, "openFirstGate")
+      const stage = vi.spyOn(firstGateActions!, "stagePendingDelivery")
+      const { settled } = await sendFirstMessage()
+      // Staged as today: in the create response's own continuation, before
+      // the socket for the new task has even opened.
+      expect(stage).toHaveBeenCalledTimes(1)
+      await connectNewTask()
+      await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
+      expect(await settled).toBe("resolved")
+      expect(openFirstGate).not.toHaveBeenCalled()
+      expect(apiRequestMock).not.toHaveBeenCalledWith(...connectorRuntimeReadCall)
+    })
+
+    // The create response lands while the user is on a page the first gate
+    // may not show on (they left the start page while it was in flight).
+    // Never visible, so it releases the message exactly as today.
+    it("sends it as today when the user was off the dialog's pages before it ever showed", async () => {
+      currentPathname.current = "/settings"
+      stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+      render(firstGateTree())
+      const openFirstGate = vi.spyOn(firstGateActions!, "openFirstGate")
+      const { settled } = await sendFirstMessage()
+      await connectNewTask()
+      await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
+      expect(await settled).toBe("resolved")
+      expect(openFirstGate.mock.calls).toEqual([[FIRST_GATE_TASK_ID]])
+      expect(apiRequestMock).not.toHaveBeenCalledWith(...connectorRuntimeReadCall)
+      expect(toast.error).not.toHaveBeenCalled()
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    })
+  })
+
+  it("leaves the held message alone when another message's failure frame lands during the hold", async () => {
+    const { settled } = await startHeld()
+    const held = connectorRuntimeState.request as { seq: number; trigger: string; resendPayload: unknown }
+
+    // The navigation to the new conversation lands, and the user sends a
+    // second message into it while the first is held; it is delivered, then
+    // its turn fails.
+    currentPathname.current = `/task/${FIRST_GATE_TASK_ID}`
+    sendChatMessageMock.mockResolvedValueOnce({ client_message_id: "turn-second", turn_id: "turn-second" })
+    await act(async () => {
+      await firstGateApp!.sendMessage("second", { clientMessageId: "turn-second" })
+    })
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(["turn-second"])
+    expect((connectorRuntimeState.payload as { clientMessageId: string } | null)?.clientMessageId).toBe("turn-second")
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:02Z", task_id: FIRST_GATE_TASK_ID,
+        task: { id: FIRST_GATE_TASK_ID, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: "run-second", state_version: 2,
+      } as TestWebSocketMessage)
+    })
+    await act(async () => { await tick() })
+    expect(connectorRuntimeState.request).toBe(held)
+    expect(held.trigger).toBe("first_gate")
+    expect(held.resendPayload).toBeNull()
+    expect(connectorRuntimeState.payload).toBeNull()
+    expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument()
+    expect(screen.queryByText("connectorRuntime.actions.saveAndResend")).not.toBeInTheDocument()
+
+    // Released, the first message goes out; its own failure frame then
+    // opens the per-turn dialog with that message as the resend.
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "v" } })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(2))
+    expect(await settled).toBe("resolved")
+    act(() => {
+      onMessage?.({
+        type: "task_error", timestamp: "2026-05-27T05:00:03Z", task_id: FIRST_GATE_TASK_ID,
+        task: { id: FIRST_GATE_TASK_ID, status: "failed" }, message: "x", error: "x",
+        code: "missing_runtime_context", run_id: "run-first", state_version: 3,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => expect((connectorRuntimeState.request as { trigger: string } | null)?.trigger).toBe("turn_failure"))
+    const failure = connectorRuntimeState.request as { resendPayload: { clientMessageId: string } | null }
+    expect(failure.resendPayload?.clientMessageId).toBe("turn-first")
+  })
+
+  // The held message has no ticket yet, so the task page's check for the new
+  // conversation finds the first gate's own request on that task instead,
+  // and leaves it as it is, on opening and on a reconnect alike.
+  it("leaves the held message alone when the task page checks the new conversation", async () => {
+    stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+    render(firstGateTree())
+    const { done } = await sendFirstMessage()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument())
+    const held = connectorRuntimeState.request
+    for (const cause of ["opened", "reconnected"] as const) {
+      await act(async () => { firstGateActions!.openSessionCheck(FIRST_GATE_TASK_ID, cause) })
+      expect(connectorRuntimeState.request).toBe(held)
+    }
+    expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument()
+    expect(done()).toBe(false)
+  })
+
+  // The pending-task auto-send predates the dialog: a pending task_info with
+  // a description arms it, and on the next connect it would send that
+  // description after one second. The held task's description is the held
+  // message's text, so a reconnect during the hold must never send it.
+  it("never auto-sends the task description while the first message is held", async () => {
+    stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+    render(firstGateTree())
+    await sendFirstMessage()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument())
+
+    vi.useFakeTimers()
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: FIRST_GATE_TASK_ID,
+        data: {
+          event_id: "task-info-first-gate",
+          event_type: "task_info",
+          data: {
+            id: FIRST_GATE_TASK_ID, title: "hello", description: "hello", status: "PENDING",
+            created_at: "2026-05-27T05:00:00Z", updated_at: "2026-05-27T05:00:01Z",
+          },
+        },
+      } as unknown as TestWebSocketMessage)
+    })
+    // Drop and reopen the socket.
+    wsHarness.isConnected = false
+    act(() => { firstGateApp!.dispatch({ type: "TRIGGER_TASK_UPDATE" }) })
+    wsHarness.isConnected = true
+    act(() => { webSocketOptions.current?.onConnect?.() })
+    act(() => { vi.advanceTimersByTime(2000) })
+
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument()
+  })
+
+  // Not by timer order: here the socket reports connected again with no
+  // onConnect, so onConnect's own one-second disarm never runs. The auto-send
+  // is armed before the send by another task's pending task_info, and the
+  // held task's pending task_info lands during the hold.
+  it("never auto-sends while the first message is held, even with no disarm timer", async () => {
+    const pendingTaskInfo = (id: number, description: string, taskId?: number) => ({
+      type: "trace_event",
+      timestamp: "2026-05-27T05:00:02Z",
+      ...(taskId === undefined ? {} : { task_id: taskId }),
+      data: {
+        event_id: `task-info-${id}`,
+        event_type: "task_info",
+        data: { id, title: description, description, status: "PENDING", created_at: "2026-05-27T05:00:00Z", updated_at: "2026-05-27T05:00:01Z" },
+      },
+    }) as unknown as TestWebSocketMessage
+    stubFirstMessage(CONNECTOR_RUNTIME_REPORT_NEEDS_FILL)
+    render(firstGateTree())
+    act(() => { webSocketOptions.current?.onMessage?.(pendingTaskInfo(7, "earlier")) })
+    await sendFirstMessage()
+    await waitFor(() => expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument())
+
+    vi.useFakeTimers()
+    act(() => { webSocketOptions.current?.onMessage?.(pendingTaskInfo(FIRST_GATE_TASK_ID, "hello", FIRST_GATE_TASK_ID)) })
+    wsHarness.isConnected = true
+    act(() => { firstGateApp!.dispatch({ type: "TRIGGER_TASK_UPDATE" }) })
+    act(() => { vi.advanceTimersByTime(2000) })
+
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(screen.getByText("connectorRuntime.actions.saveAndSend")).toBeInTheDocument()
+  })
+
+  it("sends the released first message exactly once under StrictMode", async () => {
+    const { settled, openFirstGate } = await startHeld(<React.StrictMode>{firstGateTree()}</React.StrictMode>, async () => {
+      // The provider has been updated before, as on a page that sent a message
+      // earlier, so the gate's update is computed during render (and twice here).
+      await act(async () => { firstGateActions!.stagePendingDelivery({ taskId: 5, clientMessageId: "warm", text: "x" }) })
+      await act(async () => { firstGateActions!.discardPendingDelivery("warm") })
+    })
+    fireEvent.change(screen.getByLabelText("token"), { target: { value: "v" } })
+    fireEvent.click(screen.getByText("connectorRuntime.actions.saveAndSend"))
+    await waitFor(() => expect(sendChatMessageMock).toHaveBeenCalledTimes(1))
+    expect(await settled).toBe("resolved")
+    await act(async () => { await tick() })
+    expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+    expect(openFirstGate).toHaveBeenCalledTimes(1)
+  })
+})
+
+// Who may open which dialog request, read off the production sources: a
+// first gate only from the app context, and a session check only from the
+// task page. The scans count call sites and nothing else; that the one first
+// gate call sits in sendMessage's create branch, after the create response
+// and before the message is staged, is held by the behavior tests above.
+describe("opens the first gate and the session check from one place each", () => {
+  const root = path.resolve(__dirname, "..")
+  function productionSources(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) return entry.name === "__tests__" ? [] : productionSources(full)
+      return /\.(ts|tsx)$/.test(entry.name) && !/\.test\.(ts|tsx)$/.test(entry.name) ? [full] : []
+    })
+  }
+  // Comments go first: prose may name these actions.
+  const code = (file: string) => readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "")
+  const callers = (pattern: RegExp) => productionSources(root)
+    .map(file => ({ file: path.relative(root, file), calls: Array.from(code(file).matchAll(pattern)).length }))
+    .filter(({ calls }) => calls > 0)
+
+  it("calls openFirstGate once, from the app context", () => {
+    expect(callers(/\bopenFirstGate\s*\(/g)).toEqual([{ file: "contexts/app-context-chat.tsx", calls: 1 }])
+  })
+
+  it("calls openSessionCheck only from the task page", () => {
+    expect(callers(/\bopenSessionCheck\s*\(/g)).toEqual([{ file: "app/task/[id]/page-client.tsx", calls: 1 }])
   })
 })

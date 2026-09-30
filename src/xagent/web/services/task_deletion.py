@@ -10,6 +10,11 @@ from ..models.task import (
     TraceMessageBlob,
 )
 from ..models.task_interaction import TaskInteractionRequest
+from .task_file_lifecycle import (
+    DetachmentReason,
+    detach_task_files,
+    lock_attachment_task,
+)
 from .task_interaction_schema import interaction_requests_table_exists
 
 
@@ -17,13 +22,13 @@ def purge_task_rows(
     db: Session,
     *,
     task_id: int,
+    detached_reason: DetachmentReason,
 ) -> bool:
     """Delete one task and its non-cascading rows in a caller-owned transaction.
 
-    ``UploadedFile`` rows are detached, not deleted: ``Task.uploaded_files`` is a
-    relationship without a cascade, so the unit of work nulls
-    ``UploadedFile.task_id`` before the task row is removed. The rows and their
-    backing blobs therefore outlive the task and are not reclaimed here.
+    ``detached_reason`` is required: ``task_deleted`` for deletion/expiry or
+    ``task_create_failed`` for failed-create compensation. Marking shares this
+    transaction with deletion; retained file bytes are reclaimed later.
 
     ``task_interaction_requests`` rows, unlike ``UploadedFile``, are deleted
     outright: the CASCADE on ``task_id`` would remove them anyway, and the
@@ -31,9 +36,10 @@ def purge_task_rows(
     ordering comment at that call).
     """
 
-    task = db.query(Task).filter(Task.id == task_id).first()
+    task = lock_attachment_task(db, task_id, deleting=True)
     if task is None:
         return False
+    detach_task_files(db, task_id=task_id, reason=detached_reason)
 
     # NULL the checkpoint pointer columns before the trace_events delete
     # below: last_checkpoint_trace_event_id FKs to trace_events.id, so a

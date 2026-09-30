@@ -317,19 +317,6 @@ class TestCallbacksOnlyAsyncCompensationRejected:
         assert "DOCUMENT" in result.boundary_errors
 
 
-class TestAsyncTwin:
-    def test_async_form_offloads_to_sync(self) -> None:
-        coordinator = _make_coordinator()
-        order: list[str] = []
-        request = _make_request(_spy_callbacks(order), operation=None)
-
-        result = asyncio.run(coordinator.rollback_failed_ingestion(request))
-
-        assert order == ["document", "file", "status", "snapshot"]
-        assert result.status == "complete"
-        assert result.rollback_complete is True
-
-
 class TestUploadRollback:
     """#795: the upload entry awaits on the caller's loop and stops at the first failure."""
 

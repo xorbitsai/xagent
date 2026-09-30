@@ -1,9 +1,10 @@
 """Unit tests for web ingestion pipeline."""
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -15,9 +16,12 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
 from xagent.core.tools.core.RAG_tools.kb import (
     KBOperationCompatibilityFacade,
     KBPipelineCompatibilityFacade,
+    RollbackStatus,
+    SideEffectPlane,
 )
 from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
     _callback_accepts_ingestion_result,
+    _log_kept_path_only_file,
     run_web_ingestion,
 )
 from xagent.core.tools.core.RAG_tools.utils.string_utils import sanitize_for_doc_id
@@ -1594,60 +1598,148 @@ class TestCrawlStopReasonDrivesStatus:
         assert result.status == "success"
 
 
-class TestLegacyPersistentFileCompensationGuard:
-    """The legacy persistent-file cleanup must not touch a file whose fate the
-    file_handler already owns through boundary compensation."""
+class TestHandlerWithoutFileCompensation:
+    """A handler that declares no file_compensation owns its file_path."""
 
-    @staticmethod
-    def _run(tmp_path: Path, file_info: Optional[dict]) -> tuple[MagicMock, Path]:
-        from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
-            _run_legacy_persistent_file_compensation,
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("file_id", "callbacks", "expected"),
+        [
+            pytest.param(
+                "file-1",
+                {},
+                (True, RollbackStatus.INCOMPLETE, [SideEffectPlane.FILE]),
+                id="path_only-file-1",
+            ),
+            pytest.param(
+                None,
+                {},
+                (True, RollbackStatus.INCOMPLETE, [SideEffectPlane.FILE]),
+                id="path_only-None",
+            ),
+            pytest.param(
+                "file-1",
+                {
+                    "document_compensation": lambda result=None: (lambda: None),
+                    "status_compensation": lambda result=None: (lambda: None),
+                },
+                (
+                    False,
+                    RollbackStatus.COMPLETE,
+                    [SideEffectPlane.DOCUMENT, SideEffectPlane.STATUS],
+                ),
+                id="reuse",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("failure", ["error_result", "exception"])
+    async def test_failed_page_keeps_the_file_and_reports_it(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        failure: str,
+        file_id: Optional[str],
+        callbacks: dict[str, Any],
+        expected: tuple[bool, RollbackStatus, list[SideEffectPlane]],
+    ) -> None:
+        remains, rollback_status, planes = expected
+        operation_facade = KBOperationCompatibilityFacade()
+        pipeline_facade = KBPipelineCompatibilityFacade(
+            operation_compatibility=operation_facade
         )
-
-        persistent = tmp_path / "page.md"
-        persistent.write_text("keep me", encoding="utf-8")
-        facade = MagicMock()
-        # Explicit: an unconfigured MagicMock is truthy and would read as
-        # "compensation failed", steering the callee down the error branch.
-        facade.compensate_web_page_file_side_effect.return_value = []
-        _run_legacy_persistent_file_compensation(
-            pipeline_facade=facade,
-            page_operation=None,
-            collection="col",
-            url="https://example.com/page",
-            copied_persistent_file=persistent,
-            file_info=file_info,  # type: ignore[arg-type]
-            warnings=[],
-        )
-        return facade, persistent
-
-    def test_per_boundary_compensation_spares_the_persistent_file(self, tmp_path):
-        """A reused existing web file would otherwise be unlinked on rollback."""
-        facade, _ = self._run(
-            tmp_path,
-            {
-                "file_path": "page.md",
-                "file_id": "file-1",
-                "document_compensation": lambda result=None: (lambda: None),
-                "status_compensation": lambda result=None: (lambda: None),
+        stored_file = tmp_path / "stored.md"
+        stored_file.write_text("user data", encoding="utf-8")
+        url = "https://example.com/page1"
+        ingest_patch: dict[str, Any] = {
+            "error_result": {
+                "return_value": IngestionResult(
+                    status="error", doc_id="doc1", message="embedding failed"
+                )
             },
+            "exception": {"side_effect": RuntimeError("boom")},
+        }[failure]
+        reason, warning_prefix = {
+            "error_result": ("embedding failed", "Partial ingestion for"),
+            "exception": ("boom", "Failed to ingest"),
+        }[failure]
+
+        def file_handler(
+            temp_file_path: Path, title: str, collection: str, url: str
+        ) -> dict[str, Any]:
+            return {"file_path": str(stored_file), "file_id": file_id, **callbacks}
+
+        module = "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion"
+        caplog.set_level(logging.WARNING, logger=module)
+        with (
+            patch(f"{module}.WebCrawler") as mock_crawler_class,
+            patch(
+                f"{module}._get_pipeline_compatibility_facade",
+                return_value=pipeline_facade,
+            ),
+            patch(f"{module}.run_document_ingestion", **ingest_patch),
+        ):
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(
+                return_value=[
+                    MagicMock(
+                        url=url,
+                        title="Page 1",
+                        content_markdown="# Page 1",
+                        status="success",
+                        depth=0,
+                        timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                        content_length=8,
+                    )
+                ]
+            )
+            mock_crawler.total_urls_found = 1
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+            result = await run_web_ingestion(
+                collection="test_collection",
+                crawl_config=WebCrawlConfig(start_url="https://example.com"),
+                file_handler=file_handler,
+            )
+
+        assert stored_file.read_text(encoding="utf-8") == "user data"
+        assert result.status == "error"
+        assert result.message == f"Web ingestion failed: {url} returned {reason}"
+        assert result.warnings == [f"{warning_prefix} {url}: {reason}"]
+        assert result.side_effects_may_remain is remains
+        outcome = operation_facade.last_outcome
+        assert outcome is not None
+        (child,) = outcome.child_outcomes
+        assert [step.plane for step in child.compensation_steps] == planes
+        assert (child.side_effects_may_remain, child.rollback_status) == (
+            remains,
+            rollback_status,
+        )
+        kept_logs = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and str(stored_file) in record.getMessage()
+        ]
+        assert kept_logs == (
+            []
+            if callbacks
+            else [
+                f"Kept file_handler file {stored_file} after ingestion of {url} "
+                "failed; declare file_compensation if it should be removed"
+            ]
         )
 
-        facade.record_web_page_file_side_effect.assert_not_called()
+    def test_pipeline_temp_file_is_not_reported_as_kept(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        temp_file = tmp_path / "0_page.md"
+        module = "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion"
+        with caplog.at_level(logging.WARNING, logger=module):
+            _log_kept_path_only_file(
+                {"file_path": str(temp_file), "file_id": "file-1"},
+                temp_file,
+                str(tmp_path),
+                "https://example.com/page1",
+            )
 
-    def test_unmanaged_persistent_file_is_still_registered_for_cleanup(self, tmp_path):
-        """Counter-case: with no declared compensation the cleanup is registered."""
-        facade, persistent = self._run(
-            tmp_path, {"file_path": "page.md", "file_id": "file-1"}
-        )
-
-        facade.record_web_page_file_side_effect.assert_called_once_with(
-            None,
-            collection="col",
-            url="https://example.com/page",
-            file_path=str(persistent),
-            file_id="file-1",
-            reason="legacy_persistent_file",
-            extra_payload={"rollback_kind": "legacy_persistent_file"},
-            compensation=ANY,
-        )
+        assert caplog.records == []

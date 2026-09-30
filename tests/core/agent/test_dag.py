@@ -58,14 +58,6 @@ from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
 
-@pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
-
-
 class FakeWorkspace:
     def __init__(self, task_id: str, tmp_path: Path) -> None:
         workspace_dir = tmp_path / task_id
@@ -415,6 +407,52 @@ class FailingPlanGenerator(PlanGenerator):
 
 def build_plan(*steps: PlanStep) -> ExecutionPlan:
     return ExecutionPlan(steps=list(steps))
+
+
+@pytest.mark.asyncio
+async def test_plan_request_tool_names_leave_out_the_stored_result_reader(
+    tmp_path: Path,
+) -> None:
+    """The planner is given every real file tool name except read_tool_result:
+    ReAct offers the reader per turn once the run's registry holds a record,
+    and the planner's list is not gated on the registry."""
+    from xagent.core.tools.adapters.vibe.workspace_file_tool import (
+        create_workspace_file_tools,
+    )
+    from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
+    from xagent.core.workspace import TaskWorkspace
+
+    requests: list[PlanGenerationRequest] = []
+
+    class CapturingPlanGenerator(PlanGenerator):
+        async def generate_plan(
+            self,
+            *,
+            request: PlanGenerationRequest,
+            llm: Any,
+        ) -> ExecutionPlan:
+            del llm
+            requests.append(request)
+            raise RuntimeError("request captured")
+
+    tools = create_workspace_file_tools(TaskWorkspace("dag-tools", str(tmp_path)))
+    all_names = [tool.metadata.name for tool in tools]
+    assert SPILL_READ_TOOL_NAME in all_names
+    context = ExecutionContext(execution_id="dag-tool-names")
+    context.add_user_message("Tidy up the output files")
+
+    result = await DAGPattern(CapturingPlanGenerator()).run(
+        context=context,
+        tools=tools,
+        llm=SequenceLLM([]),
+        runtime=PatternRuntime(execution_id="dag-tool-names"),
+    )
+
+    assert result["failure_reason"] == "plan_generation_error"
+    assert len(requests) == 1
+    assert requests[0].available_tool_names == [
+        name for name in all_names if name != SPILL_READ_TOOL_NAME
+    ]
 
 
 def test_completion_assessment_plan_withholds_execution_intent_fields() -> None:
@@ -1618,7 +1656,7 @@ async def test_dag_waiting_resume_keeps_memory_input_for_later_child() -> None:
     assert result["success"] is True, result
     assert restored.memory_input_text == typed
     assert memory_store.added
-    assert memory_store.added[-1].metadata["task"] == typed
+    assert "task" not in memory_store.added[-1].metadata
     assert {call["query"] for call in memory_store.searches} == {
         typed,
         "User chose option B.",
@@ -2701,7 +2739,9 @@ async def test_dag_pattern_passes_compact_llm_to_step_react_compaction() -> None
 
 
 @pytest.mark.asyncio
-async def test_dag_compaction_resume_preserves_clean_memory_metadata() -> None:
+async def test_dag_compaction_resume_keeps_request_text_out_of_memory_metadata() -> (
+    None
+):
     class CrudMemoryStore:
         def __init__(self) -> None:
             self.notes = {
@@ -2814,8 +2854,8 @@ async def test_dag_compaction_resume_preserves_clean_memory_metadata() -> None:
     )
 
     assert result["success"] is True, result
-    assert memory_store.added[0].metadata["task"] == typed
-    assert memory_store.updated[0].metadata["updated_by_task"] == typed
+    assert "task" not in memory_store.added[0].metadata
+    assert "updated_by_task" not in memory_store.updated[0].metadata
 
 
 @pytest.mark.asyncio
@@ -6252,8 +6292,7 @@ async def test_dag_pattern_enriches_plan_prompt_with_memory() -> None:
         "Plan this",
         "User prefers concise summaries.",
     ]
-    assert memory_store.added[0].metadata["task"] == "Plan this"
-    assert "/private/runtime/input.txt" not in memory_store.added[0].metadata["task"]
+    assert "task" not in memory_store.added[0].metadata
     prompt_payload = json.loads(llm.call_kwargs[0]["messages"][1]["content"])
     assert (
         "Split this project using the historical DAG pattern."

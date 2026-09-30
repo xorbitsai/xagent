@@ -360,8 +360,17 @@ class TaskWorkspace:
         source = self.resolve_file_id_detached(file_id)
         if source is None:
             raise FileNotFoundError(f"File not found: {file_id}")
+        raw_source = Path(source)
+        probe = raw_source
+        while probe != probe.parent:
+            if probe.is_symlink():
+                # A registered path can be replaced after lookup. Refuse
+                # symlink sources entirely so a later swap cannot redirect
+                # bytes to a different tenant's file before containment.
+                raise FileNotFoundError(f"File not found: {file_id}")
+            probe = probe.parent
         try:
-            source = Path(source).resolve(strict=True)
+            source = raw_source.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             # Python 3.11/3.12 raise RuntimeError for symlink loops. Treat
             # both that case and a disappearing source as an unavailable file.

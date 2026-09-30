@@ -1682,6 +1682,15 @@ def _task_user_id(task: Any) -> int | None:
     return int(cast(Any, user_id))
 
 
+def _completion_outcome(result: dict[str, Any]) -> str | None:
+    outcome = result.get("completion_outcome")
+    return (
+        outcome
+        if isinstance(outcome, str) and outcome in {"completed", "partial", "blocked"}
+        else None
+    )
+
+
 @dataclass(frozen=True)
 class _TaskExecutionFinalization:
     normalized_outputs: list[dict[str, Any]]
@@ -1919,6 +1928,13 @@ def _finalize_task_execution_result_isolated(
                     status=final_status,
                     expected_run_id=expected_run_id,
                 )
+                setattr(
+                    task_updated,
+                    "completion_outcome",
+                    _completion_outcome(result)
+                    if final_status == TaskStatus.COMPLETED
+                    else None,
+                )
                 if final_status == TaskStatus.FAILED:
                     diagnostic_error = safe_str(result.get("error")).strip()
                     setattr(
@@ -1998,6 +2014,7 @@ def _finalize_task_execution_result_isolated(
                 "description": task_updated.description,
                 "execution_mode": getattr(task_updated, "execution_mode", None),
                 "updated_at": task_updated.updated_at,
+                "completion_outcome": task_updated.completion_outcome,
             }
         else:
             broadcast_meta = {
@@ -2006,6 +2023,7 @@ def _finalize_task_execution_result_isolated(
                 "description": None,
                 "execution_mode": None,
                 "updated_at": None,
+                "completion_outcome": None,
             }
 
         return _TaskExecutionFinalization(
@@ -2268,6 +2286,9 @@ async def execute_task_background(
                             "title": broadcast_meta["title"],
                             "description": broadcast_meta["description"],
                             "status": final_task_status,
+                            "completion_outcome": broadcast_meta.get(
+                                "completion_outcome"
+                            ),
                             "execution_mode": broadcast_meta["execution_mode"],
                             "agent_id": broadcast_agent_meta["agent_id"],
                             "agent_name": broadcast_agent_meta["agent_name"],
@@ -2294,6 +2315,7 @@ async def execute_task_background(
                         "status": final_task_status,
                         "description": broadcast_meta["description"],
                     },
+                    "completion_outcome": broadcast_meta.get("completion_outcome"),
                     "result": ai_response,
                     "output": ai_response,
                     "file_outputs": normalized_outputs,
@@ -2724,6 +2746,15 @@ def _finalize_resumed_task(
             status=final_task_status,
             expected_run_id=task_lease.run_id,
         )
+
+        setattr(
+            task,
+            "completion_outcome",
+            _completion_outcome(result)
+            if final_task_status == TaskStatus.COMPLETED
+            else None,
+        )
+        finalized["completion_outcome"] = task.completion_outcome
 
         if success and output.strip() and task_owner_user_id is not None:
             persist_assistant_message_no_commit(
@@ -3695,6 +3726,7 @@ async def execute_resume_background(
                 },
                 "result": output,
                 "output": output,
+                "completion_outcome": finalized.get("completion_outcome"),
                 "file_outputs": normalized_outputs,
                 "success": success,
                 # Forward the coded reason so a mid-run quota interrupt on a

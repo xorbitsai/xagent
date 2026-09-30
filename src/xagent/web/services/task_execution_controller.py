@@ -223,6 +223,8 @@ def apply_task_control_transition(
         }
         if status is not None:
             values[Task.status] = status
+        if new_run or (status is not None and status != TaskStatus.COMPLETED):
+            values[Task.completion_outcome] = None
         if current_run_id != getattr(task, "run_id", None):
             values[Task.run_id] = current_run_id
 
@@ -299,6 +301,8 @@ def apply_task_control_transition(
         setattr(task, "run_id", current_run_id)
     if status is not None:
         setattr(task, "status", status)
+    if new_run or (status is not None and status != TaskStatus.COMPLETED):
+        setattr(task, "completion_outcome", None)
     setattr(task, "control_state", control_state.value)
     setattr(task, "state_version", int(getattr(task, "state_version", 0) or 0) + 1)
     return task_control_snapshot(task)

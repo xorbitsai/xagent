@@ -235,6 +235,7 @@ def begin_task_execution_no_commit(
     control_state = TaskControlState.RUNNING.value
     values = {
         "status": task_status_predicate.value(TaskStatus.RUNNING),
+        "completion_outcome": None,
         "control_state": control_state,
         "state_version": lease_state_version_case(
             TaskStatus.RUNNING, control_state, func.coalesce(Task.state_version, 0)

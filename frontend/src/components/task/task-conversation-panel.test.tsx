@@ -276,6 +276,15 @@ describe("TaskConversationPanel", () => {
     appState.filePreview = { isOpen: false, fileId: "", fileName: "", viewMode: "preview" }
   })
 
+  it.each(["completed", "partial", "blocked"])("shows the current settled outcome %s, including on history load", (completionOutcome) => {
+    appState.currentTask = { id: "42", status: "completed", completionOutcome }
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.getByText(`taskCompletion.${completionOutcome}`)).toBeInTheDocument()
+    appState.currentTask = { ...appState.currentTask, status: "running" }
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByText(`taskCompletion.${completionOutcome}`)).not.toBeInTheDocument()
+  })
+
   it("marks user turns with the task's Local browser context", () => {
     appState.messages = [{
       id: "user-1",

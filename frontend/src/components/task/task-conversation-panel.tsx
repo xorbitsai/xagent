@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { FolderOpen, Loader2 } from "lucide-react"
+import { CheckCircle2, AlertCircle, FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
@@ -827,6 +827,15 @@ export function TaskConversationPanel({
                     />
                   )}
                 </>
+              )}
+              {state.currentTask?.id === String(state.taskId)
+                && state.currentTask.status === "completed"
+                && !state.isProcessing
+                && state.currentTask.completionOutcome && (
+                <div role="status" className={cn("flex items-center gap-2 text-sm", state.currentTask.completionOutcome === "completed" ? "text-muted-foreground" : "text-amber-600 dark:text-amber-400")}>
+                  {state.currentTask.completionOutcome === "completed" ? <CheckCircle2 className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                  {t(`taskCompletion.${state.currentTask.completionOutcome}`)}
+                </div>
               )}
               <div ref={messagesEndRef} />
             </div>

@@ -210,6 +210,7 @@ function StateProbe() {
       </div>
       <div data-testid="last-task-update">{state.lastTaskUpdate}</div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
+      <div data-testid="task-outcome">{state.currentTask?.completionOutcome || ""}</div>
       <div data-testid="waiting-request-id">{state.currentTask?.waitingRequestId || ""}</div>
       <div data-testid="waiting-interactions">{JSON.stringify(state.currentTask?.waitingInteractions || [])}</div>
       <div data-testid="task-dag-terminated-at">{state.currentTask?.dagTerminatedAt ?? ""}</div>
@@ -1859,6 +1860,24 @@ describe("AppProvider websocket message routing", () => {
       await delivery
     })
     expect(screen.getByTestId("task-status").textContent).toBe("completed")
+  })
+
+  it.each(["completed", "partial", "blocked"])("preserves %s through live, history, and snapshot paths and clears it for a new run", (outcome) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: TestWebSocketMessage) => act(() => webSocketOptions.current?.onMessage?.(message))
+    send({ type: "task_completed", task_id: 1, timestamp: "2026-05-27T05:00:02Z", data: {
+      task: { id: 1, status: "completed" }, success: true, completion_outcome: outcome,
+    } })
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent(outcome)
+    expect(screen.getByTestId("task-status")).toHaveTextContent("completed")
+    send(taskInfoMessage(1, { status: "running" }))
+    expect(screen.getByTestId("task-outcome").textContent).toBe("")
+    send(taskInfoMessage(1, { status: "completed", completion_outcome: outcome }))
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent(outcome)
+    send({ type: "task_stream_snapshot", task_id: 1, timestamp: "2026-05-27T05:00:03Z", run_id: "run-2", state_version: 4, status: "completed", control_state: "completed", data: { completion_outcome: "completed" } } as TestWebSocketMessage)
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent("completed")
+    send({ type: "task_completed", task_id: 1, timestamp: "2026-05-27T05:00:02Z", run_id: "run-1", state_version: 2, status: "completed", control_state: "completed", data: { success: true, completion_outcome: "blocked" } } as TestWebSocketMessage)
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent("completed")
   })
 
   it("clears a stale dagTerminatedAt once a rerun's task_info reports running again", async () => {

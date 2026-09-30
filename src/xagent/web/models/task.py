@@ -515,6 +515,10 @@ class Task(Base):  # type: ignore
     llm_calls = Column(Integer, default=0)
     token_usage_details = Column(JSON, nullable=True)  # Detailed breakdown
 
+    # Semantic result, separate from control status. NULL means unreported
+    # (including legacy rows), not proof that the user's goal was completed.
+    completion_outcome = Column(String(20), nullable=True)
+
     # ----- SDK surface fields (read/written by /v1/* endpoints) -----
     # The four columns below are populated by SDK-driven task lifecycles
     # (see web/api/v1/tasks.py). Legacy task creation paths

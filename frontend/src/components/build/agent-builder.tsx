@@ -1910,6 +1910,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     && state.taskId === previewCompletionTaskId
     && state.currentTask?.id === String(previewCompletionTaskId)
     && state.currentTask?.status === "completed"
+    && state.currentTask.completionOutcome !== "partial"
+    && state.currentTask.completionOutcome !== "blocked"
     && !state.isProcessing
   const shouldHighlightConfigStep = !configStepCompleted
   const shouldHighlightKbSection = useTemplateSpecificHighlights ? templateMissingKb : shouldHighlightConfigStep

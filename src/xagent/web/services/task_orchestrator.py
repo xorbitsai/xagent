@@ -1204,6 +1204,7 @@ def _accept_turn_no_commit(
             Task.status: TaskStatus.RUNNING,
             Task.input: payload.transcript_message,
             Task.output: None,
+            Task.completion_outcome: None,
             Task.error_message: None,
             Task.run_id: run_id,
             Task.last_checkpoint_event_id: None,

@@ -1,6 +1,10 @@
 import { normalizeTaskStatus } from "./task-status"
 
 export type TaskTerminalStatus = "completed" | "failed"
+export type TaskCompletionOutcome = "completed" | "partial" | "blocked"
+
+export const normalizeCompletionOutcome = (value: unknown): TaskCompletionOutcome | undefined =>
+  value === "completed" || value === "partial" || value === "blocked" ? value : undefined
 
 type TaskCompletedRecord = {
   data?: unknown
@@ -15,6 +19,7 @@ type TaskCompletedRecord = {
   file_outputs?: unknown
   chat_response?: unknown
   metadata?: unknown
+  completion_outcome?: unknown
   error_code?: unknown
   error_details?: unknown
 }
@@ -28,6 +33,7 @@ export type NormalizedTaskCompletion = {
   fileOutputs: Array<string | Record<string, unknown>>
   chatResponse?: unknown
   metadata?: unknown
+  completionOutcome?: TaskCompletionOutcome
   errorCode?: string
   errorDetails?: Record<string, unknown>
 }
@@ -71,6 +77,7 @@ export const normalizeTaskCompletedMessage = (
     fileOutputs,
     chatResponse: payload.chat_response,
     metadata: payload.metadata,
+    completionOutcome: status === "completed" ? normalizeCompletionOutcome(payload.completion_outcome) : undefined,
     errorCode: typeof payload.error_code === "string" ? payload.error_code : undefined,
     errorDetails:
       payload.error_details &&

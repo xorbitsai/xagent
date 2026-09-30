@@ -497,7 +497,7 @@ def _element_text(element: dict[str, Any]) -> str:
 
 def _text_tokens(value: str) -> Counter[str]:
     """Return order-independent visible-text tokens for import validation."""
-    return Counter(re.findall(r"\w+|[^\w\s]", value.casefold(), re.UNICODE))
+    return Counter(re.findall(r"\w+", value.casefold(), re.UNICODE))
 
 
 def _contains_text_tokens(expected: str, actual: str) -> bool:
@@ -508,7 +508,10 @@ def _contains_text_tokens(expected: str, actual: str) -> bool:
     text without rejecting an otherwise correct conversion solely because a
     title and body shape were returned in a different order.
     """
-    return not (_text_tokens(expected) - _text_tokens(actual))
+    expected_tokens = _text_tokens(expected)
+    if not expected_tokens:
+        return expected.casefold() in actual.casefold()
+    return not (expected_tokens - _text_tokens(actual))
 
 
 def _slide_summary(slide: dict[str, Any], index: int) -> dict[str, Any]:

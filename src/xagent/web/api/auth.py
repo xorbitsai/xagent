@@ -393,47 +393,34 @@ def _merged_oauth_scopes(
     return scopes, scope_str
 
 
-# Microsoft Graph delegated permissions that Microsoft's own permissions
-# reference classifies as requiring tenant admin consent (checked against
-# the Graph docs at the time these builtin scopes were added). Deliberately
-# a hand-maintained allowlist, not "any Microsoft scope": Entra ID's
-# access_denied/error_subcode=cancel shape is the SAME generic signal for a
-# user simply declining/cancelling an ordinary, self-consentable request
-# (e.g. the bare login's own default_scopes=["User.Read"], or Outlook's
-# Mail.Read/Mail.Send/Calendars.ReadWrite/Contacts.Read, none of which need
-# an admin) as it is for a genuine admin-required block -- Microsoft does
-# not distinguish the two in this redirect. Gating on this allowlist rather
-# than the generic cancellation shape keeps the admin-consent page from
-# firing (and asking an admin to grant broader org-wide access) every time
-# an ordinary user just changes their mind on an unrelated Microsoft login.
-# Keep this in sync with builtin_mcp_registry.py's Microsoft app scopes --
-# test_microsoft_admin_consent_scopes_matches_known_classification enforces
-# that every scope any builtin Microsoft app currently requests is
-# consciously classified one way or the other here, so a newly added scope
-# fails loudly instead of silently falling through to the generic error
-# page the day someone adds it.
-_MICROSOFT_ADMIN_CONSENT_SCOPES = frozenset(
-    {
-        "TeamMember.Read.All",
-        "ChannelMessage.Read.All",
-    }
-)
-
-# A bare ``access_denied``/``error_subcode=cancel`` redirect is ambiguous:
-# Microsoft also uses it when a user simply backs out of an ordinary consent
-# prompt. Only these provider error codes explicitly identify an admin/policy
-# block, so do not mint a tenant-wide handoff for a generic cancellation.
-_MICROSOFT_ADMIN_CONSENT_ERROR_CODES = frozenset(
-    {"AADSTS90093", "AADSTS90094", "AADSTS900941"}
-)
+# Entra ID reports "access_denied" + error_subcode=cancel for ANY abandoned
+# sign-in/consent step: a user backing out of an ordinary prompt, and a
+# non-admin stopped by the "Need admin approval" screen, look identical in
+# those two parameters. Neither the requested scopes nor the subcode can say
+# which one happened, so the admin-consent handoff is keyed on the one thing
+# that can: a provider error code in error_description that Microsoft's own
+# error reference defines as an admin-consent block.
+#   AADSTS90094  AdminConsentRequired
+#   AADSTS90095  AdminConsentRequiredRequestAccess (admin consent workflow)
+# https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes
+# Deliberately NOT included: AADSTS65004 (UserDeclinedConsent, an ordinary
+# decline), AADSTS65001 (DelegationDoesNotExist, a user can still consent),
+# AADSTS90093 (GraphUserUnauthorized, not a consent error).
+#
+# Known limit: the SG prod redirects captured on 2026-09-17 for this exact
+# scenario carried only error/error_subcode/state and NO error_description,
+# so for that redirect shape this gate never opens and the user gets the
+# generic error page. Do not widen the gate to make that case fire -- the
+# signal simply is not in the redirect.
+_MICROSOFT_ADMIN_CONSENT_ERROR_CODES = frozenset({"AADSTS90094", "AADSTS90095"})
 
 
 def _microsoft_admin_consent_error(error_description: str | None) -> bool:
     """Return whether Microsoft's callback explicitly reports admin blocking."""
     if not error_description:
         return False
-    match = re.search(r"\b(AADSTS\d+)\b", error_description.upper())
-    return bool(match and match.group(1) in _MICROSOFT_ADMIN_CONSENT_ERROR_CODES)
+    codes = re.findall(r"\bAADSTS\d+\b", error_description.upper())
+    return any(code in _MICROSOFT_ADMIN_CONSENT_ERROR_CODES for code in codes)
 
 
 # How long a minted admin-consent handoff link stays valid. Deliberately
@@ -445,34 +432,27 @@ _MICROSOFT_ADMIN_CONSENT_STATE_LIFETIME = timedelta(hours=24)
 
 
 def _build_microsoft_admin_consent_url(
-    db: Session,
     db_provider: Any,
     app_id: str | None,
-    *,
-    app_info: Dict[str, Any] | None = None,
+    app_info: Dict[str, Any] | None,
 ) -> str | None:
     """Build a tenant-wide admin consent link for the Microsoft provider.
 
-    Several Microsoft Graph scopes used by builtin apps (e.g. teams'
-    TeamMember.Read.All) are classified by Entra ID as requiring org admin
-    approval -- a non-admin user hitting the ordinary authorize endpoint is
-    blocked outright (redirected back with error=access_denied&
-    error_subcode=cancel) with no way to consent themselves. The v2.0
-    /adminconsent endpoint is the documented way to let a tenant admin grant
-    that approval once for the whole org, after which ordinary users can
-    complete the normal login flow. `organizations` (not `common`) is used
-    as the tenant segment: consumer Microsoft accounts have no concept of
-    admin consent, and this link is only ever useful for a work/school
-    tenant. Returns None when the provider isn't configured yet, or when
-    none of the actually-requested scopes are in
-    _MICROSOFT_ADMIN_CONSENT_SCOPES, so the caller falls back to the plain
-    error page instead of wrongly asking an admin to approve a request that
-    was never blocked on their approval in the first place.
+    Only called once Microsoft has explicitly reported an admin-consent block
+    (see _MICROSOFT_ADMIN_CONSENT_ERROR_CODES). The v2.0 /adminconsent
+    endpoint is the documented way to let a tenant admin grant that approval
+    once for the whole org, after which ordinary users can complete the
+    normal login flow. `organizations` (not `common`) is used as the tenant
+    segment: consumer Microsoft accounts have no concept of admin consent,
+    and this link is only ever useful for a work/school tenant. The scope
+    list is the same provider-default + connector merge the normal login
+    requests, so the admin approves exactly what users will ask for.
 
-    `app_info` lets a caller that already looked up the catalog row (e.g.
-    to apply the hidden-app gate before calling this) pass it straight
-    through instead of this function re-querying get_app_by_id for the
-    same app_id a second time on the same request.
+    `app_info` is the catalog row the caller already looked up for `app_id`
+    (None for a bare login or an app_id with no catalog row). Returns None
+    when the provider has no client_id configured, so the caller falls back
+    to the plain error page instead of linking to a request Microsoft would
+    reject.
     """
     from urllib.parse import urlencode
 
@@ -481,17 +461,12 @@ def _build_microsoft_admin_consent_url(
         return None
 
     app_scopes: list[str] | None = None
-    if app_id:
-        if app_info is None:
-            app_info = get_app_by_id(db, app_id)
-        if app_info and "oauth_scopes" in app_info:
-            app_scopes = app_info["oauth_scopes"]
+    if app_info and "oauth_scopes" in app_info:
+        app_scopes = app_info["oauth_scopes"]
 
-    scopes, scope_str = _merged_oauth_scopes(
+    _, scope_str = _merged_oauth_scopes(
         db_provider.default_scopes, app_scopes, "microsoft"
     )
-    if _MICROSOFT_ADMIN_CONSENT_SCOPES.isdisjoint(scopes):
-        return None
     redirect_uri = _resolve_oauth_redirect_uri("microsoft", db_provider)
     state = create_access_token(
         {"type": "admin_consent_state", "app_id": app_id},
@@ -3427,7 +3402,7 @@ def generic_oauth_callback(
                             status_code=404,
                         )
             admin_consent_url = _build_microsoft_admin_consent_url(
-                db, db_provider, consent_app_id, app_info=consent_app_info
+                db_provider, consent_app_id, consent_app_info
             )
             if admin_consent_url:
                 return _microsoft_admin_consent_required_response(admin_consent_url)

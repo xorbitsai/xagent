@@ -16,21 +16,20 @@ from sqlalchemy.orm import sessionmaker
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import (
-    _MICROSOFT_ADMIN_CONSENT_SCOPES,
     create_access_token,
     generic_oauth_callback,
     verify_token,
 )
-from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 
-# Entra ID blocks a non-admin user outright when the requested delegated
-# scopes include any that are classified as requiring org admin approval --
-# the Teams connector requests TeamMember.Read.All and ChannelMessage.Read.All,
-# among other scopes. The user never sees a consent screen at all; the redirect
-# back to us carries error=access_denied&error_subcode=cancel with no `code`.
+# The handoff link is only minted when Microsoft's own error_description
+# carries an admin-consent error code (AADSTS90094 / AADSTS90095). A bare
+# error=access_denied&error_subcode=cancel is Entra ID's generic "abandoned
+# the flow" redirect -- a user backing out of an ordinary prompt looks the
+# same -- so it must keep the generic error page. The redirects captured
+# from the SG prod incident on 2026-09-17 had exactly that bare shape.
 ADMIN_CONSENT_LINK_RE = re.compile(r'href="([^"]+)"')
 
 
@@ -264,18 +263,19 @@ def test_other_providers_are_not_affected(db_session):
     assert "Error: access_denied" in response.body.decode()
 
 
-def test_bare_microsoft_cancellation_keeps_the_generic_page(db_session):
-    """error=access_denied&error_subcode=cancel is Entra ID's generic signal
-    for a cancelled sign-in/consent step -- it fires just as much for a user
-    simply declining an ordinary, self-consentable request as it does for a
-    genuine admin-required block, and Microsoft does not distinguish the two
-    in this redirect. A bare login (no app_id) only ever requests the
-    provider's own default_scopes (User.Read), which is not in
-    _MICROSOFT_ADMIN_CONSENT_SCOPES, so this must not be misread as
-    "needs an admin" and must not hand an admin a request to grant broader,
-    unrelated org-wide access nobody asked for."""
-    db, user = db_session
-    state = create_access_token(
+def _cancel_request(state, error_description=None, error_subcode="cancel"):
+    params = {
+        "error": "access_denied",
+        "error_subcode": error_subcode,
+        "state": state,
+    }
+    if error_description is not None:
+        params["error_description"] = error_description
+    return SimpleNamespace(query_params=params)
+
+
+def _bare_login_state(user):
+    return create_access_token(
         data={
             "type": "oauth_state",
             "user_id": user.id,
@@ -285,44 +285,116 @@ def test_bare_microsoft_cancellation_keeps_the_generic_page(db_session):
         },
         expires_delta=timedelta(minutes=10),
     )
-    request = SimpleNamespace(
-        query_params={
-            "error": "access_denied",
-            "error_subcode": "cancel",
-            "state": state,
-        }
-    )
 
-    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
 
+def _assert_generic_error_page(response):
     assert response.status_code == 400
     body = response.body.decode()
     assert "Error: access_denied" in body
     assert "adminconsent" not in body
 
 
-def test_connector_cancellation_without_admin_error_keeps_generic_page(db_session):
-    """The cancel subcode alone must not be treated as an admin block."""
+def test_incident_shaped_redirect_without_error_description_keeps_generic_page(
+    db_session,
+):
+    """The SG prod redirects for a Teams connect (2026-09-17) carried only
+    error=access_denied, error_subcode=cancel and state -- no
+    error_description. Nothing in that shape says admin approval is the
+    reason, so it must not produce a tenant-wide handoff link, even for a
+    connector (Teams) whose scopes genuinely need an admin."""
     db, user = db_session
-    request = SimpleNamespace(
-        query_params={
-            "error": "access_denied",
-            "error_subcode": "cancel",
-            "error_description": "AADSTS65004: User declined to consent to the app.",
-            "state": _oauth_state(user),
-        }
+
+    response = generic_oauth_callback(
+        "microsoft", _cancel_request(_oauth_state(user)), db, _microsoft_provider()
     )
 
-    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
+    _assert_generic_error_page(response)
+
+
+def test_bare_login_cancellation_keeps_the_generic_page(db_session):
+    db, user = db_session
+
+    response = generic_oauth_callback(
+        "microsoft", _cancel_request(_bare_login_state(user)), db, _microsoft_provider()
+    )
+
+    _assert_generic_error_page(response)
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "AADSTS65004: User declined to consent to access the app.",
+        "AADSTS90093: Graph returned with a forbidden error code.",
+        "AADSTS900941: Not an admin-consent error.",
+        "AADSTS65001: The user or administrator has not consented.",
+        "Something went wrong and there is no error code at all.",
+    ],
+)
+def test_non_admin_error_descriptions_keep_the_generic_page(db_session, description):
+    """Only codes Microsoft's error reference defines as admin-consent blocks
+    open the gate; an ordinary decline (65004) or any other code does not."""
+    db, user = db_session
+
+    response = generic_oauth_callback(
+        "microsoft",
+        _cancel_request(_oauth_state(user), error_description=description),
+        db,
+        _microsoft_provider(),
+    )
+
+    _assert_generic_error_page(response)
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "AADSTS90094: Administrator consent is required.",
+        "AADSTS90095: Admin consent workflow: ask your admin for access.",
+        "aadsts90094: lowercase still identifies the code",
+        "Trace ID: 1234\r\nAADSTS90094: buried after other text",
+    ],
+)
+def test_each_admin_consent_code_produces_the_handoff_link(db_session, description):
+    db, user = db_session
+
+    response = generic_oauth_callback(
+        "microsoft",
+        _cancel_request(_oauth_state(user), error_description=description),
+        db,
+        _microsoft_provider(),
+    )
 
     assert response.status_code == 400
     body = response.body.decode()
-    assert "Error: access_denied" in body
-    assert "adminconsent" not in body
+    assert "Admin approval required" in body
+    assert "/organizations/v2.0/adminconsent" in _extract_admin_consent_url(body)
 
 
-def test_sharepoint_delegated_scope_does_not_trigger_admin_handoff(db_session):
-    """Sites.ReadWrite.All is user-consentable when delegated."""
+@pytest.mark.parametrize("subcode", ["Cancel", "CANCEL"])
+def test_error_subcode_matching_is_case_insensitive(db_session, subcode):
+    db, user = db_session
+
+    response = generic_oauth_callback(
+        "microsoft",
+        _cancel_request(
+            _oauth_state(user),
+            error_description="AADSTS90094: Administrator consent is required.",
+            error_subcode=subcode,
+        ),
+        db,
+        _microsoft_provider(),
+    )
+
+    assert "Admin approval required" in response.body.decode()
+
+
+def test_explicit_admin_code_needs_no_scope_allowlist(db_session):
+    """An explicit admin-consent code from Microsoft is authoritative on its
+    own. A connector whose scopes are individually user-consentable
+    (SharePoint's Sites.ReadWrite.All) still gets the link when the tenant
+    itself blocks user consent, and the link asks for the connector's real
+    scope set."""
     db, user = db_session
     db.add(
         PublicMCPApp(
@@ -340,21 +412,36 @@ def test_sharepoint_delegated_scope_does_not_trigger_admin_handoff(db_session):
     )
     db.commit()
 
-    request = SimpleNamespace(
-        query_params={
-            "error": "access_denied",
-            "error_subcode": "cancel",
-            "error_description": "AADSTS90094: Admin approval is required.",
-            "state": _oauth_state(user, app_id="sharepoint"),
-        }
+    response = generic_oauth_callback(
+        "microsoft",
+        _cancel_request(
+            _oauth_state(user, app_id="sharepoint"),
+            error_description="AADSTS90094: Administrator consent is required.",
+        ),
+        db,
+        _microsoft_provider(),
     )
 
-    response = generic_oauth_callback("microsoft", request, db, _microsoft_provider())
-
     assert response.status_code == 400
-    body = response.body.decode()
-    assert "Error: access_denied" in body
-    assert "adminconsent" not in body
+    url = _extract_admin_consent_url(response.body.decode())
+    assert parse_qs(urlparse(url).query)["scope"] == ["User.Read Sites.ReadWrite.All"]
+
+
+def test_explicit_admin_code_on_bare_login_uses_provider_default_scopes(db_session):
+    db, user = db_session
+
+    response = generic_oauth_callback(
+        "microsoft",
+        _cancel_request(
+            _bare_login_state(user),
+            error_description="AADSTS90094: Administrator consent is required.",
+        ),
+        db,
+        _microsoft_provider(),
+    )
+
+    url = _extract_admin_consent_url(response.body.decode())
+    assert parse_qs(urlparse(url).query)["scope"] == ["User.Read"]
 
 
 def test_hidden_connector_blocks_the_admin_consent_link(db_session):
@@ -519,59 +606,3 @@ def test_admin_consent_state_lifetime_suits_asynchronous_admin_approval(db_sessi
     payload = verify_token(state_token)
     minted_lifetime = payload["exp"] - int(time.time())
     assert minted_lifetime > timedelta(hours=1).total_seconds()
-
-
-# Every scope any builtin Microsoft app currently requests, explicitly
-# classified as admin-required or not (per Microsoft's Graph permissions
-# reference at the time each was added). This is deliberately NOT derived
-# from _MICROSOFT_ADMIN_CONSENT_SCOPES itself -- the point of
-# test_microsoft_admin_consent_scopes_matches_known_classification below is
-# to catch the two lists drifting apart, which a self-referential check
-# could never do.
-_KNOWN_MICROSOFT_SCOPE_CLASSIFICATION = {
-    "User.Read": False,
-    "Team.ReadBasic.All": False,
-    "Channel.ReadBasic.All": False,
-    "TeamMember.Read.All": True,
-    "ChannelMessage.Read.All": True,
-    "ChannelMessage.Send": False,
-    "Chat.ReadWrite": False,
-    "Mail.Read": False,
-    "Mail.Send": False,
-    "Calendars.ReadWrite": False,
-    "Contacts.Read": False,
-    "Files.ReadWrite": False,
-    "Files.ReadWrite.All": False,
-    "Tasks.ReadWrite": False,
-    "offline_access": False,
-    "Sites.ReadWrite.All": False,
-}
-
-
-def test_microsoft_admin_consent_scopes_matches_known_classification():
-    """Guards against _MICROSOFT_ADMIN_CONSENT_SCOPES silently going stale.
-
-    Without this, a new builtin Microsoft app/scope could ship without
-    anyone deciding whether it needs admin consent, and a genuine
-    admin-required cancellation for it would silently fall through to the
-    generic error page -- regressing to the exact bug this feature exists
-    to fix, with nothing failing to say so."""
-    microsoft_scopes: set[str] = set()
-    for row in get_builtin_public_mcp_app_rows():
-        if row.get("provider_name") == "microsoft":
-            microsoft_scopes.update(row.get("oauth_scopes") or [])
-
-    unclassified = microsoft_scopes - set(_KNOWN_MICROSOFT_SCOPE_CLASSIFICATION)
-    assert not unclassified, (
-        f"new Microsoft scope(s) {unclassified} need a classification added "
-        "to _KNOWN_MICROSOFT_SCOPE_CLASSIFICATION (and, if admin-required, "
-        "to _MICROSOFT_ADMIN_CONSENT_SCOPES) after checking Microsoft's "
-        "Graph permissions reference"
-    )
-
-    for scope, requires_admin in _KNOWN_MICROSOFT_SCOPE_CLASSIFICATION.items():
-        if scope not in microsoft_scopes:
-            continue
-        assert (scope in _MICROSOFT_ADMIN_CONSENT_SCOPES) == requires_admin, (
-            f"{scope!r} classification drifted from _MICROSOFT_ADMIN_CONSENT_SCOPES"
-        )

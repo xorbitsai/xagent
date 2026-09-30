@@ -3535,7 +3535,12 @@ export function AppProvider({
             const shouldHideAgentMessage =
               isAgentMessage &&
               eventData.visible === false
-            if (expectsUserResponse) {
+            // Replayed questions belong in the transcript, but must not undo
+            // the settled status/outcome already restored by task_info.
+            if (expectsUserResponse && !(
+              isHistoricalDataLoadingRef.current &&
+              isTerminalTaskStatus(currentState.currentTask?.status)
+            )) {
               dispatch({
                 type: "UPDATE_TASK_STATUS",
                 payload: {

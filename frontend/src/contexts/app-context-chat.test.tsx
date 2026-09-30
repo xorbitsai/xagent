@@ -1880,6 +1880,42 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("task-outcome")).toHaveTextContent("completed")
   })
 
+  it.each([
+    ["partial", "ai_message"],
+    ["blocked", "ai_message"],
+    ["partial", "task_completion"],
+    ["blocked", "task_completion"],
+  ])("keeps %s during historical questions followed by %s", (outcome, finalEvent) => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (message: TestWebSocketMessage) => act(() => webSocketOptions.current?.onMessage?.(message))
+    act(() => webSocketOptions.current?.onConnect?.())
+    send(taskInfoMessage(1, { status: "completed", completion_outcome: outcome }))
+    const question = (requestId: string): TestWebSocketMessage => ({
+      type: "trace_event", task_id: 1, timestamp: "2026-05-27T05:00:01Z",
+      data: { event_type: "agent_message", event_id: requestId, data: {
+        message: "Which file?", expect_response: true, request_id: requestId, role: "assistant",
+      } },
+    })
+    send(question("historical-question"))
+    expect(screen.getByTestId("messages").textContent).toContain("Which file?")
+    expect(screen.getByTestId("task-status")).toHaveTextContent("completed")
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent(outcome)
+    send({ type: "trace_event", task_id: 1, timestamp: "2026-05-27T05:00:02Z", data: {
+      event_type: finalEvent, data: finalEvent === "ai_message"
+        ? { message: "Delivered answer", status: "completed" }
+        : { result: { content: "Delivered answer" }, success: true },
+    } })
+    send({ type: "historical_data_complete", task_id: 1, timestamp: "2026-05-27T05:00:03Z" })
+    expect(screen.getByTestId("task-status")).toHaveTextContent("completed")
+    expect(screen.getByTestId("task-outcome")).toHaveTextContent(outcome)
+
+    // A live question must still clear the old outcome and request a response.
+    send(question("live-question"))
+    expect(screen.getByTestId("task-status")).toHaveTextContent("waiting_for_user")
+    expect(screen.getByTestId("task-outcome").textContent).toBe("")
+    expect(screen.getByTestId("waiting-request-id")).toHaveTextContent("live-question")
+  })
+
   it("clears a stale dagTerminatedAt once a rerun's task_info reports running again", async () => {
     render(
       <AppProvider token="token">

@@ -2302,6 +2302,16 @@ def test_import_pptx_rejects_path_outside_allowlist(monkeypatch, tmp_path):
     assert "outside the allowed directories" in result["message"]
 
 
+def test_resolve_pptx_upload_path_rejects_oversized_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(google_slides, "allowed_dirs_from_env", lambda _: [tmp_path])
+    oversized = tmp_path / "oversized.pptx"
+    with oversized.open("wb") as file_handle:
+        file_handle.truncate(google_slides._MAX_PPTX_UPLOAD_BYTES + 1)
+
+    with pytest.raises(ValueError, match="100 MB"):
+        google_slides._resolve_pptx_upload_path(str(oversized))
+
+
 def test_resolve_pptx_upload_path_surfaces_symlink_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(google_slides, "allowed_dirs_from_env", lambda _: [tmp_path])
     loop_path = tmp_path / "loop.pptx"

@@ -35,6 +35,9 @@ _PPTX_MIME_TYPE = (
 )
 _GOOGLE_SLIDES_MIME_TYPE = "application/vnd.google-apps.presentation"
 _PPTX_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
+# Google Drive's PPTX-to-Slides conversion rejects files over 100 MB.  Check
+# the local file before parsing it with python-pptx or starting an upload.
+_MAX_PPTX_UPLOAD_BYTES = 100_000_000
 
 # Keep track of default pages created by this MCP process.  A presentation can
 # legitimately contain an intentional blank page, so add_slide must not infer
@@ -404,8 +407,11 @@ def _resolve_pptx_upload_path(file_path: str) -> Path:
 
     if local_path.suffix.lower() != ".pptx":
         raise ValueError("file_path must point to a .pptx file")
-    if local_path.stat().st_size == 0:
+    file_size = local_path.stat().st_size
+    if file_size == 0:
         raise ValueError("PPTX file is empty")
+    if file_size > _MAX_PPTX_UPLOAD_BYTES:
+        raise ValueError("PPTX file exceeds the 100 MB Google Slides conversion limit")
     return local_path
 
 

@@ -17,6 +17,7 @@ from ..models.database import get_db
 from ..models.oauth_provider import OAuthProvider
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..services.google_picker import get_google_picker_config
 from ..services.user_oauth import (
     get_scoped_user_oauth_account,
     scoped_user_oauth_query,
@@ -213,29 +214,16 @@ async def get_google_drive_picker_config(
     # Fail closed before touching account credentials. An unconfigured
     # deployment should consistently report 503 rather than leaking account
     # state through a 401/409 response.
-    client_id, _ = get_google_oauth_config(db)
-    client_id = client_id or os.environ.get("GOOGLE_CLIENT_ID")
-
-    # Picker keys are browser-facing and must be a dedicated, referrer-
-    # restricted key.  GOOGLE_API_KEY is also used for server-side Gemini and
-    # Custom Search calls, so returning it here would expose a billable
-    # operator credential to every authenticated Drive user.
-    developer_key = os.environ.get("GOOGLE_PICKER_API_KEY", "").strip()
-    picker_app_id = os.environ.get("GOOGLE_PICKER_APP_ID", "").strip()
-    if not picker_app_id and client_id:
-        # Google OAuth client IDs start with the numeric Cloud project number.
-        # Keep this as a fallback for existing deployments; an explicit
-        # GOOGLE_PICKER_APP_ID remains preferred because it is unambiguous.
-        candidate = client_id.split("-", 1)[0]
-        if candidate.isdigit():
-            picker_app_id = candidate
-
-    if not developer_key or not picker_app_id:
+    oauth_client_id, _ = get_google_oauth_config(db)
+    picker_config = get_google_picker_config(db, oauth_client_id=oauth_client_id)
+    if picker_config is None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Google Drive Picker is not configured. Set "
-                "GOOGLE_PICKER_API_KEY and GOOGLE_PICKER_APP_ID."
+                "Google Drive Picker is not configured. Set the dedicated, "
+                "referrer-restricted GOOGLE_PICKER_API_KEY and either "
+                "GOOGLE_PICKER_APP_ID or a numeric Google OAuth client_id. "
+                "The access token and Picker key are sent to the browser."
             ),
         )
 
@@ -255,9 +243,19 @@ async def get_google_drive_picker_config(
 
     return {
         "access_token": str(creds.token),
-        "developer_key": developer_key,
-        "app_id": picker_app_id,
+        "developer_key": picker_config.developer_key,
+        "app_id": picker_config.app_id,
     }
+
+
+@cloud_router.get("/google-drive/picker-availability")
+async def get_google_drive_picker_availability(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, bool]:
+    """Expose Picker configuration readiness without touching OAuth tokens."""
+    del user
+    return {"configured": get_google_picker_config(db) is not None}
 
 
 @cloud_router.delete("/accounts/{account_id}")

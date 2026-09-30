@@ -31,7 +31,7 @@ interface GooglePickerBuilder {
 }
 
 interface GooglePickerNamespace {
-  Action: { PICKED: string }
+  Action: { PICKED: string; CANCEL: string }
   Feature: { MULTISELECT_ENABLED: string }
   ViewId: { DOCS: string }
   DocsView: new (viewId: string) => GooglePickerView

@@ -3115,6 +3115,7 @@ class CloudFile(BaseModel):
     provider: str
     fileId: str = Field(pattern=r"^[^\r\n]*$")
     fileName: str
+    accountId: Optional[int] = Field(default=None, gt=0)
     resourceKey: Optional[str] = Field(default=None, pattern=r"^[^\r\n]*$")
 
 
@@ -4403,7 +4404,10 @@ async def ingest_cloud(
                     )
                 try:
                     creds = await asyncio.to_thread(
-                        get_google_credentials, int(actor_user.id), db
+                        get_google_credentials,
+                        int(actor_user.id),
+                        db,
+                        file_info.accountId,
                     )
                 except HTTPException as e:
                     return KBApiOperationResult(

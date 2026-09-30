@@ -825,6 +825,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           provider,
           fileId: file.id,
           fileName: file.name,
+          accountId: file.accountId,
           resourceKey: file.resourceKey,
         }))
       )

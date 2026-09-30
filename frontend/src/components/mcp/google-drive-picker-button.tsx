@@ -24,7 +24,7 @@ interface GoogleDrivePickerButtonProps {
 }
 
 /**
- * Authorize existing Drive files/folders for the restricted drive.file scope.
+ * Authorize existing Drive files for the restricted drive.file scope.
  * Selecting an item is the authorization event; the connector does not need
  * to retain the Picker result locally.
  */
@@ -105,8 +105,11 @@ export function GoogleDrivePickerButton({
         .addView(docsView)
         .enableFeature(pickerApi.Feature.MULTISELECT_ENABLED)
         .setCallback(data => {
+          if (data.action !== pickerApi.Action.PICKED) {
+            if (data.action === pickerApi.Action.CANCEL) onPickerOpenChange?.(false)
+            return
+          }
           onPickerOpenChange?.(false)
-          if (data.action !== pickerApi.Action.PICKED) return
           const selected = sanitizeGooglePickerDocuments(data.docs)
           if (selected.length > 0) {
             toast.success(t("kb.dialog.cloudConnect.picker.authorized"))

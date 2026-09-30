@@ -11,7 +11,6 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import secrets
 import shlex
 from collections.abc import Collection, Sequence
@@ -70,6 +69,7 @@ from ..models.mcp_oauth import (
 from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..services.google_picker import get_google_picker_config
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
@@ -2947,7 +2947,7 @@ def list_mcp_apps(
                 # not be shown when its browser-facing Picker key is absent.
                 # Otherwise every click predictably ends in a 503.
                 app_copy["picker_configured"] = bool(
-                    os.environ.get("GOOGLE_PICKER_API_KEY", "").strip()
+                    get_google_picker_config(db) is not None
                 )
 
             if is_connected:

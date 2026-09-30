@@ -1539,16 +1539,13 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_new_task", [False, True])
+@pytest.mark.parametrize("outcome", ["partial", "blocked"])
 async def test_successful_telegram_turn_hands_finalize_the_execution_result(
     monkeypatch: pytest.MonkeyPatch,
     is_new_task: bool,
+    outcome: str,
 ) -> None:
-    """The waiting-branch call site forwards its own execute_task() result.
-
-    finalize_result has no reader for execution_result yet, but the channel
-    must already supply the exact object execute_task returned so a future
-    reader gets the full result mapping rather than a synthesized draft.
-    """
+    """New and resumed turns preserve the result for semantic settlement."""
 
     bot = make_bot()
     bot.channel_id = 1
@@ -1576,7 +1573,11 @@ async def test_successful_telegram_turn_hands_finalize_the_execution_result(
             finalized.append(kwargs)
             return True
 
-    execution_result = {"success": True, "output": "Telegram reply"}
+    execution_result = {
+        "success": True,
+        "output": "Telegram reply",
+        "completion_outcome": outcome,
+    }
     connector_turn_ids: list[str | None] = []
     execution_turn_ids: list[str] = []
     persisted_turn_ids: list[str] = []

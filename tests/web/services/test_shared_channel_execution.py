@@ -131,14 +131,20 @@ async def test_stop_cannot_target_replacement_run(selected):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["completed", "waiting_for_user"])
+@pytest.mark.parametrize("storage_version", [1, 2])
+@pytest.mark.parametrize(
+    "status,outcome",
+    [("completed", outcome) for outcome in ("completed", "partial", "blocked", None)]
+    + [("waiting_for_user", "partial")],
+)
 async def test_worker_handoff_and_channel_result_commit_atomically(
-    selected, monkeypatch, status
+    selected, monkeypatch, status, outcome, storage_version
 ):
     import asyncio
     from unittest.mock import AsyncMock, Mock
 
     from tests.web.services.coordinator_command_shared import claim_task_command
+    from xagent.web.models.task_execution_event import TaskExecutionEvent
     from xagent.web.services import (
         agent_service_manager,
         task_command_execution,
@@ -154,6 +160,11 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
     from xagent.web.services import task_coordinator_runtime
 
     monkeypatch.setattr(task_coordinator_runtime, "get_runner_id", lambda: "worker-1")
+    with get_session_local()() as db:
+        db.get(
+            Task, selected.selection.task_id
+        ).conversation_storage_version = storage_version
+        db.commit()
     command_id = shared._accept_channel_turn(
         selected, TaskTurnPayload("hello"), "ingress"
     )
@@ -169,11 +180,15 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         set_execution_context_messages=Mock(),
         set_recovered_skill_context=Mock(),
     )
+    execution_result = {
+        "success": True,
+        "status": status,
+        "output": "Worker answer",
+        "completion_outcome": outcome,
+    }
     manager = SimpleNamespace(
         get_agent_for_task=AsyncMock(return_value=service),
-        execute_task=AsyncMock(
-            return_value={"success": True, "status": status, "output": "Worker answer"}
-        ),
+        execute_task=AsyncMock(return_value=execution_result),
     )
     monkeypatch.setattr(agent_service_manager, "get_agent_manager", lambda: manager)
     bridge = Mock()
@@ -196,7 +211,7 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         await forwarder.handle_event(Mock(to_dict=lambda: {"event": "B"}))
         await forwarder.handle_event(Mock(to_dict=lambda: {"event": "C"}))
         release.set()
-        return {"success": True, "status": status, "output": "Worker answer"}
+        return execution_result
 
     manager.execute_task.side_effect = execute_with_progress
     monkeypatch.setattr(task_event_bridge, "_bridge", bridge)
@@ -244,8 +259,11 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         task = db.get(Task, command.task_id)
         row = db.get(TaskExecutionCommand, command.id)
         assert task.status == TaskStatus(status)
+        expected_outcome = outcome if status == "completed" else None
+        assert task.completion_outcome == expected_outcome
         assert task.lease_attempt_id is None
         assert row.result["channel_result"]["status"] == status
+        assert row.result["channel_result"]["completion_outcome"] == expected_outcome
         messages = (
             db.query(TaskChatMessage).filter_by(task_id=task.id, role="assistant").all()
         )
@@ -253,13 +271,42 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         assert messages[0].content == "Worker answer"
         assert messages[0].turn_id == command.command_id
         assert task.output == ("Worker answer" if status == "completed" else None)
+        if storage_version == 2:
+            fact = (
+                db.query(TaskExecutionEvent)
+                .filter_by(task_id=task.id, kind="execution_settled")
+                .one()
+            )
+            assert fact.payload["result"] == execution_result
     assert (
         shared._read_channel_result(command.id, selected.run_id)["output"]
         == "Worker answer"
     )
+    assert (
+        shared._read_channel_result(command.id, selected.run_id)["completion_outcome"]
+        == expected_outcome
+    )
     tracer.remove_handler.assert_called_once_with(tracer.add_handler.call_args.args[0])
     assert delivered == [{"event": "A"}, {"event": "B"}, {"event": "C"}]
     bridge.discard_command.assert_called_with(command.command_id, command.task_id)
+
+
+@pytest.mark.parametrize("outcome", ["completed", "partial", "blocked", None])
+def test_recovered_channel_result_keeps_persisted_outcome(selected, outcome):
+    command_id = shared._accept_channel_turn(
+        selected, TaskTurnPayload("hello"), "ingress"
+    )
+    with get_session_local()() as db:
+        task = db.get(Task, selected.selection.task_id)
+        task.status = TaskStatus.COMPLETED
+        task.run_id = selected.run_id
+        task.completion_outcome = outcome
+        task.output = "Recovered answer"
+        db.get(TaskExecutionCommand, command_id).status = "completed"
+        db.commit()
+    result = shared._read_channel_result(command_id, selected.run_id)
+    assert result["completion_outcome"] == outcome
+    assert result["output"] == "Recovered answer"
 
 
 def test_completion_waits_for_paused_execution_lease_release(selected):

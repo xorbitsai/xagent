@@ -130,6 +130,7 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .execution_result_projection import completion_outcome_for_status
 from .file_reference_output_service import (
     reconcile_assistant_file_references,
 )
@@ -1682,15 +1683,6 @@ def _task_user_id(task: Any) -> int | None:
     return int(cast(Any, user_id))
 
 
-def _completion_outcome(result: dict[str, Any]) -> str | None:
-    outcome = result.get("completion_outcome")
-    return (
-        outcome
-        if isinstance(outcome, str) and outcome in {"completed", "partial", "blocked"}
-        else None
-    )
-
-
 @dataclass(frozen=True)
 class _TaskExecutionFinalization:
     normalized_outputs: list[dict[str, Any]]
@@ -1931,9 +1923,7 @@ def _finalize_task_execution_result_isolated(
                 setattr(
                     task_updated,
                     "completion_outcome",
-                    _completion_outcome(result)
-                    if final_status == TaskStatus.COMPLETED
-                    else None,
+                    completion_outcome_for_status(result, final_status),
                 )
                 if final_status == TaskStatus.FAILED:
                     diagnostic_error = safe_str(result.get("error")).strip()
@@ -2756,9 +2746,7 @@ def _finalize_resumed_task(
         setattr(
             task,
             "completion_outcome",
-            _completion_outcome(result)
-            if final_task_status == TaskStatus.COMPLETED
-            else None,
+            completion_outcome_for_status(result, final_task_status),
         )
         finalized["completion_outcome"] = task.completion_outcome
 

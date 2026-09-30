@@ -11,6 +11,14 @@ from xagent.web.services import task_execution as execution
 from xagent.web.services import task_lease_service as leases
 from xagent.web.services import task_orchestrator as orchestrator
 from xagent.web.services import task_stream_snapshot as snapshots
+from xagent.web.services.execution_result_projection import (
+    project_execution_result_for_channel,
+)
+from xagent.web.services.managed_task_lease import (
+    claim_managed_task_lease_isolated,
+    finalize_managed_task_lease_result,
+    finalize_managed_task_lease_result_isolated,
+)
 from xagent.web.services.task_command_execution import (
     _load_task_command_routing_snapshot,
 )
@@ -25,7 +33,7 @@ engine = engine_fixture
 task_id = task_id_fixture
 
 
-@pytest.mark.parametrize("route", ["initial", "resume"])
+@pytest.mark.parametrize("route", ["initial", "resume", "channel"])
 @pytest.mark.parametrize("storage_version", [1, 2])
 @pytest.mark.parametrize(
     "result_status,success,final_status,outcome",
@@ -86,7 +94,7 @@ def test_settled_outcome_and_next_run(
             prepared_outputs=empty,
         )
         transported = finalized.broadcast_meta["completion_outcome"]
-    else:
+    elif route == "resume":
         finalized = execution._finalize_resumed_task(
             task_id,
             status=result_status,
@@ -98,6 +106,17 @@ def test_settled_outcome_and_next_run(
             prepared_outputs=empty,
         )
         transported = finalized["completion_outcome"]
+    else:
+        projection = project_execution_result_for_channel(result)
+        with factory() as db:
+            assert finalize_managed_task_lease_result(
+                db,
+                lease,
+                status=projection.task_status,
+                assistant_content=projection.transcript_content,
+                execution_result=result,
+            )
+        transported = projection.completion_outcome
     expected = (
         outcome
         if final_status == TaskStatus.COMPLETED and outcome != "invalid"
@@ -108,7 +127,7 @@ def test_settled_outcome_and_next_run(
         task = db.get(Task, task_id)
         assert task.status == final_status
         assert task.completion_outcome == expected
-        if final_status == TaskStatus.COMPLETED:
+        if final_status == TaskStatus.COMPLETED and route != "channel":
             assert task.output == "Delivered answer"
     assert (
         snapshots.load_task_stream_snapshots([task_id])[0]["completion_outcome"]
@@ -126,9 +145,10 @@ def test_settled_outcome_and_next_run(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["persisted", "channel"])
 @pytest.mark.parametrize("outcome", ["completed", "partial", "blocked", None])
 async def test_history_and_rest_read_same_outcome(
-    engine, task_id, monkeypatch, outcome
+    engine, task_id, monkeypatch, outcome, route
 ):
     from xagent.web.api import chat, websocket
     from xagent.web.models import database
@@ -150,6 +170,18 @@ async def test_history_and_rest_read_same_outcome(
         task.completion_outcome = outcome
         uid = task.user_id
         db.commit()
+        if route == "channel":
+            lease = leases.acquire_task_lease(
+                db, task_id, runner_id="channel-history-test", new_run=True
+            )
+            assert lease is not None
+            assert finalize_managed_task_lease_result(
+                db,
+                lease,
+                status=TaskStatus.COMPLETED,
+                assistant_content="Channel answer",
+                execution_result={"completion_outcome": outcome},
+            )
         owner = db.get(User, uid)
         assert (await chat.get_task(task_id, db, owner))[
             "completion_outcome"
@@ -166,6 +198,61 @@ async def test_history_and_rest_read_same_outcome(
         event for event in history.events if event.get("event_type") == "task_info"
     )
     assert info["data"]["completion_outcome"] == outcome
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_version", [1, 2])
+@pytest.mark.parametrize("first_outcome", ["partial", "blocked"])
+async def test_channel_continuation_updates_outcome_and_rejects_late_result(
+    engine, task_id, monkeypatch, storage_version, first_outcome
+):
+    from xagent.web.models import database
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    factory = sessionmaker(engine)
+    monkeypatch.setattr(database, "get_session_local", lambda: factory)
+    monkeypatch.setattr(snapshots, "get_session_local", lambda: factory)
+    with factory() as db:
+        db.get(Task, task_id).conversation_storage_version = storage_version
+        db.commit()
+
+    for outcome in (first_outcome, "completed"):
+        managed = await claim_managed_task_lease_isolated(task_id)
+        assert managed is not None
+        try:
+            assert (
+                snapshots.load_task_stream_snapshots([task_id])[0]["completion_outcome"]
+                is None
+            )
+            assert await managed.finalize_result(
+                status=TaskStatus.COMPLETED,
+                assistant_content=outcome,
+                execution_result={"success": True, "completion_outcome": outcome},
+            )
+        finally:
+            await managed.close()
+        assert (
+            snapshots.load_task_stream_snapshots([task_id])[0]["completion_outcome"]
+            == outcome
+        )
+        if outcome == first_outcome:
+            first_lease = managed.lease
+
+    # A delayed result from the earlier run cannot replace the new completion.
+    assert not await finalize_managed_task_lease_result_isolated(
+        first_lease,
+        status=TaskStatus.COMPLETED,
+        assistant_content="Late answer",
+        execution_result={"completion_outcome": "blocked"},
+    )
+    with factory() as db:
+        assert db.get(Task, task_id).completion_outcome == "completed"
+        assert [
+            message.content
+            for message in db.query(TaskChatMessage)
+            .filter_by(task_id=task_id, role="assistant")
+            .order_by(TaskChatMessage.id)
+        ] == [first_outcome, "completed"]
 
 
 @pytest.mark.parametrize(

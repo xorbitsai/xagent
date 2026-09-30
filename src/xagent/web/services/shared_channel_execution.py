@@ -530,6 +530,9 @@ def _read_channel_result(command_id: int, run_id: str) -> dict[str, Any] | None:
             "success": task.status == TaskStatus.COMPLETED,
             "status": task.status.value,
             "output": task.output or "",
+            "completion_outcome": task.completion_outcome
+            if task.status == TaskStatus.COMPLETED
+            else None,
         }
 
 
@@ -741,6 +744,7 @@ async def execute_channel_background(
             "success": projection.task_status != TaskStatus.FAILED,
             "status": str(result.get("status") or projection.task_status.value),
             "output": projection.transcript_content,
+            "completion_outcome": projection.completion_outcome,
             "chat_response": {
                 "message": projection.transcript_content,
                 "interactions": projection.interactions,
@@ -758,6 +762,7 @@ async def execute_channel_background(
                     interactions=projection.interactions,
                     message_type=projection.message_type,
                     error_message=projection.diagnostic_error,
+                    execution_result=result,
                     completion=(command.id, durable_result),
                 )
 

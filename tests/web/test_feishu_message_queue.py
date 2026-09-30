@@ -269,10 +269,25 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
     ),
     [
         (
-            {"success": True, "output": "completed reply"},
+            {
+                "success": True,
+                "output": "completed reply",
+                "completion_outcome": "partial",
+            },
             TaskStatus.COMPLETED,
             "assistant_response",
             "completed reply",
+            None,
+        ),
+        (
+            {
+                "success": True,
+                "output": "blocked reply",
+                "completion_outcome": "blocked",
+            },
+            TaskStatus.COMPLETED,
+            "assistant_response",
+            "blocked reply",
             None,
         ),
         (

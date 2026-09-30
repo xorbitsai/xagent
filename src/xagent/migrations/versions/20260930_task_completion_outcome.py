@@ -24,5 +24,6 @@ def downgrade() -> None:
     if inspector.has_table("tasks") and "completion_outcome" in {
         column["name"] for column in inspector.get_columns("tasks")
     }:
-        with op.batch_alter_table("tasks") as batch_op:
-            batch_op.drop_column("completion_outcome")
+        # No FK, index, or CHECK references this column. Drop it in place so
+        # SQLite preserves inbound rows and the other columns' inline CHECKs.
+        op.drop_column("tasks", "completion_outcome")

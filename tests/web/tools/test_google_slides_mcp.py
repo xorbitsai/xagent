@@ -17,6 +17,7 @@ def _credentials(monkeypatch):
     # with a confusing "missing env var" error instead of the actual assertion.
     monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "access-token")
     monkeypatch.setattr(google_slides, "_CREATED_DEFAULT_SLIDES", {})
+    monkeypatch.setattr(google_slides, "_PRESERVED_BLANK_SLIDES", {})
 
 
 def _mock_slides_service(monkeypatch, presentations_mock):
@@ -586,18 +587,21 @@ def test_add_slide_allows_whitespace_only_body_on_layout_without_body_placeholde
     assert result["status"] == "success"
 
 
-def test_add_slide_rejects_whitespace_only_content_on_blank_layout(monkeypatch):
-    """BLANK cannot create an empty page; use batch_update for custom content."""
+@pytest.mark.parametrize(
+    "kwargs", [{"title": "   "}, {"title": "T"}, {"body": "B"}, {}]
+)
+def test_add_slide_rejects_blank_layout(monkeypatch, kwargs):
+    """Blank/custom slides must use batch_update rather than this primitive."""
     presentations = Mock()
     presentations.batchUpdate.return_value.execute.return_value = {}
     _mock_slides_service(monkeypatch, presentations)
 
     result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="   ", layout="BLANK")
+        google_slides.google_slides_add_slide("pres1", layout="BLANK", **kwargs)
     )
 
     assert result["status"] == "error"
-    assert "creates no content by itself" in result["message"]
+    assert "Unknown layout" in result["message"]
     presentations.batchUpdate.assert_not_called()
 
 
@@ -726,47 +730,6 @@ def test_add_slide_title_layout_allows_missing_body(monkeypatch):
     )
 
     assert result["status"] == "success"
-
-
-def test_add_slide_blank_layout_rejects_title_alone(monkeypatch):
-    presentations = Mock()
-    _mock_slides_service(monkeypatch, presentations)
-
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", title="T", layout="BLANK")
-    )
-
-    assert result["status"] == "error"
-    assert "has no title placeholder" in result["message"]
-    presentations.batchUpdate.assert_not_called()
-
-
-def test_add_slide_blank_layout_rejects_body_alone(monkeypatch):
-    presentations = Mock()
-    _mock_slides_service(monkeypatch, presentations)
-
-    result = json.loads(
-        google_slides.google_slides_add_slide("pres1", body="B", layout="BLANK")
-    )
-
-    assert result["status"] == "error"
-    assert "has no body placeholder" in result["message"]
-    presentations.batchUpdate.assert_not_called()
-
-
-def test_add_slide_blank_layout_rejects_empty_slide(
-    monkeypatch,
-):
-    """BLANK has no content primitive; callers must use batch_update to add
-    custom content instead of creating an unidentifiable empty page."""
-    presentations = Mock()
-    _mock_slides_service(monkeypatch, presentations)
-
-    result = json.loads(google_slides.google_slides_add_slide("pres1", layout="BLANK"))
-
-    assert result["status"] == "error"
-    assert "creates no content by itself" in result["message"]
-    presentations.batchUpdate.assert_not_called()
 
 
 def test_add_slide_resolves_full_presentation_url(monkeypatch):
@@ -1857,6 +1820,94 @@ def test_add_slide_keeps_image_only_existing_slide(monkeypatch):
     assert not any("deleteObject" in request for request in requests)
 
 
+def test_add_slide_keeps_background_only_existing_slide_without_id(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [
+            {
+                "objectId": "background-slide",
+                "pageElements": [],
+                "pageProperties": {
+                    "pageBackgroundFill": {
+                        "solidFill": {"color": {"rgbColor": {"red": 1}}}
+                    }
+                },
+            }
+        ]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="Title", body="Detail")
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is False
+    assert not any(
+        "deleteObject" in request for request in _batch_update_requests(presentations)
+    )
+
+
+def test_add_slide_keeps_unfilled_placeholder_cover_without_id(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [
+            {
+                "objectId": "cover-slide",
+                "pageElements": [_placeholder_element("title", "TITLE")],
+            }
+        ]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(
+        google_slides.google_slides_add_slide("pres1", title="Title", body="Detail")
+    )
+
+    assert result["status"] == "success"
+    assert result["default_slide_removed"] is False
+    assert not any(
+        "deleteObject" in request for request in _batch_update_requests(presentations)
+    )
+
+
+def test_add_slide_preserve_blank_slide_does_not_delete_it_on_next_call(monkeypatch):
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "slides": [{"objectId": "default", "pageElements": []}]
+    }
+    presentations.batchUpdate.return_value.execute.return_value = {}
+    _mock_slides_service(monkeypatch, presentations)
+    google_slides._CREATED_DEFAULT_SLIDES["pres1"] = "default"
+
+    preserved = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1",
+            title="Title",
+            body="Detail",
+            default_slide_id="default",
+            preserve_blank_slide=True,
+        )
+    )
+
+    assert preserved["status"] == "success"
+    assert "pres1" not in google_slides._CREATED_DEFAULT_SLIDES
+
+    appended = json.loads(
+        google_slides.google_slides_add_slide(
+            "pres1", title="Second", body="More detail"
+        )
+    )
+
+    assert appended["status"] == "success"
+    assert appended["default_slide_removed"] is False
+    assert not any(
+        "deleteObject" in request for request in _batch_update_requests(presentations)
+    )
+
+
 def test_import_pptx_converts_and_verifies_native_google_slides(monkeypatch, tmp_path):
     pptx_path = tmp_path / "designed-deck.pptx"
     pptx_path.write_bytes(b"pptx-bytes")
@@ -2012,6 +2063,52 @@ def test_import_pptx_rejects_missing_text_after_conversion(monkeypatch, tmp_path
     assert result["status"] == "validation_failed"
     assert result["empty_slide_numbers"] == []
     assert result["missing_text_slide_numbers"] == [1]
+
+
+def test_import_pptx_allows_drive_to_reorder_text_elements(monkeypatch, tmp_path):
+    pptx_path = tmp_path / "reordered-deck.pptx"
+    pptx_path.write_bytes(b"pptx-bytes")
+    _mock_pptx_text(monkeypatch, "Title Detail")
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS", str(tmp_path))
+
+    drive = Mock()
+    drive.files.return_value.create.return_value.execute.return_value = {
+        "id": "pres1",
+        "name": "Reordered Deck",
+    }
+    monkeypatch.setattr(google_slides, "get_drive_service", lambda: drive)
+
+    presentations = Mock()
+    presentations.get.return_value.execute.return_value = {
+        "presentationId": "pres1",
+        "title": "Reordered Deck",
+        "slides": [
+            {
+                "objectId": "slide1",
+                "pageElements": [
+                    {
+                        "shape": {
+                            "text": {
+                                "textElements": [{"textRun": {"content": "Detail\n"}}]
+                            }
+                        }
+                    },
+                    {
+                        "shape": {
+                            "text": {
+                                "textElements": [{"textRun": {"content": "Title\n"}}]
+                            }
+                        }
+                    },
+                ],
+            }
+        ],
+    }
+    _mock_slides_service(monkeypatch, presentations)
+
+    result = json.loads(google_slides.google_slides_import_pptx(str(pptx_path)))
+
+    assert result["status"] == "success"
 
 
 def test_import_pptx_rejects_empty_slide_after_conversion(monkeypatch, tmp_path):

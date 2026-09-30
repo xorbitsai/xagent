@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -40,6 +41,7 @@ _PPTX_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
 # that every sole empty page is Google's implementation detail.  The returned
 # id can also be passed explicitly for calls that cross process boundaries.
 _CREATED_DEFAULT_SLIDES: dict[str, str] = {}
+_PRESERVED_BLANK_SLIDES: dict[str, set[str]] = {}
 _MAX_TRACKED_DEFAULT_SLIDES = 256
 
 
@@ -56,7 +58,7 @@ def _normalize_layout(value: object) -> object:
 
 
 _Layout = Annotated[
-    Literal["TITLE", "TITLE_AND_BODY", "TITLE_ONLY", "SECTION_HEADER", "BLANK"],
+    Literal["TITLE", "TITLE_AND_BODY", "TITLE_ONLY", "SECTION_HEADER"],
     BeforeValidator(_normalize_layout),
 ]
 
@@ -80,7 +82,6 @@ _LAYOUT_PLACEHOLDERS: dict[str, tuple[str | None, str | None]] = {
     "TITLE_AND_BODY": ("TITLE", "BODY"),
     "TITLE_ONLY": ("TITLE", None),
     "SECTION_HEADER": ("TITLE", None),
-    "BLANK": (None, None),
 }
 
 # Leading "•"/"-"/"*" marker at the start of a line, with or without a
@@ -353,6 +354,7 @@ def _resolve_pptx_upload_path(file_path: str) -> Path:
     )
     local_path: Path | None = None
     authorized_candidate: Path | None = None
+    path_error: OSError | None = None
     for candidate in candidates:
         try:
             resolved_candidate = candidate.resolve()
@@ -372,7 +374,11 @@ def _resolve_pptx_upload_path(file_path: str) -> Path:
             resolved_candidate.stat()
         except OSError as exc:
             if exc.errno != errno.ENOENT:
-                raise
+                logger.warning(
+                    "Could not inspect PPTX path %s: %s", resolved_candidate, exc
+                )
+                path_error = path_error or exc
+            continue
         if resolved_candidate.is_file():
             local_path = resolved_candidate
             break
@@ -392,6 +398,8 @@ def _resolve_pptx_upload_path(file_path: str) -> Path:
                 "file path is outside the allowed directories; provide a PPTX "
                 "inside the task workspace"
             )
+        if path_error is not None:
+            raise path_error
         raise FileNotFoundError(f"File not found: {file_path}")
 
     if local_path.suffix.lower() != ".pptx":
@@ -481,6 +489,22 @@ def _element_text(element: dict[str, Any]) -> str:
     return own_text + grouped_text
 
 
+def _text_tokens(value: str) -> Counter[str]:
+    """Return order-independent visible-text tokens for import validation."""
+    return Counter(re.findall(r"\w+|[^\w\s]", value.casefold(), re.UNICODE))
+
+
+def _contains_text_tokens(expected: str, actual: str) -> bool:
+    """Return whether ``actual`` preserves all tokens from ``expected``.
+
+    Drive may reorder page elements while converting a PPTX.  Comparing the
+    token multisets keeps the validation useful for detecting dropped detail
+    text without rejecting an otherwise correct conversion solely because a
+    title and body shape were returned in a different order.
+    """
+    return not (_text_tokens(expected) - _text_tokens(actual))
+
+
 def _slide_summary(slide: dict[str, Any], index: int) -> dict[str, Any]:
     texts = [
         text
@@ -514,6 +538,22 @@ def _slide_is_empty(slide: dict[str, Any]) -> bool:
         if "placeholder" not in shape:
             return False
     return True
+
+
+def _slide_is_untouched_default(slide: dict[str, Any]) -> bool:
+    """Return whether a slide is safe to infer as Google's initial page.
+
+    The stateless fallback has no object id to prove provenance.  Restrict it
+    to a truly element-free slide with no custom background; empty title
+    placeholders and background-only covers are user content and must remain.
+    """
+    if slide.get("pageElements"):
+        return False
+    page_properties = slide.get("pageProperties") or {}
+    background = page_properties.get("pageBackgroundFill") or {}
+    return background.get("propertyState", "INHERIT") == "INHERIT" and not any(
+        key in background for key in ("solidFill", "stretchedPictureFill")
+    )
 
 
 @mcp.tool()
@@ -714,7 +754,8 @@ def google_slides_import_pptx(file_path: str, title: str = "") -> str:
         missing_text_slide_numbers = [
             index + 1
             for index, expected_text in enumerate(expected_slide_text)
-            if expected_text and expected_text not in actual_slide_text[index]
+            if expected_text
+            and not _contains_text_tokens(expected_text, actual_slide_text[index])
         ]
         if empty_slide_numbers or missing_text_slide_numbers:
             return validation_failed(
@@ -795,13 +836,13 @@ def google_slides_add_slide(
         title, body (optional) becomes the subtitle line (not bulleted).
       - "TITLE_ONLY", "SECTION_HEADER": title only, no body placeholder —
         pass body="" or the call is rejected.
-      - "BLANK": no placeholders at all; use google_slides_batch_update to
-        add free-form text boxes/images instead.
+    For blank/custom slides, use google_slides_batch_update directly; this
+    helper only exposes layouts with title/body placeholders.
 
     Layouts with a title placeholder that don't already require a body
     (TITLE, TITLE_ONLY, SECTION_HEADER — not TITLE_AND_BODY, whose own
-    body-required rule above already covers it, and not BLANK, which has
-    no title placeholder) still need at least a non-empty title — or, for
+    body-required rule above already covers it) still need at least a
+    non-empty title — or, for
     "TITLE", a non-empty body/subtitle instead — since otherwise the call
     would produce a completely empty slide; that combination is rejected.
 
@@ -868,12 +909,6 @@ def google_slides_add_slide(
                 "detail text in 'body' — don't create the slide "
                 "with just a title."
             )
-        if normalized_layout == "BLANK" and not title.strip() and not body.strip():
-            return _error(
-                "layout 'BLANK' creates no content by itself; use "
-                "google_slides_batch_update to add custom content in the same "
-                "workflow"
-            )
         if (
             title_placeholder is not None
             and not body_required
@@ -891,11 +926,21 @@ def google_slides_add_slide(
         pres_id = _resolve_presentation_id(presentation_id)
         service = get_slides_service()
 
-        requested_default_slide_id = default_slide_id.strip()
         tracked_default_slide_id = _CREATED_DEFAULT_SLIDES.get(pres_id)
+        requested_default_slide_id = default_slide_id.strip()
         candidate_default_slide_id = (
             requested_default_slide_id or tracked_default_slide_id
         )
+        if preserve_blank_slide:
+            # Preserving the page consumes any in-process default inference;
+            # otherwise a later call without this flag could delete the page
+            # the caller explicitly asked us to keep.
+            if candidate_default_slide_id:
+                _PRESERVED_BLANK_SLIDES.setdefault(pres_id, set()).add(
+                    candidate_default_slide_id
+                )
+            _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
+            candidate_default_slide_id = ""
         # A Slides API create call starts with a default blank page. Read the
         # current pages before creating the next real page, then delete that
         # default only after the new page has been created in this same atomic
@@ -924,11 +969,19 @@ def google_slides_add_slide(
                         # The caller used the page before asking us to append
                         # a slide, so it is no longer the untouched default.
                         _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
-            elif len(existing_slides) == 1 and _slide_is_empty(existing_slides[0]):
+            elif (
+                len(existing_slides) == 1
+                and existing_slides[0].get("objectId")
+                not in _PRESERVED_BLANK_SLIDES.get(pres_id, set())
+                and _slide_is_untouched_default(existing_slides[0])
+            ):
                 # Without a cross-process id, the only safe inference is a
                 # presentation whose sole page is empty. Never infer that a
                 # blank page in a multi-page deck is Google's default.
                 slide_to_remove = existing_slides[0].get("objectId")
+
+        if slide_to_remove:
+            _PRESERVED_BLANK_SLIDES.get(pres_id, set()).discard(slide_to_remove)
 
         slide_id = f"slide_{uuid.uuid4().hex[:12]}"
         title_id = f"{slide_id}_title"

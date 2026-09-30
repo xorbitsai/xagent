@@ -2199,6 +2199,9 @@ def _schedule_bg(
                             task_id,
                             task_owner_user_id,
                             before_message_id=before_message_id,
+                            before_turn_id=payload.turn_id
+                            if before_message_id is not None
+                            else None,
                         )
                     )
                     if snapshot is None:

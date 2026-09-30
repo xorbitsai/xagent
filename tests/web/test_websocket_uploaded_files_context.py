@@ -201,7 +201,9 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
             captured["broadcast_task_id"] = task_id
 
     class AgentService:
-        def set_conversation_history(self, history, *, watermark=None):
+        def set_conversation_history(
+            self, history, *, watermark=None, event_watermark=None
+        ):
             captured["conversation_history"] = history
 
         def set_execution_context_messages(self, messages):
@@ -258,7 +260,9 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
 
 
 class _NoopAgentService:
-    def set_conversation_history(self, history, *, watermark=None):
+    def set_conversation_history(
+        self, history, *, watermark=None, event_watermark=None
+    ):
         pass
 
     def set_execution_context_messages(self, messages):

@@ -525,7 +525,11 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
         def cleanup_workspace(self) -> None: ...
 
         def set_conversation_history(
-            self, _messages: list[dict[str, str]], *, watermark: int | None = None
+            self,
+            _messages: list[dict[str, str]],
+            *,
+            watermark: int | None = None,
+            event_watermark: dict[str, Any] | None = None,
         ) -> None: ...
 
         def set_execution_context_messages(self, _messages: list[Any]) -> None: ...

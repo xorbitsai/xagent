@@ -1265,7 +1265,10 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
     agent_service = SimpleNamespace(
         workspace=None,
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages, *, watermark=None: None,
+        set_conversation_history=lambda _messages,
+        *,
+        watermark=None,
+        event_watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
@@ -1315,6 +1318,7 @@ async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
             runtime_user=None,
             conversation_history=(),
             conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
             # The turn binds ``task.source`` into the agent context (MCP
             # approval gate identity), so the stand-in row carries the

@@ -8,22 +8,21 @@ never permission to reclaim capacity: the existing owner recovery must fence
 out that acquisition first.
 
 Capacity is charged per active execution, not per stamped ticket row. Every
-ticket the task's current owner holds in one bucket is the same execution: a
-RESUME admitted while the previous incarnation's cleanup still holds its ticket
-does not take a second slot. That relies on every new incarnation draining
-the previous one before it runs; a timed-out cancellation currently breaks that
-precondition (#2778), which is an activation gate. Live guidance joins the
-running execution without a slot from its own bucket, because the bucket
-classified a queue position and the execution it joins already paid for its
-slot; it must reserve one only if it becomes a new turn. Tickets carry no
-execution identity, so an incarnation classified into another bucket keeps the
-previous bucket's slot until this owner's next settled or idle release, not
-merely through cleanup (#2777). Counting distinct tasks is serialized by the
-bucket row lock taken before every stamp and by the exclusive owner stamp per
-task. The scan and claim predicates below must agree on this contract, so every
-executor must run the same revision before a host enables a policy. The
-snapshot counts every held task, including the waiter's own; it is display
-only (#2700).
+ticket the task's current owner holds in one bucket is the same execution, so
+a RESUME admitted while the previous incarnation's cleanup still holds its
+ticket does not take a second slot there. Live guidance joins the running
+execution without a slot from its own bucket, because the bucket classified a
+queue position and the execution it joins already paid for its slot; it must
+reserve one only if it becomes a new turn. Tickets carry no execution
+identity, so the coordinator releases the ticket of each execution handle as
+that handle finishes: an incarnation classified into another bucket frees the
+previous bucket's slot once the previous incarnation has drained, while the
+owner's settled and idle releases remain the backstop for tickets no handle
+ever carried. Counting distinct tasks is serialized by the bucket row lock
+taken before every stamp and by the exclusive owner stamp per task. The scan
+and claim predicates below must agree on this contract, so every executor must
+run the same revision before a host enables a policy. The snapshot counts every
+held task, including the waiter's own; it is display only (#2700).
 """
 
 from __future__ import annotations
@@ -371,13 +370,16 @@ def reserve_task_admission(db: Session, command_id: int, lease: TaskLease) -> bo
     return True
 
 
-def release_task_admissions(db: Session, lease: TaskLease) -> None:
-    """Release only after the owner drained execution, never merely on status flip."""
-    owned = (
+def _owned_tickets(lease: TaskLease) -> tuple[ColumnElement[bool], ...]:
+    return (
         TaskAdmissionTicket.task_id == lease.task_id,
         TaskAdmissionTicket.runner_id == lease.runner_id,
         TaskAdmissionTicket.owner_attempt_id == lease.attempt_id,
     )
+
+
+def _release_tickets(db: Session, *owned: ColumnElement[bool]) -> None:
+    """Drop the tickets of completed commands; unstamp the rest for their retry."""
     db.execute(
         delete(TaskAdmissionTicket).where(
             *owned,
@@ -392,6 +394,24 @@ def release_task_admissions(db: Session, lease: TaskLease) -> None:
         update(TaskAdmissionTicket)
         .where(*owned)
         .values(runner_id=None, owner_attempt_id=None)
+    )
+
+
+def release_task_admissions(db: Session, lease: TaskLease) -> None:
+    """Release only after the owner drained execution, never merely on status flip."""
+    _release_tickets(db, *_owned_tickets(lease))
+
+
+def release_command_admission(db: Session, lease: TaskLease, command_id: int) -> None:
+    """Release one command's ticket, versus every ticket the lease holds.
+
+    Compare ``release_task_admissions``, which releases every ticket of the
+    lease; this releases only the one drained execution's ticket, since the
+    owner may still run another. Fenced by the ticket's current owner, so a
+    stale owner never frees a slot a successor acquisition stamped.
+    """
+    _release_tickets(
+        db, TaskAdmissionTicket.command_id == command_id, *_owned_tickets(lease)
     )
 
 

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from ...core.agent.context.execution import (
     COMPACT_SUMMARY_METADATA_KEY,
     COMPACT_WATERMARK_METADATA_KEY,
+    MODEL_CONTEXT_WATERMARK_METADATA_KEY,
 )
 from ..models.chat_message import TaskChatMessage
 from ..models.task import Task, TaskStatus
@@ -220,6 +221,27 @@ def compact_transcript_event_watermark(
     compaction, not just this write. Stage 3.3-C must carry event-native coverage
     through model setup and compaction to remove this transitional lookup.
     """
+    native = data.get(MODEL_CONTEXT_WATERMARK_METADATA_KEY)
+    if native is not None:
+        if (
+            not isinstance(native, dict)
+            or native.get("scope_id") != "root"
+            or type(native.get("sequence")) is not int
+            or native["sequence"] <= 0
+            or not isinstance(native.get("event_id"), str)
+            or not native["event_id"]
+        ):
+            raise ValueError("Invalid native model context watermark")
+        anchor = db.scalar(
+            select(TaskExecutionEvent.event_id).where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.sequence == native["sequence"],
+                TaskExecutionEvent.event_id == native.get("event_id"),
+            )
+        )
+        if anchor is None:
+            raise ValueError("Native model context watermark has no root event")
     summary = data.get(COMPACT_SUMMARY_METADATA_KEY)
     watermark = data.get(COMPACT_WATERMARK_METADATA_KEY)
     if (

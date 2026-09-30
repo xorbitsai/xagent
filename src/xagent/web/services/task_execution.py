@@ -2092,6 +2092,11 @@ async def execute_task_background(
                     task_id,
                     task_owner_user_id,
                     before_message_id=before_message_id,
+                    before_turn_id=(
+                        context.get("turn_id")
+                        if isinstance(context, dict) and before_message_id is not None
+                        else None
+                    ),
                 )
             )
         if snapshot is None:
@@ -2170,6 +2175,7 @@ async def execute_task_background(
             agent_service.set_conversation_history(
                 [dict(message) for message in snapshot.conversation_history],
                 watermark=snapshot.conversation_watermark,
+                event_watermark=snapshot.conversation_event_watermark,
             )
             recovery_state = await materialize_task_execution_recovery_state(
                 snapshot.execution_recovery

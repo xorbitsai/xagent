@@ -38,9 +38,12 @@ class RunExecution(Execution):
         super().__init__(host)
         self.settled = settled
         self.new_run = new_run
+        self.handles: list[asyncio.Task] = []
+        self.owner = None
 
     async def __call__(self, command):
         owner = runtime.current_task_coordinator(command.task_id)
+        self.owner = owner
         with self.host.sessions() as db, db.begin():
             ownership.begin_task_execution_no_commit(
                 db,
@@ -61,7 +64,9 @@ class RunExecution(Execution):
                 self.terminal.set()
             await self.cleanup.wait()
 
-        owner.track_execution(asyncio.create_task(run()))
+        handle = asyncio.create_task(run())
+        self.handles.append(handle)
+        owner.track_execution(handle)
         return {}
 
 

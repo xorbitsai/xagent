@@ -34,6 +34,8 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import BaseModel
 
+from xagent.core.agent.context.execution import MODEL_CONTEXT_WATERMARK_METADATA_KEY
+from xagent.core.agent.service import AgentService
 from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolMetadata
 from xagent.web.channels.feishu.bot import FeishuBotInstance
 from xagent.web.channels.slack.bot import SlackBotInstance
@@ -43,12 +45,15 @@ from xagent.web.services.task_execution_context_service import (
 )
 from xagent.web.services.task_lease_service import TaskLease
 
+_EVENT_WATERMARK = {"scope_id": "root", "event_id": "channel-history", "sequence": 9}
+
 
 def _snapshot(source: str | None) -> Any:
     return SimpleNamespace(
         runtime_user=None,
         conversation_history=(),
         conversation_watermark=None,
+        conversation_event_watermark=_EVENT_WATERMARK,
         execution_recovery=TaskExecutionRecoverySnapshot(),
         task=SimpleNamespace(source=source),
     )
@@ -67,13 +72,19 @@ class _FakeTracer:
 
 
 def _agent_service() -> Any:
-    return SimpleNamespace(
+    service = SimpleNamespace(
         workspace=None,
         tracer=_FakeTracer(),
-        set_conversation_history=lambda _messages, *, watermark=None: None,
+        execution_metadata={},
+        _execution_adapter=None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
+
+    service.set_conversation_history = AgentService.set_conversation_history.__get__(
+        service, AgentService
+    )
+    return service
 
 
 def _agent_manager(contexts: list[Any], service: Any) -> Any:
@@ -82,6 +93,10 @@ def _agent_manager(contexts: list[Any], service: Any) -> Any:
             return service
 
         async def execute_task(self, **kwargs: Any) -> dict[str, Any]:
+            assert (
+                service.execution_metadata[MODEL_CONTEXT_WATERMARK_METADATA_KEY]
+                == _EVENT_WATERMARK
+            )
             contexts.append(kwargs["context"])
             return {"success": True, "output": "ok"}
 
@@ -369,6 +384,7 @@ async def test_shared_channel_turn_binds_the_snapshot_source(
         runtime_user=None,
         conversation_history=(),
         conversation_watermark=None,
+        conversation_event_watermark=_EVENT_WATERMARK,
         execution_recovery=TaskExecutionRecoverySnapshot(),
         task=SimpleNamespace(source="internal", user_id=5),
     )

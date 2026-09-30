@@ -134,6 +134,8 @@ SPILL_REGISTRY_MAX_RECORDS = 64
 # caller that issued it -- but carrying it through compaction is what lets a
 # later turn know which stored rows the summary already stands in for.
 TRANSCRIPT_WATERMARK_METADATA_KEY = "transcript_watermark"
+# Explicit root event-history prefix; never a legacy transcript row id.
+MODEL_CONTEXT_WATERMARK_METADATA_KEY = "model_context_watermark"
 # Wire name: ``to_dict`` writes ``self.metadata`` unfiltered, so renaming this
 # strands every checkpoint written before the rename, and request_context keys
 # reach this dict verbatim, which is why AgentRunner refuses this one there.
@@ -1676,6 +1678,7 @@ class ExecutionContext:
         top_level_user_request(self)
         child_metadata = dict(self.metadata)
         child_metadata.pop(ACCEPTED_TURN_IDS_METADATA_KEY, None)
+        child_metadata.pop(MODEL_CONTEXT_WATERMARK_METADATA_KEY, None)
         if metadata:
             child_metadata.update(metadata)
         if task:
@@ -2205,6 +2208,11 @@ class ExecutionContext:
                 ],
             },
         )
+        event_watermark = self.metadata.get(MODEL_CONTEXT_WATERMARK_METADATA_KEY)
+        if event_watermark is not None:
+            result.metadata[MODEL_CONTEXT_WATERMARK_METADATA_KEY] = dict(
+                event_watermark
+            )
         watermark = self.metadata.get(TRANSCRIPT_WATERMARK_METADATA_KEY)
         # Omitted rather than stored as None when the caller issued no
         # watermark: a reader must be able to tell "this summary covers stored

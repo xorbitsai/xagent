@@ -106,10 +106,16 @@ def _snapshot(tool_categories: list[str] | None) -> TaskSetupSnapshot:
 class TestApply:
     def test_every_model_slot_takes_the_override(self):
         selected = NamedLLM("selected", ["chat", "tool_calling", "vision"])
+        coordinate = {"scope_id": "root", "event_id": "history", "sequence": 4}
+        snapshot = replace(
+            _snapshot(["basic", "image"]), conversation_event_watermark=coordinate
+        )
         applied = apply_task_model_override(
-            _snapshot(["basic", "image"]),
+            snapshot,
             TaskModelOverride(llm=selected, vision_llm=selected),
         )
+        assert applied.conversation_event_watermark == coordinate
+        assert applied.model_override is not None
         assert applied.task_llm is selected
         assert applied.task_fast_llm is selected
         assert applied.task_compact_llm is selected

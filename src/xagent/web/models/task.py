@@ -272,6 +272,9 @@ class Task(Base):  # type: ignore
             "interaction_protocol_version IS NULL OR interaction_protocol_version = 1",
             name="ck_tasks_interaction_protocol_version",
         ),
+        # Deleted tasks leave retained files under web_task_<id>. Never give
+        # their workspace identity to a later task on SQLite.
+        {"sqlite_autoincrement": True},
     )
 
     id = Column(Integer, primary_key=True, index=True)

@@ -3,7 +3,7 @@
 Status: reader prerequisites and source audit, based on main `90660939a`.
 This document distinguishes existing facts from the readers still to be built.
 Production task creation remains V1. The stage 3.3-B implementation is described
-below; C and D still cover model context and display/Trace. Production routing
+below; C covers model context below and D still covers display/Trace. Production routing
 is stage 3.4.
 
 ## Scope and compatibility
@@ -352,7 +352,70 @@ Deleting legacy Trace/checkpoint content does not prevent these recovery reads.
 An accepted input is not applied merely because its acceptance fact exists;
 application and compacted retry identity remain in the saved context.
 
-This is a recovery boundary, not whole-task isolation certification: setup still
-reads model transcript and cross-round tool/skill context through legacy sources
-until C, and UI/Trace reads await D. Compatibility writers, control fields,
+This is a recovery boundary, not whole-task isolation certification: the model setup switch is described in C below, and UI/Trace reads await D. Compatibility writers, control fields,
 production defaults, checkpoint formats, database schema and V1 remain unchanged.
+
+## Stage 3.3-C: event-backed model context
+
+V2 setup now reads root event facts at one captured committed horizon. The
+snapshot carries the task's storage version and a separate
+`conversation_event_watermark`; V1 keeps `conversation_watermark` as a chat row
+ID. The background runner, manager reconstruction and compatibility hydration
+entry points preserve that distinction. No schema or production-default change.
+
+Only accepted turns with an `input_applied` fact enter prior model history.
+Their position is the application sequence, so an input accepted before a
+summary but applied afterward survives in the suffix. The current start's
+accepted turn supplies the cutoff when available. Existing queued integer
+`before_message_id` values retain their meaning through an identity-only join
+on `execution_event_id`; no legacy chat content is loaded. Starts that have no
+transcript cutoff keep their existing no-cutoff semantics. Root queries exclude
+build scopes, recovery snapshot bodies and raw LLM request/response facts.
+
+Ordinary tool calls pair by `tool_attempt_id` and group by
+`assistant_message_id`: one assistant declaration followed by contiguous tool
+observations, regardless of completion order. The recent window retains eight
+calls plus the rest of the boundary batch. Results use the existing runtime
+sanitization, formatting and model token-compaction pipeline instead of the old
+240-character Trace preview. No tool is invoked to reconstruct history. A start
+without an outcome is explicitly unknown, including its external effect; this
+model observation does not relax B's refusal to resume an unknown effect.
+Question outbounds supply their transcript content. Failed/cancelled settlements
+supply one outcome instead of a safe failure placeholder plus another summary.
+Normal waiting, paused and interrupted settlements do not add a failure outcome,
+including after a successful continuation.
+Selected-skill loading continues through the existing business loader.
+
+The existing newest-first budget of 16 historical image references is shared by
+message attachments, tool-result references and retained summary references.
+File bytes still pass through the normal authorization/materialization boundary.
+V1 transcript and Trace context behavior remains unchanged.
+
+Native summaries persist `data.model_context_watermark` with root scope,
+event UUID and sequence. This is the historical prefix installed at setup,
+including its tool history, rather than a reinterpreted chat ID. Compaction
+passes the coordinate through without inventing a later position. Consequently
+current-run facts beyond that prefix remain a conservative replay suffix; the
+coordinate does not claim the summary exclusively describes that prefix.
+Child contexts do not inherit its root coverage claim, and request context
+cannot overwrite it. The writer validates the coordinate against the same task
+and root scope without consulting chat projections.
+
+A's older `transcript_watermark` remains transcript-only: it cannot suppress
+earlier tool facts. Summaries with no coordinate cannot replace a known prefix;
+the reader replays facts without regenerating the summary. Malformed required
+facts or invalid coverage fail explicitly, without a legacy-content fallback.
+Display/Trace conversion and whole-task isolation remain D and E work.
+
+### Follow-up: bound model-context payload loading
+
+The current reader pages queries and batches anchor lookups, but retains every
+matching event payload before applying summary coverage and the tool window.
+Thus payload bytes read and setup memory still grow with lifetime history even
+when compaction covers old facts. This is a non-blocking follow-up to stage C.
+Select the applicable summary and retained batch identities first, then load
+only required payloads at the same fixed committed horizon. Selection must keep
+inputs applied after the summary boundary even when accepted before it, tool
+batches with outcomes after the boundary, and complete boundary batches. Verify
+bounded payload loading against large histories as well as equivalent model
+messages for these cross-boundary cases.

@@ -100,11 +100,12 @@ def _make_first_call_hangs_stub(
     When ``swallow_cancellation`` is False, it then blocks on an event
     nobody sets, so the only way out is being cancelled — when that
     happens it sets ``first_call_cancelled`` and re-raises. When it is
-    True, it instead swallows every cancellation it receives and only
-    unblocks once the caller sets ``release_first_call``, at which point
-    it raises ``raise_after_release`` if one was given, or returns an
-    empty result. Every call after the first sets ``second_call_started``
-    and returns an empty result immediately.
+    True, it instead swallows every cancellation it receives, setting
+    ``first_call_cancelled`` each time, and only unblocks once the caller
+    sets ``release_first_call``, at which point it raises
+    ``raise_after_release`` if one was given, or returns an empty result.
+    Every call after the first sets ``second_call_started`` and returns an
+    empty result immediately.
     """
     call_count = 0
     first_call_started = asyncio.Event()
@@ -125,6 +126,7 @@ def _make_first_call_hangs_stub(
                 try:
                     await release_first_call.wait()
                 except asyncio.CancelledError:
+                    first_call_cancelled.set()
                     continue
                 break
         else:
@@ -321,13 +323,18 @@ async def test_connection_test_caps_concurrent_loads(monkeypatch, timeout):
         await _wait_until(lambda: started >= _MCP_CONNECTION_TEST_MAX_INFLIGHT + 1)
         assert started == _MCP_CONNECTION_TEST_MAX_INFLIGHT + 1
     finally:
-        # Cancel and drain regardless of the outcome above: an assertion
-        # failure here must not strand tasks stuck on an event nobody will
-        # ever set, which would hang the test runner's loop teardown.
+        # Drain regardless of the outcome above. Cancel the requests first,
+        # so a request still queued for a slot never starts a load, then
+        # release every load that did start: whether a request's
+        # cancellation reaches its load is not what this test is about, and
+        # a load left waiting on its event would hang the test runner's loop
+        # teardown.
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        for release_event in release_events:
+            release_event.set()
         await _wait_until_connection_test_loads_empty()
 
 
@@ -368,31 +375,6 @@ async def test_connection_test_deadline_matches_loader_timeout(
                 }
             }
         )
-
-        # The queued case mirrors the loader's other timeout: no per-server
-        # slot freed in time. Fill that slot pool and run the real loader
-        # again so the queued request is also compared against that path.
-        real_slot_wait_result = None
-        if where == "queued":
-            loader_gate = mcp_adapter_module._get_server_load_gate(
-                _MCP_CONNECTION_TEST_SERVER_NAME
-            )
-            for _ in range(mcp_adapter_module._MAX_INFLIGHT_LOADS_PER_SERVER):
-                await loader_gate.acquire()
-            try:
-                real_slot_wait_result = (
-                    await mcp_adapter_module.load_mcp_tools_as_agent_tools(
-                        {
-                            _MCP_CONNECTION_TEST_SERVER_NAME: {
-                                "transport": "streamable_http",
-                                "url": "http://x",
-                            }
-                        }
-                    )
-                )
-            finally:
-                for _ in range(mcp_adapter_module._MAX_INFLIGHT_LOADS_PER_SERVER):
-                    loader_gate.release()
 
     expected_projection = _project_mcp_tool_load_result(real_timeout_result)
     expected_details = {"tool_count": len(expected_projection.tools)}
@@ -466,9 +448,6 @@ async def test_connection_test_deadline_matches_loader_timeout(
         assert len(seen_load_results) == 1
         assert seen_load_results[0].failures == real_timeout_result.failures
         assert seen_load_results[0].tools == real_timeout_result.tools == ()
-        if where == "queued":
-            assert real_slot_wait_result is not None
-            assert seen_load_results[0].failures == real_slot_wait_result.failures
 
         # One ERROR per request that timed out: the request under test, plus,
         # when queued, each blocker whose own deadline passed first.
@@ -496,11 +475,13 @@ async def test_connection_test_deadline_matches_loader_timeout(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_connection_test_real_loader_timeout_logs_one_error(monkeypatch, caplog):
+async def test_connection_test_real_loader_timeout_error_lines(monkeypatch, caplog):
     """With the real adapter loader under the endpoint (only its per-server
     direct load stubbed to never answer), a timed-out test returns within the
-    deadline, its cancellation reaches the per-server load, and the whole
-    request logs exactly one ERROR line, from this endpoint."""
+    deadline plus a margin. The request does not cancel its load; the
+    loader's own per-server timeout ends it and cancels the per-server load.
+    The request logs one ERROR line from this endpoint, and the load that ran
+    into the loader's own timeout logs the adapter's one ERROR line."""
     from xagent.config import MCP_TOOL_INIT_TIMEOUT_SECONDS
     from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 
@@ -546,7 +527,11 @@ async def test_connection_test_real_loader_timeout_logs_one_error(monkeypatch, c
         (
             "xagent.web.api.mcp",
             "MCP connection test did not finish within 1s; reporting a timeout",
-        )
+        ),
+        (
+            "xagent.core.tools.adapters.vibe.mcp_adapter",
+            "Unexpected failure loading tools from MCP server test (TimeoutError)",
+        ),
     ]
 
 
@@ -650,54 +635,60 @@ async def test_connection_test_load_failure_is_not_logged_as_abandoned(
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize("trigger", ["deadline", "request_cancelled"])
-async def test_connection_test_interrupts_load_and_returns_slot(monkeypatch, trigger):
+async def test_connection_test_slot_outlives_request_until_load_returns(
+    monkeypatch, trigger
+):
     """When a request reaches its deadline or is itself cancelled, its load
-    is cancelled too, and the freed slot lets the next queued load start."""
+    is not cancelled and keeps its slot: the next queued load starts only
+    once that load returns."""
     monkeypatch.setattr(mcp_module, "_MCP_CONNECTION_TEST_MAX_INFLIGHT", 1)
+    # Request A's deadline is short only in the deadline case; request B's is
+    # long enough that its own wait for a slot never expires in this test.
+    timeouts = iter([0.2 if trigger == "deadline" else 5.0, 5.0])
+    monkeypatch.setattr(
+        mcp_module, "get_mcp_tool_init_timeout_seconds", lambda: next(timeouts)
+    )
 
-    stub = _make_first_call_hangs_stub(swallow_cancellation=False)
+    stub = _make_first_call_hangs_stub(swallow_cancellation=True)
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
         stub.call,
     )
+    gate = mcp_module._mcp_connection_test_gate()
 
-    if trigger == "deadline":
-        # request A gets a short deadline so it times out on its own;
-        # request B gets a long one so its own wait for a slot never expires
-        # before A's slot is freed.
-        timeouts = iter([0.2, 5.0])
-        monkeypatch.setattr(
-            mcp_module, "get_mcp_tool_init_timeout_seconds", lambda: next(timeouts)
-        )
-
-        task_a = asyncio.create_task(
-            _load_mcp_connection_test_tools({"transport": "stdio"})
-        )
-        await asyncio.wait_for(stub.first_call_started.wait(), timeout=1)
-        await task_a  # returns the loader's timeout result; does not raise
-    else:
-        monkeypatch.setattr(
-            mcp_module, "get_mcp_tool_init_timeout_seconds", lambda: 5.0
-        )
-
-        task_a = asyncio.create_task(
-            _load_mcp_connection_test_tools({"transport": "stdio"})
-        )
-        await asyncio.wait_for(stub.first_call_started.wait(), timeout=1)
-        task_a.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task_a
-
-    assert stub.first_call_cancelled.is_set()
-
-    task_b = asyncio.create_task(
+    task_a = asyncio.create_task(
         _load_mcp_connection_test_tools({"transport": "stdio"})
     )
-    await asyncio.wait_for(stub.second_call_started.wait(), timeout=0.1)
+    task_b = None
+    try:
+        await asyncio.wait_for(stub.first_call_started.wait(), timeout=1)
+        if trigger == "deadline":
+            assert await task_a == _mcp_connection_test_timeout_result()
+        else:
+            task_a.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task_a
 
-    task_b.cancel()
-    await asyncio.gather(task_b, return_exceptions=True)
-    await _wait_until_connection_test_loads_empty()
+        task_b = asyncio.create_task(
+            _load_mcp_connection_test_tools({"transport": "stdio"})
+        )
+        await _wait_until(lambda: len(gate._waiters or ()) == 1)
+        assert not stub.second_call_started.is_set()
+        assert not stub.first_call_cancelled.is_set()
+
+        stub.release_first_call.set()
+        await asyncio.wait_for(stub.second_call_started.wait(), timeout=1)
+        assert (await asyncio.wait_for(task_b, timeout=1)).tools == ()
+    finally:
+        # Let the first load finish whatever happened above: it swallows
+        # cancellation, so leaving it blocked would hang the loop teardown.
+        stub.release_first_call.set()
+        if task_b is not None and not task_b.done():
+            task_b.cancel()
+        await asyncio.gather(
+            task_a, *([task_b] if task_b else []), return_exceptions=True
+        )
+        await _wait_until_connection_test_loads_empty()
 
 
 @pytest.mark.asyncio
@@ -767,7 +758,7 @@ async def test_connection_test_late_load_exception_is_consumed(
         await asyncio.wait_for(stub.first_call_started.wait(), timeout=1)
         task_a.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task_a  # the load swallows the cancel and is still running
+            await task_a  # the load is not cancelled and is still running
 
     loop = asyncio.get_running_loop()
     handler_calls: list[dict] = []

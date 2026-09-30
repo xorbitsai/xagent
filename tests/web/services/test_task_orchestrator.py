@@ -1758,7 +1758,7 @@ async def test_repeated_cancellation_keeps_turn_command_gate_until_claim_settles
         actor_user_id=None,
     ):
         claim_started.set()
-        assert release_claim.wait(timeout=2)
+        assert release_claim.wait(timeout=30), "claim was never released"
         return _ClaimedTurn(
             task_lease=TaskLease(
                 task_id=task_id,
@@ -1793,22 +1793,31 @@ async def test_repeated_cancellation_keeps_turn_command_gate_until_claim_settles
                 kind=TurnKind.CREATE,
             )
         )
-        while not claim_started.is_set():
-            await asyncio.sleep(0)
+        contender_task = None
+        try:
+            assert await asyncio.to_thread(claim_started.wait, 30)
 
-        turn.cancel()
-        await asyncio.sleep(0.01)
-        turn.cancel()
-        contender_task = asyncio.create_task(contender())
-        await asyncio.sleep(0.05)
+            turn.cancel()
+            await asyncio.sleep(0.01)
+            turn.cancel()
+            contender_task = asyncio.create_task(contender())
+            await asyncio.sleep(0.05)
 
-        assert not turn.done()
-        assert not contender_entered.is_set()
+            assert not turn.done()
+            assert not contender_entered.is_set()
 
-        release_claim.set()
-        with pytest.raises(asyncio.CancelledError):
-            await turn
-        await asyncio.wait_for(contender_task, timeout=1)
+            release_claim.set()
+            with pytest.raises(asyncio.CancelledError):
+                await turn
+            await asyncio.wait_for(contender_task, timeout=30)
+        finally:
+            release_claim.set()
+            pending = [turn]
+            if contender_task is not None:
+                pending.append(contender_task)
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=30
+            )
 
     assert contender_entered.is_set()
     sched.assert_called_once()

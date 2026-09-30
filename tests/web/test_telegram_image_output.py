@@ -274,10 +274,17 @@ def test_markdown_to_tg_html_accepts_single_hyphen_table_delimiters() -> None:
     assert "• <b>Storage</b>: Object storage first" in html
 
 
+@pytest.mark.parametrize(
+    "event_watermark",
+    [None, {"scope_id": "root", "event_id": "telegram-history", "sequence": 7}],
+)
 @pytest.mark.asyncio
 async def test_restore_telegram_task_context_loads_transcript_and_recovery_state(
     monkeypatch: pytest.MonkeyPatch,
+    event_watermark,
 ) -> None:
+    from xagent.core.agent.context.execution import MODEL_CONTEXT_WATERMARK_METADATA_KEY
+    from xagent.core.agent.service import AgentService
     from xagent.web.services import chat_history_service, task_execution_context_service
 
     db = object()
@@ -289,11 +296,18 @@ async def test_restore_telegram_task_context_loads_transcript_and_recovery_state
 
     class FakeAgentService:
         def __init__(self) -> None:
+            self.execution_metadata = {}
+            self._execution_adapter = None
             self.conversation_history = None
             self.execution_context_messages = None
             self.recovered_skill_context = None
 
-        def set_conversation_history(self, messages, *, watermark=None):
+        def set_conversation_history(
+            self, messages, *, watermark=None, event_watermark=None
+        ):
+            AgentService.set_conversation_history(
+                self, messages, watermark=watermark, event_watermark=event_watermark
+            )
             self.conversation_history = messages
 
         def set_execution_context_messages(self, messages):
@@ -311,7 +325,7 @@ async def test_restore_telegram_task_context_loads_transcript_and_recovery_state
         chat_history_service,
         "load_task_transcript_window",
         lambda received_db, received_task_id: TranscriptWindow(
-            messages=transcript, watermark=None
+            messages=transcript, watermark=None, event_watermark=event_watermark
         ),
     )
     monkeypatch.setattr(
@@ -324,6 +338,10 @@ async def test_restore_telegram_task_context_loads_transcript_and_recovery_state
 
     await restore_telegram_task_context(agent_service, db, 423)  # type: ignore[arg-type]
 
+    assert (
+        agent_service.execution_metadata.get(MODEL_CONTEXT_WATERMARK_METADATA_KEY)
+        == event_watermark
+    )
     assert agent_service.conversation_history == transcript
     assert agent_service.execution_context_messages == recovery_state["messages"]
     assert agent_service.recovered_skill_context == recovery_state["skill_context"]

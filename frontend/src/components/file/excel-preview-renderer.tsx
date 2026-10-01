@@ -1,8 +1,9 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import React, { useEffect, useRef, useState } from "react"
 import { useI18n } from "@/contexts/i18n-context"
 import * as XLSX from "xlsx"
+import { createExcelSheetPreview, type ExcelSheetPreview } from "./excel-sheet-preview"
 
 interface ExcelPreviewRendererProps {
     base64Content: string
@@ -12,12 +13,15 @@ export function ExcelPreviewRenderer({ base64Content }: ExcelPreviewRendererProp
     const containerRef = useRef<HTMLDivElement | null>(null)
     const [error, setError] = useState<string | null>(null)
     const [activeSheet, setActiveSheet] = useState<string | null>(null)
-    const [sheets, setSheets] = useState<{ [key: string]: string }>({})
+    const [sheets, setSheets] = useState<Record<string, ExcelSheetPreview>>({})
     const { t } = useI18n()
 
     useEffect(() => {
         const render = async () => {
             if (!base64Content) {
+                setSheets({})
+                setActiveSheet(null)
+                setError(null)
                 return
             }
 
@@ -34,21 +38,23 @@ export function ExcelPreviewRenderer({ base64Content }: ExcelPreviewRendererProp
                         for (let i = 0; i < binary.length; i++) {
                             bytes[i] = binary.charCodeAt(i)
                         }
-                        workbook = XLSX.read(bytes, { type: "array" })
-                    } catch (e) {
+                        workbook = XLSX.read(bytes, { type: "array", sheetStubs: true })
+                    } catch {
                         // Fallback for non-base64 text
-                        workbook = XLSX.read(base64Content, { type: "string" })
+                        workbook = XLSX.read(base64Content, { type: "string", sheetStubs: true })
                     }
                 } else {
-                    workbook = XLSX.read(base64Content, { type: "string" })
+                    workbook = XLSX.read(base64Content, { type: "string", sheetStubs: true })
                 }
 
-                const sheetData: { [key: string]: string } = {}
+                const sheetData: Record<string, ExcelSheetPreview> = {}
 
                 workbook.SheetNames.forEach((sheetName: string) => {
                     const worksheet = workbook.Sheets[sheetName]
-                    const html = XLSX.utils.sheet_to_html(worksheet)
-                    sheetData[sheetName] = html
+                    sheetData[sheetName] = createExcelSheetPreview(
+                        worksheet,
+                        t("files.previewDialog.formulas.missingResult"),
+                    )
                 })
 
                 setSheets(sheetData)
@@ -92,13 +98,21 @@ export function ExcelPreviewRenderer({ base64Content }: ExcelPreviewRendererProp
                 </div>
             )}
 
+            {sheets[activeSheet].missingFormulaResults > 0 && (
+                <div role="status" className="border-b bg-amber-50 px-4 py-2 text-sm text-amber-900 dark:bg-amber-950/30 dark:text-amber-200 flex-shrink-0">
+                    {t("files.previewDialog.formulas.missingResults", {
+                        count: sheets[activeSheet].missingFormulaResults,
+                    })}
+                </div>
+            )}
+
             <div
                 className="flex-1 overflow-auto p-4 excel-preview-container"
                 ref={containerRef}
             >
                 <div
                     className="bg-background rounded-md shadow-sm border min-w-max"
-                    dangerouslySetInnerHTML={{ __html: sheets[activeSheet] }}
+                    dangerouslySetInnerHTML={{ __html: sheets[activeSheet].html }}
                 />
             </div>
 

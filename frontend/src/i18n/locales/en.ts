@@ -1529,6 +1529,10 @@ Build when you need.`,
         hint: "Try downloading to view",
       },
       emptyContent: "File content is empty",
+      formulas: {
+        missingResult: "Not calculated",
+        missingResults: "Missing formula results on this sheet: {count}. Formulas are shown where available; this preview does not calculate them. Download and open the file in a spreadsheet app to recalculate.",
+      },
       errors: {
         loadFailed: "Failed to load file",
         docxRenderFailed: "Failed to render DOCX preview",

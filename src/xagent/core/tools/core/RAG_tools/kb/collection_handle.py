@@ -2596,8 +2596,8 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             "metadata",
         }
         scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
-        # Admin scope never reads user_id, so legacy tables without it keep working.
-        if not scope.is_admin:
+        # A table without user_id holds only legacy rows, which only admin may read.
+        if not scope.is_admin and "user_id" in table.schema.names:
             desired_columns.add("user_id")
         if filters and isinstance(filters, dict):
             desired_columns.update(filters.keys())

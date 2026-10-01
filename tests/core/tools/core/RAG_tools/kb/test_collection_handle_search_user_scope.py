@@ -6,6 +6,7 @@ Storage isolation is provided by the autouse ``isolate_rag_storage`` fixture in
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -116,3 +117,29 @@ def test_admin_fallback_reads_table_without_user_id_column() -> None:
     )
 
     assert [r.doc_id for r in response.results] == ["doc-old"]
+
+
+def test_non_admin_fallback_skips_table_without_user_id_column(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    table = (
+        get_vector_index_store()
+        .get_raw_connection()
+        .create_table("embeddings_legacy", data=[_row("doc-old")])
+    )
+
+    with caplog.at_level(logging.ERROR):
+        results = _handle()._substring_fallback(
+            table=table,
+            collection=COLLECTION,
+            query_text="phazu",
+            model_tag="legacy",
+            top_k=10,
+            filters=None,
+            current_warnings=[],
+            user_id=1,
+            is_admin=False,
+        )
+
+    assert results == []
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]

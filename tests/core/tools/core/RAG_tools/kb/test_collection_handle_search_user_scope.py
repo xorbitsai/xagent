@@ -69,13 +69,11 @@ def _row(doc_id: str) -> dict:
 
 @pytest.fixture
 def shared_collection() -> None:
-    get_vector_index_store().upsert_embeddings(
-        MODEL,
-        [
-            {**_row(doc_id), "user_id": user_id}
-            for doc_id, user_id in (("doc-u1", 1), ("doc-u2", 2), ("doc-legacy", None))
-        ],
-    )
+    # One write per row keeps scan order; doc-u2 last makes a pre-scope top_k cutoff miss it.
+    for doc_id, user_id in (("doc-u1", 1), ("doc-legacy", None), ("doc-u2", 2)):
+        get_vector_index_store().upsert_embeddings(
+            MODEL, [{**_row(doc_id), "user_id": user_id}]
+        )
 
 
 @pytest.mark.parametrize(
@@ -107,6 +105,48 @@ def test_sparse_search_applies_user_scope_on_fts_and_fallback(
     assert fell_back is (query == "phazu" and bool(expected))
 
 
+def test_fallback_scope_applies_before_top_k(shared_collection: None) -> None:
+    response = _handle().search_sparse(
+        MODEL, "phazu", top_k=1, user_id=2, is_admin=False
+    )
+
+    assert {r.doc_id for r in response.results} == {"doc-u2"}
+
+
+def test_fallback_caller_filters_cannot_change_collection(
+    shared_collection: None,
+) -> None:
+    get_vector_index_store().upsert_embeddings(
+        MODEL, [{**_row("doc-other"), "collection": "other", "user_id": 1}]
+    )
+
+    response = _handle().search_sparse(
+        MODEL,
+        "phazu",
+        top_k=10,
+        filters={"collection": "other"},
+        user_id=1,
+        is_admin=False,
+    )
+
+    assert response.results == []
+
+
+def test_fallback_returns_more_than_ten_in_scope_rows() -> None:
+    mine = {f"doc-u1-{i:02d}" for i in range(15)}
+    get_vector_index_store().upsert_embeddings(
+        MODEL,
+        [{**_row(f"doc-u2-{i}"), "user_id": 2} for i in range(5)]
+        + [{**_row(doc_id), "user_id": 1} for doc_id in sorted(mine)],
+    )
+
+    response = _handle().search_sparse(
+        MODEL, "phazu", top_k=50, user_id=1, is_admin=False
+    )
+
+    assert {r.doc_id for r in response.results} == mine
+
+
 def test_admin_fallback_reads_table_without_user_id_column() -> None:
     get_vector_index_store().get_raw_connection().create_table(
         "embeddings_legacy", data=[_row("doc-old")]
@@ -122,15 +162,13 @@ def test_admin_fallback_reads_table_without_user_id_column() -> None:
 def test_non_admin_fallback_skips_table_without_user_id_column(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    table = (
-        get_vector_index_store()
-        .get_raw_connection()
-        .create_table("embeddings_legacy", data=[_row("doc-old")])
+    get_vector_index_store().get_raw_connection().create_table(
+        "embeddings_legacy", data=[_row("doc-old")]
     )
 
     with caplog.at_level(logging.ERROR):
         results = _handle()._substring_fallback(
-            table=table,
+            table_name="embeddings_legacy",
             collection=COLLECTION,
             query_text="phazu",
             model_tag="legacy",

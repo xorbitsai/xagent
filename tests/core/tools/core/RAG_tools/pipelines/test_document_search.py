@@ -181,6 +181,7 @@ def test_document_search_end_to_end(
         collection=collection,
         embeddings=embeddings,
         create_index=True,
+        user_id=1,
     )
 
     # -------- Execute sparse search --------
@@ -195,6 +196,7 @@ def test_document_search_end_to_end(
             top_k=3,
             embedding_model_id=embedding_model_id,
         ),
+        user_id=1,
     )
 
     assert isinstance(search_result, SearchPipelineResult)
@@ -332,6 +334,7 @@ def test_chinese_sparse_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         collection=collection,
         embeddings=embeddings,
         create_index=True,
+        user_id=1,
     )
 
     # -------- Test Chinese sparse search queries --------
@@ -351,6 +354,7 @@ def test_chinese_sparse_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
                 top_k=5,
                 embedding_model_id=embedding_model_id,
             ),
+            user_id=1,
         )
 
         assert isinstance(search_result, SearchPipelineResult)

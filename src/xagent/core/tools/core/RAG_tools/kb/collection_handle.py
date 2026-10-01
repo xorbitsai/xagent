@@ -93,6 +93,8 @@ from ..utils.hash_utils import compute_chunk_hash
 from ..utils.lancedb_query_utils import build_fts_query, list_table_names, query_to_list
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import escape_lancedb_string, generate_deterministic_doc_id
+from ..utils.user_permissions import UserPermissions
+from ..utils.user_scope import resolve_user_scope
 from .models import (
     KBBackendCapabilities,
     KBCollectionContext,
@@ -2578,6 +2580,8 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         top_k: int,
         filters: Optional[Dict[str, Any]],
         current_warnings: List[SearchWarning],
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
         batch_size: int = 2048,
     ) -> List[SearchResult]:
         """Perform a memory-friendly substring scan across the table when FTS misses."""
@@ -2591,6 +2595,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             "created_at",
             "metadata",
         }
+        scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+        # Admin scope never reads user_id, so legacy tables without it keep working.
+        if not scope.is_admin:
+            desired_columns.add("user_id")
         if filters and isinstance(filters, dict):
             desired_columns.update(filters.keys())
 
@@ -2640,6 +2648,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 continue
 
             for _, row in batch_df.loc[mask].iterrows():
+                if not UserPermissions.can_access_data(
+                    scope.user_id, row.get("user_id"), scope.is_admin
+                ):
+                    continue
                 # Deserialize metadata from JSON string to dictionary
                 metadata = deserialize_metadata(row.get("metadata"))
                 results.append(
@@ -2952,6 +2964,8 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 top_k=top_k,
                 filters=filters,
                 current_warnings=current_warnings,
+                user_id=user_id,
+                is_admin=is_admin,
             )
 
             return self._build_sparse_response(

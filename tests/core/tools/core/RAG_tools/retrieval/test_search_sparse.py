@@ -616,6 +616,7 @@ class TestSearchSparse:
             top_k=5,
             filters=None,
             current_warnings=warnings,
+            is_admin=True,
         )
 
         # Verify results were found and warning was added

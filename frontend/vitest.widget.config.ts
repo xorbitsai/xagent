@@ -19,6 +19,8 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/file/inline-file-preview.tsx",
         "src/components/file/artifact-validation.tsx",
         "src/components/file/pptx-preview-renderer.tsx",
+        "src/components/file/excel-preview-renderer.tsx",
+        "src/components/file/excel-sheet-preview.ts",
         "src/components/task/task-conversation-panel.tsx",
         "src/components/ui/markdown-renderer.tsx",
         "src/components/widget/public-agent-chat-page.tsx",
@@ -143,6 +145,12 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/file/pptx-preview-renderer.tsx": {
           statements: 45, branches: 35, functions: 30, lines: 45,
         },
+        "src/components/file/excel-preview-renderer.tsx": {
+          statements: 85, branches: 75, functions: 90, lines: 85,
+        },
+        "src/components/file/excel-sheet-preview.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
         "src/components/task/task-conversation-panel.tsx": {
           statements: 80, branches: 70, functions: 60, lines: 80,
         },
@@ -177,6 +185,7 @@ export default defineConfig({
       "src/components/file/inline-file-preview.test.tsx",
       "src/components/file/artifact-validation.test.tsx",
       "src/components/file/pptx-preview-renderer.test.tsx",
+      "src/components/file/excel-preview-renderer.test.tsx",
       "src/components/layout/sidebar.test.tsx",
       "src/components/pages/login.test.tsx",
       "src/components/pages/oidc-callback.test.tsx",

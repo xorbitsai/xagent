@@ -74,6 +74,7 @@ ERROR_PAYLOAD_SINKS = {
     "broadcast_to_task",
     "send_text",
     "publish_task_event",
+    "publish_task_result",
     "reply",
 }
 

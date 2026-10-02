@@ -467,6 +467,23 @@ describe("ChatMessage Session file capability", () => {
     expect(copied).not.toContain("/private/raw-secret.csv")
   })
 
+  it.each([true, false])("labels an unfinished durable stream as interrupted (trace visible: %s)", (showProcessView) => {
+    render(<ChatMessage role="assistant" content="" processStatus="interrupted"
+      showProcessView={showProcessView} showEmptyStatus={false}
+      traceEvents={[{ event_type: "tool_execution_end", data: {} }]} />)
+    expect(screen.getByText("agent.layout.status.interrupted")).toBeInTheDocument()
+    expect(screen.queryByText("common.thinking")).not.toBeInTheDocument()
+  })
+
+  it("retains received text when a running stream becomes interrupted", () => {
+    const { rerender } = render(<ChatMessage role="assistant" content="Received answer prefix" processStatus="running" />)
+    expect(screen.getByText("Received answer prefix")).toBeInTheDocument()
+    rerender(<ChatMessage role="assistant" content="Received answer prefix" processStatus="interrupted" />)
+    expect(screen.getByText("Received answer prefix")).toBeInTheDocument()
+    expect(screen.getByText("agent.layout.status.interrupted")).toBeInTheDocument()
+    expect(screen.queryByText("common.thinking")).not.toBeInTheDocument()
+  })
+
   it("names the active tool in the status line while it is running", () => {
     render(
       <ChatMessage

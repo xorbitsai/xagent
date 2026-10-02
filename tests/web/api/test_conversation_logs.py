@@ -764,7 +764,8 @@ def test_conversation_logs_list_does_not_preload_off_page_messages() -> None:
     assert message_query_param_counts, (
         "Expected message queries to fire but none matched the SQL filter"
     )
-    assert max(message_query_param_counts) <= 5
+    # At most five page task IDs plus the V1-only storage-version predicate.
+    assert max(message_query_param_counts) <= 6
 
 
 def test_conversation_logs_list_batches_trigger_type_lookup() -> None:

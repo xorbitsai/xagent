@@ -15,6 +15,7 @@ from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.task import Task
 from ..models.user import User
+from ..services.task_event_metrics import monitoring_trace_source
 from ..utils.db_timezone import safe_timestamp_to_unix
 
 logger = logging.getLogger(__name__)
@@ -265,7 +266,9 @@ async def get_monitoring_stats(
     server's or the viewer's local day.
     """
     try:
-        from ..models.task import TraceEvent
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build TraceEvent query filter based on user permissions
         trace_event_filter = []
@@ -431,7 +434,7 @@ async def get_monitoring_stats(
             active_models = 0
 
         # Get total token count
-        total_tokens: int | None = 0
+        token_sum = 0
         tokens_found = False
         llm_end_events = (
             db.query(TraceEvent)
@@ -448,14 +451,14 @@ async def get_monitoring_stats(
                 if "total_tokens" in event.data and isinstance(
                     event.data["total_tokens"], int
                 ):
-                    total_tokens += event.data["total_tokens"]
+                    token_sum += event.data["total_tokens"]
                     tokens_found = True
                 elif "usage" in event.data and isinstance(event.data["usage"], dict):
                     usage = event.data["usage"]
                     if "total_tokens" in usage and isinstance(
                         usage["total_tokens"], int
                     ):
-                        total_tokens += usage["total_tokens"]
+                        token_sum += usage["total_tokens"]
                         tokens_found = True
                     elif (
                         "prompt_tokens" in usage
@@ -463,14 +466,11 @@ async def get_monitoring_stats(
                         and isinstance(usage["prompt_tokens"], int)
                         and isinstance(usage["completion_tokens"], int)
                     ):
-                        total_tokens += (
-                            usage["prompt_tokens"] + usage["completion_tokens"]
-                        )
+                        token_sum += usage["prompt_tokens"] + usage["completion_tokens"]
                         tokens_found = True
 
         # If no token information found, set to None
-        if not tokens_found:
-            total_tokens = None
+        total_tokens = token_sum if tokens_found else None
 
         return {
             "totalCalls": total_calls,
@@ -499,7 +499,9 @@ async def get_popular_tools(
 ) -> List[Dict[str, Any]]:
     """Get popular tools statistics"""
     try:
-        from ..models.task import TraceEvent
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build filter conditions based on user permissions
         trace_event_filter = []
@@ -563,7 +565,9 @@ async def get_model_stats(
 ) -> List[Dict[str, Any]]:
     """Get model usage statistics"""
     try:
-        from ..models.task import TraceEvent
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build filter conditions based on user permissions
         trace_event_filter = []
@@ -650,7 +654,11 @@ async def get_dashboard_stats(
     server's or the viewer's local day.
     """
     try:
-        from ..models.task import Task, TaskStatus, TraceEvent, task_status_predicate
+        from ..models.task import Task, TaskStatus, task_status_predicate
+
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build filter conditions based on user permissions
         task_filter = []

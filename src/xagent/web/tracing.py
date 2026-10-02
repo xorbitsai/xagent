@@ -207,7 +207,10 @@ def create_task_tracer(
         handlers=[
             ConsoleTraceHandler(),
             database_handler,
-            TaskEventTraceHandler(task_id),
+            TaskEventTraceHandler(
+                task_id,
+                authoritative=isinstance(database_handler, ExecutionEventTraceAdapter),
+            ),
         ],
         task_id=str(task_id),
         user_id=resolved_user_id,

@@ -45,6 +45,15 @@ describe("streaming final answer events", () => {
     ).toEqual([toolStart, toolEnd])
   })
 
+  it("restores an interrupted boundary without inventing partial text", () => {
+    expect(getFinalAnswerStreamActionPayload({
+      eventType: "final_answer_start", executionSequence: 10,
+      eventData: { message_id: "final_answer_1", status: "interrupted" },
+      timestamp: "2026-09-30T00:00:00Z",
+    })).toEqual({ messageId: "final_answer_1", status: "interrupted",
+      executionSequence: 10, timestamp: "2026-09-30T00:00:00Z" })
+  })
+
   it("marks error events as failed terminal stream updates", () => {
     const payload = getFinalAnswerStreamActionPayload({
       eventType: "final_answer_error",

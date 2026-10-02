@@ -21,7 +21,7 @@ from xagent.web.models.workforce import (
     WorkforceBuilderMessage,
     WorkforceRun,
 )
-from xagent.web.services import workforce_creator
+from xagent.web.services import task_agent_execution, workforce_creator
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 from .conftest import (
@@ -788,7 +788,7 @@ def test_agent_execution_status_recognizes_dag_terminal_events(
     expected: str,
 ) -> None:
     assert (
-        workforces_api._derive_agent_execution_status(
+        task_agent_execution._derive_agent_execution_status(
             [{"event_type": event_type, "data": {"result": result}}]
         )
         == expected

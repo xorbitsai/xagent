@@ -228,6 +228,7 @@ def test_jira_json_body_quirk_preserves_an_accept_header_if_ever_combined(
 def test_non_jira_callback_still_sends_form_urlencoded_body(db_session, monkeypatch):
     """Guard the branch condition: a non-jira provider must be unaffected by
     the Atlassian-specific JSON-body carve-out."""
+    monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", "true")
     db, user = db_session
     db.add(
         PublicMCPApp(

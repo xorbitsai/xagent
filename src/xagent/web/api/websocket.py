@@ -64,7 +64,7 @@ from ..models.database import (
     get_session_local,
     release_db_connection_if_clean,
 )
-from ..models.task import Task
+from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
@@ -91,6 +91,7 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.file_reference_output_service import (
+    load_assistant_file_reference_records,
     reconcile_assistant_file_references,
 )
 from ..services.file_turn import (
@@ -2015,6 +2016,200 @@ class _HistoricalStreamSnapshot:
     events: tuple[dict[str, Any], ...]
 
 
+def _history_task_info(db: Any, task: Any, task_id: int) -> dict[str, Any]:
+    from ..models.agent import Agent
+
+    # Determine is_dag from agent config if agent_id exists
+    is_dag = None
+    if task.agent_id:
+        agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
+        if agent:
+            is_dag = agent.execution_mode == "think"
+
+    (
+        model_id,
+        small_fast_model_id,
+        visual_model_id,
+        compact_model_id,
+    ) = command_execution_service._resolve_task_llm_ids(task, db)
+    waiting_question = None
+    waiting_interactions = None
+    if task.status == TaskStatus.WAITING_FOR_USER:
+        waiting_question, waiting_interactions = get_pending_interaction_question(
+            db, task
+        )
+
+    # Send task basic info
+    task_event = create_stream_event(
+        "task_info",
+        task_id,
+        {
+            "id": task.id,
+            "title": task.title,
+            "description": task.description,
+            "status": task.status.value,
+            "model_id": model_id,
+            "completion_outcome": task.completion_outcome,
+            "conversation_storage_version": task.conversation_storage_version,
+            "small_fast_model_id": small_fast_model_id,
+            "visual_model_id": visual_model_id,
+            "compact_model_id": compact_model_id,
+            "model_name": task.model_name,
+            "small_fast_model_name": task.small_fast_model_name,
+            "visual_model_name": task.visual_model_name,
+            "compact_model_name": task.compact_model_name,
+            "execution_mode": task.execution_mode,
+            "agent_id": task.agent_id,
+            "agent_name": task.agent.name if task.agent else None,
+            "agent_logo_url": task.agent.logo_url if task.agent else None,
+            "is_dag": is_dag,
+            "waiting_question": waiting_question,
+            "waiting_interactions": waiting_interactions,
+            "created_at": safe_timestamp_to_unix(task.created_at)
+            if task.created_at
+            else None,
+            "updated_at": safe_timestamp_to_unix(task.updated_at)
+            if task.updated_at
+            else None,
+        },
+        task.created_at if task.created_at else None,
+    )
+    return task_event
+
+
+def _load_event_historical_stream_snapshot(
+    db: Any, task: Any
+) -> _HistoricalStreamSnapshot:
+    from ..services.task_event_display import (
+        display_horizon,
+        load_event_display_snapshot,
+    )
+
+    task_id = int(task.id)
+    horizon = display_horizon(db, task_id)
+    info = _history_task_info(db, task, task_id)
+    state = task_control_snapshot(task).as_dict()
+    active_run_id = (
+        db.query(Task.run_id)
+        .filter(
+            Task.id == task_id,
+            Task.runner_id.isnot(None),
+            Task.run_id.isnot(None),
+            Task.lease_expires_at >= datetime.now(timezone.utc),
+        )
+        .scalar()
+    )
+    version = {
+        "active_run_id": active_run_id,
+        "scope": "execution-events-root-v1",
+        "horizon": horizon,
+        "task": info["data"],
+        "control": state,
+        "lease_expires_at": cache_version_token(task.lease_expires_at),
+    }
+    cache_key = web_task_history_key(task_id)
+    cached = cache_get(cache_key) if release_db_connection_if_clean(db) else None
+    if isinstance(cached, dict) and cached.get("event_version") == version:
+        return _HistoricalStreamSnapshot(events=tuple(cached["events"]))
+
+    snapshot = load_event_display_snapshot(
+        db,
+        task_id,
+        through_sequence=horizon,
+        active_run_id=active_run_id,
+    )
+    events: list[dict[str, Any]] = [info]
+    records = load_assistant_file_reference_records(
+        db, task_id=task_id, user_id=int(task.user_id)
+    )
+    paths: dict[str, str] = {}
+    converted = []
+    for event in snapshot.events:
+        event = dict(event)
+        is_trace = event["type"] == "trace_event"
+        data = dict(event["data"]) if is_trace else event
+        if "file_outputs" in data:
+            data["file_outputs"], mapping = _normalize_task_file_outputs(
+                db,
+                None,
+                data["file_outputs"],
+                task_id=task_id,
+                task_user_id=int(task.user_id),
+            )
+            paths.update(mapping)
+        if event.get("event_type", event["type"]) in {
+            "agent_message",
+            "final_answer_end",
+        }:
+            for field in ("message", "content"):
+                if isinstance(data.get(field), str):
+                    data[field] = reconcile_assistant_file_references(
+                        db,
+                        task_id=task_id,
+                        user_id=int(task.user_id),
+                        content=data[field],
+                        records=records,
+                    )
+        if is_trace:
+            event["data"] = data
+        event["timestamp"] = safe_timestamp_to_unix(event["timestamp"])
+        converted.append(event)
+    for event in converted:
+        if paths:
+            if event["type"] == "trace_event":
+                event["data"] = _rewrite_links_in_payload(event["data"], paths)
+            else:
+                event = _rewrite_links_in_payload(event, paths)
+        events.append(event)
+    events.append(
+        create_stream_event(
+            "historical_data_complete",
+            task_id,
+            {
+                "message": "Historical data loading complete",
+                "total_trace_events": len(converted),
+            },
+        )
+    )
+    # The cache lookup released the original read transaction. Reassert one
+    # current control tuple, including its matching pending question, rather
+    # than combining a refreshed status with the earlier state version.
+    db.refresh(task)
+    current_state = task_control_snapshot(task).as_dict()
+    state_changed = current_state != state
+    if state_changed:
+        info = _history_task_info(db, task, task_id)
+        events[0] = info
+    if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
+        kind, default = _waiting_or_paused_event_fields(task.status)
+        question = info["data"]["waiting_question"]
+        status_event = {
+            "type": kind,
+            "display": "timeline",
+            "task_id": task_id,
+            "message": question or default,
+            "timestamp": datetime.now(timezone.utc).timestamp(),
+            **current_state,
+        }
+        if question:
+            status_event["question"] = question
+        interactions = info["data"]["waiting_interactions"]
+        if isinstance(interactions, list):
+            status_event["interactions"] = interactions
+        events.append(status_event)
+    detached = [
+        _with_task_control_state_snapshot(e, task_id=task_id, state=current_state)
+        for e in events
+    ]
+    if release_db_connection_if_clean(db) and not state_changed:
+        cache_set(
+            cache_key,
+            {"event_version": version, "events": detached},
+            ttl_seconds=task_cache_ttl_seconds(),
+        )
+    return _HistoricalStreamSnapshot(events=tuple(detached))
+
+
 def _load_historical_stream_snapshot_sync(
     task_id: int,
     *,
@@ -2024,7 +2219,6 @@ def _load_historical_stream_snapshot_sync(
     """Load, normalize, and cache one historical replay in a short Session."""
     try:
         # Load historical data directly from database
-        from ..models.agent import Agent
         from ..models.database import get_db
         from ..models.task import Task, TaskStatus, TraceEvent
         from ..models.workforce import WorkforceRun
@@ -2053,6 +2247,9 @@ def _load_historical_stream_snapshot_sync(
                     task.user_id,
                 )
                 return None
+
+            if task.conversation_storage_version == 2:
+                return _load_event_historical_stream_snapshot(db, task)
 
             is_workforce_run = (
                 db.query(WorkforceRun.id)
@@ -2113,60 +2310,9 @@ def _load_historical_stream_snapshot_sync(
 
             cached_stream_events: list[dict[str, Any]] = []
 
-            # Determine is_dag from agent config if agent_id exists
-            is_dag = None
-            if task.agent_id:
-                agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
-                if agent:
-                    is_dag = agent.execution_mode == "think"
-
-            (
-                model_id,
-                small_fast_model_id,
-                visual_model_id,
-                compact_model_id,
-            ) = command_execution_service._resolve_task_llm_ids(task, db)
-            waiting_question = None
-            waiting_interactions = None
-            if task.status == TaskStatus.WAITING_FOR_USER:
-                waiting_question, waiting_interactions = (
-                    get_pending_interaction_question(db, task)
-                )
-
-            # Send task basic info
-            task_event = create_stream_event(
-                "task_info",
-                task_id,
-                {
-                    "id": task.id,
-                    "title": task.title,
-                    "description": task.description,
-                    "status": task.status.value,
-                    "model_id": model_id,
-                    "completion_outcome": task.completion_outcome,
-                    "small_fast_model_id": small_fast_model_id,
-                    "visual_model_id": visual_model_id,
-                    "compact_model_id": compact_model_id,
-                    "model_name": task.model_name,
-                    "small_fast_model_name": task.small_fast_model_name,
-                    "visual_model_name": task.visual_model_name,
-                    "compact_model_name": task.compact_model_name,
-                    "execution_mode": task.execution_mode,
-                    "agent_id": task.agent_id,
-                    "agent_name": task.agent.name if task.agent else None,
-                    "agent_logo_url": task.agent.logo_url if task.agent else None,
-                    "is_dag": is_dag,
-                    "waiting_question": waiting_question,
-                    "waiting_interactions": waiting_interactions,
-                    "created_at": safe_timestamp_to_unix(task.created_at)
-                    if task.created_at
-                    else None,
-                    "updated_at": safe_timestamp_to_unix(task.updated_at)
-                    if task.updated_at
-                    else None,
-                },
-                task.created_at if task.created_at else None,
-            )
+            task_event = _history_task_info(db, task, task_id)
+            waiting_question = task_event["data"]["waiting_question"]
+            waiting_interactions = task_event["data"]["waiting_interactions"]
             cached_stream_events.append(task_event)
 
             # Replay only top-level task events. Delegated Agent internals can

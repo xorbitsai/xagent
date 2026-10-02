@@ -152,6 +152,7 @@ def test_zoom_callback_exchanges_code_with_http_basic_auth(db_session, monkeypat
 def test_non_zoom_callback_still_sends_client_secret_in_body(db_session, monkeypatch):
     """Guard the branch condition: a non-zoom provider must be unaffected by the
     Zoom-specific Basic-Auth carve-out."""
+    monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", "true")
     db, user = db_session
     db.add(
         PublicMCPApp(

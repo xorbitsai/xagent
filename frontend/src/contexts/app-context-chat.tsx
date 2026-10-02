@@ -30,6 +30,8 @@ interface WebSocketMessage {
   step_id?: string
   event_type?: string
   event_id?: string
+  message_id?: string
+  execution_sequence?: number
   run_id?: string | null
   stream_run_id?: string | null
   stream_attempt_id?: string | null
@@ -660,10 +662,11 @@ interface Message {
   content: string | React.ReactNode
   rawContent?: string
   timestamp: string
-  status?: "pending" | "running" | "completed" | "failed"
+  status?: "pending" | "running" | "completed" | "failed" | "interrupted"
   isResult?: boolean
   isFileOutput?: boolean
   streamMessageId?: string
+  executionSequence?: number
   traceEvents?: TraceEvent[]
   interactions?: Interaction[]
   interactionRequestId?: string
@@ -687,6 +690,7 @@ export interface Task {
   title: string
   status: TaskStatus
   completionOutcome?: TaskCompletionOutcome
+  conversationStorageVersion?: number
   description: string
   createdAt: string | number
   updatedAt: string | number
@@ -896,6 +900,9 @@ const taskFromTaskInfoData = (
   description: taskData.description as string,
   status: normalizeTaskStatus(taskData.status) || "pending",
   completionOutcome: normalizeCompletionOutcome(taskData.completion_outcome),
+  ...(taskData.conversation_storage_version !== undefined
+    ? { conversationStorageVersion: taskData.conversation_storage_version as number }
+    : {}),
   createdAt: taskData.created_at as string | number,
   updatedAt: taskData.updated_at as string | number,
   modelId: taskData.model_id as string | undefined,
@@ -1250,7 +1257,7 @@ type AppAction =
   | { type: "ADOPT_SESSION_TASK"; payload: { taskId: number; task: Task } }
   | { type: "RESET_SESSION_CONVERSATION" }
   | { type: "ADD_MESSAGE"; payload: Message }
-  | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
+  | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; executionSequence?: number; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; completionOutcome?: TaskCompletionOutcome; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
@@ -1416,6 +1423,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
 
       if (newMessage.role === "assistant" && newMessage.isResult) {
         const replaceMessageAt = (targetIndex: number) => {
+          const existingSequence = state.messages[targetIndex].executionSequence
+          if (existingSequence !== undefined && newMessage.executionSequence !== undefined
+            && newMessage.executionSequence <= existingSequence) return state
           const updatedMessages = state.messages.map((message, index) =>
             index === targetIndex
               ? {
@@ -1429,14 +1439,15 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           )
           return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
         }
-        if (newMessage.streamMessageId) {
-          const streamingIndex = state.messages.findIndex(
+        if (newMessage.streamMessageId || newMessage.executionSequence !== undefined) {
+          const targetId = newMessage.streamMessageId ?? newMessage.id
+          const deliveredIndex = state.messages.findIndex(
             message =>
-              message.id === newMessage.streamMessageId &&
-              isStreamingFinalAnswerMessage(message)
+              message.role === "assistant" && message.id === targetId &&
+              (!newMessage.streamMessageId || isStreamingFinalAnswerMessage(message))
           )
-          if (streamingIndex >= 0) {
-            return replaceMessageAt(streamingIndex)
+          if (deliveredIndex >= 0) {
+            return replaceMessageAt(deliveredIndex)
           }
         }
       }
@@ -1564,10 +1575,26 @@ function projectAppState(state: AppState, action: AppAction): AppState {
     }
 
     case "UPSERT_STREAMING_FINAL_ANSWER": {
-      const { messageId, delta, content, status, timestamp } = action.payload
+      const { messageId, delta, content, status, timestamp, executionSequence } = action.payload
       const existing = state.messages.find(message => message.id === messageId)
+      if (existing?.executionSequence !== undefined) {
+        if (executionSequence !== undefined && executionSequence <= existing.executionSequence) {
+          // Ownership can end without adding another stream fact. Refresh
+          // that start's status, but never downgrade newer or terminal text.
+          if (executionSequence === existing.executionSequence
+            && status === "interrupted" && existing.status === "running") {
+            return { ...state, messages: state.messages.map(message =>
+              message.id === messageId ? { ...message, status: "interrupted" } : message
+            ) }
+          }
+          return state
+        }
+        // Deltas are ephemeral; a durable terminal frame owns the full text.
+        if (executionSequence === undefined && existing.status !== "running") return state
+      }
       if (!existing) {
         const message: Message = {
+          executionSequence,
           id: messageId,
           role: "assistant",
           content: content || delta || "",
@@ -1590,6 +1617,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           ...message,
           content: nextContent,
           rawContent: nextContent,
+          executionSequence: executionSequence ?? message.executionSequence,
           status: status || message.status || "running",
         }
       })
@@ -2326,6 +2354,8 @@ export function AppProvider({
     interrupted: boolean
     prefixSeen: boolean
     complete: boolean
+    messageId?: string
+    executionSequence?: number
   }>({ interrupted: false, prefixSeen: false, complete: false })
   const taskStateVersionsRef = useRef(
     new Map<number, TaskStateVersionEntry>()
@@ -2985,34 +3015,53 @@ export function AppProvider({
         if (stream.attemptId && message.stream_attempt_id !== stream.attemptId) return
       }
       const streamType = getWebSocketEventType(message)
-      if (stream.complete && isFinalAnswerStreamEventType(streamType)) return
-      if (streamType === "final_answer_start") {
-        stream.prefixSeen = true
-        stream.interrupted = false
-        dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
-      }
       if (isFinalAnswerStreamEventType(streamType)) {
         const sharedFrame = message.stream_run_id !== undefined
         const data = asMessageRecord(message.data)
         const eventData = message.type === "trace_event"
           ? asMessageRecord(data.data ?? data)
           : { ...data, ...message }
-        const replacesContent = sharedFrame && (
-          (streamType === "final_answer_end" && typeof eventData.content === "string")
-          || (streamType === "final_answer_error" && typeof eventData.error === "string")
-        )
-        if (sharedFrame && streamType === "final_answer_delta" && !stream.prefixSeen) {
-          stream.interrupted = true
-          dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
-          return
+        const executionSequence = message.execution_sequence
+        // Historical frames still update their own bubbles below. Only a
+        // newer boundary can change which occurrence owns transport flags.
+        const updatesCurrentStream = executionSequence === undefined
+          || stream.executionSequence === undefined
+          || executionSequence > stream.executionSequence
+        if (updatesCurrentStream) {
+          if (executionSequence !== undefined) {
+            if (eventData.message_id !== stream.messageId) {
+              stream.complete = false
+              stream.prefixSeen = false
+              stream.interrupted = false
+            }
+            stream.messageId = eventData.message_id as string
+            stream.executionSequence = executionSequence
+          }
+          if (stream.complete && executionSequence === undefined
+            && (stream.executionSequence === undefined || eventData.message_id === stream.messageId)) return
+          if (streamType === "final_answer_start") {
+            stream.prefixSeen = true
+            stream.interrupted = false
+            dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+          }
+          const replacesContent = (sharedFrame || executionSequence !== undefined) && (
+            (streamType === "final_answer_end" && typeof eventData.content === "string")
+            || (streamType === "final_answer_error" && typeof eventData.error === "string")
+          )
+          if (sharedFrame && streamType === "final_answer_delta"
+            && (!stream.prefixSeen || (stream.executionSequence !== undefined && eventData.message_id !== stream.messageId))) {
+            stream.interrupted = true
+            dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
+            return
+          }
+          if (replacesContent) {
+            stream.prefixSeen = true
+            stream.interrupted = false
+            dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+          }
+          if (stream.interrupted) return
+          if (replacesContent) stream.complete = true
         }
-        if (replacesContent) {
-          stream.prefixSeen = true
-          stream.interrupted = false
-          dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
-        }
-        if (stream.interrupted) return
-        if (replacesContent) stream.complete = true
       }
     }
     // The 30s dedup cache below is keyed on message content/type only, not
@@ -3219,6 +3268,7 @@ export function AppProvider({
         eventType: message.type,
         eventData: message,
         eventId: message.event_id,
+        executionSequence: message.execution_sequence,
         timestamp: message.timestamp,
         fallbackMessageId: generateMessageId("msg-final-answer"),
       })
@@ -3256,6 +3306,19 @@ export function AppProvider({
                 data: eventData,
               }
             })
+          }
+
+          // V2 completion/AI facts are timeline entries. The owning durable
+          // assistant message supplies the bubble, with an explicit stream alias.
+          if (eventData.display === "timeline" && (eventType === "task_completion" || eventType === "ai_message")) {
+            dispatch({ type: "ADD_TRACE_EVENT", payload: {
+              event_id: message.event_id || traceEventData.event_id,
+              event_type: eventType,
+              step_id: message.step_id || eventData.step_id,
+              timestamp: message.timestamp,
+              data: eventData,
+            } })
+            return
           }
 
           // Handle structured trace events
@@ -3440,6 +3503,7 @@ export function AppProvider({
               eventType,
               eventData,
               eventId: message.event_id,
+              executionSequence: message.execution_sequence,
               timestamp: message.timestamp,
               fallbackMessageId: generateMessageId("msg-final-answer"),
             })
@@ -3551,21 +3615,24 @@ export function AppProvider({
                 }
               })
             }
-            const streamMessageId =
-              isAiMessage
+            const canonicalMessageId = typeof eventData.message_id === "string"
+              && (eventData.message_id.startsWith("execution_message_") || eventData.message_id.startsWith("final_answer_"))
+              ? eventData.message_id : undefined
+            const streamMessageId = canonicalMessageId?.startsWith("final_answer_")
+              ? canonicalMessageId : isAiMessage
                 ? getFinalAnswerStreamMessageId(eventData)
                 : undefined
             if (shouldHideAgentMessage) {
               return
             }
-            if (!streamMessageId && isDuplicateMessageForViewedTask(
+            if (!canonicalMessageId && !streamMessageId && isDuplicateMessageForViewedTask(
               messageContent,
               'agent-message',
               isAgentMessage ? interactionRequestId : undefined,
             )) {
               return
             }
-            const msgId =
+            const msgId = canonicalMessageId ??
               (isAgentMessage
                 ? stableAssistantMessageId(
                   message.event_id || traceEventData.event_id || eventData.event_id,
@@ -3579,9 +3646,11 @@ export function AppProvider({
                 content: messageContent,
                 rawContent: messageContent,
                 timestamp: message.timestamp,
-                status: eventData.status === "completed" ? "completed" : "running",
+                status: canonicalMessageId ? (eventData.message_type === "task_failure" ? "failed" : "completed")
+                  : eventData.status === "completed" ? "completed" : "running",
                 isResult: true,
                 streamMessageId,
+                executionSequence: message.execution_sequence,
                 interactions: interactions.length > 0 ? interactions : undefined,
                 interactionRequestId,
               }
@@ -5764,11 +5833,11 @@ export function AppProvider({
           const lastMessage = currentState.messages[currentState.messages.length - 1]
           const lastContent =
             typeof lastMessage?.content === "string" ? lastMessage.content : ""
-          if (failureReason && lastContent !== failureReason) {
+          if (failureReason && (message.message_id || lastContent !== failureReason)) {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
-                id: generateMessageId("msg-task-failed"),
+                id: typeof message.message_id === "string" ? message.message_id : generateMessageId("msg-task-failed"),
                 role: "assistant",
                 // The reason verbatim, no prefix: a reload replays the
                 // persisted transcript row (this same text), so any live-only
@@ -6016,6 +6085,7 @@ export function AppProvider({
         })
         dispatch({ type: "SET_PROCESSING", payload: false })
         if (
+          waitingRoot.display !== "timeline" && waitingData.display !== "timeline" &&
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
           !isDuplicateMessageForViewedTask(
@@ -6159,7 +6229,7 @@ export function AppProvider({
         }
 
         if (
-          !isDuplicateMessageForViewedTask(
+          !message.message_id && !isDuplicateMessageForViewedTask(
             errorFrame.dedupText,
             "agent-error",
             errorFrame.occurrenceIdentity,
@@ -6874,6 +6944,7 @@ export function AppProvider({
             agentId: taskData.agent_id,
             agentName: taskData.agent_name,
             agentLogoUrl: taskData.agent_logo_url,
+            conversationStorageVersion: taskData.conversation_storage_version,
             waitingQuestion: taskData.waiting_question,
             waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
             runId: taskData.run_id,

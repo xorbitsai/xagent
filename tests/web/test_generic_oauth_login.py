@@ -241,7 +241,9 @@ def test_google_drive_login_does_not_reuse_previous_granted_scopes(db_session):
     }
 
 
-def test_other_google_connector_keeps_incremental_authorization(db_session):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_google_scope_aggregation(db_session, monkeypatch, enabled):
+    monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", str(enabled))
     db, user = db_session
     db.add(
         PublicMCPApp(
@@ -273,7 +275,7 @@ def test_other_google_connector_keeps_incremental_authorization(db_session):
     )
 
     params = parse_qs(urlparse(_location(response)).query)
-    assert params["include_granted_scopes"] == ["true"]
+    assert params["include_granted_scopes"] == ["true" if enabled else "false"]
 
 
 def test_auth_url_with_query_uses_ampersand_separator(db_session):

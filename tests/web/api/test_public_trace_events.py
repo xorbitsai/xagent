@@ -184,7 +184,7 @@ def test_public_trace_folds_non_string_memory_reason_without_failing() -> None:
 
 
 def test_top_level_failed_pattern_status_survives_public_normalization() -> None:
-    from xagent.web.api.workforces import _derive_agent_execution_status
+    from xagent.web.services.task_agent_execution import _derive_agent_execution_status
 
     event_type, data = normalize_public_trace_event(
         "dag_execute_end",

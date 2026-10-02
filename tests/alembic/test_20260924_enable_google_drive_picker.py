@@ -135,9 +135,12 @@ def test_revision_metadata() -> None:
     assert migration.down_revision == "20260924_hide_google_drive_until_picker"
 
 
-def test_registry_is_visible_after_picker_migration() -> None:
+def test_registry_exposes_drive_when_restricted_scope_gate_is_enabled(
+    monkeypatch,
+) -> None:
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 
+    monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", "true")
     app = get_builtin_public_mcp_app("google-drive")
     assert app is not None
     assert app["is_visible_in_connector"] is True

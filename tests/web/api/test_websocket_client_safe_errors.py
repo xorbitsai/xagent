@@ -270,8 +270,10 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # to the original 51. Unknown delivery adds a personal coded notice.
     # Its task-wide copy, published when no origin can receive the personal
     # one, brings the census to 55.
-    assert result.error_payloads == 55, (
-        f"expected exactly 55 error payloads, matched {result.error_payloads}; "
+    # V2 resume also wraps its safe terminal constructor with committed control
+    # identity; the scanner visits both the constructor and the wrapper.
+    assert result.error_payloads == 56, (
+        f"expected exactly 56 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -3312,3 +3314,10 @@ async def handle_task_message(reply):
     )
     assert result.error_payloads == 1
     assert result.offenders
+
+
+def test_result_publication_guard_rejects_raw_exception_text():
+    assert _guard_offenders("""
+async def report(exc, task_id):
+    await publish_task_result({"type": "task_error", "message": str(exc)}, task_id)
+""")

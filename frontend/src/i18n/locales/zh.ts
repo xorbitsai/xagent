@@ -1529,6 +1529,10 @@ const zh = {
         hint: "请尝试下载查看",
       },
       emptyContent: "文件内容为空",
+      formulas: {
+        missingResult: "未计算",
+        missingResults: "此工作表有 {count} 个公式单元格未保存计算结果，已尽可能显示公式；本预览不会计算公式。请下载文件并用表格软件打开后重算。",
+      },
       errors: {
         loadFailed: "文件加载失败",
         docxRenderFailed: "DOCX 预览渲染失败",

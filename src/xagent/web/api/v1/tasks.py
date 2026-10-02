@@ -20,7 +20,7 @@ one state machine.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -416,6 +416,7 @@ class _TaskStepsVersionSnapshot:
     agent_id: int
     max_event_id: int
     traces_expired_at: datetime | None
+    storage_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -439,6 +440,7 @@ class _TaskStepsSnapshot:
     max_event_id: int
     traces_expired_at: datetime | None
     events: tuple[_TraceEventSnapshot, ...]
+    storage_version: int = 1
 
 
 def _read_traces_expired_at(task_id: int, db: Session) -> datetime | None:
@@ -507,6 +509,16 @@ def _load_task_steps_version_snapshot(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         task = _resolve_task_or_404(task_id, principal, db)
+        if task.conversation_storage_version == 2:
+            from ...services.task_event_display import display_horizon
+
+            return _TaskStepsVersionSnapshot(
+                task_id=int(task.id),
+                agent_id=int(task.agent_id),
+                max_event_id=display_horizon(db, task_id),
+                traces_expired_at=None,
+                storage_version=2,
+            )
         max_event_id = (
             db.query(func.max(TraceEvent.id))
             .filter(
@@ -533,6 +545,31 @@ def _load_task_steps_snapshot(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         task = _resolve_task_or_404(task_id, principal, db)
+        if task.conversation_storage_version == 2:
+            from ...services.task_event_display import load_event_display_snapshot
+
+            view = load_event_display_snapshot(db, task_id)
+            return _TaskStepsSnapshot(
+                task_id=int(task.id),
+                agent_id=int(task.agent_id),
+                max_event_id=view.horizon,
+                traces_expired_at=None,
+                storage_version=2,
+                events=tuple(
+                    _TraceEventSnapshot(
+                        task_id=task_id,
+                        event_id=event["event_id"],
+                        event_type=event["event_type"],
+                        timestamp=datetime.fromtimestamp(
+                            event["timestamp"], timezone.utc
+                        ),
+                        step_id=event["step_id"],
+                        data=event["data"],
+                    )
+                    for event in view.events
+                    if event["type"] == "trace_event"
+                ),
+            )
         rows = (
             db.query(TraceEvent)
             .filter(
@@ -658,6 +695,7 @@ def _get_chat_task_steps_sync(
     # touched -- the ones whose cached body is still right without the flag.
     if (
         isinstance(cached, dict)
+        and cached.get("storage_version", 1) == version.storage_version
         and cached.get("max_event_id") == version.max_event_id
         and cached.get("traces_expired_at")
         == cache_version_token(version.traces_expired_at)
@@ -676,6 +714,7 @@ def _get_chat_task_steps_sync(
     cache_set(
         cache_key,
         {
+            "storage_version": snapshot.storage_version,
             "max_event_id": snapshot.max_event_id,
             "traces_expired_at": cache_version_token(snapshot.traces_expired_at),
             "response": response.model_dump(mode="json"),

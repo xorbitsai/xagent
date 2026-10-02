@@ -226,10 +226,12 @@ describe("workforces-api", () => {
       }),
     )
 
-    await getWorkforceAgentExecution(5, 760, "agent_17 run")
+    const signal = new AbortController().signal
+    await getWorkforceAgentExecution(5, 760, "agent_17 run", signal)
 
     expect(apiRequestMock).toHaveBeenCalledWith(
       "http://api.local/api/workforces/5/runs/760/agent-executions/agent_17%20run",
+      { signal },
     )
   })
 

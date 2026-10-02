@@ -19,4 +19,4 @@ export const stableAssistantMessageId = (eventId: unknown): string | null => {
 }
 
 export const isStableAssistantMessageId = (id: string): boolean =>
-  id.startsWith(`${ASSISTANT_EVENT_MESSAGE_PREFIX}-`)
+  id.startsWith(`${ASSISTANT_EVENT_MESSAGE_PREFIX}-`) || id.startsWith("execution_message_")

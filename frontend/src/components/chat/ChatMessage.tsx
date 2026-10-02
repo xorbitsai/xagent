@@ -448,6 +448,7 @@ export function ChatMessage({
   // unanswered turns are the exception once the trace is hidden (see above).
   const isProcessOnlyMessage =
     hasTraceEvents &&
+    resolvedProcessStatus !== "interrupted" &&
     !isUser &&
     !content &&
     showEmptyStatus === false &&
@@ -565,7 +566,7 @@ export function ChatMessage({
               ) : (
                 // A past paused/waiting turn has showEmptyStatus=false, but with
                 // the trace hidden its status line is all that marks the turn.
-                !isUser && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
+                !isUser && resolvedProcessStatus !== "interrupted" && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
                   <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} />
                 )
               )}
@@ -601,6 +602,9 @@ export function ChatMessage({
                     onSend={onSendInteraction}
                   />
                 </div>
+              )}
+              {resolvedProcessStatus === "interrupted" && (
+                <div className="py-3 text-sm text-muted-foreground">{t("agent.layout.status.interrupted")}</div>
               )}
             </div>
           </div>

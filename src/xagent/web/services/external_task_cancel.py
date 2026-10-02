@@ -29,6 +29,7 @@ surface needs.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from sqlalchemy import func, update
 from sqlalchemy.orm import Session
@@ -45,7 +46,7 @@ from .chat_history_service import (
 )
 from .db_runtime import run_db_io_cancellation_safe
 from .task_command_transport import TaskCommandRejected
-from .task_execution_controller import TaskControlState
+from .task_execution_controller import TaskControlState, task_control_snapshot
 from .task_lease_service import task_settlement_ownership_values
 
 logger = logging.getLogger(__name__)
@@ -243,6 +244,7 @@ def _load_cancelable_external_task_sync(
     agent_id: int,
     expected_run_id: str | None,
     expected_state_version: int,
+    terminal_event_state: dict[str, Any] | None = None,
 ) -> bool:
     """Return whether the exact cancel target is already settled."""
 
@@ -254,6 +256,11 @@ def _load_cancelable_external_task_sync(
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
         ):
+            if (
+                terminal_event_state is not None
+                and task.conversation_storage_version == 2
+            ):
+                terminal_event_state.update(task_control_snapshot(task).as_dict())
             return True
         _assert_external_cancel_target(
             task,
@@ -371,6 +378,7 @@ def _finalize_external_cancel_sync(
     expected_run_id: str | None,
     expected_state_version: int,
     turn_id: str | None,
+    terminal_event_state: dict[str, Any] | None = None,
 ) -> None:
     """Atomically persist cancellation for one exact task-state target."""
 
@@ -382,6 +390,11 @@ def _finalize_external_cancel_sync(
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
         ):
+            if (
+                terminal_event_state is not None
+                and task.conversation_storage_version == 2
+            ):
+                terminal_event_state.update(task_control_snapshot(task).as_dict())
             return
         _assert_external_cancel_target(
             task,
@@ -432,20 +445,31 @@ def _finalize_external_cancel_sync(
                 updated,
                 {"status": "cancelled", "error": EXTERNAL_CANCEL_ERROR_MESSAGE},
             )
+        event_state = (
+            task_control_snapshot(updated).as_dict()
+            if updated.conversation_storage_version == 2
+            else {}
+        )
         db.commit()
+        if terminal_event_state is not None:
+            terminal_event_state.update(event_state)
         _invalidate_task_cache_after_commit(task_id)
 
 
-async def _broadcast_external_cancel_terminal_event(task_id: int) -> None:
-    from .task_events import publish_task_event
+async def _broadcast_external_cancel_terminal_event(
+    task_id: int, terminal_event_state: dict[str, Any]
+) -> None:
+    from .task_event_display import publish_task_result
     from .task_execution import create_terminal_task_error_event
 
     try:
-        await publish_task_event(
-            create_terminal_task_error_event(
-                task_id,
-                EXTERNAL_TURN_INTERRUPTED_MESSAGE,
-            ),
+        await publish_task_result(
+            {
+                **create_terminal_task_error_event(
+                    task_id, EXTERNAL_TURN_INTERRUPTED_MESSAGE
+                ),
+                **terminal_event_state,
+            },
             task_id,
         )
     except Exception:
@@ -468,12 +492,14 @@ async def cancel_external_task_unserialized(
 ) -> None:
     """Cancel one exact durable-command target while the caller owns its gate."""
 
+    terminal_event_state: dict[str, Any] = {}
     already_settled = await run_db_io_cancellation_safe(
         lambda: _load_cancelable_external_task_sync(
             task_id=task_id,
             agent_id=agent_id,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
+            terminal_event_state=terminal_event_state,
         )
     )
     if not already_settled:
@@ -490,6 +516,7 @@ async def cancel_external_task_unserialized(
                 expected_run_id=expected_run_id,
                 expected_state_version=expected_state_version,
                 turn_id=turn_id,
+                terminal_event_state=terminal_event_state,
             )
         )
-    await _broadcast_external_cancel_terminal_event(task_id)
+    await _broadcast_external_cancel_terminal_event(task_id, terminal_event_state)

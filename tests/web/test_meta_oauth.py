@@ -40,7 +40,9 @@ class NonJsonResponse(MockResponse):
 
 
 @pytest.fixture()
-def db_session(tmp_path):
+def db_session(tmp_path, monkeypatch):
+    # Gmail callback tests exercise the enabled review environment.
+    monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", "true")
     db_path = tmp_path / "test.db"
     engine = create_engine(
         f"sqlite:///{db_path}", connect_args={"check_same_thread": False}

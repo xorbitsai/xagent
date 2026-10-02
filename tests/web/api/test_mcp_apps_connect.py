@@ -1098,21 +1098,28 @@ def test_connect_rejects_oauth_app(test_db):
 
     from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
 
+    # Isolate auth-mode validation from builtin release gates such as Gmail.
+    app_id = "custom-oauth"
     test_db.add(
         PublicMCPApp(
-            app_id="gmail", name="gmail", transport="oauth", provider_name="google"
+            app_id=app_id,
+            name="Custom OAuth",
+            transport="oauth",
+            provider_name="google",
+            is_visible_in_connector=True,
         )
     )
     test_db.commit()
 
     with pytest.raises(HTTPException) as exc:
         connect_mcp_app(
-            "gmail",
+            app_id,
             MCPAppConnectRequest(env={"X": "y"}),
             current_user=_user(test_db, 1),
             db=test_db,
         )
     assert exc.value.status_code == 400
+    assert exc.value.detail == "OAuth apps must be connected via the OAuth flow"
 
 
 def test_connect_keyless_app_creates_association_without_env(test_db):

@@ -1151,6 +1151,7 @@ async def get_task(
                 "description": task.description,
                 "status": status_value,
                 "completion_outcome": task.completion_outcome,
+                "conversation_storage_version": task.conversation_storage_version,
                 "run_id": task.run_id,
                 "state_version": int(task.state_version or 0),
                 "control_state": str(task.control_state or "idle"),
@@ -1215,6 +1216,24 @@ async def get_task(
     except Exception as e:
         logger.error(f"Get task failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@chat_router.get("/task/{task_id}/agent-executions/{worker_task_id}")
+def get_task_agent_execution(
+    task_id: int,
+    worker_task_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    from ..services.task_agent_execution import load_agent_execution_detail
+
+    query = db.query(Task).filter(Task.id == task_id)
+    if not user.is_admin:
+        query = query.filter(Task.user_id == user.id)
+    task = query.first()
+    if task is None:
+        _raise_task_expired_or_not_found(db, user, task_id)
+    return load_agent_execution_detail(db, task, worker_task_id)
 
 
 @chat_router.get("/task/{task_id}/status")

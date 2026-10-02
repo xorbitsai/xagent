@@ -286,6 +286,7 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
     )
     from ..builtin_mcp_registry import (
         seed_builtin_oauth_and_public_mcp_apps,
+        sync_google_scope_policy,
         validate_builtin_public_mcp_apps,
     )
     from .task import check_task_status_enum_drift
@@ -312,12 +313,14 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
             check_task_status_enum_drift(locked_connection)
             if should_seed_builtin_mcp_registry:
                 seed_builtin_oauth_and_public_mcp_apps(locked_connection)
+            sync_google_scope_policy(locked_connection)
             return validate_builtin_public_mcp_apps(locked_connection)
 
         with engine.begin() as connection:
             check_task_status_enum_drift(connection)
             if should_seed_builtin_mcp_registry:
                 seed_builtin_oauth_and_public_mcp_apps(connection)
+            sync_google_scope_policy(connection)
             return validate_builtin_public_mcp_apps(connection)
 
 

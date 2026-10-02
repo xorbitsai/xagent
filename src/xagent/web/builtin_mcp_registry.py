@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from copy import deepcopy
 from typing import Any, Literal
@@ -13,6 +14,14 @@ from ..builtin_identity import (
     builtin_provenance_identity,
     canonicalize_builtin_identity,
 )
+from ..config import get_google_restricted_scopes
+
+logger = logging.getLogger(__name__)
+
+GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+GOOGLE_GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+GOOGLE_RESTRICTED_SCOPES = frozenset({GOOGLE_DRIVE_SCOPE, GOOGLE_GMAIL_SCOPE})
 
 OAUTH_PROVIDERS_TABLE = sa.table(
     "oauth_providers",
@@ -436,6 +445,7 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
 
 
 def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
+    restricted_scopes = get_google_restricted_scopes()
     return [
         {
             "app_id": "linkedin",
@@ -461,12 +471,9 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Communication",
-            # Temporarily unavailable while the restricted Gmail permission is
-            # outside this release's Google OAuth verification scope. Keep the
-            # app row (rather than deleting it) so existing installations and
-            # a later re-enable migration retain the connector's stable ID.
-            "oauth_scopes": [],
-            "is_visible_in_connector": False,
+            # Keep the narrowed production row unless the review gate is open.
+            "oauth_scopes": [GOOGLE_GMAIL_SCOPE] if restricted_scopes else [],
+            "is_visible_in_connector": restricted_scopes,
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.gmail"],
@@ -481,8 +488,11 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Support",
-            "oauth_scopes": ["https://www.googleapis.com/auth/drive.file"],
-            "is_visible_in_connector": True,
+            "oauth_scopes": [
+                GOOGLE_DRIVE_SCOPE if restricted_scopes else GOOGLE_DRIVE_FILE_SCOPE
+            ],
+            # drive.file still needs Picker support; expose full Drive only for review.
+            "is_visible_in_connector": restricted_scopes,
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.google_drive"],
@@ -2125,6 +2135,49 @@ def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
         )
 
     return mismatches
+
+
+def sync_google_scope_policy(bind: Connection) -> None:
+    """Sync only environment-owned fields on existing Google catalog rows."""
+    app_ids = {"google-drive", "gmail"}
+    fields = ("oauth_scopes", "is_visible_in_connector")
+    policies = {
+        row["app_id"]: {field: row[field] for field in fields}
+        for row in get_builtin_public_mcp_app_rows()
+        if row["app_id"] in app_ids
+    }
+    if not get_google_restricted_scopes():
+        # Narrow scopes without hiding an existing production Drive connector.
+        policies["google-drive"].pop("is_visible_in_connector")
+
+    rows = bind.execute(
+        sa.select(
+            PUBLIC_MCP_APPS_TABLE.c.app_id,
+            PUBLIC_MCP_APPS_TABLE.c.oauth_scopes,
+            PUBLIC_MCP_APPS_TABLE.c.is_visible_in_connector,
+        ).where(PUBLIC_MCP_APPS_TABLE.c.app_id.in_(policies))
+    ).mappings()
+
+    for row in rows:
+        changes = {
+            field: expected
+            for field, expected in policies[row["app_id"]].items()
+            if row[field] != expected
+        }
+        if not changes:
+            continue
+
+        bind.execute(
+            sa.update(PUBLIC_MCP_APPS_TABLE)
+            .where(PUBLIC_MCP_APPS_TABLE.c.app_id == row["app_id"])
+            .values(**changes)
+        )
+        logger.info(
+            "Synced Google scope policy: app_id=%s fields=%s restricted_scopes=%s",
+            row["app_id"],
+            ",".join(changes),
+            get_google_restricted_scopes(),
+        )
 
 
 def _filter_row(row: dict[str, Any], allowed_columns: set[str]) -> dict[str, Any]:

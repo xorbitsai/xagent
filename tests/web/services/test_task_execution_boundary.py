@@ -35,7 +35,7 @@ def test_execution_services_and_tracer_load_without_api_routes() -> None:
                 task_events.set_task_event_sink(sink)
                 event = {"type": "task_error", "task_id": 1}
                 with patch.object(task_execution, "create_terminal_task_error_event", return_value=event):
-                    asyncio.run(_broadcast_external_cancel_terminal_event(1))
+                    asyncio.run(_broadcast_external_cancel_terminal_event(1, {}))
                 sink.assert_awaited_once_with(event, 1)
                 from xagent.web.models.database import configure_db, get_engine, Base
                 import tempfile

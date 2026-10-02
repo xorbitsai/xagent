@@ -279,6 +279,18 @@ def test_artifact_validation_size_rejects_invalid_and_nonfinite(monkeypatch, val
         config.get_artifact_validation_max_bytes()
 
 
+@pytest.mark.parametrize("value", [None, "false", "", "invalid", "true", "1", "ON"])
+def test_google_scope_config(monkeypatch, value):
+    flag = "XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED"
+    if value is None:
+        monkeypatch.delenv(flag, raising=False)
+    else:
+        monkeypatch.setenv(flag, value)
+
+    assert flag == config.GOOGLE_RESTRICTED_SCOPES_ENABLED
+    assert config.get_google_restricted_scopes() is (value in {"true", "1", "ON"})
+
+
 class TestEnvironmentVariableConstants:
     """Test environment variable constant names."""
 

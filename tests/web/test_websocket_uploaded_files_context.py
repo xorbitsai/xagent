@@ -44,13 +44,16 @@ from xagent.web.services.task_setup_snapshot import (
 
 
 @pytest.fixture()
-def db_session(tmp_path):
+def db_session(tmp_path, monkeypatch):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'test.db'}",
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local", lambda: SessionLocal
+    )
     db = SessionLocal()
     try:
         yield db

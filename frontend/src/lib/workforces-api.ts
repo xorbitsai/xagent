@@ -352,9 +352,11 @@ export async function getWorkforceAgentExecution(
   workforceId: number | string,
   taskId: number | string,
   workerTaskId: string,
+  signal?: AbortSignal,
 ): Promise<WorkforceAgentExecution> {
   const response = await apiRequest(
     `${getApiUrl()}/api/workforces/${workforceId}/runs/${taskId}/agent-executions/${encodeURIComponent(workerTaskId)}`,
+    { signal },
   )
   if (!response.ok) {
     throw await parseApiError(response, "Failed to load Agent execution")

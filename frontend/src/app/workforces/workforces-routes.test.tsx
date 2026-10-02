@@ -28,7 +28,7 @@ const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const toastSuccessMock = vi.hoisted(() => vi.fn())
 const workforceAppState = vi.hoisted(() => ({
-  currentTask: null as null | { id: string; status: string },
+  currentTask: null as null | { id: string; status: string; conversationStorageVersion?: number },
   traceEvents: [] as Array<Record<string, unknown>>,
   filePreview: {
     isOpen: false,
@@ -245,7 +245,7 @@ import WorkforceRunPage from "./[id]/run/page"
 import {
   getAgentExecutionConclusion,
   mergeAgentExecutionTraceEvents,
-} from "./[id]/run/page-client"
+} from "@/components/task/agent-execution-panel"
 import { getNavigationGroupsForUser } from "@/components/layout/sidebar"
 import type { WorkforceDetail, WorkforceListResponse } from "@/types/workforce"
 
@@ -353,6 +353,7 @@ describe("workforce route entry points", () => {
 
   afterEach(() => {
     cleanup()
+    vi.useRealTimers()
   })
 
   it("adds the visible sidebar entry for workforces", () => {
@@ -422,6 +423,79 @@ describe("workforce route entry points", () => {
       [{ event_id: "malformed", data: "not-an-object" }],
       "agent_17_live",
     )).toEqual([])
+  })
+
+  async function openRunningInspector(version = 2) {
+    getWorkforceMock.mockResolvedValueOnce(workforceDetail)
+    getWorkforceRunMock.mockResolvedValueOnce({
+      id: 15, task_id: 760, status: "running", is_preview: false,
+      task_title: "Active V2 run", message: "Generate the film",
+      created_at: "2026-07-17T16:32:08Z", completed_at: null,
+    })
+    searchParamsMock.set("run", "15")
+    workforceAppState.currentTask = { id: "760", status: "running", conversationStorageVersion: version }
+    const view = render(<WorkforceRunPage />)
+    await waitFor(() => expect(setTaskIdMock).toHaveBeenCalledWith(760, { navigate: false }))
+    vi.useFakeTimers()
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "View Editor execution" })) })
+    return view
+  }
+
+  const runningChild = { task_id: 760, worker_task_id: "agent_17_run", agent_name: "Editor", status: "running", trace_events: [] }
+  const finishedChild = (content: string) => ({ ...runningChild, status: "completed", trace_events: [{
+    event_id: "child-completion", event_type: "task_completion", data: { result: { content } },
+  }] })
+
+  it("refreshes V2 worker details after the root completion summary and stops after fetching the result", async () => {
+    getWorkforceAgentExecutionMock.mockResolvedValueOnce(runningChild).mockResolvedValueOnce(finishedChild("Final child result"))
+    const view = await openRunningInspector()
+    workforceAppState.traceEvents = [{ event_type: "workforce_delegation_end", data: { worker_task_id: "agent_17_run" } }]
+    view.rerender(<WorkforceRunPage />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    expect(screen.getByText("Final child result")).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000) })
+    expect(getWorkforceAgentExecutionMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("ignores an obsolete polling response after selecting another worker", async () => {
+    let resolveOld!: (value: Record<string, unknown>) => void
+    getWorkforceAgentExecutionMock.mockResolvedValueOnce(runningChild)
+      .mockReturnValueOnce(new Promise(resolve => { resolveOld = resolve }))
+      .mockResolvedValueOnce({ ...finishedChild("New QA result"), worker_task_id: "agent_18_run", agent_name: "QA" })
+    await openRunningInspector()
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+    expect(getWorkforceAgentExecutionMock).toHaveBeenCalledTimes(2)
+    const oldSignal = getWorkforceAgentExecutionMock.mock.calls[1][3] as AbortSignal
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "View QA execution" })) })
+    expect(oldSignal.aborted).toBe(true)
+    await act(async () => { resolveOld(finishedChild("Obsolete Editor result")) })
+    expect(screen.getByText("New QA result")).toBeInTheDocument()
+    expect(screen.queryByText("Obsolete Editor result")).not.toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000) })
+    expect(getWorkforceAgentExecutionMock).toHaveBeenCalledTimes(3)
+  })
+
+  it.each(["close", "unmount", "task change"])("cancels the V2 inspector refresh on %s", async (action) => {
+    getWorkforceAgentExecutionMock.mockResolvedValue(runningChild)
+    const view = await openRunningInspector()
+    const signal = getWorkforceAgentExecutionMock.mock.calls[0][3] as AbortSignal
+    if (action === "unmount") view.unmount()
+    else if (action === "task change") {
+      getWorkforceRunMock.mockResolvedValueOnce({ id: 16, task_id: 761, status: "running", task_title: "Next task", message: "Next request" })
+      searchParamsMock.set("run", "16")
+      await act(async () => { view.rerender(<WorkforceRunPage />) })
+    }
+    else fireEvent.click(within(screen.getByTestId("workforce-run-inspector")).getAllByRole("button")[0])
+    expect(signal.aborted).toBe(true)
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000) })
+    expect(getWorkforceAgentExecutionMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("retains the one-shot detail read for V1 workers with live trace updates", async () => {
+    getWorkforceAgentExecutionMock.mockResolvedValue(runningChild)
+    await openRunningInspector(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000) })
+    expect(getWorkforceAgentExecutionMock).toHaveBeenCalledTimes(1)
   })
 
   it("keeps the latest Agent execution when an older request resolves late", async () => {
@@ -1047,6 +1121,7 @@ describe("workforce route entry points", () => {
         "42",
         760,
         "agent_17_run",
+        expect.any(AbortSignal),
       )
     })
     expect(await screen.findByText("Editor")).toBeInTheDocument()

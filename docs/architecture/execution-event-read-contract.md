@@ -3,7 +3,7 @@
 Status: reader prerequisites and source audit, based on main `90660939a`.
 This document distinguishes existing facts from the readers still to be built.
 Production task creation remains V1. The stage 3.3-B implementation is described
-below; C covers model context below and D still covers display/Trace. Production routing
+below; C covers model context and D covers display/Trace below. Production routing
 is stage 3.4.
 
 ## Scope and compatibility
@@ -135,7 +135,11 @@ The single root completion's explicit stream link is the alias for that
 terminal message. Display the settled answer by updating the existing stream
 bubble under that same `message_id`; the assistant fact remains the log owner.
 Completion/AI traces are Trace entries, not extra bubbles. A non-stream result
-has no alias and uses `execution_message_{event_id}`. Other streams are distinct
+has no alias and uses `execution_message_{event_id}`. Live terminal notifications
+carry the exact run/state-version snapshot captured by their settlement owner;
+a newer task state cannot select their transcript. Pre-lease operation errors
+have no execution settlement and retain their existing business-notice path.
+Other streams are distinct
 attempts; never merge them by text or by being the latest stream.
 
 This association requires a unique root completion in that interval and a
@@ -153,7 +157,8 @@ is still owned. After ownership ends it is an interrupted attempt, never a
 completed answer. An error restores a failed attempt; an end restores the full
 answer even if settlement is later than H. Once the matching settlement enters
 a later horizon it updates that bubble rather than appending another. No partial
-text can be invented on cold replay. Mutable ownership status is read separately
+text can be invented on cold replay. A warm reconnect preserves text already
+received and renders it alongside the interrupted label. Mutable ownership status is read separately
 from H. A stream without a matching completion link never suppresses a terminal
 message. D tests live/reconnect reconciliation using these exact rules.
 
@@ -405,7 +410,7 @@ A's older `transcript_watermark` remains transcript-only: it cannot suppress
 earlier tool facts. Summaries with no coordinate cannot replace a known prefix;
 the reader replays facts without regenerating the summary. Malformed required
 facts or invalid coverage fail explicitly, without a legacy-content fallback.
-Display/Trace conversion and whole-task isolation remain D and E work.
+Display/Trace conversion is described in D below; whole-task isolation remains E work.
 
 ### Follow-up: bound model-context payload loading
 
@@ -419,3 +424,51 @@ inputs applied after the summary boundary even when accepted before it, tool
 batches with outcomes after the boundary, and complete boundary batches. Verify
 bounded payload loading against large histories as well as equivalent model
 messages for these cross-boundary cases.
+
+
+## Stage 3.3-D: event-backed display and Trace
+
+New V2 tasks now use one safe event converter for live notifications and fixed-H
+history. WebSocket replay, REST task steps, conversation-log messages and activity,
+monitoring aggregates, and explicitly scoped delegated-agent details read execution
+facts. V1 retains its existing readers and public identities; production creation
+still defaults to V1. No schema change, in-place conversion, or compatibility-write
+removal is part of this step.
+
+The frozen identities above apply to both live and replayed frames. V2 envelopes
+also expose `execution_sequence`, the owning fact's task-local sequence. The chat
+reducer uses this coordinate to prevent an older replayed stream start/end from
+replacing a newer full answer or its settled file links. Ephemeral deltas do not
+carry a durable sequence and cannot append after a durable terminal frame. This
+coordinate is independent of business `state_version` and transport ordering.
+A stream start without an end/error restores an empty running placeholder while
+its run is owned, or an explicit interrupted state after ownership ends. Completion
+and companion AI traces remain timeline entries. The settlement message supplies
+the final bubble, under its explicit stream alias when present. Shared-stream
+reconciliation uses those same settled message facts instead of V2 `Task.output`.
+It re-sends durable content to repair dropped frames, while isolating an invalid
+task's display from other connected tasks. A completed interval with a stream end
+requires its matching completion link; missing provenance never creates a second
+answer identity.
+
+Root views exclude child scopes. The worker inspector reads only its requested
+scope after the existing task authorization checks, selects delegated occurrences
+before public redaction, and retains safe failure events even when redaction
+removes their source metadata. Ordinary V2 tasks expose this inspector through
+`/api/chat/task/{task_id}/agent-executions/{worker_task_id}`, authorized for the
+owner or an admin; workforce runs retain their existing access checks. The open
+inspector refreshes an active child and stops on terminal status or close.
+Business tables still own authorization, control,
+interaction CAS, file records and file-byte materialization. Existing error,
+checkpoint, audit-only and sensitive-tool normalization remains in the display
+pipeline; recovery snapshots and raw LLM bodies are not chat content.
+
+V2 log IDs are message sequences, counts/activity use the same message inclusion
+policy, and compaction notices are ordered at their event position. Monitoring
+selects V1 traces or V2 root facts once per task, excluding V2 compatibility rows.
+User-scoped monitoring filters each source before the union; conversation activity
+aggregates only the candidate tasks selected by the list's existing filters.
+Task-level token counters remain existing business metadata. Queries page facts at
+a captured horizon; total history payload loading is not claimed to be bounded
+independently of lifetime history. Whole-task legacy-read isolation is stage E;
+activation, removal and conversion remain stages 3.4–3.6.

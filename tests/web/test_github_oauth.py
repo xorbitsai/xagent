@@ -944,6 +944,7 @@ def test_github_callback_does_not_leak_token_on_db_commit_failure(
 def test_non_github_callback_omits_accept_json_header(db_session, monkeypatch):
     """Guard the branch condition: a non-github provider must be unaffected by
     the GitHub-specific Accept header."""
+    monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", "true")
     db, user = db_session
     db.add(
         PublicMCPApp(

@@ -5,6 +5,8 @@ import { ArrowLeft, Loader2, PanelRight } from "lucide-react"
 import { useParams, useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+import { TaskAgentExecutionDrawer } from "@/components/task/task-agent-execution-drawer"
+import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
 import { ProgressPanel, type ProgressStepView } from "@/components/task/progress-panel"
 import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
 import { useConnectorRuntimeDialogActions, type SessionCheckCause } from "@/contexts/connector-runtime-dialog-context"
@@ -49,6 +51,7 @@ function TaskDetailContent() {
   const router = useRouter()
   const taskIdFromUrl = params.id
   const [progressPanelOpen, setProgressPanelOpen] = useState(false)
+  const [agentExecution, setAgentExecution] = useState<{ taskId: number; selection: AgentExecutionSummary } | null>(null)
   const dismissedProgressRunKeyRef = useRef<string | null>(null)
 
   useEffect(() => {
@@ -92,6 +95,7 @@ function TaskDetailContent() {
   // first one) is harmless: both start already at their default values.
   useEffect(() => {
     setProgressPanelOpen(false)
+    setAgentExecution(null)
     dismissedProgressRunKeyRef.current = null
   }, [state.taskId])
 
@@ -279,7 +283,20 @@ function TaskDetailContent() {
           </div>
         )}
         <div className="flex-1 min-h-0 relative">
-          <TaskConversationPanel mode="page" />
+          <TaskConversationPanel mode="page" onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
+            if (state.taskId) {
+              closeFilePreview()
+              setAgentExecution({ taskId: state.taskId, selection })
+            }
+          } : undefined} />
+          {agentExecution && agentExecution.taskId === state.taskId && (
+            <TaskAgentExecutionDrawer
+              key={`${agentExecution.taskId}:${agentExecution.selection.workerTaskId}`}
+              taskId={agentExecution.taskId}
+              selection={agentExecution.selection}
+              onClose={() => setAgentExecution(null)}
+            />
+          )}
         </div>
       </div>
 

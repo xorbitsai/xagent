@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ..config import get_google_restricted_scopes
 from .builtin_mcp_registry import (
     _persisted_builtin_provenance_matches,
     get_builtin_execution_fields_and_optional_scopes,
@@ -258,6 +259,11 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
 
     transport = execution_fields["transport"]
     launch_config = deepcopy(execution_fields["launch_config"])
+    # A stale or admin-edited row cannot expose Gmail while the gate is closed.
+    visible = bool(app.is_visible_in_connector)
+    if app.app_id == "gmail" and not get_google_restricted_scopes():
+        visible = False
+
     return {
         "id": app.app_id,
         "name": execution_fields["name"],
@@ -271,7 +277,7 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
         # get_builtin_execution_fields_and_optional_scopes) - a custom
         # admin-created app has no column for it and always gets [].
         "optional_oauth_scopes": optional_oauth_scopes,
-        "is_visible_in_connector": bool(app.is_visible_in_connector),
+        "is_visible_in_connector": visible,
         "launch_config": launch_config,
         "auth_type": classify_app_auth(transport, launch_config),
     }

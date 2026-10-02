@@ -6,7 +6,19 @@ from datetime import timezone
 from typing import Any, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import (
+    JSON,
+    String,
+    and_,
+    case,
+    cast,
+    func,
+    literal,
+    or_,
+    select,
+    union_all,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, aliased, selectinload
 from sqlalchemy.sql import ColumnElement, visitors
@@ -19,6 +31,7 @@ from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
 from ..models.expired_task import ExpiredTaskTombstone
 from ..models.task import Task, TraceEvent
+from ..models.task_execution_event import TaskExecutionEvent
 from ..models.trigger import AgentTrigger, TriggerRun
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
@@ -455,7 +468,13 @@ def _apply_task_filters(
 def _base_task_query(db: Session, user: User) -> Any:
     query = db.query(Task).options(
         selectinload(Task.agent),
-        selectinload(Task.chat_messages),
+        selectinload(
+            Task.chat_messages.and_(
+                TaskChatMessage.task_id.in_(
+                    select(Task.id).where(Task.conversation_storage_version == 1)
+                )
+            )
+        ),
     )
     return _apply_external_task_scope(query, user)
 
@@ -520,7 +539,9 @@ def _last_activity_at(task: Task) -> Any:
     return task.updated_at or task.created_at
 
 
-def _serialize_log_summary(task: Task, ui_source: str) -> dict[str, Any]:
+def _serialize_log_summary(
+    task: Task, ui_source: str, *, event_activity: tuple[int, Any] | None = None
+) -> dict[str, Any]:
     agent = task.agent if isinstance(task.agent, Agent) else None
     return {
         "task_id": int(task.id),
@@ -535,12 +556,18 @@ def _serialize_log_summary(task: Task, ui_source: str) -> dict[str, Any]:
         "agent_logo_url": agent.logo_url if agent else None,
         "created_at": format_datetime_for_api(task.created_at),
         "updated_at": format_datetime_for_api(task.updated_at),
-        "last_activity_at": format_datetime_for_api(_last_activity_at(task)),
+        "last_activity_at": format_datetime_for_api(
+            (event_activity[1] or task.updated_at or task.created_at)
+            if event_activity is not None
+            else _last_activity_at(task)
+        ),
         "input_tokens": task.input_tokens or 0,
         "output_tokens": task.output_tokens or 0,
         "total_tokens": task.total_tokens or 0,
         "llm_calls": task.llm_calls or 0,
-        "message_count": len(getattr(task, "chat_messages", []) or []),
+        "message_count": event_activity[0]
+        if event_activity is not None
+        else len(getattr(task, "chat_messages", []) or []),
     }
 
 
@@ -776,13 +803,80 @@ def _source_summary_from_query(
     )
 
 
-def _latest_message_activity_subquery(db: Session) -> Any:
-    return (
-        db.query(
-            TaskChatMessage.task_id.label("task_id"),
-            func.max(TaskChatMessage.created_at).label("last_message_at"),
+def _event_log_message_predicate(db: Session) -> Any:
+    data = TaskExecutionEvent.payload["data"]
+    expects_response: ColumnElement[bool]
+    # Match the transcript reader's Python identity/truthiness checks without
+    # casting arbitrary persisted JSON strings to PostgreSQL booleans.
+    if db.get_bind().dialect.name == "postgresql":
+        audit_only = cast(data["__audit_only__"], JSONB) == literal(True, type_=JSONB)
+        hidden = cast(data["visible"], JSONB) == literal(False, type_=JSONB)
+        expects_response = cast(data["expect_response"], JSONB).not_in(
+            [JSON.NULL, False, 0, "", [], {}]
         )
-        .group_by(TaskChatMessage.task_id)
+    else:
+        audit_only = (
+            func.json_type(TaskExecutionEvent.payload, "$.data.__audit_only__")
+            == "true"
+        )
+        hidden = func.json_type(TaskExecutionEvent.payload, "$.data.visible") == "false"
+        response_type = func.json_type(
+            TaskExecutionEvent.payload, "$.data.expect_response"
+        )
+        expects_response = case(
+            (
+                response_type.in_(["integer", "real"]),
+                data["expect_response"].as_float() != 0,
+            ),
+            else_=cast(data["expect_response"], String).not_in(
+                ["null", "0", '""', "[]", "{}"]
+            ),
+        )
+    return and_(
+        audit_only.is_not(True),
+        or_(
+            TaskExecutionEvent.kind.in_(["input_accepted", "assistant_message"]),
+            and_(
+                TaskExecutionEvent.kind == "agent_message",
+                expects_response,
+                hidden.is_not(True),
+                data["message"].as_string().isnot(None),
+                data["message"].as_string() != "",
+            ),
+        ),
+    )
+
+
+def _latest_message_activity_subquery(db: Session, task_ids: Any) -> Any:
+    legacy = (
+        select(
+            TaskChatMessage.task_id.label("task_id"),
+            TaskChatMessage.created_at.label("created_at"),
+        )
+        .join(Task, Task.id == TaskChatMessage.task_id)
+        .where(Task.conversation_storage_version == 1, Task.id.in_(task_ids))
+    )
+    canonical = (
+        select(
+            TaskExecutionEvent.task_id.label("task_id"),
+            TaskExecutionEvent.occurred_at.label("created_at"),
+        )
+        .join(Task, Task.id == TaskExecutionEvent.task_id)
+        .where(
+            Task.conversation_storage_version == 2,
+            TaskExecutionEvent.scope_id == "root",
+            Task.id.in_(task_ids),
+            _event_log_message_predicate(db),
+        )
+    )
+    messages = union_all(legacy, canonical).subquery()
+    return (
+        select(
+            messages.c.task_id,
+            func.max(messages.c.created_at).label("last_message_at"),
+            func.count().label("message_count"),
+        )
+        .group_by(messages.c.task_id)
         .subquery()
     )
 
@@ -829,7 +923,9 @@ async def list_conversation_logs(
 
     total = int(source_counts[normalized_source])
     start = (page - 1) * per_page
-    latest_message_activity = _latest_message_activity_subquery(db)
+    latest_message_activity = _latest_message_activity_subquery(
+        db, filtered_query.with_entities(Task.id).statement.correlate(None)
+    )
     last_activity_at = func.coalesce(
         latest_message_activity.c.last_message_at,
         Task.updated_at,
@@ -840,19 +936,31 @@ async def list_conversation_logs(
             latest_message_activity,
             latest_message_activity.c.task_id == Task.id,
         )
-        .with_entities(Task.id, ui_source)
+        .with_entities(
+            Task.id,
+            ui_source,
+            latest_message_activity.c.message_count,
+            latest_message_activity.c.last_message_at,
+        )
         .order_by(last_activity_at.desc(), Task.id.desc())
         .offset(start)
         .limit(per_page)
         .all()
     )
-    task_ids = [int(task_id) for task_id, _source in page_rows]
-    source_by_task_id = {int(task_id): str(source) for task_id, source in page_rows}
+    task_ids = [int(row[0]) for row in page_rows]
+    source_by_task_id = {int(row[0]): str(row[1]) for row in page_rows}
+    activity_by_task_id = {int(row[0]): (int(row[2] or 0), row[3]) for row in page_rows}
     tasks_by_id = _load_tasks_by_id(db, user, task_ids)
 
     return {
         "logs": [
-            _serialize_log_summary(tasks_by_id[task_id], source_by_task_id[task_id])
+            _serialize_log_summary(
+                tasks_by_id[task_id],
+                source_by_task_id[task_id],
+                event_activity=activity_by_task_id[task_id]
+                if tasks_by_id[task_id].conversation_storage_version == 2
+                else None,
+            )
             for task_id in task_ids
             if task_id in tasks_by_id
         ],
@@ -889,26 +997,75 @@ async def get_conversation_log_detail(
     if ui_source is None:
         raise HTTPException(status_code=404, detail="Conversation log not found")
 
-    messages = list(task.chat_messages or [])
+    messages = (
+        list(task.chat_messages or []) if task.conversation_storage_version == 1 else []
+    )
     file_reference_records = load_assistant_file_reference_records(
         db,
         task_id=int(task.id),
         user_id=int(task.user_id),
     )
+    if task.conversation_storage_version == 2:
+        from ..services.task_event_display import load_event_display_snapshot
+
+        view = load_event_display_snapshot(db, int(task.id))
+        transcript = []
+        for message in view.messages:
+            item = dict(message)
+            if item["role"] == "assistant":
+                item["content"] = reconcile_assistant_file_references(
+                    db,
+                    task_id=int(task.id),
+                    user_id=int(task.user_id),
+                    content=item["content"],
+                    records=file_reference_records,
+                )
+            item["created_at"] = format_datetime_for_api(item["created_at"])
+            transcript.append(item)
+        traces = [
+            {
+                key: event[key]
+                for key in (
+                    "event_id",
+                    "event_type",
+                    "step_id",
+                    "timestamp",
+                    "data",
+                    "parent_event_id",
+                )
+            }
+            for event in view.events
+            if event["type"] == "trace_event"
+            and event["event_type"] not in {"user_message", "agent_message"}
+        ]
+        positioned = [(item["id"], item) for item in transcript]
+        for notice in view.compactions:
+            item = dict(notice)
+            position = item.pop("sequence")
+            item["created_at"] = format_datetime_for_api(item["created_at"])
+            positioned.append((position, item))
+        transcript = [item for _, item in sorted(positioned, key=lambda pair: pair[0])]
+        event_activity = (
+            len(view.messages),
+            max((item["created_at"] for item in view.messages), default=None),
+        )
+    else:
+        transcript = _serialize_transcript_with_events(
+            db, task, messages, file_reference_records
+        )
+        traces = _serialize_trace_events(db, int(task.id))
+        event_activity = None
     return {
-        "log": _serialize_log_summary(task, ui_source),
-        "transcript": _serialize_transcript_with_events(
-            db,
-            task,
-            messages,
-            file_reference_records,
-        ),
-        "trace_events": _serialize_trace_events(db, int(task.id)),
+        "log": _serialize_log_summary(task, ui_source, event_activity=event_activity),
+        "transcript": transcript,
+        "trace_events": traces,
         # When retention last removed this task's trace (#2565). Later turns
         # write new trace rows, so a non-null value does not mean
         # ``trace_events`` is empty: it means the events from before this
         # moment are gone and the timeline may be incomplete.
-        "trace_events_expired_at": format_datetime_for_api(task.traces_expired_at),
+        "trace_events_expired_at": format_datetime_for_api(task.traces_expired_at)
+        if task.conversation_storage_version == 1
+        else None,
         "metadata": {
             "task": {
                 "task_id": int(task.id),

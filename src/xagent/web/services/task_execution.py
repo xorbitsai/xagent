@@ -727,16 +727,12 @@ def _persist_agent_outbound_event(
                     # The fact and its projections committed together. Reuse
                     # the envelope, but permit retransmission after a crash
                     # between commit and broadcast. Do not execute a new send.
+                    from .task_event_display import convert_display_event
+
+                    public_event = convert_display_event(existing)
+                    assert public_event is not None
                     event.clear()
-                    event.update(
-                        create_stream_event(
-                            str(existing.kind),
-                            task_id,
-                            original_payload["data"],
-                            timestamp=existing.occurred_at,
-                            event_id=original_payload["protocol_event_id"],
-                        )
-                    )
+                    event.update(public_event)
                     db.commit()
                     return
             fact = append_fact_no_commit(
@@ -752,7 +748,13 @@ def _persist_agent_outbound_event(
             )
             setattr(trace_event, "data", fact.payload["data"])
             if trace_event.event_type.startswith("final_answer_"):
+                from .task_event_display import convert_display_event
+
+                public_event = convert_display_event(fact)
+                assert public_event is not None
                 db.commit()
+                event.clear()
+                event.update(public_event)
                 return
             execution_event_id = cast(str, fact.event_id)
             data = cast(Dict[str, Any], fact.payload)["data"]
@@ -801,6 +803,13 @@ def _persist_agent_outbound_event(
                     execution_event_id=execution_event_id,
                 )
 
+        if authoritative:
+            from .task_event_display import convert_display_event
+
+            public_event = convert_display_event(fact)
+            assert public_event is not None
+            event.clear()
+            event.update(public_event)
         db.commit()
     except Exception as exc:
         db.rollback()
@@ -2303,7 +2312,9 @@ async def execute_task_background(
                 return
 
             # Send task completion event (includes agent response info)
-            await publish_task_event(
+            from .task_event_display import publish_task_result
+
+            await publish_task_result(
                 {
                     "task": {
                         "id": broadcast_meta["id"],
@@ -2814,6 +2825,7 @@ def _settle_resumed_task_lease(
     lease: TaskLease,
     *,
     error_message: str | None,
+    terminal_event_state: dict[str, Any] | None = None,
 ) -> bool:
     """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
     from .assistant_history_safety import CLIENT_SAFE_FAILURE_MESSAGE_TYPE
@@ -2827,10 +2839,12 @@ def _settle_resumed_task_lease(
             error_message=error_message,
             client_error_message=error_message,
             client_message_type=CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+            terminal_event_state=terminal_event_state,
         )
     return settle_task_lease_isolated(
         lease,
         error_message=error_message,
+        terminal_event_state=terminal_event_state,
     )
 
 
@@ -3710,7 +3724,9 @@ async def execute_resume_background(
             )
             return
 
-        await publish_task_event(
+        from .task_event_display import publish_task_result
+
+        await publish_task_result(
             {
                 "task": {
                     "id": task_id,
@@ -4083,6 +4099,7 @@ async def execute_resume_background(
                                 settlement_error
                                 or _resume_cancel_settlement_error(trusted_task_source)
                             )
+                        terminal_event_state: dict[str, Any] = {}
                         if pause_for_input and not explicit_cancel:
                             from .task_orchestrator import pause_unknown_task_lease
 
@@ -4099,17 +4116,23 @@ async def execute_resume_background(
                                 lambda: _settle_resumed_task_lease(
                                     lease,
                                     error_message=settlement_error,
+                                    terminal_event_state=terminal_event_state,
                                 )
                             )
                         if settled:
                             lease_released = True
                             if broadcast_error_message is not None:
                                 try:
-                                    await publish_task_event(
-                                        create_terminal_task_error_event(
-                                            task_id,
-                                            broadcast_error_message,
-                                        ),
+                                    from .task_event_display import publish_task_result
+
+                                    await publish_task_result(
+                                        {
+                                            **create_terminal_task_error_event(
+                                                task_id,
+                                                broadcast_error_message,
+                                            ),
+                                            **terminal_event_state,
+                                        },
                                         task_id,
                                     )
                                 except Exception:

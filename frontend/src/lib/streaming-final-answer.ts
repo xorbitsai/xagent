@@ -26,8 +26,9 @@ export type FinalAnswerStreamActionPayload = {
   messageId: string
   delta?: string
   content?: string
-  status: "running" | "completed" | "failed"
+  status: "running" | "completed" | "failed" | "interrupted"
   timestamp: string
+  executionSequence?: number
 }
 
 export const isStreamingFinalAnswerMessage = (message: ResultMessageLike): boolean => {
@@ -145,12 +146,14 @@ export const getFinalAnswerStreamActionPayload = ({
   eventId,
   timestamp,
   fallbackMessageId,
+  executionSequence,
 }: {
   eventType: FinalAnswerStreamEventType
   eventData: unknown
   eventId?: unknown
   timestamp?: unknown
   fallbackMessageId?: string
+  executionSequence?: number
 }): FinalAnswerStreamActionPayload | null => {
   const data =
     eventData && typeof eventData === "object"
@@ -172,8 +175,9 @@ export const getFinalAnswerStreamActionPayload = ({
   if (eventType === "final_answer_start") {
     return {
       messageId,
+      executionSequence,
       timestamp: normalizedTimestamp,
-      status: "running",
+      status: streamData.status === "interrupted" ? "interrupted" : "running",
     }
   }
   if (eventType === "final_answer_delta") {
@@ -183,6 +187,7 @@ export const getFinalAnswerStreamActionPayload = ({
     }
     return {
       messageId,
+      executionSequence,
       delta,
       timestamp: normalizedTimestamp,
       status: "running",
@@ -192,6 +197,7 @@ export const getFinalAnswerStreamActionPayload = ({
     const error = typeof streamData.error === "string" ? streamData.error : ""
     return {
       messageId,
+      executionSequence,
       content: error,
       timestamp: normalizedTimestamp,
       status: "failed",
@@ -204,6 +210,7 @@ export const getFinalAnswerStreamActionPayload = ({
       : ""
   return {
     messageId,
+    executionSequence,
     content,
     timestamp: normalizedTimestamp,
     status: "completed",

@@ -1719,6 +1719,7 @@ def settle_task_lease_isolated(
     error_message: str | None = None,
     client_error_message: str = CLIENT_SAFE_TASK_FAILURE,
     client_message_type: str = TASK_FAILURE_MESSAGE_TYPE,
+    terminal_event_state: dict[str, Any] | None = None,
 ) -> bool:
     """Settle exactly one run/runner lease in one worker-owned Session.
 
@@ -1734,12 +1735,16 @@ def settle_task_lease_isolated(
     reconciled and released, but returns ``False`` so callers do not publish a
     contradictory failure event.
 
+    When supplied, ``terminal_event_state`` receives the committed V2 control
+    identity after commit; the caller can publish without re-reading latest state.
+
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
     ownerless RUNNING task.
     """
     from ..models.database import get_session_local
     from .chat_history_service import persist_assistant_message_no_commit
+    from .task_execution_controller import task_control_snapshot
     from .workforce_runtime import sync_workforce_run_status
 
     SessionLocal = get_session_local()
@@ -1776,7 +1781,16 @@ def settle_task_lease_isolated(
                         delete_runtime_values_no_commit(
                             settle_db, task_id=lease.task_id, run_id=lease.run_id
                         )
+                    # Capture the exact committed occurrence before another run can
+                    # replace the task state. Keep the existing boolean settle API.
+                    event_state = (
+                        task_control_snapshot(task).as_dict()
+                        if task.conversation_storage_version == 2
+                        else {}
+                    )
                     settle_db.commit()
+                    if terminal_event_state is not None:
+                        terminal_event_state.update(event_state)
                     invalidate_task_cache_best_effort(lease.task_id)
                     return True
 
@@ -2091,7 +2105,7 @@ def _schedule_bg(
     bg run loads its own snapshot and opens its own sessions, so no
     caller-bound ORM object crosses into the coroutine.
     """
-    from .task_events import publish_task_event
+    from .task_event_display import publish_task_result
     from .task_execution import (
         background_task_manager,
         create_terminal_task_error_event,
@@ -2422,6 +2436,7 @@ def _schedule_bg(
 
                 if not defer_settlement_to_ttl_recovery:
                     lease_settled = False
+                    terminal_event_state: dict[str, Any] = {}
                     try:
                         settled = await run_db_io_cancellation_safe(
                             lambda: settle_task_lease_isolated(
@@ -2433,6 +2448,7 @@ def _schedule_bg(
                                     or CLIENT_SAFE_TASK_FAILURE
                                 ),
                                 client_message_type=client_history_message_type,
+                                terminal_event_state=terminal_event_state,
                             )
                         )
                         # Gate on the returned value, not on "didn't raise":
@@ -2446,12 +2462,15 @@ def _schedule_bg(
                         lease_settled = bool(settled)
                         if settled and broadcast_error_message is not None:
                             try:
-                                await publish_task_event(
-                                    create_terminal_task_error_event(
-                                        task_id,
-                                        broadcast_error_message,
-                                        code=broadcast_error_code,
-                                    ),
+                                await publish_task_result(
+                                    {
+                                        **create_terminal_task_error_event(
+                                            task_id,
+                                            broadcast_error_message,
+                                            code=broadcast_error_code,
+                                        ),
+                                        **terminal_event_state,
+                                    },
                                     task_id,
                                 )
                             except Exception:

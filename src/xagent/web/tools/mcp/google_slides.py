@@ -1,16 +1,25 @@
+# The repository's Ruff and isort configurations classify the MCP package
+# differently; keep this module's import grouping stable for both hooks.
+# isort: skip_file
+
+import errno
 import json
 import logging
 import os
 import re
 import uuid
+from collections import Counter
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
-from mcp.server.fastmcp import FastMCP
+from googleapiclient.http import MediaIoBaseUpload  # type: ignore[import-not-found]
 from pydantic import BeforeValidator
 
-from .utils import resolve_id_from_url, setup_proxy_env
+from mcp.server.fastmcp import FastMCP
+
+from .utils import allowed_dirs_from_env, resolve_id_from_url, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-slides-mcp")
@@ -21,6 +30,22 @@ setup_proxy_env()
 mcp = FastMCP("google-slides-mcp")
 
 _PRESENTATION_URL_ID_PATTERN = re.compile(r"/presentation/d/([a-zA-Z0-9_-]+)")
+_PPTX_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+)
+_GOOGLE_SLIDES_MIME_TYPE = "application/vnd.google-apps.presentation"
+_PPTX_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"
+# Google Drive's PPTX-to-Slides conversion rejects files over 100 MB.  Check
+# the local file before parsing it with python-pptx or starting an upload.
+_MAX_PPTX_UPLOAD_BYTES = 100_000_000
+
+# Keep track of default pages created by this MCP process.  A presentation can
+# legitimately contain an intentional blank page, so add_slide must not infer
+# that every sole empty page is Google's implementation detail.  The returned
+# id can also be passed explicitly for calls that cross process boundaries.
+_CREATED_DEFAULT_SLIDES: dict[str, str] = {}
+_PRESERVED_BLANK_SLIDES: dict[str, set[str]] = {}
+_MAX_TRACKED_DEFAULT_SLIDES = 256
 
 
 def _normalize_layout(value: object) -> object:
@@ -36,7 +61,7 @@ def _normalize_layout(value: object) -> object:
 
 
 _Layout = Annotated[
-    Literal["TITLE", "TITLE_AND_BODY", "TITLE_ONLY", "SECTION_HEADER", "BLANK"],
+    Literal["TITLE", "TITLE_AND_BODY", "TITLE_ONLY", "SECTION_HEADER"],
     BeforeValidator(_normalize_layout),
 ]
 
@@ -60,7 +85,6 @@ _LAYOUT_PLACEHOLDERS: dict[str, tuple[str | None, str | None]] = {
     "TITLE_AND_BODY": ("TITLE", "BODY"),
     "TITLE_ONLY": ("TITLE", None),
     "SECTION_HEADER": ("TITLE", None),
-    "BLANK": (None, None),
 }
 
 # Leading "•"/"-"/"*" marker at the start of a line, with or without a
@@ -154,6 +178,24 @@ def _strip_bullet_prefixes(text: str) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _delete_imported_presentation(drive_service: Any, presentation_id: str) -> bool:
+    """Delete a Drive presentation that failed import validation."""
+    try:
+        (
+            drive_service.files()
+            .delete(fileId=presentation_id, supportsAllDrives=True)
+            .execute()
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not clean up failed imported presentation %s: %s",
+            presentation_id,
+            exc,
+        )
+        return False
 
 
 def _normalize_newlines(text: str) -> str:
@@ -264,7 +306,7 @@ def _find_placeholders(
     return found
 
 
-def get_slides_service() -> Any:
+def _get_google_credentials() -> Credentials:
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
     client_id = os.environ.get("GOOGLE_CLIENT_ID")
@@ -285,7 +327,151 @@ def get_slides_service() -> Any:
         )
 
     credentials = Credentials(**creds_kwargs)
+    return credentials
+
+
+def get_slides_service() -> Any:
+    credentials = _get_google_credentials()
     return build("slides", "v1", credentials=credentials)
+
+
+def get_drive_service() -> Any:
+    credentials = _get_google_credentials()
+    return build("drive", "v3", credentials=credentials)
+
+
+def _resolve_pptx_upload_path(file_path: str) -> Path:
+    """Resolve a generated PPTX and keep uploads inside approved roots."""
+    try:
+        allowed_dirs = allowed_dirs_from_env(_PPTX_UPLOAD_ALLOWED_DIRS_ENV_VAR)
+    except ValueError:
+        logger.warning("Invalid PPTX upload directory configuration")
+        raise ValueError("Upload directory configuration is invalid") from None
+
+    requested_path = Path(file_path).expanduser()
+    candidates = (
+        [requested_path]
+        if requested_path.is_absolute()
+        else [Path.cwd() / requested_path]
+        + [directory / requested_path for directory in allowed_dirs]
+    )
+    local_path: Path | None = None
+    authorized_candidate: Path | None = None
+    path_error: OSError | None = None
+    for candidate in candidates:
+        try:
+            resolved_candidate = candidate.resolve()
+        except RuntimeError:
+            # Python 3.11/3.12 raises RuntimeError for symlink loops. Keep the
+            # original path so stat() can surface the expected ELOOP error.
+            resolved_candidate = candidate
+        except OSError as exc:
+            logger.warning("Could not resolve PPTX path %s: %s", candidate, exc)
+            raise ValueError("file path could not be resolved safely") from None
+        if not any(
+            resolved_candidate.is_relative_to(directory) for directory in allowed_dirs
+        ):
+            continue
+        authorized_candidate = authorized_candidate or resolved_candidate
+        try:
+            resolved_candidate.stat()
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                logger.warning(
+                    "Could not inspect PPTX path %s: %s", resolved_candidate, exc
+                )
+                path_error = path_error or exc
+            continue
+        if resolved_candidate.is_file():
+            local_path = resolved_candidate
+            break
+
+    if local_path is None:
+        if authorized_candidate is None:
+            try:
+                rejected_path = candidates[0].resolve()
+            except (OSError, RuntimeError):
+                rejected_path = candidates[0]
+            logger.warning(
+                "Rejected PPTX path %s outside allowed directories: %s",
+                rejected_path,
+                ", ".join(str(directory) for directory in allowed_dirs),
+            )
+            raise PermissionError(
+                "file path is outside the allowed directories; provide a PPTX "
+                "inside the task workspace"
+            )
+        if path_error is not None:
+            raise path_error
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    if local_path.suffix.lower() != ".pptx":
+        raise ValueError("file_path must point to a .pptx file")
+    file_size = local_path.stat().st_size
+    if file_size == 0:
+        raise ValueError("PPTX file is empty")
+    if file_size > _MAX_PPTX_UPLOAD_BYTES:
+        raise ValueError("PPTX file exceeds the 100 MB Google Slides conversion limit")
+    return local_path
+
+
+def _normalize_comparison_text(value: str) -> str:
+    """Normalize whitespace for PPTX/Slides text-preservation checks."""
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _shape_texts(shape: Any) -> list[str]:
+    """Extract text from a python-pptx shape, including grouped shapes."""
+    texts: list[str] = []
+    text = getattr(shape, "text", "")
+    if text and str(text).strip():
+        texts.append(str(text))
+    grouped_shapes = getattr(shape, "shapes", None)
+    if grouped_shapes is not None:
+        for child in grouped_shapes:
+            texts.extend(_shape_texts(child))
+    return texts
+
+
+def _shape_has_meaningful_content(shape: Any) -> bool:
+    """Return whether a PPTX shape represents content beyond an empty placeholder."""
+    text = getattr(shape, "text", "")
+    if text and str(text).strip():
+        return True
+
+    grouped_shapes = getattr(shape, "shapes", None)
+    if grouped_shapes is not None:
+        return any(_shape_has_meaningful_content(child) for child in grouped_shapes)
+
+    return not bool(getattr(shape, "is_placeholder", False))
+
+
+def _extract_pptx_slide_content(file_path: Path) -> list[tuple[str, bool]]:
+    """Return normalized text and meaningful-content flags for each PPTX slide."""
+    from pptx import Presentation
+
+    presentation = Presentation(str(file_path))
+    slide_content: list[tuple[str, bool]] = []
+    for slide in presentation.slides:
+        texts = [text for shape in slide.shapes for text in _shape_texts(shape)]
+        slide_content.append(
+            (
+                _normalize_comparison_text(" ".join(texts)),
+                any(_shape_has_meaningful_content(shape) for shape in slide.shapes),
+            )
+        )
+    return slide_content
+
+
+def _extract_pptx_slide_text(file_path: Path) -> list[str]:
+    """Return normalized visible text for each local PPTX slide."""
+    return [text for text, _has_content in _extract_pptx_slide_content(file_path)]
+
+
+def _record_created_default_slide(presentation_id: str, slide_id: str) -> None:
+    if len(_CREATED_DEFAULT_SLIDES) >= _MAX_TRACKED_DEFAULT_SLIDES:
+        _CREATED_DEFAULT_SLIDES.pop(next(iter(_CREATED_DEFAULT_SLIDES)))
+    _CREATED_DEFAULT_SLIDES[presentation_id] = slide_id
 
 
 def _resolve_presentation_id(presentation_id: str) -> str:
@@ -297,10 +483,35 @@ def _resolve_presentation_id(presentation_id: str) -> str:
 
 def _element_text(element: dict[str, Any]) -> str:
     text_elements = element.get("shape", {}).get("text", {}).get("textElements", [])
-    return "".join(
+    own_text = "".join(
         text_element.get("textRun", {}).get("content", "")
+        or text_element.get("autoText", {}).get("content", "")
         for text_element in text_elements
     )
+    grouped_text = "".join(
+        _element_text(child)
+        for child in element.get("elementGroup", {}).get("children", [])
+    )
+    return own_text + grouped_text
+
+
+def _text_tokens(value: str) -> Counter[str]:
+    """Return order-independent visible-text tokens for import validation."""
+    return Counter(re.findall(r"\w+", value.casefold(), re.UNICODE))
+
+
+def _contains_text_tokens(expected: str, actual: str) -> bool:
+    """Return whether ``actual`` preserves all tokens from ``expected``.
+
+    Drive may reorder page elements while converting a PPTX.  Comparing the
+    token multisets keeps the validation useful for detecting dropped detail
+    text without rejecting an otherwise correct conversion solely because a
+    title and body shape were returned in a different order.
+    """
+    expected_tokens = _text_tokens(expected)
+    if not expected_tokens:
+        return expected.casefold() in actual.casefold()
+    return not (expected_tokens - _text_tokens(actual))
 
 
 def _slide_summary(slide: dict[str, Any], index: int) -> dict[str, Any]:
@@ -314,6 +525,44 @@ def _slide_summary(slide: dict[str, Any], index: int) -> dict[str, Any]:
         "object_id": slide.get("objectId"),
         "text": texts,
     }
+
+
+def _slide_is_empty(slide: dict[str, Any]) -> bool:
+    """Return whether a slide has no meaningful page content.
+
+    A visual slide may intentionally contain only an image, chart, line, or
+    other non-text element. Treating "no text" as empty would reject those
+    legitimate slides after PPTX import. Empty placeholder shapes do not count
+    as content, but any non-placeholder shape or non-shape page element does.
+    """
+    page_elements = slide.get("pageElements", [])
+    if not page_elements:
+        return True
+    for element in page_elements:
+        shape = element.get("shape")
+        if shape is None:
+            return False
+        if _element_text(element).strip():
+            return False
+        if "placeholder" not in shape:
+            return False
+    return True
+
+
+def _slide_is_untouched_default(slide: dict[str, Any]) -> bool:
+    """Return whether a slide is safe to infer as Google's initial page.
+
+    The stateless fallback has no object id to prove provenance.  Restrict it
+    to a truly element-free slide with no custom background; empty title
+    placeholders and background-only covers are user content and must remain.
+    """
+    if slide.get("pageElements"):
+        return False
+    page_properties = slide.get("pageProperties") or {}
+    background = page_properties.get("pageBackgroundFill") or {}
+    return background.get("propertyState", "INHERIT") == "INHERIT" and not any(
+        key in background for key in ("solidFill", "stretchedPictureFill")
+    )
 
 
 @mcp.tool()
@@ -349,13 +598,42 @@ def google_slides_get_presentation(presentation_id: str) -> str:
 @mcp.tool()
 def google_slides_create_presentation(title: str) -> str:
     """
-    Create a new, empty Google Slides presentation with the given title.
-    Use google_slides_add_slide to add content slides afterwards.
+    Create a new Google Slides presentation with the given title.
+
+    This is a plain text/layout primitive. For a new deck that needs visual
+    design, create a styled PPTX first and call google_slides_import_pptx;
+    do not build the deck by repeatedly calling google_slides_add_slide.
+
+    Google creates a default, empty slide as part of this operation. Keep it
+    until the first content slide is created: google_slides_add_slide removes
+    it in the same batchUpdate after creating the real slide, so the API never
+    has to delete the only page from the presentation. The response reports
+    the default slide id so callers can diagnose the initial state.
     """
     try:
         service = get_slides_service()
         presentation = service.presentations().create(body={"title": title}).execute()
         pres_id = presentation.get("presentationId")
+        if not pres_id:
+            raise ValueError("Google Slides did not return a presentation_id")
+
+        # The create response normally includes the initial page, but Google
+        # does not document that shape as a stable part of the create
+        # response. Fall back to a read when it is omitted so the cleanup is
+        # safe across client/API versions.
+        slides = presentation.get("slides")
+        if slides is None:
+            created = service.presentations().get(presentationId=pres_id).execute()
+            slides = created.get("slides", [])
+
+        default_slide_id = None
+        if len(slides) == 1 and _slide_is_empty(slides[0]):
+            default_slide_id = slides[0].get("objectId")
+            if not default_slide_id:
+                raise ValueError(
+                    "Google Slides returned an empty initial slide without an object_id"
+                )
+            _record_created_default_slide(pres_id, default_slide_id)
 
         return json.dumps(
             {
@@ -363,6 +641,8 @@ def google_slides_create_presentation(title: str) -> str:
                 "presentation_id": pres_id,
                 "title": presentation.get("title"),
                 "link": f"https://docs.google.com/presentation/d/{pres_id}/edit",
+                "slide_count": len(slides),
+                "default_slide_id": default_slide_id,
             },
             ensure_ascii=False,
         )
@@ -372,14 +652,181 @@ def google_slides_create_presentation(title: str) -> str:
 
 
 @mcp.tool()
+def google_slides_import_pptx(file_path: str, title: str = "") -> str:
+    """Import a designed local PPTX as a native Google Slides presentation.
+
+    Use this for requests that ask for a beautiful, polished, or visually
+    designed deck. The existing PPTX generator owns layout and styling; Drive
+    converts its bytes to a native Google Slides file, preserving editable
+    slides instead of falling back to raw title/body placeholders.
+
+    ``file_path`` must point to a non-empty ``.pptx`` inside the current task
+    workspace (or another configured Google Drive upload directory). The
+    conversion is read back through the Slides API before this tool reports
+    success, and an unexpected blank slide or dropped visual content is
+    returned as ``validation_failed`` rather than being presented as a
+    finished deck.
+    """
+    drive_service: Any | None = None
+    presentation_id: str | None = None
+    try:
+        local_path = _resolve_pptx_upload_path(file_path)
+        resolved_title = title.strip() or local_path.stem
+        if not resolved_title:
+            return _error("title cannot be empty")
+        try:
+            expected_slide_content = _extract_pptx_slide_content(local_path)
+            expected_slide_text = [
+                text for text, _has_content in expected_slide_content
+            ]
+            expected_slide_has_content = [
+                has_content for _text, has_content in expected_slide_content
+            ]
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not inspect PPTX text before import: %s", exc)
+            return _error("Could not inspect PPTX text before import")
+
+        drive_service = get_drive_service()
+        with local_path.open("rb") as file_handle:
+            media = MediaIoBaseUpload(
+                file_handle, mimetype=_PPTX_MIME_TYPE, resumable=True
+            )
+            imported_file = (
+                drive_service.files()
+                .create(
+                    body={
+                        "name": resolved_title,
+                        "mimeType": _GOOGLE_SLIDES_MIME_TYPE,
+                    },
+                    media_body=media,
+                    supportsAllDrives=True,
+                    fields="id,name,mimeType,webViewLink",
+                )
+                .execute()
+            )
+
+        presentation_id = imported_file.get("id")
+        if not presentation_id:
+            raise ValueError("Google Drive did not return the imported file id")
+
+        presentation = (
+            get_slides_service()
+            .presentations()
+            .get(presentationId=presentation_id)
+            .execute()
+        )
+        link = imported_file.get("webViewLink") or (
+            f"https://docs.google.com/presentation/d/{presentation_id}/edit"
+        )
+        slides = presentation.get("slides", [])
+
+        def validation_failed(message: str, **details: Any) -> str:
+            cleanup_succeeded = _delete_imported_presentation(
+                drive_service, presentation_id
+            )
+            payload: dict[str, Any] = {
+                "status": "validation_failed",
+                "message": message,
+                "title": presentation.get("title") or resolved_title,
+                **details,
+            }
+            if not cleanup_succeeded:
+                payload["presentation_id"] = presentation_id
+                payload["link"] = link
+                payload["cleanup_failed"] = True
+            return json.dumps(payload, ensure_ascii=False)
+
+        if not slides:
+            return validation_failed(
+                "Imported presentation contains no slides",
+                slide_count=0,
+                empty_slide_numbers=[],
+                missing_text_slide_numbers=[],
+            )
+        if len(expected_slide_text) != len(slides):
+            return validation_failed(
+                "Imported presentation slide count differs from the PPTX",
+                slide_count=len(slides),
+                expected_slide_count=len(expected_slide_text),
+                empty_slide_numbers=[],
+                missing_text_slide_numbers=[],
+            )
+        empty_slide_numbers = [
+            index + 1
+            for index, slide in enumerate(slides)
+            if expected_slide_has_content[index] and _slide_is_empty(slide)
+        ]
+        actual_slide_text = [
+            _normalize_comparison_text(" ".join(_slide_summary(slide, index)["text"]))
+            for index, slide in enumerate(slides)
+        ]
+        missing_text_slide_numbers = [
+            index + 1
+            for index, expected_text in enumerate(expected_slide_text)
+            if expected_text
+            and not _contains_text_tokens(expected_text, actual_slide_text[index])
+        ]
+        if empty_slide_numbers or missing_text_slide_numbers:
+            return validation_failed(
+                "Imported presentation contains empty slides or missing text",
+                slide_count=len(slides),
+                empty_slide_numbers=empty_slide_numbers,
+                missing_text_slide_numbers=missing_text_slide_numbers,
+            )
+
+        return json.dumps(
+            {
+                "status": "success",
+                "presentation_id": presentation_id,
+                "title": presentation.get("title") or resolved_title,
+                "link": link,
+                "slide_count": len(slides),
+                "empty_slide_numbers": [],
+                "missing_text_slide_numbers": [],
+            },
+            ensure_ascii=False,
+        )
+    except PermissionError as e:
+        if drive_service is not None and presentation_id:
+            _delete_imported_presentation(drive_service, presentation_id)
+        logger.error("PPTX import rejected: %s", e)
+        return _error(str(e))
+    except FileNotFoundError as e:
+        if drive_service is not None and presentation_id:
+            _delete_imported_presentation(drive_service, presentation_id)
+        logger.error("PPTX file not found: %s", e)
+        return _error("PPTX file was not found")
+    except ValueError as e:
+        if drive_service is not None and presentation_id:
+            _delete_imported_presentation(drive_service, presentation_id)
+        logger.error("PPTX import rejected: %s", e)
+        return _error(str(e))
+    except OSError as e:
+        if drive_service is not None and presentation_id:
+            _delete_imported_presentation(drive_service, presentation_id)
+        logger.error("Error reading PPTX during Google Slides import: %s", e)
+        return _error("Could not read the PPTX file")
+    except Exception as e:
+        if drive_service is not None and presentation_id:
+            _delete_imported_presentation(drive_service, presentation_id)
+        logger.error(f"Error importing PPTX into Google Slides: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
 def google_slides_add_slide(
     presentation_id: str,
     title: str = "",
     body: str = "",
     layout: _Layout = "TITLE_AND_BODY",
+    default_slide_id: str = "",
+    preserve_blank_slide: bool = False,
 ) -> str:
     """
     Append a slide with a title and body text to a Google Slides presentation.
+    This is a text/layout primitive and does not create visual styling. For a
+    polished or designed deck, generate a local PPTX with the presentation
+    generator and call google_slides_import_pptx instead.
     The body supports plain text; use newlines to separate bullet lines — each
     line is rendered as its own bulleted paragraph (don't type literal "•"/"-"
     markers, Slides adds the bullet glyph itself — only "•"/"-"/"*" are
@@ -398,13 +845,13 @@ def google_slides_add_slide(
         title, body (optional) becomes the subtitle line (not bulleted).
       - "TITLE_ONLY", "SECTION_HEADER": title only, no body placeholder —
         pass body="" or the call is rejected.
-      - "BLANK": no placeholders at all; use google_slides_batch_update to
-        add free-form text boxes/images instead.
+    For blank/custom slides, use google_slides_batch_update directly; this
+    helper only exposes layouts with title/body placeholders.
 
     Layouts with a title placeholder that don't already require a body
     (TITLE, TITLE_ONLY, SECTION_HEADER — not TITLE_AND_BODY, whose own
-    body-required rule above already covers it, and not BLANK, which has
-    no title placeholder) still need at least a non-empty title — or, for
+    body-required rule above already covers it) still need at least a
+    non-empty title — or, for
     "TITLE", a non-empty body/subtitle instead — since otherwise the call
     would produce a completely empty slide; that combination is rejected.
 
@@ -414,6 +861,13 @@ def google_slides_add_slide(
     underlying batchUpdate call rather than a friendly one — use
     google_slides_batch_update directly for presentations with a
     non-standard theme.
+
+    When the presentation was created with google_slides_create_presentation,
+    pass its returned default_slide_id when this call may run in another MCP
+    process. The known default page is removed even if other pages were added
+    before this call. Without an id, cleanup is limited to a presentation with
+    exactly one empty page; an empty page in a multi-page deck is preserved.
+    Set preserve_blank_slide=True when that sole empty page is intentional.
 
     To fix a slide this call already created (wrong/missing text), use
     google_slides_update_slide with its slide_id — do NOT call
@@ -481,6 +935,63 @@ def google_slides_add_slide(
         pres_id = _resolve_presentation_id(presentation_id)
         service = get_slides_service()
 
+        tracked_default_slide_id = _CREATED_DEFAULT_SLIDES.get(pres_id)
+        requested_default_slide_id = default_slide_id.strip()
+        candidate_default_slide_id = (
+            requested_default_slide_id or tracked_default_slide_id
+        )
+        if preserve_blank_slide:
+            # Preserving the page consumes any in-process default inference;
+            # otherwise a later call without this flag could delete the page
+            # the caller explicitly asked us to keep.
+            if candidate_default_slide_id:
+                _PRESERVED_BLANK_SLIDES.setdefault(pres_id, set()).add(
+                    candidate_default_slide_id
+                )
+            _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
+            candidate_default_slide_id = ""
+        # A Slides API create call starts with a default blank page. Read the
+        # current pages before creating the next real page, then delete that
+        # default only after the new page has been created in this same atomic
+        # batch. A known id can identify the default even after other pages
+        # were added; without one, only a sole empty page is considered the
+        # default, so user content in a multi-page deck is never guessed away.
+        existing: dict[str, Any] = {"slides": []}
+        if candidate_default_slide_id or not preserve_blank_slide:
+            existing = service.presentations().get(presentationId=pres_id).execute()
+        slide_to_remove = None
+        existing_slides = existing.get("slides", [])
+        if not preserve_blank_slide:
+            if candidate_default_slide_id:
+                candidate_slide = next(
+                    (
+                        slide
+                        for slide in existing_slides
+                        if slide.get("objectId") == candidate_default_slide_id
+                    ),
+                    None,
+                )
+                if candidate_slide is not None:
+                    if _slide_is_empty(candidate_slide):
+                        slide_to_remove = candidate_default_slide_id
+                    else:
+                        # The caller used the page before asking us to append
+                        # a slide, so it is no longer the untouched default.
+                        _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
+            elif (
+                len(existing_slides) == 1
+                and existing_slides[0].get("objectId")
+                not in _PRESERVED_BLANK_SLIDES.get(pres_id, set())
+                and _slide_is_untouched_default(existing_slides[0])
+            ):
+                # Without a cross-process id, the only safe inference is a
+                # presentation whose sole page is empty. Never infer that a
+                # blank page in a multi-page deck is Google's default.
+                slide_to_remove = existing_slides[0].get("objectId")
+
+        if slide_to_remove:
+            _PRESERVED_BLANK_SLIDES.get(pres_id, set()).discard(slide_to_remove)
+
         slide_id = f"slide_{uuid.uuid4().hex[:12]}"
         title_id = f"{slide_id}_title"
         body_id = f"{slide_id}_body"
@@ -515,10 +1026,14 @@ def google_slides_add_slide(
             )
         if body.strip():
             requests.extend(_body_insert_requests(body_id, body, is_bulleted))
+        if slide_to_remove:
+            requests.append({"deleteObject": {"objectId": slide_to_remove}})
 
         service.presentations().batchUpdate(
             presentationId=pres_id, body={"requests": requests}
         ).execute()
+        if slide_to_remove and _CREATED_DEFAULT_SLIDES.get(pres_id) == slide_to_remove:
+            _CREATED_DEFAULT_SLIDES.pop(pres_id, None)
 
         return json.dumps(
             {
@@ -526,6 +1041,7 @@ def google_slides_add_slide(
                 "presentation_id": pres_id,
                 "slide_id": slide_id,
                 "layout": normalized_layout,
+                "default_slide_removed": bool(slide_to_remove),
             },
             ensure_ascii=False,
         )
@@ -578,13 +1094,11 @@ def google_slides_update_slide(
 
         if title and "title" not in placeholders:
             return _error(
-                f"Slide '{slide_id}' has no title placeholder, so 'title' "
-                "has nowhere to go."
+                f"Slide '{slide_id}' has no title placeholder, so 'title' has nowhere to go."
             )
         if body and "body" not in placeholders:
             return _error(
-                f"Slide '{slide_id}' has no body/subtitle placeholder, so "
-                "'body' has nowhere to go."
+                f"Slide '{slide_id}' has no body/subtitle placeholder, so 'body' has nowhere to go."
             )
 
         if body:
@@ -692,6 +1206,9 @@ def google_slides_batch_update(presentation_id: str, requests_json: str) -> str:
     requests_json must be a JSON array of request objects following the Slides API
     schema (e.g. createShape, insertText, updateTextStyle, createImage).
     Use this only when the simpler tools cannot express the required change.
+    When following google_slides_create_presentation across MCP processes, use
+    the returned default_slide_id in a deleteObject request after creating the
+    first content slide; this tool cannot infer that id from a later session.
     """
     try:
         pres_id = _resolve_presentation_id(presentation_id)

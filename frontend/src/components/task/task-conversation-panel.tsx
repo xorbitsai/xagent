@@ -783,7 +783,7 @@ export function TaskConversationPanel({
                         rawContent={item.rawContent}
                         traceEvents={item.traceEvents as any || []}
                         showProcessView={showProcessView}
-                        processStatus={item.processStatus}
+                        processStatus={item.status === "interrupted" ? "interrupted" : item.processStatus}
                         taskStatus={
                           isFailedResultMessage
                             ? "failed"

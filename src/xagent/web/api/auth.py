@@ -35,7 +35,11 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ...builtin_identity import builtin_provenance_identity
-from ...config import get_app_base_url, get_password_reset_expire_minutes
+from ...config import (
+    get_app_base_url,
+    get_google_restricted_scopes,
+    get_password_reset_expire_minutes,
+)
 from ...core.agent.voice_policy import VALID_VOICES as _CORE_VALID_VOICES
 from ...core.runtime_performance import (
     increment_counter as increment_performance_counter,
@@ -53,6 +57,7 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user
+from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
 from ..mcp_apps import get_app_by_id
 from ..models.actor_oauth_flow import ActorOAuthFlowState
@@ -2567,6 +2572,22 @@ def _lock_actor_link(db: Session, *, user_id: int, provider: str, app_id: str) -
     _require_one_actor_link(links, app_id)
 
 
+def _google_gmail_error(provider: str, app_id: str | None) -> HTMLResponse | None:
+    """Block Gmail even when its persisted catalog row is absent."""
+    if (
+        provider.lower() == "google"
+        and app_id == "gmail"
+        and not get_google_restricted_scopes()
+    ):
+        return HTMLResponse(
+            content=(
+                "<h1>Cannot Connect</h1><p>This app is not currently available.</p>"
+            ),
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    return None
+
+
 def start_builtin_oauth_for_resource_owner(
     *,
     provider: str,
@@ -2586,6 +2607,9 @@ def start_builtin_oauth_for_resource_owner(
     if owner_key is None:  # pragma: no cover - normalization preserves only None
         raise ValueError("resource_owner_key must not be null")
     app_id = app_id.strip()
+    if error_response := _google_gmail_error(provider, app_id):
+        return error_response
+
     _require_actor_oauth_personal_link(
         db,
         user_id=int(user.id),
@@ -3026,6 +3050,9 @@ def _generic_oauth_login(
             status_code=401,
         )
 
+    if error_response := _google_gmail_error(provider, app_id):
+        return error_response
+
     if not app_id:
         from ..mcp_apps import requires_app_scoped_oauth_grant
 
@@ -3193,13 +3220,22 @@ def _generic_oauth_login(
         "state": state,
     }
     if provider.lower() == "google":
+        restricted_scopes = get_google_restricted_scopes()
+        # Provider defaults and custom apps must obey the same review gate.
+        if not restricted_scopes and GOOGLE_RESTRICTED_SCOPES.intersection(
+            scopes + app_optional_scopes
+        ):
+            logger.warning("Rejected Google restricted scopes: app_id=%s", app_id)
+            return HTMLResponse(
+                content=(
+                    "<h1>Cannot Connect</h1>"
+                    "<p>Google restricted scopes are disabled in this environment.</p>"
+                ),
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
         params["access_type"] = "offline"
-        # Do not carry a previously granted full-Drive permission into a
-        # narrowed drive.file reconnect. Other Google connectors still use
-        # incremental authorization so their independent grants compose.
-        params["include_granted_scopes"] = (
-            "false" if app_id == "google-drive" else "true"
-        )
+        # Closed environments must not aggregate historical restricted grants.
+        params["include_granted_scopes"] = "true" if restricted_scopes else "false"
         params["prompt"] = "consent"
     if provider.lower() == "zoom":
         params["prompt"] = "login"
@@ -3498,6 +3534,9 @@ def generic_oauth_callback(
         )
     user_id = user_id_claim
     app_id = payload.get("app_id")
+    if error_response := _google_gmail_error(provider, app_id):
+        return error_response
+
     encrypted_code_verifier = payload.get("code_verifier")
     code_verifier = None
     if encrypted_code_verifier:

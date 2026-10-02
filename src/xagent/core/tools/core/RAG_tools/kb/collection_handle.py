@@ -19,19 +19,12 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 if TYPE_CHECKING:
     from .models import KBVectorStorageCleanupResult
 
 import pandas as pd
-
-try:
-    import pyarrow as pa  # type: ignore
-    from pyarrow import Table as PyArrowTable
-except ImportError:  # pragma: no cover - pyarrow is an optional runtime dep
-    pa = None
-    PyArrowTable = Any
 
 from ..core.config import (
     DEFAULT_LANCEDB_BATCH_SIZE,
@@ -2571,94 +2564,74 @@ class LanceDBCollectionHandle(KBCollectionHandle):
     def _substring_fallback(
         self,
         *,
-        table: Any,
+        table_name: str,
         collection: str,
         query_text: str,
         model_tag: str,
         top_k: int,
         filters: Optional[Dict[str, Any]],
         current_warnings: List[SearchWarning],
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
         batch_size: int = 2048,
     ) -> List[SearchResult]:
         """Perform a memory-friendly substring scan across the table when FTS misses."""
 
-        desired_columns: Set[str] = {
-            "collection",
-            "doc_id",
-            "chunk_id",
-            "text",
-            "parse_hash",
-            "created_at",
-            "metadata",
-        }
-        if filters and isinstance(filters, dict):
-            desired_columns.update(filters.keys())
+        query_filters: Dict[str, Any] = (
+            dict(filters) if isinstance(filters, dict) else {}
+        )
+        # Caller filters AND the handle's collection, as in the FTS query.
+        if query_filters.setdefault("collection", collection) != collection:
+            return []
 
         results: List[SearchResult] = []
 
         try:
-            if hasattr(table, "to_batches"):
-                batch_iter: Iterable[Any] = table.to_batches(
-                    columns=list(desired_columns), batch_size=batch_size
+            for batch in self.vector_index_store.iter_batches(
+                table_name=table_name,
+                columns=[
+                    "doc_id",
+                    "chunk_id",
+                    "text",
+                    "parse_hash",
+                    "created_at",
+                    "metadata",
+                ],
+                batch_size=batch_size,
+                filters=query_filters,
+                user_id=user_id,
+                is_admin=is_admin,
+            ):
+                batch_df = batch.to_pandas()
+                text_mask = (
+                    batch_df["text"]
+                    .astype(str)
+                    .str.contains(query_text, na=False, regex=False)
                 )
-            else:
-                if pa is None:  # pragma: no cover - Safety guard when pyarrow missing
-                    raise ImportError(
-                        "pyarrow is required for substring fallback when LanceDB table does not expose to_batches()."
+
+                for _, row in batch_df.loc[text_mask].iterrows():
+                    # Deserialize metadata from JSON string to dictionary
+                    metadata = deserialize_metadata(row.get("metadata"))
+                    results.append(
+                        SearchResult(
+                            doc_id=row["doc_id"],
+                            chunk_id=row["chunk_id"],
+                            text=row["text"],
+                            score=1.0,
+                            parse_hash=row["parse_hash"],
+                            model_tag=model_tag,
+                            created_at=row["created_at"],
+                            metadata=metadata,
+                        )
                     )
-                arrow_table: PyArrowTable = table.to_arrow()  # type: ignore
-                arrow_table = arrow_table.select(list(desired_columns))
-                batch_iter = arrow_table.to_batches(max_chunksize=batch_size)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Substring fallback failed to read batches: %s", exc)
-            return results
+                    if len(results) >= top_k:
+                        break
 
-        for batch in batch_iter:
-            batch_df = batch.to_pandas()
-
-            mask = batch_df["collection"] == collection
-            if filters and isinstance(filters, dict):
-                for key, value in filters.items():
-                    if key not in batch_df.columns:
-                        continue
-                    if isinstance(value, (list, tuple, set)):
-                        mask &= batch_df[key].isin(list(value))
-                    else:
-                        mask &= batch_df[key] == value
-
-            if not mask.any():
-                continue
-
-            text_mask = (
-                batch_df["text"]
-                .astype(str)
-                .str.contains(query_text, na=False, regex=False)
-            )
-            mask &= text_mask
-
-            if not mask.any():
-                continue
-
-            for _, row in batch_df.loc[mask].iterrows():
-                # Deserialize metadata from JSON string to dictionary
-                metadata = deserialize_metadata(row.get("metadata"))
-                results.append(
-                    SearchResult(
-                        doc_id=row["doc_id"],
-                        chunk_id=row["chunk_id"],
-                        text=row["text"],
-                        score=1.0,
-                        parse_hash=row["parse_hash"],
-                        model_tag=model_tag,
-                        created_at=row["created_at"],
-                        metadata=metadata,
-                    )
-                )
                 if len(results) >= top_k:
                     break
-
-            if len(results) >= top_k:
-                break
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Substring fallback failed to read batches: %s", exc)
+            return []
 
         if results:
             current_warnings.append(
@@ -2945,13 +2918,15 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 query_text,
             )
             fallback_results = self._substring_fallback(
-                table=table,
+                table_name=actual_table_name,
                 collection=collection,
                 query_text=query_text,
                 model_tag=model_tag,
                 top_k=top_k,
                 filters=filters,
                 current_warnings=current_warnings,
+                user_id=user_id,
+                is_admin=is_admin,
             )
 
             return self._build_sparse_response(

@@ -129,7 +129,11 @@ async def test_pending_control_call_recovers_original_message(
         assert db.query(TraceEvent).count() == 1
         sent = broadcasts.await_args.args[0]
         assert sent["event_id"] == original_id
-        assert sent["data"] == fact.payload["data"]
+        expected_data = dict(fact.payload["data"])
+        if wait:
+            expected_data["message_id"] = f"execution_message_{fact.event_id}"
+        assert sent["data"] == expected_data
+        assert sent["execution_sequence"] == fact.sequence
         assert (
             resumed.outbound_messages[0]["metadata"] == fact.payload["data"]["metadata"]
         )

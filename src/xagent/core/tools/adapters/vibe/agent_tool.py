@@ -166,14 +166,20 @@ class _DelegatedAgentTaskEventTraceHandler:
         *,
         task_id: int,
         metadata: Mapping[str, Any],
+        event_backed: bool = False,
     ) -> None:
         from .....web.services.task_event_trace_handler import TaskEventTraceHandler
 
         self.task_id = task_id
+        self.event_backed = event_backed
         self.metadata = dict(metadata)
         self._handler = TaskEventTraceHandler(task_id)
 
     async def handle_event(self, event: Any) -> None:
+        # V2 root streams contain root facts only. The authorized worker drawer
+        # reads this delegated scope directly from its durable events.
+        if self.event_backed:
+            return
         original_data = event.data
         base_data = original_data if isinstance(original_data, dict) else {}
         event.data = {**base_data, **self.metadata}
@@ -2127,7 +2133,10 @@ class AgentTool(AbstractBaseTool):
         if (
             self._parent_tracer is None
             or self._parent_task_id is None
-            or not self._runtime_metadata
+            or (
+                not self._runtime_metadata
+                and getattr(self._parent_tracer, "event_writer", None) is None
+            )
         ):
             return
 
@@ -2202,6 +2211,7 @@ class AgentTool(AbstractBaseTool):
                 _DelegatedAgentTaskEventTraceHandler(
                     task_id=parent_db_task_id,
                     metadata=metadata,
+                    event_backed=handlers[0]._handler.authoritative,
                 )
             )
 

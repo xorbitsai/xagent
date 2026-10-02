@@ -15,7 +15,13 @@ vi.mock("next/navigation", () => ({
 }))
 
 vi.mock("@/components/task/task-conversation-panel", () => ({
-  TaskConversationPanel: () => <div data-testid="conversation-panel" />,
+  TaskConversationPanel: ({ onAgentExecutionClick }: { onAgentExecutionClick?: (selection: { workerTaskId: string; agentName: string; status: "running" }) => void }) => (
+    <button data-testid="conversation-panel" disabled={!onAgentExecutionClick} onClick={() => onAgentExecutionClick?.({ workerTaskId: "child-one", agentName: "Researcher", status: "running" })}>Open child</button>
+  ),
+}))
+
+vi.mock("@/components/task/task-agent-execution-drawer", () => ({
+  TaskAgentExecutionDrawer: ({ taskId, selection }: { taskId: number; selection: { workerTaskId: string } }) => <div data-testid="child-drawer">{taskId}:{selection.workerTaskId}</div>,
 }))
 
 const app = vi.hoisted(() => ({
@@ -351,5 +357,30 @@ describe("TaskDetailPage progress panel lifecycle", () => {
     // history/terminal auto-open test above) - open it via the header toggle.
     fireEvent.click(screen.getByTitle("Show execution progress"))
     expect(screen.getByText("Old step")).toBeInTheDocument()
+  })
+})
+
+
+describe("TaskDetailPage child inspector", () => {
+  it.each([undefined, 1, 2])("only offers the inspector for V2 (version %s)", (version) => {
+    app.state = baseState()
+    app.state.currentTask!.conversationStorageVersion = version
+    renderPage()
+    expect(screen.getByTestId("conversation-panel").hasAttribute("disabled")).toBe(version !== 2)
+    if (version === 2) {
+      fireEvent.click(screen.getByText("Open child"))
+      expect(screen.getByTestId("child-drawer")).toHaveTextContent("1:child-one")
+      expect(app.closeFilePreview).toHaveBeenCalled()
+    }
+  })
+
+  it("closes the selected child when switching tasks", () => {
+    app.state = baseState()
+    app.state.currentTask!.conversationStorageVersion = 2
+    const { rerender } = renderPage()
+    fireEvent.click(screen.getByText("Open child"))
+    app.state = baseState({ taskId: 2 })
+    rerender(<I18nProvider initialLocale="en"><TaskDetailPage /></I18nProvider>)
+    expect(screen.queryByTestId("child-drawer")).not.toBeInTheDocument()
   })
 })

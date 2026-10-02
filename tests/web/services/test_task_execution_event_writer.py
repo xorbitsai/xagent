@@ -320,7 +320,12 @@ async def test_outbound_stream_is_committed_before_websocket_and_failure_is_stri
 
     monkeypatch.setattr(websocket, "publish_task_event", broadcast)
     handler = websocket.make_agent_outbound_handler(task_id, authoritative=True)
-    payload = {"type": "final_answer_end", "content": "hello", "stream_id": "stream1"}
+    payload = {
+        "type": "final_answer_end",
+        "content": "hello",
+        "stream_id": "stream1",
+        "message_id": "final_answer_1",
+    }
     await handler(payload)
     assert len(broadcasts) == 1
 
@@ -1066,7 +1071,12 @@ async def test_stream_deltas_publish_without_durable_writes(
         with bind_task_lease_context(lease):
             for chunk in ("hello", " ", "world"):
                 await handler(
-                    {"type": "final_answer_delta", "delta": chunk, "stream_id": "s"}
+                    {
+                        "type": "final_answer_delta",
+                        "delta": chunk,
+                        "stream_id": "s",
+                        "message_id": "final_answer_1",
+                    }
                 )
     finally:
         sa.event.remove(engine, "before_cursor_execute", record)
@@ -1082,7 +1092,12 @@ async def test_stream_deltas_publish_without_durable_writes(
         assert facts(db, task_id) == []
     with bind_task_lease_context(lease):
         await handler(
-            {"type": "final_answer_end", "content": "hello world", "stream_id": "s"}
+            {
+                "type": "final_answer_end",
+                "content": "hello world",
+                "stream_id": "s",
+                "message_id": "final_answer_1",
+            }
         )
     with factory() as db:
         assert [row.kind for row in facts(db, task_id)] == ["final_answer_end"]

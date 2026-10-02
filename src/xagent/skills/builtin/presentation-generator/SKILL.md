@@ -5,14 +5,44 @@ description: |
   content extraction, templates, speaker notes, combining or splitting decks.
   Not for posters, images, or social graphics.
 when_to_use: |
-  The user asks for a deck, slides, a presentation, PPT/PPTX, or names a .pptx
-  file. Use pptx-editorial instead when magazine-grade editorial styling is
-  wanted.
+  The user asks for a deck, slides, a presentation, Google Slides, PPT/PPTX,
+  or names a .pptx file. Use pptx-editorial instead when magazine-grade
+  editorial styling is wanted.
 ---
 
 # Presentation Generator
 
 Generate PowerPoint presentations using JavaScript code with the pptxgenjs library.
+
+## Google Slides output
+
+When the requested output is Google Slides, this skill is the local deck
+creation step, not the final delivery step:
+
+1. Generate and inspect the designed local PPTX in the workspace.
+2. Call `google_slides_import_pptx` with that PPTX path to convert it into an
+   editable native Google Slides presentation.
+   Treat `validation_failed` as a failed delivery; it means the conversion
+   changed the slide count, dropped text, or left a blank slide.
+3. Call `google_slides_get_presentation` to verify slide count and text before
+   returning the Google Slides link.
+
+Do not build a new outlined deck with repeated `google_slides_create_presentation`
+and `google_slides_add_slide` calls. Those tools are for explicitly requested
+simple text/layout edits and do not preserve visual design.
+
+For simple Google Slides layout edits, pass the `default_slide_id` returned by
+`google_slides_create_presentation` to the first `google_slides_add_slide` call
+when calls may cross MCP processes. Without the id, the connector removes the
+sole empty page as the default page; an empty page in a multi-page deck is
+preserved. Pass `preserve_blank_slide=true` when that sole page is intentional.
+`google_slides_add_slide` only supports layouts with title/body placeholders;
+use `google_slides_batch_update` directly for blank/custom slides.
+
+When using `google_slides_batch_update` after `google_slides_create_presentation`,
+the connector cannot infer the default page across MCP processes. Include a
+`deleteObject` request for the returned `default_slide_id` after creating the
+first content page, or use `google_slides_add_slide` with that ID.
 
 ## ⚠️ CRITICAL REQUIREMENTS - READ FIRST
 

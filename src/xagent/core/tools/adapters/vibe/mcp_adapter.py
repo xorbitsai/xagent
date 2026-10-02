@@ -278,9 +278,9 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
 }
 
 # Built-in connector tools that create a real binary under the current task
-# workspace. Their result is converted into a durable FileRef at the host
-# boundary before the path reaches the model, so a later turn does not depend
-# on the original process-local output directory still existing.
+# workspace. Their result is annotated with a durable FileRef at the host
+# boundary, so later turns and connectors can use the registered artifact even
+# when the original process-local output directory is no longer available.
 _WORKSPACE_DOWNLOAD_FIELDS: dict[tuple[str, str], str] = {
     ("onedrive", "onedrive_download_file"): "file_path",
     ("google-drive", "google_drive_download_file"): "path",

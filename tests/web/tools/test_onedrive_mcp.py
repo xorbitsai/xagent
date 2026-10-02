@@ -1,4 +1,5 @@
 import base64
+import errno
 import hashlib
 import io
 import json
@@ -692,6 +693,60 @@ def test_download_file_reserves_a_collision_free_output_name(monkeypatch, tmp_pa
     assert result["filename"] == "report (1).pdf"
     assert (output_dir / "report.pdf").read_bytes() == b"existing"
     assert (output_dir / "report (1).pdf").read_bytes() == content
+
+
+def test_download_file_preserves_extension_for_cjk_and_long_names(
+    monkeypatch, tmp_path
+):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    cases = [
+        ("季度报告.xlsx", "file.xlsx"),
+        ("a" * 300 + ".docx", "a" * 195 + ".docx"),
+    ]
+    for index, (remote_name, expected_name) in enumerate(cases):
+        content = f"content-{index}".encode()
+        metadata = MockResponse(
+            {
+                "id": f"item-name-{index}",
+                "name": remote_name,
+                "size": len(content),
+                "file": {},
+            }
+        )
+        monkeypatch.setattr(
+            onedrive.requests,
+            "request",
+            Mock(side_effect=[metadata, MockResponse(content=content)]),
+        )
+
+        result = json.loads(onedrive.onedrive_download_file(remote_name))
+
+        assert result["status"] == "success"
+        assert result["filename"] == expected_name
+        assert (task_dir / "output" / expected_name).read_bytes() == content
+
+
+def test_publish_download_file_falls_back_when_hard_links_are_unavailable(
+    monkeypatch, tmp_path
+):
+    temporary_path = tmp_path / "staging.part"
+    temporary_path.write_bytes(b"downloaded")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    monkeypatch.setattr(
+        onedrive.os,
+        "link",
+        Mock(side_effect=OSError(errno.EPERM, "hard links unavailable")),
+    )
+
+    output_path = onedrive._publish_download_file(
+        temporary_path, output_dir, "report.pdf"
+    )
+
+    assert output_path.read_bytes() == b"downloaded"
+    assert not temporary_path.exists()
 
 
 def test_download_file_rejects_folder_metadata(monkeypatch, tmp_path):

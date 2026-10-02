@@ -864,6 +864,192 @@ def test_custom_google_drive_server_is_not_trusted_for_download_registration():
     assert "durable file_ref" not in adapter.description
 
 
+def test_workspace_download_registration_uses_real_file_ref_for_google_drive(
+    tmp_path,
+):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    downloaded = output_dir / "export.pdf"
+    downloaded.write_bytes(b"pdf bytes")
+    workspace_root = tmp_path
+    workspace_output_dir = output_dir
+
+    class FakeWorkspace:
+        workspace_dir = workspace_root
+        output_dir = workspace_output_dir
+
+        def resolve_path(self, path):
+            return Path(path)
+
+        def get_file_id_from_path(self, path):
+            return None
+
+        def register_file(self, path):
+            return "file-real"
+
+    adapter = _build_mcp_tool_adapter(
+        "Google Drive",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="google_drive_download_file",
+            description="Download a file",
+            inputSchema={"type": "object", "properties": {"path": {"type": "string"}}},
+        ),
+        workspace=FakeWorkspace(),
+    )
+    result = {
+        "content": [
+            {
+                "text": json.dumps(
+                    {
+                        "status": "success",
+                        "path": str(downloaded),
+                        "file": {"mimeType": "application/vnd.google-apps.document"},
+                    }
+                )
+            }
+        ]
+    }
+
+    adapter._register_workspace_download_result(result)
+
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["file_ref"]["file_id"] == "file-real"
+    assert payload["file_ref"]["filename"] == "export.pdf"
+    assert payload["file_ref"]["mime_type"] == "application/pdf"
+    assert payload["file_ref"]["size"] == len(b"pdf bytes")
+    assert "durable file_ref" in adapter.description
+
+
+@pytest.mark.parametrize(
+    "result_factory",
+    [
+        lambda path: {
+            "content": [
+                {"text": json.dumps({"status": "error", "file_path": str(path)})}
+            ]
+        },
+        lambda path: {
+            "content": [
+                {"text": json.dumps({"status": "success", "file_path": str(path)})}
+            ]
+        },
+    ],
+    ids=["non_success", "outside_output"],
+)
+def test_workspace_download_registration_does_not_attach_untrusted_refs(
+    tmp_path, result_factory
+):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    outside_path = tmp_path / "outside.bin"
+    outside_path.write_bytes(b"outside")
+    workspace_root = tmp_path
+    workspace_output_dir = output_dir
+
+    class FakeWorkspace:
+        workspace_dir = workspace_root
+        output_dir = workspace_output_dir
+
+        def resolve_path(self, path):
+            return Path(path)
+
+        def get_file_id_from_path(self, path):
+            return None
+
+        def register_file(self, path):
+            raise AssertionError("untrusted path must not be registered")
+
+    adapter = _build_mcp_tool_adapter(
+        "OneDrive",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="onedrive_download_file",
+            description="Download a file",
+            inputSchema={
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+            },
+        ),
+        workspace=FakeWorkspace(),
+    )
+    result = result_factory(outside_path)
+
+    adapter._register_workspace_download_result(result)
+
+    payload = json.loads(result["content"][0]["text"])
+    if payload["status"] == "success":
+        assert payload["file_ref_error"] == "durable file registration failed"
+    else:
+        assert "file_ref" not in payload
+
+
+def test_workspace_download_registration_reports_registration_failure(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    downloaded = output_dir / "report.xlsx"
+    downloaded.write_bytes(b"xlsx bytes")
+    workspace_root = tmp_path
+    workspace_output_dir = output_dir
+
+    class FakeWorkspace:
+        workspace_dir = workspace_root
+        output_dir = workspace_output_dir
+
+        def resolve_path(self, path):
+            return Path(path)
+
+        def get_file_id_from_path(self, path):
+            return None
+
+        def register_file(self, path):
+            raise OSError("registration unavailable")
+
+    adapter = _build_mcp_tool_adapter(
+        "OneDrive",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="onedrive_download_file",
+            description="Download a file",
+            inputSchema={
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+            },
+        ),
+        workspace=FakeWorkspace(),
+    )
+    result = {
+        "content": [
+            {"text": json.dumps({"status": "success", "file_path": str(downloaded)})}
+        ]
+    }
+
+    adapter._register_workspace_download_result(result)
+
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["file_ref_error"] == "durable file registration failed"
+    assert payload["file_path"] == str(downloaded)
+
+
+def test_workspace_download_registration_is_disabled_without_workspace():
+    adapter = _build_mcp_tool_adapter(
+        "OneDrive",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="onedrive_download_file",
+            description="Download a file",
+            inputSchema={
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+            },
+        ),
+        workspace=None,
+    )
+    result = {"content": [{"text": json.dumps({"status": "success"})}]}
+
+    assert adapter._register_workspace_download_result(result) is result
+
+
 def test_exception_indicates_http_401_uses_bounded_status_signals():
     class StatusError(RuntimeError):
         status_code = 401

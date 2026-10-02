@@ -1,4 +1,5 @@
 import base64
+import errno
 import hashlib
 import json
 import logging
@@ -6,6 +7,7 @@ import math
 import mimetypes
 import os
 import re
+import shutil
 import time
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -696,7 +698,33 @@ def _publish_download_file(
         except FileExistsError:
             counter += 1
             continue
-        temporary_path.unlink()
+        except OSError as exc:
+            if exc.errno not in {
+                errno.EXDEV,
+                errno.EPERM,
+                errno.ENOTSUP,
+                errno.EOPNOTSUPP,
+            }:
+                raise
+            try:
+                fd = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                counter += 1
+                continue
+            try:
+                with os.fdopen(fd, "wb") as output, temporary_path.open("rb") as source:
+                    shutil.copyfileobj(source, output)
+            except BaseException:
+                candidate.unlink(missing_ok=True)
+                raise
+        try:
+            temporary_path.unlink()
+        except OSError:
+            logger.warning("Failed to remove OneDrive download staging file")
         return candidate
 
 
@@ -741,7 +769,7 @@ def _stream_download_to_path(
                         "The OneDrive download exceeded the "
                         f"{_MAX_DOWNLOAD_BYTES // (1024 * 1024 * 1024)} GiB limit"
                     )
-                if expected_quickxor_hash is None and total > expected_size:
+                if total > expected_size:
                     raise RuntimeError(
                         "OneDrive file size changed while it was being downloaded"
                     )
@@ -1295,9 +1323,6 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
         elif raw_message.startswith(
             (
                 "No task workspace configured for this connector",
-                "file_path must include a filename",
-                "file_path filename must not end with a period",
-                "file_path is required",
                 "path must use '/' separators",
                 "path must not contain",
                 "The OneDrive file is ",

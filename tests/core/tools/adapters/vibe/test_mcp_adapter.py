@@ -814,6 +814,20 @@ async def test_mcp_binary_download_is_registered_as_durable_file_ref(monkeypatch
                     )
                 ],
                 isError=False,
+                structuredContent={
+                    "result": json.dumps(
+                        {
+                            "status": "success",
+                            "file_path": "/task/output/Deck.pptx",
+                            "file": {
+                                "mimeType": (
+                                    "application/vnd.openxmlformats-officedocument."
+                                    "presentationml.presentation"
+                                )
+                            },
+                        }
+                    )
+                },
             )
 
     @asynccontextmanager
@@ -826,6 +840,10 @@ async def test_mcp_binary_download_is_registered_as_durable_file_ref(monkeypatch
 
     payload = json.loads(result["content"][0]["text"])
     assert payload["file_ref"] == {"file_id": "file-123", "filename": "Deck.pptx"}
+    assert "file_path" not in payload
+    structured_payload = json.loads(result["structured_content"]["result"])
+    assert structured_payload["file_ref"] == payload["file_ref"]
+    assert "file_path" not in structured_payload
 
 
 def test_custom_google_drive_server_is_not_trusted_for_download_registration():

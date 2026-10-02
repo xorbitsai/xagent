@@ -2250,9 +2250,13 @@ class MCPToolAdapter(AbstractBaseTool):
                         if retry_result is None:
                             raise
                         result = retry_result
-                    result = await self._run_upload_staging_operation(
-                        self._register_workspace_download_result, result
-                    )
+                    if (
+                        self._workspace is not None
+                        and self._workspace_download_field is not None
+                    ):
+                        result = await self._run_upload_staging_operation(
+                            self._register_workspace_download_result, result
+                        )
                     if bound_args:
                         result["runtime_bound_arguments"] = bound_args
                     return _replace_staged_upload_paths(result, staged_upload_sources)

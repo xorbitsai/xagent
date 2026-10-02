@@ -304,7 +304,15 @@ def upgrade() -> None:
         .mappings()
         .first()
     )
-    if row is None or _owned_remote_launch(row["launch_config"]):
+    if row is None:
+        return
+    if _owned_remote_launch(row["launch_config"]):
+        # A prior registry sync may have updated the catalog before this
+        # migration ran. Keep the migration idempotent by still removing
+        # legacy state left behind by that partial transition.
+        _delete_legacy_local_server(bind)
+        _clear_legacy_hubspot_tokens(bind)
+        _remove_legacy_hubspot_provider(bind)
         return
     if not _legacy_catalog_row(row):
         raise RuntimeError(

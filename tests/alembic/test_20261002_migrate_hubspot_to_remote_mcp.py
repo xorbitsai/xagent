@@ -243,6 +243,70 @@ def test_upgrade_accepts_legacy_scopes_in_a_different_order(tmp_path):
         assert row["oauth_scopes"] is None
 
 
+def test_upgrade_cleans_legacy_state_when_catalog_is_already_remote(tmp_path):
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, servers, _ = _schema(metadata)
+    user_oauth = metadata.tables["user_oauth"]
+    oauth_providers = metadata.tables["oauth_providers"]
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        _insert_legacy_app(connection, apps, migration)
+        connection.execute(
+            apps.update()
+            .where(apps.c.app_id == "hubspot")
+            .values(
+                transport="streamable_http",
+                provider_name=None,
+                oauth_scopes=None,
+                launch_config=migration.REMOTE_LAUNCH_CONFIG,
+            )
+        )
+        connection.execute(
+            servers.insert().values(
+                id=7,
+                name="HubSpot",
+                transport="oauth",
+                auth={"app_id": "hubspot", "provider": "hubspot"},
+            )
+        )
+        connection.execute(
+            user_oauth.insert().values(
+                id=1,
+                provider="hubspot",
+                access_token="legacy-access-token",
+                refresh_token="legacy-refresh-token",
+            )
+        )
+        connection.execute(
+            oauth_providers.insert().values(
+                provider_name="hubspot",
+                name="HubSpot",
+                client_id="legacy-client",
+                client_secret="legacy-secret",
+                auth_url="https://app.hubspot.com/oauth/authorize",
+                token_url="https://api.hubapi.com/oauth/v1/token",
+                redirect_uri="https://example.com/callback",
+                userinfo_url="https://api.hubapi.com/oauth/v1/access-tokens/{{access_token}}",
+                user_id_path="user_id",
+                email_path="user",
+                default_scopes=["oauth"],
+            )
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        assert connection.execute(select(servers)).all() == []
+        assert (
+            connection.execute(select(user_oauth)).mappings().one()["access_token"]
+            == ""
+        )
+        assert connection.execute(select(oauth_providers)).all() == []
+
+
 def test_upgrade_preserves_custom_description(tmp_path):
     migration = _load_migration()
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")

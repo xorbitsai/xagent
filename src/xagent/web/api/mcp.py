@@ -3848,13 +3848,24 @@ def _resolve_catalog_mcp_oauth_auth(app_id: str, auth_config: Any) -> dict[str, 
             detail="Unsupported catalog OAuth credential provider",
         )
 
-    client_id = get_hubspot_mcp_client_id()
-    client_secret = get_hubspot_mcp_client_secret()
+    # Keep catalog reconciliation/startup independent of this optional
+    # connector's deployment credentials. The connect path validates these
+    # values immediately before it calls this helper, while an empty pair lets
+    # a future catalog sync materialize a safe, unavailable placeholder.
+    resolved["client_id"] = get_hubspot_mcp_client_id() or ""
+    resolved["client_secret"] = get_hubspot_mcp_client_secret() or ""
+    return resolved
+
+
+def _require_catalog_mcp_oauth_credentials(app_id: str) -> None:
+    """Fail closed when a user actually starts a static-client OAuth flow."""
+    if app_id != "hubspot":
+        return
     missing = [
         name
         for name, value in (
-            ("XAGENT_HUBSPOT_MCP_CLIENT_ID", client_id),
-            ("XAGENT_HUBSPOT_MCP_CLIENT_SECRET", client_secret),
+            ("XAGENT_HUBSPOT_MCP_CLIENT_ID", get_hubspot_mcp_client_id()),
+            ("XAGENT_HUBSPOT_MCP_CLIENT_SECRET", get_hubspot_mcp_client_secret()),
         )
         if not value
     ]
@@ -3863,9 +3874,6 @@ def _resolve_catalog_mcp_oauth_auth(app_id: str, auth_config: Any) -> dict[str, 
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"HubSpot MCP is not configured. Missing: {', '.join(missing)}",
         )
-    resolved["client_id"] = client_id
-    resolved["client_secret"] = client_secret
-    return resolved
 
 
 def _ensure_catalog_mcp_oauth_server(
@@ -3974,6 +3982,7 @@ def _ensure_mcp_oauth_app_user(
     persistence: _OAuthPersistence,
 ) -> tuple[MCPServer, dict]:
     """Ensure one catalog server and non-owning user link."""
+    _require_catalog_mcp_oauth_credentials(app_id)
     server, app_info = _ensure_catalog_mcp_oauth_server(db, app_id)
     association = (
         db.query(UserMCPServer)

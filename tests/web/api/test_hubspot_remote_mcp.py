@@ -43,15 +43,28 @@ def test_hubspot_catalog_credentials_resolve_from_config(monkeypatch):
     }
 
 
-def test_hubspot_catalog_credentials_fail_closed_when_missing(monkeypatch):
+def test_hubspot_catalog_reconciliation_uses_empty_placeholders_when_missing(
+    monkeypatch,
+):
+    monkeypatch.delenv("XAGENT_HUBSPOT_MCP_CLIENT_ID", raising=False)
+    monkeypatch.delenv("XAGENT_HUBSPOT_MCP_CLIENT_SECRET", raising=False)
+
+    assert mcp_api._resolve_catalog_mcp_oauth_auth(
+        "hubspot",
+        {"type": "mcp_oauth", "credential_provider": "hubspot"},
+    ) == {
+        "type": "mcp_oauth",
+        "client_id": "",
+        "client_secret": "",
+    }
+
+
+def test_hubspot_connect_flow_fails_closed_when_credentials_are_missing(monkeypatch):
     monkeypatch.delenv("XAGENT_HUBSPOT_MCP_CLIENT_ID", raising=False)
     monkeypatch.delenv("XAGENT_HUBSPOT_MCP_CLIENT_SECRET", raising=False)
 
     try:
-        mcp_api._resolve_catalog_mcp_oauth_auth(
-            "hubspot",
-            {"type": "mcp_oauth", "credential_provider": "hubspot"},
-        )
+        mcp_api._require_catalog_mcp_oauth_credentials("hubspot")
     except HTTPException as exc:
         assert exc.status_code == 503
         assert "XAGENT_HUBSPOT_MCP_CLIENT_ID" in exc.detail

@@ -745,6 +745,9 @@ def _stream_download_to_path(
     finally:
         response.close()
 
+    # Graph's driveItem.size is the byte length of the raw file content. An
+    # exact match prevents registering either a truncated or an unexpectedly
+    # extended response as the requested durable artifact.
     if total != expected_size:
         raise RuntimeError("OneDrive file size changed while it was being downloaded")
     return total, digest.hexdigest()

@@ -24,6 +24,20 @@ def _load_migration_module():
     return module
 
 
+def _load_remote_mcp_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20261002_migrate_hubspot_to_remote_mcp.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "migrate_hubspot_to_remote_mcp", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -373,16 +387,11 @@ def test_downgrade_does_not_touch_user_oauth(tmp_path):
         assert refresh_tokens["salesforce"] == "old-salesforce-refresh"
 
 
-def test_migration_fields_match_registry():
+def test_migration_fields_chain_to_remote_mcp_migration():
     """This migration's CURRENT_SCOPES and CURRENT_DESCRIPTION are historical
-    snapshots, not the app's final values - 20260914_add_hubspot_deals_write_scope
-    layers another scope and description update on top of them, so only a
-    subset check on scopes (every scope this migration granted is still
-    present) holds going forward; the live description is no longer this
-    migration's CURRENT_DESCRIPTION but 20260914's (see that migration's own
-    test_migration_fields_match_registry for the exact-match check). Mirrors
-    the same precedent already established in
-    20260812_add_slack_history_reactions_files_scopes.py.
+    snapshots, not the app's final values. Later migrations add the deals
+    write scope, revise the description, and finally replace the legacy OAuth
+    connector with HubSpot's hosted MCP server.
 
     An earlier revision of this file bumped both constants forward to match
     the live registry exactly, to keep this exact-match assertion passing -
@@ -391,13 +400,9 @@ def test_migration_fields_match_registry():
     before this migration's downgrade() runs, so a bumped-forward
     CURRENT_DESCRIPTION here no longer matched what was actually in the row
     at that point, silently no-opping the "only revert if unchanged" guard
-    and leaving a downgraded database advertising Marketing Hub/forms/
+    and leaving a downgraded database advertising Marketing Hub/forms and
     analytics support with none of the granting scopes.
     """
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-
     migration = _load_migration_module()
-    registry_row = next(
-        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "hubspot"
-    )
-    assert set(migration.CURRENT_SCOPES) <= set(registry_row["oauth_scopes"])
+    remote_migration = _load_remote_mcp_migration_module()
+    assert set(migration.CURRENT_SCOPES) <= set(remote_migration.LEGACY_SCOPES)

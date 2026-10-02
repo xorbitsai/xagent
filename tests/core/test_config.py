@@ -710,6 +710,20 @@ class TestMCPOAuthConfig:
         with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_PROXY_URL"):
             get_mcp_oauth_proxy_url()
 
+    def test_hubspot_credentials_are_trimmed(self, monkeypatch):
+        monkeypatch.setenv(config.HUBSPOT_MCP_CLIENT_ID, " client-id ")
+        monkeypatch.setenv(config.HUBSPOT_MCP_CLIENT_SECRET, " client-secret ")
+
+        assert config.get_hubspot_mcp_client_id() == "client-id"
+        assert config.get_hubspot_mcp_client_secret() == "client-secret"
+
+    def test_hubspot_credentials_default_none(self, monkeypatch):
+        monkeypatch.delenv(config.HUBSPOT_MCP_CLIENT_ID, raising=False)
+        monkeypatch.delenv(config.HUBSPOT_MCP_CLIENT_SECRET, raising=False)
+
+        assert config.get_hubspot_mcp_client_id() is None
+        assert config.get_hubspot_mcp_client_secret() is None
+
 
 class TestTrustedEgressProxyConfig:
     def test_trusted_egress_proxy_constant(self):

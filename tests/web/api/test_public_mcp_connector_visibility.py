@@ -868,10 +868,6 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
             "xagent.web.tools.mcp.google_search_console",
             {"GOOGLE_ACCESS_TOKEN": "access_token"},
         ),
-        "hubspot": (
-            "xagent.web.tools.mcp.hubspot",
-            {"HUBSPOT_ACCESS_TOKEN": "access_token"},
-        ),
         "teams": (
             "xagent.web.tools.mcp.teams",
             {"AUTH_TOKEN": "access_token"},
@@ -942,6 +938,21 @@ def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
         "auth": {"type": "mcp_oauth"},
     }
 
+    assert rows_by_app_id["hubspot"]["transport"] == "streamable_http"
+    assert rows_by_app_id["hubspot"]["launch_config"] == {
+        "url": "https://mcp.hubspot.com",
+        "auth": {
+            "type": "mcp_oauth",
+            "credential_provider": "hubspot",
+            "token_endpoint_auth_method": "client_secret_post",
+        },
+        "builtin_provenance": {
+            "registry": "xagent",
+            "app_id": "hubspot",
+            "version": 2,
+        },
+    }
+
     # Atlassian's current endpoint is /v2/mcp; the legacy /v1/sse endpoint is
     # unsupported after 2026-06-30 and must not be what the catalog points at.
     assert rows_by_app_id["atlassian"]["transport"] == "streamable_http"
@@ -998,7 +1009,15 @@ def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
 
 @pytest.mark.parametrize(
     "app_id",
-    ["granola", "notion", "atlassian", "miro", "fireflies", "rocketlane"],
+    [
+        "granola",
+        "notion",
+        "hubspot",
+        "atlassian",
+        "miro",
+        "fireflies",
+        "rocketlane",
+    ],
 )
 def test_builtin_registry_classifies_remote_mcp_apps_as_mcp_oauth(app_id) -> None:
     """The registry shape must classify as mcp_oauth — anything else means the
@@ -1068,11 +1087,7 @@ def test_get_builtin_execution_fields_and_optional_scopes() -> None:
         get_builtin_execution_fields_and_optional_scopes("hubspot")
     )
     assert execution_fields == get_builtin_execution_fields("hubspot")
-    assert optional_scopes == [
-        "business-intelligence",
-        "marketing-email",
-        "marketing.campaigns.read",
-    ]
+    assert optional_scopes == []
 
     # Most builtin apps have no optional_oauth_scopes key at all.
     gmail_fields, gmail_optional = get_builtin_execution_fields_and_optional_scopes(
@@ -1087,9 +1102,7 @@ def test_get_builtin_execution_fields_and_optional_scopes() -> None:
     )
 
 
-def test_app_to_dict_exposes_optional_oauth_scopes_for_builtin_and_custom_apps() -> (
-    None
-):
+def test_app_to_dict_defaults_optional_oauth_scopes_for_apps() -> None:
     from xagent.web.mcp_apps import _app_to_dict
     from xagent.web.models.public_mcp import PublicMCPApp
 
@@ -1101,11 +1114,7 @@ def test_app_to_dict_exposes_optional_oauth_scopes_for_builtin_and_custom_apps()
         oauth_scopes=["crm.objects.contacts.read"],
         launch_config={},
     )
-    assert _app_to_dict(hubspot_app)["optional_oauth_scopes"] == [
-        "business-intelligence",
-        "marketing-email",
-        "marketing.campaigns.read",
-    ]
+    assert _app_to_dict(hubspot_app)["optional_oauth_scopes"] == []
 
     custom_app = PublicMCPApp(
         app_id="some-custom-app",

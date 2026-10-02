@@ -256,6 +256,8 @@ XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
 FORM_ANSWER_CONTINUATION_ENABLED = "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
+HUBSPOT_MCP_CLIENT_ID = "XAGENT_HUBSPOT_MCP_CLIENT_ID"
+HUBSPOT_MCP_CLIENT_SECRET = "XAGENT_HUBSPOT_MCP_CLIENT_SECRET"
 TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
 
@@ -748,6 +750,18 @@ def get_mcp_oauth_allow_private_hosts() -> bool:
     servers. Production deployments should leave it disabled.
     """
     return _get_bool_env(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, False)
+
+
+def get_hubspot_mcp_client_id() -> str | None:
+    """Return the client ID for Xagent's HubSpot MCP Connector."""
+    value = (os.getenv(HUBSPOT_MCP_CLIENT_ID) or "").strip()
+    return value or None
+
+
+def get_hubspot_mcp_client_secret() -> str | None:
+    """Return the client secret for Xagent's HubSpot MCP Connector."""
+    value = (os.getenv(HUBSPOT_MCP_CLIENT_SECRET) or "").strip()
+    return value or None
 
 
 def get_toby_personal_stdio_enabled() -> bool:

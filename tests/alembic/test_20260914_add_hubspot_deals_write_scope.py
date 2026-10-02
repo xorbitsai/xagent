@@ -38,6 +38,20 @@ def _load_previous_migration_module():
     return module
 
 
+def _load_remote_mcp_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20261002_migrate_hubspot_to_remote_mcp.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "migrate_hubspot_to_remote_mcp", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -326,21 +340,15 @@ def test_downgrade_does_not_touch_user_oauth(tmp_path):
         assert tokens["hubspot"] == ""
 
 
-def test_migration_fields_match_registry():
+def test_migration_fields_chain_to_remote_mcp_migration():
     """This migration's CURRENT_DESCRIPTION is a historical snapshot, not the
     app's final value - 20260916_update_hubspot_description layers another
-    description update on top of it, so the live description is no longer
-    this migration's CURRENT_DESCRIPTION but 20260916's (see that migration's
-    own test_migration_fields_match_registry for the exact-match check).
-    CURRENT_SCOPES has no such follow-up migration, so it still holds
-    exactly."""
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-
+    description update on top of it, and the hosted-MCP migration later
+    replaces both the description and scope model. CURRENT_SCOPES must still
+    match the legacy snapshot consumed by that final migration."""
     migration = _load_migration_module()
-    registry_row = next(
-        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "hubspot"
-    )
-    assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]
+    remote_migration = _load_remote_mcp_migration_module()
+    assert migration.CURRENT_SCOPES == remote_migration.LEGACY_SCOPES
 
 
 def test_previous_fields_chain_from_the_prior_migration():

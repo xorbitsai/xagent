@@ -39,6 +39,20 @@ def _load_previous_migration_module():
     return module
 
 
+def _load_remote_mcp_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20261002_migrate_hubspot_to_remote_mcp.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "migrate_hubspot_to_remote_mcp", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -254,14 +268,10 @@ def test_upgrade_without_matching_row_is_a_noop(tmp_path):
         assert description == "unrelated"
 
 
-def test_migration_fields_match_registry():
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-
+def test_migration_fields_chain_to_remote_mcp_migration():
     migration = _load_migration_module()
-    registry_row = next(
-        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "hubspot"
-    )
-    assert registry_row["description"] == migration.CURRENT_DESCRIPTION
+    remote_migration = _load_remote_mcp_migration_module()
+    assert remote_migration.LEGACY_DESCRIPTION == migration.CURRENT_DESCRIPTION
 
 
 def test_previous_description_chains_from_the_prior_migration():

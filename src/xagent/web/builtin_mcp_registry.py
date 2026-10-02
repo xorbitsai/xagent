@@ -633,57 +633,30 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "hubspot",
             "name": "HubSpot",
-            "description": "Connect to HubSpot CRM and Marketing Hub to list, search, create, and update contacts, companies, and deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
+            "description": "Connect to HubSpot's hosted MCP server to work with CRM, activity, content, and marketing data using the authenticated user's HubSpot permissions.",
             "icon": "https://www.google.com/s2/favicons?domain=hubspot.com&sz=128",
-            "transport": "oauth",
-            "provider_name": "hubspot",
+            "transport": "streamable_http",
+            "provider_name": None,
             "category": "CRM",
-            "oauth_scopes": [
-                "crm.objects.contacts.read",
-                "crm.objects.contacts.write",
-                "crm.objects.companies.read",
-                "crm.objects.companies.write",
-                "crm.objects.deals.read",
-                "crm.objects.deals.write",
-                "forms",
-            ],
-            # All three are tier-gated, each confirmed against HubSpot's own
-            # docs: business-intelligence requires Marketing Hub Basic+ (the
-            # traffic analytics tool isn't available on Free/Starter);
-            # marketing-email requires Enterprise or the transactional email
-            # add-on; marketing.campaigns.read requires Professional+ (the
-            # Campaigns API docs state this explicitly). Requesting any of
-            # them as required scopes would block the whole OAuth
-            # authorization (and therefore every CRM tool too) for portals
-            # below those tiers. Separately: GET /marketing/v3/emails (used
-            # by hubspot_list_marketing_emails and
-            # hubspot_get_marketing_email_statistics) accepts marketing-email
-            # OR content OR transactional-email - marketing-email is used
-            # here as the most narrowly-scoped of the three that still
-            # covers both read calls; content is broader (also grants
-            # pages/blog/campaigns access this connector doesn't use) and
-            # transactional-email's applicability to non-transactional
-            # marketing emails is unconfirmed.
-            # Sent via the authorize request's optional_scope parameter
-            # instead (see api/auth.py) so those portals still connect
-            # successfully and only hubspot_get_analytics_report /
-            # hubspot_list_marketing_emails / hubspot_get_marketing_email_statistics /
-            # hubspot_list_campaigns / hubspot_get_campaign_metrics fail at
-            # call time if the tier doesn't grant them. This pairing must
-            # also be reflected in this app's scope configuration in the
-            # HubSpot Developer Dashboard - HubSpot blocks installation if a
-            # scope's required/optional designation there disagrees with
-            # which parameter it arrives in.
-            "optional_oauth_scopes": [
-                "business-intelligence",
-                "marketing-email",
-                "marketing.campaigns.read",
-            ],
+            # HubSpot determines scopes from its hosted MCP tools and the
+            # installing user's choices; Xagent must not request the legacy
+            # public-app scopes itself.
+            "oauth_scopes": None,
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "python",
-                "args": ["-m", "xagent.web.tools.mcp.hubspot"],
-                "env_mapping": {"HUBSPOT_ACCESS_TOKEN": "access_token"},
+                "url": "https://mcp.hubspot.com",
+                "auth": {
+                    "type": "mcp_oauth",
+                    # The catalog is client-visible. Resolve this marker from
+                    # deployment config only inside the server connect path.
+                    "credential_provider": "hubspot",
+                    "token_endpoint_auth_method": "client_secret_post",
+                },
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "hubspot",
+                    "version": 2,
+                },
             },
         },
         {

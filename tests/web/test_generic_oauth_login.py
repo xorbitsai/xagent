@@ -1051,57 +1051,10 @@ def test_bare_microsoft_callback_skips_excel_but_connects_eligible_sibling(
     assert "Excel" not in server_names
 
 
-def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
-    """business-intelligence, marketing-email, and marketing.campaigns.read
-    are all gated on a Marketing Hub tier above Free/CRM-only - requesting
-    any of them as required scopes would block the whole authorization for
-    portals below that tier. They must arrive via optional_scope, not
-    merged into the required scope param."""
-    db, user = db_session
-    token = _token_for(user)
-    db.add(
-        PublicMCPApp(
-            app_id="hubspot",
-            name="HubSpot",
-            description="HubSpot connector",
-            transport="oauth",
-            provider_name="hubspot",
-            category="CRM",
-            oauth_scopes=["crm.objects.contacts.read"],
-            is_visible_in_connector=True,
-            launch_config={},
-        )
-    )
-    db.commit()
-
-    provider = _provider(
-        auth_url="https://app.hubspot.com/oauth/authorize",
-        default_scopes=["oauth"],
-        redirect_uri="https://app.example.com/api/auth/hubspot/callback",
-    )
-
-    resp = generic_oauth_login(
-        provider="hubspot",
-        token=token,
-        app_id="hubspot",
-        redirect=None,
-        db=db,
-        db_provider=provider,
-    )
-    qs = parse_qs(urlparse(_location(resp)).query)
-
-    assert "business-intelligence" not in qs["scope"][0]
-    assert "marketing-email" not in qs["scope"][0]
-    assert "marketing.campaigns.read" not in qs["scope"][0]
-    assert qs["optional_scope"] == [
-        "business-intelligence marketing-email marketing.campaigns.read"
-    ]
-
-
-def test_non_hubspot_app_sends_no_optional_scope_param(db_session, monkeypatch):
-    """optional_oauth_scopes is a HubSpot-specific registry field today; a
-    builtin app that doesn't set it must not get a stray optional_scope
-    param on a provider whose authorize endpoint doesn't expect one."""
+def test_app_without_optional_scopes_sends_no_optional_scope_param(
+    db_session, monkeypatch
+):
+    """An app without optional scopes must not send a stray provider param."""
     db, user = db_session
     token = _token_for(user)
     monkeypatch.delenv("META_CONFIG_ID", raising=False)

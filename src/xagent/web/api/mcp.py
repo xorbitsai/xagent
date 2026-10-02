@@ -43,6 +43,8 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_app_base_url,
+    get_hubspot_mcp_client_id,
+    get_hubspot_mcp_client_secret,
     get_mcp_tool_init_timeout_seconds,
     get_public_api_base_url,
     get_session_secret,
@@ -3822,12 +3824,57 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
     return server, app_info
 
 
+def _resolve_catalog_mcp_oauth_auth(app_id: str, auth_config: Any) -> dict[str, Any]:
+    """Resolve trusted deployment credentials for a catalog MCP OAuth app.
+
+    Catalog payloads are returned to browser clients, so a builtin must not
+    place a static OAuth secret in ``launch_config``. HubSpot's hosted MCP
+    server does not use Dynamic Client Registration; replace its safe marker
+    here immediately before the shared server row is reconciled. The normal
+    MCPServer write path encrypts the resulting client secret at rest.
+    """
+    if not isinstance(auth_config, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid remote OAuth configuration",
+        )
+    resolved = dict(auth_config)
+    credential_provider = resolved.pop("credential_provider", None)
+    if credential_provider is None:
+        return resolved
+    if app_id != "hubspot" or credential_provider != "hubspot":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported catalog OAuth credential provider",
+        )
+
+    client_id = get_hubspot_mcp_client_id()
+    client_secret = get_hubspot_mcp_client_secret()
+    missing = [
+        name
+        for name, value in (
+            ("XAGENT_HUBSPOT_MCP_CLIENT_ID", client_id),
+            ("XAGENT_HUBSPOT_MCP_CLIENT_SECRET", client_secret),
+        )
+        if not value
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"HubSpot MCP is not configured. Missing: {', '.join(missing)}",
+        )
+    resolved["client_id"] = client_id
+    resolved["client_secret"] = client_secret
+    return resolved
+
+
 def _ensure_catalog_mcp_oauth_server(
     db: Session, app_id: str
 ) -> tuple[MCPServer, dict]:
     """Idempotently ensure the shared server row for a remote-MCP OAuth
-    (DCR-capable) catalog app exists, without creating any per-user
-    association. Returns (server, app_info). Mirrors
+    catalog app exists, without creating any per-user association. Supports
+    both DCR-capable apps and trusted static-client builtins. Returns
+    (server, app_info). Mirrors
     _ensure_catalog_app_server's hijack guards, but for a streamable_http/
     sse/websocket server row instead of a stdio one.
     """
@@ -3846,7 +3893,7 @@ def _ensure_catalog_mcp_oauth_server(
         )
     launch = app_info.get("launch_config") or {}
     url = launch.get("url")
-    auth = launch.get("auth") or {}
+    auth = _resolve_catalog_mcp_oauth_auth(app_id, launch.get("auth") or {})
     transport = str(app_info["transport"])
     server_name = str(app_info["id"])
 

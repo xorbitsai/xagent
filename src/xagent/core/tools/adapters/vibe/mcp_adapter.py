@@ -2132,10 +2132,18 @@ class MCPToolAdapter(AbstractBaseTool):
                 )
             file_payload = selected_payload.get("file")
             mime_type = selected_payload.get("mime_type")
+            if isinstance(mime_type, str) and mime_type.startswith(
+                "application/vnd.google-apps."
+            ):
+                mime_type = None
             if not isinstance(mime_type, str) and isinstance(file_payload, dict):
                 mime_type = file_payload.get("mimeType") or file_payload.get(
                     "mime_type"
                 )
+            if isinstance(mime_type, str) and mime_type.startswith(
+                "application/vnd.google-apps."
+            ):
+                mime_type = None
             file_ref = sanitize_file_ref_for_context(
                 build_workspace_file_ref(
                     workspace=self._workspace,
@@ -2155,9 +2163,9 @@ class MCPToolAdapter(AbstractBaseTool):
         for payload, kind, owner in candidates:
             if str(payload[path_field]).strip() != selected_path:
                 continue
-            # A connector-local absolute path is not a durable reference. Do
-            # not expose it after the host has had a chance to materialize it.
-            payload.pop(path_field, None)
+            # Keep the workspace path for legacy local-path consumers (for
+            # example Gmail attachments) while adding the durable reference
+            # for later turns and connectors that understand FileRefs.
             if file_ref is None:
                 payload["file_ref_error"] = "durable file registration failed"
             else:

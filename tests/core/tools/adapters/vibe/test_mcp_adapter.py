@@ -840,10 +840,10 @@ async def test_mcp_binary_download_is_registered_as_durable_file_ref(monkeypatch
 
     payload = json.loads(result["content"][0]["text"])
     assert payload["file_ref"] == {"file_id": "file-123", "filename": "Deck.pptx"}
-    assert "file_path" not in payload
+    assert payload["file_path"] == "/task/output/Deck.pptx"
     structured_payload = json.loads(result["structured_content"]["result"])
     assert structured_payload["file_ref"] == payload["file_ref"]
-    assert "file_path" not in structured_payload
+    assert structured_payload["file_path"] == "/task/output/Deck.pptx"
 
 
 def test_custom_google_drive_server_is_not_trusted_for_download_registration():

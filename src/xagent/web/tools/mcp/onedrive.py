@@ -636,6 +636,14 @@ def _content_path(file_path: str, *, field_name: str = "file_path") -> str:
     return f"/me/drive/root:/{quote(normalized, safe='/')}:/content"
 
 
+def _item_content_path(item_id: str) -> str:
+    """Build a stable content URL for a previously resolved drive item."""
+    normalized_id = str(item_id).strip()
+    if not normalized_id:
+        raise ValueError("OneDrive item id is required")
+    return f"/me/drive/items/{quote(normalized_id, safe='')}/content"
+
+
 def _download_output_dir() -> Path:
     """Return the current task's output directory for binary downloads."""
     base = os.environ.get(_OUTPUT_DIR_ENV_VAR, "").strip()
@@ -662,17 +670,10 @@ _MAX_DOWNLOAD_FILENAME_LENGTH = 200
 _MAX_DOWNLOAD_SUFFIX_LENGTH = 20
 
 
-def _split_download_stem_suffix(base: str) -> tuple[str, str]:
-    suffix = Path(base).suffix
-    if not suffix and base.startswith(".") and base.count(".") == 1 and len(base) > 1:
-        return "", base
-    return Path(base).stem, suffix
-
-
 def _safe_download_filename(name: str) -> str:
     """Keep a remote OneDrive name as one safe local path segment."""
     base = Path(str(name).strip()).name
-    stem, suffix = _split_download_stem_suffix(base)
+    stem, suffix = _split_stem_suffix(base)
     stem = _UNSAFE_DOWNLOAD_FILENAME_CHARS.sub("_", stem).strip(" ._") or "file"
     suffix = _UNSAFE_DOWNLOAD_FILENAME_CHARS.sub("_", suffix)[
         :_MAX_DOWNLOAD_SUFFIX_LENGTH
@@ -685,7 +686,7 @@ def _publish_download_file(
     temporary_path: Path, output_dir: Path, filename: str
 ) -> Path:
     """Publish a completed download without clobbering a concurrent result."""
-    stem, suffix = _split_download_stem_suffix(filename)
+    stem, suffix = _split_stem_suffix(filename)
     counter = 0
     while True:
         candidate_name = filename if counter == 0 else f"{stem} ({counter}){suffix}"
@@ -705,9 +706,10 @@ def _stream_download_to_path(
     expected_size: int,
     *,
     authenticated: bool,
+    expected_quickxor_hash: str | None = None,
 ) -> tuple[int, str]:
-    """Stream a Graph content response, enforcing size and computing SHA-256."""
-    headers = _graph_headers() if authenticated else {"Accept": "*/*"}
+    """Stream content, enforcing a safe bound and verifying available hashes."""
+    headers = _graph_headers({"Accept": "*/*"}) if authenticated else {"Accept": "*/*"}
     try:
         response = requests.request(
             method="GET",
@@ -720,6 +722,7 @@ def _stream_download_to_path(
         raise RuntimeError("OneDrive file download failed") from None
 
     digest = hashlib.sha256()
+    quickxor = _QuickXorHash()
     total = 0
     try:
         try:
@@ -738,17 +741,22 @@ def _stream_download_to_path(
                         "The OneDrive download exceeded the "
                         f"{_MAX_DOWNLOAD_BYTES // (1024 * 1024 * 1024)} GiB limit"
                     )
+                if expected_quickxor_hash is None and total > expected_size:
+                    raise RuntimeError(
+                        "OneDrive file size changed while it was being downloaded"
+                    )
                 output.write(chunk)
                 digest.update(chunk)
+                quickxor.update(chunk)
     except requests.RequestException:
         raise RuntimeError("OneDrive file download failed") from None
     finally:
         response.close()
 
-    # Graph's driveItem.size is the byte length of the raw file content. An
-    # exact match prevents registering either a truncated or an unexpectedly
-    # extended response as the requested durable artifact.
-    if total != expected_size:
+    if expected_quickxor_hash is not None:
+        if quickxor.base64_digest() != expected_quickxor_hash:
+            raise RuntimeError("OneDrive file content hash did not match metadata")
+    elif total != expected_size:
         raise RuntimeError("OneDrive file size changed while it was being downloaded")
     return total, digest.hexdigest()
 
@@ -1232,6 +1240,14 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
                 f"{_MAX_DOWNLOAD_BYTES // (1024 * 1024 * 1024)} GiB limit"
             )
 
+        file_metadata = metadata["file"]
+        hashes = file_metadata.get("hashes")
+        expected_quickxor_hash = (
+            hashes.get("quickXorHash") if isinstance(hashes, dict) else None
+        )
+        if not isinstance(expected_quickxor_hash, str) or not expected_quickxor_hash:
+            expected_quickxor_hash = None
+
         remote_name = str(metadata.get("name") or Path(file_path).name)
         output_name = _safe_download_filename(filename or remote_name)
         staging_dir = output_dir.parent / ".xagent-onedrive-downloads"
@@ -1239,24 +1255,22 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
         temporary_path = staging_dir / f"{uuid4().hex}.part"
         download_url = metadata.get("@microsoft.graph.downloadUrl")
         if isinstance(download_url, str) and download_url:
-            total, sha256 = _stream_download_to_path(
-                download_url,
-                temporary_path,
-                size,
-                authenticated=False,
-            )
+            authenticated = False
+            content_url = download_url
         else:
-            total, sha256 = _stream_download_to_path(
-                f"{GRAPH_BASE_URL}{_content_path(file_path)}",
-                temporary_path,
-                size,
-                authenticated=True,
-            )
+            authenticated = True
+            content_url = f"{GRAPH_BASE_URL}{_item_content_path(metadata['id'])}"
+        total, sha256 = _stream_download_to_path(
+            content_url,
+            temporary_path,
+            size,
+            authenticated=authenticated,
+            expected_quickxor_hash=expected_quickxor_hash,
+        )
         output_path = _publish_download_file(temporary_path, output_dir, output_name)
         temporary_path = None
-        file_metadata = metadata.get("file")
         mime_type = (
-            (file_metadata.get("mimeType") if isinstance(file_metadata, dict) else None)
+            file_metadata.get("mimeType")
             or _guess_mime_type(output_path.name)
             or "application/octet-stream"
         )
@@ -1275,16 +1289,27 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
                 logger.warning("Failed to clean OneDrive download temp file")
         raw_message = str(e)
         public_message = "OneDrive file download failed"
-        if raw_message.startswith("No task workspace configured for this connector"):
-            public_message = raw_message
-        elif raw_message.startswith("The OneDrive file is "):
-            public_message = raw_message
-        elif raw_message == "OneDrive item is not a file":
+        if isinstance(e, _GraphRequestError):
+            public_message = f"OneDrive file download failed with HTTP {e.status_code}"
+        elif raw_message.startswith(
+            (
+                "No task workspace configured for this connector",
+                "The OneDrive file is ",
+                "OneDrive item is not a file",
+                "OneDrive returned ",
+                "OneDrive file size changed",
+                "OneDrive file content hash did not match metadata",
+                "The OneDrive download exceeded ",
+                "OneDrive file download failed with HTTP ",
+                "AUTH_TOKEN environment variable is missing",
+            )
+        ):
             public_message = raw_message
         logger.error(
-            "Error downloading OneDrive binary file %s (%s)",
+            "Error downloading OneDrive binary file %s (%s): %s",
             file_path,
             type(e).__name__,
+            public_message,
         )
         return _error(public_message)
 

@@ -525,7 +525,8 @@ def test_download_file_streams_to_task_output_and_hashes_content(monkeypatch, tm
             "file": {
                 "mimeType": (
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                ),
+                "hashes": {"quickXorHash": _quickxor_hash(content)},
             },
         }
     )
@@ -543,9 +544,7 @@ def test_download_file_streams_to_task_output_and_hashes_content(monkeypatch, tm
     output_path = task_dir / "output" / "Issue Tracker.xlsx"
     assert output_path.read_bytes() == content
     download_call = mock_request.call_args_list[1]
-    assert download_call.kwargs["url"].endswith(
-        "/me/drive/root:/Issue%20Tracker.xlsx:/content"
-    )
+    assert download_call.kwargs["url"].endswith("/me/drive/items/item-1/content")
     assert download_call.kwargs["headers"]["Authorization"] == "Bearer test-graph-token"
     assert download_call.kwargs["stream"] is True
 
@@ -562,7 +561,10 @@ def test_download_file_uses_graph_download_url_without_auth_header(
             "id": "item-2",
             "name": "report.pdf",
             "size": len(content),
-            "file": {"mimeType": "application/pdf"},
+            "file": {
+                "mimeType": "application/pdf",
+                "hashes": {"quickXorHash": _quickxor_hash(content)},
+            },
             "@microsoft.graph.downloadUrl": "https://download.example/item-2",
         }
     )

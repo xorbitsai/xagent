@@ -3,6 +3,11 @@
 Revision ID: 20261002_hubspot_remote_mcp
 Revises: 20260930_merge_task_outcome_identity
 Create Date: 2026-10-02
+
+Downgrading restores the legacy HubSpot OAuth provider from the historical
+HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, and HUBSPOT_REDIRECT_URI environment
+variables. If those legacy variables are no longer available, an administrator
+must re-enter the provider credentials after the downgrade.
 """
 
 import os

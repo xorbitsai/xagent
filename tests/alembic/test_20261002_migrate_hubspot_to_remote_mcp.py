@@ -52,7 +52,7 @@ def _schema(metadata):
         "mcp_servers",
         metadata,
         Column("id", Integer, primary_key=True),
-        Column("name", String),
+        Column("name", String, unique=True),
         Column("transport", String),
         Column("url", String),
         Column("auth", JSON),
@@ -137,22 +137,10 @@ def test_upgrade_switches_catalog_and_removes_legacy_server(tmp_path):
                 auth={"app_id": "hubspot", "provider": "hubspot"},
             )
         )
-        connection.execute(
-            servers.insert().values(
-                id=6,
-                name="HubSpot",
-                transport="oauth",
-                auth={"app_id": "other", "provider": "other"},
-            )
-        )
         connection.execute(associations.insert().values(id=9, mcpserver_id=7))
-        connection.execute(associations.insert().values(id=8, mcpserver_id=6))
         connection.execute(flow_states.insert().values(id=1, mcp_server_id=7))
         connection.execute(grants.insert().values(id=2, mcp_server_id=7))
         connection.execute(clients.insert().values(id=3, mcp_server_id=7))
-        connection.execute(flow_states.insert().values(id=4, mcp_server_id=6))
-        connection.execute(grants.insert().values(id=5, mcp_server_id=6))
-        connection.execute(clients.insert().values(id=6, mcp_server_id=6))
         connection.execute(
             user_oauth.insert().values(
                 id=1,
@@ -190,21 +178,11 @@ def test_upgrade_switches_catalog_and_removes_legacy_server(tmp_path):
         assert row["oauth_scopes"] is None
         assert row["description"] == migration.REMOTE_DESCRIPTION
         assert row["launch_config"] == migration.REMOTE_LAUNCH_CONFIG
-        assert connection.execute(select(servers)).mappings().all() == [
-            {
-                "id": 6,
-                "name": "HubSpot",
-                "transport": "oauth",
-                "url": None,
-                "auth": {"app_id": "other", "provider": "other"},
-            }
-        ]
-        assert connection.execute(select(associations)).mappings().all() == [
-            {"id": 8, "mcpserver_id": 6}
-        ]
-        assert connection.execute(select(flow_states)).all() == [(4, 6)]
-        assert connection.execute(select(grants)).all() == [(5, 6)]
-        assert connection.execute(select(clients)).all() == [(6, 6)]
+        assert connection.execute(select(servers)).all() == []
+        assert connection.execute(select(associations)).all() == []
+        assert connection.execute(select(flow_states)).all() == []
+        assert connection.execute(select(grants)).all() == []
+        assert connection.execute(select(clients)).all() == []
         assert connection.execute(select(user_oauth)).mappings().all() == [
             {
                 "id": 1,
@@ -241,6 +219,32 @@ def test_upgrade_accepts_legacy_scopes_in_a_different_order(tmp_path):
         )
         assert row["transport"] == "streamable_http"
         assert row["oauth_scopes"] is None
+
+
+def test_upgrade_preserves_nonmatching_legacy_named_server(tmp_path):
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, servers, _ = _schema(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        _insert_legacy_app(connection, apps, migration)
+        connection.execute(
+            servers.insert().values(
+                id=6,
+                name="HubSpot",
+                transport="oauth",
+                auth={"app_id": "other", "provider": "other"},
+            )
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        server = connection.execute(select(servers)).mappings().one()
+        assert server["id"] == 6
+        assert server["auth"] == {"app_id": "other", "provider": "other"}
 
 
 def test_upgrade_cleans_legacy_state_when_catalog_is_already_remote(tmp_path):
@@ -377,23 +381,10 @@ def test_downgrade_restores_legacy_catalog_and_removes_remote_server(tmp_path):
                 auth={"type": "mcp_oauth", "client_id": "encrypted"},
             )
         )
-        connection.execute(
-            servers.insert().values(
-                id=9,
-                name="hubspot",
-                transport="streamable_http",
-                url="https://custom.example.com/mcp",
-                auth={"type": "mcp_oauth", "client_id": "custom"},
-            )
-        )
         connection.execute(associations.insert().values(id=10, mcpserver_id=8))
-        connection.execute(associations.insert().values(id=11, mcpserver_id=9))
         connection.execute(flow_states.insert().values(id=12, mcp_server_id=8))
         connection.execute(grants.insert().values(id=13, mcp_server_id=8))
         connection.execute(clients.insert().values(id=14, mcp_server_id=8))
-        connection.execute(flow_states.insert().values(id=15, mcp_server_id=9))
-        connection.execute(grants.insert().values(id=16, mcp_server_id=9))
-        connection.execute(clients.insert().values(id=17, mcp_server_id=9))
 
         with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()
@@ -408,24 +399,43 @@ def test_downgrade_restores_legacy_catalog_and_removes_remote_server(tmp_path):
         assert row["oauth_scopes"] == migration.LEGACY_SCOPES
         assert row["description"] == migration.LEGACY_DESCRIPTION
         assert row["launch_config"] == migration.LEGACY_LAUNCH_CONFIG
-        assert connection.execute(select(servers)).mappings().all() == [
-            {
-                "id": 9,
-                "name": "hubspot",
-                "transport": "streamable_http",
-                "url": "https://custom.example.com/mcp",
-                "auth": {"type": "mcp_oauth", "client_id": "custom"},
-            }
-        ]
-        assert connection.execute(select(associations)).mappings().all() == [
-            {"id": 11, "mcpserver_id": 9}
-        ]
-        assert connection.execute(select(flow_states)).all() == [(15, 9)]
-        assert connection.execute(select(grants)).all() == [(16, 9)]
-        assert connection.execute(select(clients)).all() == [(17, 9)]
+        assert connection.execute(select(servers)).all() == []
+        assert connection.execute(select(associations)).all() == []
+        assert connection.execute(select(flow_states)).all() == []
+        assert connection.execute(select(grants)).all() == []
+        assert connection.execute(select(clients)).all() == []
         assert connection.execute(
             select(oauth_providers.c.provider_name)
         ).scalars().all() == ["hubspot"]
+
+
+def test_downgrade_preserves_nonmatching_remote_server(tmp_path):
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, servers, _ = _schema(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        _insert_legacy_app(connection, apps, migration)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        connection.execute(
+            servers.insert().values(
+                id=9,
+                name="hubspot",
+                transport="streamable_http",
+                url="https://custom.example.com/mcp",
+                auth={"type": "mcp_oauth", "client_id": "custom"},
+            )
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+
+        server = connection.execute(select(servers)).mappings().one()
+        assert server["id"] == 9
+        assert server["url"] == "https://custom.example.com/mcp"
 
 
 def test_remote_row_matches_builtin_registry():

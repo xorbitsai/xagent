@@ -1039,6 +1039,7 @@ def classify_actor_remote_oauth_server(
 
     launch = app_info.get("launch_config") or {}
     expected_auth = launch.get("auth") or {}
+    static_client_credentials = False
     if isinstance(expected_auth, Mapping):
         expected_auth = dict(expected_auth)
         credential_provider = expected_auth.pop("credential_provider", None)
@@ -1049,11 +1050,26 @@ def classify_actor_remote_oauth_server(
                     "remote OAuth credential provider is unsupported"
                 )
             expected_auth.update(credentials[0])
+            static_client_credentials = True
     decrypted_auth = server._decrypt_auth_config(server.auth)
     if not isinstance(decrypted_auth, Mapping):
         raise RemoteOAuthServerDefinitionError("remote OAuth auth is invalid")
     actual_auth = dict(decrypted_auth)
     actual_auth.pop("app_id", None)
+    if static_client_credentials:
+        # These values are deployment secrets and may be rotated without
+        # changing the already-connected server's canonical definition. The
+        # connect path has already persisted them securely; actor validation
+        # only needs to ensure a usable pair exists, not compare against the
+        # current process environment.
+        if not actual_auth.get("client_id") or not actual_auth.get("client_secret"):
+            raise RemoteOAuthServerDefinitionError(
+                "remote OAuth static-client credentials are unavailable"
+            )
+        expected_auth.pop("client_id", None)
+        expected_auth.pop("client_secret", None)
+        actual_auth.pop("client_id", None)
+        actual_auth.pop("client_secret", None)
     failures = []
     if str(server.managed or "") != "external":
         failures.append("managed")

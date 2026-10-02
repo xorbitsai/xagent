@@ -3892,6 +3892,7 @@ def _ensure_catalog_mcp_oauth_server(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This app is not a remote-OAuth connector",
         )
+    _require_catalog_mcp_oauth_credentials(app_id)
     launch = app_info.get("launch_config") or {}
     url = launch.get("url")
     auth = _resolve_catalog_mcp_oauth_auth(app_id, launch.get("auth") or {})
@@ -3975,7 +3976,6 @@ def _ensure_mcp_oauth_app_user(
     persistence: _OAuthPersistence,
 ) -> tuple[MCPServer, dict]:
     """Ensure one catalog server and non-owning user link."""
-    _require_catalog_mcp_oauth_credentials(app_id)
     server, app_info = _ensure_catalog_mcp_oauth_server(db, app_id)
     association = (
         db.query(UserMCPServer)

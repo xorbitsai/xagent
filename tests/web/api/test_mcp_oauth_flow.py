@@ -41,6 +41,7 @@ from xagent.web.api.mcp import (
     mcp_oauth_callback,
     update_mcp_server,
 )
+from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -2210,6 +2211,73 @@ async def test_connect_app_creates_server_and_association_then_starts_dcr_flow(
     )
     assert assoc.is_active is True
     assert assoc.is_owner is False
+
+
+@pytest.mark.asyncio
+async def test_connect_hubspot_app_uses_static_client_credentials(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    app = get_builtin_public_mcp_app("hubspot")
+    assert app is not None
+    db.add(
+        PublicMCPApp(
+            app_id="hubspot",
+            name=app["name"],
+            description=app["description"],
+            transport=app["transport"],
+            provider_name=app["provider_name"],
+            category=app["category"],
+            oauth_scopes=app["oauth_scopes"],
+            launch_config=app["launch_config"],
+            is_visible_in_connector=True,
+        )
+    )
+    db.commit()
+    monkeypatch.setenv("XAGENT_HUBSPOT_MCP_CLIENT_ID", "hubspot-client")
+    monkeypatch.setenv("XAGENT_HUBSPOT_MCP_CLIENT_SECRET", "hubspot-secret")
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test")
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    async def fail_dcr(*args, **kwargs):
+        raise AssertionError("HubSpot static credentials must not use DCR")
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(mcp_api, "register_mcp_oauth_public_client", fail_dcr)
+
+    response = await connect_mcp_oauth_app(
+        "hubspot",
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    assert response.status_code == 303
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["hubspot-client"]
+
+    server = db.query(MCPServer).filter(MCPServer.name == "hubspot").one()
+    assert server.auth["client_id"] == "hubspot-client"
+    assert server.auth["token_endpoint_auth_method"] == "client_secret_post"
+    assert server.auth["client_secret"] != "hubspot-secret"
+    assert decrypt_value(server.auth["client_secret"]) == "hubspot-secret"
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    response_model = mcp_api._db_server_to_response(
+        server,
+        association,
+        mcp_api.DatabaseMCPServerManager(db),
+        is_admin=False,
+    )
+    assert response_model.config["auth"]["client_secret"] == "********"
 
 
 @pytest.mark.asyncio

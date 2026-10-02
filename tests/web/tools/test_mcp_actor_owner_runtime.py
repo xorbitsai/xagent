@@ -393,6 +393,8 @@ def test_actor_remote_hubspot_row_created_by_catalog_connect_is_canonical(
     db_session.db.commit()
 
     server, _ = mcp_api._ensure_catalog_mcp_oauth_server(db_session.db, "hubspot")
+    monkeypatch.setenv("XAGENT_HUBSPOT_MCP_CLIENT_ID", "rotated-client")
+    monkeypatch.setenv("XAGENT_HUBSPOT_MCP_CLIENT_SECRET", "rotated-secret")
 
     resolved = mcp_apps.classify_actor_remote_oauth_server(db_session.db, server)
 

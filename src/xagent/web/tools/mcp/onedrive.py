@@ -645,7 +645,14 @@ def _download_output_dir() -> Path:
             f"({_OUTPUT_DIR_ENV_VAR} is unset) — onedrive_download_file needs "
             "a task workspace to write into."
         )
-    output_dir = Path(base).expanduser().resolve() / "output"
+    resolved_base = Path(base).expanduser()
+    try:
+        resolved_base = resolved_base.resolve()
+    except RuntimeError:
+        # Python 3.11/3.12 raise RuntimeError for symlink loops. Leave the
+        # unresolved path for mkdir(), which reports the underlying OSError.
+        pass
+    output_dir = resolved_base / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 

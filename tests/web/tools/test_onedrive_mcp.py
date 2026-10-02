@@ -556,6 +556,19 @@ def test_download_file_requires_task_workspace(monkeypatch):
     assert "XAGENT_ONEDRIVE_OUTPUT_DIR" in result["message"]
 
 
+def test_download_output_dir_handles_symlink_loop(monkeypatch, tmp_path):
+    task_dir = tmp_path / "task"
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    monkeypatch.setattr(
+        onedrive.Path,
+        "resolve",
+        Mock(side_effect=RuntimeError("symlink loop")),
+    )
+
+    assert onedrive._download_output_dir() == task_dir / "output"
+    assert (task_dir / "output").is_dir()
+
+
 @pytest.mark.parametrize(
     "call",
     [

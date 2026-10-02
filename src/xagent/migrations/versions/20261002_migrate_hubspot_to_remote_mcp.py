@@ -1,7 +1,7 @@
 """migrate HubSpot from local REST tools to its hosted MCP server
 
 Revision ID: 20261002_hubspot_remote_mcp
-Revises: 20260930_merge_task_outcome_identity
+Revises: 20260929_merge_google_drive_picker_task_attachment
 Create Date: 2026-10-02
 
 Downgrading restores the legacy HubSpot OAuth provider from the historical
@@ -19,7 +19,7 @@ from alembic import op
 from xagent.builtin_identity import builtin_provenance_identity
 
 revision: str = "20261002_hubspot_remote_mcp"
-down_revision: Union[str, None] = "20260930_merge_task_outcome_identity"
+down_revision: Union[str, None] = "20260929_merge_google_drive_picker_task_attachment"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

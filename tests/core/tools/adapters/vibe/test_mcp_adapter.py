@@ -777,7 +777,10 @@ async def test_mcp_binary_download_is_registered_as_durable_file_ref(monkeypatch
     monkeypatch.setattr(
         mcp_adapter_module,
         "sanitize_file_ref_for_context",
-        lambda file_ref: {"file_id": file_ref["file_id"], "filename": file_ref["filename"]},
+        lambda file_ref: {
+            "file_id": file_ref["file_id"],
+            "filename": file_ref["filename"],
+        },
     )
     adapter = _build_mcp_tool_adapter(
         "OneDrive",

@@ -1443,7 +1443,10 @@ class MCPToolAdapter(AbstractBaseTool):
 
         if (
             self._workspace is not None
-            and (normalize_mcp_server_name(self.source_server or ""), self.mcp_tool.name)
+            and (
+                normalize_mcp_server_name(self.source_server or ""),
+                self.mcp_tool.name,
+            )
             in _WORKSPACE_DOWNLOAD_FIELDS
         ):
             description += (
@@ -2054,7 +2057,9 @@ class MCPToolAdapter(AbstractBaseTool):
                     self.mcp_tool.name,
                 )
 
-    def _register_workspace_download_result(self, result: dict[str, Any]) -> dict[str, Any]:
+    def _register_workspace_download_result(
+        self, result: dict[str, Any]
+    ) -> dict[str, Any]:
         """Attach a durable FileRef to a trusted connector download result."""
         if self._workspace is None:
             return result

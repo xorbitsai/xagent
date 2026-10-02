@@ -720,9 +720,7 @@ def _stream_download_to_path(
         response.close()
 
     if total != expected_size:
-        raise RuntimeError(
-            "OneDrive file size changed while it was being downloaded"
-        )
+        raise RuntimeError("OneDrive file size changed while it was being downloaded")
     return total, digest.hexdigest()
 
 
@@ -1188,9 +1186,7 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
         metadata = _graph_request(
             "GET",
             _item_path(file_path),
-            params={
-                "$select": "id,name,size,file,@microsoft.graph.downloadUrl"
-            },
+            params={"$select": "id,name,size,file,@microsoft.graph.downloadUrl"},
         )
         if not isinstance(metadata, dict) or not metadata.get("id"):
             raise RuntimeError("OneDrive did not return file metadata")
@@ -1228,10 +1224,10 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
         temporary_path = None
         file_metadata = metadata.get("file")
         mime_type = (
-            file_metadata.get("mimeType")
-            if isinstance(file_metadata, dict)
-            else None
-        ) or _guess_mime_type(output_path.name) or "application/octet-stream"
+            (file_metadata.get("mimeType") if isinstance(file_metadata, dict) else None)
+            or _guess_mime_type(output_path.name)
+            or "application/octet-stream"
+        )
         return _success(
             file_path=str(output_path),
             filename=output_path.name,

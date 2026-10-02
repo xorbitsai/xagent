@@ -15,6 +15,7 @@ from collections.abc import Coroutine, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import (
     Annotated,
     Any,
@@ -282,7 +283,7 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
 # on the original process-local output directory still existing.
 _WORKSPACE_DOWNLOAD_FIELDS: dict[tuple[str, str], str] = {
     ("onedrive", "onedrive_download_file"): "file_path",
-    ("google_drive", "google_drive_download_file"): "path",
+    ("google-drive", "google_drive_download_file"): "path",
 }
 
 
@@ -294,6 +295,15 @@ def _durable_upload_fields(server_name: str, tool_name: str) -> tuple[str, ...]:
 
     return _DURABLE_UPLOAD_FIELDS.get(
         (canonicalize_builtin_identity(server_name) or "", tool_name), ()
+    )
+
+
+def _workspace_download_field(server_name: str, tool_name: str) -> str | None:
+    """Return a download path field only for a built-in connector identity."""
+    from .....builtin_identity import canonicalize_builtin_identity
+
+    return _WORKSPACE_DOWNLOAD_FIELDS.get(
+        (canonicalize_builtin_identity(server_name) or "", tool_name)
     )
 
 
@@ -1331,6 +1341,7 @@ class MCPToolAdapter(AbstractBaseTool):
         source_server: Optional[str] = None,
         workspace: Any | None = None,
         durable_upload_fields: tuple[str, ...] = (),
+        workspace_download_field: str | None = None,
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
         raw_annotations: Optional[Mapping[str, Any]] = None,
@@ -1351,6 +1362,9 @@ class MCPToolAdapter(AbstractBaseTool):
                 for local-path upload connectors.
             durable_upload_fields: Host-owned scalar argument names that accept
                 a durable FileRef and need task-local staging.
+            workspace_download_field: Host-owned result field for a built-in
+                connector download that should be registered as a durable
+                FileRef.
             concurrency_safe: Whether the server operator guarantees these MCP
                 tools are both concurrency-safe and idempotent when retried
                 after interruption.
@@ -1373,6 +1387,7 @@ class MCPToolAdapter(AbstractBaseTool):
         self.source_server = source_server
         self._workspace = workspace
         self._durable_upload_fields = durable_upload_fields
+        self._workspace_download_field = workspace_download_field
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
             concurrency_safe=concurrency_safe,
@@ -1439,19 +1454,11 @@ class MCPToolAdapter(AbstractBaseTool):
                 "the local upload argument; it will be staged in the current "
                 "task workspace before this connector runs."
             )
-        from .selection_spec import normalize_mcp_server_name
-
-        if (
-            self._workspace is not None
-            and (
-                normalize_mcp_server_name(self.source_server or ""),
-                self.mcp_tool.name,
-            )
-            in _WORKSPACE_DOWNLOAD_FIELDS
-        ):
+        if self._workspace is not None and self._workspace_download_field is not None:
             description += (
-                " The successful result includes a durable file_ref; use its "
-                "file_id for later turns or connector uploads."
+                " A successful result includes a durable file_ref when "
+                "registration succeeds; use its file_id for later turns or "
+                "connector uploads."
             )
         bound_args = self._runtime_tool_arguments(
             redact_sensitive=True, log_skipped=False
@@ -2061,16 +2068,15 @@ class MCPToolAdapter(AbstractBaseTool):
         self, result: dict[str, Any]
     ) -> dict[str, Any]:
         """Attach a durable FileRef to a trusted connector download result."""
-        if self._workspace is None:
-            return result
-        from .selection_spec import normalize_mcp_server_name
-
-        path_field = _WORKSPACE_DOWNLOAD_FIELDS.get(
-            (normalize_mcp_server_name(self.source_server or ""), self.mcp_tool.name)
-        )
-        if path_field is None:
+        path_field = self._workspace_download_field
+        if self._workspace is None or path_field is None:
             return result
 
+        # Keep references to every JSON payload copy exposed by the MCP SDK:
+        # FastMCP may put the same result in content[].text and in
+        # structured_content.result. Updating only one copy leaves the model
+        # with a stale payload that still points at a process-local path.
+        records: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
         for content_item in result.get("content", []):
             if not isinstance(content_item, dict):
                 continue
@@ -2081,27 +2087,85 @@ class MCPToolAdapter(AbstractBaseTool):
                 payload = json.loads(text)
             except (TypeError, ValueError):
                 continue
-            if not isinstance(payload, dict) or payload.get("status") != "success":
-                continue
-            raw_path = payload.get(path_field)
-            if not isinstance(raw_path, str) or not raw_path.strip():
-                continue
-            try:
-                resolved_path = self._workspace.resolve_path(raw_path)
-                file_ref = build_workspace_file_ref(
+            if isinstance(payload, dict):
+                records.append((payload, "content", content_item))
+
+        structured_content = result.get("structured_content")
+        if isinstance(structured_content, dict):
+            structured_result = structured_content.get("result")
+            if isinstance(structured_result, str):
+                try:
+                    structured_payload = json.loads(structured_result)
+                except (TypeError, ValueError):
+                    structured_payload = None
+                if isinstance(structured_payload, dict):
+                    records.append(
+                        (structured_payload, "structured_json", structured_content)
+                    )
+            elif isinstance(structured_result, dict):
+                records.append(
+                    (structured_result, "structured_dict", structured_content)
+                )
+            elif structured_content.get("status") is not None:
+                records.append(
+                    (structured_content, "structured_dict", structured_content)
+                )
+
+        candidates = [
+            (payload, kind, owner)
+            for payload, kind, owner in records
+            if payload.get("status") == "success"
+            and isinstance(payload.get(path_field), str)
+            and payload[path_field].strip()
+        ]
+        if not candidates:
+            return result
+
+        selected_payload, _, _ = candidates[0]
+        raw_path = str(selected_payload[path_field])
+        try:
+            resolved_path = Path(self._workspace.resolve_path(raw_path)).resolve()
+            output_root = Path(self._workspace.output_dir).resolve()
+            if not resolved_path.is_relative_to(output_root):
+                raise ValueError(
+                    "download path is outside the workspace output directory"
+                )
+            file_payload = selected_payload.get("file")
+            mime_type = selected_payload.get("mime_type")
+            if not isinstance(mime_type, str) and isinstance(file_payload, dict):
+                mime_type = file_payload.get("mimeType") or file_payload.get(
+                    "mime_type"
+                )
+            file_ref = sanitize_file_ref_for_context(
+                build_workspace_file_ref(
                     workspace=self._workspace,
                     file_path=resolved_path,
-                    mime_type=payload.get("mime_type"),
+                    mime_type=mime_type,
                 )
-                payload["file_ref"] = sanitize_file_ref_for_context(file_ref)
-                content_item["text"] = json.dumps(payload, ensure_ascii=False)
-            except Exception as exc:
-                logger.warning(
-                    "Failed to register %s download as a FileRef: %s",
-                    self.mcp_tool.name,
-                    type(exc).__name__,
-                )
-            break
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to register %s download as a FileRef: %s",
+                self.mcp_tool.name,
+                type(exc).__name__,
+            )
+            file_ref = None
+
+        selected_path = raw_path.strip()
+        for payload, kind, owner in candidates:
+            if str(payload[path_field]).strip() != selected_path:
+                continue
+            # A connector-local absolute path is not a durable reference. Do
+            # not expose it after the host has had a chance to materialize it.
+            payload.pop(path_field, None)
+            if file_ref is None:
+                payload["file_ref_error"] = "durable file registration failed"
+            else:
+                payload["file_ref"] = file_ref
+            if kind == "content":
+                owner["text"] = json.dumps(payload, ensure_ascii=False)
+            elif kind == "structured_json":
+                owner["result"] = json.dumps(payload, ensure_ascii=False)
         return result
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
@@ -2186,6 +2250,9 @@ class MCPToolAdapter(AbstractBaseTool):
                         if retry_result is None:
                             raise
                         result = retry_result
+                    result = await self._run_upload_staging_operation(
+                        self._register_workspace_download_result, result
+                    )
                     if bound_args:
                         result["runtime_bound_arguments"] = bound_args
                     return _replace_staged_upload_paths(result, staged_upload_sources)
@@ -2279,8 +2346,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            normalized = _normalized_mcp_call_result(result)
-            return self._register_workspace_download_result(normalized)
+            return _normalized_mcp_call_result(result)
 
     async def _retry_after_authorization_failure(
         self,
@@ -2721,6 +2787,7 @@ def _build_mcp_tool_adapter(
         source_server=normalize_mcp_server_name(server_name),
         workspace=workspace,
         durable_upload_fields=_durable_upload_fields(server_name, mcp_tool.name),
+        workspace_download_field=_workspace_download_field(server_name, mcp_tool.name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,
         # Read off the tool the loader produced -- both the direct and the

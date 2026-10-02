@@ -658,26 +658,45 @@ def _download_output_dir() -> Path:
 
 
 _UNSAFE_DOWNLOAD_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.() -]")
+_MAX_DOWNLOAD_FILENAME_LENGTH = 200
+_MAX_DOWNLOAD_SUFFIX_LENGTH = 20
+
+
+def _split_download_stem_suffix(base: str) -> tuple[str, str]:
+    suffix = Path(base).suffix
+    if not suffix and base.startswith(".") and base.count(".") == 1 and len(base) > 1:
+        return "", base
+    return Path(base).stem, suffix
 
 
 def _safe_download_filename(name: str) -> str:
     """Keep a remote OneDrive name as one safe local path segment."""
     base = Path(str(name).strip()).name
-    sanitized = _UNSAFE_DOWNLOAD_FILENAME_CHARS.sub("_", base).strip(" ._")
-    if not sanitized:
-        sanitized = "downloaded-file"
-    return sanitized[:200]
+    stem, suffix = _split_download_stem_suffix(base)
+    stem = _UNSAFE_DOWNLOAD_FILENAME_CHARS.sub("_", stem).strip(" ._") or "file"
+    suffix = _UNSAFE_DOWNLOAD_FILENAME_CHARS.sub("_", suffix)[
+        :_MAX_DOWNLOAD_SUFFIX_LENGTH
+    ]
+    max_stem_length = max(1, _MAX_DOWNLOAD_FILENAME_LENGTH - len(suffix))
+    return stem[:max_stem_length] + suffix
 
 
-def _unique_download_path(output_dir: Path, filename: str) -> Path:
-    candidate = output_dir / filename
-    if not candidate.exists():
+def _publish_download_file(
+    temporary_path: Path, output_dir: Path, filename: str
+) -> Path:
+    """Publish a completed download without clobbering a concurrent result."""
+    stem, suffix = _split_download_stem_suffix(filename)
+    counter = 0
+    while True:
+        candidate_name = filename if counter == 0 else f"{stem} ({counter}){suffix}"
+        candidate = output_dir / candidate_name
+        try:
+            os.link(temporary_path, candidate)
+        except FileExistsError:
+            counter += 1
+            continue
+        temporary_path.unlink()
         return candidate
-    stem, suffix = Path(filename).stem, Path(filename).suffix
-    counter = 1
-    while (candidate := output_dir / f"{stem} ({counter}){suffix}").exists():
-        counter += 1
-    return candidate
 
 
 def _stream_download_to_path(
@@ -687,7 +706,7 @@ def _stream_download_to_path(
     *,
     authenticated: bool,
 ) -> tuple[int, str]:
-    """Stream a Graph content response to disk with size and hash checks."""
+    """Stream a Graph content response, enforcing size and computing SHA-256."""
     headers = _graph_headers() if authenticated else {"Accept": "*/*"}
     try:
         response = requests.request(
@@ -1162,7 +1181,7 @@ def onedrive_get_item(path: str | None = None, item_id: str | None = None) -> st
 
 @mcp.tool()
 def onedrive_get_file_content(file_path: str) -> str:
-    """Download file content from OneDrive by path. Returns text when possible, otherwise base64."""
+    """Read text content by path; use onedrive_download_file for binaries."""
     try:
         content = _graph_request("GET", _content_path(file_path), raw=True)
         text_content, base64_content = _decode_bytes(content)
@@ -1184,7 +1203,7 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
     This tool is intended for Office files and other binary content that must
     be passed to another connector or edited in a later turn. It writes a real
     local file under the task's ``output/`` directory, verifies the byte count,
-    and returns its SHA-256 plus a workspace path. The MCP host also registers
+    and computes its SHA-256 plus a workspace path. The MCP host also registers
     that path as a durable FileRef before exposing the result to the agent.
     """
     temporary_path: Path | None = None
@@ -1195,8 +1214,12 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
             _item_path(file_path),
             params={"$select": "id,name,size,file,@microsoft.graph.downloadUrl"},
         )
-        if not isinstance(metadata, dict) or not metadata.get("id"):
-            raise RuntimeError("OneDrive did not return file metadata")
+        if (
+            not isinstance(metadata, dict)
+            or not metadata.get("id")
+            or not isinstance(metadata.get("file"), dict)
+        ):
+            raise RuntimeError("OneDrive item is not a file")
         size = metadata.get("size")
         if not isinstance(size, int) or isinstance(size, bool) or size < 0:
             raise RuntimeError("OneDrive returned an invalid file size")
@@ -1208,10 +1231,9 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
 
         remote_name = str(metadata.get("name") or Path(file_path).name)
         output_name = _safe_download_filename(filename or remote_name)
-        output_path = _unique_download_path(output_dir, output_name)
-        temporary_path = output_path.with_name(
-            f".{output_path.name}.{uuid4().hex}.part"
-        )
+        staging_dir = output_dir.parent / ".xagent-onedrive-downloads"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = staging_dir / f"{uuid4().hex}.part"
         download_url = metadata.get("@microsoft.graph.downloadUrl")
         if isinstance(download_url, str) and download_url:
             total, sha256 = _stream_download_to_path(
@@ -1227,7 +1249,7 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
                 size,
                 authenticated=True,
             )
-        temporary_path.replace(output_path)
+        output_path = _publish_download_file(temporary_path, output_dir, output_name)
         temporary_path = None
         file_metadata = metadata.get("file")
         mime_type = (
@@ -1248,8 +1270,20 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
                 temporary_path.unlink(missing_ok=True)
             except OSError:
                 logger.warning("Failed to clean OneDrive download temp file")
-        logger.error("Error downloading OneDrive binary file %s: %s", file_path, e)
-        return _error(str(e))
+        raw_message = str(e)
+        public_message = "OneDrive file download failed"
+        if raw_message.startswith("No task workspace configured for this connector"):
+            public_message = raw_message
+        elif raw_message.startswith("The OneDrive file is "):
+            public_message = raw_message
+        elif raw_message == "OneDrive item is not a file":
+            public_message = raw_message
+        logger.error(
+            "Error downloading OneDrive binary file %s (%s)",
+            file_path,
+            type(e).__name__,
+        )
+        return _error(public_message)
 
 
 @mcp.tool()

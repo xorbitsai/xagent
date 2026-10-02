@@ -8,6 +8,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
@@ -763,6 +764,8 @@ async def test_mcp_binary_download_is_registered_as_durable_file_ref(monkeypatch
             assert path == "/task/output/Deck.pptx"
             return path
 
+        output_dir = Path("/task/output")
+
     workspace = FakeWorkspace()
     monkeypatch.setattr(
         mcp_adapter_module,
@@ -823,6 +826,24 @@ async def test_mcp_binary_download_is_registered_as_durable_file_ref(monkeypatch
 
     payload = json.loads(result["content"][0]["text"])
     assert payload["file_ref"] == {"file_id": "file-123", "filename": "Deck.pptx"}
+
+
+def test_custom_google_drive_server_is_not_trusted_for_download_registration():
+    mcp_tool = SimpleNamespace(
+        name="google_drive_download_file",
+        description="Download a file",
+        inputSchema={"type": "object", "properties": {"path": {"type": "string"}}},
+    )
+
+    adapter = _build_mcp_tool_adapter(
+        "Google_Drive",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=object(),
+    )
+
+    assert adapter._workspace_download_field is None
+    assert "durable file_ref" not in adapter.description
 
 
 def test_exception_indicates_http_401_uses_bounded_status_signals():

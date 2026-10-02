@@ -3822,14 +3822,13 @@ class WebToolConfig(BaseToolConfig):
                 env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-            # Distinct from the six read allowlists above: Google Drive's
-            # download tool writes NEW files into the task workspace, so it
+            # Distinct from the read allowlists above: Google Drive and
+            # OneDrive download tools write NEW files into the task workspace, so they
             # gets its own single-value, task-dir-only var rather than
             # reusing the read-allowlist shape (see
             # _build_mcp_task_output_dir's docstring for why that would be
-            # wrong, not just differently-shaped). google_drive_upload_file
-            # reads from XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS above instead,
-            # like the other five read allowlists.
+            # wrong, not just differently-shaped). Upload tools read from the
+            # read allowlists above instead.
             task_output_dir = self._build_mcp_task_output_dir()
             if task_output_dir:
                 env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir

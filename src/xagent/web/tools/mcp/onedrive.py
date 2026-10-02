@@ -1213,9 +1213,10 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
 
     This tool is intended for Office files and other binary content that must
     be passed to another connector or edited in a later turn. It writes a real
-    local file under the task's ``output/`` directory, verifies the byte count,
-    and computes its SHA-256 plus a workspace path. The MCP host also registers
-    that path as a durable FileRef before exposing the result to the agent.
+    local file under the task's ``output/`` directory, enforces the download
+    limit, verifies available Graph metadata hashes, and computes its SHA-256
+    plus a workspace path. The MCP host also registers that path as a durable
+    FileRef before exposing the result to the agent.
     """
     temporary_path: Path | None = None
     try:

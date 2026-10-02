@@ -580,6 +580,120 @@ def test_download_file_uses_graph_download_url_without_auth_header(
     assert download_call.kwargs["headers"] == {"Accept": "*/*"}
 
 
+def test_download_file_reports_http_status_without_leaking_download_url(
+    monkeypatch, tmp_path
+):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    metadata = MockResponse(
+        {
+            "id": "item-3",
+            "name": "report.pdf",
+            "size": 4,
+            "file": {"mimeType": "application/pdf"},
+        }
+    )
+    failed_download = MockResponse(
+        status_code=404,
+        content=b"not found",
+        url="https://download.example/item-3?secret=token",
+    )
+    mock_request = Mock(side_effect=[metadata, failed_download])
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_download_file("report.pdf"))
+
+    assert result == {
+        "status": "error",
+        "message": "OneDrive file download failed with HTTP 404",
+    }
+    assert "download.example" not in result["message"]
+    assert not list((task_dir / ".xagent-onedrive-downloads").glob("*.part"))
+
+
+def test_download_file_cleans_partial_file_on_size_mismatch(monkeypatch, tmp_path):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    metadata = MockResponse(
+        {
+            "id": "item-4",
+            "name": "report.pdf",
+            "size": 4,
+            "file": {"mimeType": "application/pdf"},
+        }
+    )
+    content_response = MockResponse(content=b"too long")
+    monkeypatch.setattr(
+        onedrive.requests, "request", Mock(side_effect=[metadata, content_response])
+    )
+
+    result = json.loads(onedrive.onedrive_download_file("report.pdf"))
+
+    assert result["status"] == "error"
+    assert (
+        result["message"] == "OneDrive file size changed while it was being downloaded"
+    )
+    assert not (task_dir / "output" / "report.pdf").exists()
+    assert not list((task_dir / ".xagent-onedrive-downloads").glob("*.part"))
+
+
+def test_download_file_rejects_metadata_over_limit_before_streaming(
+    monkeypatch, tmp_path
+):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "id": "item-5",
+                "name": "huge.bin",
+                "size": onedrive._MAX_DOWNLOAD_BYTES + 1,
+                "file": {},
+            }
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", mock_request)
+
+    result = json.loads(onedrive.onedrive_download_file("huge.bin"))
+
+    assert result["status"] == "error"
+    assert "over the 2 GiB limit" in result["message"]
+    assert mock_request.call_count == 1
+
+
+def test_download_file_reserves_a_collision_free_output_name(monkeypatch, tmp_path):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    output_dir = task_dir / "output"
+    output_dir.mkdir()
+    (output_dir / "report.pdf").write_bytes(b"existing")
+    monkeypatch.setenv("XAGENT_ONEDRIVE_OUTPUT_DIR", str(task_dir))
+    content = b"new report"
+    metadata = MockResponse(
+        {
+            "id": "item-6",
+            "name": "report.pdf",
+            "size": len(content),
+            "file": {"mimeType": "application/pdf"},
+        }
+    )
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(side_effect=[metadata, MockResponse(content=content)]),
+    )
+
+    result = json.loads(onedrive.onedrive_download_file("report.pdf"))
+
+    assert result["status"] == "success"
+    assert result["filename"] == "report (1).pdf"
+    assert (output_dir / "report.pdf").read_bytes() == b"existing"
+    assert (output_dir / "report (1).pdf").read_bytes() == content
+
+
 def test_download_file_rejects_folder_metadata(monkeypatch, tmp_path):
     task_dir = tmp_path / "task"
     task_dir.mkdir()

@@ -117,6 +117,33 @@ def test_upgrade_switches_catalog_and_removes_legacy_server(tmp_path):
         assert connection.execute(select(associations)).all() == []
 
 
+def test_upgrade_accepts_legacy_scopes_in_a_different_order(tmp_path):
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = MetaData()
+    apps, _, _ = _schema(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        _insert_legacy_app(connection, apps, migration)
+        connection.execute(
+            apps.update()
+            .where(apps.c.app_id == "hubspot")
+            .values(oauth_scopes=list(reversed(migration.LEGACY_SCOPES)))
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        row = (
+            connection.execute(select(apps).where(apps.c.app_id == "hubspot"))
+            .mappings()
+            .one()
+        )
+        assert row["transport"] == "streamable_http"
+        assert row["oauth_scopes"] is None
+
+
 def test_upgrade_preserves_custom_description(tmp_path):
     migration = _load_migration()
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")

@@ -91,12 +91,21 @@ def _owned_remote_launch(value: object) -> bool:
     ) == builtin_provenance_identity(BUILTIN_PROVENANCE)
 
 
+def _same_legacy_scope_set(value: object) -> bool:
+    """Match legacy scopes without depending on JSON array ordering."""
+    return (
+        isinstance(value, (list, tuple))
+        and all(isinstance(scope, str) for scope in value)
+        and set(value) == set(LEGACY_SCOPES)
+    )
+
+
 def _legacy_catalog_row(row: Any) -> bool:
     return (
         row["name"] == "HubSpot"
         and row["transport"] == "oauth"
         and row["provider_name"] == "hubspot"
-        and row["oauth_scopes"] == LEGACY_SCOPES
+        and _same_legacy_scope_set(row["oauth_scopes"])
         and row["launch_config"] == LEGACY_LAUNCH_CONFIG
     )
 

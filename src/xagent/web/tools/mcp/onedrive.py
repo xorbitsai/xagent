@@ -1295,6 +1295,11 @@ def onedrive_download_file(file_path: str, filename: str = "") -> str:
         elif raw_message.startswith(
             (
                 "No task workspace configured for this connector",
+                "file_path must include a filename",
+                "file_path filename must not end with a period",
+                "file_path is required",
+                "path must use '/' separators",
+                "path must not contain",
                 "The OneDrive file is ",
                 "OneDrive item is not a file",
                 "OneDrive returned ",

@@ -112,9 +112,6 @@ dependencies = [
   "byteplus-python-sdk-v2>=3.0.52",
 ]
 
-[tool.ruff]
-target-version = "py311"
-
 [project.optional-dependencies]
 command-path-guard = ["bashlex>=0.18"]
 

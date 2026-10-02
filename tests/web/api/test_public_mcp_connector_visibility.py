@@ -705,9 +705,8 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
     db = next(get_db())
     try:
         provider_names = {row.provider_name for row in db.query(OAuthProvider).all()}
-        assert {"google", "linkedin", "microsoft", "meta", "hubspot"}.issubset(
-            provider_names
-        )
+        assert {"google", "linkedin", "microsoft", "meta"}.issubset(provider_names)
+        assert "hubspot" not in provider_names
 
         microsoft_provider = (
             db.query(OAuthProvider)

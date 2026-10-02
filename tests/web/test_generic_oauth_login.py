@@ -1093,6 +1093,69 @@ def test_app_without_optional_scopes_sends_no_optional_scope_param(
     assert "optional_scope" not in qs
 
 
+def test_patched_builtin_optional_scopes_are_sent_to_authorize_endpoint(
+    db_session, monkeypatch
+):
+    """Keep the optional-scope path covered even when no current builtin uses it."""
+    import xagent.web.mcp_apps as mcp_apps_module
+
+    db, user = db_session
+    token = _token_for(user)
+    original_lookup = mcp_apps_module.get_builtin_execution_fields_and_optional_scopes
+
+    def fake_lookup(app_id):
+        execution_fields, optional_scopes = original_lookup(app_id)
+        if app_id == "optional-test":
+            execution_fields = {
+                "name": "Optional Test",
+                "transport": "oauth",
+                "provider_name": "test-provider",
+                "oauth_scopes": ["required.scope"],
+                "launch_config": {},
+            }
+            optional_scopes = ["optional.scope"]
+        return execution_fields, optional_scopes
+
+    monkeypatch.setattr(
+        mcp_apps_module,
+        "get_builtin_execution_fields_and_optional_scopes",
+        fake_lookup,
+    )
+    db.add(
+        PublicMCPApp(
+            app_id="optional-test",
+            name="Optional Test",
+            description="Optional scope test connector",
+            transport="oauth",
+            provider_name="test-provider",
+            category="Testing",
+            oauth_scopes=["required.scope"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://provider.example.com/authorize",
+        default_scopes=["identity.scope"],
+        redirect_uri="https://app.example.com/api/auth/test-provider/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="test-provider",
+        token=token,
+        app_id="optional-test",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == ["identity.scope required.scope"]
+    assert qs["optional_scope"] == ["optional.scope"]
+
+
 def test_meta_login_uses_config_id_without_scope_when_configured(
     db_session, monkeypatch
 ):

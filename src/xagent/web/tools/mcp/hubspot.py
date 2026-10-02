@@ -1,3 +1,10 @@
+"""Legacy local HubSpot MCP tools.
+
+The builtin registry now uses HubSpot's hosted MCP server. This module remains
+only so the HubSpot migration can support a downgrade; remove it in a future
+cleanup once that compatibility window is no longer needed.
+"""
+
 import json
 import logging
 import os

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
+from xagent.web.api import mcp as mcp_api
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -367,6 +368,35 @@ def test_actor_remote_legacy_classification_queries_each_live_view(db_session) -
     assert PublicMCPApp in queried
     assert MCPServer in queried
     assert any(entity is UserMCPServer.id for entity in queried)
+
+
+def test_actor_remote_hubspot_row_created_by_catalog_connect_is_canonical(
+    db_session, monkeypatch
+) -> None:
+    monkeypatch.setenv("XAGENT_HUBSPOT_MCP_CLIENT_ID", "hubspot-client")
+    monkeypatch.setenv("XAGENT_HUBSPOT_MCP_CLIENT_SECRET", "hubspot-secret")
+    app = get_builtin_public_mcp_app("hubspot")
+    assert app is not None
+    db_session.db.add(
+        PublicMCPApp(
+            app_id="hubspot",
+            name=app["name"],
+            description=app["description"],
+            transport=app["transport"],
+            provider_name=app["provider_name"],
+            category=app["category"],
+            oauth_scopes=app["oauth_scopes"],
+            launch_config=app["launch_config"],
+            is_visible_in_connector=True,
+        )
+    )
+    db_session.db.commit()
+
+    server, _ = mcp_api._ensure_catalog_mcp_oauth_server(db_session.db, "hubspot")
+
+    resolved = mcp_apps.classify_actor_remote_oauth_server(db_session.db, server)
+
+    assert resolved is not None and resolved["id"] == "hubspot"
 
 
 def test_actor_remote_legacy_non_remote_unpersisted_row_remains_native(

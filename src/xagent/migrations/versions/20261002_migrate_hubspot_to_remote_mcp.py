@@ -5,6 +5,7 @@ Revises: 20260930_merge_task_outcome_identity
 Create Date: 2026-10-02
 """
 
+import os
 from typing import Any, Sequence, Union
 
 import sqlalchemy as sa
@@ -57,6 +58,15 @@ REMOTE_LAUNCH_CONFIG = {
     },
     "builtin_provenance": BUILTIN_PROVENANCE,
 }
+LEGACY_OAUTH_PROVIDER_STATIC_FIELDS = {
+    "name": "HubSpot",
+    "auth_url": "https://app.hubspot.com/oauth/authorize",
+    "token_url": "https://api.hubapi.com/oauth/v1/token",
+    "userinfo_url": "https://api.hubapi.com/oauth/v1/access-tokens/{{access_token}}",
+    "user_id_path": "user_id",
+    "email_path": "user",
+    "default_scopes": ["oauth"],
+}
 
 PUBLIC_MCP_APPS = sa.table(
     "public_mcp_apps",
@@ -75,6 +85,26 @@ MCP_SERVERS = sa.table(
     sa.column("transport", sa.String),
     sa.column("url", sa.String),
     sa.column("auth", sa.JSON),
+)
+OAUTH_PROVIDERS = sa.table(
+    "oauth_providers",
+    sa.column("provider_name", sa.String),
+    sa.column("name", sa.String),
+    sa.column("client_id", sa.String),
+    sa.column("client_secret", sa.String),
+    sa.column("auth_url", sa.String),
+    sa.column("token_url", sa.String),
+    sa.column("redirect_uri", sa.String),
+    sa.column("userinfo_url", sa.String),
+    sa.column("user_id_path", sa.String),
+    sa.column("email_path", sa.String),
+    sa.column("default_scopes", sa.JSON),
+)
+USER_OAUTH = sa.table(
+    "user_oauth",
+    sa.column("provider", sa.String),
+    sa.column("access_token", sa.String),
+    sa.column("refresh_token", sa.String),
 )
 
 
@@ -177,6 +207,81 @@ def _delete_remote_server(bind: sa.engine.Connection) -> None:
     )
 
 
+def _clear_legacy_hubspot_tokens(bind: sa.engine.Connection) -> None:
+    required = {"provider", "access_token"}
+    if not required.issubset(_columns(bind, "user_oauth")):
+        return
+    values: dict[str, object] = {"access_token": ""}
+    if "refresh_token" in _columns(bind, "user_oauth"):
+        values["refresh_token"] = None
+    bind.execute(
+        sa.update(USER_OAUTH).where(USER_OAUTH.c.provider == APP_ID).values(**values)
+    )
+
+
+def _remove_legacy_hubspot_provider(bind: sa.engine.Connection) -> None:
+    required = {"provider_name", *LEGACY_OAUTH_PROVIDER_STATIC_FIELDS}
+    if not required.issubset(_columns(bind, "oauth_providers")):
+        return
+    row = (
+        bind.execute(
+            sa.select(*(OAUTH_PROVIDERS.c[name] for name in required)).where(
+                OAUTH_PROVIDERS.c.provider_name == APP_ID
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if row is None or any(
+        row[name] != expected
+        for name, expected in LEGACY_OAUTH_PROVIDER_STATIC_FIELDS.items()
+    ):
+        return
+    bind.execute(
+        sa.delete(OAUTH_PROVIDERS).where(OAUTH_PROVIDERS.c.provider_name == APP_ID)
+    )
+
+
+def _restore_legacy_hubspot_provider(bind: sa.engine.Connection) -> None:
+    required = {
+        "provider_name",
+        "name",
+        "client_id",
+        "client_secret",
+        "auth_url",
+        "token_url",
+        "redirect_uri",
+        "userinfo_url",
+        "user_id_path",
+        "email_path",
+        "default_scopes",
+    }
+    if not required.issubset(_columns(bind, "oauth_providers")):
+        return
+    exists = bind.execute(
+        sa.select(OAUTH_PROVIDERS.c.provider_name).where(
+            OAUTH_PROVIDERS.c.provider_name == APP_ID
+        )
+    ).first()
+    if exists is not None:
+        return
+    bind.execute(
+        sa.insert(OAUTH_PROVIDERS).values(
+            provider_name=APP_ID,
+            name=LEGACY_OAUTH_PROVIDER_STATIC_FIELDS["name"],
+            client_id=os.environ.get("HUBSPOT_CLIENT_ID", ""),
+            client_secret=os.environ.get("HUBSPOT_CLIENT_SECRET", ""),
+            auth_url=LEGACY_OAUTH_PROVIDER_STATIC_FIELDS["auth_url"],
+            token_url=LEGACY_OAUTH_PROVIDER_STATIC_FIELDS["token_url"],
+            redirect_uri=os.environ.get("HUBSPOT_REDIRECT_URI", ""),
+            userinfo_url=LEGACY_OAUTH_PROVIDER_STATIC_FIELDS["userinfo_url"],
+            user_id_path=LEGACY_OAUTH_PROVIDER_STATIC_FIELDS["user_id_path"],
+            email_path=LEGACY_OAUTH_PROVIDER_STATIC_FIELDS["email_path"],
+            default_scopes=LEGACY_OAUTH_PROVIDER_STATIC_FIELDS["default_scopes"],
+        )
+    )
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     required = {
@@ -221,6 +326,8 @@ def upgrade() -> None:
         .values(**values)
     )
     _delete_legacy_local_server(bind)
+    _clear_legacy_hubspot_tokens(bind)
+    _remove_legacy_hubspot_provider(bind)
 
 
 def downgrade() -> None:
@@ -261,3 +368,4 @@ def downgrade() -> None:
         .values(**values)
     )
     _delete_remote_server(bind)
+    _restore_legacy_hubspot_provider(bind)

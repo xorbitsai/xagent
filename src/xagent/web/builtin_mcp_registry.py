@@ -104,22 +104,6 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "default_scopes": ["User.Read"],
         },
         {
-            "provider_name": "hubspot",
-            "name": "HubSpot",
-            "client_id": os.environ.get("HUBSPOT_CLIENT_ID", ""),
-            "client_secret": os.environ.get("HUBSPOT_CLIENT_SECRET", ""),
-            "auth_url": "https://app.hubspot.com/oauth/authorize",
-            "token_url": "https://api.hubapi.com/oauth/v1/token",
-            "redirect_uri": os.environ.get("HUBSPOT_REDIRECT_URI", ""),
-            # HubSpot's token-info endpoint takes the token in the URL path
-            # rather than a Bearer header; the callback substitutes the
-            # {{access_token}} placeholder before issuing the GET.
-            "userinfo_url": "https://api.hubapi.com/oauth/v1/access-tokens/{{access_token}}",
-            "user_id_path": "user_id",
-            "email_path": "user",
-            "default_scopes": ["oauth"],
-        },
-        {
             "provider_name": "meta",
             "name": "Meta",
             "client_id": os.environ.get("META_CLIENT_ID", ""),

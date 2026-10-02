@@ -43,8 +43,6 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_app_base_url,
-    get_hubspot_mcp_client_id,
-    get_hubspot_mcp_client_secret,
     get_mcp_tool_init_timeout_seconds,
     get_public_api_base_url,
     get_session_secret,
@@ -60,6 +58,7 @@ from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
     get_app_for_mcp_server,
+    get_catalog_mcp_oauth_credentials,
     normalize_catalog_key,
     restrict_to_app_scoped_oauth_grant,
 )
@@ -3842,7 +3841,8 @@ def _resolve_catalog_mcp_oauth_auth(app_id: str, auth_config: Any) -> dict[str, 
     credential_provider = resolved.pop("credential_provider", None)
     if credential_provider is None:
         return resolved
-    if app_id != "hubspot" or credential_provider != "hubspot":
+    credentials = get_catalog_mcp_oauth_credentials(app_id, credential_provider)
+    if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Unsupported catalog OAuth credential provider",
@@ -3852,27 +3852,20 @@ def _resolve_catalog_mcp_oauth_auth(app_id: str, auth_config: Any) -> dict[str, 
     # connector's deployment credentials. The connect path validates these
     # values immediately before it calls this helper, while an empty pair lets
     # a future catalog sync materialize a safe, unavailable placeholder.
-    resolved["client_id"] = get_hubspot_mcp_client_id() or ""
-    resolved["client_secret"] = get_hubspot_mcp_client_secret() or ""
+    resolved.update(credentials[0])
     return resolved
 
 
 def _require_catalog_mcp_oauth_credentials(app_id: str) -> None:
     """Fail closed when a user actually starts a static-client OAuth flow."""
-    if app_id != "hubspot":
+    credentials = get_catalog_mcp_oauth_credentials(app_id)
+    if credentials is None:
         return
-    missing = [
-        name
-        for name, value in (
-            ("XAGENT_HUBSPOT_MCP_CLIENT_ID", get_hubspot_mcp_client_id()),
-            ("XAGENT_HUBSPOT_MCP_CLIENT_SECRET", get_hubspot_mcp_client_secret()),
-        )
-        if not value
-    ]
+    _, missing = credentials
     if missing:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"HubSpot MCP is not configured. Missing: {', '.join(missing)}",
+            detail=f"{app_id} MCP is not configured. Missing: {', '.join(missing)}",
         )
 
 

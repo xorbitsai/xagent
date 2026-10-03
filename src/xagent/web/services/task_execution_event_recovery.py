@@ -89,13 +89,15 @@ def read_event_checkpoint(
     if filter_run:
         query = query.where(TaskExecutionEvent.run_id == run_id)
     # Keyset pages also bound work when other executions share a build scope.
-    before = int(horizon) + 1
-    for _ in range(50):
+    # The newest state usually matches, and each one inlines a whole snapshot:
+    # fetch it alone first, then page through the rest of the same scan bound.
+    before, limit = int(horizon) + 1, 1
+    for _ in range(51):
         page = list(
             db.scalars(
                 query.where(TaskExecutionEvent.sequence < before)
                 .order_by(TaskExecutionEvent.sequence.desc())
-                .limit(100)
+                .limit(limit)
             )
         )
         if not page:
@@ -189,7 +191,7 @@ def read_event_checkpoint(
                         through_sequence=int(horizon),
                     )
             return deepcopy(data)
-        before = int(page[-1].sequence)
+        before, limit = int(page[-1].sequence), 100
     raise CheckpointUnavailableError("Recovery event scan exceeded its page limit")
 
 

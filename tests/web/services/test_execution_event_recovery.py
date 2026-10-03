@@ -2,6 +2,7 @@
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.orm import Session
 
 from tests.web.services.test_task_execution_event_writer import (
     canonical as canonical_fixture,
@@ -67,6 +68,40 @@ async def test_checkpoint_reads_event_after_legacy_trace_deletion(canonical, sco
             )
             is None
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newest", ["execution", "other"])
+async def test_checkpoint_scan_fetches_the_newest_state_alone_first(canonical, newest):
+    factory, tid = canonical
+    store = TraceCheckpointStore(tracer_for(tid))
+    for label in range(5):
+        await store.save(
+            {
+                "execution_id": "execution",
+                "context": {"messages": []},
+                "label": str(label),
+            }
+        )
+    if newest == "other":
+        await store.save({"execution_id": "other", "context": {"messages": []}})
+    pages: list[int] = []
+    scalars = Session.scalars
+
+    def counted(self, statement, *args, **kwargs):
+        result = scalars(self, statement, *args, **kwargs)
+        if "recovery_state" not in statement.compile().params.values():
+            return result
+        rows = list(result)
+        pages.append(len(rows))
+        return rows
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Session, "scalars", counted)
+        checkpoint = await store.load_latest_checkpoint("execution")
+    assert checkpoint is not None and checkpoint["label"] == "4"
+    # Each state inlines a whole snapshot: never page in older ones eagerly.
+    assert pages == ([1] if newest == "execution" else [1, 5])
 
 
 @pytest.mark.asyncio

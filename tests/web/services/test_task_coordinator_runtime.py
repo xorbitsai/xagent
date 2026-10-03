@@ -27,7 +27,11 @@ task_id = task_id_fixture
 
 @pytest.fixture
 async def registry(database, monkeypatch):
-    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.02)
+    # Every renewal is a SQLite write. An interval shorter than a slow (CI
+    # fsync) commit makes renewals back to back and starves other writers,
+    # such as a competing owner's acquisition, behind SQLite's polling busy
+    # handler. Leave the write lock idle longer than its 100ms poll gap.
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.5)
     result = runtime.TaskCoordinatorRegistry(database[0])
     try:
         yield result

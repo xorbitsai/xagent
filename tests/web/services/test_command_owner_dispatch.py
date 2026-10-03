@@ -28,7 +28,12 @@ async def host(engine, task_id, monkeypatch):
     monkeypatch.setattr(database, "get_session_local", lambda: factory)
     monkeypatch.setattr(transport, "get_runner_id", lambda: "worker")
     monkeypatch.setattr(runtime, "get_runner_id", lambda: "worker")
-    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.02)
+    # Every renewal is a SQLite write. When commits are slow (CI fsync), a
+    # renewal interval shorter than the commit time turns the heartbeat into
+    # a back-to-back writer that starves the dispatcher's claim transaction
+    # behind SQLite's polling busy handler. Leave the write lock idle for
+    # longer than that handler's maximum 100ms poll gap between renewals.
+    monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.5)
     registry = runtime.TaskCoordinatorRegistry(factory)
     monkeypatch.setattr(runtime, "get_task_coordinator_registry", lambda: registry)
     monkeypatch.setattr(
@@ -174,8 +179,13 @@ async def test_registry_renews_while_handler_runs_without_command_updates(host, 
 
         async def execute(command):
             statements.clear()
-            await asyncio.sleep(0.09)
-            assert any("last_heartbeat_at" in sql for sql in statements)
+
+            async def wait_for_renewal():
+                while not any("last_heartbeat_at" in sql for sql in statements):
+                    await asyncio.sleep(0.01)
+
+            # Wait for a renewal, not a fixed number of heartbeat intervals.
+            await asyncio.wait_for(wait_for_renewal(), 5)
             assert not any("task_execution_commands" in sql for sql in statements)
             return {}
 

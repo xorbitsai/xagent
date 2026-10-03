@@ -583,6 +583,9 @@ class TestModelService:
             visible_model.model_name = "visible-model"
             visible_model.model_id = "mid-1"
             visible_model.abilities = ["generate"]
+            # An int, not the MagicMock default: _add_image_model_with_id now
+            # clamps this value with max(), which needs something orderable.
+            visible_model.max_retries = 3
 
             invisible_model = MagicMock()
             invisible_model.id = 2
@@ -592,6 +595,7 @@ class TestModelService:
             invisible_model.model_name = "invisible-model"
             invisible_model.model_id = "mid-2"
             invisible_model.abilities = ["generate"]
+            invisible_model.max_retries = 3
 
             mock_db.query.return_value.filter.return_value.all.return_value = [
                 visible_model,

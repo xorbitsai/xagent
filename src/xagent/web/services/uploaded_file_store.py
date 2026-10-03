@@ -1080,6 +1080,19 @@ def delete_durable_storage_keys(
     return tuple(failed)
 
 
+def upload_path_is_registered_sync(path: Path) -> bool:
+    """Check persistent path ownership without holding a Session over file I/O."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        return (
+            db.query(UploadedFile.id)
+            .filter(UploadedFile.storage_path == str(path))
+            .first()
+            is not None
+        )
+
+
 def register_local_uploads_sync(
     registrations: Sequence[LocalUploadRegistration],
 ) -> tuple[UploadedFileRegistrationSnapshot, ...]:

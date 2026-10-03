@@ -92,6 +92,7 @@ from ..services.uploaded_file_store import (
     delete_legacy_preview_caches,
     delete_registered_preview_caches,
     register_local_uploads_sync,
+    upload_path_is_registered_sync,
 )
 from .auth import create_access_token
 from .legacy_file import (
@@ -430,9 +431,10 @@ def _reserve_and_copy_upload(
     """Reserve one local upload path and copy bytes through its descriptor.
 
     This synchronous worker owns path construction, exclusive reservation, and
-    bounded source reads. A collision is only a ``FileExistsError`` raised by
-    the exclusive create itself; errors from source reads or destination writes
-    remain I/O failures and clean the exact reserved candidate.
+    bounded source reads. Registered paths remain owned even after local cache
+    eviction. Exclusive creation also protects concurrent uploads; errors from
+    source reads or destination writes remain I/O failures and clean the exact
+    reserved candidate.
     """
 
     try:
@@ -445,6 +447,10 @@ def _reserve_and_copy_upload(
     suffix_index = 1
 
     while True:
+        if candidate.exists() or upload_path_is_registered_sync(candidate):
+            candidate = path.parent / f"{stem}_{suffix_index}{suffix}"
+            suffix_index += 1
+            continue
         try:
             destination = open(candidate, "xb")
         except FileExistsError:

@@ -135,9 +135,11 @@ def _admin_user_id() -> int:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evicted_base", [False, True])
 async def test_concurrent_same_name_uploads_reserve_distinct_paths_and_contents(
     monkeypatch: pytest.MonkeyPatch,
     isolated_upload_storage,
+    evicted_base: bool,
 ) -> None:
     """The shared staging boundary must make naming reservation atomic."""
 
@@ -147,22 +149,43 @@ async def test_concurrent_same_name_uploads_reserve_distinct_paths_and_contents(
         files_api, "get_upload_path", _stage_path_in(upload_root, user_id)
     )
 
-    original_reserve = files_api._reserve_and_copy_upload
+    base_path = upload_root / f"user_{user_id}" / "same-name.txt"
+    original_upload = None
+    if evicted_base:
+        original_upload = await files_api.store_uploaded_files(
+            upload_items=[
+                UploadFile(filename="same-name.txt", file=io.BytesIO(b"original"))
+            ],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+        base_path.unlink()
+
+    race_path = base_path.with_name("same-name_1.txt") if evicted_base else base_path
+    original_lookup = files_api.upload_path_is_registered_sync
     workers_started = 0
     workers_ready = threading.Barrier(2)
     workers_lock = threading.Lock()
 
-    def synchronized_reserve(upload, **kwargs):  # type: ignore[no-untyped-def]
+    def synchronized_lookup(path: Path) -> bool:
         nonlocal workers_started
-        with workers_lock:
-            workers_started += 1
-        workers_ready.wait(timeout=2)
-        return original_reserve(upload, **kwargs)
+        registered = original_lookup(path)
+        if path == race_path:
+            assert not registered
+            with workers_lock:
+                workers_started += 1
+            # Both workers finish the pre-check before either can reserve the
+            # candidate. Exclusive creation must resolve the actual race.
+            workers_ready.wait(timeout=5)
+        return registered
 
     monkeypatch.setattr(
         files_api,
-        "_reserve_and_copy_upload",
-        synchronized_reserve,
+        "upload_path_is_registered_sync",
+        synchronized_lookup,
     )
     first = UploadFile(
         filename="same-name.txt",
@@ -201,6 +224,130 @@ async def test_concurrent_same_name_uploads_reserve_distinct_paths_and_contents(
         b"first exact contents",
         b"second exact contents",
     }
+    if original_upload is not None:
+        assert not base_path.exists()
+        assert base_path not in staged
+        response = client.get(
+            f"/api/files/download/{original_upload['file_id']}",
+            headers=_admin_headers(),
+        )
+        assert response.status_code == 200
+        assert response.content == b"original"
+        assert {path.read_bytes() for path in staged} == {
+            b"first exact contents",
+            b"second exact contents",
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, FileExistsError])
+async def test_upload_lookup_failure_propagates_without_staging_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_upload_storage,
+    error_type: type[Exception],
+) -> None:
+    """A lookup failure is not a filename collision and must fail closed."""
+
+    upload_root, object_root = isolated_upload_storage
+    user_id = _admin_user_id()
+    monkeypatch.setattr(
+        files_api, "get_upload_path", _stage_path_in(upload_root, user_id)
+    )
+
+    def failing_lookup(_path: Path) -> bool:
+        raise error_type("lookup unavailable")
+
+    monkeypatch.setattr(files_api, "upload_path_is_registered_sync", failing_lookup)
+    source = io.BytesIO(b"must not be staged")
+    with pytest.raises(error_type, match="lookup unavailable"):
+        await files_api.store_uploaded_files(
+            upload_items=[UploadFile(filename="lookup-failure.txt", file=source)],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+    assert source.tell() == 0
+    assert not list(upload_root.rglob("lookup-failure*"))
+    assert not list(object_root.rglob("lookup-failure*"))
+    with _direct_db_session() as db:
+        assert db.query(UploadedFile).count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_spelling", ["plain", "symlink", "parent-components"])
+async def test_same_name_upload_preserves_registered_file_after_cache_eviction(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_upload_storage,
+    path_spelling: str,
+) -> None:
+    """An absent local cache is not an unclaimed upload path."""
+
+    upload_root, _object_root = isolated_upload_storage
+    staging_root = upload_root
+    if path_spelling == "symlink":
+        staging_root = upload_root.with_name("upload-alias")
+        staging_root.symlink_to(upload_root, target_is_directory=True)
+    elif path_spelling == "parent-components":
+        intermediate = upload_root / "nested"
+        intermediate.mkdir()
+        staging_root = intermediate / ".."
+    if path_spelling != "plain":
+        assert str(staging_root) != str(staging_root.resolve())
+    user_id = _admin_user_id()
+    monkeypatch.setattr(
+        files_api, "get_upload_path", _stage_path_in(staging_root, user_id)
+    )
+
+    async def upload(payload: bytes):
+        return await files_api.store_uploaded_files(
+            upload_items=[
+                UploadFile(filename="same-name.txt", file=io.BytesIO(payload))
+            ],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+
+    originals = []
+    for payload in (b"first contents", b"second contents"):
+        result = await upload(payload)
+        with _direct_db_session() as db:
+            record = (
+                db.query(UploadedFile)
+                .filter(UploadedFile.file_id == result["file_id"])
+                .one()
+            )
+            original_path = Path(record.storage_path)
+        # Registration preserves the same spelling used by the reservation check.
+        assert original_path.parent == staging_root / f"user_{user_id}"
+        originals.append((result["file_id"], original_path, payload))
+        original_path.unlink()
+
+    new_upload = await upload(b"new contents")
+    with _direct_db_session() as db:
+        new_record = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.file_id == new_upload["file_id"])
+            .one()
+        )
+        new_path = Path(new_record.storage_path)
+        assert db.query(UploadedFile).count() == 3
+    assert new_path not in [path for _, path, _ in originals]
+    assert new_path.read_bytes() == b"new contents"
+
+    headers = _admin_headers()
+    for file_id, original_path, payload in originals:
+        assert file_id != new_upload["file_id"]
+        assert not original_path.exists()
+        response = client.get(f"/api/files/download/{file_id}", headers=headers)
+        assert response.status_code == 200
+        assert response.content == payload
+        assert original_path.read_bytes() == payload
+    assert new_path.read_bytes() == b"new contents"
 
 
 @pytest.mark.asyncio

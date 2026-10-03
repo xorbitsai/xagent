@@ -4,6 +4,7 @@ Phase 1A Part 2: Extended with additional store contracts for complete decouplin
 """
 
 from .contracts import (
+    ActiveGenerationStore,
     IngestionStatusStore,
     KBWriteCoordinator,
     MainPointerStore,
@@ -13,6 +14,7 @@ from .contracts import (
 )
 from .factory import (
     StorageFactory,
+    get_active_generation_store,
     get_ingestion_status_store,
     get_kb_write_coordinator,
     get_main_pointer_store,
@@ -38,6 +40,7 @@ __all__ = [
     "IngestionStatusStore",
     "PromptTemplateStore",
     "MainPointerStore",
+    "ActiveGenerationStore",
     # Factory
     "StorageFactory",
     "get_kb_write_coordinator",
@@ -51,6 +54,7 @@ __all__ = [
     "get_ingestion_status_store",
     "get_prompt_template_store",
     "get_main_pointer_store",
+    "get_active_generation_store",
     "reset_kb_write_coordinator",
     "reset_rag_storage_for_tests",
 ]

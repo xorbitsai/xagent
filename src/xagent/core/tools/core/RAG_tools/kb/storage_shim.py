@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..storage.contracts import (
+        ActiveGenerationStore,
         IngestionStatusStore,
         KBWriteCoordinator,
         MainPointerStore,
@@ -58,6 +59,10 @@ class KBStorageShimCompatibilityFacade:
     def get_main_pointer_store(self) -> MainPointerStore:
         """Return the legacy main pointer store singleton."""
         return self._storage_factory.get_main_pointer_store()
+
+    def get_active_generation_store(self) -> ActiveGenerationStore:
+        """Return the legacy active generation store singleton."""
+        return self._storage_factory.get_active_generation_store()
 
     def reset_kb_write_coordinator(self) -> None:
         """Clear legacy storage singletons and coordinator-backed shim state."""

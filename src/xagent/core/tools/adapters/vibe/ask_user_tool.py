@@ -7,7 +7,12 @@ from pydantic import BaseModel, Field
 from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .factory import register_tool
-from .interaction_types import INTERACTION_TYPES, OPTIONS_REQUIRED_GUIDANCE
+from .interaction_types import (
+    CLARIFICATION_GUIDANCE,
+    INTERACTION_TYPES,
+    OPTIONS_REQUIRED_GUIDANCE,
+    SUGGESTED_VALUE_GUIDANCE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +46,7 @@ class InteractionArg(BaseModel):
     min: Optional[int] = Field(default=None, description="Min value for number_input")
     max: Optional[int] = Field(default=None, description="Max value for number_input")
     default_value: Union[str, bool, int, float, None] = Field(
-        default=None, description="Default value"
+        default=None, description=SUGGESTED_VALUE_GUIDANCE
     )
     accept: Optional[list[str]] = Field(
         default=None,
@@ -91,7 +96,8 @@ class AskUserQuestionTool(AbstractBaseTool):
             "Ask the user a question and provide a structured form for them to fill out. "
             "Use this when you need clarification, specific information, or a decision from the user "
             "before proceeding with a task. "
-            "For example, you can ask if they want to create a knowledge base (use 'action_cards' for Import/Upload), or select from a list (use 'select_one')."
+            "For example, you can ask if they want to create a knowledge base (use 'action_cards' for Import/Upload), or select from a list (use 'select_one'). "
+            + CLARIFICATION_GUIDANCE
         )
 
     def args_type(self) -> Type[BaseModel]:

@@ -76,11 +76,13 @@ from ....file_ref import (
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ....tools.adapters.vibe.interaction_types import (
+    CLARIFICATION_GUIDANCE,
     DEFAULT_WAITING_INTERACTION,
     DEGRADED_FIELDS_NOTE,
     INTERACTION_TYPE_ALIASES,
     INTERACTION_TYPES,
     OPTIONS_REQUIRED_GUIDANCE,
+    SUGGESTED_VALUE_GUIDANCE,
     degrade_options_less_pickers,
     lacks_required_options,
 )
@@ -3731,7 +3733,10 @@ class ReActPattern(AgentPattern):
                         "access tokens in these fields. For missing data access, "
                         "offer uploaded or pasted data where suitable; credentials "
                         "belong in the application's connection settings, not this "
-                        "form. " + OPTIONS_REQUIRED_GUIDANCE
+                        "form. "
+                        + OPTIONS_REQUIRED_GUIDANCE
+                        + " "
+                        + CLARIFICATION_GUIDANCE
                     ),
                     "parameters": {
                         "type": "object",
@@ -3769,6 +3774,15 @@ class ReActPattern(AgentPattern):
                                             },
                                         },
                                         "placeholder": {"type": "string"},
+                                        "default_value": {
+                                            "type": [
+                                                "string",
+                                                "number",
+                                                "boolean",
+                                                "null",
+                                            ],
+                                            "description": SUGGESTED_VALUE_GUIDANCE,
+                                        },
                                         "multiline": {"type": "boolean"},
                                         "accept": {
                                             "type": "array",

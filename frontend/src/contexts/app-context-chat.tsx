@@ -631,6 +631,9 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
       if (typeof item.min === "number") normalized.min = item.min
       if (typeof item.max === "number") normalized.max = item.max
       if (typeof item.default !== "undefined") normalized.default = item.default
+      if (item.default_value === null || typeof item.default_value === "string" || typeof item.default_value === "boolean" || (typeof item.default_value === "number" && Number.isFinite(item.default_value))) {
+        normalized.default_value = item.default_value
+      }
       if (Array.isArray(item.accept) || typeof item.accept === "string") normalized.accept = item.accept
       if (typeof item.multiple === "boolean") normalized.multiple = item.multiple
       if (Array.isArray(item.apps)) {

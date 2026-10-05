@@ -67,11 +67,230 @@ vi.mock("@/contexts/auth-context", () => ({
 
 import { ClarificationForm } from "./clarification-form"
 import { createClarificationSendFailure } from "./clarification-delivery"
+import { suggestedClarificationValue } from "./clarification-guidance"
+import type { Interaction } from "@/contexts/app-context-chat"
 
 // Every describe in this file gets the identity translate back, so a locale
 // swapped by one test cannot leak into a suite added below it.
 beforeEach(() => {
   i18nMock.translate = i18nMock.identity
+})
+
+describe("ClarificationForm guided answers", () => {
+  beforeEach(() => {
+    // MultiSelect uses Next's automatic JSX runtime; Vitest uses classic JSX.
+    vi.stubGlobal("React", React)
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+  })
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  const select: Interaction = {
+    type: "select_one", field: "cadence", label: "Cadence", default_value: "weekly",
+    options: [
+      { value: "daily", label: "Daily" },
+      { value: "weekly", label: "Weekly", description: "One summary each week" },
+    ],
+  }
+  const submit = () => fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.submit" }))
+  const next = () => fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.next" }))
+  const previous = () => fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.previous" }))
+  const defer = (field: string) => fireEvent.click(screen.getByRole("button", {
+    name: `chatPage.clarification.deferField:${JSON.stringify({ field })}`,
+  }))
+  const textFields = (count: number): Interaction[] => Array.from({ length: count }, (_, i) => ({
+    type: "text_input", field: `q${i}`, label: `Question ${i}`, placeholder: `Answer ${i}`,
+  }))
+
+  it("keeps a wire suggestion through normalization, but submits only an explicit choice", async () => {
+    const { normalizeInteractions } = await vi.importActual<typeof import("@/contexts/app-context-chat")>("@/contexts/app-context-chat")
+    const onSend = vi.fn()
+    render(<ClarificationForm requestId="request-1" interactions={normalizeInteractions([select])} onSend={onSend} />)
+    expect(screen.getByText("chatPage.clarification.recommended")).toBeInTheDocument()
+    expect(screen.getByText("One summary each week")).toBeInTheDocument()
+    expect(screen.getByRole("radio", { name: "Weekly" })).not.toBeChecked()
+    submit()
+    expect(onSend).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole("radio", { name: "Daily" }))
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Cadence: Daily", [], { request_id: "request-1" }))
+  })
+
+  it("keeps large option sets as a dropdown and labels only the suggested choice", async () => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={[{ ...select, options: [...select.options!, ...[1, 2, 3, 4].map(i => ({ value: String(i), label: String(i) }))] }]} onSend={onSend} />)
+    expect(screen.queryByRole("radio")).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+    fireEvent.click(screen.getByText("Weekly (chatPage.clarification.recommended)"))
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Cadence: Weekly", [], {}))
+  })
+
+  it("lets users adopt a numeric zero suggestion without treating it as empty", async () => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={[{ type: "number_input", field: "threshold", label: "Threshold", default_value: 0 }]} onSend={onSend} />)
+    expect(screen.getByRole("spinbutton")).toHaveValue(null)
+    fireEvent.click(screen.getByRole("button", { name: 'chatPage.clarification.useSuggestion:{"value":"0"}' }))
+    expect(screen.getByRole("spinbutton")).toHaveValue(0)
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Threshold: 0", [], {}))
+  })
+
+  it("does not apply consent defaults or offer to skip approval controls", async () => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={[{ type: "confirm", field: "send", label: "Send to team", default_value: true }]} onSend={onSend} />)
+    expect(screen.getByRole("switch")).not.toBeChecked()
+    expect(screen.queryByText("chatPage.clarification.notSure")).not.toBeInTheDocument()
+    expect(screen.queryByText("chatPage.clarification.recommended")).not.toBeInTheDocument()
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Send to team: chatPage.clarification.no", [], {}))
+  })
+
+  it("adopts an existing multi-select suggestion only after an explicit click", async () => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={[{ ...select, type: "select_multiple" }]} onSend={onSend} />)
+    expect(screen.getByText("chatPage.clarification.selectOptions")).toBeInTheDocument()
+    submit()
+    expect(onSend).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole("button", { name: 'chatPage.clarification.useSuggestion:{"value":"Weekly"}' }))
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Cadence: Weekly", [], {}))
+  })
+
+  it("does not open a disabled multi-select while a response is being sent", () => {
+    const onSend = vi.fn(() => new Promise<void>(() => {}))
+    render(<ClarificationForm interactions={[{ ...select, type: "select_multiple" }]} onSend={onSend} />)
+    fireEvent.click(screen.getByRole("button", { name: 'chatPage.clarification.useSuggestion:{"value":"Weekly"}' }))
+    submit()
+    fireEvent.click(screen.getByText("Weekly"))
+    expect(screen.queryByText("Daily")).not.toBeInTheDocument()
+    expect(onSend).toHaveBeenCalledOnce()
+  })
+
+  it("reports a skipped suggestion as missing, never as the suggested answer", async () => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={[select]} onSend={onSend} />)
+    fireEvent.click(screen.getByRole("radio", { name: "Weekly" }))
+    defer("Cadence")
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Cadence: chatPage.clarification.deferredAnswer", [], {}))
+  })
+
+  it("can undo deferral and restore a previously chosen answer", async () => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={[select]} onSend={onSend} />)
+    fireEvent.click(screen.getByRole("radio", { name: "Weekly" }))
+    defer("Cadence")
+    defer("Cadence")
+    expect(screen.getByRole("radio", { name: "Weekly" })).toBeChecked()
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Cadence: Weekly", [], {}))
+  })
+
+  it("never submits attachments for a deferred upload", async () => {
+    const onSend = vi.fn()
+    const { container } = render(<ClarificationForm interactions={[{ type: "file_upload", field: "sample", label: "Sample" }]} onSend={onSend} />)
+    fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files: [new File(["data"], "sample.csv")] } })
+    defer("Sample")
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Sample: chatPage.clarification.deferredAnswer", [], {}))
+  })
+
+  it("pages all seven questions without sending early or losing answers on back navigation", async () => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={textFields(7)} onSend={onSend} />)
+    expect(screen.getAllByRole("textbox")).toHaveLength(3)
+    expect(screen.queryByRole("button", { name: "chatPage.clarification.submit" })).not.toBeInTheDocument()
+    for (let i = 0; i < 3; i++) fireEvent.change(screen.getByPlaceholderText(`Answer ${i}`), { target: { value: `value ${i}` } })
+    next()
+    for (let i = 3; i < 6; i++) fireEvent.change(screen.getByPlaceholderText(`Answer ${i}`), { target: { value: `value ${i}` } })
+    previous()
+    expect(screen.getByPlaceholderText("Answer 0")).toHaveValue("value 0")
+    next()
+    next()
+    fireEvent.change(screen.getByPlaceholderText("Answer 6"), { target: { value: "value 6" } })
+    expect(onSend).not.toHaveBeenCalled()
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend).toHaveBeenCalledWith(Array.from({ length: 7 }, (_, i) => `Question ${i}: value ${i}`).join("\n"), [], {})
+  })
+
+  it("retains answers, deferrals, and files across pages after a rejected send", async () => {
+    const onSend = vi.fn().mockRejectedValueOnce(createClarificationSendFailure("Not sent", "not_sent")).mockResolvedValueOnce(undefined)
+    const file = new File(["data"], "sample.csv")
+    const { container } = render(<ClarificationForm requestId="retry-request" interactions={[
+      { type: "file_upload", field: "sample", label: "Sample" }, ...textFields(3),
+    ]} onSend={onSend} />)
+    fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files: [file] } })
+    fireEvent.change(screen.getByPlaceholderText("Answer 0"), { target: { value: "preserved" } })
+    defer("Question 1")
+    next()
+    fireEvent.change(screen.getByPlaceholderText("Answer 2"), { target: { value: "last" } })
+    submit()
+    await screen.findByRole("alert")
+    previous()
+    expect(screen.getByText("sample.csv")).toBeInTheDocument()
+    expect(screen.getByPlaceholderText("Answer 0")).toHaveValue("preserved")
+    expect(screen.getByText("chatPage.clarification.deferredAnswer")).toBeInTheDocument()
+    next()
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+    expect(onSend.mock.calls[1]).toEqual(onSend.mock.calls[0])
+    expect(onSend.mock.calls[1]).toEqual([
+      "Question 0: preserved\nQuestion 1: chatPage.clarification.deferredAnswer\nQuestion 2: last", [file], { request_id: "retry-request" },
+    ])
+  })
+
+  it("starts a new request on page one without reusing deferrals or answers", () => {
+    const interactions = textFields(4)
+    const { rerender } = render(<ClarificationForm requestId="old" interactions={interactions} onSend={vi.fn()} />)
+    defer("Question 0")
+    next()
+    rerender(<ClarificationForm requestId="new" interactions={interactions} onSend={vi.fn()} />)
+    expect(screen.getByPlaceholderText("Answer 0")).toHaveValue("")
+    expect(screen.queryByText("chatPage.clarification.deferredAnswer")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "chatPage.clarification.previous" })).not.toBeInTheDocument()
+  })
+
+  it("does not count disabled uploads as questions or expose hidden suggested actions", () => {
+    render(<ClarificationForm filesDisabled interactions={[
+      { type: "file_upload", field: "file", label: "File" }, ...textFields(2),
+      { type: "action_cards", field: "source", label: "Source", default_value: "upload", options: [
+        { value: "upload", label: "Upload", action_type: "upload" }, { value: "paste", label: "Paste", action_type: "none" },
+      ] },
+    ]} onSend={vi.fn()} />)
+    expect(screen.queryByRole("button", { name: "chatPage.clarification.next" })).not.toBeInTheDocument()
+    expect(screen.queryByText("chatPage.clarification.recommended")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Paste" })).toHaveAttribute("aria-pressed", "false")
+  })
+
+  it("translates recommendation and deferral controls with a live locale change", () => {
+    i18nMock.translate = (key, vars) => resolveTranslation("en", key as Parameters<typeof resolveTranslation>[1], vars)
+    const { rerender } = render(<ClarificationForm interactions={[select]} onSend={vi.fn()} />)
+    expect(screen.getByText("Recommended")).toBeInTheDocument()
+    i18nMock.translate = (key, vars) => resolveTranslation("zh", key as Parameters<typeof resolveTranslation>[1], vars)
+    rerender(<ClarificationForm interactions={[select]} onSend={vi.fn()} />)
+    expect(screen.getByText("推荐")).toBeInTheDocument()
+    expect(screen.getByText("不确定 / 暂不回答")).toBeInTheDocument()
+  })
+
+  it.each([
+    { type: "number_input", default_value: Infinity },
+    { type: "number_input", default_value: 0, min: 1 },
+    { type: "number_input", default_value: 10, max: 5 },
+    { type: "number_input", default_value: false },
+    { type: "select_one", default_value: "missing", options: select.options },
+    { type: "confirm", default_value: true },
+    { type: "text_input", default_value: " " },
+  ] as Partial<Interaction>[]) ("ignores unusable or unsafe suggestions: %s", input => {
+    expect(suggestedClarificationValue({ field: "f", label: "F", ...input } as Interaction)).toBeUndefined()
+  })
 })
 
 describe("ClarificationForm Session file capability", () => {
@@ -836,8 +1055,6 @@ describe("ClarificationForm blank option filtering", () => {
       <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
     )
 
-    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
-
     expect(screen.getByText("Import")).toBeInTheDocument()
     expect(blankOptionSpans(container)).toHaveLength(0)
   })
@@ -858,13 +1075,9 @@ describe("ClarificationForm blank option filtering", () => {
         ],
       },
     ]
-    const { container } = render(
-      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
-    )
+    render(<ClarificationForm interactions={interactions} onSend={vi.fn()} />)
 
-    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
-
-    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(screen.getByRole("radio", { name: "Import" })).toBeInTheDocument()
     expect(screen.queryByText("Blank value only")).not.toBeInTheDocument()
   })
 

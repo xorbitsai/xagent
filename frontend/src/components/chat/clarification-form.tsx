@@ -7,12 +7,14 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { MultiSelect } from "@/components/ui/multi-select"
 import { Select } from "@/components/ui/select"
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { useApp } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField } from "./connect-apps-field"
+import { canDeferClarification, CLARIFICATION_PAGE_SIZE, suggestedClarificationValue } from "./clarification-guidance"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import { clientErrorTranslationKey, type ClientErrorCode } from "@/lib/client-errors"
 import {
@@ -117,6 +119,8 @@ export function ClarificationForm({
       : interaction.label || interaction.field
 
   const [formState, setFormState] = useState<Record<string, any>>({})
+  const [deferredFields, setDeferredFields] = useState<Set<string>>(new Set())
+  const [page, setPage] = useState(0)
   const previousRequestIdRef = useRef(requestId)
   const latestRequestIdRef = useRef(requestId)
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -137,6 +141,8 @@ export function ClarificationForm({
     if (previousRequestIdRef.current === requestId) return
     previousRequestIdRef.current = requestId
     setFormState({})
+    setDeferredFields(new Set())
+    setPage(0)
     setIsSubmitting(false)
     setIsSubmitted(!active && !isConnectAppsOnly)
     setIsOpen(active || isConnectAppsOnly)
@@ -194,6 +200,15 @@ export function ClarificationForm({
     }) as Interaction[]
   }, [interactions])
 
+  const visibleInteractions = normalizedInteractions.filter(interaction =>
+    !filesDisabled || interaction.type !== "file_upload")
+  const pageCount = Math.max(1, Math.ceil(visibleInteractions.length / CLARIFICATION_PAGE_SIZE))
+  const currentPage = Math.min(page, pageCount - 1)
+  const pageInteractions = visibleInteractions.slice(
+    currentPage * CLARIFICATION_PAGE_SIZE, (currentPage + 1) * CLARIFICATION_PAGE_SIZE,
+  )
+  const formDisabled = !active || isSubmitting || isSubmitted
+
   useEffect(() => {
     if (!filesDisabled) return
 
@@ -231,11 +246,28 @@ export function ClarificationForm({
   }, [filesDisabled, normalizedInteractions])
 
   const handleInputChange = (field: string, value: any) => {
+    if (formDisabled) return
     setFormState((prev) => ({ ...prev, [field]: value }))
+    setDeferredFields(previous => {
+      const next = new Set(previous)
+      next.delete(field)
+      return next
+    })
+    setSendFailure(null)
+  }
+
+  const toggleDeferred = (field: string) => {
+    setDeferredFields(previous => {
+      const next = new Set(previous)
+      if (next.has(field)) next.delete(field)
+      else next.add(field)
+      return next
+    })
     setSendFailure(null)
   }
 
   const handleSubmit = async () => {
+    if (formDisabled) return
     const submittedRequestId = requestId
     // Construct the message
     const metadata: ClarificationSendMetadata = requestId ? { request_id: requestId } : {}
@@ -244,6 +276,9 @@ export function ClarificationForm({
 
       if (filesDisabled && interaction.type === "file_upload") {
         return []
+      }
+      if (canDeferClarification(interaction) && deferredFields.has(interaction.field)) {
+        return [{ field: interaction.field, label: interaction.label || interaction.field, value: t("chatPage.clarification.deferredAnswer"), isFile: false }]
       }
       if (
         filesDisabled
@@ -395,19 +430,20 @@ export function ClarificationForm({
 
   const renderField = (interaction: Interaction) => {
     const value = formState[interaction.field]
+    const suggestion = suggestedClarificationValue(interaction)
 
     switch (interaction.type) {
       case "text_input":
         return interaction.multiline ? (
           <Textarea
             placeholder={interaction.placeholder}
-            value={value || ""}
+            value={value ?? ""}
             onChange={(e) => handleInputChange(interaction.field, e.target.value)}
           />
         ) : (
           <Input
             placeholder={interaction.placeholder}
-            value={value || ""}
+            value={value ?? ""}
             onChange={(e) => handleInputChange(interaction.field, e.target.value)}
           />
         )
@@ -419,17 +455,35 @@ export function ClarificationForm({
             placeholder={interaction.placeholder}
             min={interaction.min}
             max={interaction.max}
-            value={value || ""}
+            value={value ?? ""}
             onChange={(e) => handleInputChange(interaction.field, e.target.value)}
           />
         )
 
       case "select_one":
+        if (interaction.options?.length && interaction.options.length <= 5) {
+          return (
+            <RadioGroup aria-label={fieldLabel(interaction)} value={value ?? ""}
+              onValueChange={v => handleInputChange(interaction.field, v)} disabled={formDisabled}>
+              {interaction.options.map(option => (
+                <label key={option.value} className={`flex cursor-pointer items-start gap-3 rounded-md border p-3 ${value === option.value ? "border-primary bg-primary/5" : "hover:bg-muted/50"}`}>
+                  <RadioGroupItem value={option.value} className="mt-0.5" aria-label={option.label} />
+                  <span className="min-w-0 text-sm">
+                    <span className="font-medium">{option.label}</span>
+                    {option.value === suggestion && <span className="ml-2 text-xs text-primary">{t("chatPage.clarification.recommended")}</span>}
+                    {option.description && <span className="mt-1 block text-xs text-muted-foreground">{option.description}</span>}
+                  </span>
+                </label>
+              ))}
+            </RadioGroup>
+          )
+        }
         return (
           <Select
             value={value}
             onValueChange={(v) => handleInputChange(interaction.field, v)}
-            options={interaction.options || []}
+            options={interaction.options?.map(option => ({ ...option, label: option.value === suggestion ? `${option.label} (${t("chatPage.clarification.recommended")})` : option.label })) || []}
+            disabled={formDisabled}
             placeholder={t("chatPage.clarification.selectOption")}
           />
         )
@@ -440,6 +494,7 @@ export function ClarificationForm({
             values={value || []}
             onValuesChange={(v) => handleInputChange(interaction.field, v)}
             options={interaction.options || []}
+            disabled={formDisabled}
             placeholder={interaction.placeholder || t("chatPage.clarification.selectOptions")}
           />
         )
@@ -541,8 +596,11 @@ export function ClarificationForm({
           <div className="flex flex-col gap-4 w-full">
             <div className="grid w-full grid-cols-1 sm:grid-cols-2 gap-4">
               {visibleOptions?.map((opt) => (
-                <div
+                <button
+                  type="button"
                   key={opt.value}
+                  disabled={formDisabled}
+                  aria-pressed={value === opt.value}
                   className={`flex flex-col items-center justify-center gap-2 rounded-lg border p-6 cursor-pointer transition-all ${value === opt.value ? 'border-primary bg-primary/5 shadow-sm ring-1 ring-primary' : 'bg-card hover:bg-muted/50 hover:border-muted-foreground/30'
                     }`}
                   onClick={() => handleInputChange(interaction.field, opt.value)}
@@ -558,9 +616,10 @@ export function ClarificationForm({
                   </div>
                   <div className="flex flex-col items-center text-center gap-1">
                     <span className="font-medium text-sm text-foreground">{opt.label}</span>
+                    {opt.value === suggestion && <span className="text-xs text-primary">{t("chatPage.clarification.recommended")}</span>}
                     {opt.description && <span className="text-xs text-muted-foreground">{opt.description}</span>}
                   </div>
-                </div>
+                </button>
               ))}
             </div>
             {isUploadSelected && (
@@ -645,19 +704,48 @@ export function ClarificationForm({
           </div>
         ) : (
           <>
+            {pageCount > 1 && <p className="text-xs text-muted-foreground" aria-live="polite">
+              {t("chatPage.clarification.page", { current: currentPage + 1, total: pageCount })}
+            </p>}
             <div className="space-y-4">
-              {normalizedInteractions.map((interaction, index) => (
-                filesDisabled && interaction.type === "file_upload" ? null : (
+              {pageInteractions.map((interaction, index) => {
+                const suggestion = suggestedClarificationValue(interaction)
+                return (
                 <div key={`${interaction.field}-${index}`} className="space-y-2">
                   <Label className="text-sm font-medium">
                     {fieldLabel(interaction)}
                     {interaction.type === "confirm" || LIVE_WIDGET_TYPES.has(interaction.type) ? "" : ":"}
                   </Label>
 
-                  {renderField(interaction)}
+                  {LIVE_WIDGET_TYPES.has(interaction.type) ? renderField(interaction) : (
+                    <>
+                      {deferredFields.has(interaction.field) && canDeferClarification(interaction) ? (
+                        <p className="text-sm text-muted-foreground">{t("chatPage.clarification.deferredAnswer")}</p>
+                      ) : (
+                        <fieldset disabled={formDisabled} className="min-w-0 space-y-2">
+                          {renderField(interaction)}
+                          {["text_input", "number_input", "select_multiple"].includes(interaction.type) && suggestion !== undefined && (
+                            <Button type="button" size="sm" variant="outline" onClick={() => {
+                              handleInputChange(interaction.field, interaction.type === "select_multiple" ? [suggestion] : suggestion)
+                            }}>
+                              {t("chatPage.clarification.useSuggestion", { value: interaction.options?.find(option => option.value === suggestion)?.label ?? String(suggestion) })}
+                            </Button>
+                          )}
+                        </fieldset>
+                      )}
+                      {canDeferClarification(interaction) && (
+                        <Button type="button" variant="ghost" size="sm" disabled={formDisabled}
+                          aria-label={t("chatPage.clarification.deferField", { field: fieldLabel(interaction) })}
+                          aria-pressed={deferredFields.has(interaction.field)}
+                          onClick={() => toggleDeferred(interaction.field)}>
+                          {t(deferredFields.has(interaction.field) ? "chatPage.clarification.answerInstead" : "chatPage.clarification.notSure")}
+                        </Button>
+                      )}
+                    </>
+                  )}
                 </div>
                 )
-              ))}
+              })}
             </div>
 
             {sendFailure && (
@@ -670,9 +758,14 @@ export function ClarificationForm({
             )}
 
             <div className="pt-2 flex gap-2">
-              <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={!active || isSubmitting || isSubmitted}>
+              {currentPage > 0 && <Button type="button" variant="outline" size="sm" disabled={isSubmitting}
+                onClick={() => setPage(currentPage - 1)}>{t("chatPage.clarification.previous")}</Button>}
+              {currentPage < pageCount - 1 ? (
+                <Button type="button" className="flex-1" size="sm" disabled={isSubmitting}
+                  onClick={() => setPage(currentPage + 1)}>{t("chatPage.clarification.next")}</Button>
+              ) : <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={formDisabled}>
                 {isSubmitting ? t("chatPage.clarification.submitting") : t("chatPage.clarification.submit")}
-              </Button>
+              </Button>}
             </div>
           </>
         )}

@@ -3,6 +3,13 @@
 Operational helper scripts for local development, upgrades, and release checks.
 Run commands from the repository root unless a script says otherwise.
 
+## `parallel_search_example.py`
+
+Runs opt-in, keyless web search and optional page fetching through Xagent's
+MCP configuration model and agent tool loader. See
+[Parallel Search MCP](../docs/parallel-search.md) for the runnable configuration
+and setup instructions.
+
 ## `backfill_uploaded_files.py`
 
 Registers files already present under the configured uploads directory into the

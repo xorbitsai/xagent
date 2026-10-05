@@ -3737,6 +3737,8 @@ class ReActPattern(AgentPattern):
                         + OPTIONS_REQUIRED_GUIDANCE
                         + " "
                         + CLARIFICATION_GUIDANCE
+                        + " default_value: "
+                        + SUGGESTED_VALUE_GUIDANCE
                     ),
                     "parameters": {
                         "type": "object",

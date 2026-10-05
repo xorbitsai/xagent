@@ -712,6 +712,7 @@ export function ClarificationForm({
                 const suggestion = suggestedClarificationValue(interaction)
                 const selectedValues = Array.isArray(formState[interaction.field]) ? formState[interaction.field] : []
                 const suggestionAlreadySelected = interaction.type === "select_multiple" && selectedValues.includes(suggestion)
+                const deferActionLabel = t(deferredFields.has(interaction.field) ? "chatPage.clarification.answerInstead" : "chatPage.clarification.notSure")
                 return (
                 <div key={`${interaction.field}-${index}`} className="space-y-2">
                   <Label className="text-sm font-medium">
@@ -737,10 +738,10 @@ export function ClarificationForm({
                       )}
                       {canDeferClarification(interaction) && (
                         <Button type="button" variant="ghost" size="sm" disabled={formDisabled}
-                          aria-label={t("chatPage.clarification.deferField", { field: fieldLabel(interaction) })}
+                          aria-label={`${deferActionLabel}: ${fieldLabel(interaction)}`}
                           aria-pressed={deferredFields.has(interaction.field)}
                           onClick={() => toggleDeferred(interaction.field)}>
-                          {t(deferredFields.has(interaction.field) ? "chatPage.clarification.answerInstead" : "chatPage.clarification.notSure")}
+                          {deferActionLabel}
                         </Button>
                       )}
                     </>
@@ -760,11 +761,17 @@ export function ClarificationForm({
             )}
 
             <div className="pt-2 flex gap-2">
-              {currentPage > 0 && <Button type="button" variant="outline" size="sm" disabled={isSubmitting}
-                onClick={() => setPage(currentPage - 1)}>{t("chatPage.clarification.previous")}</Button>}
+              {currentPage > 0 && <Button key={`previous-${currentPage}`} type="button" variant="outline" size="sm" disabled={isSubmitting}
+                onClick={event => {
+                  if (event.detail > 1) return
+                  setPage(currentPage - 1)
+                }}>{t("chatPage.clarification.previous")}</Button>}
               {currentPage < pageCount - 1 ? (
-                <Button key="next" type="button" className="flex-1" size="sm" disabled={isSubmitting}
-                  onClick={() => setPage(currentPage + 1)}>{t("chatPage.clarification.next")}</Button>
+                <Button key={`next-${currentPage}`} type="button" className="flex-1" size="sm" disabled={isSubmitting}
+                  onClick={event => {
+                    if (event.detail > 1) return
+                    setPage(currentPage + 1)
+                  }}>{t("chatPage.clarification.next")}</Button>
               ) : <Button key="submit" type="button" className="flex-1" size="sm" onClick={event => {
                 // A second pointer click on Next must not submit the last page,
                 // even when it lands on the newly mounted Submit button.

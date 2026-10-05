@@ -102,7 +102,7 @@ describe("ClarificationForm guided answers", () => {
   const next = () => fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.next" }))
   const previous = () => fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.previous" }))
   const defer = (field: string) => fireEvent.click(screen.getByRole("button", {
-    name: `chatPage.clarification.deferField:${JSON.stringify({ field })}`,
+    name: name => ["notSure", "answerInstead"].some(action => name === `chatPage.clarification.${action}: ${field}`),
   }))
   const textFields = (count: number): Interaction[] => Array.from({ length: count }, (_, i) => ({
     type: "text_input", field: `q${i}`, label: `Question ${i}`, placeholder: `Answer ${i}`,
@@ -275,6 +275,29 @@ describe("ClarificationForm guided answers", () => {
     expect(onSend).toHaveBeenCalledWith("Question 0: kept\nApprove: chatPage.clarification.no", [], {})
   })
 
+  it.each(["next", "previous"])("does not skip question groups when %s is double clicked", direction => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={textFields(7)} onSend={onSend} />)
+    if (direction === "previous") {
+      next()
+      next()
+    }
+    const name = `chatPage.clarification.${direction}`
+    const navigationButton = screen.getByRole("button", { name })
+    navigationButton.focus()
+    fireEvent.click(navigationButton, { detail: 1 })
+    expect(screen.getByPlaceholderText("Answer 3")).toBeInTheDocument()
+    fireEvent.click(navigationButton, { detail: 2 })
+    const newButton = screen.getByRole("button", { name })
+    expect(newButton).not.toBe(navigationButton)
+    expect(newButton).not.toHaveFocus()
+    fireEvent.click(newButton, { detail: 2 })
+    expect(screen.getByPlaceholderText("Answer 3")).toBeInTheDocument()
+    expect(onSend).not.toHaveBeenCalled()
+    fireEvent.click(newButton, { detail: 1 })
+    expect(screen.getByPlaceholderText(direction === "next" ? "Answer 6" : "Answer 0")).toBeInTheDocument()
+  })
+
   it("retains answers, deferrals, and files across pages after a rejected send", async () => {
     const onSend = vi.fn().mockRejectedValueOnce(createClarificationSendFailure("Not sent", "not_sent")).mockResolvedValueOnce(undefined)
     const file = new File(["data"], "sample.csv")
@@ -332,6 +355,23 @@ describe("ClarificationForm guided answers", () => {
     rerender(<ClarificationForm interactions={[select]} onSend={vi.fn()} />)
     expect(screen.getByText("推荐")).toBeInTheDocument()
     expect(screen.getByText("不确定 / 暂不回答")).toBeInTheDocument()
+  })
+
+  it.each(["en", "zh"] as const)("keeps the visible defer action in its accessible name in %s", locale => {
+    i18nMock.translate = (key, vars) => resolveTranslation(locale, key as Parameters<typeof resolveTranslation>[1], vars)
+    render(<ClarificationForm interactions={[select]} onSend={vi.fn()} />)
+    const deferText = resolveTranslation(locale, "chatPage.clarification.notSure")
+    const resumeText = resolveTranslation(locale, "chatPage.clarification.answerInstead")
+    const button = screen.getByRole("button", { name: `${deferText}: Cadence` })
+    expect(button).toHaveTextContent(deferText)
+    expect(button).toHaveAttribute("aria-pressed", "false")
+    fireEvent.click(button)
+    expect(button).toHaveAccessibleName(`${resumeText}: Cadence`)
+    expect(button).toHaveTextContent(resumeText)
+    expect(button).toHaveAttribute("aria-pressed", "true")
+    fireEvent.click(button)
+    expect(button).toHaveAccessibleName(`${deferText}: Cadence`)
+    expect(button).toHaveAttribute("aria-pressed", "false")
   })
 
   it.each([

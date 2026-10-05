@@ -386,7 +386,6 @@ const en = {
       useSuggestion: "Use suggestion: {value}",
       notSure: "Not sure / skip for now",
       answerInstead: "Answer this question",
-      deferField: "Defer answer: {field}",
       deferredAnswer: "Not provided yet. This is not consent or acceptance of a suggested default.",
       page: "Questions — page {current} of {total}. Answers are sent together at the end.",
       previous: "Previous",

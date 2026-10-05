@@ -386,7 +386,6 @@ const zh = {
       useSuggestion: "采用建议：{value}",
       notSure: "不确定 / 暂不回答",
       answerInstead: "返回填写",
-      deferField: "暂不回答：{field}",
       deferredAnswer: "暂未提供。这不代表同意，也不代表采用建议的默认值。",
       page: "第 {current} / {total} 组问题，全部填写后统一提交。",
       previous: "上一组",

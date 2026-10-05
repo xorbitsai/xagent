@@ -98,6 +98,8 @@ class AskUserQuestionTool(AbstractBaseTool):
             "before proceeding with a task. "
             "For example, you can ask if they want to create a knowledge base (use 'action_cards' for Import/Upload), or select from a list (use 'select_one'). "
             + CLARIFICATION_GUIDANCE
+            + " default_value: "
+            + SUGGESTED_VALUE_GUIDANCE
         )
 
     def args_type(self) -> Type[BaseModel]:

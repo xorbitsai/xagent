@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
+from xagent.core.model.chat.basic.claude import ClaudeLLM
 from xagent.core.model.chat.basic.gemini import GeminiLLM
 from xagent.core.tools.adapters.vibe.ask_user_tool import (
     AskUserQuestionArgs,
@@ -38,6 +39,32 @@ def test_builtin_question_schema_builds_real_gemini_sdk_tool_config() -> None:
         "BOOLEAN",
         "NULL",
     }
+
+
+@pytest.mark.parametrize("source", ["builtin", "adapter"])
+def test_suggestion_guidance_survives_claude_tool_conversion(source: str) -> None:
+    if source == "builtin":
+        schemas = ReActPattern()._builtin_tool_schemas()
+    else:
+        tool = AskUserQuestionTool()
+        schemas = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.args_type().model_json_schema(),
+                },
+            }
+        ]
+    converted = ClaudeLLM(api_key="test-key")._convert_tools_to_anthropic_format(
+        schemas
+    )
+    question = next(tool for tool in converted if tool["name"] == "ask_user_question")
+    # Claude currently simplifies unions and drops field-level descriptions.
+    # Keep the complete guidance available independently of that conversion.
+    assert f"default_value: {SUGGESTED_VALUE_GUIDANCE}" in question["description"]
+    assert CLARIFICATION_GUIDANCE in question["description"]
 
 
 def test_both_question_schemas_expose_suggestions_and_the_same_guidance() -> None:

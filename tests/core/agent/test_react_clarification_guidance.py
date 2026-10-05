@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
+from xagent.core.model.chat.basic.gemini import GeminiLLM
 from xagent.core.tools.adapters.vibe.ask_user_tool import (
     AskUserQuestionArgs,
     AskUserQuestionTool,
@@ -17,6 +18,28 @@ from xagent.core.tools.adapters.vibe.interaction_types import (
 from .test_react_ask_user_question_dedup import FakeLLM, _ask_user_question_call
 
 
+def test_builtin_question_schema_builds_real_gemini_sdk_tool_config() -> None:
+    # All ReAct requests carry this schema, even before asking a question.
+    # Exercise the SDK's typed Tool/Schema construction without a network call.
+    llm = GeminiLLM(api_key="test-key")
+    schemas = ReActPattern()._builtin_tool_schemas()
+    config = llm._build_gemini_tool_config(schemas, tool_choice="auto")
+    declarations = config["tools"][0].function_declarations
+    assert [item.name for item in declarations] == [
+        schema["function"]["name"] for schema in schemas
+    ]
+    question = next(item for item in declarations if item.name == "ask_user_question")
+    suggestion = question.parameters.properties["interactions"].items.properties[
+        "default_value"
+    ]
+    assert {branch.type.value for branch in suggestion.any_of} == {
+        "STRING",
+        "NUMBER",
+        "BOOLEAN",
+        "NULL",
+    }
+
+
 def test_both_question_schemas_expose_suggestions_and_the_same_guidance() -> None:
     pattern = ReActPattern()
     schema = next(
@@ -27,7 +50,12 @@ def test_both_question_schemas_expose_suggestions_and_the_same_guidance() -> Non
     suggestion = schema["parameters"]["properties"]["interactions"]["items"][
         "properties"
     ]["default_value"]
-    assert set(suggestion["type"]) == {"string", "number", "boolean", "null"}
+    assert {branch["type"] for branch in suggestion["anyOf"]} == {
+        "string",
+        "number",
+        "boolean",
+        "null",
+    }
     assert suggestion["description"] == SUGGESTED_VALUE_GUIDANCE
     assert CLARIFICATION_GUIDANCE in schema["description"]
     assert CLARIFICATION_GUIDANCE in AskUserQuestionTool().description

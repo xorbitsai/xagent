@@ -3775,11 +3775,11 @@ class ReActPattern(AgentPattern):
                                         },
                                         "placeholder": {"type": "string"},
                                         "default_value": {
-                                            "type": [
-                                                "string",
-                                                "number",
-                                                "boolean",
-                                                "null",
+                                            "anyOf": [
+                                                {"type": "string"},
+                                                {"type": "number"},
+                                                {"type": "boolean"},
+                                                {"type": "null"},
                                             ],
                                             "description": SUGGESTED_VALUE_GUIDANCE,
                                         },

@@ -197,8 +197,11 @@ CLARIFICATION_GUIDANCE = (
 
 SUGGESTED_VALUE_GUIDANCE = (
     "Optional suggested answer, shown for the user to choose, never submitted "
-    "automatically. For selection fields, use an existing option value. "
-    "Suggest only safe preferences, not unknown facts, action targets or consent."
+    "automatically. For select_one/select_multiple or a suggested action_cards "
+    "choice, use an existing option value. An action_cards default_value may "
+    "instead carry a website URL already provided by the user as context for "
+    "an input_url field; this does not select or authorize the action. "
+    "Suggest safe preferences, never invent facts, action targets or consent."
 )
 
 # Handed back to the model beside ``degraded_fields``: the echoed list already

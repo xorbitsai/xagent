@@ -132,6 +132,24 @@ describe("ClarificationForm guided answers", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("Cadence: Weekly", [], {}))
   })
 
+  it("still shows radio choices at the five-option boundary", () => {
+    render(<ClarificationForm interactions={[{ ...select, options: [...select.options!, ...[1, 2, 3].map(i => ({ value: String(i), label: String(i) }))] }]} onSend={vi.fn()} />)
+    expect(screen.getAllByRole("radio")).toHaveLength(5)
+    expect(screen.queryByText("chatPage.clarification.selectOption")).not.toBeInTheDocument()
+  })
+
+  it("disables radio choices while the chosen answer is being sent", () => {
+    const onSend = vi.fn(() => new Promise<void>(() => {}))
+    render(<ClarificationForm interactions={[select]} onSend={onSend} />)
+    fireEvent.click(screen.getByRole("radio", { name: "Weekly" }))
+    submit()
+    for (const radio of screen.getAllByRole("radio")) expect(radio).toBeDisabled()
+    fireEvent.click(screen.getByRole("radio", { name: "Daily" }))
+    expect(screen.getByRole("radio", { name: "Weekly" })).toBeChecked()
+    expect(onSend).toHaveBeenCalledOnce()
+    expect(onSend).toHaveBeenCalledWith("Cadence: Weekly", [], {})
+  })
+
   it("lets users adopt a numeric zero suggestion without treating it as empty", async () => {
     const onSend = vi.fn()
     render(<ClarificationForm interactions={[{ type: "number_input", field: "threshold", label: "Threshold", default_value: 0 }]} onSend={onSend} />)
@@ -161,6 +179,18 @@ describe("ClarificationForm guided answers", () => {
     fireEvent.click(screen.getByRole("button", { name: 'chatPage.clarification.useSuggestion:{"value":"Weekly"}' }))
     submit()
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("Cadence: Weekly", [], {}))
+  })
+
+  it("adds a multi-select suggestion without replacing existing choices and then hides it", async () => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={[{ ...select, type: "select_multiple" }]} onSend={onSend} />)
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOptions"))
+    fireEvent.click(screen.getByText("Daily"))
+    const suggestionButton = screen.getByRole("button", { name: 'chatPage.clarification.useSuggestion:{"value":"Weekly"}' })
+    fireEvent.click(suggestionButton)
+    expect(suggestionButton).not.toBeInTheDocument()
+    submit()
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Cadence: Daily, Weekly", [], {}))
   })
 
   it("does not open a disabled multi-select while a response is being sent", () => {
@@ -219,6 +249,30 @@ describe("ClarificationForm guided answers", () => {
     submit()
     await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
     expect(onSend).toHaveBeenCalledWith(Array.from({ length: 7 }, (_, i) => `Question ${i}: value ${i}`).join("\n"), [], {})
+  })
+
+  it("requires a fresh submit activation after the last Next button", async () => {
+    const onSend = vi.fn()
+    render(<ClarificationForm interactions={[
+      ...textFields(3), { type: "confirm", field: "approve", label: "Approve" },
+    ]} onSend={onSend} />)
+    fireEvent.change(screen.getByPlaceholderText("Answer 0"), { target: { value: "kept" } })
+    const nextButton = screen.getByRole("button", { name: "chatPage.clarification.next" })
+    nextButton.focus()
+    fireEvent.click(nextButton, { detail: 1 })
+    expect(screen.getByRole("switch")).not.toBeChecked()
+    // A queued activation of Next must not turn into a Submit click.
+    fireEvent.click(nextButton, { detail: 2 })
+    expect(onSend).not.toHaveBeenCalled()
+    const submitButton = screen.getByRole("button", { name: "chatPage.clarification.submit" })
+    expect(submitButton).not.toBe(nextButton)
+    expect(submitButton).not.toHaveFocus()
+    // Also ignore the second pointer click if it targets the new button.
+    fireEvent.click(submitButton, { detail: 2 })
+    expect(onSend).not.toHaveBeenCalled()
+    fireEvent.click(submitButton, { detail: 1 })
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend).toHaveBeenCalledWith("Question 0: kept\nApprove: chatPage.clarification.no", [], {})
   })
 
   it("retains answers, deferrals, and files across pages after a rejected send", async () => {

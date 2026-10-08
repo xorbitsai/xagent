@@ -111,6 +111,19 @@ describe("SettingsPage auth profile synchronization", () => {
     )
   })
 
+  it("places execution budget after the common account settings", async () => {
+    apiRequest.mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      user: authState.user,
+    }), { headers: { "Content-Type": "application/json" } }))
+
+    render(<SettingsPage />)
+
+    await waitFor(() => expect(screen.getByLabelText("settings.email.current")).toBeEnabled())
+    const budget = screen.getByTestId("execution-budget-settings")
+    expect(budget.parentElement?.lastElementChild).toBe(budget)
+  })
+
   it("does not apply an old profile response to a replacement login", async () => {
     let resolve!: (response: Response) => void
     apiRequest.mockReturnValue(new Promise<Response>(resolvePromise => { resolve = resolvePromise }))

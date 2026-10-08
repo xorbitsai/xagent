@@ -14,7 +14,7 @@ import {
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useAuth } from "@/contexts/auth-context"
-import { useI18n } from "@/contexts/i18n-context"
+import { useI18n, type Locale } from "@/contexts/i18n-context"
 import { Select } from "@/components/ui/select"
 import { inspectAuthSession, updateAuthSessionUser } from "@/lib/auth-cache"
 import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
@@ -86,7 +86,6 @@ export default function SettingsPage() {
 
       <div className="space-y-6">
         <TaskRuntimeSettingsExtension />
-        <ExecutionBudgetSettings key={session.sessionId} isAdmin={user?.is_admin} />
 
         {/* Language Section */}
         <Card>
@@ -104,7 +103,7 @@ export default function SettingsPage() {
               <Label htmlFor="language-select">{t("settings.language.title")}</Label>
               <Select
                 value={locale}
-                onValueChange={(val) => setLocale(val as any)}
+                onValueChange={(val) => setLocale(val as Locale)}
                 options={[
                   { value: "zh", label: "简体中文" },
                   { value: "en", label: "English" },
@@ -225,6 +224,7 @@ export default function SettingsPage() {
             </Button>
           </CardContent>
         </Card>
+        <ExecutionBudgetSettings key={session.sessionId} isAdmin={user?.is_admin} />
       </div>
     </div>
   )

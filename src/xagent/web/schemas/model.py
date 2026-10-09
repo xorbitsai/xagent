@@ -181,7 +181,9 @@ class ModelUpdate(BaseModel):
     format: Optional[str] = None  # TTS audio format (e.g., 'mp3', 'wav', 'pcm')
     sample_rate: Optional[int] = None  # TTS sample rate in Hz (e.g., 24000, 48000)
 
-    @field_validator("model_name", "base_url", "api_key", "bedrock_region", mode="before")
+    @field_validator(
+        "model_name", "base_url", "api_key", "bedrock_region", mode="before"
+    )
     @classmethod
     def strip_string_fields(cls, v: Any) -> Any:
         return _strip_whitespace(v)
@@ -272,7 +274,9 @@ class ModelConnectionTestRequest(BaseModel):
     top_n: Optional[int] = None
     instruct: Optional[str] = None
 
-    @field_validator("model_name", "base_url", "api_key", "bedrock_region", mode="before")
+    @field_validator(
+        "model_name", "base_url", "api_key", "bedrock_region", mode="before"
+    )
     @classmethod
     def strip_string_fields(cls, v: Any) -> Any:
         return _strip_whitespace(v)

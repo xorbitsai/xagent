@@ -53,7 +53,9 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
         created_at = Column(DateTime(timezone=True), server_default=func.now())
         updated_at = Column(DateTime(timezone=True), onupdate=func.now())
         is_active = Column(Boolean, default=True)
-        _api_key_encrypted = Column(String(500), nullable=False)
+        # Fernet expands the plaintext substantially. Cloud credentials and
+        # signed tokens can exceed VARCHAR(500) after encryption.
+        _api_key_encrypted = Column(Text, nullable=False)
 
         # Properties
         @property

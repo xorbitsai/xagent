@@ -19,7 +19,7 @@ if TYPE_CHECKING:
         category = Column(String(20), nullable=False, default="llm")
         model_provider = Column(String(50), nullable=False)
         model_name = Column(String(100), nullable=False)
-        api_key = Column(String(500), nullable=False)
+        _api_key_encrypted = Column(Text, nullable=False)
         base_url = Column(String(500), nullable=True)
         temperature = Column(Float, nullable=True)
         dimension = Column(Integer, nullable=True)

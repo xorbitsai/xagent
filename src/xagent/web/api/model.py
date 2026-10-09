@@ -2364,7 +2364,17 @@ async def fetch_provider_models(
         )
 
     try:
-        models = await fetch_models_from_provider(provider_to_use, api_key, base_url)
+        if canonical_provider_name(provider_to_use) == "claude":
+            models = await fetch_models_from_provider(
+                provider_to_use,
+                api_key,
+                base_url,
+                raise_on_error=True,
+            )
+        else:
+            models = await fetch_models_from_provider(
+                provider_to_use, api_key, base_url
+            )
 
         return {
             "provider": provider,
@@ -2372,6 +2382,28 @@ async def fetch_provider_models(
             "count": len(models),
         }
     except Exception as e:
+        from ...core.model.chat.basic.claude import (
+            AnthropicAuthenticationError,
+            ModelCatalogUnavailableError,
+        )
+
+        if isinstance(e, ModelCatalogUnavailableError):
+            return {
+                "provider": provider,
+                "models": [],
+                "count": 0,
+                "catalog_unavailable": True,
+                "warning": (
+                    "This compatible endpoint does not provide a model catalog. "
+                    "Enter the model name manually, then test the model connection."
+                ),
+            }
+        if isinstance(e, AnthropicAuthenticationError):
+            safe_error = redact_sensitive_text(str(e))
+            logger.warning(
+                "Provider %s rejected its credentials: %s", provider, safe_error
+            )
+            raise HTTPException(status_code=e.status_code, detail=safe_error) from e
         safe_error = redact_sensitive_text(str(e))
         logger.error(
             "Error fetching models from %s: %s",
@@ -2379,9 +2411,9 @@ async def fetch_provider_models(
             safe_error,
         )
         raise HTTPException(
-            status_code=500,
+            status_code=502,
             detail=f"Failed to fetch models from {provider}: {safe_error}",
-        )
+        ) from e
 
 
 @model_router.post("/providers/fetch")

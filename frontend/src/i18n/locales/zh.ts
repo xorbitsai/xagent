@@ -2083,6 +2083,7 @@ const zh = {
         baseUrlHint: "填写任何兼容 OpenAI API 协议的服务地址,例如 vLLM、Together 或自建的本地服务。",
         testConnection: "测试模型连接",
         testSuccess: "连接成功！模型工作正常。",
+        catalogUnavailable: "此兼容端点不提供模型列表。请手动输入模型名称，然后测试模型连接。",
         selectModelWarning: "请选择一个模型",
         activate: "激活",
         defaultModels: "默认模型",

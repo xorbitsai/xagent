@@ -138,6 +138,7 @@ export function ModelManagementDialog({
   const [connectSearchQuery, setConnectSearchQuery] = useState("")
 
   const [fetchedModels, setFetchedModels] = useState<ProviderModel[]>([])
+  const [modelCatalogUnavailable, setModelCatalogUnavailable] = useState(false)
   const [isFetchingModels, setIsFetchingModels] = useState(false)
 
 
@@ -245,6 +246,7 @@ export function ModelManagementDialog({
   const resetConnectionState = () => {
     resetTestConnectionState()
     setFetchedModels([])
+    setModelCatalogUnavailable(false)
   }
 
   const providerAllowsEmptyApiKey = (providerId: string) => providerId === 'xinference'
@@ -532,11 +534,12 @@ export function ModelManagementDialog({
   const fetchModelsForCategory = async (category: string) => {
     try {
       setIsFetchingModels(true)
-      const models = await getProviderModels(formData.model_provider, {
+      const catalog = await getProviderModels(formData.model_provider, {
         api_key: formData.api_key,
         base_url: formData.base_url,
         category,
       })
+      const models = catalog.models
       // Strip 'models/' prefix from Gemini models returned by the SDK API
       const cleanedModels = models.map(model => {
         if (model.id && model.id.startsWith('models/')) {
@@ -545,10 +548,12 @@ export function ModelManagementDialog({
         return model
       })
       setFetchedModels(cleanedModels)
+      setModelCatalogUnavailable(catalog.catalogUnavailable)
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : t('models.errors.fetchFailed')
       toast.error(errorMessage)
       setFetchedModels([])
+      setModelCatalogUnavailable(false)
       throw err // Rethrow to allow caller to handle failure
     } finally {
       setIsFetchingModels(false)
@@ -1086,6 +1091,11 @@ export function ModelManagementDialog({
                             setTestConnectionError(null)
                           }}
                         />
+                        {modelCatalogUnavailable && (
+                          <div className="p-3 bg-amber-50 text-amber-800 border border-amber-200 rounded-md text-sm">
+                            {t('models.dialog.connect.catalogUnavailable')}
+                          </div>
+                        )}
                       </div>
 
                       {formData.model_name && (

@@ -8,6 +8,7 @@ vi.mock("./api-wrapper", async (importOriginal) => ({
 
 import { apiRequest } from "./api-wrapper"
 import {
+  getProviderModels,
   getUserDefaultModels,
   getUserModels,
   hostnameFromUrl,
@@ -94,6 +95,39 @@ function deferred<T>() {
 
 beforeEach(() => {
   mockedRequest.mockReset()
+})
+
+describe("getProviderModels", () => {
+  it("preserves a missing-catalog signal so compatible endpoints allow manual entry", async () => {
+    mockedRequest.mockResolvedValueOnce(jsonResponse({
+      models: [],
+      count: 0,
+      catalog_unavailable: true,
+      warning: "Enter the model name manually.",
+    }))
+
+    await expect(getProviderModels("claude", {
+      api_key: "synthetic-key",
+      base_url: "https://bedrock.example.com/anthropic/v1",
+    })).resolves.toEqual({
+      models: [],
+      catalogUnavailable: true,
+      warning: "Enter the model name manually.",
+    })
+  })
+
+  it("keeps ordinary model catalogs distinguishable from a missing catalog", async () => {
+    mockedRequest.mockResolvedValueOnce(jsonResponse({
+      models: [{ id: "claude-test" }],
+      count: 1,
+    }))
+
+    await expect(getProviderModels("claude")).resolves.toEqual({
+      models: [{ id: "claude-test" }],
+      catalogUnavailable: false,
+      warning: undefined,
+    })
+  })
 })
 
 describe("hostnameFromUrl", () => {

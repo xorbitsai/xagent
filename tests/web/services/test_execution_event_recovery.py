@@ -518,10 +518,12 @@ async def test_tool_outcome_recovery_preserves_failure_and_waiting(canonical, ou
             )
             == result
         )
-        assert pattern.tool_ledger["call"].status == (
+        assert pattern._record_for_tool_call_id("call").status == (
             "failed" if outcome == "failed" else "waiting_for_user"
         )
-        assert pattern.tool_ledger["call"].args == {"credential": "redacted"}
+        assert pattern._record_for_tool_call_id("call").args == {
+            "credential": "redacted"
+        }
     assert tool.calls == []
 
 

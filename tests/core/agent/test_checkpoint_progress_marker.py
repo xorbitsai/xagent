@@ -35,7 +35,7 @@ async def test_rewriting_before_llm_at_same_position_keeps_marker() -> None:
     context.add_user_message("Find it")
     pattern = ReActPattern(max_iterations=5)
     pattern.current_iteration = 2
-    pattern.tool_ledger["call-1"] = _record("call-1")
+    pattern._store_tool_record(_record("call-1"))
 
     first = await _before_llm(
         PatternRuntime(execution_id="exec-marker"), context, pattern
@@ -68,7 +68,7 @@ async def test_react_advances_change_marker() -> None:
     after_message = checkpoint_progress_marker(
         await _before_llm(runtime, context, pattern)
     )
-    pattern.tool_ledger["call-1"] = _record("call-1")
+    pattern._store_tool_record(_record("call-1"))
     after_tool = checkpoint_progress_marker(
         await _before_llm(runtime, context, pattern)
     )

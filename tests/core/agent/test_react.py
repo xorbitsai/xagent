@@ -13326,7 +13326,7 @@ async def test_resumed_settlement_fact_failure_stops_delivery(
             "response": "Approve",
         }
     ]
-    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern._store_tool_record(_waiting_ledger_record("call-1"))
     context = ExecutionContext(execution_id="settlement-fact-failure")
     context.add_tool_result(
         "approval_gate", {"success": False, "status": "waiting_for_user"}, "call-1"

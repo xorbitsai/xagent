@@ -91,9 +91,9 @@ async def test_401_pauses_cancels_fallback_and_replans_after_checkpoint(
     assert len(llm.calls) == 1
     request.assert_awaited_once()
     fallback_request.assert_not_awaited()
-    assert pattern.tool_ledger["original"].status == "waiting_for_user"
-    assert pattern.tool_ledger["retry"].status == "cancelled"
-    assert pattern.tool_ledger["fallback"].status == "cancelled"
+    assert pattern._record_for_tool_call_id("original").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("retry").status == "cancelled"
+    assert pattern._record_for_tool_call_id("fallback").status == "cancelled"
     assert runtime.outbound_messages[-1]["expect_response"] is True
     assert "connection settings" in result["message"]
     checkpoint = next(
@@ -203,10 +203,10 @@ async def test_concurrent_authentication_pause_keeps_sibling_and_cancels_fallbac
     assert result["status"] == "waiting_for_user"
     assert len(llm.calls) == 1
     assert any(c["label"] == "before_tool_batch" for c in runtime.checkpoints)
-    assert pattern.tool_ledger["auth"].status == "waiting_for_user"
-    assert pattern.tool_ledger["sibling"].status == "completed"
-    assert pattern.tool_ledger["sibling"].result["records"] == [1]
-    assert pattern.tool_ledger["fallback"].status == "cancelled"
+    assert pattern._record_for_tool_call_id("auth").status == "waiting_for_user"
+    assert pattern._record_for_tool_call_id("sibling").status == "completed"
+    assert pattern._record_for_tool_call_id("sibling").result["records"] == [1]
+    assert pattern._record_for_tool_call_id("fallback").status == "cancelled"
     assert runtime.checkpoints[-1]["pattern_state"]["pending_tool_calls"] == []
     assert len(runtime.outbound_messages) == 1
     request.assert_not_awaited()
@@ -237,7 +237,7 @@ async def test_401_headless_run_keeps_failure_available_for_partial_delivery(
 
     assert result["success"] is True
     assert "authorization failed" in result["response"]
-    assert pattern.tool_ledger["original"].status == "failed"
+    assert pattern._record_for_tool_call_id("original").status == "failed"
     assert "authentication_required" in str(llm.calls[1]["messages"])
 
 

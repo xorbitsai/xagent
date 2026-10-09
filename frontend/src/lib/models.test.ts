@@ -136,6 +136,8 @@ describe("model producer decoders", () => {
     expect(Object.keys(parsed?.[0] ?? {}).sort()).toEqual([
       "abilities",
       "base_url",
+      "bedrock_auth_mode",
+      "bedrock_region",
       "can_delete",
       "can_edit",
       "category",
@@ -155,6 +157,22 @@ describe("model producer decoders", () => {
     ])
     ;(raw.abilities as unknown as string[]).push("mutated")
     expect(parsed?.[0].abilities).toEqual(["chat"])
+  })
+
+  it("preserves Bedrock settings in the UI model payload", () => {
+    const parsed = parseModelList([model({
+      model_provider: "bedrock",
+      model_name: "arn:aws:bedrock:us-west-2:123456789012:inference-profile/example",
+      base_url: "https://bedrock-runtime.us-west-2.amazonaws.com",
+      bedrock_region: "us-west-2",
+      bedrock_auth_mode: "credentials_chain",
+    })])
+
+    expect(parsed?.[0]).toEqual(expect.objectContaining({
+      model_provider: "bedrock",
+      bedrock_region: "us-west-2",
+      bedrock_auth_mode: "credentials_chain",
+    }))
   })
 
   it.each([

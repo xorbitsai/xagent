@@ -2046,13 +2046,21 @@ async def update_model(
     effective_model_name = update_data.get("model_name", db_model.model_name)
     _validate_provider_model_name(effective_provider, effective_model_name)
     if effective_provider == "bedrock":
+        effective_auth_mode = update_data.get(
+            "bedrock_auth_mode", db_model.bedrock_auth_mode or "api_key"
+        )
+        effective_api_key = update_data.get("api_key") or db_model.api_key
+        if update_data.get("bedrock_auth_mode") == "credentials_chain":
+            # A mode switch deliberately discards the stored explicit token
+            # below, so validate the effective post-update state rather than
+            # the stale encrypted value currently on the row. A newly supplied
+            # non-empty key remains visible here and is rejected.
+            effective_api_key = update_data.get("api_key") or None
         try:
             validate_bedrock_settings(
                 region=update_data.get("bedrock_region", db_model.bedrock_region),
-                auth_mode=update_data.get(
-                    "bedrock_auth_mode", db_model.bedrock_auth_mode or "api_key"
-                ),
-                api_key=update_data.get("api_key") or db_model.api_key,
+                auth_mode=effective_auth_mode,
+                api_key=effective_api_key,
                 endpoint_url=update_data.get("base_url", db_model.base_url),
             )
         except ValueError as exc:

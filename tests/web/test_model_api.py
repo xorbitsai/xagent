@@ -1479,6 +1479,26 @@ class TestModelAPI:
         )
         assert response.status_code == 200
 
+    def test_bedrock_credentials_chain_rejects_api_key(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-with-key",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "must-not-be-retained",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "cannot include an API key" in response.json()["detail"]
+
     def test_switching_bedrock_to_credentials_chain_clears_api_key(
         self, test_db, regular_user, regular_headers
     ):
@@ -1499,7 +1519,7 @@ class TestModelAPI:
 
         updated = client.put(
             "/api/models/bedrock-switch-auth",
-            json={"bedrock_auth_mode": "credentials_chain"},
+            json={"bedrock_auth_mode": "credentials_chain", "api_key": ""},
             headers=regular_headers,
         )
         assert updated.status_code == 200

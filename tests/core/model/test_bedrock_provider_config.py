@@ -21,6 +21,16 @@ def test_validate_bedrock_credentials_chain_settings() -> None:
     )
 
 
+def test_validate_bedrock_credentials_chain_rejects_explicit_api_key() -> None:
+    with pytest.raises(ValueError, match="cannot include an API key"):
+        validate_bedrock_settings(
+            region="us-east-1",
+            auth_mode="credentials_chain",
+            api_key="must-not-be-retained",
+            endpoint_url=None,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

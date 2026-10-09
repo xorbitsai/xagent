@@ -381,6 +381,10 @@ def validate_bedrock_settings(
         raise ValueError(
             "An Amazon Bedrock API key is required for api_key authentication"
         )
+    if auth_mode == "credentials_chain" and not is_placeholder_api_key(api_key):
+        raise ValueError(
+            "Amazon Bedrock credentials_chain authentication cannot include an API key"
+        )
 
     if not endpoint_url:
         return

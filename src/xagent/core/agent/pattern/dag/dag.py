@@ -1310,6 +1310,11 @@ class DAGPattern(AgentPattern):
         )
         frames = {root_frame_id: root_frame}
         active_frame_ids = [root_frame_id]
+        # Same view as ``get_state()`` above: both halves go into one payload,
+        # so a step's child frame must carry the staged entry its own
+        # checkpoint is committing, and a sibling's frame must not.
+        contexts = self._payload_step_contexts()
+        states = self._payload_step_pattern_states()
         for step_id, child_frame_id in zip(self.active_step_ids, active_child_ids):
             child_frame = ExecutionFrame(
                 frame_id=child_frame_id,
@@ -1317,8 +1322,8 @@ class DAGPattern(AgentPattern):
                 root_execution_id=root_execution_id,
                 pattern_type="react",
                 status=self._execution_status(self.status),
-                context=dict(self.active_step_contexts.get(step_id, {})),
-                pattern_state=dict(self.active_step_pattern_states.get(step_id, {})),
+                context=dict(contexts.get(step_id, {})),
+                pattern_state=dict(states.get(step_id, {})),
                 metadata={"dag_step_id": step_id},
             )
             frames[child_frame_id] = child_frame

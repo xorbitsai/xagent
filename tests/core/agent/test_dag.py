@@ -2289,6 +2289,7 @@ async def test_dag_sibling_payload_excludes_another_steps_staged_entry() -> None
     b_suspended = asyncio.Event()
     a_persisted = asyncio.Event()
     persisted: list[dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
 
     class Parent(PatternRuntime):
         async def checkpoint(
@@ -2305,6 +2306,7 @@ async def test_dag_sibling_payload_excludes_another_steps_staged_entry() -> None
                 await a_persisted.wait()
                 raise CheckpointPersistenceError("B's writer is down")
             persisted.append(copy.deepcopy(pattern.get_state()))
+            snapshots.append(copy.deepcopy(pattern.get_execution_snapshot(context)))
             return {"label": label}
 
     dag = DAGPattern(lambda **_: build_plan())
@@ -2348,6 +2350,13 @@ async def test_dag_sibling_payload_excludes_another_steps_staged_entry() -> None
     assert persisted[0]["active_step_pattern_states"]["b"] == {"marker": "b-committed"}
     # A's own entry is the state it was checkpointing.
     assert persisted[0]["active_step_contexts"]["a"] == {"marker": "a-new"}
+    # The execution snapshot written in the same payload agrees with it: A's
+    # child frame carries the entry A is committing, B's only its committed one.
+    frames = snapshots[0]["frames"]
+    for step_id, marker in (("a", "a-new"), ("b", "b-committed")):
+        frame = frames[f"dag-root:dag_step:{step_id}"]
+        assert frame["context"] == {"marker": marker}
+        assert frame["pattern_state"] == {"marker": marker}
     # B rolled back, and A's success was committed.
     assert dag.active_step_contexts["b"] == {"marker": "b-committed"}
     assert dag.active_step_contexts["a"] == {"marker": "a-new"}

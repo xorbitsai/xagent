@@ -84,6 +84,8 @@ def _create_llm_instance(db_model: Model) -> BaseLLM:
             base_url=db_model.base_url,
             default_temperature=db_model.temperature,
             context_window=db_model.context_window,
+            bedrock_region=db_model.bedrock_region,
+            bedrock_auth_mode=db_model.bedrock_auth_mode or "api_key",
             abilities=db_model.abilities,
             description=db_model.description,
         )
@@ -150,6 +152,8 @@ class CoreStorage:
                 default_temperature=db_model.temperature,
                 default_max_tokens=db_model.max_tokens,
                 context_window=db_model.context_window,
+                bedrock_region=db_model.bedrock_region,
+                bedrock_auth_mode=db_model.bedrock_auth_mode or "api_key",
             )
         elif db_model.category == "image":
             from ...core.model.model import ImageModelConfig
@@ -248,6 +252,8 @@ class CoreStorage:
                     "temperature": model.default_temperature,
                     "max_tokens": model.default_max_tokens,
                     "context_window": model.context_window,
+                    "bedrock_region": model.bedrock_region,
+                    "bedrock_auth_mode": model.bedrock_auth_mode,
                     "category": "llm",
                 }
             )

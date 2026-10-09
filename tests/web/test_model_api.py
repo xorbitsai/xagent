@@ -1189,6 +1189,118 @@ class TestModelAPI:
         assert data["can_delete"] is True
         assert data["is_shared"] is False
 
+    def test_bedrock_settings_survive_create_list_and_runtime_reload(
+        self, test_db, regular_user, regular_headers
+    ):
+        payload = {
+            "model_id": "bedrock-profile",
+            "category": "llm",
+            "model_provider": "bedrock",
+            "model_name": (
+                "arn:aws:bedrock:us-west-2:123456789012:inference-profile/example"
+            ),
+            "api_key": "bedrock-test-token",
+            "base_url": "https://bedrock-runtime.us-west-2.amazonaws.com",
+            "bedrock_region": "us-west-2",
+            "bedrock_auth_mode": "api_key",
+            "abilities": ["chat", "tool_calling"],
+        }
+
+        created = client.post("/api/models/", json=payload, headers=regular_headers)
+        assert created.status_code == 200
+        assert created.json()["bedrock_region"] == "us-west-2"
+        assert created.json()["bedrock_auth_mode"] == "api_key"
+
+        listed = client.get("/api/models/", headers=regular_headers)
+        assert listed.status_code == 200
+        saved = next(
+            item for item in listed.json() if item["model_id"] == "bedrock-profile"
+        )
+        assert saved["bedrock_region"] == "us-west-2"
+        assert saved["bedrock_auth_mode"] == "api_key"
+
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-profile")
+        finally:
+            db.close()
+        assert isinstance(config, ChatModelConfig)
+        assert config.bedrock_region == "us-west-2"
+        assert config.bedrock_auth_mode == "api_key"
+        assert config.api_key == "bedrock-test-token"
+
+    def test_bedrock_credentials_chain_does_not_require_api_key(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+                "abilities": ["chat", "tool_calling"],
+            },
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+    def test_switching_bedrock_to_credentials_chain_clears_api_key(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-switch-auth",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "bedrock-test-token",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+
+        updated = client.put(
+            "/api/models/bedrock-switch-auth",
+            json={"bedrock_auth_mode": "credentials_chain"},
+            headers=regular_headers,
+        )
+        assert updated.status_code == 200
+
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-switch-auth")
+        finally:
+            db.close()
+        assert isinstance(config, ChatModelConfig)
+        assert config.bedrock_auth_mode == "credentials_chain"
+        assert config.api_key == ""
+
+    def test_bedrock_rejects_mantle_endpoint(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-mantle",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "bedrock-test-token",
+                "base_url": "https://bedrock-mantle.us-east-1.api.aws/v1",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert response.status_code == 400
+        assert "do not support Converse" in response.json()["detail"]
+
     def test_create_shared_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data
     ):
@@ -1825,6 +1937,22 @@ class TestModelAPI:
         assert deepseek["name"] == "DeepSeek"
         assert deepseek["category"] == ["llm"]
         assert deepseek["default_base_url"] == "https://api.deepseek.com"
+
+    def test_list_supported_providers_marks_bedrock_catalog_optional(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported", headers=regular_headers
+        )
+        assert response.status_code == 200
+        bedrock = next(
+            provider
+            for provider in response.json()["providers"]
+            if provider["id"] == "bedrock"
+        )
+        assert bedrock["category"] == ["llm"]
+        assert bedrock["supports_model_listing"] is False
+        assert bedrock["requires_base_url"] is False
 
     def test_list_supported_providers_includes_multi_category_provider(
         self, test_db, regular_user, regular_headers

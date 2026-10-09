@@ -13,8 +13,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.shared.auth_database import auth_db_override
-from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
 from xagent.core.model.chat.basic.claude import AnthropicAuthenticationError
+from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
 from xagent.web.api import model as model_module
 from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
@@ -1988,9 +1988,7 @@ class TestModelAPI:
     def test_claude_compatible_endpoint_without_catalog_allows_manual_entry(
         self, test_db, regular_user, regular_headers, monkeypatch
     ):
-        from xagent.core.model.chat.basic.claude import (
-            ModelCatalogUnavailableError,
-        )
+        from xagent.core.model.chat.basic.claude import ModelCatalogUnavailableError
 
         fetch = AsyncMock(
             side_effect=ModelCatalogUnavailableError("catalog is unavailable")

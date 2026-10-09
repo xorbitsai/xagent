@@ -1,0 +1,7 @@
+name: fxmacrodata
+description: Official macroeconomic releases and release calendars from FXMacroData MCP
+managed: external
+transport: streamable_http
+url: https://mcp.fxmacrodata.com
+headers:
+  User-Agent: xagent/fxmacrodata-example

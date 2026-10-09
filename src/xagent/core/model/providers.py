@@ -130,6 +130,21 @@ _ROUTING_MODEL_IDS_BY_PROVIDER: dict[str, frozenset[str]] = {
 
 _SUPPORTED_PROVIDER_METADATA: tuple[dict[str, Any], ...] = (
     {
+        "id": "bedrock",
+        "name": "Amazon Bedrock",
+        "description": "Amazon Bedrock models through native Converse APIs",
+        "requires_base_url": False,
+        "category": ["llm"],
+        "credential_fields": [
+            {
+                "name": "api_key",
+                "label": "Bedrock API key",
+                "kind": "secret",
+                "required": False,
+            }
+        ],
+    },
+    {
         "id": "openai",
         "name": "OpenAI",
         "description": "OpenAI models",

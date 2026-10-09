@@ -10,6 +10,7 @@ from xagent.core.model.sound_effect.elevenlabs import ElevenLabsSoundEffectModel
 from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
 from xagent.web.services.model_list_service import (
     PROVIDER_FETCHERS,
+    fetch_bedrock_models,
     fetch_dashscope_embedding_models,
     fetch_elevenlabs_models,
     fetch_elevenlabs_music_models,
@@ -23,6 +24,11 @@ def test_openai_compatible_is_registered_in_provider_fetchers() -> None:
     "fetch models" — every provider in _SUPPORTED_PROVIDER_METADATA that can
     list models must also appear in PROVIDER_FETCHERS."""
     assert PROVIDER_FETCHERS.get("openai-compatible") is fetch_openai_models
+
+
+async def test_bedrock_catalog_is_not_an_invocation_admission_gate() -> None:
+    assert PROVIDER_FETCHERS.get("bedrock") is fetch_bedrock_models
+    assert await fetch_bedrock_models("key", "https://runtime.example") == []
 
 
 async def test_fetch_dashscope_embedding_models_returns_curated_text_models() -> None:

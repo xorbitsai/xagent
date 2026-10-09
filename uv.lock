@@ -8116,7 +8116,7 @@ requires-dist = [
     { name = "bcrypt", specifier = ">=4.0.0" },
     { name = "beartype", specifier = ">=0.18.5" },
     { name = "beautifulsoup4", specifier = ">=4.12.3" },
-    { name = "boto3", specifier = ">=1.34.0" },
+    { name = "boto3", specifier = ">=1.34.59" },
     { name = "boxlite", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.6.0" },
     { name = "boxlite", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=0.6.0" },
     { name = "byteplus-python-sdk-v2", specifier = ">=3.0.52" },

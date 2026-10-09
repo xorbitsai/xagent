@@ -59,6 +59,20 @@ async def fetch_deepseek_models(
     return await DeepSeekLLM.list_available_models(api_key, base_url)
 
 
+async def fetch_bedrock_models(
+    api_key: str, base_url: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Return no catalog and let users enter an invocation target directly.
+
+    Bedrock's control-plane model list is neither a complete list of valid
+    Converse targets (inference profiles and ARNs are also accepted) nor proof
+    that the caller has ``InvokeModel`` permission. A denied list operation
+    must therefore not become an admission gate for an otherwise valid target.
+    """
+    _ = api_key, base_url
+    return []
+
+
 async def fetch_zhipu_models(
     api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
 ) -> List[Dict[str, Any]]:
@@ -426,6 +440,7 @@ async def fetch_byteplus_ark_video_models(
 
 # Provider registry mapping provider names to their fetch functions
 PROVIDER_FETCHERS: Dict[str, Any] = {
+    "bedrock": fetch_bedrock_models,
     "openai": fetch_openai_models,
     "openai-compatible": fetch_openai_models,
     "openrouter": fetch_openai_models,

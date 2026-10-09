@@ -745,9 +745,15 @@ class BedrockLLM(BaseLLM):
                 elif "contentBlockStop" in event:
                     index = int(event["contentBlockStop"].get("contentBlockIndex", 0))
                     if index in tool_calls:
+                        completed_call = copy.deepcopy(tool_calls[index])
+                        # Deltas above are appended by the shared runtime. The
+                        # stop event repeats the fully accumulated arguments,
+                        # so mark that final value as a snapshot instead of
+                        # appending the same JSON a second time.
+                        completed_call["function"]["arguments_mode"] = "snapshot"
                         yield StreamChunk(
                             type=ChunkType.TOOL_CALL,
-                            tool_calls=[copy.deepcopy(tool_calls[index])],
+                            tool_calls=[completed_call],
                             raw=event,
                         )
                 elif "messageStop" in event:

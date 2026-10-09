@@ -61,9 +61,7 @@ def test_factory_and_metadata_preserve_native_bedrock_settings():
     )
     assert metadata["category"] == ["llm"]
     api_key_field = next(
-        field
-        for field in metadata["credential_fields"]
-        if field["name"] == "api_key"
+        field for field in metadata["credential_fields"] if field["name"] == "api_key"
     )
     assert api_key_field["required"] is False
 
@@ -446,7 +444,8 @@ async def test_converse_stream_accumulates_fragmented_multi_tool_arguments():
     assert final_by_id["a"]["function"]["arguments"] == '{"city":"Paris"}'
     assert final_by_id["b"]["function"]["arguments"] == '{"city":"Tokyo"}'
     assert all(
-        call["function"]["arguments_mode"] == "delta" for call in final_by_id.values()
+        call["function"]["arguments_mode"] == "snapshot"
+        for call in final_by_id.values()
     )
     usage = next(chunk for chunk in chunks if chunk.type is ChunkType.USAGE)
     assert usage.usage["cached_input_tokens"] == 3

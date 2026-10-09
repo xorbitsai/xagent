@@ -4,6 +4,7 @@ import asyncio
 import os
 import tempfile
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import quote
 
@@ -14,7 +15,9 @@ from fastapi.testclient import TestClient
 
 from tests.shared.auth_database import auth_db_override
 from xagent.core.model.chat.basic.claude import AnthropicAuthenticationError
+from xagent.core.model.chat.basic.bedrock import BedrockLLM
 from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
+from xagent.core.agent.service import AgentService
 from xagent.web.api import model as model_module
 from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
@@ -1277,6 +1280,186 @@ class TestModelAPI:
         assert config.bedrock_region == "us-west-2"
         assert config.bedrock_auth_mode == "api_key"
         assert config.api_key == "bedrock-test-token"
+
+    def test_bedrock_connection_test_uses_native_runtime(
+        self, test_db, regular_user, regular_headers
+    ):
+        class SyntheticBedrockClient:
+            def converse(self, **request: Any) -> dict[str, Any]:
+                assert request["modelId"] == "amazon.nova-lite-v1:0"
+                assert request["messages"][-1]["content"] == [{"text": "Hello"}]
+                return {
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "Hello from Bedrock"}],
+                        }
+                    },
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 2},
+                }
+
+        synthetic_client = SyntheticBedrockClient()
+        with patch.object(
+            BedrockLLM, "_build_client", return_value=synthetic_client
+        ) as build_client:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "amazon.nova-lite-v1:0",
+                    "api_key": "bedrock-test-token",
+                    "bedrock_region": "us-east-1",
+                    "bedrock_auth_mode": "api_key",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        build_client.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_bedrock_saved_model_runs_agent_tool_loop_end_to_end(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-agent-e2e",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "bedrock-test-token",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+                "abilities": ["chat", "tool_calling"],
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+
+        db = next(get_db())
+        try:
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-agent-e2e")
+        finally:
+            db.close()
+        assert llm is not None
+        bedrock = llm._inner
+        assert isinstance(bedrock, BedrockLLM)
+        assert bedrock.region_name == "us-east-1"
+        assert bedrock.auth_mode == "api_key"
+
+        class SyntheticBedrockClient:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            def converse_stream(self, **request: Any) -> dict[str, Any]:
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    events = [
+                        {"messageStart": {"role": "assistant"}},
+                        {
+                            "contentBlockStart": {
+                                "contentBlockIndex": 0,
+                                "start": {
+                                    "toolUse": {
+                                        "toolUseId": "call-weather",
+                                        "name": "weather",
+                                    }
+                                },
+                            }
+                        },
+                        {
+                            "contentBlockDelta": {
+                                "contentBlockIndex": 0,
+                                "delta": {"toolUse": {"input": '{"city":"Paris"}'}},
+                            }
+                        },
+                        {"contentBlockStop": {"contentBlockIndex": 0}},
+                        {"messageStop": {"stopReason": "tool_use"}},
+                        {"metadata": {"usage": {"inputTokens": 2, "outputTokens": 3}}},
+                    ]
+                else:
+                    events = [
+                        {"messageStart": {"role": "assistant"}},
+                        {
+                            "contentBlockDelta": {
+                                "contentBlockIndex": 0,
+                                "delta": {"text": "Paris is 18 C."},
+                            }
+                        },
+                        {"contentBlockStop": {"contentBlockIndex": 0}},
+                        {"messageStop": {"stopReason": "end_turn"}},
+                        {"metadata": {"usage": {"inputTokens": 4, "outputTokens": 5}}},
+                    ]
+                return {"stream": iter(events)}
+
+        class WeatherTool:
+            name = "weather"
+
+            class Metadata:
+                name = "weather"
+                description = "Return synthetic weather for one city."
+
+            metadata = Metadata()
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def args_type(self) -> type:
+                class Args:
+                    @staticmethod
+                    def model_json_schema() -> dict[str, Any]:
+                        return {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        }
+
+                return Args
+
+            async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+                self.calls.append(args)
+                return {"city": args["city"], "temperature_c": 18}
+
+            async def setup(self, task_id: str | None = None) -> None:
+                return None
+
+            async def teardown(self, task_id: str | None = None) -> None:
+                return None
+
+        synthetic_client = SyntheticBedrockClient()
+        bedrock._client = synthetic_client
+        weather = WeatherTool()
+        service = AgentService(
+            name="bedrock-e2e",
+            id="bedrock-e2e",
+            pattern="react",
+            llm=llm,
+            tools=[weather],
+            tool_config=None,
+            enable_workspace=False,
+            skills_enabled=False,
+            memory_enabled=False,
+            user_interaction_enabled=False,
+        )
+        service.allowed_skills = []
+
+        result = await service.execute_task(
+            "What is the weather in Paris?", task_id="bedrock-agent-e2e"
+        )
+
+        assert result["success"] is True
+        assert result["output"] == "Paris is 18 C."
+        assert weather.calls == [{"city": "Paris"}]
+        assert len(synthetic_client.requests) == 2
+        tool_result = synthetic_client.requests[1]["messages"][-1]["content"][0]
+        assert tool_result["toolResult"]["toolUseId"] == "call-weather"
+        result_text = tool_result["toolResult"]["content"][0]["text"]
+        assert "'city': 'Paris'" in result_text
+        assert "'temperature_c': 18" in result_text
 
     def test_bedrock_credentials_chain_does_not_require_api_key(
         self, test_db, regular_user, regular_headers

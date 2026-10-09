@@ -460,6 +460,12 @@ export interface ProviderModel {
   default_base_url?: string;
 }
 
+export interface ProviderModelCatalog {
+  models: ProviderModel[];
+  catalogUnavailable: boolean;
+  warning?: string;
+}
+
 /**
  * Get list of supported model providers
  */
@@ -487,7 +493,7 @@ export async function getSupportedProviders(): Promise<Provider[]> {
 export async function getProviderModels(
   provider: string,
   config?: { api_key?: string; base_url?: string; category?: string }
-): Promise<ProviderModel[]> {
+): Promise<ProviderModelCatalog> {
   const apiUrl = getApiUrl()
 
   const response = await apiRequest(`${apiUrl}/api/models/providers/${provider}/models`, {
@@ -509,7 +515,14 @@ export async function getProviderModels(
 
   const data = await response.json();
   if (data && Array.isArray(data.models)) {
-    return data.models;
+    return {
+      models: data.models,
+      catalogUnavailable: data.catalog_unavailable === true,
+      warning: typeof data.warning === 'string' ? data.warning : undefined,
+    };
   }
-  return Array.isArray(data) ? data : [];
+  return {
+    models: Array.isArray(data) ? data : [],
+    catalogUnavailable: false,
+  };
 }

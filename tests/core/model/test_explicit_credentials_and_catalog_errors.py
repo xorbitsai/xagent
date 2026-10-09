@@ -26,6 +26,11 @@ from openai import AsyncAzureOpenAI
 
 from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.basic.azure_openai import AzureOpenAILLM
+from xagent.core.model.chat.basic.claude import (
+    AnthropicAuthenticationError,
+    ClaudeLLM,
+    ModelCatalogUnavailableError,
+)
 from xagent.core.model.chat.basic.gemini import GeminiLLM
 from xagent.core.model.chat.basic.openai import OpenAILLM
 from xagent.core.model.chat.basic.zhipu import ZhipuLLM
@@ -271,6 +276,62 @@ def _status_error(status: int) -> Exception:
 
 
 class TestStrictCatalogReads:
+    async def test_custom_claude_endpoint_without_catalog_is_distinguishable(
+        self, monkeypatch
+    ):
+        requested_urls: list[str] = []
+
+        async def not_found(self, url, **kwargs):
+            requested_urls.append(str(url))
+            request = httpx.Request("GET", url)
+            return httpx.Response(404, request=request)
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", not_found)
+
+        with pytest.raises(ModelCatalogUnavailableError):
+            await ClaudeLLM.list_available_models(
+                "synthetic-key",
+                "https://bedrock.example.com/anthropic/v1",
+                raise_on_error=True,
+            )
+
+        assert requested_urls == ["https://bedrock.example.com/anthropic/v1/models"]
+
+    @pytest.mark.parametrize(
+        "base_url", [None, "https://api.anthropic.com", "https://api.anthropic.com/v1/"]
+    )
+    async def test_official_claude_catalog_404_remains_an_error(
+        self, monkeypatch, base_url
+    ):
+        async def not_found(self, url, **kwargs):
+            request = httpx.Request("GET", url)
+            return httpx.Response(404, request=request)
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", not_found)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await ClaudeLLM.list_available_models(
+                "synthetic-key", base_url, raise_on_error=True
+            )
+
+    @pytest.mark.parametrize("status", [401, 403])
+    async def test_claude_catalog_rejects_invalid_credentials(
+        self, monkeypatch, status
+    ):
+        async def rejected(self, url, **kwargs):
+            request = httpx.Request("GET", url)
+            return httpx.Response(status, request=request)
+
+        monkeypatch.setattr(httpx.AsyncClient, "get", rejected)
+
+        with pytest.raises(AnthropicAuthenticationError) as caught:
+            await ClaudeLLM.list_available_models(
+                "synthetic-key",
+                "https://compatible.example.com/anthropic/v1",
+                raise_on_error=True,
+            )
+        assert caught.value.status_code == status
+
     @pytest.mark.parametrize(
         "error",
         [
